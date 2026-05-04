@@ -224,17 +224,66 @@ async function openVault(): Promise<void> {
 
 pickBtn.addEventListener("click", () => void openVault());
 
-async function confirm3(
+function confirm3(
   message: string,
   a: string,
   b: string,
   cancel: string,
 ): Promise<"a" | "b" | "cancel"> {
-  const labels = `[1] ${a}\n[2] ${b}\n[Cancel] ${cancel}`;
-  const ans = window.prompt(`${message}\n\n${labels}\n\nEnter 1 or 2 (Cancel to abort):`);
-  if (ans === "1") return "a";
-  if (ans === "2") return "b";
-  return "cancel";
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+
+    const dialog = document.createElement("div");
+    dialog.className = "modal-dialog";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+
+    const msg = document.createElement("p");
+    msg.className = "modal-message";
+    msg.textContent = message;
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "modal-buttons";
+
+    const aBtn = document.createElement("button");
+    aBtn.className = "modal-btn modal-btn-primary";
+    aBtn.textContent = a;
+    const bBtn = document.createElement("button");
+    bBtn.className = "modal-btn";
+    bBtn.textContent = b;
+    const cBtn = document.createElement("button");
+    cBtn.className = "modal-btn";
+    cBtn.textContent = cancel;
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const finish = (choice: "a" | "b" | "cancel") => {
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      previouslyFocused?.focus?.();
+      resolve(choice);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); finish("cancel"); }
+      else if (e.key === "Enter") { e.preventDefault(); finish("a"); }
+      else if (e.key === "1") { e.preventDefault(); finish("a"); }
+      else if (e.key === "2") { e.preventDefault(); finish("b"); }
+    };
+
+    aBtn.addEventListener("click", () => finish("a"));
+    bBtn.addEventListener("click", () => finish("b"));
+    cBtn.addEventListener("click", () => finish("cancel"));
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) finish("cancel");
+    });
+    document.addEventListener("keydown", onKey, true);
+
+    btnRow.append(cBtn, bBtn, aBtn);
+    dialog.append(msg, btnRow);
+    overlay.append(dialog);
+    document.body.append(overlay);
+    aBtn.focus();
+  });
 }
 
 const win = getCurrentWindow();

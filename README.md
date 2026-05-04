@@ -2,7 +2,7 @@
 
 A personal notes and knowledge system. Plain markdown on disk, semantic search, agent-accessible.
 
-See `notes.md` for the problem space and `design.md` for the implementation design.
+See `design.md` for the implementation design.
 
 
 ## Core ideals

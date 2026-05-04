@@ -139,3 +139,66 @@ html, body, #app {
   content: " ●";
   color: #e0a040;
 }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: #0008;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-dialog {
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid #8886;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px #0006;
+  padding: 20px;
+  min-width: 360px;
+  max-width: 520px;
+  font-size: 13px;
+}
+
+.modal-message {
+  margin: 0 0 16px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modal-btn {
+  font: inherit;
+  padding: 6px 14px;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.modal-btn:hover {
+  background: #8882;
+}
+
+.modal-btn-primary {
+  background: #4a90e2;
+  border-color: #4a90e2;
+  color: white;
+}
+
+.modal-btn-primary:hover {
+  background: #3a80d2;
+}
+
+.modal-btn:focus-visible {
+  outline: 2px solid #4a90e2;
+  outline-offset: 1px;
+}
