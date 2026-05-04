@@ -1,0 +1,12 @@
+[package]
+name = "hiker-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hiker-mcp"
+path = "src/main.rs"
+
+[dependencies]
+hiker-core.workspace = true

@@ -1,0 +1,73 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: light dark;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  grid-template-rows: 100%;
+}
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #8884;
+  min-height: 0;
+}
+
+#vault-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #8884;
+  font-size: 12px;
+}
+
+#vault-path {
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#tree {
+  overflow: auto;
+  padding: 8px;
+  font-size: 13px;
+  flex: 1;
+}
+
+#tree ul {
+  list-style: none;
+  padding-left: 12px;
+  margin: 0;
+}
+
+#tree li {
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#tree li:hover {
+  background: #8882;
+}
+
+#tree li.active {
+  background: #4a90e244;
+}
+
+#editor {
+  overflow: hidden;
+}
+
+.cm-editor {
+  height: 100%;
+}

@@ -1,0 +1,12 @@
+[package]
+name = "hiker-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hiker"
+path = "src/main.rs"
+
+[dependencies]
+hiker-core.workspace = true
