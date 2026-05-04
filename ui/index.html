@@ -15,7 +15,21 @@
         </header>
         <div id="tree"></div>
       </aside>
-      <main id="editor"></main>
+      <main id="editor-pane">
+        <div id="editor"></div>
+        <footer id="status-bar">
+          <div id="status-left">
+            <button id="save-btn" disabled>Save</button>
+            <span id="status-path"></span>
+          </div>
+          <div id="status-center"></div>
+          <div id="status-right">
+            <span id="status-cursor">1:1</span>
+            <span id="status-words">0 words</span>
+            <span class="badge">md</span>
+          </div>
+        </footer>
+      </main>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

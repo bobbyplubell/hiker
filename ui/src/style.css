@@ -64,10 +64,78 @@ html, body, #app {
   background: #4a90e244;
 }
 
+#editor-pane {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
 #editor {
   overflow: hidden;
+  min-height: 0;
 }
 
 .cm-editor {
   height: 100%;
+}
+
+#status-bar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 10px;
+  border-top: 1px solid #8884;
+  font-size: 12px;
+  color: #888;
+}
+
+#status-left, #status-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#status-right {
+  justify-content: flex-end;
+}
+
+#status-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#save-btn {
+  font: inherit;
+  padding: 2px 8px;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  color: inherit;
+}
+
+#save-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#save-btn.dirty::before {
+  content: "● ";
+  color: #e0a040;
+}
+
+.badge {
+  padding: 1px 6px;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+#tree li.dirty::after {
+  content: " ●";
+  color: #e0a040;
 }

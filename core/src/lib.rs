@@ -4,14 +4,24 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Serialize)]
+#[serde(tag = "kind", content = "message")]
+#[serde(rename_all = "snake_case")]
 pub enum HikerError {
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
     #[error("path escapes vault: {0}")]
     PathEscape(String),
     #[error("not utf-8: {0}")]
     NotUtf8(String),
+    #[error("disk drift: file changed since load (expected hash {expected}, found {found})")]
+    DiskDrift { expected: String, found: String },
+}
+
+impl From<std::io::Error> for HikerError {
+    fn from(e: std::io::Error) -> Self {
+        HikerError::Io(e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +99,12 @@ impl Vault {
         String::from_utf8(bytes).map_err(|e| HikerError::NotUtf8(e.to_string()))
     }
 
+    pub fn read_file_with_hash(&self, rel: &str) -> Result<(String, String), HikerError> {
+        let contents = self.read_file(rel)?;
+        let hash = hash_str(&contents);
+        Ok((contents, hash))
+    }
+
     pub fn write_file(&self, rel: &str, contents: &str) -> Result<(), HikerError> {
         let abs = self.resolve(rel)?;
         if let Some(parent) = abs.parent() {
@@ -97,6 +113,46 @@ impl Vault {
         fs::write(&abs, contents)?;
         Ok(())
     }
+
+    pub fn write_file_checked(
+        &self,
+        rel: &str,
+        expected_hash: &str,
+        contents: &str,
+    ) -> Result<String, HikerError> {
+        let abs = self.resolve(rel)?;
+        match fs::read(&abs) {
+            Ok(bytes) => {
+                let on_disk = String::from_utf8(bytes)
+                    .map_err(|e| HikerError::NotUtf8(e.to_string()))?;
+                let found = hash_str(&on_disk);
+                if found != expected_hash {
+                    return Err(HikerError::DiskDrift {
+                        expected: expected_hash.to_string(),
+                        found,
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !expected_hash.is_empty() {
+                    return Err(HikerError::DiskDrift {
+                        expected: expected_hash.to_string(),
+                        found: String::new(),
+                    });
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, contents)?;
+        Ok(hash_str(contents))
+    }
+}
+
+pub fn hash_str(s: &str) -> String {
+    blake3::hash(s.as_bytes()).to_hex().to_string()
 }
 
 fn normalize(p: &Path) -> PathBuf {

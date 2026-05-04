@@ -24,9 +24,36 @@ fn read_file(state: State<AppState>, rel: String) -> Result<String, String> {
     vault_or_err(&state, |v| v.read_file(&rel).map_err(|e| e.to_string()))
 }
 
+#[derive(serde::Serialize)]
+struct FileWithHash {
+    contents: String,
+    hash: String,
+}
+
+#[tauri::command]
+fn read_file_with_hash(state: State<AppState>, rel: String) -> Result<FileWithHash, String> {
+    vault_or_err(&state, |v| {
+        v.read_file_with_hash(&rel)
+            .map(|(contents, hash)| FileWithHash { contents, hash })
+            .map_err(|e| e.to_string())
+    })
+}
+
 #[tauri::command]
 fn write_file(state: State<AppState>, rel: String, contents: String) -> Result<(), String> {
     vault_or_err(&state, |v| v.write_file(&rel, &contents).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn write_file_checked(
+    state: State<AppState>,
+    rel: String,
+    expected_hash: String,
+    contents: String,
+) -> Result<String, hiker_core::HikerError> {
+    let guard = state.vault.lock().map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
+    let vault = guard.as_ref().ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
+    vault.write_file_checked(&rel, &expected_hash, &contents)
 }
 
 #[tauri::command]
@@ -49,7 +76,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState { vault: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![list_dir, read_file, write_file, pick_vault])
+        .invoke_handler(tauri::generate_handler![
+            list_dir,
+            read_file,
+            read_file_with_hash,
+            write_file,
+            write_file_checked,
+            pick_vault
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
