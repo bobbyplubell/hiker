@@ -51,35 +51,33 @@ The pre-write check and the watcher both reduce to the same conflict-resolution 
 
 Keybind registry
 
-A single module owns all keybindings. CM6 keymap entries, Tauri global shortcuts, and DOM-level handlers all register through it. Goals: discoverable (a help panel can enumerate them), overridable (user config later), conflict-detectable (registering two actions on the same chord is an error, not a silent override).
+A single module owns all keybindings as a flat list. The registry is an introspection layer, not a translator — CM6's `keymap.of([...])` is the only sink in v0. Goals: discoverable (a help panel can enumerate `list()`), overridable (user config later), conflict-detectable.
 
 Shape:
 
     interface Binding {
-      id: string;            // "editor.save", "vault.openFile", "tree.toggleNode"
-      keys: string;          // "Mod-s", "Mod-Shift-p", "Ctrl-Alt-Right"
-      scope: "editor" | "global" | "tree";
+      id: string;            // "editor.save", "editor.toggleBold"
+      keys: string;          // CM6 chord syntax: "Mod-s", "Mod-Shift-p"
       label: string;         // human-readable for help panel
-      run: () => boolean;    // returns true if handled
+      run: (view: EditorView) => boolean;   // returns true if handled
     }
 
-The registry compiles its bindings into the appropriate sinks:
-    `scope: "editor"` → CM6 `keymap.of([...])` extension
-    `scope: "global"` → Tauri global shortcut (post-v0; for now a window-level keydown handler)
-    `scope: "tree"` → DOM keydown listener on the tree element when it has focus
+Compilation: `registry.toCMKeymap()` returns a CM6 extension built from `keymap.of(bindings.map(b => ({key: b.keys, run: b.run})))`. The editor wires this in once at startup.
+
+Validation: a `registry.validate()` pass at startup logs and throws on duplicate `id` or duplicate `keys`. No silent overrides.
+
+Scope: v0 has one scope — the editor. Bindings only fire when the editor has DOM focus. When a future binding needs to fire outside the editor (e.g. `Mod-P` quick-open from any pane), reuse CM6's exported `keyName` parser in a window-level `keydown` handler — never roll a custom chord parser. Add a `scope` field then; until then, omit it.
 
 v0 bindings:
     editor.save           Mod-S       save current buffer
 
-Reserved IDs (registered as no-ops or stubs in v0, real impls later):
+Reserved IDs (real impls later, not registered as no-ops in v0):
     vault.openFile        Mod-P       quick-open by filename
     vault.commandPalette  Mod-Shift-P open command palette
     editor.toggleBold     Mod-B
     editor.toggleItalic   Mod-I
-    tree.focus            Mod-1       focus tree
-    editor.focus          Mod-2       focus editor
 
-Override mechanism (deferred to v2 or later): a user keybind file (`vault/.hiker/keybinds.toml`) overrides any binding's `keys` by `id`. Until then, defaults are hardcoded.
+Override mechanism (deferred): a user keybind file (`vault/.hiker/keybinds.toml`) overrides any binding's `keys` by `id`. The registry's flat-list shape supports this trivially; the loader is later.
 
 
 Status bar

@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { EditorState, Compartment } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
+import { register, validate, toCMKeymap } from "./editor/keybinds";
 
 type EntryKind = "dir" | "file";
 interface DirEntry {
@@ -19,6 +20,17 @@ const vaultPathEl = document.getElementById("vault-path")!;
 let currentPath: string | null = null;
 const language = new Compartment();
 
+register({
+  id: "editor.save",
+  keys: "Mod-s",
+  label: "Save current buffer",
+  run: () => {
+    void save();
+    return true;
+  },
+});
+validate();
+
 const view = new EditorView({
   parent: editorEl,
   state: EditorState.create({
@@ -26,15 +38,7 @@ const view = new EditorView({
     extensions: [
       basicSetup,
       language.of(markdown()),
-      keymap.of([
-        {
-          key: "Mod-s",
-          run: () => {
-            void save();
-            return true;
-          },
-        },
-      ]),
+      toCMKeymap(),
     ],
   }),
 });
