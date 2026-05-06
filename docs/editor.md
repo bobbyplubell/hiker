@@ -98,7 +98,7 @@ Override mechanism (deferred): a user keybind file (`vault/.hiker/keybinds.toml`
 Bottom strip across the editor pane only (not under the tree). Three regions:
 
 - left: save button + dirty dot, current file path (relative to vault root)
-- center: (empty in v0; reserved for sync/index status indicators later)
+- center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later.
 - right: line:col, word count, file type badge (`md`)
 
 Click targets:
@@ -106,6 +106,19 @@ Click targets:
 - save button → save action
 - file path → copy path to clipboard
 - line:col → opens a goto-line input (deferred; click is a no-op in v0)
+
+
+## Layout (v1)
+
+Three columns, both sides collapsible:
+
+- **Left**: file tree (existing `#sidebar`). Collapsible. Supports drag-and-drop to move notes between folders — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command.
+- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open.
+- **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md).
+
+Default state on first launch: tree open, related panel collapsed. Persistence of these toggles across launches is a settings concern (see settings.md) — for v1 the state lives in-memory only.
+
+CSS: a 3-column grid where the side columns collapse to width 0 (or `display: none`) when toggled. Editor column is `1fr`; sides are fixed widths. Toolbar lives inside the editor column so the buttons sit where the user's eyes naturally are.
 
 
 ## Extension load order (CM6)

@@ -56,6 +56,14 @@ Notes:
 - `path_ids` is the rename-stability table. On a rename event we look up the old path's id, update `notes.path`, leave the id alone. Trails and links never break.
 - Schema version pragma (`PRAGMA user_version = 1`) so future migrations have a hook.
 
+**Static linking.** Both SQLite itself and the sqlite-vec extension are statically linked into the Hiker binary — `rusqlite` with the `bundled` feature compiles the SQLite C source in, and the `sqlite-vec` crate compiles the vec extension's C source in via its `cc` build-script. No system libsqlite3 dependency, no runtime extension load, no separate `vec0.so` to ship. One binary, no surprises across OS/distro versions.
+
+**Open semantics (`Store::open(vault_root)`).** Creates `vault/.hiker/index.db` if missing, runs idempotent schema setup (every `CREATE TABLE` uses `IF NOT EXISTS`) on a matching `user_version`, and **fails loudly on version mismatch** rather than auto-migrating. v1 ships at version 1; if a future binary opens a v2 db (or vice-versa), the user gets a clear error rather than silent breakage.
+
+**Migration policy (pre-real-use).** Until the project crosses into "I'm storing my actual notes in this" territory, no migration code is written. Schema bumps are handled by deleting `.hiker/index.db` and re-indexing — the db is regenerable from content, so the cost is one rescan. Saves a lot of effort writing migrations against a schema that's still moving. When real-data use begins, the policy flips: every schema bump from that point ships a migration alongside it. Worth a one-line note in the changelog when that line is crossed.
+
+**Writer connection ownership.** The single writer connection lives *inside* the indexer task, not behind an `Arc<Mutex<Connection>>`. Only the indexer task ever writes; the design's mpsc job queue already serializes access. No mutex needed, no shared state to reason about. Read connections are entirely independent (fresh per call as described above), so writer/reader concurrency is handled at the SQLite WAL level rather than in Rust locking.
+
 
 ## Store module discipline
 
@@ -105,6 +113,8 @@ Bumping `embedder_version` triggers full re-embed naturally — query for stale 
 
 Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never block command handlers.
 
+**CPU-bound boundary.** fastembed-rs is synchronous and CPU-heavy. Both model load (multi-second on first call) and `embed_batch` must run via `tokio::task::spawn_blocking` (or on a dedicated `std::thread` driven by an mpsc channel). Calling them directly inside an async context will block one of tokio's worker threads and starve other tasks. The indexer task awaits the spawn_blocking handle to keep its mpsc-driven loop async-shaped while the actual work runs on the blocking pool.
+
 **Module discipline (mirrors the store):** all fastembed-rs usage lives in `core::embed` (single `core/src/embed.rs`, splittable later). Outside the module, code calls `Embedder::embed_batch(&[String]) -> Vec<Vec<f32>>` and treats it as opaque. No fastembed types leak past the boundary. Reasoning: the embedder is at least as likely to be swapped as the store — a future user might want a cloud embedder (Voyage, OpenAI), a different local model (candle + a custom checkpoint), or a multilingual model (`bge-m3`). v1 ships fastembed-only with no fallback; the trait shape is what makes future fallbacks cheap.
 
 **Model storage:** downloaded model files live under the platform data dir (Linux `~/.local/share/hiker/models/`, macOS `~/Library/Application Support/hiker/models/`, Windows `%APPDATA%\hiker\models\`). Use the `directories` crate; do not roll path logic by hand. Treated as durable data rather than cache because re-downloading 30MB on a slow or metered connection is a real cost; users may still delete the directory and the app re-downloads on next launch.
@@ -141,7 +151,7 @@ Concurrency:
 
 - Indexer owns a single tokio task with an mpsc channel of `IndexJob` messages. Watcher and command handlers send jobs; the task drains them serially.
 - Serial processing is fine for v1 — embedding throughput is the bottleneck and batching across files is a v2 optimization.
-- The indexer task holds the only sqlite connection for writes. Reads (search, related) use a separate read-only connection pool.
+- The indexer task holds the only sqlite connection for writes. Reads (search, related) open a fresh connection per call and drop it on return — sub-millisecond cost on a warm cache, zero shared-state concerns. Database is opened in WAL mode (`PRAGMA journal_mode = WAL`) so readers don't block on the writer's transactions. If the sqlite-vec extension load turns out to be slow per-open, switch to an `r2d2` reader pool — one-day change since all SQL lives in `core::store`.
 
 
 ## Related-notes query (v1)
@@ -158,7 +168,38 @@ Algorithm:
 
 This is intentionally crude. No reranking, no rank fusion, no entity boosting. Good enough to validate the pipeline; the design.md:227 query pipeline arrives in v2 alongside lexical search.
 
+The full algorithm lives behind a single `Store::related_notes(source_note_id, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (Tauri command handlers, MCP later) hand it a note id and receive note-shaped hits.
+
 Latency budget: the panel updates on file-open and on save (debounced 500ms). Brute-force KNN over a 100k-chunk vault should be <100ms; if it isn't, that's the signal to add an ANN index, not before.
+
+
+## Tauri command surface (v1 additions)
+
+Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_hash`, `write_file_checked`). v1 adds three:
+
+- `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence.
+- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`.
+- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events.
+
+`RelatedHit` shape (note-level, since the v1 panel renders by note):
+
+```rust
+struct RelatedHit {
+    note_id: String,
+    path: String,
+    title: String,                 // filename stem until frontmatter parsing lands
+    score: f32,
+    best_heading_path: Option<String>,
+    snippet: String,               // text from the highest-scoring chunk
+}
+```
+
+DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` per design.md:371.
+
+
+## Walker symlink handling
+
+The startup-scan walker (`walkdir` or `ignore` crate) must match the watcher's symlink policy: **don't follow symlinks** in v1. Both walker and watcher will pick this up consistently; the goal is no surprise where the indexer sees content the watcher can't notify on, or vice versa. External-path ingestion in v2+ revisits this with an explicit allowlist.
 
 
 ## Failure modes

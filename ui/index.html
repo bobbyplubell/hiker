@@ -16,13 +16,20 @@
         <div id="tree"></div>
       </aside>
       <main id="editor-pane">
+        <header id="editor-toolbar">
+          <button id="toggle-sidebar" class="toolbar-btn" title="Toggle file tree">☰</button>
+          <span class="toolbar-spacer"></span>
+          <button id="toggle-related" class="toolbar-btn" title="Toggle related notes">⊕</button>
+        </header>
         <div id="editor"></div>
         <footer id="status-bar">
           <div id="status-left">
             <button id="save-btn" disabled>Save</button>
             <span id="status-path"></span>
           </div>
-          <div id="status-center"></div>
+          <div id="status-center">
+            <span id="status-index"></span>
+          </div>
           <div id="status-right">
             <span id="status-cursor">1:1</span>
             <span id="status-words">0 words</span>
@@ -30,6 +37,10 @@
           </div>
         </footer>
       </main>
+      <aside id="related" class="collapsed">
+        <header id="related-header">Related</header>
+        <div id="related-list"></div>
+      </aside>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
