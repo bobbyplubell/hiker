@@ -273,6 +273,14 @@ html, body, #app {
   height: 100%;
 }
 
+/* status: view-line-numbers-toggle
+   `basicSetup` includes the line-number gutter; the View menu's "Show line
+   numbers" toggle hides it via this class on the editor's root rather than
+   reconfiguring the extension stack. */
+.cm-editor.hide-line-numbers .cm-gutter.cm-lineNumbers {
+  display: none;
+}
+
 /* status: ui-no-sibling-pushout
    Horizontal regions that contain dynamic content use min-width:0 +
    flex-shrink:1 so a long child can ellipsize instead of pushing siblings

@@ -56,7 +56,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `drag-and-drop-move` | partial | `ui/src/main.ts` (`attachDnd`) | file DnD wired to Tauri `move_note`; folder drag disabled until walk-and-batch lands |
 | `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler) | auto-suffix `new-note-N.md` via Tauri `create_note`, opens + inline-renames |
 | `tree-refresh-manual` | done | `ui/src/main.ts` (`tree-actions-btn` "Refresh tree" entry) | re-reads dir; restores active highlight; expansion state preserved across refresh via `expandedFolders` set; lives inside the `…` actions menu |
-| `tree-refresh-watcher` | planned | — | auto-refresh tree from watcher events (v2 per watcher.md) |
+| `tree-refresh-watcher` | done | `ui/src/main.ts` (`scheduleTreeRefreshFromWatcher`, `hiker:file-changed` listener) | 200ms-debounced `refreshTree` on created/deleted/renamed events; modified events are no-ops (tree shape unchanged); manual `tree-refresh-manual` stays as a backstop. Lifted from v2 → v1; watcher.md "Out of scope for v1" entry now stale |
 | `tree-double-click-rename` | planned | — | double-click row → inline rename (same UX as post-create rename) |
 | `tree-context-menu` | done | `ui/src/main.ts` (`attachContextMenu`, `openContextMenu`) | row menu: Open / Rename / Delete / Properties (greyed); empty-space menu: New note here |
 | `tree-context-delete` | done | `ui/src/main.ts` (`deleteFromTree`) | confirm modal (Cancel default-focus, danger Move-to-trash); folder copy includes recursive note count; closes open buffer if deleted; toast confirmation |
@@ -86,8 +86,8 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `view-live-preview-toggle` | done | `ui/src/main.ts` (`buildViewMenuItems` "Live preview" entry) | wired to `setLivePreviewEnabled`; checkmark reflects `livePreviewEnabled`; default on |
 | `view-render-txt-as-markdown-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-vault-config-toml" |
 | `view-word-wrap-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-section-editor" |
-| `view-show-whitespace-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled; CM6 whitespace extension not wired yet |
-| `view-line-numbers-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled; line-number gutter not wired yet |
+| `view-show-whitespace-toggle` | done | `ui/src/main.ts` (`whitespaceCompartment`, `setWhitespaceEnabled`) | CM6's `highlightWhitespace` in its own compartment; default off; toggled via View menu. Persistence still pending `settings-section-editor` |
+| `view-line-numbers-toggle` | done | `ui/src/main.ts` (`setLineNumbersVisible`), `ui/src/style.css` (`.cm-editor.hide-line-numbers`) | hides `.cm-gutter.cm-lineNumbers` from `basicSetup` via a class on the editor root rather than reconfiguring the extension stack; default visible. Persistence still pending `settings-section-editor` |
 | `view-heading-breadcrumb-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Pairs with view-show-chunk-boundaries" |
 
 

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { EditorState, Compartment, type Extension } from "@codemirror/state";
-import { EditorView, ViewPlugin } from "@codemirror/view";
+import { EditorView, ViewPlugin, highlightWhitespace } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { register, validate, toCMKeymap } from "./editor/keybinds";
@@ -128,6 +128,21 @@ let chunkBoundariesEnabled = false;
 let chunkBoundariesRequestSeq = 0;
 let chunkBoundariesDebounce: number | null = null;
 
+// status: view-show-whitespace-toggle
+// Default off. CM6's `highlightWhitespace` is a single extension wired into
+// its own compartment so the View menu can flip it without touching anything
+// else. Renders space/tab markers via the standard `cm-highlightSpace` /
+// `cm-highlightTab` classes; theming is whatever CM6 ships.
+const whitespaceCompartment = new Compartment();
+let whitespaceEnabled = false;
+
+// status: view-line-numbers-toggle
+// `basicSetup` already includes the line-number gutter, so the toggle hides
+// it via a CSS class on the editor root rather than swapping extensions —
+// avoids fighting basicSetup's facet wiring. Default visible (matches
+// basicSetup's default behavior).
+let lineNumbersVisible = true;
+
 // Hoisted above any top-level `updateStatus()` call: `renderIndexStatus`
 // (invoked from `updateStatus`) reads both, and the first `updateStatus()`
 // fires during module init before its original declaration site below.
@@ -142,6 +157,10 @@ let indexStatus: IndexStatus = {
 };
 // scan_complete adds, every terminal event subtracts, Started is a no-op.
 let outstandingCount = 0;
+// Hoisted so `renderIndexStatus` (called during early init) can blank the
+// index label before any vault is opened. The original declaration site is
+// further down with the rest of the background-interval state.
+let vaultIsOpen = false;
 
 // status: txt-render-as-markdown-default
 // Hardcoded to true until the per-vault settings loader (settings-vault-config-toml)
@@ -231,6 +250,18 @@ export function setChunkBoundariesEnabled(on: boolean): void {
   refreshChunkBoundaries();
 }
 
+export function setWhitespaceEnabled(on: boolean): void {
+  whitespaceEnabled = on;
+  view.dispatch({
+    effects: whitespaceCompartment.reconfigure(on ? highlightWhitespace() : []),
+  });
+}
+
+export function setLineNumbersVisible(on: boolean): void {
+  lineNumbersVisible = on;
+  view.dom.classList.toggle("hide-line-numbers", !on);
+}
+
 export function setLivePreviewEnabled(on: boolean): void {
   // Hook for the future View menu's `view-live-preview-toggle`. Current
   // buffer's md-ness still gates whether the extension actually applies.
@@ -308,6 +339,7 @@ const view = new EditorView({
       language.of(markdown()),
       livePreviewCompartment.of(livePreview()),
       chunkBoundariesCompartment.of([]),
+      whitespaceCompartment.of([]),
       readOnlyCompartment.of(EditorState.readOnly.of(false)),
       statusUpdater,
       toCMKeymap(),
@@ -684,6 +716,19 @@ async function refreshTree(): Promise<void> {
   }
 }
 
+// status: tree-refresh-watcher
+// Debounce a single tree rebuild across bursts of watcher events (git
+// checkout, mass copy, multi-file rename). 200ms matches the watcher's own
+// debounce window so a single logical fs change → at most one rebuild.
+let treeRefreshDebounce: number | null = null;
+function scheduleTreeRefreshFromWatcher(): void {
+  if (treeRefreshDebounce !== null) window.clearTimeout(treeRefreshDebounce);
+  treeRefreshDebounce = window.setTimeout(() => {
+    treeRefreshDebounce = null;
+    void refreshTree();
+  }, 200);
+}
+
 // Tree-root drop zone: dropping on empty space below the tree moves to root.
 treeEl.addEventListener("dragover", (e) => {
   if (!e.dataTransfer?.types.includes("text/plain")) return;
@@ -743,6 +788,9 @@ async function openVault(): Promise<void> {
   // (paths can collide across vaults).
   indexStateCache.clear();
   inflightStateFetches.clear();
+  // Clear the related-notes panel so hits from the prior vault don't linger
+  // until the next file open / save populates it for the new vault.
+  void refreshRelated(null);
   startBackgroundIntervals();
   await refreshTree();
   await refreshTrashBin();
@@ -1257,18 +1305,14 @@ function buildViewMenuItems(): CtxMenuItem[] {
       tooltip: "Waits for settings-section-editor",
     },
     {
-      // status: view-show-whitespace-toggle
       label: "Show whitespace",
-      checked: false,
-      disabled: true,
-      tooltip: "Reserved — CM6 whitespace extension not wired yet",
+      checked: whitespaceEnabled,
+      run: () => setWhitespaceEnabled(!whitespaceEnabled),
     },
     {
-      // status: view-line-numbers-toggle
       label: "Show line numbers",
-      checked: false,
-      disabled: true,
-      tooltip: "Reserved — line-number gutter not wired yet",
+      checked: lineNumbersVisible,
+      run: () => setLineNumbersVisible(!lineNumbersVisible),
     },
     {
       // status: view-heading-breadcrumb-toggle
@@ -1352,7 +1396,6 @@ function scheduleRelatedRefresh(delayMs: number): void {
   }, delayMs);
 }
 
-let vaultIsOpen = false;
 let bufferPathInterval: number | null = null;
 let indexStatusInterval: number | null = null;
 let lastSeenBufferPath: string | null = null;
@@ -1380,6 +1423,14 @@ function startBackgroundIntervals(): void {
 // hit the TDZ during module init.
 
 function renderIndexStatus(): void {
+  // No vault → no indexer; blank the label rather than reporting state from
+  // a previous vault (or a half-initialized "Model loading…" before any
+  // vault has even been picked).
+  if (!vaultIsOpen) {
+    statusIndexEl.textContent = "";
+    statusIndexEl.title = "";
+    return;
+  }
   if (indexStatus.last_error) {
     statusIndexEl.textContent = "Index error";
     statusIndexEl.title = indexStatus.last_error;
@@ -1765,6 +1816,12 @@ let watcherConflictPromptOpen = false;
 
 void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
   const ev = event.payload;
+  // Tree shape changes don't depend on which buffer (if any) is active.
+  // Schedule before buffer mutations so the rebuild reads the post-update
+  // `buffer.path` (matters for the renamed branch's silent path follow).
+  if (ev.kind === "created" || ev.kind === "deleted" || ev.kind === "renamed") {
+    scheduleTreeRefreshFromWatcher();
+  }
   // Don't react while previewing a trash entry — the read-only buffer's path
   // points inside .hiker/trash/ which the watcher already ignores, but guard
   // defensively so we never mutate a preview buffer.
