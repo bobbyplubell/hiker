@@ -1745,29 +1745,102 @@ void listen("hiker:trash-changed", async () => {
 });
 
 // ---------- watcher → editor integration ----------
-// Silent reload for clean buffers when their file changes externally.
-// Conflict prompts for dirty buffers stay in the existing pre-write check.
+// Reacts to external changes to the active buffer's file:
+// - clean + modified → silent reload
+// - dirty + modified → proactive conflict modal (Keep/Take/Cancel)
+// - deleted (clean)  → close buffer + toast
+// - deleted (dirty)  → keep buffer + toast ("save to recreate")
+// - renamed          → buffer.path follows the new path silently
+//
+// status: watcher-editor-reload-clean
+// status: watcher-editor-conflict-dirty
+// status: watcher-editor-deleted-buffer
+// status: watcher-editor-renamed-followup
 
-void listen<{ kind: string; path?: string; from?: string; to?: string }>(
-  "hiker:file-changed",
-  async (event) => {
-    const ev = event.payload;
-    if (!buffer) return;
-    if (ev.kind === "modified" && ev.path === buffer.path && !isDirty()) {
+type FileChangedEvent =
+  | { kind: "created" | "modified" | "deleted"; path: string }
+  | { kind: "renamed"; from: string; to: string };
+
+let watcherConflictPromptOpen = false;
+
+void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
+  const ev = event.payload;
+  // Don't react while previewing a trash entry — the read-only buffer's path
+  // points inside .hiker/trash/ which the watcher already ignores, but guard
+  // defensively so we never mutate a preview buffer.
+  if (!buffer || buffer.preview) return;
+
+  if (ev.kind === "modified" && ev.path === buffer.path) {
+    if (isDirty()) {
+      if (watcherConflictPromptOpen) return;
+      watcherConflictPromptOpen = true;
       try {
-        const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: buffer.path });
-        if (fresh.hash !== buffer.loadedHash) {
-          view.dispatch({
-            changes: { from: 0, to: view.state.doc.length, insert: fresh.contents },
-          });
-          buffer.loadedText = view.state.doc.toString();
-          buffer.loadedHash = fresh.hash;
-          updateStatus();
-          scheduleChunkBoundariesRefresh(500);
-        }
-      } catch (err) {
-        console.error("silent reload failed:", err);
+        await handleWatcherConflictDirty(buffer.path);
+      } finally {
+        watcherConflictPromptOpen = false;
       }
+      return;
     }
-  },
-);
+    try {
+      const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: buffer.path });
+      if (fresh.hash !== buffer.loadedHash) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: fresh.contents },
+        });
+        buffer.loadedText = view.state.doc.toString();
+        buffer.loadedHash = fresh.hash;
+        updateStatus();
+        scheduleChunkBoundariesRefresh(500);
+      }
+    } catch (err) {
+      console.error("silent reload failed:", err);
+    }
+    return;
+  }
+
+  if (ev.kind === "deleted" && ev.path === buffer.path) {
+    const path = buffer.path;
+    if (isDirty()) {
+      showToast(`${path} was removed on disk; save to recreate.`);
+    } else {
+      buffer = null;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+      updateStatus();
+      showToast(`${path} was removed externally`);
+    }
+    return;
+  }
+
+  if (ev.kind === "renamed" && ev.from === buffer.path) {
+    buffer.path = ev.to;
+    updateStatus();
+    return;
+  }
+});
+
+async function handleWatcherConflictDirty(path: string): Promise<void> {
+  const choice = await confirm3(
+    `${path} has been modified on disk while you have unsaved changes.`,
+    "Keep mine",
+    "Take theirs (reload from disk)",
+    "Cancel",
+  );
+  // The buffer may have switched files (or closed) while the modal was up.
+  if (!buffer || buffer.path !== path) return;
+  // "Keep mine" / "Cancel": leave buffer untouched; the next save's pre-write
+  // drift check will re-prompt because loadedHash no longer matches disk.
+  if (choice !== "b") return;
+  try {
+    const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: path });
+    if (!buffer || buffer.path !== path) return;
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: fresh.contents },
+    });
+    buffer.loadedText = view.state.doc.toString();
+    buffer.loadedHash = fresh.hash;
+    updateStatus();
+    scheduleChunkBoundariesRefresh(500);
+  } catch (err) {
+    console.error("watcher conflict reload failed:", err);
+  }
+}

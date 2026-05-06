@@ -167,10 +167,10 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `watcher-broadcast-channel` | done | `core/src/watcher.rs:54` | tokio broadcast |
 | `watcher-bridge-to-indexer` | done | `ui/src-tauri/src/lib.rs:114` | |
 | `watcher-bridge-to-frontend` | done | `ui/src-tauri/src/lib.rs:122` | hiker:file-changed |
-| `watcher-editor-reload-clean` | done | `ui/src/main.ts:524` | silent reload |
-| `watcher-editor-conflict-dirty` | planned | — | dirty buffer should fire conflict modal proactively |
-| `watcher-editor-deleted-buffer` | planned | — | close-or-toast behavior on deletion |
-| `watcher-editor-renamed-followup` | planned | — | update currentPath when active path is renamed |
+| `watcher-editor-reload-clean` | done | `ui/src/main.ts` (`hiker:file-changed` listener, modified+clean branch) | silent reload via `read_file_with_hash` when fresh hash differs |
+| `watcher-editor-conflict-dirty` | done | `ui/src/main.ts` (`handleWatcherConflictDirty`) | proactive Keep/Take/Cancel modal; Keep+Cancel leave buffer alone (next save re-prompts via `pre-write-drift-check`); re-entry guard prevents stacked modals |
+| `watcher-editor-deleted-buffer` | done | `ui/src/main.ts` (`hiker:file-changed` listener, deleted branch) | clean → close buffer + "removed externally" toast; dirty → keep buffer + "save to recreate" toast |
+| `watcher-editor-renamed-followup` | done | `ui/src/main.ts` (`hiker:file-changed` listener, renamed branch) | silently sets `buffer.path = ev.to`; tree row stays stale until manual refresh / `tree-refresh-watcher` |
 | `watcher-overflow-rescan` | planned | — | detect notify queue overflow, trigger rescan |
 | `watcher-config-ignore-file` | planned | — | `vault/.hiker/ignore` (deferred per spec) |
 
