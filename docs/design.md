@@ -236,7 +236,13 @@ User-authored layer on top of the automatic indexes:
 - Collections / saved queries (named groupings — tags, folder globs, manual note IDs + order)
 - Curated tree from auto-gen clustering — see "Curated tree placement" below
 - Pinned anchors / landmarks (other notes get a "nearest landmark" tag in embedding space)
-- Trails (memex-style): ordered, named, optionally annotated sequences of notes or chunks. A trail is a curated walk through the vault — narrative, not just a set. Useful for investigations ("how I figured out X"), onboarding docs to past projects, or feeding an agent a coherent path rather than a bag of chunks. Trails are queryable via MCP and renderable as a guided walk in the UI.
+- Trails (memex-style): ordered, named sequences of notes or chunks with **per-waypoint annotations**. A trail is a curated walk through the vault — narrative, not just a set. Useful for investigations ("how I figured out X"), onboarding docs to past projects, or feeding an agent a coherent path rather than a bag of chunks. Trails are queryable via MCP and renderable as a guided walk in the UI.
+
+  **User-authored only.** The clustering / auto-org pipeline never proposes trails — they exist precisely because *the framing is the value*, and that framing has to come from a human who knows why these notes belong together as a path. Auto-discovery would defeat the point. (Clustering can surface "you have a thread crossing these notes" hints — that's a different feature; the user decides whether to turn a hint into a trail.)
+
+  **Annotations live separately from notes.** A trail's per-waypoint commentary belongs to the trail, not to the notes — the same note can appear in many trails with different framings ("this paper, in the context of why I rejected the GPU-resident index" vs. "this paper, in the context of the embedder choice"), and putting trail annotations in a note's frontmatter would balloon it and couple unrelated trails. The principle is locked in; the storage mechanism is not — sidecar yaml, sqlite table, or something else gets decided when trails actually get specced.
+
+  Full mechanics (storage, creation UX, branching vs. linear, agent authorship) deferred to a dedicated `trails.md` when this lands (v4+).
 
 
 ## Curated tree placement

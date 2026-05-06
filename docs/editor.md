@@ -113,6 +113,11 @@ Click targets:
 Three columns, both sides collapsible:
 
 - **Left**: file tree (existing `#sidebar`). Collapsible. Supports drag-and-drop to move notes between folders — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command.
+
+  Tree toolbar at the top of the sidebar: a wide **+ New note** button and a small refresh icon next to it. The asymmetry is the point — new-note is a frequent action, refresh is a sanity-check fallback.
+
+  - **New note** creates `new_note.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new_note` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name.
+  - **Refresh** re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; the manual button stays even after that lands.
 - **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open.
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md).
 
