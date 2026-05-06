@@ -20,16 +20,12 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 
 ### Open meta-tasks
 
-- [ ] Backfill spec docs (`editor.md`, `index.md`, `watcher.md`, `settings.md`, `qa.md`, `design.md`) with inline `[slug]` markers next to each feature definition. One-time mechanical pass, ~75 annotations. Keeps spec → status → code traceable in both directions.
+- [x] Backfilled spec docs with inline `[slug]` markers next to each feature definition — 2026-05-06.
 
 
 ### Bugs / known issues
 
-Tracked the same way as features: kebab-case slug, one-line note, optional file:line. Resolve by fixing in code, then strike the row (or remove it). If a bug ends up reshaping a feature, update the corresponding feature row instead of carrying both.
-
-| Slug | Notes |
-| ---- | ----- |
-| `bug-status-bar-path-overflow` | full path in left status region overflows on deep vaults and pushes siblings out — fixed by switching to basename + tooltip per `status-bar-path-basename-tooltip` and applying `ui-no-sibling-pushout` |
+Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug, one-line note, optional file:line); this file stays focused on the feature registry.
 
 
 ## Editor (editor.md)
@@ -187,6 +183,32 @@ All planned. Lands post-v1, alongside the curated-tree placement feature.
 | `txt-chunker-sentence-pack` | planned | Layer 3: sentence-aware packing to ~1200-char soft cap within sections |
 | `txt-chunker-guardrails` | planned | max-promotions-per-window, period+space sentence rule, code-region exclusion |
 | `txt-abbreviation-allowlist` | planned | small list (`Mr.`, `Dr.`, `e.g.`, ...) so abbreviations don't terminate sentences |
+
+
+## Observability (observability.md)
+
+All planned. Lands early so later modules ship instrumented from day one.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `obs-tracing-baseline` | planned | `tracing` + `tracing-subscriber` + `tracing-appender`; no `log`, no `println!` for diagnostics |
+| `obs-spans-pipeline` | planned | spans wrap pipeline stages, not individual fn calls |
+| `obs-env-filter` | planned | `HIKER_LOG` env var drives `EnvFilter`; defaults `info,hiker=debug` |
+| `obs-format-json` | planned | stderr layer (compact debug / json release via `HIKER_LOG_JSON=1`) |
+| `obs-log-files` | planned | file layer at `vault/.hiker/logs/hiker.log` |
+| `obs-log-rotation` | planned | daily rotation via `tracing-appender`, 7-day retention |
+| `obs-instrument-watcher` | planned | one span per debounced event; raw events at `trace!` only |
+| `obs-instrument-indexer` | planned | top-level span per job; child spans for chunk / embed / store |
+| `obs-instrument-embed` | planned | span with `batch_size`, elapsed; per-batch event |
+| `obs-instrument-store` | planned | slow-query log at >100ms; no per-call span |
+| `obs-instrument-cluster` | planned | top-level span on reconcile; per-level child spans |
+| `obs-tauri-command-spans` | planned | `#[instrument]` on every `#[tauri::command]` |
+| `obs-frontend-bridge` | planned | `log_from_frontend` Tauri command emits server-side `tracing` events |
+| `obs-error-context` | planned | structured fields on `error!`; no string-interpolated context |
+| `obs-no-content` | planned | log titles/paths but never note body text |
+| `obs-no-secrets` | planned | `tracing::field::Empty` pattern; never Display config containing keys |
+| `obs-test-subscriber` | planned | `core::test_support::init_tracing()` per-test, no global init |
+| `obs-perf-flamegraph` | planned | deferred; one-line `tracing-flame` add when needed |
 
 
 ## CLI (no spec doc yet)

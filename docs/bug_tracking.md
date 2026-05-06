@@ -1,0 +1,34 @@
+# Bug tracking
+
+Known issues in the codebase. Each row is a kebab-case slug, a one-line description, optional file:line, and (where useful) a brief note on the intended fix. Same conventions as `status.md` — resolve by fixing in code, then strike the row (or remove it). If a bug ends up reshaping a feature, update the feature row in `status.md` instead of carrying both.
+
+When a fix lands, tag the implementation site with `// status: <bug-slug>` so `rg "status: bug-…"` lands on the resolution.
+
+
+## Open
+
+| Slug | File | Notes |
+| ---- | ---- | ----- |
+| `bug-status-bar-path-overflow` | `ui/src/style.css` | full path in left status region overflows on deep vaults and pushes siblings out — fix by switching to basename + tooltip per `status-bar-path-basename-tooltip` and applying `ui-no-sibling-pushout` |
+| `bug-save-button-double-listener` | `ui/src/main.ts:129, :629` | two `click` listeners are bound to `#save-btn`; the `removeEventListener(_origSaveBtnClick)` at :628 is a no-op (different fn ref). Every save click fires `save()` twice; the second call usually fails with `disk_drift`. Fix: drop the line-129 binding, keep only the line-629 handler. |
+| `bug-indexer-shutdown-broken` | `core/src/indexer.rs:121–132` | `IndexerHandle::shutdown` does `drop(self.tx.clone())`, dropping a clone, not the held sender. Channel never closes; loop never returns; 5s timeout fires; task continues detached. Currently unreachable (no caller), but lurking. Fix: hold `tx` as `Option<Sender>`, `take()` and drop before awaiting join. |
+| `bug-pick-vault-blocks-tokio-worker` | `ui/src-tauri/src/lib.rs:90–94` | `pick_vault` uses `std::sync::mpsc::recv()` inside an `async fn`, parking a Tokio worker until the user finishes the file dialog. Fix: replace with `tokio::sync::oneshot`, or call `blocking_pick_folder` from inside `spawn_blocking`. |
+| `bug-progress-counter-unpaired-decrement` | `ui/src/main.ts` (progress event handler) | `Renamed` (and any other event without a matching `Started`) decrements `inFlightCount`, occasionally driving the counter negative (clamped to 0). Fix: only decrement on events that pair with a prior `Started`. |
+| `bug-embedder-failure-counter-stuck` | `core/src/indexer.rs:201–207` | when the embedder load fails, the indexer drains queued jobs with `while let Some(_) = rx.recv().await {}` and emits no progress events. Frontend `pendingCount` keeps climbing from incoming `scan_complete` events with no decrements → status reads "Indexing N pending" forever. Fix: emit `Error` per drained job, or zero the counter in the UI when `model_ready=false && last_error`. |
+| `bug-not-utf8-pins-index-error` | `core/src/indexer.rs` (`process_upsert`, ~line 401) | a single binary `.md` file (e.g. user pasted an image into a `.md` extension) returns `IndexerError::NotUtf8`, which fires an `Error` progress event and pins `last_error` so the status indicator says "Index error" until another file succeeds. Fix: treat NotUtf8 as `Skipped` rather than `Error`. |
+| `bug-vault-refuse-symlinks` | `core/src/vault.rs:39` | `Vault::resolve` uses logical normalization (`..` collapsing) but does not resolve symlinks. A symlink inside the vault pointing outside passes `starts_with(self.root)` yet `fs::read`/`fs::write` follows it. Fix: refuse symlinks outright — at `resolve` time, reject any path whose canonicalized form has a symlink component, and at walker time skip symlinked entries (matches `walker-symlink-policy` slug). |
+| `bug-watcher-rename-pair-order-assumed` | `core/src/watcher.rs:106–127` | rename handling reads `paths[0]` as `from` and `paths[1]` as `to`, but `notify-debouncer-full` doesn't strictly guarantee that ordering across platforms (macOS FSEvents in particular). Fix: branch on `RenameMode::From` / `To` / `Both` from the underlying notify event before assigning sides. |
+| `bug-watcher-unpaired-rename-as-modified` | `core/src/watcher.rs:124–126` | when notify emits a rename without pairing (only one path), we surface it as `Modified`. Per spec (`watcher-rename-pairing` in status.md), an unpaired rename should produce `Created`/`Deleted`. The current behavior leaves stale entries in the index when the source disappears. Fix: emit `Deleted` for unpaired-from / `Created` for unpaired-to. |
+| `bug-move-note-routes-via-fresh-writer` | `ui/src-tauri/src/lib.rs:271–276` | the `move_note` Tauri command opens a parallel writer connection and relies on `busy_timeout` to avoid SQLITE_BUSY. Works under WAL but contradicts "one writer at a time" elsewhere. Fix: add an `IndexJob::Move { from, to }` variant and route the Tauri command through the indexer task so all writes are serialized through a single owned connection. |
+| `bug-watcher-suppress-ttl-too-short` | `core/src/watcher.rs:23` | `SUPPRESS_TTL = 500ms` can elapse before notify surfaces an event on slow systems (200ms debounce + sqlite contention + fs latency). Fix: bump to ~2s, *or* re-`suppress` after the rename returns instead of only before. |
+| `bug-vault-resolve-accepts-absolute` | `core/src/vault.rs:39` | `Vault::resolve` accepts absolute paths and surfaces them as `PathEscape` only by accident (the `starts_with` check fails). Fix: explicitly reject paths whose first component is `RootDir` or `Prefix`, returning a clearer error. |
+| `bug-css-escape-incomplete` | `ui/src/main.ts:91, :208, :349` | the `cssEscape` helper only escapes `"` and `\`. Vault paths can contain other CSS-special chars (newlines, control chars). Fix: use the browser builtin `CSS.escape()`. |
+| `bug-vault-close-leaks-intervals` | `ui/src/main.ts:618, :708` | the 250ms buffer-path watch and 2000ms `index_status` polling intervals never get cleared, including after vault close, and the latter then invokes a Tauri command that errors silently. Fix: guard both interval bodies with `if (vaultPathEl.textContent)` *and* clear them on vault swap to be safe. |
+| `bug-count-notes-swallows-errors` | `core/src/indexer.rs:155, :271` | `count_notes(&store).unwrap_or(0)` swallows store errors as 0, so a corrupt db shows "Indexed (0 notes)" instead of an error. Fix: surface the error via `last_error` and a logged stderr line. |
+| `bug-sqlite-vec-init-transmute-fragile` | `core/src/store.rs` (`register_vec_extension`) | `std::mem::transmute` on the sqlite-vec init function pointer works today but is fragile across rustc/abi changes. Fix: migrate to the rusqlite-documented extension registration helper when convenient. |
+| `bug-queue-count-undercounts` | `core/src/indexer.rs` (`update_queue_count`) | `rx.len()` is read after `recv().await` returns, so the just-pulled job in flight isn't counted. Frontend's pending+inFlight model already compensates, but the polled `queued` field occasionally flashes "Indexing 0 pending" mid-job. Fix: `+1` while a job is in flight, or have the UI ignore the polled `queued` field. |
+
+
+## Resolved
+
+(none yet — when a fix lands, move the row here with a date and the commit/PR reference.)

@@ -255,7 +255,7 @@ Each node in the curated tree stores:
 - accepts_direct_members — bool; false for purely structural nodes whose role is to group children
 - member_count
 
-New-note placement (greedy descent):
+New-note placement (greedy descent): [cluster-place-greedy-descent]
 
 - Start at root. At each node, find children whose centroid is within (similarity ≥ centroid - threshold) and recurse into the best match.
 - Stop when no child improves on the current node (or when the current node is a leaf).

@@ -7,7 +7,7 @@ Not built in v1. Lands alongside the curated-tree placement feature (post-v1, af
 
 ## Approach: recursive cluster + LLM-summarize (RAPTOR-shaped)
 
-Bottom-up tree construction. Repeatedly cluster the current level's embeddings, ask an LLM to summarize each cluster, embed the summary, and recurse. The summary serves three roles at once: it names the node (proposed name in the reconcile UI), it's the embedding seed for the parent level, and it becomes the user-visible "what's in this branch" description.
+Bottom-up tree construction. Repeatedly cluster the current level's embeddings, ask an LLM to summarize each cluster, embed the summary, and recurse. The summary serves three roles at once: it names the node (proposed name in the reconcile UI), it's the embedding seed for the parent level, and it becomes the user-visible "what's in this branch" description. [cluster-build-recursive]
 
 ```
 level 0: note embeddings              ─┐
@@ -28,7 +28,7 @@ The named technique in the literature is RAPTOR (Sarthi et al., 2024). Borrowed 
 
 The curated tree is a tree of notes — placement is per-note, the leaves are notes. So clustering operates on **note-level** embeddings at level 0, not chunk-level.
 
-The note embedding is the mean of the note's chunk embeddings, weighted by chunk byte length. Computed lazily on first cluster pass and cached on the `notes` row (new column: `note_embedding BLOB`). Recomputed when any of the note's chunks change. This is cheap — a vector mean over typically <20 chunks — and avoids spending a separate embedder pass on each note.
+The note embedding is the mean of the note's chunk embeddings, weighted by chunk byte length. Computed lazily on first cluster pass and cached on the `notes` row (new column: `note_embedding BLOB`). Recomputed when any of the note's chunks change. This is cheap — a vector mean over typically <20 chunks — and avoids spending a separate embedder pass on each note. [cluster-note-embeddings]
 
 Why mean-pool rather than embed the full note text directly: `bge-small`'s context window is 512 tokens (~2000 characters). A note longer than that gets silently truncated by the embedder, and personal-vault notes commonly exceed this — anything longer than a couple of paragraphs. Mean-pool over chunks sidesteps the limit entirely (each chunk is ~1200 chars by the chunker's cap, so each chunk fits), and the resulting representation already reflects the chunker's heading-bounded structure. There is no practical max note size for clustering with mean-pool. If we ever swap to a long-context embedder (`bge-m3` does 8k tokens, `nomic-embed-text` does 8k), direct embed becomes viable for most notes; mean-pool stays as a fallback for outliers.
 
@@ -37,7 +37,7 @@ Empty notes (no chunks) get no embedding and are excluded from clustering — th
 
 ## Clustering algorithm: HDBSCAN
 
-HDBSCAN over GMM (RAPTOR's choice) for three reasons specific to personal-vault scale:
+HDBSCAN over GMM (RAPTOR's choice) for three reasons specific to personal-vault scale: [cluster-hdbscan]
 
 1. **Outlier handling.** Personal vaults always have a long tail of notes that don't belong to any cohesive topic — fleeting thoughts, one-off snippets, miscellaneous reference. HDBSCAN labels these as outliers natively; they go to the inbox rather than being force-fit into a cluster they don't belong in. GMM's soft-probabilistic assignment can't represent "doesn't belong anywhere."
 2. **No K.** Personal vault sizes vary by 100×. Tuning K per vault is annoying; HDBSCAN's `min_cluster_size` is more stable across scales (default 5).
@@ -52,9 +52,9 @@ Watch for: small vaults (<50 notes) where HDBSCAN may produce all-outliers and a
 
 Possible future swap: GMM behind the same trait if outlier rate proves too aggressive. The clustering call lives in a single `core::cluster::partition(embeddings) -> Vec<ClusterAssignment>` boundary so swaps are local. Same module discipline as `core::store` and `core::embed`.
 
-**User-selectable algorithm.** A `cluster.algorithm` setting in `vault/.hiker/config.toml` picks between `hdbscan` (default), `gmm`, and `hybrid`. Per-vault rather than per-user — different vaults have different shapes (a structured reference vault vs. a fleeting-thoughts journal cluster very differently).
+**User-selectable algorithm.** A `cluster.algorithm` setting in `vault/.hiker/config.toml` picks between `hdbscan` (default), `gmm`, and `hybrid`. Per-vault rather than per-user — different vaults have different shapes (a structured reference vault vs. a fleeting-thoughts journal cluster very differently). [cluster-algorithm-selectable]
 
-**Hybrid mode.** `hdbscan` runs first to extract cohesive clusters and the outlier set. `gmm` then runs only on the outliers, with K = sqrt(outlier_count). Outliers that GMM places with probability > 0.6 join the corresponding HDBSCAN cluster as soft members; the rest stay in the inbox. This recovers the "doesn't fit confidently anywhere but isn't truly miscellaneous" middle ground without forcing every note into a cluster the way pure GMM does. Soft members are tagged in the cluster row so the reconcile UI can show them differently from primary members.
+**Hybrid mode.** `hdbscan` runs first to extract cohesive clusters and the outlier set. `gmm` then runs only on the outliers, with K = sqrt(outlier_count). Outliers that GMM places with probability > 0.6 join the corresponding HDBSCAN cluster as soft members; the rest stay in the inbox. This recovers the "doesn't fit confidently anywhere but isn't truly miscellaneous" middle ground without forcing every note into a cluster the way pure GMM does. Soft members are tagged in the cluster row so the reconcile UI can show them differently from primary members. [cluster-hybrid-outlier-recovery]
 
 A second hybrid form — HDBSCAN structure with GMM soft-membership across *siblings* (every note gets P(cluster) for its cluster's siblings) — is interesting for surfacing "this note also touches topic Y" and connects naturally to the multi-axis idea in `design.md:215`. Deferred until the simpler hybrid is in production.
 
@@ -75,9 +75,9 @@ Most of the time only `Place` runs — every new note gets a home cheaply. `Buil
 
 Auto-placement is a starting point, not a verdict. Users move notes in the file tree (the `drag-and-drop-move` flow) when they disagree with the placer. The provenance system in `design.md:259` makes this stick:
 
-- A drag-move writes `hiker.placement: manual` to the note's frontmatter (only field Hiker writes to user files outside an explicit user action — the move *is* that action).
+- A drag-move writes `hiker.placement: manual` to the note's frontmatter (only field Hiker writes to user files outside an explicit user action — the move *is* that action). [cluster-manual-via-tree-dnd, cluster-placement-provenance]
 - `Place` and `Build` both treat `manual` and `confirmed` as immovable: the per-note placer skips notes already manually placed; the reconcile pass surfaces conflicts (where auto-clustering disagrees with manual placement) as **Conflict** deltas (`design.md:269`) for the user to review, never auto-overrides.
-- A user can promote `auto:vN` → `confirmed` from the UI ("yes this is correct, lock it in"). Future reconciles treat confirmed placements like manual.
+- A user can promote `auto:vN` → `confirmed` from the UI ("yes this is correct, lock it in"). Future reconciles treat confirmed placements like manual. [cluster-confirm-promotion]
 
 Net effect: the auto-org pass seeds an organization, the user reshapes it via normal tree drags, and successive reconciles preserve every manual decision. The system gets out of the user's way once they care enough to organize a region themselves.
 
@@ -88,8 +88,8 @@ Note-level clustering at level 0 is the right default because the curated tree's
 
 That said, chunk-level clustering has real uses as a *parallel* feature, not a replacement:
 
-- **Cross-note thread surfacing** — chunks from different notes that cluster tightly together are evidence of a thread that crosses several notes. Useful as a "you might be writing about X across these places" hint, not as input to an auto-built trail (trails are user-authored only — see `design.md`).
-- **Multi-topic flagging** — a note whose chunks scatter across many distinct clusters is a candidate for splitting. Useful as a soft suggestion, not an auto-action.
+- **Cross-note thread surfacing** — chunks from different notes that cluster tightly together are evidence of a thread that crosses several notes. Useful as a "you might be writing about X across these places" hint, not as input to an auto-built trail (trails are user-authored only — see `design.md`). [cluster-chunk-thread-hint]
+- **Multi-topic flagging** — a note whose chunks scatter across many distinct clusters is a candidate for splitting. Useful as a soft suggestion, not an auto-action. [cluster-chunk-multitopic-flag]
 - **Section reorganization** — chunk clusters *within* a single note suggest heading reorganization.
 
 None of these are in scope for the v1-of-clustering pass. Listed here so the chunk-level signal isn't forgotten when the note-level pipeline is in place.
@@ -97,7 +97,7 @@ None of these are in scope for the v1-of-clustering pass. Listed here so the chu
 
 ## Summarization
 
-One LLM call per cluster per level. Input: cluster member titles + per-note summaries (or per-cluster summaries at higher levels). Output: a short cluster summary (1–3 sentences) and a proposed name (3–6 words).
+One LLM call per cluster per level. Input: cluster member titles + per-note summaries (or per-cluster summaries at higher levels). Output: a short cluster summary (1–3 sentences) and a proposed name (3–6 words). [cluster-summarize-llm, cluster-name-from-summary]
 
 Prompt shape (sketch):
 
@@ -120,14 +120,14 @@ At level 0 the per-note summary input comes from the existing `Summary` enrichme
 
 Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the reconcile flow shows it but recommends the user review before accepting.
 
-Model choice: a small local LLM is sufficient. Cluster naming is a much easier task than freeform writing — `Llama-3.2-3B` or similar runs on CPU and produces fine names. The expensive part is summarization quality; for v1-of-clustering, even template-based names ("Notes about X, Y, Z" using top-tf-idf terms) are a reasonable fallback if the LLM dependency is undesirable. Make the summarizer pluggable behind a `core::summarize` trait — same discipline pattern as embedder and store.
+Model choice: a small local LLM is sufficient. Cluster naming is a much easier task than freeform writing — `Llama-3.2-3B` or similar runs on CPU and produces fine names. The expensive part is summarization quality; for v1-of-clustering, even template-based names ("Notes about X, Y, Z" using top-tf-idf terms) are a reasonable fallback if the LLM dependency is undesirable. Make the summarizer pluggable behind a `core::summarize` trait — same discipline pattern as embedder and store. [cluster-summarize-fallback-tfidf]
 
 
 ## Cluster identity across runs
 
 Cluster IDs from HDBSCAN are inherently unstable — re-running on slightly different data produces clusters with shuffled integer ids, even when membership is essentially unchanged. The reconcile flow needs stable identity (so a previously-rejected cluster proposal isn't re-proposed every run).
 
-Identity rule: a cluster on run N matches a cluster on run N-1 if their **member Jaccard similarity is ≥ 0.7**. Stable id is carried forward; new cluster id is minted only on first appearance or when match fails. Stored in `vault/.hiker/cluster-history.yaml`:
+Identity rule: a cluster on run N matches a cluster on run N-1 if their **member Jaccard similarity is ≥ 0.7**. Stable id is carried forward; new cluster id is minted only on first appearance or when match fails. Stored in `vault/.hiker/cluster-history.yaml`: [cluster-stable-identity, cluster-history-yaml]
 
 ```yaml
 clusters:
@@ -160,7 +160,7 @@ Reconcile is **not** an interactive operation. Run on a user-triggered `hiker re
 
 ## When it runs
 
-- **`hiker reconcile`** — explicit user command. Reads current vault state, runs the full pipeline, writes a proposal to `vault/.hiker/proposals/<timestamp>.yaml`. The flow described in `design.md:264-273` consumes that proposal.
+- **`hiker reconcile`** — explicit user command. Reads current vault state, runs the full pipeline, writes a proposal to `vault/.hiker/proposals/<timestamp>.yaml`. The flow described in `design.md:264-273` consumes that proposal. [cluster-trigger-reconcile-only]
 - **Never automatically.** No background reconcile, no on-save trigger. The clustering pass is offline by design — re-clustering touches every cluster's identity, and surprising the user with reorganized topics is exactly the trust violation `design.md` warns against for frontmatter writes.
 - **Watcher does not drive it.** Watcher events drive the *index* (chunk/embed updates); they do not drive the *tree*.
 
@@ -169,7 +169,7 @@ Future: a `--watch` flag that re-runs reconcile on a schedule (daily?), still wr
 
 ## Output: what reconcile consumes
 
-The cluster pass produces a `ClusterTree`:
+The cluster pass produces a `ClusterTree`: [cluster-tree-output]
 
 ```rust
 struct ClusterTree {
@@ -193,7 +193,7 @@ struct ClusterNode {
 
 ## Module discipline
 
-All clustering logic lives in `core::cluster`. Outside the module: `partition()` returns plain assignments, `build_tree()` returns a `ClusterTree` of plain Rust types. No HDBSCAN-crate types leak past the boundary. Same reasoning as `core::store` and `core::embed` — algorithm choice is a defensible default, not a permanent commitment, and the future swap (GMM, agglomerative, leiden) should be a one-file rewrite.
+All clustering logic lives in `core::cluster`. Outside the module: `partition()` returns plain assignments, `build_tree()` returns a `ClusterTree` of plain Rust types. No HDBSCAN-crate types leak past the boundary. Same reasoning as `core::store` and `core::embed` — algorithm choice is a defensible default, not a permanent commitment, and the future swap (GMM, agglomerative, leiden) should be a one-file rewrite. [cluster-module-discipline]
 
 Summarization is its own module (`core::summarize`) since it has independent failure modes (LLM unavailable, slow, low-quality) and an independent swap surface (local model vs cloud vs template fallback).
 

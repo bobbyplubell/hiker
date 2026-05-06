@@ -22,7 +22,7 @@ Three layers, in build order:
     - research/sqlite-vec.md
 ```
 
-A `hiker eval` CLI subcommand runs `related_notes(source)` for each entry and checks whether expected paths appear in top-k. Reports:
+A `hiker eval` CLI subcommand runs `related_notes(source)` for each entry and checks whether expected paths appear in top-k. Reports: [eval-golden-set]
 
 - **Recall@5** — fraction of expected paths that landed in the top 5
 - **Recall@10** — same, top 10
@@ -34,7 +34,7 @@ The eval file lives in the vault by default. User decides whether to commit it v
 
 ### 2. Live thumbs feedback (add when v1 panel ships)
 
-Each row in the related-notes panel gets a 👍 / 👎. Clicks append to `vault/.hiker/feedback.jsonl`:
+Each row in the related-notes panel gets a 👍 / 👎. Clicks append to `vault/.hiker/feedback.jsonl`: [eval-thumbs-feedback]
 
 ```jsonl
 {"source": "...", "hit": "...", "rank": 2, "verdict": "up", "ts": 1747000000}
@@ -49,7 +49,7 @@ The same data shape feeds the curated-tree reconcile flow when that lands — a 
 
 ### 3. Sanity dashboards (cheap, catches "is it broken")
 
-`hiker stats` subcommand prints:
+`hiker stats` subcommand prints: [eval-sanity-stats]
 
 - Distribution of chunks-per-note (huge tail = chunker pathology)
 - Mean / median top-1 similarity across the vault (collapsing toward 0 or saturating at 1 = embedder is broken)
@@ -61,7 +61,7 @@ Doesn't answer "is it good?" but catches "is it broken?" cheaply, and gives you 
 
 ## Auto-organization evaluation (curated tree, much later)
 
-Lands when curated-tree placement is built (design.md `hiker reconcile` flow). Two ground-truth sources:
+Lands when curated-tree placement is built (design.md `hiker reconcile` flow). Two ground-truth sources: [eval-auto-org]
 
 - **Manual placements** — every note with `hiker.placement: manual` is a ground-truth label for "where it should go." Eval flow: hide the placement, ask the placer where it would put the note, score = fraction of placements within ±1 tree-level of the manual choice.
 - **Reconcile-history** — `vault/.hiker/reconcile-history.yaml` already records rejected proposals. Re-running reconcile and re-proposing something previously rejected is a regression signal.
@@ -71,7 +71,7 @@ Cluster coherence as a secondary metric: per-cluster mean intra-distance vs near
 
 ## Synthetic corpora (bootstrap when real notes are thin)
 
-A personal vault starts empty, which means both the golden-set and the auto-org eval are starved for ground truth on day one. One way around this: generate synthetic notes across a spread of topics (e.g. ask an LLM for N notes across M domains, with intentional cross-links and near-duplicates) and use them as a seed corpus.
+A personal vault starts empty, which means both the golden-set and the auto-org eval are starved for ground truth on day one. One way around this: generate synthetic notes across a spread of topics (e.g. ask an LLM for N notes across M domains, with intentional cross-links and near-duplicates) and use them as a seed corpus. [eval-synthetic-corpus]
 
 Useful because:
 

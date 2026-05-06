@@ -4,8 +4,8 @@ Strategy for ingesting and rendering plain-text files. Scope is `.txt` only — 
 
 The headline decisions:
 
-- `.txt` files are indexed alongside `.md` (one more extension the indexer accepts; nothing else changes about the pipeline).
-- The editor renders `.txt` with markdown formatting by default, with a per-vault disable toggle. A lot of "txt" content is markdown with the wrong extension; rendering it nicely is a free win and the user can turn it off when it isn't.
+- `.txt` files are indexed alongside `.md` (one more extension the indexer accepts; nothing else changes about the pipeline). [txt-extension-recognized]
+- The editor renders `.txt` with markdown formatting by default, with a per-vault disable toggle. A lot of "txt" content is markdown with the wrong extension; rendering it nicely is a free win and the user can turn it off when it isn't. [txt-render-as-markdown-default]
 - No auto-detection of "this `.txt` is really markdown." Extension is the user's responsibility; we never silently re-classify or rename.
 - No source rewriting, ever. The file on disk stays exactly as the user typed or pasted it.
 - The chunker uses cheap deterministic heuristics — paragraph splits, structure detection, sentence packing. No LLMs in the ingest path. More expensive techniques (TextTiling, embedder-driven boundaries, LLM rewrite) are deferred future options listed at the bottom.
@@ -35,13 +35,13 @@ Three layers, applied in order. Each layer's output feeds the next.
 
 ### Layer 1: Paragraph splits
 
-Split the file on blank-line runs (one or more empty lines between paragraphs). This is the workhorse — emails, articles, READMEs, meeting notes, anything written for human reading separates ideas with blank lines, and that gives the chunker clean boundaries for free.
+Split the file on blank-line runs (one or more empty lines between paragraphs). This is the workhorse — emails, articles, READMEs, meeting notes, anything written for human reading separates ideas with blank lines, and that gives the chunker clean boundaries for free. [txt-chunker-paragraph-splits]
 
 Empty `.txt` files produce zero chunks (matching the `.md` behavior in `index.md`).
 
 ### Layer 2: Heuristic structure detection
 
-Within the paragraph stream, recognize lightweight structural signals and treat them as virtual markdown elements for chunking purposes only — the source file is never modified.
+Within the paragraph stream, recognize lightweight structural signals and treat them as virtual markdown elements for chunking purposes only — the source file is never modified. [txt-chunker-structure-heuristics]
 
 Recognized patterns:
 
@@ -54,18 +54,18 @@ Recognized patterns:
 
 ### Layer 3: Sentence pack within sections
 
-Inside each section produced by Layer 2 (a heading + the text that follows), accumulate sentences into chunks until reaching the same ~1200-char soft cap as the markdown chunker. This matches `index.md`'s chunking discipline so chunk sizes stay comparable across `.md` and `.txt` content.
+Inside each section produced by Layer 2 (a heading + the text that follows), accumulate sentences into chunks until reaching the same ~1200-char soft cap as the markdown chunker. This matches `index.md`'s chunking discipline so chunk sizes stay comparable across `.md` and `.txt` content. [txt-chunker-sentence-pack]
 
 Sentence segmentation rules (deterministic, no library):
 
 - A sentence ends at `.`, `?`, or `!` *followed by whitespace and a capital letter* (or end of input). The trailing-space + capital rule rejects code operators (`foo.bar`, `obj.method()`) and abbreviations followed by lowercase tokens.
-- Common abbreviations checked against a small allowlist (`Mr.`, `Dr.`, `e.g.`, `i.e.`, `etc.`, `vs.`, ...) so they don't terminate sentences. Allowlist lives in `core::txt::abbreviations`.
+- Common abbreviations checked against a small allowlist (`Mr.`, `Dr.`, `e.g.`, `i.e.`, `etc.`, `vs.`, ...) so they don't terminate sentences. Allowlist lives in `core::txt::abbreviations`. [txt-abbreviation-allowlist]
 - If a "section" has no detectable sentence terminators (e.g. a code paste with no real sentences), pack by line until the soft cap.
 
 
 ## Heuristic guardrails
 
-The cheap heuristics in Layer 2 are *very* eager by default — left unchecked they produce false-positive headings on any file that happens to contain capitalized lines or `:`-suffixed paragraphs. Three guardrails:
+The cheap heuristics in Layer 2 are *very* eager by default — left unchecked they produce false-positive headings on any file that happens to contain capitalized lines or `:`-suffixed paragraphs. Three guardrails: [txt-chunker-guardrails]
 
 - **Max-promotions-per-window.** No more than one ALL-CAPS-heading promotion per rolling 5-line window. A file where every line is short and capitalized (a scream-cased poem, a list of acronyms) gets at most a few virtual headings, not one per line.
 - **Period-plus-space sentence rule** (already noted in Layer 3 above). Prevents `obj.method` from being seen as a sentence break.

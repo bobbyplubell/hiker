@@ -7,7 +7,7 @@ This doc covers *what* settings exist and *where* they live on disk, not the UI 
 
 ## Storage location
 
-Per-user config file at the platform's standard config dir:
+Per-user config file at the platform's standard config dir: [settings-user-config-toml]
 
 - Linux: `~/.config/hiker/config.toml`
 - macOS: `~/Library/Application Support/hiker/config.toml`
@@ -15,24 +15,24 @@ Per-user config file at the platform's standard config dir:
 
 Use the `directories` crate; do not roll path logic by hand. Format is TOML — human-readable, comment-friendly, common in Rust tooling.
 
-Per-vault config lives separately at `vault/.hiker/config.toml` and overrides per-user defaults for that vault. Some settings are per-user only (model location), some per-vault only (chunk size for that vault's content), some both with vault winning.
+Per-vault config lives separately at `vault/.hiker/config.toml` and overrides per-user defaults for that vault. Some settings are per-user only (model location), some per-vault only (chunk size for that vault's content), some both with vault winning. [settings-vault-config-toml]
 
 
 ## Sections (planned, not yet built)
 
 Each section gets a fuller spec when implemented. One-line stubs here so future work knows where it goes.
 
-- **Indexing** — embedder model selection, model download trigger / progress, manual reindex (`reindex --rebuild`), batch size, ignored-paths additions on top of watcher.md's hard-coded list. See `index.md` for the underlying mechanics.
-- **Keymap** — overrides for the keybind registry (editor.md). Maps `binding.id` → key chord. Loaded from `vault/.hiker/keybinds.toml` per editor.md's deferred override mechanism; user-global overrides live in the user config.
-- **Editor** — tab size, line wrapping, theme (light/dark/system), font family/size, autosave on idle (deferred per editor.md).
-- **Vault** — recently-opened vaults list, default vault on startup.
+- **Indexing** — embedder model selection, model download trigger / progress, manual reindex (`reindex --rebuild`), batch size, ignored-paths additions on top of watcher.md's hard-coded list. See `index.md` for the underlying mechanics. [settings-section-indexing]
+- **Keymap** — overrides for the keybind registry (editor.md). Maps `binding.id` → key chord. Loaded from `vault/.hiker/keybinds.toml` per editor.md's deferred override mechanism; user-global overrides live in the user config. [settings-section-keymap]
+- **Editor** — tab size, line wrapping, theme (light/dark/system), font family/size, autosave on idle (deferred per editor.md). [settings-section-editor]
+- **Vault** — recently-opened vaults list, default vault on startup. [settings-section-vault]
 - **Sync / backup** — informational only at first (Hiker doesn't do sync; design.md:441 defers to Syncthing). Settings page links out to docs.
 - **Telemetry / privacy** — opt-in toggles for any external calls (cloud embedders if/when added, scraping). Default off.
 
 
 ## Migration
 
-Bump a `schema_version` field at the top of `config.toml`. On version mismatch, load with defaults for unknown keys, log a warning for removed keys, never silently lose user-set values. Migration code is per-version, additive.
+Bump a `schema_version` field at the top of `config.toml`. On version mismatch, load with defaults for unknown keys, log a warning for removed keys, never silently lose user-set values. Migration code is per-version, additive. [settings-schema-version]
 
 
 ## Out of scope
