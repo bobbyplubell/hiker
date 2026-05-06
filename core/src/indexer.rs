@@ -159,13 +159,11 @@ where
     });
 
     let progress_for_task = progress_tx.clone();
-    let tx_for_loop = tx.clone();
     let join = tokio::spawn(indexer_loop(
         vault_root,
         store,
         embedder_loader,
         rx,
-        tx_for_loop,
         progress_for_task,
         status_tx,
     ));
@@ -183,7 +181,6 @@ async fn indexer_loop<F>(
     mut store: Store,
     embedder_loader: F,
     mut rx: mpsc::Receiver<IndexJob>,
-    tx: mpsc::Sender<IndexJob>,
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Sender<IndexStatus>,
 ) where
@@ -219,101 +216,36 @@ async fn indexer_loop<F>(
     while let Some(job) = rx.recv().await {
         update_queue_count(&status, &rx);
         match job {
-            IndexJob::Upsert { rel_path } => {
-                let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
-                match process_upsert(&vault_root, &mut store, embedder.clone(), &rel_path).await {
-                    Ok(UpsertOutcome::Indexed) => {
-                        let _ = progress.send(ProgressEvent::Finished { path: rel_path });
-                    }
-                    Ok(UpsertOutcome::Unchanged) => {
-                        let _ = progress.send(ProgressEvent::Skipped {
-                            path: rel_path,
-                            reason: "unchanged".into(),
-                        });
-                    }
-                    Ok(UpsertOutcome::Skipped(reason)) => {
-                        let _ = progress.send(ProgressEvent::Skipped {
-                            path: rel_path,
-                            reason,
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        update_status(&status, |s| s.last_error = Some(msg.clone()));
-                        let _ = progress.send(ProgressEvent::Error {
-                            path: Some(rel_path),
-                            message: msg,
-                        });
-                    }
-                }
-            }
-            IndexJob::Delete { rel_path } => match process_delete(&mut store, &rel_path) {
-                Ok(true) => {
-                    let _ = progress.send(ProgressEvent::Deleted { path: rel_path });
-                }
-                Ok(false) => {
-                    // Path wasn't indexed; nothing to do.
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    update_status(&status, |s| s.last_error = Some(msg.clone()));
-                    let _ = progress.send(ProgressEvent::Error {
-                        path: Some(rel_path),
-                        message: msg,
-                    });
-                }
-            },
-            IndexJob::Rename { from, to } => match process_rename(&mut store, &from, &to) {
-                Ok(true) => {
-                    let _ = progress.send(ProgressEvent::Renamed {
-                        from: from.clone(),
-                        to: to.clone(),
-                    });
-                }
-                Ok(false) => {
-                    // From-path wasn't indexed; treat the destination as a
-                    // fresh upsert so the file ends up in the index.
-                    if let Err(e) = handle_inline_upsert(
-                        &vault_root,
-                        &mut store,
-                        embedder.clone(),
-                        &progress,
-                        &status,
-                        &to,
-                    )
-                    .await
-                    {
-                        let msg = format!("{e}");
-                        update_status(&status, |s| s.last_error = Some(msg.clone()));
-                        let _ = progress.send(ProgressEvent::Error {
-                            path: Some(to),
-                            message: msg,
-                        });
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    update_status(&status, |s| s.last_error = Some(msg.clone()));
-                    let _ = progress.send(ProgressEvent::Error {
-                        path: Some(to),
-                        message: msg,
-                    });
-                }
-            },
             IndexJob::FullScan => match run_full_scan(&vault_root, &store) {
                 Ok(jobs) => {
+                    // Count Upsert/Delete jobs so the UI can show the queue
+                    // depth as "Indexing N pending" before we start chewing.
                     let scanned = jobs.len() as u32;
-                    let mut queued = 0_u32;
-                    for j in jobs {
-                        if let IndexJob::Upsert { .. } | IndexJob::Delete { .. } = &j {
-                            queued += 1;
-                        }
-                        if tx.send(j).await.is_err() {
-                            // Receiver dropped — task is shutting down.
-                            break;
-                        }
-                    }
+                    let queued = jobs
+                        .iter()
+                        .filter(|j| {
+                            matches!(j, IndexJob::Upsert { .. } | IndexJob::Delete { .. })
+                        })
+                        .count() as u32;
                     let _ = progress.send(ProgressEvent::ScanComplete { scanned, queued });
+                    // Process scan results inline rather than re-enqueueing
+                    // through `tx`: the indexer task is both producer and
+                    // consumer of that mpsc, so a vault with more than
+                    // `channel_capacity` notes would deadlock — `tx.send`
+                    // blocks once the buffer fills, but no one is calling
+                    // `rx.recv` to drain.
+                    for j in jobs {
+                        handle_simple_job(
+                            &vault_root,
+                            &mut store,
+                            &embedder,
+                            &progress,
+                            &status,
+                            j,
+                        )
+                        .await;
+                        update_total_notes(&status, &store);
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{e}");
@@ -324,8 +256,119 @@ async fn indexer_loop<F>(
                     });
                 }
             },
+            other => {
+                handle_simple_job(
+                    &vault_root,
+                    &mut store,
+                    &embedder,
+                    &progress,
+                    &status,
+                    other,
+                )
+                .await;
+            }
         }
         update_total_notes(&status, &store);
+    }
+}
+
+/// Dispatch a single non-FullScan job. Extracted so the FullScan handler can
+/// call it directly on its scan results without re-entering the mpsc.
+async fn handle_simple_job(
+    vault_root: &Path,
+    store: &mut Store,
+    embedder: &Arc<dyn Embedder>,
+    progress: &broadcast::Sender<ProgressEvent>,
+    status: &watch::Sender<IndexStatus>,
+    job: IndexJob,
+) {
+    match job {
+        IndexJob::Upsert { rel_path } => {
+            let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
+            match process_upsert(vault_root, store, embedder.clone(), &rel_path).await {
+                Ok(UpsertOutcome::Indexed) => {
+                    let _ = progress.send(ProgressEvent::Finished { path: rel_path });
+                }
+                Ok(UpsertOutcome::Unchanged) => {
+                    let _ = progress.send(ProgressEvent::Skipped {
+                        path: rel_path,
+                        reason: "unchanged".into(),
+                    });
+                }
+                Ok(UpsertOutcome::Skipped(reason)) => {
+                    let _ = progress.send(ProgressEvent::Skipped {
+                        path: rel_path,
+                        reason,
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    update_status(status, |s| s.last_error = Some(msg.clone()));
+                    let _ = progress.send(ProgressEvent::Error {
+                        path: Some(rel_path),
+                        message: msg,
+                    });
+                }
+            }
+        }
+        IndexJob::Delete { rel_path } => match process_delete(store, &rel_path) {
+            Ok(true) => {
+                let _ = progress.send(ProgressEvent::Deleted { path: rel_path });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let msg = format!("{e}");
+                update_status(status, |s| s.last_error = Some(msg.clone()));
+                let _ = progress.send(ProgressEvent::Error {
+                    path: Some(rel_path),
+                    message: msg,
+                });
+            }
+        },
+        IndexJob::Rename { from, to } => match process_rename(store, &from, &to) {
+            Ok(true) => {
+                let _ = progress.send(ProgressEvent::Renamed {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+            }
+            Ok(false) => {
+                if let Err(e) = handle_inline_upsert(
+                    vault_root,
+                    store,
+                    embedder.clone(),
+                    progress,
+                    status,
+                    &to,
+                )
+                .await
+                {
+                    let msg = format!("{e}");
+                    update_status(status, |s| s.last_error = Some(msg.clone()));
+                    let _ = progress.send(ProgressEvent::Error {
+                        path: Some(to),
+                        message: msg,
+                    });
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                update_status(status, |s| s.last_error = Some(msg.clone()));
+                let _ = progress.send(ProgressEvent::Error {
+                    path: Some(to),
+                    message: msg,
+                });
+            }
+        },
+        IndexJob::FullScan => {
+            // Reachable only via `tx` re-enqueue (recovery from watcher
+            // overflow). Forward back into the main loop by re-sending —
+            // safe because this path is rare and we're not in a tight
+            // for-loop here. We can't recursively call run_full_scan from
+            // inside this helper without ballooning stack, so the
+            // FullScan-from-recovery case stays in the main loop's match.
+            unreachable!("FullScan must be handled by the main loop, not handle_simple_job");
+        }
     }
 }
 
@@ -486,7 +529,14 @@ fn process_rename(store: &mut Store, from: &str, to: &str) -> Result<bool, Index
 /// store in line with the filesystem. Upserts for every `.md` file found,
 /// Deletes for indexed paths whose files have vanished.
 pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, IndexerError> {
+    eprintln!(
+        "[hiker::indexer] full_scan starting at {}",
+        vault_root.display()
+    );
     let mut on_disk: Vec<String> = Vec::new();
+    let mut total_files_seen = 0_u32;
+    let mut filtered_non_md = 0_u32;
+    let mut filtered_ignored = 0_u32;
     let walker = WalkDir::new(vault_root).follow_links(false).into_iter();
     for entry in walker.filter_entry(|e| !walk_skip(vault_root, e.path())) {
         let entry = match entry {
@@ -499,15 +549,35 @@ pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, 
         if !entry.file_type().is_file() {
             continue;
         }
+        total_files_seen += 1;
         let rel = match entry.path().strip_prefix(vault_root) {
             Ok(p) => path_to_rel(p),
-            Err(_) => continue,
+            Err(_) => {
+                eprintln!(
+                    "[hiker::indexer] strip_prefix failed for {} under root {}",
+                    entry.path().display(),
+                    vault_root.display()
+                );
+                continue;
+            }
         };
-        if is_ignored(&rel) || !rel.ends_with(".md") {
+        if is_ignored(&rel) {
+            filtered_ignored += 1;
+            continue;
+        }
+        if !rel.ends_with(".md") {
+            filtered_non_md += 1;
             continue;
         }
         on_disk.push(rel);
     }
+    eprintln!(
+        "[hiker::indexer] full_scan: {} files seen, {} non-md skipped, {} ignored, {} markdown queued",
+        total_files_seen,
+        filtered_non_md,
+        filtered_ignored,
+        on_disk.len()
+    );
 
     let mut jobs: Vec<IndexJob> = on_disk
         .iter()

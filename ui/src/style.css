@@ -57,11 +57,57 @@ html, body, #app {
   font-size: 12px;
 }
 
+#vault-bar > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 #vault-path {
   color: #888;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+}
+
+#tree-toolbar {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #8884;
+}
+
+#new-note-btn {
+  flex: 1;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+#new-note-btn:hover {
+  background: #8882;
+}
+
+.icon-btn {
+  font: inherit;
+  font-size: 14px;
+  padding: 2px 8px;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.icon-btn:hover {
+  background: #8882;
 }
 
 #tree {
@@ -69,6 +115,27 @@ html, body, #app {
   padding: 8px;
   font-size: 13px;
   flex: 1;
+}
+
+#tree li.drop-target {
+  background: #4a90e244;
+  outline: 1px dashed #4a90e2;
+}
+
+#tree li.dragging {
+  opacity: 0.5;
+}
+
+.tree-rename-input {
+  font: inherit;
+  font-size: 13px;
+  padding: 0 2px;
+  margin: 0;
+  border: 1px solid #4a90e2;
+  border-radius: 2px;
+  background: Canvas;
+  color: CanvasText;
+  width: calc(100% - 12px);
 }
 
 #tree ul {

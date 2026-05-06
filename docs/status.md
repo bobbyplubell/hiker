@@ -8,7 +8,7 @@ Status values:
 - **partial** — present but incomplete; the gap is named in the notes column
 - **planned** — specced, not started
 
-When a feature is reorganized, renamed, or split, update its row here first — this file is the registry. Audited 2026-05-05.
+When a feature is reorganized, renamed, or split, update its row here first — this file is the registry. Audited 2026-05-06.
 
 
 ## How to use this file
@@ -21,6 +21,15 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 ### Open meta-tasks
 
 - [ ] Backfill spec docs (`editor.md`, `index.md`, `watcher.md`, `settings.md`, `qa.md`, `design.md`) with inline `[slug]` markers next to each feature definition. One-time mechanical pass, ~75 annotations. Keeps spec → status → code traceable in both directions.
+
+
+### Bugs / known issues
+
+Tracked the same way as features: kebab-case slug, one-line note, optional file:line. Resolve by fixing in code, then strike the row (or remove it). If a bug ends up reshaping a feature, update the corresponding feature row instead of carrying both.
+
+| Slug | Notes |
+| ---- | ----- |
+| `bug-status-bar-path-overflow` | full path in left status region overflows on deep vaults and pushes siblings out — fixed by switching to basename + tooltip per `status-bar-path-basename-tooltip` and applying `ui-no-sibling-pushout` |
 
 
 ## Editor (editor.md)
@@ -40,16 +49,26 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 | `drift-conflict-modal` | done | `ui/src/main.ts:150` | keep/take/cancel; no diff option |
 | `status-bar-layout` | done | `ui/index.html`, `ui/src/style.css` | three regions |
 | `status-bar-index-label` | done | `ui/src/main.ts:450` | model loading / indexing / indexed / error |
-| `status-bar-path-copy` | planned | — | path-click → clipboard not wired |
+| `status-bar-path-basename-tooltip` | planned | — | left region shows basename only; full path in `title=` tooltip |
+| `status-bar-path-reveal` | planned | — | click basename → reveal note in system file explorer (Tauri shell/opener) |
+| `ui-no-sibling-pushout` | planned | — | UI rule: every horizontal region uses `min-width: 0` + `flex-shrink: 1` so long content can't push siblings off-screen; cite from CSS comments |
 | `status-bar-goto-line` | planned | — | line:col is display-only |
 | `three-column-layout` | done | `ui/index.html`, `ui/src/style.css` | grid, sides collapsible |
 | `panel-toggle-buttons` | done | `ui/index.html:19` | sidebar + related toggles |
 | `cm6-extension-order` | done | `ui/src/main.ts:113` | basicSetup → lang → save tracking → keymap |
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
-| `drag-and-drop-move` | planned | — | tree DnD → core `move_note` → fs rename + index update |
-| `create-note-button` | planned | — | wide "+ New note" at top of tree; creates `new-note-N.md` (auto-suffixed) in selected folder, opens immediately, inline-rename with basename pre-selected |
-| `tree-refresh-manual` | planned | — | small icon button at top of tree; re-reads dir from disk; backstop for watcher misses |
+| `drag-and-drop-move` | partial | `ui/src/main.ts` (`attachDnd`) | file DnD wired to Tauri `move_note`; folder drag disabled until walk-and-batch lands |
+| `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler) | auto-suffix `new-note-N.md` via Tauri `create_note`, opens + inline-renames |
+| `tree-refresh-manual` | done | `ui/src/main.ts` (`refresh-tree-btn` handler) | re-reads dir; restores active highlight; expansion state not preserved |
 | `tree-refresh-watcher` | planned | — | auto-refresh tree from watcher events (v2 per watcher.md) |
+| `tree-double-click-rename` | planned | — | double-click row → inline rename (same UX as post-create rename) |
+| `tree-context-menu` | planned | — | right-click on row opens menu (Open / Rename / Delete / Properties); right-click on empty space → New note here |
+| `tree-context-delete` | planned | — | menu entry → soft delete via `delete-note-core-cmd`; confirm modal |
+| `tree-context-properties` | planned | — | menu entry stub; greyed out until frontmatter editing exists |
+| `delete-note-core-cmd` | planned | — | `core::vault::delete_note`; soft delete (moves to vault trash); atomic with index update |
+| `vault-trash` | planned | — | `vault/.hiker/trash/` with timestamp-prefixed entries + `manifest.yaml`; ignored by watcher |
+| `vault-trash-restore` | planned | — | `hiker trash restore <id>` puts file back via `move_note`; UI undo toast for ~5s after delete |
+| `vault-trash-empty` | planned | — | `hiker trash empty` is the only path to permanent delete; confirm prompt; no auto-empty in v1 |
 | `confirm3-real-modal` | planned | — | replace `window.prompt` 3-way with proper modal |
 | `help-panel-keybinds` | planned | — | enumerate keybinds.list() |
 
@@ -89,8 +108,8 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 | `tauri-cmd-index-status` | done | `ui/src-tauri/src/lib.rs:188` | |
 | `tauri-cmd-index` | done | `ui/src-tauri/src/lib.rs:173` | All / Path scopes |
 | `walker-symlink-policy` | partial | not visible in code | spec says don't follow; configuration not confirmed |
-| `move-note-core-cmd` | planned | — | atomic fs rename + index path update; backs `drag-and-drop-move` and `hiker mv` |
-| `create-note-core-cmd` | planned | — | `core::vault::create_note(rel)`; backs `create-note-button` and a future `hiker new` |
+| `move-note-core-cmd` | done | `core/src/vault.rs` (`move_note`) | atomic fs rename + index update with watcher suppression; folder walk lives in `drag-and-drop-move` |
+| `create-note-core-cmd` | done | `core/src/vault.rs` (`Vault::create_note`) | empty file, errors on collision (auto-suffix is the caller's job) |
 
 
 ## Watcher (watcher.md)
@@ -101,7 +120,7 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 | `watcher-debounce-200ms` | done | `core/src/watcher.rs:23` | |
 | `watcher-event-normalized` | done | `core/src/watcher.rs:28` | Created/Modified/Deleted/Renamed |
 | `watcher-rename-pairing` | done | `core/src/watcher.rs:106` | unpaired → Created/Deleted |
-| `watcher-suppress-self-writes` | planned | — | spec says TTL-500ms suppression set; not implemented |
+| `watcher-suppress-self-writes` | done | `core/src/watcher.rs` (`Watcher::suppress`) | TTL-500ms map; bridge thread filters events whose path is currently suppressed |
 | `watcher-ignore-hardcoded` | done | `core/src/watcher.rs:143` | .hiker/, .git/, dotfiles, swap files |
 | `watcher-symlink-policy` | partial | not visible in code | spec disables symlink-following on watcher |
 | `watcher-broadcast-channel` | done | `core/src/watcher.rs:54` | tokio broadcast |
@@ -157,6 +176,19 @@ All planned. Lands post-v1, alongside the curated-tree placement feature.
 | `cluster-module-discipline` | planned | `core::cluster` + `core::summarize` modules; trait-bounded swaps |
 
 
+## Txt ingest (txt-ingest.md)
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `txt-extension-recognized` | planned | `.txt` indexed alongside `.md`; chunker dispatched by extension |
+| `txt-render-as-markdown-default` | planned | `.txt` opens with markdown language compartment by default; per-vault flag `editor.render_txt_as_markdown` |
+| `txt-chunker-paragraph-splits` | planned | Layer 1: split on blank-line runs |
+| `txt-chunker-structure-heuristics` | planned | Layer 2: ALL-CAPS / setext underline / lists / blockquotes → virtual headings |
+| `txt-chunker-sentence-pack` | planned | Layer 3: sentence-aware packing to ~1200-char soft cap within sections |
+| `txt-chunker-guardrails` | planned | max-promotions-per-window, period+space sentence rule, code-region exclusion |
+| `txt-abbreviation-allowlist` | planned | small list (`Mr.`, `Dr.`, `e.g.`, ...) so abbreviations don't terminate sentences |
+
+
 ## CLI (no spec doc yet)
 
 The CLI is a stub today. Slugs reserved for what's implied by other docs.
@@ -164,6 +196,10 @@ The CLI is a stub today. Slugs reserved for what's implied by other docs.
 | Slug | Status | Notes |
 | ---- | ------ | ----- |
 | `cli-mv` | planned | shares `move-note-core-cmd` with tree DnD |
+| `cli-rm` | planned | shares `delete-note-core-cmd`; soft delete; `--yes` bypasses confirm |
+| `cli-trash-list` | planned | enumerate trash manifest |
+| `cli-trash-restore` | planned | restore by id or original path |
+| `cli-trash-empty` | planned | permanent delete of all trash entries |
 | `cli-reindex` | planned | spec'd in index.md ingest pipeline |
 | `cli-reindex-rebuild` | planned | drop + recreate schema |
 | `cli-eval` | planned | runs golden-set, reports recall@5/@10/MRR (qa.md) |

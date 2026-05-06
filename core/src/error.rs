@@ -13,6 +13,10 @@ pub enum HikerError {
     NotUtf8(String),
     #[error("disk drift: file changed since load (expected hash {expected}, found {found})")]
     DiskDrift { expected: String, found: String },
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl From<std::io::Error> for HikerError {

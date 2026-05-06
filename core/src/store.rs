@@ -549,6 +549,10 @@ fn configure_connection(conn: &Connection) -> Result<(), StoreError> {
     // Sensible durability: WAL with synchronous=NORMAL is safe and faster
     // than the FULL default.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // Move/rename ops open a short-lived writer that may briefly contend
+    // with the indexer's owned writer. busy_timeout makes the second writer
+    // wait rather than fail loudly with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     Ok(())
 }
 

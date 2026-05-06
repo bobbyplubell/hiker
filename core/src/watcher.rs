@@ -5,14 +5,16 @@
 //! normalized `FileEvent` stream via a tokio broadcast channel. Multiple
 //! consumers (the indexer, the frontend bridge) can subscribe.
 //!
-//! v1 deliberately omits self-write suppression: the indexer never writes
-//! to user `.md` files, and `.hiker/` is in the hard-coded ignore list, so
-//! there's no loop to break. Add suppression later if/when frontmatter
-//! injection or other indexer-side writes land.
+//! Self-write suppression (`Watcher::suppress`) lets explicit-mutation paths
+//! like `core::vault::move_note` and `create_note` register a short-lived TTL
+//! on a vault-relative path; events for that path are dropped from the
+//! normalized stream until the TTL expires. See `watcher-suppress-self-writes`
+//! in docs/status.md.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer};
@@ -22,6 +24,15 @@ use tokio::sync::broadcast;
 
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 const BROADCAST_CAPACITY: usize = 1024;
+/// How long a `suppress(path)` registration stays effective. Sized to outlast
+/// the debounce window plus typical fs latency without stretching far enough
+/// to silence a real user edit that happens right after our write.
+const SUPPRESS_TTL: Duration = Duration::from_millis(500);
+
+/// Map of vault-relative paths → instant of last suppression registration.
+/// Shared between `Watcher::suppress` (writers) and the bridge thread
+/// (filtering). Bounded by lazy eviction on every access.
+type SuppressMap = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// Normalized filesystem event. Paths are vault-relative (forward-slash on
 /// all platforms) so consumers don't need to know the vault root.
@@ -46,6 +57,7 @@ pub enum WatcherError {
 pub struct Watcher {
     _debouncer: Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>,
     tx: broadcast::Sender<FileEvent>,
+    suppressed: SuppressMap,
 }
 
 impl Watcher {
@@ -53,6 +65,7 @@ impl Watcher {
         let vault_root = vault_root.into();
         let (broadcast_tx, _) = broadcast::channel::<FileEvent>(BROADCAST_CAPACITY);
         let (raw_tx, raw_rx) = mpsc::channel::<DebounceEventResult>();
+        let suppressed: SuppressMap = Arc::new(Mutex::new(HashMap::new()));
 
         let mut debouncer = new_debouncer(DEBOUNCE_WINDOW, None, raw_tx)?;
         debouncer
@@ -62,6 +75,7 @@ impl Watcher {
         // forwards into the broadcast channel. Owns no async runtime.
         let bcast = broadcast_tx.clone();
         let root_for_thread = vault_root.clone();
+        let suppressed_for_thread = suppressed.clone();
         std::thread::spawn(move || {
             for batch in raw_rx {
                 let events = match batch {
@@ -75,6 +89,9 @@ impl Watcher {
                 };
                 for ev in events {
                     if let Some(file_event) = normalize(&root_for_thread, &ev) {
+                        if is_suppressed_event(&suppressed_for_thread, &file_event) {
+                            continue;
+                        }
                         // send returns Err when no receivers; that's fine.
                         let _ = bcast.send(file_event);
                     }
@@ -85,12 +102,45 @@ impl Watcher {
         Ok(Self {
             _debouncer: debouncer,
             tx: broadcast_tx,
+            suppressed,
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<FileEvent> {
         self.tx.subscribe()
     }
+
+    /// Register a vault-relative path for self-write suppression. Events
+    /// referencing this path emitted within `SUPPRESS_TTL` of this call are
+    /// dropped before reaching subscribers. Call this immediately *before*
+    /// performing the fs mutation so the entry is in place when notify
+    /// surfaces the event after the debounce window.
+    ///
+    /// status: watcher-suppress-self-writes
+    pub fn suppress(&self, rel_path: impl Into<String>) {
+        let mut map = self.suppressed.lock().expect("suppress lock poisoned");
+        map.insert(rel_path.into(), Instant::now());
+        evict_expired(&mut map);
+    }
+}
+
+/// Drop a normalized event if any of its referenced paths is currently
+/// suppressed. Renames suppress on either side: callers register both `from`
+/// and `to`, so seeing a fresh registration on either is sufficient.
+fn is_suppressed_event(map: &SuppressMap, ev: &FileEvent) -> bool {
+    let mut guard = map.lock().expect("suppress lock poisoned");
+    evict_expired(&mut guard);
+    match ev {
+        FileEvent::Created { path }
+        | FileEvent::Modified { path }
+        | FileEvent::Deleted { path } => guard.contains_key(path),
+        FileEvent::Renamed { from, to } => guard.contains_key(from) || guard.contains_key(to),
+    }
+}
+
+fn evict_expired(map: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    map.retain(|_, t| now.duration_since(*t) < SUPPRESS_TTL);
 }
 
 /// Translate one debounced raw event into our normalized form. Returns None
@@ -248,6 +298,39 @@ mod tests {
             }
         }
         assert!(saw_event, "expected a Created/Modified event for note.md");
+    }
+
+    #[tokio::test]
+    async fn suppress_swallows_event_for_path_within_ttl() {
+        let dir = tempdir().unwrap();
+        let watcher = Watcher::start(dir.path()).unwrap();
+        let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Suppress before the write — the resulting event must not surface.
+        watcher.suppress("hidden.md");
+        fs::write(dir.path().join("hidden.md"), b"x").unwrap();
+        // Also a non-suppressed write so we have something positive to wait on.
+        fs::write(dir.path().join("visible.md"), b"y").unwrap();
+
+        let started = Instant::now();
+        let mut saw_visible = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    let p = match &ev {
+                        FileEvent::Created { path } | FileEvent::Modified { path } => path.clone(),
+                        _ => continue,
+                    };
+                    assert_ne!(p, "hidden.md", "suppressed path leaked: {ev:?}");
+                    if p == "visible.md" {
+                        saw_visible = true;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_visible, "expected to see the unsuppressed write");
     }
 
     #[tokio::test]

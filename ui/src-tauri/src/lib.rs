@@ -5,8 +5,9 @@ use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
 use hiker_core::store::{RelatedHit, Store};
+use hiker_core::vault::move_note as vault_move_note;
 use hiker_core::watcher::{FileEvent, Watcher};
-use hiker_core::{embed::FastembedEmbedder, DirEntryDto, Vault};
+use hiker_core::{embed::FastembedEmbedder, DirEntryDto, HikerError, Vault};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -18,7 +19,9 @@ struct VaultSession {
     root: PathBuf,
     indexer: IndexerHandle,
     /// Held to keep the watcher alive; dropping this closes the broadcast.
-    _watcher: Watcher,
+    /// Also referenced by `create_note` / `move_note` to register self-write
+    /// suppression around fs mutations.
+    watcher: Watcher,
 }
 
 struct AppState {
@@ -155,7 +158,7 @@ async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
         vault,
         root,
         indexer,
-        _watcher: watcher,
+        watcher,
     };
 
     let state = app.state::<AppState>();
@@ -189,6 +192,88 @@ fn index_status(state: State<AppState>) -> Result<IndexStatus, String> {
     let guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
     Ok(session.indexer.status())
+}
+
+/// Create a new empty note in `folder` (vault-relative; `""` = vault root)
+/// with an auto-suffixed `new-note-N.md` name. Returns the rel path of the
+/// file actually created so the UI can open and inline-rename it.
+///
+/// status: create-note-button
+#[tauri::command]
+async fn create_note(
+    state: State<'_, AppState>,
+    folder: String,
+) -> Result<String, HikerError> {
+    let (created, sender) = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        // Pick the lowest free `new-note-N.md` in the target folder.
+        let folder = folder.trim_end_matches('/');
+        let mut created: Option<String> = None;
+        let mut last_err: Option<HikerError> = None;
+        for n in 1..1000 {
+            let candidate = if folder.is_empty() {
+                format!("new-note-{n}.md")
+            } else {
+                format!("{folder}/new-note-{n}.md")
+            };
+            session.watcher.suppress(candidate.clone());
+            match session.vault.create_note(&candidate) {
+                Ok(p) => {
+                    created = Some(p);
+                    break;
+                }
+                Err(HikerError::AlreadyExists(_)) => continue,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let created = match created {
+            Some(p) => p,
+            None => return Err(last_err.unwrap_or_else(|| {
+                HikerError::AlreadyExists("ran out of new-note-N candidates".into())
+            })),
+        };
+        (created, session.indexer.job_sender())
+    };
+    // Explicitly index the new file (the watcher event was suppressed).
+    let _ = sender
+        .send(IndexJob::Upsert { rel_path: created.clone() })
+        .await;
+    Ok(created)
+}
+
+/// Atomic note rename. Backs both tree drag-and-drop and inline rename of
+/// freshly-created notes. Errors leave both sides untouched per the spec.
+///
+/// status: drag-and-drop-move
+#[tauri::command]
+async fn move_note(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<(), HikerError> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+    let session = guard
+        .as_ref()
+        .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+    // Open a fresh writer for this op rather than threading the indexer's
+    // owned writer back through a channel — store-module-discipline: one
+    // writer at a time is the SQLite invariant, but `rename_note` is a
+    // tiny tx that can briefly contend without harm. (The indexer is
+    // serial and any concurrent upsert just retries on its next pull.)
+    let mut store = Store::open(&session.root).map_err(|e| HikerError::Io(e.to_string()))?;
+    vault_move_note(&session.vault, &mut store, Some(&session.watcher), &from, &to)
 }
 
 #[tauri::command]
@@ -226,6 +311,8 @@ pub fn run() {
             index,
             index_status,
             related_notes,
+            create_note,
+            move_note,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

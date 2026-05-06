@@ -54,6 +54,8 @@ const statusIndexEl = document.getElementById("status-index")!;
 const relatedListEl = document.getElementById("related-list")!;
 const toggleSidebarBtn = document.getElementById("toggle-sidebar") as HTMLButtonElement;
 const toggleRelatedBtn = document.getElementById("toggle-related") as HTMLButtonElement;
+const newNoteBtn = document.getElementById("new-note-btn") as HTMLButtonElement;
+const refreshTreeBtn = document.getElementById("refresh-tree-btn") as HTMLButtonElement;
 
 interface Buffer {
   path: string;
@@ -215,18 +217,32 @@ function cssEscape(s: string): string {
   return s.replace(/["\\]/g, "\\$&");
 }
 
+// Tracks the folder a "+ New note" click should target. Updated when the
+// user clicks a folder row or a file row (file → its parent). Empty string
+// means vault root.
+let selectedFolder: string = "";
+
+function parentOf(rel: string): string {
+  const idx = rel.lastIndexOf("/");
+  return idx >= 0 ? rel.slice(0, idx) : "";
+}
+
 async function renderDir(rel: string, container: HTMLElement): Promise<void> {
   const entries = await invoke<DirEntry[]>("list_dir", { rel });
   const ul = document.createElement("ul");
   for (const entry of entries) {
     const li = document.createElement("li");
     li.dataset.path = entry.rel_path;
+    li.dataset.kind = entry.kind;
+    li.draggable = true;
     li.textContent = (entry.kind === "dir" ? "▸ " : "  ") + entry.name;
+    attachDnd(li, entry);
     if (entry.kind === "dir") {
       let expanded = false;
       let childContainer: HTMLElement | null = null;
       li.addEventListener("click", async (e) => {
         e.stopPropagation();
+        selectedFolder = entry.rel_path;
         if (expanded) {
           childContainer?.remove();
           childContainer = null;
@@ -243,6 +259,7 @@ async function renderDir(rel: string, container: HTMLElement): Promise<void> {
     } else {
       li.addEventListener("click", (e) => {
         e.stopPropagation();
+        selectedFolder = parentOf(entry.rel_path);
         void openFile(entry.rel_path);
       });
     }
@@ -251,15 +268,182 @@ async function renderDir(rel: string, container: HTMLElement): Promise<void> {
   container.appendChild(ul);
 }
 
+// status: drag-and-drop-move
+function attachDnd(li: HTMLLIElement, entry: DirEntry): void {
+  // Folder DnD is deferred — folder moves require walking contents and
+  // calling move_note per file in a single tx. Disable drag on dirs for v1
+  // so users don't silently desync the index by renaming a folder on disk
+  // without updating the indexed paths inside it.
+  if (entry.kind === "dir") {
+    li.draggable = false;
+  }
+  li.addEventListener("dragstart", (e) => {
+    if (entry.kind === "dir") {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer?.setData("text/plain", entry.rel_path);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    li.classList.add("dragging");
+  });
+  li.addEventListener("dragend", () => li.classList.remove("dragging"));
+
+  li.addEventListener("dragover", (e) => {
+    const src = e.dataTransfer?.types.includes("text/plain");
+    if (!src) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    li.classList.add("drop-target");
+  });
+  li.addEventListener("dragleave", () => li.classList.remove("drop-target"));
+
+  li.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    li.classList.remove("drop-target");
+    const from = e.dataTransfer?.getData("text/plain");
+    if (!from) return;
+    // Drop onto folder → move into folder. Drop onto file → file's parent.
+    const targetFolder = entry.kind === "dir" ? entry.rel_path : parentOf(entry.rel_path);
+    await performDrop(from, targetFolder);
+  });
+}
+
+async function performDrop(from: string, targetFolder: string): Promise<void> {
+  if (from === targetFolder) return;
+  const fromParent = parentOf(from);
+  if (fromParent === targetFolder) return; // same parent → no-op per spec
+  const name = from.split("/").pop()!;
+  // Don't allow dropping a folder into itself or its descendants.
+  if (targetFolder === from || targetFolder.startsWith(from + "/")) return;
+  const to = targetFolder ? `${targetFolder}/${name}` : name;
+  try {
+    await invoke("move_note", { from, to });
+    if (buffer && buffer.path === from) {
+      buffer.path = to;
+      updateStatus();
+    }
+    await refreshTree();
+  } catch (err) {
+    console.error("move_note failed:", err);
+    alert(`move failed: ${formatError(err)}`);
+  }
+}
+
+function formatError(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object" && "message" in err) {
+    const m = (err as { message: unknown }).message;
+    return typeof m === "string" ? m : JSON.stringify(err);
+  }
+  return JSON.stringify(err);
+}
+
+async function refreshTree(): Promise<void> {
+  treeEl.innerHTML = "";
+  await renderDir("", treeEl);
+  // Restore active highlight on the open file, if any.
+  if (buffer) {
+    document
+      .querySelector(`#tree li[data-path="${cssEscape(buffer.path)}"]`)
+      ?.classList.add("active");
+  }
+}
+
+// Tree-root drop zone: dropping on empty space below the tree moves to root.
+treeEl.addEventListener("dragover", (e) => {
+  if (!e.dataTransfer?.types.includes("text/plain")) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+});
+treeEl.addEventListener("drop", async (e) => {
+  // Only handle drops that fell through every li (li handlers stopPropagation).
+  e.preventDefault();
+  const from = e.dataTransfer?.getData("text/plain");
+  if (!from) return;
+  await performDrop(from, "");
+});
+
 async function openVault(): Promise<void> {
   const path = await invoke<string | null>("pick_vault");
   if (!path) return;
-  vaultPathEl.textContent = path;
-  treeEl.innerHTML = "";
-  await renderDir("", treeEl);
+  const basename = path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? path;
+  vaultPathEl.textContent = basename;
+  vaultPathEl.title = path;
+  selectedFolder = "";
+  await refreshTree();
 }
 
 pickBtn.addEventListener("click", () => void openVault());
+
+// status: create-note-button
+newNoteBtn.addEventListener("click", async () => {
+  try {
+    const created = await invoke<string>("create_note", { folder: selectedFolder });
+    await refreshTree();
+    await openFile(created);
+    const li = document.querySelector(`#tree li[data-path="${cssEscape(created)}"]`) as
+      | HTMLLIElement
+      | null;
+    if (li) await beginInlineRename(li, created);
+  } catch (err) {
+    console.error("create_note failed:", err);
+    alert(`new note failed: ${formatError(err)}`);
+  }
+});
+
+// status: tree-refresh-manual
+refreshTreeBtn.addEventListener("click", () => void refreshTree());
+
+async function beginInlineRename(li: HTMLLIElement, currentPath: string): Promise<void> {
+  const name = currentPath.split("/").pop()!;
+  const dotIdx = name.lastIndexOf(".");
+  const stemEnd = dotIdx > 0 ? dotIdx : name.length;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "tree-rename-input";
+  input.value = name;
+  li.textContent = "";
+  li.appendChild(input);
+  input.focus();
+  input.setSelectionRange(0, stemEnd);
+
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = async (commit: boolean) => {
+      if (done) return;
+      done = true;
+      const newName = input.value.trim();
+      if (commit && newName && newName !== name) {
+        const parent = parentOf(currentPath);
+        const to = parent ? `${parent}/${newName}` : newName;
+        try {
+          await invoke("move_note", { from: currentPath, to });
+          if (buffer && buffer.path === currentPath) {
+            buffer.path = to;
+            updateStatus();
+          }
+        } catch (err) {
+          console.error("rename failed:", err);
+          alert(`rename failed: ${formatError(err)}`);
+        }
+      }
+      await refreshTree();
+      resolve();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        void finish(false);
+      }
+    });
+    input.addEventListener("blur", () => void finish(true));
+  });
+}
 
 function confirm3(
   message: string,

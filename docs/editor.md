@@ -97,15 +97,22 @@ Override mechanism (deferred): a user keybind file (`vault/.hiker/keybinds.toml`
 
 Bottom strip across the editor pane only (not under the tree). Three regions:
 
-- left: save button + dirty dot, current file path (relative to vault root)
+- left: save button + dirty dot, current file **basename** (e.g. `note.md`), with the full vault-relative path in a `title=` tooltip on hover.
 - center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later.
 - right: line:col, word count, file type badge (`md`)
+
+Why basename rather than full path: the file tree already shows location, the window title (`Hiker — <path>`) carries the disambiguation when needed, and full paths overflow the bar on deep vaults. Basename answers "what's open right now"; the tooltip + tree cover "where does it live." Once tabs land the per-tab basename label uses the same rule.
 
 Click targets:
 
 - save button → save action
-- file path → copy path to clipboard
+- file basename → reveal the file in the system file explorer (Finder on macOS, File Explorer on Windows, default file manager on Linux). Implemented via Tauri's shell/opener API. Tracked as `status-bar-path-reveal`.
 - line:col → opens a goto-line input (deferred; click is a no-op in v0)
+
+
+### Sibling protection (overflow rule)
+
+Every status-bar region — and any other horizontal toolbar / strip elsewhere in the app — must use `min-width: 0` and `flex-shrink: 1` so a long string in one region cannot push siblings off-screen. The basename + tooltip change above fixes the common case for the path region; the rule generalizes. Anywhere a region's content is user-derived (file names, error messages, status labels reflecting external state), the same `min-width: 0` + ellipsis combo applies. Tracked as `ui-no-sibling-pushout` so the rule has a slug to cite from CSS comments and code review.
 
 
 ## Layout (v1)
@@ -141,7 +148,46 @@ Three columns, both sides collapsible:
 
   ### Prerequisite
 
-  `move_note` and `create_note` both perform writes the watcher would otherwise observe and re-enqueue as redundant index jobs (with a small race window where the watcher's rename pairing could disagree with the explicit move). The `watcher-suppress-self-writes` feature in `watcher.md` is a prerequisite — build it first so the explicit-mutation path can register a short-lived suppression set around its writes.
+  `move_note` and `create_note` both perform writes the watcher would otherwise observe and re-enqueue as redundant index jobs (with a small race window where the watcher's rename pairing could disagree with the explicit move). The `watcher-suppress-self-writes` feature in `watcher.md` is a prerequisite — build it first so the explicit-mutation path can register a short-lived suppression set around its writes. `delete_note` (below) needs the same suppression.
+
+  ### Tree interactions
+
+  Beyond drag-and-drop and the toolbar buttons, the file tree supports two more interactions:
+
+  - **Double-click on a tree row** → enters inline-rename mode for that note. Same UX as the post-create rename: the basename is pre-selected with the extension excluded, Enter submits via `move_note`, Esc cancels and reverts. Double-clicking a folder enters inline-rename for the folder name (recursive move under the hood — the same code path the folder-drag case uses).
+  - **Right-click on a tree row** → opens a context menu. v1 entries:
+
+    - **Open** — opens the note in the editor (same as a single click; included for discoverability and to give right-click a non-destructive default).
+    - **Rename** — enters inline-rename mode (same as double-click).
+    - **Delete** — calls `delete_note` after a confirm modal. Delete is *not* permanent: the file is moved into the vault's trash (see "Delete semantics" below). Modal text reflects this: "Move `<path>` to trash?" for files; "Move `<path>` and N notes inside it to trash?" for folders. Two buttons: Cancel (default focus) and Move to trash (red-ish, but not as alarming as a true delete). No "don't ask again" bypass — keep the friction since most people deleting a note from a tree mean to.
+    - **Properties** — deferred. Stubbed in the menu (greyed out) until frontmatter editing exists; the entry will eventually open a small panel showing the note's `hiker:` frontmatter, content_hash, indexed_at, etc. Tracked as `tree-context-properties`.
+
+    Right-click on **empty space below the tree** opens a smaller menu with one entry — **New note here** — which is equivalent to clicking the toolbar's + New note while no folder is selected.
+
+  ### Delete semantics
+
+  Delete is a soft delete — the file is moved into a per-vault trash directory, not removed from disk. Restorable until the trash is emptied. This trades a small amount of disk overhead for a real safety net against the worst tree-action mistake (deleting the wrong note).
+
+  `delete_note(rel: &str) -> Result<()>` lives in `core::vault` next to `create_note` and `move_note`. Order: suppress watcher events for the source path, fs rename into trash (collision-suffixed; see below), update store (`store::delete_note` cascades chunks + vec rows + path_ids per `index.md`) so the note stops appearing in search/related, append a metadata entry to the trash manifest so restore knows the original path, release suppression.
+
+  **Trash location:** `vault/.hiker/trash/`. Per-vault rather than per-user so the safety net travels with the vault under Syncthing/git/etc., and so two vaults' deletions don't collide.
+
+  **Trash naming:** when moving a file in, prefix the filename with the deletion timestamp to avoid collisions across multiple deletes of the same path: `vault/.hiker/trash/2026-05-06T14-22-31_myNote.md`. Folder deletes recreate the relative folder structure under a single timestamped root: `vault/.hiker/trash/2026-05-06T14-22-31_<foldername>/...`. Manifest at `vault/.hiker/trash/manifest.yaml` records each entry's original path, original mtime, deletion time, and a stable id for restore.
+
+  **Restore (`hiker trash restore <id|path>`)** — moves the file back to its original path via `move_note` (so the index re-picks it up cleanly). If the original path is now occupied, restore fails and the user picks a new target.
+
+  **Empty (`hiker trash empty`)** — permanent deletion of all entries in the trash. Confirm prompt; this *is* the irrecoverable operation. No automatic emptying in v1 (no TTL, no size cap) — disk is cheap, surprise is expensive. Auto-empty policies can come later as a setting (`trash.retention_days`, `trash.max_size_mb`) when there's a real ask.
+
+  Watcher must include `vault/.hiker/trash/` in its hard-coded ignore list (it's already covered by the existing `.hiker/` ignore in `watcher.md`, but worth noting explicitly because trash entries *are* `.md` files and a less-careful ignore would re-index them).
+
+  Edge cases:
+
+  - **Currently-open buffer** — moving the file out from under the buffer closes the buffer. The editor clears (or the next file in the tree opens, picked by an "open neighbor" rule); a non-blocking toast confirms the move and offers an Undo for ~5 seconds (Undo calls `hiker trash restore` for the entry just created — cheaper than re-typing the path). If the buffer is dirty, the modal copy adjusts: "Move `<path>` to trash? Unsaved changes will be discarded." Discard is real — the file in trash reflects what was on disk, not the dirty buffer state.
+  - **Folder delete** — recursive. Walk the folder, move each file into the timestamped trash subtree preserving relative paths, then `std::fs::remove_dir_all` the now-empty source shell. Single transaction across all the store updates and a single manifest entry covers the whole folder, so restore can put the entire subtree back atomically.
+  - **Source missing** — error. Same reasoning as the move case.
+  - **Trash itself missing** — auto-create on first delete (`std::fs::create_dir_all`).
+  - **Trash entry collision** — should be impossible thanks to the timestamp prefix, but if two deletes land in the same second on the same path the second one gets a `_2`, `_3`, ... suffix.
+  - **CLI parity** — `hiker rm <path>` invokes the same core command. `--yes` skips the confirm prompt. `hiker trash list`, `hiker trash restore <id>`, `hiker trash empty` round out the CLI surface.
 - **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open.
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md).
 
