@@ -116,8 +116,32 @@ Three columns, both sides collapsible:
 
   Tree toolbar at the top of the sidebar: a wide **+ New note** button and a small refresh icon next to it. The asymmetry is the point — new-note is a frequent action, refresh is a sanity-check fallback.
 
-  - **New note** creates `new_note.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new_note` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name.
+  - **New note** creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name.
   - **Refresh** re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; the manual button stays even after that lands.
+
+  ### API & edge cases
+
+  Both `create_note` and `move_note` live in `core::vault` and are the single source of truth for creating and relocating notes — UI tree actions and CLI commands (`hiker new`, `hiker mv`) call them unchanged.
+
+  - `create_note(rel: &str) -> Result<String>` — creates an empty file at `rel`, returns the actual path used (since auto-suffix may have changed it from the requested name). The button always passes a `new-note-N.md` candidate; the CLI passes the user's requested name verbatim and errors on collision rather than auto-suffixing (CLI behavior is explicit; UI behavior is forgiving).
+  - `move_note(from: &str, to: &str) -> Result<()>` — atomic fs rename + index update. Order: suppress watcher events for both paths (see below), fs rename, update `notes.path` + `path_ids` in a single transaction, release suppression. If the index update fails the fs rename is rolled back (rename `to` → `from`) before returning the error.
+  - **Target collision** — `move_note` errors and leaves the source untouched. No overwrite, no auto-suffix; the caller decides what to do (the tree DnD shows a toast, the CLI prints an error).
+  - **Source is the currently-open buffer** — `move_note` operates on disk only and doesn't touch the buffer. The buffer's `currentPath` keeps pointing at the old path; the next save will fail the drift check (file missing) and prompt the user. Acceptable for v1 — buffer-follows-rename can come later if it proves annoying.
+  - **Source missing** — error.
+  - **Target parent directory missing** — error rather than auto-create. Only reachable via CLI typo (`hiker mv a.md sub/dir/that/doesnt/exist/a.md`); UI drops are always onto an existing tree node.
+  - **Folder drag** — moving a folder moves all contained notes recursively. Implementation: walk the folder, call `move_note` per file in a single transaction so the whole move succeeds or fails atomically. Empty subfolders move with the rename.
+
+  ### Drop targets
+
+  - Drop onto a **folder** → move into that folder.
+  - Drop onto a **file** → move into the file's parent folder (treats the row as "this folder, near this file").
+  - Drop onto **empty space below the tree** → move to vault root.
+  - Drop onto the **same parent** → no-op (don't even call `move_note`).
+  - Drop into a folder that contains a same-named file → error per the collision rule.
+
+  ### Prerequisite
+
+  `move_note` and `create_note` both perform writes the watcher would otherwise observe and re-enqueue as redundant index jobs (with a small race window where the watcher's rename pairing could disagree with the explicit move). The `watcher-suppress-self-writes` feature in `watcher.md` is a prerequisite — build it first so the explicit-mutation path can register a short-lived suppression set around its writes.
 - **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open.
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md).
 

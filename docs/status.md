@@ -47,7 +47,7 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 | `cm6-extension-order` | done | `ui/src/main.ts:113` | basicSetup → lang → save tracking → keymap |
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
 | `drag-and-drop-move` | planned | — | tree DnD → core `move_note` → fs rename + index update |
-| `create-note-button` | planned | — | wide "+ New note" at top of tree; creates `new_note.md` in selected folder, opens immediately, inline-rename with basename pre-selected |
+| `create-note-button` | planned | — | wide "+ New note" at top of tree; creates `new-note-N.md` (auto-suffixed) in selected folder, opens immediately, inline-rename with basename pre-selected |
 | `tree-refresh-manual` | planned | — | small icon button at top of tree; re-reads dir from disk; backstop for watcher misses |
 | `tree-refresh-watcher` | planned | — | auto-refresh tree from watcher events (v2 per watcher.md) |
 | `confirm3-real-modal` | planned | — | replace `window.prompt` 3-way with proper modal |
@@ -90,6 +90,7 @@ When a feature is reorganized, renamed, or split, update its row here first — 
 | `tauri-cmd-index` | done | `ui/src-tauri/src/lib.rs:173` | All / Path scopes |
 | `walker-symlink-policy` | partial | not visible in code | spec says don't follow; configuration not confirmed |
 | `move-note-core-cmd` | planned | — | atomic fs rename + index path update; backs `drag-and-drop-move` and `hiker mv` |
+| `create-note-core-cmd` | planned | — | `core::vault::create_note(rel)`; backs `create-note-button` and a future `hiker new` |
 
 
 ## Watcher (watcher.md)

@@ -229,6 +229,11 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    // Bypass tokio runtime drop, which blocks waiting on in-flight
+    // `spawn_blocking` embed tasks (fastembed runs can take seconds) and on
+    // notify-debouncer's worker thread join. The OS reclaims everything.
+    std::process::exit(0);
 }
 
 // FileEvent and ProgressEvent need to be Serialize for tauri::emit. Both

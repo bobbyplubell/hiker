@@ -135,7 +135,7 @@ async function save(): Promise<boolean> {
       expectedHash: buffer.loadedHash,
       contents,
     });
-    buffer.loadedText = contents;
+    buffer.loadedText = view.state.doc.toString();
     buffer.loadedHash = newHash;
     updateStatus();
     return true;
@@ -162,9 +162,9 @@ async function handleSaveError(err: unknown): Promise<boolean> {
     }
     if (choice === "b") {
       const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: buffer.path });
-      buffer.loadedText = fresh.contents;
-      buffer.loadedHash = fresh.hash;
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: fresh.contents } });
+      buffer.loadedText = view.state.doc.toString();
+      buffer.loadedHash = fresh.hash;
       return true;
     }
     return false;
@@ -190,10 +190,18 @@ async function openFile(rel: string): Promise<void> {
   }
   try {
     const file = await invoke<FileWithHash>("read_file_with_hash", { rel });
-    buffer = { path: rel, loadedText: file.contents, loadedHash: file.hash };
+    // Clear buffer before dispatch: the dispatch fires a synchronous
+    // ViewPlugin update, and if `buffer` still pointed at the previous note
+    // that update would compare the new doc text against the old note's
+    // loadedText and flag the old note as dirty in the tree.
+    buffer = null;
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: file.contents },
     });
+    // Compare against CM's canonical doc representation (it normalizes CRLF
+    // and similar on input), not the raw file string, or the buffer reads
+    // dirty immediately on open.
+    buffer = { path: rel, loadedText: view.state.doc.toString(), loadedHash: file.hash };
     document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
     document.querySelector(`#tree li[data-path="${cssEscape(rel)}"]`)?.classList.add("active");
     updateStatus();
@@ -530,11 +538,11 @@ void listen<{ kind: string; path?: string; from?: string; to?: string }>(
       try {
         const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: buffer.path });
         if (fresh.hash !== buffer.loadedHash) {
-          buffer.loadedText = fresh.contents;
-          buffer.loadedHash = fresh.hash;
           view.dispatch({
             changes: { from: 0, to: view.state.doc.length, insert: fresh.contents },
           });
+          buffer.loadedText = view.state.doc.toString();
+          buffer.loadedHash = fresh.hash;
           updateStatus();
         }
       } catch (err) {
