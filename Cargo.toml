@@ -23,3 +23,8 @@ tokio = { version = "1", features = ["rt", "sync", "macros", "time", "fs"] }
 notify = "7"
 notify-debouncer-full = "0.4"
 walkdir = "2"
+serde_yml = "0.0.12"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
+tracing-appender = "0.2"

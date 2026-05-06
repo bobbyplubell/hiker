@@ -22,7 +22,7 @@ Per-vault config lives separately at `vault/.hiker/config.toml` and overrides pe
 
 Each section gets a fuller spec when implemented. One-line stubs here so future work knows where it goes.
 
-- **Indexing** — embedder model selection, model download trigger / progress, manual reindex (`reindex --rebuild`), batch size, ignored-paths additions on top of watcher.md's hard-coded list. See `index.md` for the underlying mechanics. [settings-section-indexing]
+- **Indexing** — embedder model selection, model download trigger / progress, batch size, ignored-paths additions on top of watcher.md's hard-coded list. The settings page is also the home for the destructive **Reindex (rebuild)** verb — drops and recreates the schema, then full reindex; UI counterpart to `cli-reindex-rebuild` and intentionally kept off the tree toolbar's `…` menu so an accidental click can't trigger a full re-embed from scratch. The day-to-day reindex verbs (`reindex-all-action`, `reindex-current-file-action`) live in the tree toolbar per `editor.md`. See `index.md` for the underlying mechanics. [settings-section-indexing, reindex-rebuild-action]
 - **Keymap** — overrides for the keybind registry (editor.md). Maps `binding.id` → key chord. Loaded from `vault/.hiker/keybinds.toml` per editor.md's deferred override mechanism; user-global overrides live in the user config. [settings-section-keymap]
 - **Editor** — tab size, line wrapping, theme (light/dark/system), font family/size, autosave on idle (deferred per editor.md). [settings-section-editor]
 - **Vault** — recently-opened vaults list, default vault on startup. [settings-section-vault]

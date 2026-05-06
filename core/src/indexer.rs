@@ -5,8 +5,9 @@
 //! callers send jobs in; the task drains them serially. CPU-heavy embedding
 //! goes through `spawn_blocking` so it doesn't starve the runtime.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
-use crate::chunker::chunk_markdown;
+use crate::chunker::{Chunker, MarkdownChunker, TxtChunker};
 use crate::embed::{Embedder, EmbedError};
 use crate::hash::hash_str;
 use crate::store::{new_id, NoteUpsert, Store, StoreError};
@@ -29,7 +30,10 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum IndexJob {
-    Upsert { rel_path: String },
+    /// Index a single file. `force = true` bypasses the content_hash +
+    /// embedder_version short-circuit so an explicit user reindex actually
+    /// re-embeds even when bytes are unchanged.
+    Upsert { rel_path: String, force: bool },
     Delete { rel_path: String },
     Rename { from: String, to: String },
     /// Explicit move requested by a UI/CLI caller — fs rename + index update
@@ -41,9 +45,29 @@ pub enum IndexJob {
         to: String,
         reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
     },
+    /// Soft-delete requested by a UI/CLI caller — fs move into vault trash +
+    /// store cascade in one shot, on the indexer task. Reply oneshot returns
+    /// the resulting `TrashEntry` so the caller can drive an undo toast or
+    /// CLI confirmation without a second roundtrip.
+    DeleteNote {
+        rel: String,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::trash::TrashEntry, crate::error::HikerError>,
+        >,
+    },
+    /// Restore a previously soft-deleted entry from the vault trash. Same
+    /// reply pattern as DeleteNote — caller awaits the entry shape so the UI
+    /// can confirm.
+    RestoreFromTrash {
+        id: String,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::trash::TrashEntry, crate::error::HikerError>,
+        >,
+    },
     /// Walk the vault, enqueuing Upserts for `.md` files and Deletes for
-    /// indexed paths whose files have vanished.
-    FullScan,
+    /// indexed paths whose files have vanished. `force` propagates into the
+    /// produced child Upserts (see `IndexJob::Upsert`).
+    FullScan { force: bool },
 }
 
 /// Snapshot of indexer state, served to the UI on demand.
@@ -82,10 +106,6 @@ pub enum IndexerError {
     Embed(#[from] EmbedError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("file too large ({size} bytes)")]
-    TooLarge { size: u64 },
-    #[error("not utf-8")]
-    NotUtf8,
     #[error("send failed: indexer task is shut down")]
     SendFailed,
 }
@@ -100,6 +120,30 @@ pub struct IndexerHandle {
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Receiver<IndexStatus>,
     join: Option<JoinHandle<()>>,
+    /// Vault-relative paths with an in-flight Upsert job (queued in the
+    /// mpsc, recv'd, or actively processing). Backs the Queued tree-row
+    /// marker via `tauri-cmd-file-index-state`.
+    pending: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
+/// paths in the `pending` set so callers don't have to remember.
+#[derive(Clone)]
+pub struct IndexJobTx {
+    tx: mpsc::Sender<IndexJob>,
+    pending: Arc<Mutex<HashSet<String>>>,
+}
+
+impl IndexJobTx {
+    pub async fn send(
+        &self,
+        job: IndexJob,
+    ) -> Result<(), mpsc::error::SendError<IndexJob>> {
+        if let IndexJob::Upsert { rel_path, .. } = &job {
+            self.pending.lock().unwrap().insert(rel_path.clone());
+        }
+        self.tx.send(job).await
+    }
 }
 
 impl IndexerHandle {
@@ -110,15 +154,25 @@ impl IndexerHandle {
     }
 
     pub async fn enqueue(&self, job: IndexJob) -> Result<(), IndexerError> {
+        if let IndexJob::Upsert { rel_path, .. } = &job {
+            self.pending.lock().unwrap().insert(rel_path.clone());
+        }
         self.tx().send(job).await.map_err(|_| IndexerError::SendFailed)
     }
 
+    /// Whether the file at `rel_path` currently has an in-flight Upsert job
+    /// (queued in the mpsc, recv'd by the loop, or actively processing).
+    /// Backs the Queued tree-row marker.
+    pub fn is_pending(&self, rel_path: &str) -> bool {
+        self.pending.lock().unwrap().contains(rel_path)
+    }
+
     pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), IndexerError> {
-        self.enqueue(IndexJob::Upsert { rel_path: rel_path.into() }).await
+        self.enqueue(IndexJob::Upsert { rel_path: rel_path.into(), force: false }).await
     }
 
     pub async fn full_scan(&self) -> Result<(), IndexerError> {
-        self.enqueue(IndexJob::FullScan).await
+        self.enqueue(IndexJob::FullScan { force: false }).await
     }
 
 
@@ -130,10 +184,14 @@ impl IndexerHandle {
         self.progress.subscribe()
     }
 
-    /// Clone the underlying mpsc sender. Useful for routing watcher events
-    /// into the indexer from a separate task.
-    pub fn job_sender(&self) -> mpsc::Sender<IndexJob> {
-        self.tx().clone()
+    /// Clone the auto-tracking job sender. Each `send(IndexJob::Upsert{..})`
+    /// updates the pending-paths set so `is_pending` reflects queued jobs
+    /// without the caller having to remember.
+    pub fn job_sender(&self) -> IndexJobTx {
+        IndexJobTx {
+            tx: self.tx().clone(),
+            pending: self.pending.clone(),
+        }
     }
 
     /// Stop the indexer task gracefully and wait for it to finish.
@@ -167,6 +225,7 @@ where
     let (tx, rx) = mpsc::channel::<IndexJob>(256);
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(PROGRESS_CAPACITY);
     let (status_tx, status_rx) = watch::channel(IndexStatus::default());
+    let pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Seed total_notes from the store; surface a count failure as
     // last_error rather than silently showing 0 (a corrupted index would
@@ -182,6 +241,7 @@ where
     });
 
     let progress_for_task = progress_tx.clone();
+    let pending_for_task = pending.clone();
     let join = tokio::spawn(indexer_loop(
         vault,
         vault_root,
@@ -190,6 +250,7 @@ where
         rx,
         progress_for_task,
         status_tx,
+        pending_for_task,
     ));
 
     IndexerHandle {
@@ -197,6 +258,7 @@ where
         progress: progress_tx,
         status: status_rx,
         join: Some(join),
+        pending,
     }
 }
 
@@ -208,6 +270,7 @@ async fn indexer_loop<F>(
     mut rx: mpsc::Receiver<IndexJob>,
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Sender<IndexStatus>,
+    pending: Arc<Mutex<HashSet<String>>>,
 ) where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
@@ -217,6 +280,7 @@ async fn indexer_loop<F>(
     let embedder: Arc<dyn Embedder> = match load {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
+            tracing::error!(error = %e, "indexer: embedder load failed");
             update_status(&status, |s| s.last_error = Some(format!("embedder load: {e}")));
             let _ = progress.send(ProgressEvent::Error {
                 path: None,
@@ -228,7 +292,7 @@ async fn indexer_loop<F>(
             // jobs) so dropping them silently is fine.
             while let Some(job) = rx.recv().await {
                 let path = match job {
-                    IndexJob::Upsert { rel_path } | IndexJob::Delete { rel_path } => Some(rel_path),
+                    IndexJob::Upsert { rel_path, .. } | IndexJob::Delete { rel_path } => Some(rel_path),
                     IndexJob::Rename { to, .. } => Some(to),
                     IndexJob::Move { reply, .. } => {
                         let _ = reply.send(Err(crate::error::HikerError::Io(
@@ -236,7 +300,19 @@ async fn indexer_loop<F>(
                         )));
                         None
                     }
-                    IndexJob::FullScan => None,
+                    IndexJob::DeleteNote { reply, .. } => {
+                        let _ = reply.send(Err(crate::error::HikerError::Io(
+                            "embedder unavailable".into(),
+                        )));
+                        None
+                    }
+                    IndexJob::RestoreFromTrash { reply, .. } => {
+                        let _ = reply.send(Err(crate::error::HikerError::Io(
+                            "embedder unavailable".into(),
+                        )));
+                        None
+                    }
+                    IndexJob::FullScan { .. } => None,
                 };
                 if path.is_some() {
                     let _ = progress.send(ProgressEvent::Error {
@@ -256,12 +332,17 @@ async fn indexer_loop<F>(
         s.model_ready = true;
         s.last_error = None;
     });
+    tracing::info!(
+        embedder_version = embedder.version(),
+        dim = embedder.dim(),
+        "indexer: embedder ready",
+    );
     let _ = progress.send(ProgressEvent::ModelLoaded);
 
     while let Some(job) = rx.recv().await {
         update_queue_count_in_flight(&status, &rx);
         match job {
-            IndexJob::FullScan => match run_full_scan(&vault_root, &store) {
+            IndexJob::FullScan { force } => match run_full_scan(&vault_root, &store, force) {
                 Ok(jobs) => {
                     // Count Upsert/Delete jobs so the UI can show the queue
                     // depth as "Indexing N pending" before we start chewing.
@@ -280,6 +361,9 @@ async fn indexer_loop<F>(
                     // blocks once the buffer fills, but no one is calling
                     // `rx.recv` to drain.
                     for j in jobs {
+                        if let IndexJob::Upsert { rel_path, .. } = &j {
+                            pending.lock().unwrap().insert(rel_path.clone());
+                        }
                         handle_simple_job(
                             &vault,
                             &vault_root,
@@ -287,6 +371,7 @@ async fn indexer_loop<F>(
                             &embedder,
                             &progress,
                             &status,
+                            &pending,
                             j,
                         )
                         .await;
@@ -310,6 +395,7 @@ async fn indexer_loop<F>(
                     &embedder,
                     &progress,
                     &status,
+                    &pending,
                     other,
                 )
                 .await;
@@ -331,13 +417,21 @@ async fn handle_simple_job(
     embedder: &Arc<dyn Embedder>,
     progress: &broadcast::Sender<ProgressEvent>,
     status: &watch::Sender<IndexStatus>,
+    pending: &Arc<Mutex<HashSet<String>>>,
     job: IndexJob,
 ) {
     match job {
-        IndexJob::Upsert { rel_path } => {
+        IndexJob::Upsert { rel_path, force } => {
+            // Make sure the path is in the pending set even if it didn't go
+            // through a tracking sender (e.g. enqueued by some legacy path);
+            // remove on every terminal outcome below.
+            pending.lock().unwrap().insert(rel_path.clone());
             let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
-            match process_upsert(vault_root, store, embedder.clone(), &rel_path).await {
+            let outcome = process_upsert(vault_root, store, embedder.clone(), &rel_path, force).await;
+            pending.lock().unwrap().remove(&rel_path);
+            match outcome {
                 Ok(UpsertOutcome::Indexed) => {
+                    tracing::debug!(path = %rel_path, "indexer: file indexed");
                     let _ = progress.send(ProgressEvent::Finished { path: rel_path });
                 }
                 Ok(UpsertOutcome::Unchanged) => {
@@ -347,6 +441,11 @@ async fn handle_simple_job(
                     });
                 }
                 Ok(UpsertOutcome::Skipped(reason)) => {
+                    tracing::debug!(
+                        path = %rel_path,
+                        reason = %reason,
+                        "indexer: file skipped",
+                    );
                     let _ = progress.send(ProgressEvent::Skipped {
                         path: rel_path,
                         reason,
@@ -354,6 +453,7 @@ async fn handle_simple_job(
                 }
                 Err(e) => {
                     let msg = format!("{e}");
+                    tracing::error!(error = %e, path = %rel_path, "indexer: upsert failed");
                     update_status(status, |s| s.last_error = Some(msg.clone()));
                     let _ = progress.send(ProgressEvent::Error {
                         path: Some(rel_path),
@@ -418,7 +518,78 @@ async fn handle_simple_job(
             let result = crate::vault::move_note(vault, store, None, &from, &to);
             let _ = reply.send(result);
         }
-        IndexJob::FullScan => {
+        IndexJob::DeleteNote { rel, reply } => {
+            // Same shape as Move — Tauri layer handles watcher suppression
+            // around the call. The trash handle is cheap to construct
+            // (just a path) so we build one per call rather than threading
+            // it through the loop signature.
+            let trash = crate::trash::Trash::open(vault.root());
+            let result = crate::vault::delete_note(vault, store, None, &trash, &rel);
+            match &result {
+                Ok(entry) => {
+                    let _ = progress.send(ProgressEvent::Deleted {
+                        path: entry.original_path.clone(),
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    update_status(status, |s| s.last_error = Some(msg.clone()));
+                    let _ = progress.send(ProgressEvent::Error {
+                        path: Some(rel.clone()),
+                        message: msg,
+                    });
+                }
+            }
+            let _ = reply.send(result);
+        }
+        IndexJob::RestoreFromTrash { id, reply } => {
+            let trash = crate::trash::Trash::open(vault.root());
+            let restore_result = crate::vault::restore_note(vault, None, &trash, &id);
+            let result = match restore_result {
+                Ok(entry) => {
+                    // Re-ingest the restored .md files inline so the index
+                    // picks them up without waiting on watcher events
+                    // (which the Tauri layer suppressed). For folders, walk
+                    // the manifest's recorded members; for files, just the
+                    // single original_path.
+                    let to_index: Vec<String> = match &entry.members {
+                        Some(m) => m.clone(),
+                        None => vec![entry.original_path.clone()],
+                    };
+                    for rel_path in &to_index {
+                        if let Err(e) = handle_inline_upsert(
+                            vault_root,
+                            store,
+                            embedder.clone(),
+                            progress,
+                            status,
+                            rel_path,
+                        )
+                        .await
+                        {
+                            let msg = format!("{e}");
+                            update_status(status, |s| s.last_error = Some(msg.clone()));
+                            let _ = progress.send(ProgressEvent::Error {
+                                path: Some(rel_path.clone()),
+                                message: msg,
+                            });
+                        }
+                    }
+                    Ok(entry)
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    update_status(status, |s| s.last_error = Some(msg.clone()));
+                    let _ = progress.send(ProgressEvent::Error {
+                        path: Some(id.clone()),
+                        message: msg,
+                    });
+                    Err(e)
+                }
+            };
+            let _ = reply.send(result);
+        }
+        IndexJob::FullScan { .. } => {
             unreachable!("FullScan must be handled by the main loop, not handle_simple_job");
         }
     }
@@ -435,7 +606,7 @@ async fn handle_inline_upsert(
     rel_path: &str,
 ) -> Result<(), IndexerError> {
     let _ = progress.send(ProgressEvent::Started { path: rel_path.to_string() });
-    match process_upsert(vault_root, store, embedder, rel_path).await? {
+    match process_upsert(vault_root, store, embedder, rel_path, false).await? {
         UpsertOutcome::Indexed => {
             let _ = progress.send(ProgressEvent::Finished { path: rel_path.to_string() });
         }
@@ -467,10 +638,15 @@ async fn process_upsert(
     store: &mut Store,
     embedder: Arc<dyn Embedder>,
     rel_path: &str,
+    force: bool,
 ) -> Result<UpsertOutcome, IndexerError> {
-    if !rel_path.ends_with(".md") {
-        return Ok(UpsertOutcome::Skipped("non-markdown".into()));
-    }
+    let chunker: &dyn Chunker = match path_extension(rel_path) {
+        Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
+            &MarkdownChunker
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("txt") => &TxtChunker,
+        _ => return Ok(UpsertOutcome::Skipped("unsupported extension".into())),
+    };
     if is_ignored(rel_path) {
         return Ok(UpsertOutcome::Skipped("ignored path".into()));
     }
@@ -489,33 +665,45 @@ async fn process_upsert(
         return Ok(UpsertOutcome::Skipped("not a file".into()));
     }
     let size = metadata.len();
-    if size > MAX_FILE_BYTES {
-        return Err(IndexerError::TooLarge { size });
-    }
-    let bytes = tokio::fs::read(&abs).await?;
-    let contents = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return Ok(UpsertOutcome::Skipped("not utf-8".into())),
-    };
-    let content_hash = hash_str(&contents);
     let mtime = metadata
         .modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    if size > MAX_FILE_BYTES {
+        // Persist a Skipped row so the UI can mark this file across launches
+        // (per index.md `tauri-cmd-file-index-state`). Reason string is the
+        // exact human-readable text the tooltip / status bar will display.
+        let reason = "file too large";
+        store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
+        return Ok(UpsertOutcome::Skipped(reason.into()));
+    }
+    let bytes = tokio::fs::read(&abs).await?;
+    let contents = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            let reason = "not UTF-8";
+            store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
+            return Ok(UpsertOutcome::Skipped(reason.into()));
+        }
+    };
+    let content_hash = hash_str(&contents);
 
-    // Short-circuit: same content + same embedder version → no-op.
-    if let Some(existing) = store.get_note_by_path(rel_path)? {
-        if existing.content_hash == content_hash
-            && existing.embedder_version == embedder.version()
-        {
-            return Ok(UpsertOutcome::Unchanged);
+    // Short-circuit: same content + same embedder version → no-op. Skipped
+    // when `force` is set so an explicit user reindex actually re-embeds.
+    if !force {
+        if let Some(existing) = store.get_note_by_path(rel_path)? {
+            if existing.content_hash == content_hash
+                && existing.embedder_version == embedder.version()
+            {
+                return Ok(UpsertOutcome::Unchanged);
+            }
         }
     }
 
     // Chunk + embed. Embed is CPU-heavy: spawn_blocking.
-    let chunks = chunk_markdown(&contents);
+    let chunks = chunker.chunk(&contents);
     if chunks.is_empty() {
         // Empty note: still record the row so deletes/renames work, but no
         // embeddings to insert.
@@ -538,10 +726,18 @@ async fn process_upsert(
     }
 
     let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let batch_size = texts.len();
     let emb_clone = embedder.clone();
+    let embed_start = std::time::Instant::now();
     let embeddings = tokio::task::spawn_blocking(move || emb_clone.embed_batch(&texts))
         .await
         .map_err(|e| IndexerError::Embed(EmbedError::Embed(e.to_string())))??;
+    tracing::debug!(
+        batch_size,
+        elapsed_ms = embed_start.elapsed().as_millis() as u64,
+        path = %rel_path,
+        "embedder: batch embedded",
+    );
 
     let id = match store.id_for_path(rel_path)? {
         Some(id) => id,
@@ -583,10 +779,11 @@ fn process_rename(store: &mut Store, from: &str, to: &str) -> Result<bool, Index
 /// Walk the vault, returning the jobs the indexer should run to bring the
 /// store in line with the filesystem. Upserts for every `.md` file found,
 /// Deletes for indexed paths whose files have vanished.
-pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, IndexerError> {
-    eprintln!(
-        "[hiker::indexer] full_scan starting at {}",
-        vault_root.display()
+pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Vec<IndexJob>, IndexerError> {
+    tracing::info!(
+        vault_root = %vault_root.display(),
+        force,
+        "full_scan starting",
     );
     let mut on_disk: Vec<String> = Vec::new();
     let mut total_files_seen = 0_u32;
@@ -597,7 +794,7 @@ pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, 
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[hiker::indexer] walk error: {e}");
+                tracing::warn!(error = %e, "full_scan: walk error");
                 continue;
             }
         };
@@ -608,10 +805,10 @@ pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, 
         let rel = match entry.path().strip_prefix(vault_root) {
             Ok(p) => path_to_rel(p),
             Err(_) => {
-                eprintln!(
-                    "[hiker::indexer] strip_prefix failed for {} under root {}",
-                    entry.path().display(),
-                    vault_root.display()
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    vault_root = %vault_root.display(),
+                    "full_scan: strip_prefix failed",
                 );
                 continue;
             }
@@ -620,35 +817,38 @@ pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, 
             filtered_ignored += 1;
             continue;
         }
-        if !rel.ends_with(".md") {
+        if !is_indexable_path(&rel) {
             filtered_non_md += 1;
             continue;
         }
         on_disk.push(rel);
     }
-    eprintln!(
-        "[hiker::indexer] full_scan: {} files seen, {} non-md skipped, {} ignored, {} markdown queued",
-        total_files_seen,
-        filtered_non_md,
-        filtered_ignored,
-        on_disk.len()
-    );
-
     let mut jobs: Vec<IndexJob> = on_disk
         .iter()
         .cloned()
-        .map(|rel_path| IndexJob::Upsert { rel_path })
+        .map(|rel_path| IndexJob::Upsert { rel_path, force })
         .collect();
 
     // Find indexed paths missing from disk.
     let indexed = store.all_note_paths()?;
     let on_disk_set: std::collections::HashSet<&str> =
         on_disk.iter().map(String::as_str).collect();
+    let mut deleted = 0_u32;
     for path in indexed {
         if !on_disk_set.contains(path.as_str()) {
             jobs.push(IndexJob::Delete { rel_path: path });
+            deleted += 1;
         }
     }
+
+    tracing::info!(
+        seen = total_files_seen,
+        non_md = filtered_non_md,
+        ignored = filtered_ignored,
+        queued = on_disk.len() as u32,
+        deleted,
+        "full_scan complete",
+    );
 
     Ok(jobs)
 }
@@ -659,28 +859,28 @@ pub fn run_full_scan(vault_root: &Path, store: &Store) -> Result<Vec<IndexJob>, 
 /// broadcast receiver lags out or the indexer's sender closes.
 pub async fn route_watcher_events(
     mut rx: broadcast::Receiver<FileEvent>,
-    tx: mpsc::Sender<IndexJob>,
+    tx: IndexJobTx,
 ) {
     loop {
         match rx.recv().await {
             Ok(ev) => {
                 let job = match ev {
                     FileEvent::Created { path } | FileEvent::Modified { path } => {
-                        if !path.ends_with(".md") {
+                        if !is_indexable_path(&path) {
                             continue;
                         }
-                        IndexJob::Upsert { rel_path: path }
+                        IndexJob::Upsert { rel_path: path, force: false }
                     }
                     FileEvent::Deleted { path } => {
-                        if !path.ends_with(".md") {
+                        if !is_indexable_path(&path) {
                             continue;
                         }
                         IndexJob::Delete { rel_path: path }
                     }
                     FileEvent::Renamed { from, to } => {
-                        // Rename involving non-md is treated as ignore on
-                        // both sides — neither side is/was indexed.
-                        if !from.ends_with(".md") && !to.ends_with(".md") {
+                        // Rename involving an unsupported extension on both
+                        // sides means neither side is/was indexed.
+                        if !is_indexable_path(&from) && !is_indexable_path(&to) {
                             continue;
                         }
                         IndexJob::Rename { from, to }
@@ -693,7 +893,7 @@ pub async fn route_watcher_events(
             Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 // We dropped events; the safe recovery is a full rescan.
-                let _ = tx.send(IndexJob::FullScan).await;
+                let _ = tx.send(IndexJob::FullScan { force: false }).await;
             }
         }
     }
@@ -714,6 +914,30 @@ fn walk_skip(vault_root: &Path, path: &Path) -> bool {
         return false;
     }
     is_ignored(&rel)
+}
+
+/// Lowercased file extension of a vault-relative path, or None for paths with
+/// no extension (or a trailing dot only).
+fn path_extension(rel_path: &str) -> Option<&str> {
+    let basename = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let dot = basename.rfind('.')?;
+    let ext = &basename[dot + 1..];
+    if ext.is_empty() {
+        None
+    } else {
+        Some(ext)
+    }
+}
+
+/// Whether the indexer considers this path's extension supported. Single
+/// source of truth so the walker, watcher router, and per-file chunker
+/// dispatch agree.
+// status: txt-extension-recognized
+pub fn is_indexable_path(rel_path: &str) -> bool {
+    let Some(ext) = path_extension(rel_path) else { return false };
+    ext.eq_ignore_ascii_case("md")
+        || ext.eq_ignore_ascii_case("markdown")
+        || ext.eq_ignore_ascii_case("txt")
 }
 
 fn path_to_rel(p: &Path) -> String {
@@ -853,6 +1077,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_reindex_bypasses_unchanged_short_circuit() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("y.md"), b"# Y\n\nbody.\n").unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+        let mut prog = handle.subscribe_progress();
+
+        await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+        handle.index_path("y.md").await.unwrap();
+        await_event(&mut prog, |e| matches!(e, ProgressEvent::Finished { .. })).await;
+
+        // force = true → identical bytes still produce a Finished, not Skipped.
+        handle
+            .job_sender()
+            .send(IndexJob::Upsert { rel_path: "y.md".into(), force: true })
+            .await
+            .unwrap();
+        let ev = await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path, .. } if path == "y.md")
+                || matches!(e, ProgressEvent::Skipped { path, .. } if path == "y.md")
+        })
+        .await;
+        assert!(matches!(ev, ProgressEvent::Finished { .. }));
+    }
+
+    #[tokio::test]
     async fn deleting_a_note_removes_it_from_the_index() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("doomed.md"), b"# x\n").unwrap();
@@ -915,24 +1166,24 @@ mod tests {
         fs::write(dir.path().join("a.md"), b"a").unwrap();
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/b.md"), b"b").unwrap();
-        fs::write(dir.path().join("c.txt"), b"not markdown").unwrap();
+        fs::write(dir.path().join("c.log"), b"not indexed").unwrap();
         // .hiker/ subtree must be skipped.
         fs::create_dir_all(dir.path().join(".hiker/refs")).unwrap();
         fs::write(dir.path().join(".hiker/refs/secret.md"), b"x").unwrap();
 
         let store = Store::open(dir.path()).unwrap();
-        let jobs = run_full_scan(dir.path(), &store).unwrap();
+        let jobs = run_full_scan(dir.path(), &store, false).unwrap();
         let upserts: Vec<&String> = jobs
             .iter()
             .filter_map(|j| match j {
-                IndexJob::Upsert { rel_path } => Some(rel_path),
+                IndexJob::Upsert { rel_path, .. } => Some(rel_path),
                 _ => None,
             })
             .collect();
         assert!(upserts.iter().any(|p| p.as_str() == "a.md"));
         assert!(upserts.iter().any(|p| p.as_str() == "sub/b.md"));
         assert!(!upserts.iter().any(|p| p.contains(".hiker")));
-        assert!(!upserts.iter().any(|p| p.ends_with("c.txt")));
+        assert!(!upserts.iter().any(|p| p.ends_with("c.log")));
     }
 
     #[test]
@@ -957,7 +1208,7 @@ mod tests {
             })
             .unwrap();
 
-        let jobs = run_full_scan(dir.path(), &store).unwrap();
+        let jobs = run_full_scan(dir.path(), &store, false).unwrap();
         let deletes: Vec<&String> = jobs
             .iter()
             .filter_map(|j| match j {
@@ -987,18 +1238,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_markdown_files_are_skipped() {
+    async fn unsupported_extensions_are_skipped() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        fs::write(dir.path().join("a.bin"), b"x").unwrap();
         let store = Store::open(dir.path()).unwrap();
         let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
-        handle.index_path("a.txt").await.unwrap();
+        handle.index_path("a.bin").await.unwrap();
         let ev = await_event(&mut prog, |e| matches!(e, ProgressEvent::Skipped { .. })).await;
         if let ProgressEvent::Skipped { reason, .. } = ev {
-            assert_eq!(reason, "non-markdown");
+            assert_eq!(reason, "unsupported extension");
         }
+    }
+
+    #[tokio::test]
+    async fn txt_files_are_indexed() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.txt"), b"first paragraph.\n\nsecond paragraph.\n").unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+        let mut prog = handle.subscribe_progress();
+
+        await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+        handle.index_path("note.txt").await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == "note.txt")
+        })
+        .await;
+
+        let store2 = Store::open(dir.path()).unwrap();
+        let note = store2.get_note_by_path("note.txt").unwrap().unwrap();
+        let chunks = store2.get_note_chunks(&note.id).unwrap();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|c| c.text.contains("first paragraph")));
+        assert!(chunks.iter().any(|c| c.text.contains("second paragraph")));
     }
 }

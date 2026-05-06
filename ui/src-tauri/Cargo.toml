@@ -18,3 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 hiker-core.workspace = true
 tokio.workspace = true
+tracing.workspace = true

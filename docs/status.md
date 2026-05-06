@@ -55,18 +55,40 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
 | `drag-and-drop-move` | partial | `ui/src/main.ts` (`attachDnd`) | file DnD wired to Tauri `move_note`; folder drag disabled until walk-and-batch lands |
 | `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler) | auto-suffix `new-note-N.md` via Tauri `create_note`, opens + inline-renames |
-| `tree-refresh-manual` | done | `ui/src/main.ts` (`refresh-tree-btn` handler) | re-reads dir; restores active highlight; expansion state not preserved |
+| `tree-refresh-manual` | done | `ui/src/main.ts` (`tree-actions-btn` "Refresh tree" entry) | re-reads dir; restores active highlight; expansion state preserved across refresh via `expandedFolders` set; lives inside the `…` actions menu |
 | `tree-refresh-watcher` | planned | — | auto-refresh tree from watcher events (v2 per watcher.md) |
 | `tree-double-click-rename` | planned | — | double-click row → inline rename (same UX as post-create rename) |
-| `tree-context-menu` | planned | — | right-click on row opens menu (Open / Rename / Delete / Properties); right-click on empty space → New note here |
-| `tree-context-delete` | planned | — | menu entry → soft delete via `delete-note-core-cmd`; confirm modal |
-| `tree-context-properties` | planned | — | menu entry stub; greyed out until frontmatter editing exists |
-| `delete-note-core-cmd` | planned | — | `core::vault::delete_note`; soft delete (moves to vault trash); atomic with index update |
-| `vault-trash` | planned | — | `vault/.hiker/trash/` with timestamp-prefixed entries + `manifest.yaml`; ignored by watcher |
-| `vault-trash-restore` | planned | — | `hiker trash restore <id>` puts file back via `move_note`; UI undo toast for ~5s after delete |
-| `vault-trash-empty` | planned | — | `hiker trash empty` is the only path to permanent delete; confirm prompt; no auto-empty in v1 |
+| `tree-context-menu` | done | `ui/src/main.ts` (`attachContextMenu`, `openContextMenu`) | row menu: Open / Rename / Delete / Properties (greyed); empty-space menu: New note here |
+| `tree-context-delete` | done | `ui/src/main.ts` (`deleteFromTree`) | confirm modal (Cancel default-focus, danger Move-to-trash); folder copy includes recursive note count; closes open buffer if deleted; toast confirmation |
+| `tree-context-properties` | partial | `ui/src/main.ts` (`attachContextMenu`) | menu entry stub disabled; opens nothing until frontmatter editing lands |
+| `delete-note-core-cmd` | done | `core/src/vault.rs` (`delete_note`), `ui/src-tauri/src/lib.rs` (`delete_note` Tauri cmd) | files + folders; routes through `IndexJob::DeleteNote` so writes flow through the indexer's owned store; rollback on store failure |
+| `vault-trash` | done | `core/src/trash.rs` | `<vault>/.hiker/trash/` + `manifest.yaml`; collision suffix `_N`; folder moves preserve relative tree; serde_yml + time deps |
+| `vault-trash-restore` | done | `core/src/vault.rs` (`restore_note`), `ui/src-tauri/src/lib.rs` (`restore_trash_entry`), `ui/src/main.ts` (toast Undo button) | reverses delete via fs rename + manifest remove + inline re-ingest; errors if original path now occupied; recreates missing parent; CLI not yet wired |
+| `vault-trash-empty` | done | `core/src/trash.rs` (`Trash::empty`), `ui/src-tauri/src/lib.rs` (`empty_trash`), `ui/src/main.ts` (header right-click) | confirm modal, no auto-empty in v1; CLI not yet wired |
+| `tree-trash-bin` | done | `ui/index.html` (`#trash-bin`), `ui/src/main.ts` (`refreshTrashBin`, `renderTrashBin`) | pinned at bottom of sidebar; collapsed by default; chevron + count |
+| `tree-trash-disk-listing` | done | `core/src/trash.rs` (`Trash::list_from_disk`), `ui/src-tauri/src/lib.rs` (`list_trash`) | walks `.hiker/trash/`; manifest joined per-entry; orphans flagged |
+| `tree-trash-flat-by-deleted` | done | `ui/src/main.ts` (`renderTrashBin`, `relativeTime`) | sorted desc by `deleted_at`; basename + rel-time + muted orig path; folder rows show `(N notes)` or `(?)` |
+| `tree-trash-preview` | done | `ui/src/main.ts` (`openTrashPreview`, `setReadOnly`), `ui/index.html` (`#trash-banner`) | reads `.hiker/trash/<name>` via `read_file_with_hash`; `readOnlyCompartment` toggles `EditorState.readOnly`; banner shown; save disabled; status bar shows "(in trash)" |
+| `tree-trash-restore-action` | done | `ui/src/main.ts` (`openTrashRowMenu`), `ui/src-tauri/src/lib.rs` (`permanent_delete_trash_entry`), `core/src/trash.rs` (`Trash::permanent_delete`) | row right-click → Restore (greyed for orphans) / Delete permanently with confirm |
+| `tree-trash-empty-action` | done | `ui/src/main.ts` (`trashHeaderEl` contextmenu) | header right-click → "Empty trash (N entries)" with confirm; disabled when N == 0 |
+| `tree-trash-orphan-recovery` | done | `core/src/trash.rs` (`list_from_disk`), `ui/src/main.ts` (`openTrashRowMenu`) | orphans listed (italic, muted); Restore disabled with explanation; Empty + Delete permanently still work via `trashed_name` identifier |
 | `confirm3-real-modal` | planned | — | replace `window.prompt` 3-way with proper modal |
 | `help-panel-keybinds` | planned | — | enumerate keybinds.list() |
+| `tree-toolbar-actions-menu` | done | `ui/index.html` (`#tree-actions-btn`), `ui/src/main.ts` (`treeActionsBtn` click handler) | `…` button next to + New note opens the existing `openContextMenu` popover; hosts Refresh tree / Reindex all / Reindex this file / Sort by |
+| `tree-sort-options` | planned | — | Sort by submenu in `…`: Name A→Z (default) / Name Z→A / Modified newest / Modified oldest; folders grouped first; in-memory state in v1 |
+| `tree-row-unsupported-marker` | done | `ui/src/main.ts` (`renderTreeRowLabel`, `isIndexableExt`) | hollow grey suffix dot derived client-side from extension; no Tauri round trip for non-md/txt rows |
+| `tree-row-skipped-marker` | done | `ui/src/main.ts` (`renderTreeRowLabel`, `applyIndexMarker`), `ui/src/style.css` (`#tree li.ix-skipped > .ix-marker`) | amber suffix dot from `index_state_for`; reason in `title=` tooltip |
+| `tree-row-queued-marker` | done | `ui/src/main.ts` (`updateIndexStateForPath` on `started`/`finished`/`skipped`), `ui/src/style.css` (`#tree li.ix-queued > .ix-marker`, `@keyframes ix-queued-pulse`) | pulsing accent suffix dot driven by `hiker:reindex-progress` events |
+| `status-bar-active-file-index-state` | done | `ui/src/main.ts` (`renderIndexStatus`) | center label swaps to "Not indexed (unsupported filetype)" / "Skipped — <reason>" / "Queued for indexing"; reverts to aggregate label when active buffer is Indexed or trash-preview |
+| `note-mutations-menu` | planned | — | deferred top-bar menu for content-mutation actions; first candidate is markdown reformat (local-CPU / local-API / cloud backend) |
+| `editor-view-options-menu` | done | `ui/index.html` (`#view-menu-btn`), `ui/src/main.ts` (`buildViewMenuItems`, `viewMenuBtn` click handler) | `View ▾` button on the editor toolbar between the sidebar and related toggles; opens the existing `openContextMenu` popover with checkable rows. State in-memory only per spec |
+| `view-show-chunk-boundaries` | done | `ui/src/editor/chunkBoundaries/index.ts`, `ui/src/main.ts` (`chunkBoundariesCompartment`, `setChunkBoundariesEnabled`, `fetchAndApplyChunkBounds`) | StateField + line-decoration boundary rule + dedicated gutter showing chunk indices. Toggled via View menu; default off. Refreshes on file-open, on save (500ms debounce, same cadence as related), and after watcher silent-reload. Faint gutter hint shown when the file is unsupported / skipped / queued / has zero chunks |
+| `view-live-preview-toggle` | done | `ui/src/main.ts` (`buildViewMenuItems` "Live preview" entry) | wired to `setLivePreviewEnabled`; checkmark reflects `livePreviewEnabled`; default on |
+| `view-render-txt-as-markdown-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-vault-config-toml" |
+| `view-word-wrap-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-section-editor" |
+| `view-show-whitespace-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled; CM6 whitespace extension not wired yet |
+| `view-line-numbers-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled; line-number gutter not wired yet |
+| `view-heading-breadcrumb-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Pairs with view-show-chunk-boundaries" |
 
 
 ## Index (index.md)
@@ -74,7 +96,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | Slug | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
 | `store-sqlite-vec-static` | done | `core/src/store.rs` | bundled rusqlite + sqlite-vec |
-| `store-schema-v1` | done | `core/src/store.rs` | notes / chunks / chunk_vecs / path_ids |
+| `store-schema-v1` | done | `core/src/store.rs` | notes / chunks / chunk_vecs / path_ids; bumped to `SCHEMA_VERSION = 2` to add `notes.skipped` + `notes.skip_reason` (per `tauri-cmd-file-index-state`). Slug name kept for stability; the schema-version constant tracks the actual on-disk version |
 | `store-version-fail-loud` | done | `core/src/store.rs:17` | no auto-migrate |
 | `store-wal-mode` | partial | `core/src/indexer.rs:154` (comment) | PRAGMA not visibly set in code path |
 | `store-module-discipline` | done | `core/src/store.rs` | rusqlite confined to one module |
@@ -106,6 +128,29 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `walker-symlink-policy` | partial | not visible in code | spec says don't follow; configuration not confirmed |
 | `move-note-core-cmd` | done | `core/src/vault.rs` (`move_note`) | atomic fs rename + index update with watcher suppression; folder walk lives in `drag-and-drop-move` |
 | `create-note-core-cmd` | done | `core/src/vault.rs` (`Vault::create_note`) | empty file, errors on collision (auto-suffix is the caller's job) |
+| `tauri-cmd-file-index-state` | done | `ui/src-tauri/src/lib.rs` (`index_state_for`, `IndexState`), `core/src/indexer.rs` (`IndexerHandle::is_pending`) | Unsupported via `is_indexable_path`; Queued from indexer's pending-paths set; Skipped + Indexed from `notes` row. Schema bumped to v2 to add `notes.skipped` + `notes.skip_reason` (`store-schema-v1` row covers the v1 baseline; the v2 columns + persistence ride on this slug). Indexer now persists Skipped rows for "file too large" and "not UTF-8" branches in `process_upsert`; `Store::upsert_skipped` handles the row + chunk cleanup |
+| `reindex-all-action` | done | `ui/src/main.ts` (tree-actions menu "Reindex all" entry) | calls `invoke("index", { scope: { kind: "all" } })`; no confirm modal |
+| `reindex-current-file-action` | done | `ui/src/main.ts` (tree-actions menu "Reindex this file" entry) | calls `invoke("index", { scope: { kind: "path", rel: currentPath } })`; greyed when no real file is active (also when previewing a trash entry) |
+| `reindex-rebuild-action` | planned | — | destructive UI rebuild (drop + recreate schema then reindex); deferred to settings page per `settings-section-indexing` |
+| `tauri-cmd-chunks-for-path` | done | `ui/src-tauri/src/lib.rs` (`chunks_for`), `core/src/store.rs` (`ChunkBounds`, `Store::chunk_bounds_for`) | empty vec for unindexed / never-indexed paths; SELECT omits chunk text so the wire payload stays small |
+
+
+## Live preview (live-preview.md)
+
+| Slug | Status | Evidence | Notes |
+| ---- | ------ | -------- | ----- |
+| `live-preview-tier1-scope` | done | `ui/src/editor/livePreview/index.ts` | Tier-1 plugin walks the lang-markdown syntax tree and emits decorations; no widgets/media/math |
+| `live-preview-cursor-line-reveal` | done | `ui/src/editor/livePreview/index.ts` (`computeActive`, `isRangeActive`) | active-lines set rebuilt per `selectionSet`; `isRangeActive` matches by line number first |
+| `live-preview-selection-reveal-all` | done | `ui/src/editor/livePreview/index.ts` (`computeActive`, `isRangeActive`) | non-empty ranges tracked separately; selection-overlap check runs after the line check; multi-cursor unions naturally |
+| `live-preview-default-on` | done | `ui/src/main.ts` (`livePreviewExtensionForPath`, `livePreviewEnabled`) | `livePreviewEnabled` defaults to `true`; the live-preview compartment activates whenever the active path is markdown. View menu's "Live preview" entry (`view-live-preview-toggle`) flips it via `setLivePreviewEnabled` |
+| `live-preview-built-on-lang-markdown` | done | `ui/src/editor/livePreview/index.ts` | single-file plugin; only deps are `@codemirror/{language,view,state}` (already transitive) plus `@codemirror/lang-markdown` |
+| `live-preview-disabled-non-md` | done | `ui/src/main.ts` (`languageExtensionForPath`) | bundled into the language compartment's extension array; non-md paths return `[]`, so the plugin reconfigures out as a side effect of language selection |
+| `live-preview-marker-fade-inline` | done | `ui/src/editor/livePreview/index.ts` (StrongEmphasis/Emphasis/Strikethrough/InlineCode branch) | bold weight, italic, strike, monospace inline-code styling stays; `EmphasisMark`/`StrikethroughMark`/`CodeMark` children fade |
+| `live-preview-link-url-fade` | done | `ui/src/editor/livePreview/index.ts` (Link branch) | text styled via `cm-lp-link`; brackets + url + parens fade as one span (`marks[2].from..marks[3].to`) |
+| `live-preview-heading-style-fade-marker` | done | `ui/src/editor/livePreview/index.ts` (ATXHeading branch) | line decoration sets `cm-lp-h{1..6}`; HeaderMark + trailing space fade off-line; setext intentionally untouched per spec |
+| `live-preview-code-fence-block-reveal` | done | `ui/src/editor/livePreview/index.ts` (FencedCode branch) | per-block reveal: `isRangeActive(node.from, node.to)` covers cursor-anywhere-inside *and* selection-overlap with the whole block |
+| `live-preview-block-markers-keep` | done | `ui/src/editor/livePreview/index.ts` | blockquotes and lists are intentionally not visited; their markers render as raw source — no fade emitted |
+| `live-preview-frontmatter-passthrough` | done | `ui/src/editor/livePreview/index.ts` (frontmatter detection block in `buildDecorations`) | detects leading `---` … `---`/`...` block and applies `cm-lp-frontmatter` line decorations (muted, monospace). 200-line scan cap; no marker fading; no kv parsing — all per spec. Avoids a custom `MarkdownConfig` since lang-markdown emits no FrontMatter node by default |
 
 
 ## Watcher (watcher.md)
@@ -147,7 +192,7 @@ Whole surface is planned. Slugs reserved so they can be cited from code as featu
 
 ## Clustering (clustering.md)
 
-All planned. Lands post-v1, alongside the curated-tree placement feature.
+All planned. The build engine consumed by `suggestions.md`. Lands post-v1.
 
 | Slug | Status | Notes |
 | ---- | ------ | ----- |
@@ -156,60 +201,80 @@ All planned. Lands post-v1, alongside the curated-tree placement feature.
 | `cluster-hdbscan` | planned | HDBSCAN over GMM; outlier-handling + determinism |
 | `cluster-algorithm-selectable` | planned | per-vault `cluster.algorithm` config: `hdbscan` / `gmm` / `hybrid` |
 | `cluster-hybrid-outlier-recovery` | planned | HDBSCAN clusters + GMM on outliers; soft-member tagging |
-| `cluster-place-greedy-descent` | planned | online per-note placement (also specced in design.md:252) |
-| `cluster-placement-provenance` | planned | `hiker.placement: manual / auto:vN / confirmed` written to frontmatter |
-| `cluster-manual-via-tree-dnd` | planned | drag-and-drop-move sets `manual` placement, never auto-overridden |
-| `cluster-confirm-promotion` | planned | UI to promote `auto:vN` → `confirmed` |
+| `cluster-place-greedy-descent` | planned | greedy centroid-descent classifier; engine for saved-tree triage in `suggestions.md` |
 | `cluster-chunk-thread-hint` | planned | secondary: cross-note chunk clusters surface as "thread" hints to user (not auto-trails) |
 | `cluster-chunk-multitopic-flag` | planned | secondary: chunks scattered across clusters → split candidate |
 | `cluster-summarize-llm` | planned | one LLM call per cluster per level; small local model OK |
 | `cluster-name-from-summary` | planned | LLM proposes 3–6 word name + 1–3 sentence summary + confidence |
-| `cluster-stable-identity` | planned | Jaccard ≥0.7 on member sets carries cluster id across runs |
-| `cluster-history-yaml` | planned | `vault/.hiker/cluster-history.yaml` for cross-run identity |
 | `cluster-summarize-fallback-tfidf` | planned | template-based naming if LLM unavailable |
-| `cluster-trigger-reconcile-only` | planned | runs on `hiker reconcile`; never automatic in v1 |
-| `cluster-tree-output` | planned | `ClusterTree` shape consumed by reconcile flow |
+| `cluster-tree-output` | planned | `ClusterTree` shape consumed by `suggestions.md` |
 | `cluster-module-discipline` | planned | `core::cluster` + `core::summarize` modules; trait-bounded swaps |
+
+
+## Suggestions (suggestions.md)
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `suggestions-one-shot-flow` | planned | `hiker suggest` produces a markdown proposal; user reviews and applies; never auto-applies |
+| `suggestions-proposal-md` | planned | proposal file is markdown-with-checkboxes at `.hiker/proposals/<ts>.md`; per-line granularity, hand-editable, becomes audit log |
+| `suggestions-apply-cmd` | planned | `hiker suggest apply <proposal>` walks checked items; calls `move_note` / writes tag-frontmatter |
+| `suggestions-rejection-history` | planned | `.hiker/suggestion-history.yaml`; per-(cluster-fingerprint, note, action) rows with TTL so rejected suggestions don't reappear |
+| `suggestions-mode-move` | planned | apply suggestion as filesystem rename via `move_note`; auto-creates target folder |
+| `suggestions-mode-tag` | planned | apply suggestion as a frontmatter tag write; no fs move |
+| `suggestions-tag-field-configurable` | planned | `[suggestions] tag_field` config; default `hiker.suggested_tags`, can be set to `tags` to use the regular list |
+| `triage-saved-tree` | planned | `hiker suggest save` persists centroids+names+actions to `.hiker/saved-tree.yaml`; one tree per vault |
+| `triage-classifier-engine` | planned | greedy descent (`cluster-place-greedy-descent`) over the saved tree; cheap, no LLM, no re-cluster |
+| `triage-confidence-tiers` | planned | high → auto-apply with Undo; medium → queue for review; low → leave in inbox; thresholds per-vault |
+| `triage-auto-undo-toast` | planned | high-confidence auto-applies show toast with 10s Undo; Undo logs to rejection history |
+| `triage-pending-review-panel` | planned | UI panel for medium-confidence triage suggestions; accept/reject per item |
+| `suggestions-folder-pin` | planned | deferred; folder-level pin to exclude from suggestions and triage moves |
 
 
 ## Txt ingest (txt-ingest.md)
 
-| Slug | Status | Notes |
-| ---- | ------ | ----- |
-| `txt-extension-recognized` | planned | `.txt` indexed alongside `.md`; chunker dispatched by extension |
-| `txt-render-as-markdown-default` | planned | `.txt` opens with markdown language compartment by default; per-vault flag `editor.render_txt_as_markdown` |
-| `txt-chunker-paragraph-splits` | planned | Layer 1: split on blank-line runs |
-| `txt-chunker-structure-heuristics` | planned | Layer 2: ALL-CAPS / setext underline / lists / blockquotes → virtual headings |
-| `txt-chunker-sentence-pack` | planned | Layer 3: sentence-aware packing to ~1200-char soft cap within sections |
-| `txt-chunker-guardrails` | planned | max-promotions-per-window, period+space sentence rule, code-region exclusion |
-| `txt-abbreviation-allowlist` | planned | small list (`Mr.`, `Dr.`, `e.g.`, ...) so abbreviations don't terminate sentences |
+| Slug | Status | Evidence | Notes |
+| ---- | ------ | -------- | ----- |
+| `txt-extension-recognized` | done | `core/src/indexer.rs` (`is_indexable_path`, `process_upsert` chunker dispatch) | walker, watcher router, and per-file chunker dispatch all consult `is_indexable_path`; `Chunker` trait + `MarkdownChunker`/`TxtChunker` live under `core::chunker` |
+| `txt-render-as-markdown-default` | partial | `ui/src/main.ts` (`languageExtensionForPath`, `RENDER_TXT_AS_MARKDOWN`) | hardcoded `true` until `settings-vault-config-toml` lands; reconfigured on `openFile` and trash preview |
+| `txt-chunker-paragraph-splits` | done | `core/src/chunker/txt.rs` (`chunk_txt`, `build_sections`) | Layer 1 baseline subsumed by Layer 3 sentence-packing within sections |
+| `txt-chunker-structure-heuristics` | done | `core/src/chunker/txt.rs` (`detect_headings`, `is_setext_underline`, `looks_like_all_caps_heading`) | ALL-CAPS + setext `===`/`---`; lists/blockquotes flow as content per spec |
+| `txt-chunker-sentence-pack` | done | `core/src/chunker/txt.rs` (`sentence_pack_range`, `segment_sentences`) | ~1200-char soft cap shared with markdown chunker |
+| `txt-chunker-guardrails` | done | `core/src/chunker/txt.rs` (`detect_code_regions`, `last_caps_promotion` window) | code-region exclusion + max-one ALL-CAPS promotion per 5-line window; period+space rule lives in `segment_sentences` |
+| `txt-abbreviation-allowlist` | done | `core/src/chunker/txt.rs` (`abbreviations::ALL`, `is_abbreviation_ending_at`) | `Mr.`/`Dr.`/`e.g.`/`i.e.`/`etc.`/... |
 
 
 ## Observability (observability.md)
 
-All planned. Lands early so later modules ship instrumented from day one.
+v1 slice is just "init `tracing` and write to a file." Spans, in-app viewer, and the frontend bridge are deferred until file logs stop answering questions.
+
+### v1
 
 | Slug | Status | Notes |
 | ---- | ------ | ----- |
-| `obs-tracing-baseline` | planned | `tracing` + `tracing-subscriber` + `tracing-appender`; no `log`, no `println!` for diagnostics |
-| `obs-spans-pipeline` | planned | spans wrap pipeline stages, not individual fn calls |
-| `obs-env-filter` | planned | `HIKER_LOG` env var drives `EnvFilter`; defaults `info,hiker=debug` |
-| `obs-log-files` | planned | file layer at `vault/.hiker/logs/hiker.log` |
-| `obs-log-rotation` | planned | daily rotation via `tracing-appender`, 7-day retention |
-| `obs-instrument-watcher` | planned | one span per debounced event; raw events at `trace!` only |
-| `obs-instrument-indexer` | planned | top-level span per job; child spans for chunk / embed / store |
-| `obs-instrument-embed` | planned | span with `batch_size`, elapsed; per-batch event |
-| `obs-instrument-store` | planned | slow-query log at >100ms; no per-call span |
-| `obs-instrument-cluster` | planned | top-level span on reconcile; per-level child spans |
-| `obs-tauri-command-spans` | planned | `#[instrument]` on every `#[tauri::command]` |
-| `obs-frontend-bridge` | planned | `log_from_frontend` Tauri command emits server-side `tracing` events |
-| `obs-log-tauri-channel` | planned | custom `tracing` layer fans events to a `tokio::broadcast`; Tauri emits `hiker:log-event` |
-| `obs-log-ring-buffer` | planned | server-side ring (default 2000 events) for panel history; `get_log_buffer` Tauri cmd |
-| `obs-log-viewer-panel` | planned | collapsible UI panel: live event stream, level + free-text filter, pause/resume, open-log-file button |
-| `obs-error-context` | planned | structured fields on `error!`; no string-interpolated context |
-| `obs-no-content` | planned | log titles/paths but never note body text |
-| `obs-no-secrets` | planned | `tracing::field::Empty` pattern; never Display config containing keys |
-| `obs-test-subscriber` | planned | `core::test_support::init_tracing()` per-test, no global init |
+| `obs-tracing-baseline` | done | `core/src/observability.rs` (`init_tracing`); `ui/src-tauri/src/lib.rs` (`pick_vault` calls it). All prior `eprintln!` in `core::indexer` / `core::store` / `core::watcher` converted to `tracing::{debug,info,warn,error}!` |
+| `obs-log-files` | done | `core/src/observability.rs` (`init_tracing`) — file layer writes `<vault>/.hiker/logs/hiker.log` alongside the stderr layer |
+| `obs-log-rotation` | done | `core/src/observability.rs` — `tracing_appender::rolling::Builder` with `Rotation::DAILY` + `max_log_files(7)` |
+| `obs-error-context` | done | pattern applied throughout core — e.g. `core/src/indexer.rs` upsert err branch uses `error!(error = %e, path = %rel_path, ...)`; no string-interpolated context |
+| `obs-no-content` | done | discipline-only; v1 events log paths/reasons/counts only, never note body text. Documented at the top of `core/src/observability.rs` |
+| `obs-no-secrets` | done | discipline-only; nothing in v1 logs auth tokens or API keys (no such config exists yet). Documented at the top of `core/src/observability.rs` |
+
+### Deferred (post-v1)
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `obs-spans-pipeline` | planned | spans wrap pipeline stages, not individual fn calls; deferred — adopt when flat events get hard to correlate |
+| `obs-env-filter` | planned | `HIKER_LOG` env var drives `EnvFilter`; defaults `info,hiker=debug`; deferred — v1 hardcodes the default |
+| `obs-instrument-watcher` | planned | one span per debounced event; raw events at `trace!` only; deferred behind `obs-spans-pipeline` |
+| `obs-instrument-indexer` | planned | top-level span per job; child spans for chunk / embed / store; deferred behind `obs-spans-pipeline` |
+| `obs-instrument-embed` | planned | span with `batch_size`, elapsed; per-batch event; deferred behind `obs-spans-pipeline` |
+| `obs-instrument-store` | planned | slow-query log at >100ms; no per-call span; deferred (slow-query log itself is a fine v1 add if needed) |
+| `obs-instrument-cluster` | planned | top-level span on reconcile; per-level child spans; deferred until clustering lands |
+| `obs-tauri-command-spans` | planned | `#[instrument]` on every `#[tauri::command]`; deferred behind `obs-spans-pipeline` |
+| `obs-frontend-bridge` | planned | `log_from_frontend` Tauri command emits server-side `tracing` events; deferred until there's a real frontend error worth catching |
+| `obs-log-tauri-channel` | planned | custom `tracing` layer fans events to a `tokio::broadcast`; Tauri emits `hiker:log-event`; deferred behind in-app viewer |
+| `obs-log-ring-buffer` | planned | server-side ring (default 2000 events) for panel history; `get_log_buffer` Tauri cmd; deferred behind in-app viewer |
+| `obs-log-viewer-panel` | planned | collapsible UI panel: live event stream, level + free-text filter, pause/resume, open-log-file button; deferred — file logs cover v1 |
+| `obs-test-subscriber` | planned | `core::test_support::init_tracing()` per-test, no global init; deferred until a failing test wants logs |
 | `obs-perf-flamegraph` | planned | deferred; one-line `tracing-flame` add when needed |
 
 

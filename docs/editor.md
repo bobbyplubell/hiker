@@ -99,6 +99,8 @@ Bottom strip across the editor pane only (not under the tree). Three regions: [s
 
 - left: save button + dirty dot, current file **basename** (e.g. `note.md`), with the full vault-relative path in a `title=` tooltip on hover. [status-bar-path-basename-tooltip]
 - center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later. [status-bar-index-label]
+
+  When the *active buffer*'s file is in a non-indexed state (per `tauri-cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
 - right: line:col, word count, file type badge (`md`)
 
 Why basename rather than full path: the file tree already shows location, the window title (`Hiker — <path>`) carries the disambiguation when needed, and full paths overflow the bar on deep vaults. Basename answers "what's open right now"; the tooltip + tree cover "where does it live." Once tabs land the per-tab basename label uses the same rule.
@@ -121,10 +123,16 @@ Three columns, both sides collapsible: [three-column-layout]
 
 - **Left**: file tree (existing `#sidebar`). Collapsible. Supports drag-and-drop to move notes between folders — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command. [drag-and-drop-move]
 
-  Tree toolbar at the top of the sidebar: a wide **+ New note** button and a small refresh icon next to it. The asymmetry is the point — new-note is a frequent action, refresh is a sanity-check fallback.
+  Tree toolbar at the top of the sidebar: a wide **+ New note** button and a small **`…`** actions menu next to it. The asymmetry is the point — new-note is a frequent action; the menu is the bucket for everything else. [tree-toolbar-actions-menu]
 
   - **New note** creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [create-note-button]
-  - **Refresh** re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; the manual button stays even after that lands. [tree-refresh-manual, tree-refresh-watcher]
+  - **`…` menu** opens a small popover with the v1 entries below. Adding new entries is intentionally low-friction — the menu is the catch-all for low-frequency tree-scoped actions, so future verbs slot in here rather than growing the toolbar.
+    - **Refresh tree** — re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; refresh stays even after that lands. [tree-refresh-manual, tree-refresh-watcher]
+    - **Reindex all** — full-vault reindex via `reindex-all-action` (see `index.md`). No confirm modal: re-embedding identical content is non-destructive, and the user opted in by clicking.
+    - **Reindex this file** — single-file reindex via `reindex-current-file-action`; greyed when no file is active.
+    - **Sort by ▸** — submenu of mutually-exclusive sort orders applied to the file tree (folders always grouped first; the chosen order applies within folders and within files). v1 entries: **Name (A→Z)** (default), **Name (Z→A)**, **Modified (newest first)**, **Modified (oldest first)**. Selection persists in memory only for v1; per-vault persistence is a `settings.md` concern when that surface lands. Modified time comes from the filesystem's mtime — same field the watcher and indexer already use, no new metadata. [tree-sort-options]
+
+    A destructive **Reindex (rebuild)** verb — drops and recreates the schema before reindexing — is deferred to the settings page (`settings.md`). The CLI counterpart `cli-reindex-rebuild` covers the operational case in the meantime.
 
   ### API & edge cases
 
@@ -188,12 +196,91 @@ Three columns, both sides collapsible: [three-column-layout]
   - **Trash itself missing** — auto-create on first delete (`std::fs::create_dir_all`).
   - **Trash entry collision** — should be impossible thanks to the timestamp prefix, but if two deletes land in the same second on the same path the second one gets a `_2`, `_3`, ... suffix.
   - **CLI parity** — `hiker rm <path>` invokes the same core command. `--yes` skips the confirm prompt. `hiker trash list`, `hiker trash restore <id>`, `hiker trash empty` round out the CLI surface.
-- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. [panel-toggle-buttons]
+
+  ### Trash bin in tree
+
+  The trash needs a visible surface or users will lose track of what they've deleted. v1 puts a pinned `🗑 Trash (N)` row at the **bottom** of the file tree, below the regular vault entries. The bottom position keeps the trash present-but-out-of-the-way: tree scrolling lands on real notes first, and the deletion surface doesn't compete for visual priority with the working set. Expand the row to see deleted notes; collapse it to make it disappear. `N` is the count of entries currently in the trash; `Trash` (no count) when empty. [tree-trash-bin]
+
+  Headline decisions:
+
+  - **Disk is the source of truth for what's in the bin.** The panel is built by walking `<vault>/.hiker/trash/` directly — every file there shows up. The manifest is consulted for *original path* and *deletion time* only, and only on a per-entry basis. Files dropped into `.hiker/trash/` by hand, or entries whose manifest row got corrupted, still appear and can still be emptied. The manifest is a hint, not a gate. [tree-trash-disk-listing]
+  - **Flat list, sorted by deletion time descending.** No reconstruction of the original folder structure inside the bin. Trash is a recovery surface ("the thing I deleted ten minutes ago"), not a working tree. Each row shows the basename, a relative-time hint (`5m ago`, `yesterday`, `Mar 12`), and the original path as muted secondary text. Folder entries get a `▸` glyph and a `(N notes)` count derived from the manifest's `members` (or `?` if the entry is orphaned and we can't tell). [tree-trash-flat-by-deleted]
+  - **Click → read-only preview.** Single click on a trash row opens the file in the editor in a non-editable mode (CodeMirror `EditorState.readOnly.of(true)` plus a banner across the top: "Trash preview · Restore to edit"). The buffer's `path` is set to the on-disk trash location, `loadedHash` is set, but `isDirty` is forced false and the save button hides. Switching away from a trash preview discards nothing — there's nothing to discard. [tree-trash-preview]
+  - **Right-click → Restore / Delete permanently.** Per-row context menu has two entries. Restore calls `vault-trash-restore` and re-ingests the note (see below). Delete permanently removes that single entry from disk + manifest, with a confirm modal that says "Permanently delete `<original_path>`? This cannot be undone." Same `confirmDanger` modal pattern the soft-delete uses. [tree-trash-restore-action]
+  - **Top-level right-click → Empty trash.** Right-clicking the `🗑 Trash` header itself opens a single-entry menu: "Empty trash (N entries)". Calls `vault-trash-empty` after the same `confirmDanger` modal. Disabled when `N == 0`. [tree-trash-empty-action]
+
+  #### Restore semantics
+
+  Restore is a `move_note` from the trash entry's on-disk location to its `original_path` (looked up from the manifest), followed by a re-ingest so search/related see it again. Because `move_note` already routes through the indexer's owned store connection and emits the correct watcher suppression, restore inherits that path for free — no separate code, no second writer. The store-side effect of restore is identical to a fresh import: a new ulid, fresh chunks, fresh embeddings. We do *not* try to preserve the pre-delete note id; chunk ids and the note id were freed by the original `delete_note` cascade and the v1 stable-id story doesn't extend across the trash boundary. Worth revisiting if/when MCP agents start pinning to chunk ids and a delete+restore round trip needs to look like a no-op.
+
+  Edge cases:
+
+  - **Original path now occupied** — restore fails with a clear message ("`<original_path>` already exists; rename it first or restore to a new location"). v1 doesn't offer an in-app target picker; the workaround is to rename the conflicting file in the tree, then retry restore. CLI has the same constraint per `vault-trash-restore`.
+  - **Original parent directory missing** — auto-create on restore. Different from the explicit-mutation `move_note` rule (which errors on missing parent) because the user's intent here is unambiguous: put it back where it was. If the parent was itself deleted into the trash, a cascade restore is *not* attempted — the user restores the parent first. We surface this as the same "not found" error.
+  - **Orphaned entry (no manifest row)** — restore is unavailable for that row; the menu entry is greyed with tooltip "No original location recorded — drag out of `.hiker/trash/` manually". Empty trash and Delete permanently still work. [tree-trash-orphan-recovery]
+  - **Folder entry restore** — restores the entire trashed subtree to `original_path` via a recursive `move_note`-equivalent walk, then re-ingests every `.md` in the manifest's `members`. Single transaction across the store updates so search either sees all of it or none.
+
+  #### Interactions and constraints
+
+  - **No drag in or out of the trash row.** Restore is an explicit verb, not a DnD gesture. Dragging a regular tree note onto the trash header could plausibly be a delete shortcut, but the existing right-click → Delete plus the confirm modal already covers that path; adding a second route doubles the surface for accidents.
+  - **Default state: collapsed.** First open of a vault shows the trash row collapsed regardless of count. Persistence of the expanded/collapsed state across launches is deferred to `settings.md`.
+  - **Refresh.** The manual refresh button (`tree-refresh-manual`) re-walks the trash dir alongside the vault. The watcher's `.hiker/` ignore stays in place, so trash entries do not auto-refresh on filesystem events; this is intentional — trash is changed only by Hiker actions, and after each one the panel re-reads itself. If a user manually edits the trash dir, refresh picks it up.
+  - **Index isolation.** Trash entries are never indexed, never appear in search/related, never count toward `Indexed (N notes)` in the status bar. Already covered by the watcher's `.hiker/` ignore and the walker's startup-scan path skipping `.hiker/`; restated here so future indexer changes don't accidentally include trash content.
+
+  #### Out of scope (deferred)
+
+  - In-app target picker for restore-into-occupied-path conflicts (CLI workaround is fine for v1).
+  - Auto-empty policies (`trash.retention_days`, `trash.max_size_mb`) — same as the existing `vault-trash-empty` deferral.
+  - Drag-out-of-trash to a specific tree location (would need a target-picker UX too; restore-to-original covers the common case).
+  - Bulk select + restore/delete (multi-row selection isn't a v1 tree feature anywhere else).
+  - Frontmatter-editing-aware preview (the preview is read-only; richer trash inspection waits for `tree-context-properties`).
+
+  ### Tree-row index-state markers
+
+  Beyond the dirty-suffix dot (`dirty-tree-dot`), each tree row reflects its file's index state with at most one small marker rendered as a suffix glyph (right of the filename, on the same side as the dirty dot). One marker per row, mutually exclusive across the three states. The two suffix glyphs use distinct DOM slots — the dirty dot is a `li::after` pseudo-element, the index marker is a child `.ix-marker` span — so a row can carry both ("dirty *and* queued") without colliding for the single `::after` slot. Indexed-and-clean — the common case — shows nothing on either, keeping the tree visually quiet.
+
+  - **Unsupported** — hollow grey dot. The file's extension has no chunker (anything outside `.md`, `.markdown`, `.txt` in v1). Derivable client-side from the path; no index lookup needed. [tree-row-unsupported-marker]
+  - **Skipped** — amber filled dot. The indexer attempted ingest and refused (>5MB sanity cap, UTF-8 decode failure, future: corrupted source). Reason string from the indexer (`"file too large"`, `"not UTF-8"`) shown in the row's `title=` tooltip. [tree-row-skipped-marker]
+  - **Queued / mid-index** — pulsing accent dot. Transient; clears when the file's index job completes. Driven by `hiker:reindex-progress` events so no polling is needed. [tree-row-queued-marker]
+
+  State is supplied by `tauri-cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
+
+- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. The same toolbar hosts the `View ▾` menu (see `## View options menu`) and reserves a slot for the deferred `Mutations ▾` menu (see `note-mutations-menu` in "Out of scope" below). [panel-toggle-buttons]
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md). [related-notes-panel-ui]
 
 Default state on first launch: tree open, related panel collapsed. Persistence of these toggles across launches is a settings concern (see settings.md) — for v1 the state lives in-memory only.
 
 CSS: a 3-column grid where the side columns collapse to width 0 (or `display: none`) when toggled. Editor column is `1fr`; sides are fixed widths. Toolbar lives inside the editor column so the buttons sit where the user's eyes naturally are.
+
+
+## View options menu
+
+The editor pane's top toolbar (`panel-toggle-buttons`) gains a `View ▾` menu button alongside the tree- and related-panel toggles. The menu hosts display-only toggles — flips that change how the active note is rendered without touching the file or the index. Sibling to the deferred `note-mutations-menu`; the split is clean: View changes pixels, Mutations changes bytes. [editor-view-options-menu]
+
+Each entry is a checkable item — checkmark when active, click flips it, menu closes on click. State is in-memory only for v1. Persistence (per-vault, per-user, or both) is a `settings.md` concern when that surface lands; users will expect toggle state to survive a relaunch, so this menu is one of the first hooks the settings work picks up.
+
+### v1 entries
+
+- **Show chunk boundaries** — overlays the editor with a thin horizontal rule between chunks (pale reddish-orange — visible against prose without competing for attention) and the chunk index (`0`, `1`, `2`, ...) in the gutter at each chunk's start line. Backed by `tauri-cmd-chunks-for-path` (see `index.md`) which returns the active note's chunk bounds. Refreshes on save (debounced 500ms, same cadence as the related-notes panel). When the file isn't indexed (unsupported / skipped / queued per `tauri-cmd-file-index-state`), toggling on shows nothing and a faint hint in the gutter explains why. CodeMirror integration: a `StateField<DecorationSet>` plus a `gutter` extension; sits in its own slot in the CM6 extension order (after language, before keymap). [view-show-chunk-boundaries]
+
+  This is genuinely a debugging-grade view of the chunker's output — useful while txt-ingest is hardening, and useful long after as a sanity check when chunker behavior changes.
+
+### Reserved entries (greyed in v1, enabled when their backing feature lands)
+
+These appear in the menu now so the surface is predictable, but render greyed-out with a tooltip naming the dependency. Putting the slot up front is also a forcing function for designing each backing feature with the toggle in mind.
+
+- **Live preview** — hide/show markdown syntax markers on cursor-out. Specced in `live-preview.md`; entry becomes live (default on) when that ships. [view-live-preview-toggle]
+- **Render .txt as markdown** — session-scope override of `txt-render-as-markdown-default`. Greyed until `settings-vault-config-toml` lands and gives the per-vault default a real loader; see `txt-ingest.md`. Different scope from the per-note override that doc explicitly rejects — this one is "for the current app session, flip the vault default," no file mutation, no persistence in v1. [view-render-txt-as-markdown-toggle]
+- **Word wrap** — session-scope override of `settings-section-editor`'s wrap default. [view-word-wrap-toggle]
+- **Show whitespace** — toggles CM6's whitespace-rendering extension. [view-show-whitespace-toggle]
+- **Show line numbers** — toggles the line-number gutter. [view-line-numbers-toggle]
+- **Show heading breadcrumb** — overlays each chunk with its `heading_path` (already stored on chunks). Pairs with chunk boundaries; defer until both have a real user. [view-heading-breadcrumb-toggle]
+
+### Out of scope (this menu)
+
+- Content-mutating actions — those live in `note-mutations-menu`.
+- Per-file scoped toggles. The menu's scope is "active buffer at most"; per-file persistence is a frontmatter concern that doesn't exist in v1.
+- Theme / font / color-scheme — those belong in settings, not a quick toggle.
 
 
 ## Extension load order (CM6)
@@ -218,7 +305,7 @@ Editor instance is created once at startup and reused across buffer switches; sw
 
 ## Out of scope (deferred)
 
-- Live-preview decorations (syntax-marker hiding on cursor-out)
+- Live-preview decorations (syntax-marker hiding on cursor-out) — specced in `live-preview.md`
 - Wikilink rendering and autocomplete
 - Widget-based rendering (images, math, embeds, callouts)
 - Multi-buffer / tabs / split panes
@@ -226,3 +313,4 @@ Editor instance is created once at startup and reused across buffer switches; sw
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)
 - External-change watcher integration (v1)
+- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content, with user-selectable backend: tiny local-CPU model (e.g. Qwen2.5-0.5B / SmolLM2 / Gemma-3-270m via `llama.cpp` or `mistral.rs`), local LLM API (any OpenAI-compatible endpoint — Ollama, LM Studio, llama-server), or cloud LLM API. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched and the derived view is opt-in. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. [note-mutations-menu]

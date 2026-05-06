@@ -181,6 +181,7 @@ Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_h
 - `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [tauri-cmd-related-notes]
 - `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. [tauri-cmd-index-status]
 - `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events. [tauri-cmd-index]
+- `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [tauri-cmd-chunks-for-path]
 
 `RelatedHit` shape (note-level, since the v1 panel renders by note):
 
@@ -196,6 +197,34 @@ struct RelatedHit {
 ```
 
 DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` per design.md:371.
+
+
+## Per-file index state
+
+The `notes` row already answers "is this file indexed" — presence + non-zero chunks = yes. v1 expands the surface so the UI can also explain *why not* when the answer is no, and render a distinct tree-row marker for each case (see `tree-row-unsupported-marker` / `tree-row-skipped-marker` / `tree-row-queued-marker` in `editor.md`). Three non-indexed states:
+
+- **Unsupported** — the extension has no chunker (`is_indexable_path` returns false). Derivable client-side from the path; no store row required. The indexer never sees the file.
+- **Skipped** — a chunker exists but ingest refused: file exceeded the 5MB sanity cap, failed UTF-8 decode, or (future) hit a corrupted-source signal. The indexer records the attempt as a `notes` row with a `skipped` flag set and a short `skip_reason` string. Storing the row (rather than dropping silently) is what lets the UI distinguish "skipped on purpose" from "never seen."
+- **Queued** — the file is in the indexer's mpsc queue or actively processing. Transient; not stored — exposed via `hiker:reindex-progress` events.
+
+Schema addition (v1 schema bumps to `user_version = 2`): `notes.skipped` (BOOLEAN, default 0) and `notes.skip_reason` (TEXT, NULL when not skipped). Per the migration policy in `store-version-fail-loud`, the bump is handled by deleting `.hiker/index.db` and re-indexing until real-data use begins.
+
+Surface:
+
+- `index_state_for(path: String) -> IndexState` Tauri command. Returns `Indexed`, `Unsupported`, `Skipped { reason: String }`, or `Queued`. One path lookup; cheap enough for the tree to call lazily on render of visible rows. The skip reason is a stable, short, human-readable string (`"file too large"`, `"not UTF-8"`) used directly in tooltips and the status bar — no translation layer. [tauri-cmd-file-index-state]
+- `hiker:reindex-progress` events (per `ingest-progress-events`) carry per-file transitions, so the tree flips rows from Queued → Indexed (or Skipped) without polling.
+
+Indexer logic: when ingest decides to skip a file, write the `notes` row with `skipped = 1` and a reason; do not chunk, do not embed. A subsequent successful re-ingest of the same path clears the flag. Deletes cascade as before (`ingest-delete-cascade`).
+
+
+## Reindex verbs
+
+`tauri-cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the tree toolbar's `…` menu (see `editor.md`'s `tree-toolbar-actions-menu`):
+
+- **Reindex all** — `index(IndexScope::All)`. No confirm modal; re-embedding identical content is non-destructive and the click is the opt-in. [reindex-all-action]
+- **Reindex this file** — `index(IndexScope::Path(currentPath))`. Greyed when no file is active. [reindex-current-file-action]
+
+A third verb, **Reindex (rebuild)** — drops + recreates the schema, then a full reindex — is deferred to the settings page per `settings.md`'s indexing section. The CLI counterpart `cli-reindex-rebuild` covers the operational case in the meantime, so v1 ships without the in-app rebuild button. [reindex-rebuild-action]
 
 
 ## Walker symlink handling

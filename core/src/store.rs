@@ -14,9 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::chunker::Chunk;
 use crate::error::HikerError;
 
-/// Bumped only when on-disk schema changes. v1 = 1. Pre-real-use policy: a
-/// mismatch is an error, not a migration trigger — see docs/index.md.
-pub const SCHEMA_VERSION: i32 = 1;
+/// Bumped only when on-disk schema changes. Pre-real-use policy: a mismatch
+/// is an error, not a migration trigger — delete `.hiker/index.db` and
+/// re-index. See docs/index.md `store-version-fail-loud`.
+///
+/// v2 added `notes.skipped` + `notes.skip_reason` so the indexer can
+/// distinguish "skipped on purpose" from "never seen" across launches.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Embedding dimension for the v1 model (bge-small-en-v1.5). Pinned here so
 /// the schema and the embedder agree.
@@ -53,6 +57,13 @@ pub struct NoteRow {
     pub size: i64,
     pub indexed_at: i64,
     pub embedder_version: String,
+    /// True when the indexer attempted but refused this file (file too large,
+    /// non-UTF-8, ...). The row exists so the UI can mark the file as
+    /// Skipped across launches; chunks/vecs are not written for skipped rows.
+    pub skipped: bool,
+    /// Short, stable, human-readable reason — used directly in tooltips and
+    /// the status bar (`"file too large"`, `"not UTF-8"`).
+    pub skip_reason: Option<String>,
 }
 
 /// Stored chunk metadata (without the embedding — fetch via knn_chunks for
@@ -65,6 +76,17 @@ pub struct ChunkRow {
     pub byte_start: u64,
     pub byte_end: u64,
     pub text: String,
+    pub heading_path: Option<String>,
+}
+
+/// Public chunk-bounds DTO returned by `chunk_bounds_for` — the wire shape
+/// for the chunk-boundary editor decoration. Omits `text` and `note_id` to
+/// keep the payload small; the UI only needs offsets + heading_path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkBounds {
+    pub chunk_index: u32,
+    pub byte_start: u64,
+    pub byte_end: u64,
     pub heading_path: Option<String>,
 }
 
@@ -162,7 +184,8 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, path, content_hash, mtime, size, indexed_at, embedder_version
+                "SELECT id, path, content_hash, mtime, size, indexed_at, embedder_version,
+                        skipped, skip_reason
                  FROM notes WHERE path = ?1",
                 params![rel_path],
                 map_note_row,
@@ -185,6 +208,34 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT path FROM notes")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Ordered chunk bounds for the note at `rel_path`. Empty vec for an
+    /// unindexed or empty note — never errors on absence, per spec.
+    /// Slimmer than `get_note_chunks` (no chunk text), so the wire payload
+    /// to the editor pane stays small even on long notes.
+    ///
+    /// status: tauri-cmd-chunks-for-path
+    pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, StoreError> {
+        let id = match self.id_for_path(rel_path)? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_index, byte_start, byte_end, heading_path
+             FROM chunks WHERE note_id = ?1 ORDER BY chunk_index",
+        )?;
+        let rows = stmt
+            .query_map(params![id], |row| {
+                Ok(ChunkBounds {
+                    chunk_index: row.get::<_, i64>(0)? as u32,
+                    byte_start: row.get::<_, i64>(1)? as u64,
+                    byte_end: row.get::<_, i64>(2)? as u64,
+                    heading_path: row.get(3)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -214,17 +265,20 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
 
-        // Upsert notes row.
+        // Upsert notes row. Successful upsert clears any prior Skipped flag
+        // — the file made it through ingest, so it's no longer skipped.
         tx.execute(
-            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL)
              ON CONFLICT(id) DO UPDATE SET
                path = excluded.path,
                content_hash = excluded.content_hash,
                mtime = excluded.mtime,
                size = excluded.size,
                indexed_at = excluded.indexed_at,
-               embedder_version = excluded.embedder_version",
+               embedder_version = excluded.embedder_version,
+               skipped = 0,
+               skip_reason = NULL",
             params![
                 upsert.id,
                 upsert.path,
@@ -283,6 +337,75 @@ impl Store {
         Ok(())
     }
 
+    /// Record an attempted-but-refused ingest. Writes (or updates) a `notes`
+    /// row with `skipped = 1` and the supplied reason; no chunks, no
+    /// embeddings. Any prior chunks for this note are cleared so a file
+    /// that was Indexed and is now Skipped doesn't keep stale hits.
+    /// `content_hash` and `embedder_version` are stored empty — the row
+    /// exists for state, not for retrieval.
+    pub fn upsert_skipped(
+        &mut self,
+        rel_path: &str,
+        reason: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+
+        // Reuse an existing id for this path if we have one, else mint a new
+        // one — same rule as the indexed path so renames keep working.
+        let id: String = match tx
+            .query_row(
+                "SELECT id FROM path_ids WHERE path = ?1",
+                params![rel_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            Some(id) => id,
+            None => new_id(),
+        };
+        let indexed_at = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tx.execute(
+            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason)
+             VALUES (?1, ?2, '', ?3, ?4, ?5, '', 1, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               path = excluded.path,
+               mtime = excluded.mtime,
+               size = excluded.size,
+               indexed_at = excluded.indexed_at,
+               skipped = 1,
+               skip_reason = excluded.skip_reason",
+            params![id, rel_path, mtime, size, indexed_at, reason],
+        )?;
+
+        tx.execute(
+            "INSERT INTO path_ids (path, id) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET id = excluded.id",
+            params![rel_path, id],
+        )?;
+
+        // Clear any chunks/vecs left over from a previous successful ingest.
+        let old_chunk_ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
+            let ids = stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+        for cid in &old_chunk_ids {
+            tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
+        }
+        tx.execute("DELETE FROM chunks WHERE note_id = ?1", params![id])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Delete a note by id. Cascades through `chunks`; `chunk_vecs` cleaned
     /// up explicitly. `path_ids` for this id are removed too — a deleted
     /// note no longer has a stable path mapping.
@@ -302,6 +425,43 @@ impl Store {
         tx.execute("DELETE FROM path_ids WHERE id = ?1", params![note_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Delete many notes by vault-relative path in a single transaction.
+    /// Paths not present in the index are silently skipped — used by folder
+    /// delete, where some `.md` files in the tree may simply have never been
+    /// ingested. Returns the number of notes that were actually removed.
+    pub fn delete_notes_by_paths(
+        &mut self,
+        rel_paths: &[String],
+    ) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut removed = 0;
+        for rel in rel_paths {
+            let id_opt: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM path_ids WHERE path = ?1",
+                    params![rel],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = id_opt else { continue };
+            let chunk_ids: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
+                let ids = stmt
+                    .query_map(params![id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                ids
+            };
+            for cid in &chunk_ids {
+                tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
+            }
+            tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM path_ids WHERE id = ?1", params![id])?;
+            removed += 1;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Rename: update `notes.path` and add a new `path_ids` row for the new
@@ -526,6 +686,8 @@ fn map_note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
         size: row.get(4)?,
         indexed_at: row.get(5)?,
         embedder_version: row.get(6)?,
+        skipped: row.get::<_, i64>(7)? != 0,
+        skip_reason: row.get(8)?,
     })
 }
 
@@ -575,7 +737,9 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             mtime            INTEGER NOT NULL,
             size             INTEGER NOT NULL,
             indexed_at       INTEGER NOT NULL,
-            embedder_version TEXT NOT NULL
+            embedder_version TEXT NOT NULL,
+            skipped          INTEGER NOT NULL DEFAULT 0,
+            skip_reason      TEXT
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -607,6 +771,10 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
 
     if user_version == 0 {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tracing::info!(
+            schema_version = SCHEMA_VERSION,
+            "store: created index db schema",
+        );
     }
     Ok(())
 }
@@ -631,7 +799,10 @@ fn register_vec_extension() {
             // OOM or a pathologically broken sqlite build; if it does fail,
             // every subsequent Store::open will surface a clearer "vec_*
             // function not found" error, so log and continue.
-            eprintln!("[hiker::store] sqlite-vec auto-extension register failed: {e}");
+            tracing::error!(
+                error = %e,
+                "sqlite-vec auto-extension register failed",
+            );
         }
     });
 }

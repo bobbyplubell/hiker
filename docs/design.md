@@ -234,7 +234,7 @@ Query pipeline (compose as needed):
 User-authored layer on top of the automatic indexes:
 
 - Collections / saved queries (named groupings — tags, folder globs, manual note IDs + order)
-- Curated tree from auto-gen clustering — see "Curated tree placement" below
+- Auto-generated reorganization suggestions and inbox triage — see "Auto-organization suggestions" below, and `suggestions.md` for the full surface
 - Pinned anchors / landmarks (other notes get a "nearest landmark" tag in embedding space)
 - Trails (memex-style): ordered, named sequences of notes or chunks with **per-waypoint annotations**. A trail is a curated walk through the vault — narrative, not just a set. Useful for investigations ("how I figured out X"), onboarding docs to past projects, or feeding an agent a coherent path rather than a bag of chunks. Trails are queryable via MCP and renderable as a guided walk in the UI.
 
@@ -245,38 +245,16 @@ User-authored layer on top of the automatic indexes:
   Full mechanics (storage, creation UX, branching vs. linear, agent authorship) deferred to a dedicated `trails.md` when this lands (v4+).
 
 
-## Curated tree placement
+## Auto-organization suggestions
 
-Each node in the curated tree stores:
+Hiker's clustering pipeline (`clustering.md`) is consumed as a *recommendation engine*, not as durable infrastructure that owns the user's organization. The user organizes their vault; the AI suggests improvements; neither pretends to own the layout. Two flows live on the same engine:
 
-- centroid — mean of member-note embeddings; updated incrementally on add/remove
-- radius — distance threshold for "belongs here," computed as a quantile (e.g. 90th percentile) of member distances from centroid
-- representatives — optional k>1 representative points for multi-modal nodes whose members fall in distinct sub-clusters
-- accepts_direct_members — bool; false for purely structural nodes whose role is to group children
-- member_count
+- **One-shot reorganization** — user runs `hiker suggest`, gets a markdown proposal of moves and tags, picks what to apply. Tree is ephemeral; nothing persists except the user's accepted actions and a small rejection log. Each suggestion can be applied as a folder move (filesystem rename) or as a frontmatter tag — the user picks per cluster, with per-note overrides.
+- **Saved-tree triage** — user saves a generated tree as a classifier. New notes (default scope: `inbox/`) get auto-routed against it via greedy centroid descent. Confidence-tiered behavior: high → auto-apply with toast + 10s Undo, medium → queue for review, low → leave in inbox.
 
-New-note placement (greedy descent): [cluster-place-greedy-descent]
+Triage will not move a note out of any folder *other* than the configured triage scope — the worst case for an over-eager classifier is "wrong subfolder under inbox," never "your important note got moved out from under you." That's the load-bearing safety rule.
 
-- Start at root. At each node, find children whose centroid is within (similarity ≥ centroid - threshold) and recurse into the best match.
-- Stop when no child improves on the current node (or when the current node is a leaf).
-- If `accepts_direct_members: false`, continue down regardless; pick the best leaf descendant.
-- Result is a proposed placement with confidence score. High confidence → auto-place; medium → propose for review; low → leave in inbox.
-
-Manual placement is sticky: a note's frontmatter records `hiker.placement: manual | auto:vN | confirmed`. Auto-placement never overrides manual or confirmed.
-
-
-## Reconciliation between auto-clustering and curated tree
-
-`hiker reconcile` runs the clustering pass over the current corpus and emits a proposal at `vault/.hiker/proposals/<timestamp>.yaml`. Each delta is one of four categories:
-
-- Match — auto-cluster maps to existing curated node. No-op or update centroid if it shifted significantly.
-- New cluster — proposed new node with suggested name, parent, and member list.
-- Orphan — curated node whose members migrated elsewhere or were removed; flagged for review.
-- Conflict — note manually placed at A, auto-clustering says B with high confidence.
-
-Review flow: `hiker reconcile apply <proposal>` opens an interactive accept/reject per delta. Accepted changes update the tree config and centroids. Rejected deltas are logged in `.hiker/reconcile-history.yaml` so future passes don't re-propose them indefinitely.
-
-Placement provenance fields on every node and placement (`manual`, `auto:vN`, `confirmed`) drive the stickiness rules above.
+There is no per-note `hiker.placement` provenance, no parallel curated-tree-vs-filesystem mental model, and no durable cluster identity carried across runs. The filesystem (and, in tag-mode, frontmatter tags) is the only source of truth. See `suggestions.md` for the full surface — proposal file format, apply mechanic, tag-field configurability, triage thresholds, and the deferred folder-pinning escape hatch.
 
 
 ## Enrichment pipeline
@@ -295,7 +273,7 @@ Stages (each independent, opt-in per-vault):
 - Type classification — runs as a facet of auto-tag (`type:lecture`, `type:meeting`, `type:recipe`, `type:reference`, ...). Not a separate pipeline; reuses auto-tag machinery and vocabulary file.
 - Entity extraction — NER over note content; populates the entity index. Coreference resolution (Lamport / Leslie Lamport / L. Lamport → one entity) handled with embedding-similarity merging, conservative on auto-merge to avoid false positives.
 - Reference extraction — extracts URLs, file paths, hashes, mentioned artifacts (firmware blobs, ROM images, binaries, datasheet IDs) into a `references:` frontmatter list. Lightweight — pattern-matching primarily, no academic citation parsing. Each reference is resolvable: a hash matches a file in `.hiker/refs/`, a URL matches a scraped reference doc, a path matches an external-file note. References become queryable typed edges.
-- Curated-tree placement — runs the centroid-descent placement above; writes `hiker.placement` to frontmatter.
+- Triage routing — runs the saved-tree classifier (see `suggestions.md`) on notes saved within the configured triage scope. Either moves the file or writes a frontmatter tag (per the saved tree's per-cluster mode), or leaves it alone — never writes a `hiker.placement` field, never auto-overrides anything outside the triage scope.
 - Summary — short LLM-generated digest at note level (1–3 sentences) and optionally cluster level. Cached in frontmatter as `hiker.summary` (and on cluster nodes in the tree config). Refreshed on content change. Used as the cheap "what's in this" representation for MCP progressive disclosure, UI hover previews, and cluster overviews — distinct from chunk-level retrieval, which is the full text in pieces.
 
 Each stage records its version in the note's frontmatter (`hiker.enrichment.<stage>: <version>`) so future re-runs can detect stale enrichment. Bumping a stage's version forces re-enrichment naturally.

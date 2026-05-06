@@ -13,17 +13,18 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use super::{Chunk, Chunker};
+
 const SOFT_SIZE_LIMIT: usize = 1200;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Chunk {
-    pub index: u32,
-    pub byte_start: usize,
-    pub byte_end: usize,
-    pub text: String,
-    /// "Section > Subsection" breadcrumb of the enclosing heading, or None for
-    /// content above any heading.
-    pub heading_path: Option<String>,
+/// Stateless markdown chunker. Implements [`Chunker`] so the ingest pipeline
+/// can dispatch by extension.
+pub struct MarkdownChunker;
+
+impl Chunker for MarkdownChunker {
+    fn chunk(&self, source: &str) -> Vec<Chunk> {
+        chunk_markdown(source)
+    }
 }
 
 /// Split a markdown source into chunks. Frontmatter is stripped before

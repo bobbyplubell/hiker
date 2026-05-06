@@ -1,8 +1,8 @@
 # Clustering
 
-How Hiker builds a hierarchical tree of topics from an unorganized vault. This doc covers the *build* side — turning embeddings into a tree of nodes with names. Placement of new notes into the resulting tree, and the reconcile flow that lets users accept/reject changes, live in `design.md` (Curated tree placement, Reconciliation). This doc fills the gap that `design.md` leaves implicit: cluster-level embeddings and summaries are *named* as inputs to placement, but the algorithm that produces them isn't.
+How Hiker builds a hierarchical tree of topics from an unorganized vault. This doc covers the *build* side only — turning embeddings into a tree of nodes with names. The tree is consumed by `suggestions.md`, which uses it as a recommendation engine (one-shot reorganization proposals + saved-tree inbox triage); it is **not** durable infrastructure that owns the user's organization. Per-note placement provenance, manual-vs-auto stickiness, durable cluster IDs, and a parallel curated-tree-vs-filesystem mental model are explicitly out of scope — see the design pivot in `design.md`'s "Auto-organization suggestions" section.
 
-Not built in v1. Lands alongside the curated-tree placement feature (post-v1, after the related-notes panel proves the index pipeline). Speccing now because (a) the build algorithm shapes what `hiker reconcile`'s output looks like, (b) it determines the cost model that decides whether reconcile runs in seconds or minutes, and (c) it's the thing the synthetic-corpus eval (`qa.md`) is supposed to validate.
+Not built in v1. Lands alongside the suggestions surface (post-v1, after the related-notes panel proves the index pipeline). Speccing now because (a) the build algorithm shapes what suggestions look like, (b) it determines the cost model that decides whether a one-shot run takes seconds or minutes, and (c) it's the thing the synthetic-corpus eval (`qa.md`) is supposed to validate.
 
 
 ## Approach: recursive cluster + LLM-summarize (RAPTOR-shaped)
@@ -71,15 +71,14 @@ Per-note placement is fully specced in `design.md:252-257` (greedy centroid desc
 Most of the time only `Place` runs — every new note gets a home cheaply. `Build` runs when the user decides it's worth re-examining the structure (new corpus shape, the tree feels stale, after a large import).
 
 
-## User override
+## What consumes the tree
 
-Auto-placement is a starting point, not a verdict. Users move notes in the file tree (the `drag-and-drop-move` flow) when they disagree with the placer. The provenance system in `design.md:259` makes this stick:
+The build pipeline produces a `ClusterTree` (shape below). `suggestions.md` consumes it as a recommendation engine — *not* as durable infrastructure that owns the user's organization. Two flows downstream:
 
-- A drag-move writes `hiker.placement: manual` to the note's frontmatter (only field Hiker writes to user files outside an explicit user action — the move *is* that action). [cluster-manual-via-tree-dnd, cluster-placement-provenance]
-- `Place` and `Build` both treat `manual` and `confirmed` as immovable: the per-note placer skips notes already manually placed; the reconcile pass surfaces conflicts (where auto-clustering disagrees with manual placement) as **Conflict** deltas (`design.md:269`) for the user to review, never auto-overrides.
-- A user can promote `auto:vN` → `confirmed` from the UI ("yes this is correct, lock it in"). Future reconciles treat confirmed placements like manual. [cluster-confirm-promotion]
+- **One-shot reorganization** — generate a tree, render it as a markdown proposal with checkboxes, user picks what to apply (folder moves and/or frontmatter tags). Tree is ephemeral; nothing persists except the user's accepted actions.
+- **Saved-tree triage** — user saves a generated tree as a classifier; new notes get routed against it via greedy centroid descent (`cluster-place-greedy-descent`), with confidence-tiered behavior (auto-apply / queue-for-review / leave-in-inbox).
 
-Net effect: the auto-org pass seeds an organization, the user reshapes it via normal tree drags, and successive reconciles preserve every manual decision. The system gets out of the user's way once they care enough to organize a region themselves.
+The build engine is unaware of which flow consumes its output — same algorithm, same `ClusterTree`. See `suggestions.md` for everything downstream.
 
 
 ## Why notes (not chunks) at level 0 — and what chunk-level clustering is good for instead
@@ -118,27 +117,9 @@ Return strict JSON: {"name": ..., "summary": ..., "confidence": ...}
 
 At level 0 the per-note summary input comes from the existing `Summary` enrichment (`design.md:293`) — already cached on the note's frontmatter or in the store. At level 1+ the inputs are child cluster summaries; same prompt, no special-casing.
 
-Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the reconcile flow shows it but recommends the user review before accepting.
+Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the suggestions flow shows it but flags it for explicit review before applying.
 
 Model choice: a small local LLM is sufficient. Cluster naming is a much easier task than freeform writing — `Llama-3.2-3B` or similar runs on CPU and produces fine names. The expensive part is summarization quality; for v1-of-clustering, even template-based names ("Notes about X, Y, Z" using top-tf-idf terms) are a reasonable fallback if the LLM dependency is undesirable. Make the summarizer pluggable behind a `core::summarize` trait — same discipline pattern as embedder and store. [cluster-summarize-fallback-tfidf]
-
-
-## Cluster identity across runs
-
-Cluster IDs from HDBSCAN are inherently unstable — re-running on slightly different data produces clusters with shuffled integer ids, even when membership is essentially unchanged. The reconcile flow needs stable identity (so a previously-rejected cluster proposal isn't re-proposed every run).
-
-Identity rule: a cluster on run N matches a cluster on run N-1 if their **member Jaccard similarity is ≥ 0.7**. Stable id is carried forward; new cluster id is minted only on first appearance or when match fails. Stored in `vault/.hiker/cluster-history.yaml`: [cluster-stable-identity, cluster-history-yaml]
-
-```yaml
-clusters:
-  - id: cl_01HXYZ...   # ulid, minted once
-    first_seen: 2026-04-12T...
-    last_seen: 2026-05-04T...
-    members_last: [note_id_1, note_id_2, ...]
-    name: "Embedding research"
-```
-
-Centroid drift is *not* used for identity — content shifts faster than membership in personal vaults. Membership is the durable signal.
 
 
 ## Cost model
@@ -155,19 +136,18 @@ Rough numbers for a small local model (~3B, ~50ms/call on CPU):
 
 Embedding cost (one extra call per cluster summary) is negligible relative to summarization.
 
-Reconcile is **not** an interactive operation. Run on a user-triggered `hiker reconcile` command, results go to a proposal file, user reviews on their own time. No need for sub-second budgets.
+A full build pass is **not** an interactive operation. Run on demand via `hiker suggest` (per `suggestions.md`); results are written as a proposal the user reviews on their own time. No sub-second budgets.
 
 
 ## When it runs
 
-- **`hiker reconcile`** — explicit user command. Reads current vault state, runs the full pipeline, writes a proposal to `vault/.hiker/proposals/<timestamp>.yaml`. The flow described in `design.md:264-273` consumes that proposal. [cluster-trigger-reconcile-only]
-- **Never automatically.** No background reconcile, no on-save trigger. The clustering pass is offline by design — re-clustering touches every cluster's identity, and surprising the user with reorganized topics is exactly the trust violation `design.md` warns against for frontmatter writes.
-- **Watcher does not drive it.** Watcher events drive the *index* (chunk/embed updates); they do not drive the *tree*.
+- **`hiker suggest`** (one-shot) — explicit user command, runs the full pipeline once, output goes to `suggestions.md`'s proposal flow.
+- **Saved-tree triage** does *not* re-run the build pipeline. Triage uses the cheap greedy-descent classifier (`cluster-place-greedy-descent`) against an already-saved tree; only `hiker suggest save` and re-running `hiker suggest` regenerate the tree itself.
+- **Never automatic.** No background build pass, no on-save trigger for the full pipeline. Triage *can* run on note save (per `suggestions.md`) but that's the cheap classifier, not a re-cluster.
+- **Watcher does not drive the build.** Watcher events drive the *index* (chunk/embed updates); they don't drive the tree.
 
-Future: a `--watch` flag that re-runs reconcile on a schedule (daily?), still writing to a proposal file the user reviews — never auto-applying. Keep the human in the loop until trust is established.
 
-
-## Output: what reconcile consumes
+## Output: what suggestions consume
 
 The cluster pass produces a `ClusterTree`: [cluster-tree-output]
 
@@ -178,7 +158,7 @@ struct ClusterTree {
 }
 
 struct ClusterNode {
-    id: ClusterId,                    // stable across runs via Jaccard match
+    id: ClusterId,                    // ephemeral per-run; not durable across runs
     members: Vec<MemberRef>,          // notes (level 0) or child clusters (higher)
     centroid: Vec<f32>,               // mean of member embeddings
     radius: f32,                      // 90th-percentile member distance from centroid
@@ -188,7 +168,7 @@ struct ClusterNode {
 }
 ```
 
-`hiker reconcile` walks this tree against the existing curated tree (in `vault/.hiker/tree.yaml` per `design.md:242`) and emits the four delta types from `design.md:266-269`. The shape above is everything that flow needs.
+`suggestions.md` consumes this shape — rendering the markdown proposal for one-shot review, or persisting a slimmed-down version (centroids + names + target folders/tags) as the saved-tree classifier. Cluster IDs are *not* expected to be stable across runs; the rejection-history bookkeeping in `suggestions.md` keys on member-set fingerprints, not cluster IDs.
 
 
 ## Module discipline
@@ -200,8 +180,9 @@ Summarization is its own module (`core::summarize`) since it has independent fai
 
 ## Out of scope
 
-- Online incremental clustering (clusters update as notes change). v1 of this feature is batch-only on `hiker reconcile`.
+- Online incremental clustering of the *full* tree. The cheap online path is greedy descent against an already-built saved tree (`cluster-place-greedy-descent`, used by triage) — that's not a rebuild, it's a classifier.
 - Multi-axis trees (one tree per type — semantic, temporal, entity). Single semantic tree only at first; the multi-axis idea from `design.md:215` is a later concern.
-- User-guided cluster splits/merges in the reconcile UI beyond accept/reject of full proposals.
+- Durable cluster identity across runs. Each build run produces a fresh tree; rejection-history bookkeeping happens at the per-suggestion level in `suggestions.md`, not at the cluster-id level.
+- A parallel "curated tree" mental model alongside the filesystem. The filesystem is the only source of truth for organization; the build engine is a recommendation tool, not a structural overlay.
 - Cross-vault clustering. One tree per vault.
 - Trail discovery from clusters. Trails are user-authored only by design (see `design.md`); the clustering pipeline never proposes them.

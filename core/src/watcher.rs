@@ -82,7 +82,7 @@ impl Watcher {
                     Ok(evs) => evs,
                     Err(errs) => {
                         for err in errs {
-                            tracing_or_log("watcher error", &err.to_string());
+                            tracing::error!(error = %err, "watcher: notify error");
                         }
                         continue;
                     }
@@ -90,8 +90,13 @@ impl Watcher {
                 for ev in events {
                     if let Some(file_event) = normalize(&root_for_thread, &ev) {
                         if is_suppressed_event(&suppressed_for_thread, &file_event) {
+                            tracing::debug!(
+                                event = ?file_event,
+                                "watcher: suppressed self-write",
+                            );
                             continue;
                         }
+                        tracing::debug!(event = ?file_event, "watcher: debounced event");
                         // send returns Err when no receivers; that's fine.
                         let _ = bcast.send(file_event);
                     }
@@ -254,12 +259,6 @@ fn to_rel(vault_root: &Path, abs: &Path) -> Option<String> {
         out.push_str(&comp.as_os_str().to_string_lossy());
     }
     Some(out)
-}
-
-fn tracing_or_log(label: &str, msg: &str) {
-    // Once we add `tracing` as a dep this will route through it; for now,
-    // eprintln keeps the watcher from being silent on errors during dev.
-    eprintln!("[hiker::watcher] {label}: {msg}");
 }
 
 #[cfg(test)]

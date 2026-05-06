@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
-use hiker_core::store::{RelatedHit, Store};
+use hiker_core::store::{ChunkBounds, RelatedHit, Store};
+use hiker_core::trash::{Trash, TrashEntry, TrashListItem};
 use hiker_core::watcher::{FileEvent, Watcher};
 use hiker_core::{embed::FastembedEmbedder, DirEntryDto, HikerError, Vault};
 use serde::{Deserialize, Serialize};
@@ -36,14 +37,35 @@ fn with_vault<R>(
     f(&session.vault)
 }
 
+/// Log an `Err(_)` returned to the frontend, then pass the Result through
+/// unchanged. Wrap a command's final expression in this so every failure
+/// shows up in the unified log without scattering `tracing::error!` calls
+/// across each `.map_err` chain. Per `obs-error-context`: the error chain
+/// rides the `error` field, the message stays grep-stable.
+fn log_cmd_result<T, E: std::fmt::Display>(
+    command: &'static str,
+    r: Result<T, E>,
+) -> Result<T, E> {
+    if let Err(e) = &r {
+        tracing::error!(error = %e, command, "tauri command failed");
+    }
+    r
+}
+
 #[tauri::command]
 fn list_dir(state: State<AppState>, rel: String) -> Result<Vec<DirEntryDto>, String> {
-    with_vault(&state, |v| v.list_dir(&rel).map_err(|e| e.to_string()))
+    log_cmd_result(
+        "list_dir",
+        with_vault(&state, |v| v.list_dir(&rel).map_err(|e| e.to_string())),
+    )
 }
 
 #[tauri::command]
 fn read_file(state: State<AppState>, rel: String) -> Result<String, String> {
-    with_vault(&state, |v| v.read_file(&rel).map_err(|e| e.to_string()))
+    log_cmd_result(
+        "read_file",
+        with_vault(&state, |v| v.read_file(&rel).map_err(|e| e.to_string())),
+    )
 }
 
 #[derive(Serialize)]
@@ -54,18 +76,24 @@ struct FileWithHash {
 
 #[tauri::command]
 fn read_file_with_hash(state: State<AppState>, rel: String) -> Result<FileWithHash, String> {
-    with_vault(&state, |v| {
-        v.read_file_with_hash(&rel)
-            .map(|(contents, hash)| FileWithHash { contents, hash })
-            .map_err(|e| e.to_string())
-    })
+    log_cmd_result(
+        "read_file_with_hash",
+        with_vault(&state, |v| {
+            v.read_file_with_hash(&rel)
+                .map(|(contents, hash)| FileWithHash { contents, hash })
+                .map_err(|e| e.to_string())
+        }),
+    )
 }
 
 #[tauri::command]
 fn write_file(state: State<AppState>, rel: String, contents: String) -> Result<(), String> {
-    with_vault(&state, |v| {
-        v.write_file(&rel, &contents).map_err(|e| e.to_string())
-    })
+    log_cmd_result(
+        "write_file",
+        with_vault(&state, |v| {
+            v.write_file(&rel, &contents).map_err(|e| e.to_string())
+        }),
+    )
 }
 
 #[tauri::command]
@@ -75,20 +103,27 @@ fn write_file_checked(
     expected_hash: String,
     contents: String,
 ) -> Result<String, hiker_core::HikerError> {
-    let guard = state
-        .session
-        .lock()
-        .map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
-    let session = guard
-        .as_ref()
-        .ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
-    session
-        .vault
-        .write_file_checked(&rel, &expected_hash, &contents)
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
+        session
+            .vault
+            .write_file_checked(&rel, &expected_hash, &contents)
+    })();
+    log_cmd_result("write_file_checked", result)
 }
 
 #[tauri::command]
 async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    log_cmd_result("pick_vault", pick_vault_inner(app).await)
+}
+
+async fn pick_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |folder| {
         let _ = tx.send(folder);
@@ -100,6 +135,19 @@ async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let vault = Vault::open(&path_buf).map_err(|e| e.to_string())?;
     let root = vault.root().to_path_buf();
     let display = root.to_string_lossy().into_owned();
+
+    // Stand up the tracing pipeline (per-vault log files). Idempotent across
+    // vault swaps in the same UI session — the first call wins.
+    if let Err(e) = hiker_core::observability::init_tracing(&root) {
+        // Subscriber init only fails on disk errors or a competing global
+        // subscriber; surface it on stderr and keep the vault open. Falling
+        // back to no logging is strictly better than refusing to open.
+        eprintln!("[hiker] init_tracing failed: {e}");
+    }
+    tracing::info!(
+        vault_root = %root.display(),
+        "ui: vault opened",
+    );
 
     // Open the store (creates .hiker/index.db on first run).
     let store = Store::open(&root).map_err(|e| e.to_string())?;
@@ -174,23 +222,74 @@ enum IndexScope {
 
 #[tauri::command]
 async fn index(state: State<'_, AppState>, scope: IndexScope) -> Result<(), String> {
-    let job_sender = {
+    let result = (|| -> Result<(IndexJob, hiker_core::indexer::IndexJobTx), String> {
+        let job_sender = {
+            let guard = state.session.lock().map_err(|e| e.to_string())?;
+            let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+            session.indexer.job_sender()
+        };
+        let job = match scope {
+            // Explicit user-driven reindex: bypass the hash short-circuit so a
+            // click on the menu actually re-embeds even when content is unchanged.
+            IndexScope::All => IndexJob::FullScan { force: true },
+            IndexScope::Path { rel } => IndexJob::Upsert { rel_path: rel, force: true },
+        };
+        Ok((job, job_sender))
+    })();
+    let send_result = match result {
+        Ok((job, sender)) => sender.send(job).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    log_cmd_result("index", send_result)
+}
+
+/// Per-file index state for the tree-row markers and the active-file
+/// status-bar mirror. See docs/index.md `tauri-cmd-file-index-state`.
+///
+/// status: tauri-cmd-file-index-state
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum IndexState {
+    Indexed,
+    Unsupported,
+    Skipped { reason: String },
+    Queued,
+}
+
+#[tauri::command]
+fn index_state_for(state: State<AppState>, rel: String) -> Result<IndexState, String> {
+    let result = (|| {
         let guard = state.session.lock().map_err(|e| e.to_string())?;
         let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session.indexer.job_sender()
-    };
-    let job = match scope {
-        IndexScope::All => IndexJob::FullScan,
-        IndexScope::Path { rel } => IndexJob::Upsert { rel_path: rel },
-    };
-    job_sender.send(job).await.map_err(|e| e.to_string())
+        if !hiker_core::indexer::is_indexable_path(&rel) {
+            return Ok(IndexState::Unsupported);
+        }
+        if session.indexer.is_pending(&rel) {
+            return Ok(IndexState::Queued);
+        }
+        let store = Store::open(&session.root).map_err(|e| e.to_string())?;
+        match store.get_note_by_path(&rel).map_err(|e| e.to_string())? {
+            Some(row) if row.skipped => Ok(IndexState::Skipped {
+                reason: row.skip_reason.unwrap_or_else(|| "skipped".into()),
+            }),
+            Some(_) => Ok(IndexState::Indexed),
+            // No row yet for a supported file — either it's about to be indexed
+            // or the watcher hasn't surfaced its create event. Either way, the
+            // user's mental model is "queued."
+            None => Ok(IndexState::Queued),
+        }
+    })();
+    log_cmd_result("index_state_for", result)
 }
 
 #[tauri::command]
 fn index_status(state: State<AppState>) -> Result<IndexStatus, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-    Ok(session.indexer.status())
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        Ok(session.indexer.status())
+    })();
+    log_cmd_result("index_status", result)
 }
 
 /// Create a new empty note in `folder` (vault-relative; `""` = vault root)
@@ -200,6 +299,13 @@ fn index_status(state: State<AppState>) -> Result<IndexStatus, String> {
 /// status: create-note-button
 #[tauri::command]
 async fn create_note(
+    state: State<'_, AppState>,
+    folder: String,
+) -> Result<String, HikerError> {
+    log_cmd_result("create_note", create_note_inner(state, folder).await)
+}
+
+async fn create_note_inner(
     state: State<'_, AppState>,
     folder: String,
 ) -> Result<String, HikerError> {
@@ -247,7 +353,7 @@ async fn create_note(
     };
     // Explicitly index the new file (the watcher event was suppressed).
     let _ = sender
-        .send(IndexJob::Upsert { rel_path: created.clone() })
+        .send(IndexJob::Upsert { rel_path: created.clone(), force: false })
         .await;
     Ok(created)
 }
@@ -258,6 +364,14 @@ async fn create_note(
 /// status: drag-and-drop-move
 #[tauri::command]
 async fn move_note(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<(), HikerError> {
+    log_cmd_result("move_note", move_note_inner(state, from, to).await)
+}
+
+async fn move_note_inner(
     state: State<'_, AppState>,
     from: String,
     to: String,
@@ -302,23 +416,259 @@ async fn move_note(
     result
 }
 
+/// Soft-delete a note or folder. Backs the tree context-menu Delete entry
+/// (`tree-context-delete`). Mirrors `move_note` shape: suppress watcher,
+/// route through the indexer task so all writes go through its owned store
+/// connection, await the reply, re-suppress for the post-op TTL window.
+///
+/// status: delete-note-core-cmd
+#[tauri::command]
+async fn delete_note(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rel: String,
+) -> Result<TrashEntry, HikerError> {
+    log_cmd_result("delete_note", delete_note_inner(app, state, rel).await)
+}
+
+async fn delete_note_inner(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rel: String,
+) -> Result<TrashEntry, HikerError> {
+    let sender = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        // Pre-suppress every `.md` member as well as the folder root. On
+        // Linux/macOS `fs::rename` of a directory is a single inode op, so
+        // notify shouldn't emit per-child events — but other platforms may,
+        // and the cost of pre-suppressing is just adding strings to a TTL
+        // map. The post-rename re-suppression below covers the same paths
+        // again so the TTL window starts close to when notify surfaces.
+        session.watcher.suppress(rel.clone());
+        let members = session.vault.walk_md_files(&rel).unwrap_or_default();
+        for m in &members {
+            session.watcher.suppress(m.clone());
+        }
+        session.indexer.job_sender()
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(IndexJob::DeleteNote {
+            rel: rel.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HikerError::Io("indexer task is shut down".into()))?;
+    let result = reply_rx
+        .await
+        .map_err(|_| HikerError::Io("indexer dropped delete reply".into()))?;
+    if let Ok(guard) = state.session.lock() {
+        if let Some(session) = guard.as_ref() {
+            session.watcher.suppress(rel);
+            if let Ok(entry) = &result {
+                if let Some(members) = &entry.members {
+                    for m in members {
+                        session.watcher.suppress(m.clone());
+                    }
+                }
+            }
+        }
+    }
+    if result.is_ok() {
+        let _ = app.emit("hiker:trash-changed", ());
+    }
+    result
+}
+
+/// Restore a previously soft-deleted entry from the vault trash. Backs the
+/// undo affordance on the post-delete toast (`tree-context-delete`) and the
+/// CLI `hiker trash restore` command.
+///
+/// status: vault-trash-restore
+#[tauri::command]
+async fn restore_trash_entry(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrashEntry, HikerError> {
+    log_cmd_result(
+        "restore_trash_entry",
+        restore_trash_entry_inner(app, state, id).await,
+    )
+}
+
+async fn restore_trash_entry_inner(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrashEntry, HikerError> {
+    let sender = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        // Pre-suppress paths the restore is about to write. We resolve the
+        // entry here (rather than in the indexer) so the suppression is in
+        // place before the fs::rename fires.
+        let trash = Trash::open(session.vault.root());
+        if let Ok(Some(entry)) = trash.find(&id) {
+            session.watcher.suppress(entry.original_path.clone());
+            if let Some(members) = &entry.members {
+                for m in members {
+                    session.watcher.suppress(m.clone());
+                }
+            }
+        }
+        session.indexer.job_sender()
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(IndexJob::RestoreFromTrash {
+            id: id.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HikerError::Io("indexer task is shut down".into()))?;
+    let result = reply_rx
+        .await
+        .map_err(|_| HikerError::Io("indexer dropped restore reply".into()))?;
+    if let Ok(guard) = state.session.lock() {
+        if let Some(session) = guard.as_ref() {
+            if let Ok(entry) = &result {
+                session.watcher.suppress(entry.original_path.clone());
+                if let Some(members) = &entry.members {
+                    for m in members {
+                        session.watcher.suppress(m.clone());
+                    }
+                }
+            }
+        }
+    }
+    if result.is_ok() {
+        let _ = app.emit("hiker:trash-changed", ());
+    }
+    result
+}
+
+/// Disk-true listing of the vault trash. Backs the trash bin pinned at the
+/// top of the file tree.
+///
+/// status: tree-trash-disk-listing
+#[tauri::command]
+fn list_trash(state: State<AppState>) -> Result<Vec<TrashListItem>, HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        let trash = Trash::open(session.vault.root());
+        trash.list_from_disk()
+    })();
+    log_cmd_result("list_trash", result)
+}
+
+/// Permanently empty the vault trash. Irrecoverable.
+///
+/// status: vault-trash-empty
+#[tauri::command]
+fn empty_trash(app: tauri::AppHandle, state: State<AppState>) -> Result<(), HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        let trash = Trash::open(session.vault.root());
+        trash.empty()
+    })();
+    if result.is_ok() {
+        let _ = app.emit("hiker:trash-changed", ());
+    }
+    log_cmd_result("empty_trash", result)
+}
+
+/// Permanently delete a single trash entry by its on-disk basename. Works on
+/// orphaned entries too.
+///
+/// status: tree-trash-restore-action
+#[tauri::command]
+fn permanent_delete_trash_entry(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    trashed_name: String,
+) -> Result<(), HikerError> {
+    tracing::info!(
+        command = "permanent_delete_trash_entry",
+        trashed_name = %trashed_name,
+        "tauri cmd",
+    );
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        let trash = Trash::open(session.vault.root());
+        trash.permanent_delete(&trashed_name)
+    })();
+    if result.is_ok() {
+        let _ = app.emit("hiker:trash-changed", ());
+    }
+    log_cmd_result("permanent_delete_trash_entry", result)
+}
+
+/// Ordered chunk bounds for the active note. Empty vec when the note has
+/// no row in the store (unsupported / queued / never indexed) or has zero
+/// chunks. Spec: never errors on absence.
+///
+/// status: tauri-cmd-chunks-for-path
+#[tauri::command]
+fn chunks_for(state: State<AppState>, rel: String) -> Result<Vec<ChunkBounds>, String> {
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let store = Store::open(&session.root).map_err(|e| e.to_string())?;
+        store.chunk_bounds_for(&rel).map_err(|e| e.to_string())
+    })();
+    log_cmd_result("chunks_for", result)
+}
+
 #[tauri::command]
 fn related_notes(
     state: State<AppState>,
     rel: String,
     top_k: Option<usize>,
 ) -> Result<Vec<RelatedHit>, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-    // Open a fresh read connection — see the store module's notes on this.
-    let store = Store::open(&session.root).map_err(|e| e.to_string())?;
-    let id = match store.id_for_path(&rel).map_err(|e| e.to_string())? {
-        Some(id) => id,
-        None => return Ok(Vec::new()),
-    };
-    store
-        .related_notes(&id, top_k.unwrap_or(10))
-        .map_err(|e| e.to_string())
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        // Open a fresh read connection — see the store module's notes on this.
+        let store = Store::open(&session.root).map_err(|e| e.to_string())?;
+        let id = match store.id_for_path(&rel).map_err(|e| e.to_string())? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        store
+            .related_notes(&id, top_k.unwrap_or(10))
+            .map_err(|e| e.to_string())
+    })();
+    log_cmd_result("related_notes", result)
 }
 
 pub fn run() {
@@ -336,9 +686,16 @@ pub fn run() {
             pick_vault,
             index,
             index_status,
+            index_state_for,
             related_notes,
+            chunks_for,
             create_note,
             move_note,
+            delete_note,
+            restore_trash_entry,
+            list_trash,
+            empty_trash,
+            permanent_delete_trash_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -9,7 +9,8 @@ Known issues in the codebase. Each row is a kebab-case slug, a one-line descript
 
 | Slug | File | Notes |
 | ---- | ---- | ----- |
-| (empty — see Resolved below) | | |
+| `bug-related-panel-stale-on-vault-switch` | `ui/src/main.ts` | Related-notes panel doesn't refresh when a new vault is loaded; stale hits from the previous vault remain visible until the next file open or save. Fix: trigger `refreshRelated` (or clear the list) on vault open/swap. |
+| `bug-too-large-errors-instead-of-skipping` | `core/src/indexer.rs:603` | Files over the 5MB sanity cap return `IndexerError::TooLarge` (a hard error surfaced as `ProgressEvent::Error`) instead of the spec's intended Skipped outcome. `index.md:207` lists "file too large" as a canonical Skipped reason and `editor.md:242` shows it in the tree-row tooltip example. Fix: return `UpsertOutcome::Skipped("file too large".into())` so the file gets a `notes` row with `skipped=1` once schema v2 lands (see indexing-status indicators slice), and the UI can render the amber dot with the reason in `title=`. |
 
 
 ## Resolved
@@ -36,3 +37,4 @@ Fixed 2026-05-06:
 | `bug-status-bar-path-overflow` | implemented `status-bar-path-basename-tooltip` (basename in `#status-path`, full path in `title=`) plus `ui-no-sibling-pushout` rule (`min-width: 0` + `flex-shrink: 1` on the status-bar regions) |
 | `bug-move-note-routes-via-fresh-writer` | added `IndexJob::Move { from, to, reply }` + `IndexerHandle::move_note`; the Tauri move command now suppresses, sends the job via the indexer's owned writer, awaits the oneshot reply, and re-suppresses post-rename. No more parallel writer connection |
 | `bug-sqlite-vec-init-transmute-fragile` | rewrote `register_vec_extension` to use rusqlite's typed `RawAutoExtension` alias and `register_auto_extension`; the transmute is still required (sqlite-vec ships an `extern "C" fn()` stub) but the destination type is now documented at the call site, and registration failures log instead of silently dropping |
+| `bug-explicit-reindex-noops-on-unchanged-content` | added a `force: bool` field to `IndexJob::Upsert` / `IndexJob::FullScan`, plumbed through `process_upsert` and `run_full_scan`. The `index` Tauri command sets `force: true` so the menu's Reindex actions actually re-embed even when content_hash matches; watcher/startup paths keep `force: false` |

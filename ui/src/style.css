@@ -340,6 +340,39 @@ html, body, #app {
   color: #e0a040;
 }
 
+/* status: tree-row-unsupported-marker / tree-row-skipped-marker / tree-row-queued-marker
+   Index-state dot lives in a child .ix-marker span, suffixed onto the
+   filename so it sits next to the dirty dot (li::after) without colliding
+   for the single ::after slot. Color comes from the row's ix-* class. */
+#tree li > .ix-marker {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-radius: 50%;
+}
+#tree li.ix-unsupported > .ix-marker {
+  background: transparent;
+  border: 1px solid #8886;
+}
+#tree li.ix-skipped > .ix-marker {
+  background: #e0a040;
+}
+#tree li.ix-queued > .ix-marker {
+  background: #4a90e2;
+  animation: ix-queued-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ix-queued-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -401,4 +434,191 @@ html, body, #app {
 .modal-btn:focus-visible {
   outline: 2px solid #4a90e2;
   outline-offset: 1px;
+}
+
+.modal-btn-danger {
+  background: #c0392b;
+  border-color: #c0392b;
+  color: white;
+}
+
+.modal-btn-danger:hover {
+  background: #a83224;
+}
+
+/* status: tree-context-menu */
+.ctx-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 160px;
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid #8886;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px #0006;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 14px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ctx-menu-item:hover:not(:disabled) {
+  background: #4a90e2;
+  color: white;
+}
+
+.ctx-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* status: editor-view-options-menu — checkable rows reserve room for a
+   leading checkmark so checked/unchecked items align horizontally. */
+.ctx-menu-item.checkable {
+  padding-left: 28px;
+  position: relative;
+}
+
+.ctx-menu-item.checkable.checked::before {
+  content: "✓";
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+}
+
+.ctx-menu-item.danger {
+  color: #c0392b;
+}
+
+.ctx-menu-item.danger:hover {
+  background: #c0392b;
+  color: white;
+}
+
+#toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: #222;
+  color: white;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px #0006;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: none;
+  z-index: 1200;
+  max-width: 360px;
+}
+
+#toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+#toast .toast-message {
+  margin-right: 12px;
+}
+
+#toast .toast-action {
+  font: inherit;
+  background: transparent;
+  color: #4a90e2;
+  border: 0;
+  padding: 0 4px;
+  cursor: pointer;
+  text-transform: uppercase;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+
+#toast .toast-action:hover {
+  color: #6aa8f0;
+}
+
+/* status: tree-trash-bin */
+#trash-bin {
+  border-top: 1px solid #8884;
+  font-size: 12px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+#trash-header {
+  padding: 6px 10px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+#trash-header:hover {
+  background: #8881;
+}
+
+#trash-bin.collapsed #trash-list {
+  display: none;
+}
+
+#trash-list {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 2px 0 6px;
+}
+
+.trash-row {
+  padding: 4px 12px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.trash-row:hover {
+  background: #8881;
+}
+
+.trash-row.active {
+  background: #4a90e233;
+  border-left-color: #4a90e2;
+}
+
+.trash-row.orphaned .trash-row-main {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.trash-row-main {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.trash-row-meta {
+  font-size: 11px;
+  opacity: 0.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* status: tree-trash-preview */
+#trash-banner {
+  padding: 6px 12px;
+  background: #c0392b;
+  color: white;
+  font-size: 12px;
+  text-align: center;
+  letter-spacing: 0.3px;
 }
