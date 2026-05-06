@@ -22,6 +22,7 @@ pub struct DirEntryDto {
     pub kind: EntryKind,
 }
 
+#[derive(Clone)]
 pub struct Vault {
     root: PathBuf,
 }
@@ -37,11 +38,23 @@ impl Vault {
     }
 
     fn resolve(&self, rel: &str) -> Result<PathBuf, HikerError> {
-        let candidate = self.root.join(rel);
+        let rel_path = Path::new(rel);
+        for comp in rel_path.components() {
+            use std::path::Component::*;
+            if matches!(comp, RootDir | Prefix(_)) {
+                return Err(HikerError::PathEscape(format!(
+                    "expected vault-relative path, got absolute: {rel}"
+                )));
+            }
+        }
+        let candidate = self.root.join(rel_path);
         let normalized = normalize(&candidate);
         if !normalized.starts_with(&self.root) {
             return Err(HikerError::PathEscape(rel.to_string()));
         }
+        // `starts_with` only checks logical components; a symlink anywhere
+        // in the chain could still let fs::write follow it outside the vault.
+        ensure_no_symlink_components(&self.root, &normalized)?;
         Ok(normalized)
     }
 
@@ -213,6 +226,13 @@ pub fn move_note(
 
     fs::rename(&from_abs, &to_abs)?;
 
+    // Re-register suppression so the TTL window starts close to when notify
+    // surfaces its events (post-rename + debounce), not at function entry.
+    if let Some(w) = watcher {
+        w.suppress(from);
+        w.suppress(to);
+    }
+
     // Index update. If the source isn't in the index (e.g. a non-md file or
     // an md file not yet ingested), there's nothing to do — the fs rename
     // alone is the whole operation. Any store error after a successful
@@ -339,6 +359,77 @@ mod tests {
             Err(HikerError::NotFound(_))
         ));
     }
+
+    #[test]
+    fn resolve_rejects_absolute_path() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let err = vault.resolve("/etc/passwd").unwrap_err();
+        match err {
+            HikerError::PathEscape(msg) => assert!(msg.contains("absolute")),
+            other => panic!("expected PathEscape with absolute hint, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_symlinked_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"shh").unwrap();
+        symlink(outside.path().join("secret.txt"), dir.path().join("link.md")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        match vault.resolve("link.md") {
+            Err(HikerError::PathEscape(msg)) => assert!(msg.contains("symlink")),
+            other => panic!("expected PathEscape for symlink, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_symlinked_directory_ancestor() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(outside.path().join("d")).unwrap();
+        fs::write(outside.path().join("d/note.md"), b"x").unwrap();
+        symlink(outside.path().join("d"), dir.path().join("d")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        match vault.resolve("d/note.md") {
+            Err(HikerError::PathEscape(msg)) => assert!(msg.contains("symlink")),
+            other => panic!("expected PathEscape for symlinked ancestor, got {other:?}"),
+        }
+    }
+}
+
+/// Reject any path whose existing ancestors include a symlink. Components
+/// that don't exist yet (typical for create_note) are fine — we only check
+/// what's currently on disk.
+fn ensure_no_symlink_components(root: &Path, candidate: &Path) -> Result<(), HikerError> {
+    let mut current = PathBuf::new();
+    for comp in candidate.components() {
+        current.push(comp);
+        // The vault root itself was canonicalized at Vault::open, so it
+        // can't be a symlink at this point. Skip checking ancestors above
+        // the root for the same reason.
+        if !current.starts_with(root) || current == root {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(HikerError::PathEscape(format!(
+                    "symlink in path: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            // Component doesn't exist yet — fine, the rest of the path
+            // can't exist either, so stop walking.
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn normalize(p: &Path) -> PathBuf {

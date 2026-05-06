@@ -273,6 +273,10 @@ html, body, #app {
   height: 100%;
 }
 
+/* status: ui-no-sibling-pushout
+   Horizontal regions that contain dynamic content use min-width:0 +
+   flex-shrink:1 so a long child can ellipsize instead of pushing siblings
+   off-screen. Applied here to #status-left / #status-right / #status-path. */
 #status-bar {
   display: grid;
   grid-template-columns: 1fr auto 1fr;
@@ -288,6 +292,7 @@ html, body, #app {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 #status-right {
@@ -298,6 +303,8 @@ html, body, #app {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 1;
 }
 
 #save-btn {

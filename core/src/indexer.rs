@@ -27,11 +27,20 @@ const PROGRESS_CAPACITY: usize = 256;
 /// dumps); skipping them keeps the embedder from thrashing.
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum IndexJob {
     Upsert { rel_path: String },
     Delete { rel_path: String },
     Rename { from: String, to: String },
+    /// Explicit move requested by a UI/CLI caller — fs rename + index update
+    /// in one shot, executed on the indexer task so all writes flow through
+    /// the indexer's owned store connection. Reply oneshot returns the
+    /// outcome to the requester.
+    Move {
+        from: String,
+        to: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+    },
     /// Walk the vault, enqueuing Upserts for `.md` files and Deletes for
     /// indexed paths whose files have vanished.
     FullScan,
@@ -81,18 +90,27 @@ pub enum IndexerError {
     SendFailed,
 }
 
-/// Caller-side handle. Cheap to clone (everything inside is `Arc` or
-/// `Sender`).
+/// Caller-side handle. Cheap to clone fields (everything inside is `Arc` or
+/// a `Sender`); the handle itself is single-owner so `shutdown` can move and
+/// drop the sender to signal the task.
 pub struct IndexerHandle {
-    tx: mpsc::Sender<IndexJob>,
+    // `Option` so `shutdown` can take + drop it (dropping the sole remaining
+    // sender is what closes the mpsc so the task's `rx.recv()` returns None).
+    tx: Option<mpsc::Sender<IndexJob>>,
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Receiver<IndexStatus>,
     join: Option<JoinHandle<()>>,
 }
 
 impl IndexerHandle {
+    fn tx(&self) -> &mpsc::Sender<IndexJob> {
+        self.tx
+            .as_ref()
+            .expect("indexer sender used after shutdown")
+    }
+
     pub async fn enqueue(&self, job: IndexJob) -> Result<(), IndexerError> {
-        self.tx.send(job).await.map_err(|_| IndexerError::SendFailed)
+        self.tx().send(job).await.map_err(|_| IndexerError::SendFailed)
     }
 
     pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), IndexerError> {
@@ -102,6 +120,7 @@ impl IndexerHandle {
     pub async fn full_scan(&self) -> Result<(), IndexerError> {
         self.enqueue(IndexJob::FullScan).await
     }
+
 
     pub fn status(&self) -> IndexStatus {
         self.status.borrow().clone()
@@ -114,19 +133,17 @@ impl IndexerHandle {
     /// Clone the underlying mpsc sender. Useful for routing watcher events
     /// into the indexer from a separate task.
     pub fn job_sender(&self) -> mpsc::Sender<IndexJob> {
-        self.tx.clone()
+        self.tx().clone()
     }
 
     /// Stop the indexer task gracefully and wait for it to finish.
     pub async fn shutdown(mut self) {
-        // Dropping the sender signals the task's `recv` to return None.
-        drop(self.tx.clone());
+        // Drop the held sender so the task's `recv()` returns `None`. Any
+        // outstanding clones (e.g. those passed to `route_watcher_events`
+        // via `job_sender`) will be dropped when their tasks see the
+        // broadcast close — we only need to ensure *this* sender goes away.
+        self.tx.take();
         if let Some(join) = self.join.take() {
-            // Sender drop above isn't enough since `tx` is still held by
-            // `self`; replace the channel-closing strategy by sending a
-            // sentinel via an explicit close. Simplest: drop `self.tx`.
-            // We can't move out of `self.tx` after `take`-ing join, so
-            // wait briefly with a deadline.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
         }
     }
@@ -139,27 +156,34 @@ impl IndexerHandle {
 /// created by a closure so the (slow, fallible) load happens *inside* the
 /// task, giving callers a non-blocking startup.
 pub fn start_indexer<F>(
-    vault_root: PathBuf,
+    vault: crate::vault::Vault,
     store: Store,
     embedder_loader: F,
 ) -> IndexerHandle
 where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
+    let vault_root = vault.root().to_path_buf();
     let (tx, rx) = mpsc::channel::<IndexJob>(256);
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(PROGRESS_CAPACITY);
     let (status_tx, status_rx) = watch::channel(IndexStatus::default());
 
-    // Seed total_notes from the store before the task starts so a fresh open
-    // shows the correct count immediately.
-    let initial_total = count_notes(&store).unwrap_or(0);
+    // Seed total_notes from the store; surface a count failure as
+    // last_error rather than silently showing 0 (a corrupted index would
+    // otherwise look like an empty vault).
+    let (initial_total, initial_error) = match count_notes(&store) {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(format!("count_notes failed: {e}"))),
+    };
     let _ = status_tx.send(IndexStatus {
         total_notes: initial_total,
+        last_error: initial_error,
         ..IndexStatus::default()
     });
 
     let progress_for_task = progress_tx.clone();
     let join = tokio::spawn(indexer_loop(
+        vault,
         vault_root,
         store,
         embedder_loader,
@@ -169,7 +193,7 @@ where
     ));
 
     IndexerHandle {
-        tx,
+        tx: Some(tx),
         progress: progress_tx,
         status: status_rx,
         join: Some(join),
@@ -177,6 +201,7 @@ where
 }
 
 async fn indexer_loop<F>(
+    vault: crate::vault::Vault,
     vault_root: PathBuf,
     mut store: Store,
     embedder_loader: F,
@@ -197,9 +222,29 @@ async fn indexer_loop<F>(
                 path: None,
                 message: format!("embedder load failed: {e}"),
             });
-            // Drain the queue while reporting failures so callers don't
-            // block forever.
-            while let Some(_job) = rx.recv().await {}
+            // Drain the queue emitting one Error per Upsert/Delete/Rename so
+            // the UI's outstanding counter actually decrements. FullScan jobs
+            // aren't counted in the UI's total (they fan out to per-file
+            // jobs) so dropping them silently is fine.
+            while let Some(job) = rx.recv().await {
+                let path = match job {
+                    IndexJob::Upsert { rel_path } | IndexJob::Delete { rel_path } => Some(rel_path),
+                    IndexJob::Rename { to, .. } => Some(to),
+                    IndexJob::Move { reply, .. } => {
+                        let _ = reply.send(Err(crate::error::HikerError::Io(
+                            "embedder unavailable".into(),
+                        )));
+                        None
+                    }
+                    IndexJob::FullScan => None,
+                };
+                if path.is_some() {
+                    let _ = progress.send(ProgressEvent::Error {
+                        path,
+                        message: "embedder unavailable".into(),
+                    });
+                }
+            }
             return;
         }
         Err(e) => {
@@ -214,7 +259,7 @@ async fn indexer_loop<F>(
     let _ = progress.send(ProgressEvent::ModelLoaded);
 
     while let Some(job) = rx.recv().await {
-        update_queue_count(&status, &rx);
+        update_queue_count_in_flight(&status, &rx);
         match job {
             IndexJob::FullScan => match run_full_scan(&vault_root, &store) {
                 Ok(jobs) => {
@@ -236,6 +281,7 @@ async fn indexer_loop<F>(
                     // `rx.recv` to drain.
                     for j in jobs {
                         handle_simple_job(
+                            &vault,
                             &vault_root,
                             &mut store,
                             &embedder,
@@ -258,6 +304,7 @@ async fn indexer_loop<F>(
             },
             other => {
                 handle_simple_job(
+                    &vault,
                     &vault_root,
                     &mut store,
                     &embedder,
@@ -269,12 +316,16 @@ async fn indexer_loop<F>(
             }
         }
         update_total_notes(&status, &store);
+        // Job done — published queue depth now reflects only the still-queued
+        // jobs (no in-flight bump until the next recv).
+        update_queue_count_idle(&status, &rx);
     }
 }
 
 /// Dispatch a single non-FullScan job. Extracted so the FullScan handler can
 /// call it directly on its scan results without re-entering the mpsc.
 async fn handle_simple_job(
+    vault: &crate::vault::Vault,
     vault_root: &Path,
     store: &mut Store,
     embedder: &Arc<dyn Embedder>,
@@ -360,13 +411,14 @@ async fn handle_simple_job(
                 });
             }
         },
+        IndexJob::Move { from, to, reply } => {
+            // The Tauri layer suppresses the watcher around this; we don't
+            // need to here. Run vault::move_note on the indexer's owned
+            // store so all writes flow through one connection.
+            let result = crate::vault::move_note(vault, store, None, &from, &to);
+            let _ = reply.send(result);
+        }
         IndexJob::FullScan => {
-            // Reachable only via `tx` re-enqueue (recovery from watcher
-            // overflow). Forward back into the main loop by re-sending —
-            // safe because this path is rare and we're not in a tight
-            // for-loop here. We can't recursively call run_full_scan from
-            // inside this helper without ballooning stack, so the
-            // FullScan-from-recovery case stays in the main loop's match.
             unreachable!("FullScan must be handled by the main loop, not handle_simple_job");
         }
     }
@@ -441,7 +493,10 @@ async fn process_upsert(
         return Err(IndexerError::TooLarge { size });
     }
     let bytes = tokio::fs::read(&abs).await?;
-    let contents = String::from_utf8(bytes).map_err(|_| IndexerError::NotUtf8)?;
+    let contents = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(UpsertOutcome::Skipped("not utf-8".into())),
+    };
     let content_hash = hash_str(&contents);
     let mtime = metadata
         .modified()
@@ -688,12 +743,37 @@ fn update_status(status: &watch::Sender<IndexStatus>, mut f: impl FnMut(&mut Ind
 }
 
 fn update_total_notes(status: &watch::Sender<IndexStatus>, store: &Store) {
-    if let Ok(n) = count_notes(store) {
-        update_status(status, |s| s.total_notes = n);
+    match count_notes(store) {
+        Ok(n) => update_status(status, |s| {
+            s.total_notes = n;
+            // Successful count clears any prior count error; real indexing
+            // errors are pinned through their own update_status calls.
+            if let Some(msg) = &s.last_error {
+                if msg.starts_with("count_notes failed") {
+                    s.last_error = None;
+                }
+            }
+        }),
+        Err(e) => {
+            update_status(status, |s| {
+                s.last_error = Some(format!("count_notes failed: {e}"));
+            });
+        }
     }
 }
 
-fn update_queue_count(status: &watch::Sender<IndexStatus>, rx: &mpsc::Receiver<IndexJob>) {
+// Called right after `recv().await` returns: the just-pulled job is no
+// longer in `rx` but is about to be processed, so include it in the
+// published count rather than flashing 0 between recv and the next event.
+fn update_queue_count_in_flight(
+    status: &watch::Sender<IndexStatus>,
+    rx: &mpsc::Receiver<IndexJob>,
+) {
+    let len = rx.len() as u32 + 1;
+    update_status(status, |s| s.queued = len);
+}
+
+fn update_queue_count_idle(status: &watch::Sender<IndexStatus>, rx: &mpsc::Receiver<IndexJob>) {
     let len = rx.len() as u32;
     update_status(status, |s| s.queued = len);
 }
@@ -731,7 +811,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("alpha.md"), b"# Alpha\n\nbody.\n").unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         // Wait for ModelLoaded so the loader future has resolved.
@@ -755,7 +835,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("x.md"), b"# X\n\nbody.\n").unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -777,7 +857,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("doomed.md"), b"# x\n").unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -799,7 +879,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("old.md"), b"# x\n").unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -892,7 +972,7 @@ mod tests {
     async fn missing_file_during_upsert_is_treated_as_delete() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -911,7 +991,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"x").unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let handle = start_indexer(dir.path().to_path_buf(), store, mock_loader());
+        let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
         let mut prog = handle.subscribe_progress();
 
         await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;

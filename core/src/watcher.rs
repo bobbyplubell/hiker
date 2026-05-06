@@ -24,10 +24,10 @@ use tokio::sync::broadcast;
 
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 const BROADCAST_CAPACITY: usize = 1024;
-/// How long a `suppress(path)` registration stays effective. Sized to outlast
-/// the debounce window plus typical fs latency without stretching far enough
-/// to silence a real user edit that happens right after our write.
-const SUPPRESS_TTL: Duration = Duration::from_millis(500);
+/// How long a `suppress(path)` registration stays effective. Sized to
+/// outlast the debounce window (200ms) plus worst-case sqlite contention and
+/// fs latency on slower machines.
+const SUPPRESS_TTL: Duration = Duration::from_secs(2);
 
 /// Map of vault-relative paths → instant of last suppression registration.
 /// Shared between `Watcher::suppress` (writers) and the bridge thread
@@ -153,26 +153,53 @@ fn normalize(vault_root: &Path, ev: &DebouncedEvent) -> Option<FileEvent> {
             let rel = to_rel(vault_root, p)?;
             (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
         }
-        EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-            // Rename. notify-debouncer-full emits these as a single event
-            // with both From and To paths when it can pair them; otherwise
-            // we'll see a Remove + Create which is handled below.
-            if paths.len() >= 2 {
-                let from = to_rel(vault_root, &paths[0])?;
-                let to = to_rel(vault_root, &paths[1])?;
-                if is_ignored(&from) && is_ignored(&to) {
-                    return None;
+        EventKind::Modify(notify::event::ModifyKind::Name(mode)) => {
+            // notify-debouncer-full pairs From+To into a single `Name(Both)`
+            // event with paths=[from, to]; unpaired sides surface as
+            // `Name(From)` (deleted source) or `Name(To)` (created
+            // destination).
+            use notify::event::RenameMode;
+            match mode {
+                RenameMode::Both if paths.len() >= 2 => {
+                    let from = to_rel(vault_root, &paths[0])?;
+                    let to = to_rel(vault_root, &paths[1])?;
+                    if is_ignored(&from) && is_ignored(&to) {
+                        return None;
+                    }
+                    Some(FileEvent::Renamed { from, to })
                 }
-                Some(FileEvent::Renamed { from, to })
-            } else {
-                let p = paths.first()?;
-                let rel = to_rel(vault_root, p)?;
-                if is_ignored(&rel) {
-                    return None;
+                RenameMode::From => {
+                    let p = paths.first()?;
+                    let rel = to_rel(vault_root, p)?;
+                    (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
                 }
-                // Lone rename event (unpaired) — best-effort. Treat as
-                // modify; consumers downstream tolerate this.
-                Some(FileEvent::Modified { path: rel })
+                RenameMode::To => {
+                    let p = paths.first()?;
+                    let rel = to_rel(vault_root, p)?;
+                    (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
+                }
+                // RenameMode::Any / Other / Both-without-2-paths: best-effort.
+                // The two explicit cases above (From/To/Both) cover every
+                // platform where notify reports a definite rename direction.
+                // This fallback inherits the original paths[0]=from /
+                // paths[1]=to ordering assumption — fine for the common cases
+                // (the platforms hitting this branch tend to mirror what Both
+                // would give) but technically still ambiguous; treat the
+                // lone-path case as Modified rather than guessing direction.
+                _ => {
+                    if paths.len() >= 2 {
+                        let from = to_rel(vault_root, &paths[0])?;
+                        let to = to_rel(vault_root, &paths[1])?;
+                        if is_ignored(&from) && is_ignored(&to) {
+                            return None;
+                        }
+                        Some(FileEvent::Renamed { from, to })
+                    } else {
+                        let p = paths.first()?;
+                        let rel = to_rel(vault_root, p)?;
+                        (!is_ignored(&rel)).then_some(FileEvent::Modified { path: rel })
+                    }
+                }
             }
         }
         EventKind::Modify(_) => {

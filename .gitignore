@@ -3,3 +3,8 @@ node_modules/
 dist/
 ui/src-tauri/gen/
 scratch/
+
+.claude/*
+!.claude/skills/
+!.claude/commands/
+!.claude/CLAUDE.md

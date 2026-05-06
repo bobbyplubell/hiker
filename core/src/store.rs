@@ -614,13 +614,24 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
 /// Register sqlite-vec as an auto-extension. Idempotent: subsequent calls are
 /// no-ops (guarded by `Once`). Affects every `Connection` opened after this
 /// call in the process.
+///
+/// `sqlite-vec` declares its init symbol as `extern "C" fn()` (no parameters)
+/// because the real C signature `(sqlite3*, char**, sqlite3_api_routines*)`
+/// can't be expressed cleanly across the FFI boundary the crate uses. We
+/// transmute to rusqlite's typed `RawAutoExtension` alias rather than to a
+/// raw pointer so the destination signature is documented at the call site.
 fn register_vec_extension() {
+    use rusqlite::auto_extension::RawAutoExtension;
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
+        let init: RawAutoExtension =
+            unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) };
+        if let Err(e) = unsafe { rusqlite::auto_extension::register_auto_extension(init) } {
+            // Auto-extension registration is process-wide and only fails on
+            // OOM or a pathologically broken sqlite build; if it does fail,
+            // every subsequent Store::open will surface a clearer "vec_*
+            // function not found" error, so log and continue.
+            eprintln!("[hiker::store] sqlite-vec auto-extension register failed: {e}");
         }
     });
 }

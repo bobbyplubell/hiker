@@ -39,7 +39,7 @@ Normalization steps:
 
 - **Debounce** — coalesce raw events within a 200ms window keyed by path. The last event for a path during the window wins. Catches editor swap-file patterns (`vim`'s write-temp-then-rename, VSCode's atomic save) where a logical save produces 3–5 raw events. [watcher-debounce-200ms]
 - **Rename pairing** — `notify` emits paired `RenameFrom`/`RenameTo` events on Linux/macOS. Pair them within the debounce window into a single `Renamed`. Unpaired `RenameFrom` after timeout → `Deleted`; unpaired `RenameTo` → `Created`. [watcher-rename-pairing]
-- **Drop self-writes** — when the indexer or the editor's save path writes a file, mark the path in a short-lived "we just wrote this" set (TTL 500ms). Drop normalized events for those paths to avoid an infinite re-index loop. Implementation: indexer/save call `watcher.suppress(path)` immediately before the write. [watcher-suppress-self-writes]
+- **Drop self-writes** — when the indexer or the editor's save path writes a file, mark the path in a short-lived "we just wrote this" set (TTL 2s; sized to outlast the 200ms debounce window plus worst-case fs/sqlite latency on slower machines). Drop normalized events for those paths to avoid an infinite re-index loop. Implementation: indexer/save call `watcher.suppress(path)` immediately before the write and again after the write completes, so the TTL window starts close to when notify is most likely to surface the event. [watcher-suppress-self-writes]
 - **Drop ignored paths** — see below.
 
 Dispatch order: debounce window closes → normalize → check ignore list → check suppression set → fan out to consumers.

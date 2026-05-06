@@ -5,7 +5,6 @@ use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
 use hiker_core::store::{RelatedHit, Store};
-use hiker_core::vault::move_note as vault_move_note;
 use hiker_core::watcher::{FileEvent, Watcher};
 use hiker_core::{embed::FastembedEmbedder, DirEntryDto, HikerError, Vault};
 use serde::{Deserialize, Serialize};
@@ -90,11 +89,11 @@ fn write_file_checked(
 
 #[tauri::command]
 async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |folder| {
         let _ = tx.send(folder);
     });
-    let folder = rx.recv().map_err(|e| e.to_string())?;
+    let folder = rx.await.map_err(|e| e.to_string())?;
     let Some(path) = folder else { return Ok(None) };
     let path_buf = path.into_path().map_err(|e| e.to_string())?;
 
@@ -107,7 +106,7 @@ async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
 
     // Spawn the indexer task. The embedder loader runs inside the task on a
     // blocking thread — this call returns immediately.
-    let indexer = start_indexer(root.clone(), store, || {
+    let indexer = start_indexer(vault.clone(), store, || {
         FastembedEmbedder::load()
             .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn hiker_core::embed::Embedder>)
     });
@@ -241,6 +240,9 @@ async fn create_note(
                 HikerError::AlreadyExists("ran out of new-note-N candidates".into())
             })),
         };
+        // Re-suppress so the TTL window starts close to when notify
+        // surfaces the Created event, not at function entry.
+        session.watcher.suppress(created.clone());
         (created, session.indexer.job_sender())
     };
     // Explicitly index the new file (the watcher event was suppressed).
@@ -260,20 +262,44 @@ async fn move_note(
     from: String,
     to: String,
 ) -> Result<(), HikerError> {
-    let guard = state
-        .session
-        .lock()
-        .map_err(|_| HikerError::Io("lock poisoned".into()))?;
-    let session = guard
-        .as_ref()
-        .ok_or_else(|| HikerError::Io("no vault open".into()))?;
-    // Open a fresh writer for this op rather than threading the indexer's
-    // owned writer back through a channel — store-module-discipline: one
-    // writer at a time is the SQLite invariant, but `rename_note` is a
-    // tiny tx that can briefly contend without harm. (The indexer is
-    // serial and any concurrent upsert just retries on its next pull.)
-    let mut store = Store::open(&session.root).map_err(|e| HikerError::Io(e.to_string()))?;
-    vault_move_note(&session.vault, &mut store, Some(&session.watcher), &from, &to)
+    // Suppress the watcher around the move so its eventual rename event
+    // doesn't double-trigger an index update; the indexer task itself does
+    // the fs rename + index update on its owned store connection.
+    let mover = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        session.watcher.suppress(from.clone());
+        session.watcher.suppress(to.clone());
+        // Borrow nothing across the await — pull a clone of the sender we
+        // need (via job_sender) and drop the lock.
+        session.indexer.job_sender()
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    mover
+        .send(IndexJob::Move {
+            from: from.clone(),
+            to: to.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HikerError::Io("indexer task is shut down".into()))?;
+    let result = reply_rx
+        .await
+        .map_err(|_| HikerError::Io("indexer dropped move reply".into()))?;
+    // Re-suppress so the TTL window starts close to when notify surfaces
+    // its events post-rename.
+    if let Ok(guard) = state.session.lock() {
+        if let Some(session) = guard.as_ref() {
+            session.watcher.suppress(from);
+            session.watcher.suppress(to);
+        }
+    }
+    result
 }
 
 #[tauri::command]

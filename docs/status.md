@@ -45,9 +45,9 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `drift-conflict-modal` | done | `ui/src/main.ts:150` | keep/take/cancel; no diff option |
 | `status-bar-layout` | done | `ui/index.html`, `ui/src/style.css` | three regions |
 | `status-bar-index-label` | done | `ui/src/main.ts:450` | model loading / indexing / indexed / error |
-| `status-bar-path-basename-tooltip` | planned | — | left region shows basename only; full path in `title=` tooltip |
+| `status-bar-path-basename-tooltip` | done | `ui/src/main.ts` (`updateStatus`) | basename in `#status-path`, full rel-path in `title=` |
 | `status-bar-path-reveal` | planned | — | click basename → reveal note in system file explorer (Tauri shell/opener) |
-| `ui-no-sibling-pushout` | planned | — | UI rule: every horizontal region uses `min-width: 0` + `flex-shrink: 1` so long content can't push siblings off-screen; cite from CSS comments |
+| `ui-no-sibling-pushout` | done | `ui/src/style.css` (`#status-bar`, `#vault-bar`) | applied to status-bar regions and vault-bar; rule documented in CSS comment at `#status-bar` |
 | `status-bar-goto-line` | planned | — | line:col is display-only |
 | `three-column-layout` | done | `ui/index.html`, `ui/src/style.css` | grid, sides collapsible |
 | `panel-toggle-buttons` | done | `ui/index.html:19` | sidebar + related toggles |
@@ -194,7 +194,6 @@ All planned. Lands early so later modules ship instrumented from day one.
 | `obs-tracing-baseline` | planned | `tracing` + `tracing-subscriber` + `tracing-appender`; no `log`, no `println!` for diagnostics |
 | `obs-spans-pipeline` | planned | spans wrap pipeline stages, not individual fn calls |
 | `obs-env-filter` | planned | `HIKER_LOG` env var drives `EnvFilter`; defaults `info,hiker=debug` |
-| `obs-format-json` | planned | stderr layer (compact debug / json release via `HIKER_LOG_JSON=1`) |
 | `obs-log-files` | planned | file layer at `vault/.hiker/logs/hiker.log` |
 | `obs-log-rotation` | planned | daily rotation via `tracing-appender`, 7-day retention |
 | `obs-instrument-watcher` | planned | one span per debounced event; raw events at `trace!` only |
@@ -204,6 +203,9 @@ All planned. Lands early so later modules ship instrumented from day one.
 | `obs-instrument-cluster` | planned | top-level span on reconcile; per-level child spans |
 | `obs-tauri-command-spans` | planned | `#[instrument]` on every `#[tauri::command]` |
 | `obs-frontend-bridge` | planned | `log_from_frontend` Tauri command emits server-side `tracing` events |
+| `obs-log-tauri-channel` | planned | custom `tracing` layer fans events to a `tokio::broadcast`; Tauri emits `hiker:log-event` |
+| `obs-log-ring-buffer` | planned | server-side ring (default 2000 events) for panel history; `get_log_buffer` Tauri cmd |
+| `obs-log-viewer-panel` | planned | collapsible UI panel: live event stream, level + free-text filter, pause/resume, open-log-file button |
 | `obs-error-context` | planned | structured fields on `error!`; no string-interpolated context |
 | `obs-no-content` | planned | log titles/paths but never note body text |
 | `obs-no-secrets` | planned | `tracing::field::Empty` pattern; never Display config containing keys |

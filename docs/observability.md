@@ -27,8 +27,8 @@ The cost is a slightly heavier dependency tree and a one-time learning curve on 
 Single `init_tracing()` call in `main.rs` (binary) and a corresponding test helper in `core::test_support`. Layered subscriber:
 
 1. **EnvFilter** — `HIKER_LOG` env var, defaults to `info` in release, `debug` for `hiker::*` in debug builds. Lets a user run `HIKER_LOG=trace hiker reindex` to debug a stuck reindex without a custom build. [obs-env-filter]
-2. **Format layer (stderr)** — pretty-printed compact format in debug; JSON in release if `HIKER_LOG_JSON=1`. JSON output is for piping into `jq` or shipping to a log collector later. [obs-format-json]
-3. **File layer (rolling)** — `tracing-appender` daily rotation in `vault/.hiker/logs/`, retained for 7 days. The vault is the right home for these (per-vault state, follows the user, gitignored by default). [obs-log-files] [obs-log-rotation]
+2. **Format layer (stderr)** — pretty-printed compact format. Human-readable; this is what you see while running the app or tailing in dev.
+3. **File layer (rolling)** — `tracing-appender` daily rotation in `vault/.hiker/logs/`, retained for 7 days. Same compact format as stderr. The vault is the right home for these (per-vault state, follows the user, gitignored by default). [obs-log-files] [obs-log-rotation]
 
 ```rust
 let env = EnvFilter::try_from_env("HIKER_LOG")
@@ -42,7 +42,7 @@ let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
 tracing_subscriber::registry()
     .with(env)
     .with(fmt::layer().with_writer(io::stderr).compact())
-    .with(fmt::layer().with_writer(file_writer).json())
+    .with(fmt::layer().with_writer(file_writer).compact())
     .init();
 ```
 
@@ -101,12 +101,47 @@ async fn move_note(from: &str, to: &str, state: State<'_, AppState>) -> Result<(
 
 ## Frontend bridge [obs-frontend-bridge]
 
-The webview can't emit `tracing` events directly. Two options:
+The webview can't emit `tracing` events directly. A `log_from_frontend(level, message, fields)` Tauri command the frontend calls; the command emits the corresponding `tracing` event server-side. The frontend rarely needs to emit; this is mostly for surfacing errors that bubble up to the UI. Structured frontend errors (uncaught exceptions, failed fetches) ride the same command, batched — defer the auto-batching until there's a real frontend error worth catching.
 
-- **Cheap:** a `log_from_frontend(level, message, fields)` Tauri command the frontend calls; the command emits the corresponding `tracing` event server-side.
-- **Better later:** ship structured frontend errors (uncaught exceptions, failed fetches) via the same command, batched. Defer until we have a frontend error worth catching.
 
-Start with the cheap version. The frontend rarely needs to emit; this is mostly for surfacing errors that bubble up to the UI.
+## Log viewer panel
+
+Logs are useful in proportion to how easy they are to look at. A built-in viewer means you don't have to know where `vault/.hiker/logs/` is, and you can see live events without leaving the app.
+
+### Broadcast layer [obs-log-tauri-channel]
+
+A custom `tracing-subscriber` layer fans every formatted event into a `tokio::sync::broadcast` channel alongside the stderr + file layers. The Tauri side subscribes and emits each event as `hiker:log-event` so the webview can listen.
+
+```rust
+tracing_subscriber::registry()
+    .with(env)
+    .with(fmt::layer().with_writer(io::stderr).compact())
+    .with(fmt::layer().with_writer(file_writer).compact())
+    .with(BroadcastLayer::new(log_tx.clone()))   // new
+    .init();
+```
+
+The layer captures `level`, `target` (module path), `message`, `fields` (as a JSON-ish map), and a UTC timestamp. No span hierarchy in v1 — just the flat event stream that matches what's in the file.
+
+### Ring buffer [obs-log-ring-buffer]
+
+The same layer keeps the most recent N events (default 2000) in a server-side `VecDeque` behind a `Mutex`, so the viewer panel has history when it opens mid-session. A Tauri command `get_log_buffer(filter) -> Vec<LogEvent>` returns the snapshot; the panel renders that, then live-appends from the broadcast subscription.
+
+The ring buffer is *separate* from the file layer. The file is the durable record (rotated daily, 7-day retention); the ring is a UI convenience.
+
+### Viewer panel UI [obs-log-viewer-panel]
+
+A collapsible panel (toggled from the status bar or a keybind, like the related-notes panel) showing the live event stream. Per-row: timestamp, level, module, message, expandable fields. Top bar: level filter (`trace`/`debug`/`info`/`warn`/`error`), free-text filter on message + fields, a pause/resume toggle, and a "open log file" button that calls `shell.open` on `vault/.hiker/logs/hiker.log` (same reveal mechanism as `status-bar-path-reveal`).
+
+Filter is client-side only — the broadcast emits everything that passed `EnvFilter`, the panel narrows further. Keeps the protocol simple and lets the user widen filters without a round-trip.
+
+Auto-scroll on by default; turning it off lets the user inspect a frozen view while events still accumulate behind it.
+
+### Out of scope for the panel
+
+- Span tree visualization. Flat event list is enough for v1; if we want span trees later, the data is already there in the file output for offline tooling.
+- Search across rotated log files. The panel is the live + recent view; older logs are read with `less` / `rg`.
+- Persisted filter state across app restarts. Cheap to add later; not worth the config plumbing now.
 
 
 ## Error context [obs-error-context]

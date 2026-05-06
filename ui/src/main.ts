@@ -75,7 +75,10 @@ function updateStatus(): void {
   const dirty = isDirty();
   const path = buffer?.path ?? "";
   document.title = (dirty ? "• " : "") + (path ? `Hiker — ${path}` : "Hiker");
-  statusPathEl.textContent = path;
+  // status: status-bar-path-basename-tooltip
+  const basename = path ? (path.split("/").pop() ?? path) : "";
+  statusPathEl.textContent = basename;
+  statusPathEl.title = path;
   saveBtn.disabled = !buffer || !dirty;
   saveBtn.classList.toggle("dirty", dirty);
 
@@ -126,7 +129,10 @@ const view = new EditorView({
   }),
 });
 
-saveBtn.addEventListener("click", () => void save());
+saveBtn.addEventListener("click", async () => {
+  const ok = await save();
+  if (ok) scheduleRelatedRefresh(500);
+});
 
 async function save(): Promise<boolean> {
   if (!buffer) return false;
@@ -213,9 +219,7 @@ async function openFile(rel: string): Promise<void> {
   }
 }
 
-function cssEscape(s: string): string {
-  return s.replace(/["\\]/g, "\\$&");
-}
+const cssEscape = (s: string): string => CSS.escape(s);
 
 // Tracks the folder a "+ New note" click should target. Updated when the
 // user clicks a folder row or a file row (file → its parent). Empty string
@@ -372,6 +376,9 @@ async function openVault(): Promise<void> {
   vaultPathEl.textContent = basename;
   vaultPathEl.title = path;
   selectedFolder = "";
+  vaultIsOpen = true;
+  outstandingCount = 0;
+  startBackgroundIntervals();
   await refreshTree();
 }
 
@@ -613,31 +620,33 @@ function scheduleRelatedRefresh(delayMs: number): void {
   }, delayMs);
 }
 
-// Re-fetch related notes whenever the active buffer changes.
+let vaultIsOpen = false;
+let bufferPathInterval: number | null = null;
+let indexStatusInterval: number | null = null;
 let lastSeenBufferPath: string | null = null;
-window.setInterval(() => {
-  const cur = buffer?.path ?? null;
-  if (cur !== lastSeenBufferPath) {
-    lastSeenBufferPath = cur;
-    scheduleRelatedRefresh(0);
-  }
-}, 250);
 
-// Refresh shortly after a save (debounced 500ms per index.md).
-const _origSaveBtnClick = () => void save();
-saveBtn.removeEventListener("click", _origSaveBtnClick);
-saveBtn.addEventListener("click", async () => {
-  const ok = await save();
-  if (ok) scheduleRelatedRefresh(500);
-});
+function startBackgroundIntervals(): void {
+  if (bufferPathInterval !== null) window.clearInterval(bufferPathInterval);
+  if (indexStatusInterval !== null) window.clearInterval(indexStatusInterval);
+  bufferPathInterval = window.setInterval(() => {
+    if (!vaultIsOpen) return;
+    const cur = buffer?.path ?? null;
+    if (cur !== lastSeenBufferPath) {
+      lastSeenBufferPath = cur;
+      scheduleRelatedRefresh(0);
+    }
+  }, 250);
+  indexStatusInterval = window.setInterval(() => {
+    if (!vaultIsOpen) return;
+    void pollIndexStatus();
+  }, 2000);
+}
 
 // ---------- index status indicator ----------
 
 let indexStatus: IndexStatus = { model_ready: false, queued: 0, total_notes: 0, last_error: null };
-// `pending` = jobs queued but not yet processing.
-// `inFlight` = job currently processing (0 or 1 since the indexer is serial).
-let pendingCount = 0;
-let inFlightCount = 0;
+// scan_complete adds, every terminal event subtracts, Started is a no-op.
+let outstandingCount = 0;
 
 function renderIndexStatus(): void {
   if (indexStatus.last_error) {
@@ -650,9 +659,8 @@ function renderIndexStatus(): void {
     statusIndexEl.textContent = "Model loading…";
     return;
   }
-  const total = pendingCount + inFlightCount;
-  if (total > 0) {
-    statusIndexEl.textContent = `Indexing ${total} pending`;
+  if (outstandingCount > 0) {
+    statusIndexEl.textContent = `Indexing ${outstandingCount} pending`;
     return;
   }
   statusIndexEl.textContent = `Indexed (${indexStatus.total_notes} notes)`;
@@ -675,39 +683,35 @@ void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
       indexStatus.last_error = null;
       break;
     case "started":
-      // A queued job just transitioned to in-flight.
-      pendingCount = Math.max(0, pendingCount - 1);
-      inFlightCount += 1;
+      // No counter change — Started just marks "queued → processing", same
+      // job, still outstanding. The pair Started + (Finished|Skipped|Error)
+      // produces a single -1 on the terminal event.
       break;
     case "finished":
     case "skipped":
     case "deleted":
     case "renamed":
-      inFlightCount = Math.max(0, inFlightCount - 1);
-      // A successful job clears any previously-pinned error.
-      indexStatus.last_error = null;
+    case "error":
+      // Any terminal event ends one outstanding job, regardless of whether
+      // a prior Started fired (Delete and Rename don't emit Started).
+      outstandingCount = Math.max(0, outstandingCount - 1);
+      if (ev.kind === "error") {
+        indexStatus.last_error = ev.message;
+      } else {
+        indexStatus.last_error = null;
+      }
       if (ev.kind === "finished" && buffer && (ev as { path: string }).path === buffer.path) {
         scheduleRelatedRefresh(100);
       }
       break;
     case "scan_complete":
-      // The full scan just enqueued `queued` jobs. They'll surface as
-      // started → finished pairs from here on; we just record the new
-      // pending depth.
-      pendingCount += ev.queued;
-      break;
-    case "error":
-      inFlightCount = Math.max(0, inFlightCount - 1);
-      indexStatus.last_error = ev.message;
+      outstandingCount += ev.queued;
       break;
   }
   renderIndexStatus();
   void pollIndexStatus();
 });
 
-window.setInterval(() => {
-  void pollIndexStatus();
-}, 2000);
 
 // ---------- watcher → editor integration ----------
 // Silent reload for clean buffers when their file changes externally.
@@ -735,5 +739,3 @@ void listen<{ kind: string; path?: string; from?: string; to?: string }>(
     }
   },
 );
-
-void _origSaveBtnClick;
