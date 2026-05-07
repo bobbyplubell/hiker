@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
+use hiker_core::config::{Config, SettingsScope};
 use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
@@ -22,6 +23,10 @@ struct VaultSession {
     /// Also referenced by `create_note` / `move_note` to register self-write
     /// suppression around fs mutations.
     watcher: Watcher,
+    /// status: settings-load-once-at-startup
+    /// Frozen merged user+vault settings. `set_setting` writes through to
+    /// disk via `Config::set` and swaps the in-memory copy in this RwLock.
+    config: RwLock<Config>,
 }
 
 struct AppState {
@@ -118,6 +123,88 @@ fn write_file_checked(
     log_cmd_result("write_file_checked", result)
 }
 
+/// Push `root` to the front of `current`, dedupe by string equality, cap
+/// at 10 entries. Used to update the user-scope `vault.recent` list on
+/// each successful vault open.
+fn update_recent(current: &[String], root: &std::path::Path) -> Vec<String> {
+    let display = root.to_string_lossy().into_owned();
+    let mut out = Vec::with_capacity(current.len() + 1);
+    out.push(display.clone());
+    for entry in current {
+        if entry != &display {
+            out.push(entry.clone());
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out
+}
+
+/// Snapshot of the active vault's merged settings. Frontend uses this on
+/// vault open to seed View menu / tree-state defaults.
+///
+/// status: settings-load-once-at-startup
+#[tauri::command]
+fn get_settings(state: State<AppState>) -> Result<Config, String> {
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let cfg = session
+            .config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        Ok(cfg.clone())
+    })();
+    log_cmd_result("get_settings", result)
+}
+
+/// Persist a single setting. The eligible-key set is closed (see
+/// `core::config::ELIGIBLE_*`); anything not in it is rejected.
+///
+/// Concurrency: `Config::set` does file IO + reload outside the session
+/// lock, then we re-acquire the write lock to swap the in-memory copy.
+/// Two concurrent flips can therefore race so the older reload wins. In
+/// practice users flip one toggle at a time, and the next set_setting
+/// reload will reconverge — not worth a global write mutex for now.
+///
+/// status: settings-write-back
+#[tauri::command]
+fn set_setting(
+    state: State<AppState>,
+    scope: SettingsScope,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Config, HikerError> {
+    let result = (|| {
+        let root = {
+            let guard = state
+                .session
+                .lock()
+                .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+            session.root.clone()
+        };
+        let updated = Config::set(scope, &key, value, &root)?;
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+        let mut w = session
+            .config
+            .write()
+            .map_err(|_| HikerError::Config("config lock poisoned".into()))?;
+        *w = updated.clone();
+        Ok(updated)
+    })();
+    log_cmd_result("set_setting", result)
+}
+
 #[tauri::command]
 async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
     log_cmd_result("pick_vault", pick_vault_inner(app).await)
@@ -131,7 +218,44 @@ async fn pick_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, Strin
     let folder = rx.await.map_err(|e| e.to_string())?;
     let Some(path) = folder else { return Ok(None) };
     let path_buf = path.into_path().map_err(|e| e.to_string())?;
+    open_vault_at(app, path_buf).await
+}
 
+/// Try to auto-open the user-scope `vault.default`. Returns the opened
+/// vault's display path on success, `Ok(None)` when no default is set or
+/// the configured path no longer exists (deleted, unmounted, typo'd).
+/// Per the failure-mode rule in `settings.md`: log a `warn!` and fall
+/// back to the picker; never auto-clear the setting (the user might just
+/// have the drive unplugged).
+///
+/// status: settings-default-vault-autoopen
+#[tauri::command]
+async fn try_open_default_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    log_cmd_result("try_open_default_vault", try_open_default_vault_inner(app).await)
+}
+
+async fn try_open_default_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let default = match hiker_core::config::Config::user_default_vault()
+        .map_err(|e| e.to_string())?
+    {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let path = PathBuf::from(&default);
+    if !path.is_dir() {
+        tracing::warn!(
+            configured = %default,
+            "vault.default path no longer exists; falling back to picker. Setting left intact in case the path is just temporarily unavailable."
+        );
+        return Ok(None);
+    }
+    open_vault_at(app, path).await
+}
+
+async fn open_vault_at(
+    app: tauri::AppHandle,
+    path_buf: PathBuf,
+) -> Result<Option<String>, String> {
     let vault = Vault::open(&path_buf).map_err(|e| e.to_string())?;
     let root = vault.root().to_path_buf();
     let display = root.to_string_lossy().into_owned();
@@ -148,6 +272,29 @@ async fn pick_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, Strin
         vault_root = %root.display(),
         "ui: vault opened",
     );
+
+    // status: settings-load-once-at-startup
+    // Read user + vault TOML, merge, validate. Auto-creates either file
+    // with the current defaults if missing (settings-auto-create-defaults).
+    // Strict-load: any unknown key, type mismatch, or schema-version
+    // mismatch aborts here with a clear error.
+    let mut config = Config::load(&root).map_err(|e| e.to_string())?;
+
+    // Push this vault onto the user-scope `vault.recent` list. Best-effort:
+    // if the platform config dir isn't resolvable (sandboxed env), the
+    // write fails silently rather than aborting vault open. The returned
+    // Config is the freshly-reloaded merged view — adopt it so the in-memory
+    // copy in the session matches what's on disk.
+    let recent = update_recent(&config.vault.recent, &root);
+    if recent != config.vault.recent {
+        let value = serde_json::Value::Array(
+            recent.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+        );
+        match Config::set(SettingsScope::User, "vault.recent", value, &root) {
+            Ok(updated) => config = updated,
+            Err(e) => tracing::warn!(error = %e, "failed to update vault.recent"),
+        }
+    }
 
     // Open the store (creates .hiker/index.db on first run).
     let store = Store::open(&root).map_err(|e| e.to_string())?;
@@ -206,6 +353,7 @@ async fn pick_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, Strin
         root,
         indexer,
         watcher,
+        config: RwLock::new(config),
     };
 
     let state = app.state::<AppState>();
@@ -812,6 +960,9 @@ pub fn run() {
             list_trash,
             empty_trash,
             permanent_delete_trash_entry,
+            get_settings,
+            set_setting,
+            try_open_default_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

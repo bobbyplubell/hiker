@@ -65,6 +65,55 @@ type IndexState =
   | { kind: "skipped"; reason: string }
   | { kind: "queued" };
 
+// status: settings-load-once-at-startup
+// Mirror of core::config::Config for the frontend. Returned by
+// `get_settings` on vault open; consumed to seed View menu / tree state /
+// panel state defaults. Field shapes match the Rust serde output.
+interface Settings {
+  schema_version: number;
+  editor: {
+    render_txt_as_markdown: boolean;
+    live_preview: boolean;
+    word_wrap: boolean;
+    show_line_numbers: boolean;
+    show_whitespace: boolean;
+    show_chunk_boundaries: boolean;
+    tab_size: number;
+  };
+  indexing: {
+    model: string;
+    batch_size: number;
+    ignored_paths: string[];
+  };
+  vault: {
+    recent: string[];
+    default: string | null;
+    sidebar_open: boolean;
+    related_open: boolean;
+    trash_expanded: boolean;
+    tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
+  };
+}
+
+type SettingsScope = "user" | "vault";
+
+// status: settings-write-back
+// Persist a single setting via the Tauri write-back command. Failures are
+// logged but never propagated to the user — a flip that worked locally
+// should not show an error toast just because the disk write failed; the
+// in-memory change still took effect for the session.
+async function persistSetting(
+  scope: SettingsScope,
+  key: string,
+  value: unknown,
+): Promise<void> {
+  try {
+    await invoke("set_setting", { scope, key, value });
+  } catch (err) {
+    console.error(`set_setting ${scope}.${key} failed:`, err);
+  }
+}
+
 type ProgressEvent =
   | { kind: "model_loaded" }
   | { kind: "started"; path: string }
@@ -164,15 +213,23 @@ let outstandingCount = 0;
 let vaultIsOpen = false;
 
 // status: txt-render-as-markdown-default
-// Hardcoded to true until the per-vault settings loader (settings-vault-config-toml)
-// lands. The flag is `editor.render_txt_as_markdown` per docs/txt-ingest.md;
-// when false, .txt opens with no language extension (plain text, no preview).
-const RENDER_TXT_AS_MARKDOWN = true;
+// Per-vault default loaded from `editor.render_txt_as_markdown` via
+// `settings-vault-config-toml`. Flips during a session via
+// `view-render-txt-as-markdown-toggle`; the change persists through
+// `settings-write-back`.
+let renderTxtAsMarkdown = true;
+
+// status: view-word-wrap-toggle
+// CM6's `EditorView.lineWrapping` is reconfigured via this compartment so
+// the View menu can flip wrap state without rebuilding the editor. Default
+// is loaded from `editor.word_wrap`.
+const wordWrapCompartment = new Compartment();
+let wordWrapEnabled = true;
 
 function isMarkdownPath(rel: string): boolean {
   const ext = rel.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "md" || ext === "markdown") return true;
-  if (ext === "txt" && RENDER_TXT_AS_MARKDOWN) return true;
+  if (ext === "txt" && renderTxtAsMarkdown) return true;
   return false;
 }
 
@@ -263,6 +320,30 @@ export function setLineNumbersVisible(on: boolean): void {
   view.dom.classList.toggle("hide-line-numbers", !on);
 }
 
+export function setWordWrapEnabled(on: boolean): void {
+  wordWrapEnabled = on;
+  view.dispatch({
+    effects: wordWrapCompartment.reconfigure(on ? EditorView.lineWrapping : []),
+  });
+}
+
+// status: view-render-txt-as-markdown-toggle
+// Session-scope override of the per-vault default. Reconfigures the
+// language and live-preview compartments for the *currently open* buffer
+// so the user sees the change immediately for the file in front of them;
+// future opens pick the new mode up via `languageExtensionForPath`.
+export function setRenderTxtAsMarkdown(on: boolean): void {
+  renderTxtAsMarkdown = on;
+  const rel = buffer?.path;
+  if (!rel) return;
+  view.dispatch({
+    effects: [
+      language.reconfigure(languageExtensionForPath(rel)),
+      livePreviewCompartment.reconfigure(livePreviewExtensionForPath(rel)),
+    ],
+  });
+}
+
 export function setLivePreviewEnabled(on: boolean): void {
   // Hook for the future View menu's `view-live-preview-toggle`. Current
   // buffer's md-ness still gates whether the extension actually applies.
@@ -342,7 +423,7 @@ const view = new EditorView({
     doc: "",
     extensions: [
       basicSetup,
-      EditorView.lineWrapping,
+      wordWrapCompartment.of(EditorView.lineWrapping),
       language.of(markdown()),
       livePreviewCompartment.of(livePreview()),
       chunkBoundariesCompartment.of([]),
@@ -466,9 +547,28 @@ let selectedFolder: string = "";
 const expandedFolders = new Set<string>();
 
 // status: tree-sort-options
-// In-memory only per spec; per-vault persistence waits for `settings.md`.
+// Default loaded from `vault.tree.sort_by` (per `settings-section-vault`);
+// flips persist via `settings-write-back`.
 type TreeSortOrder = "name-asc" | "name-desc" | "mtime-newest" | "mtime-oldest";
 let treeSortOrder: TreeSortOrder = "name-asc";
+
+function sortOrderFromSettings(s: Settings["vault"]["tree"]["sort_by"]): TreeSortOrder {
+  switch (s) {
+    case "name_asc": return "name-asc";
+    case "name_desc": return "name-desc";
+    case "mtime_desc": return "mtime-newest";
+    case "mtime_asc": return "mtime-oldest";
+  }
+}
+
+function sortOrderToSettings(o: TreeSortOrder): Settings["vault"]["tree"]["sort_by"] {
+  switch (o) {
+    case "name-asc": return "name_asc";
+    case "name-desc": return "name_desc";
+    case "mtime-newest": return "mtime_desc";
+    case "mtime-oldest": return "mtime_asc";
+  }
+}
 
 function sortTreeEntries(entries: DirEntry[]): DirEntry[] {
   // Folders always grouped first; the chosen order applies within folders
@@ -859,27 +959,56 @@ async function openVault(): Promise<void> {
   try {
     path = await invoke<string | null>("pick_vault");
   } catch (err) {
-    const msg = formatError(err);
-    console.error("pick_vault failed:", err);
-    // Surface schema-version mismatches with the canonical fix from
-    // index.md's `store-version-fail-loud` policy. The error string is
-    // shaped like "schema version mismatch: db is vN, binary expects vM".
-    if (msg.includes("schema version mismatch")) {
-      alert(
-        `${msg}\n\nThis project's pre-real-use migration policy is to delete .hiker/index.db and re-index. Remove that file in your vault and try again.`,
-      );
-    } else {
-      alert(`open vault failed: ${msg}`);
-    }
+    handleOpenVaultError(err);
     return;
   }
   if (!path) return;
+  await applyOpenedVault(path);
+}
+
+function handleOpenVaultError(err: unknown): void {
+  const msg = formatError(err);
+  console.error("open vault failed:", err);
+  // Surface schema-version mismatches with the canonical fix from
+  // index.md's `store-version-fail-loud` policy. The error string is
+  // shaped like "schema version mismatch: db is vN, binary expects vM".
+  if (msg.includes("schema version mismatch")) {
+    alert(
+      `${msg}\n\nThis project's pre-real-use migration policy is to delete .hiker/index.db and re-index. Remove that file in your vault and try again.`,
+    );
+  } else {
+    alert(`open vault failed: ${msg}`);
+  }
+}
+
+async function applyOpenedVault(path: string): Promise<void> {
   const basename = path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? path;
   vaultPathEl.textContent = basename;
   vaultPathEl.title = path;
   selectedFolder = "";
   vaultIsOpen = true;
   outstandingCount = 0;
+
+  // status: settings-load-once-at-startup
+  // Seed View menu / tree / panel state from the merged settings. Failures
+  // here aren't fatal — fall back to whatever the in-memory defaults are.
+  try {
+    const s = await invoke<Settings>("get_settings");
+    renderTxtAsMarkdown = s.editor.render_txt_as_markdown;
+    setLivePreviewEnabled(s.editor.live_preview);
+    setWordWrapEnabled(s.editor.word_wrap);
+    setLineNumbersVisible(s.editor.show_line_numbers);
+    setWhitespaceEnabled(s.editor.show_whitespace);
+    setChunkBoundariesEnabled(s.editor.show_chunk_boundaries);
+    treeSortOrder = sortOrderFromSettings(s.vault.tree.sort_by);
+    appEl.classList.toggle("sidebar-collapsed", !s.vault.sidebar_open);
+    appEl.classList.toggle("related-collapsed", !s.vault.related_open);
+    trashBinEl.classList.toggle("collapsed", !s.vault.trash_expanded);
+    trashChevronEl.textContent = s.vault.trash_expanded ? "▾" : "▸";
+    syncToggleButtons();
+  } catch (err) {
+    console.error("get_settings failed:", err);
+  }
   // Stale per-path state from a prior vault must not leak into the new one
   // (paths can collide across vaults).
   indexStateCache.clear();
@@ -893,6 +1022,25 @@ async function openVault(): Promise<void> {
 }
 
 pickBtn.addEventListener("click", () => void openVault());
+
+// status: settings-default-vault-autoopen
+// Bootstrap: try the user-scope `vault.default` before falling back to
+// the picker. The Tauri command returns null when no default is set or
+// when the configured path no longer exists; either case leaves the user
+// at the standard "click to open vault" surface.
+async function bootstrapDefaultVault(): Promise<void> {
+  let path: string | null;
+  try {
+    path = await invoke<string | null>("try_open_default_vault");
+  } catch (err) {
+    handleOpenVaultError(err);
+    return;
+  }
+  if (!path) return;
+  await applyOpenedVault(path);
+}
+
+void bootstrapDefaultVault();
 
 // status: create-note-button
 newNoteBtn.addEventListener("click", async () => {
@@ -985,6 +1133,7 @@ function openSortByMenu(x: number, y: number): void {
         if (treeSortOrder === o) return;
         treeSortOrder = o;
         await refreshTree();
+        void persistSetting("vault", "vault.tree.sort_by", sortOrderToSettings(o));
       },
     })),
   );
@@ -1426,13 +1575,26 @@ function syncToggleButtons(): void {
 toggleSidebarBtn.addEventListener("click", () => {
   appEl.classList.toggle("sidebar-collapsed");
   syncToggleButtons();
+  if (!vaultIsOpen) return;
+  void persistSetting(
+    "vault",
+    "vault.sidebar_open",
+    !appEl.classList.contains("sidebar-collapsed"),
+  );
 });
 toggleRelatedBtn.addEventListener("click", () => {
   appEl.classList.toggle("related-collapsed");
   syncToggleButtons();
+  if (!vaultIsOpen) return;
+  void persistSetting(
+    "vault",
+    "vault.related_open",
+    !appEl.classList.contains("related-collapsed"),
+  );
 });
 
-// Default: tree open, related collapsed (per editor.md).
+// Default: tree open, related collapsed (per editor.md). Overridden once
+// `get_settings` lands in `openVault` for vaults that have explicit values.
 appEl.classList.add("related-collapsed");
 syncToggleButtons();
 
@@ -1454,37 +1616,59 @@ function buildViewMenuItems(): CtxMenuItem[] {
     {
       label: "Live preview",
       checked: livePreviewEnabled,
-      run: () => setLivePreviewEnabled(!livePreviewEnabled),
+      run: () => {
+        const on = !livePreviewEnabled;
+        setLivePreviewEnabled(on);
+        void persistSetting("vault", "editor.live_preview", on);
+      },
     },
     {
       // status: view-show-chunk-boundaries
       label: "Show chunk boundaries",
       checked: chunkBoundariesEnabled,
-      run: () => setChunkBoundariesEnabled(!chunkBoundariesEnabled),
+      run: () => {
+        const on = !chunkBoundariesEnabled;
+        setChunkBoundariesEnabled(on);
+        void persistSetting("vault", "editor.show_chunk_boundaries", on);
+      },
     },
     {
       // status: view-render-txt-as-markdown-toggle
       label: "Render .txt as markdown",
-      checked: false,
-      disabled: true,
-      tooltip: "Waits for settings-vault-config-toml",
+      checked: renderTxtAsMarkdown,
+      run: () => {
+        const on = !renderTxtAsMarkdown;
+        setRenderTxtAsMarkdown(on);
+        void persistSetting("vault", "editor.render_txt_as_markdown", on);
+      },
     },
     {
       // status: view-word-wrap-toggle
       label: "Word wrap",
-      checked: false,
-      disabled: true,
-      tooltip: "Waits for settings-section-editor",
+      checked: wordWrapEnabled,
+      run: () => {
+        const on = !wordWrapEnabled;
+        setWordWrapEnabled(on);
+        void persistSetting("vault", "editor.word_wrap", on);
+      },
     },
     {
       label: "Show whitespace",
       checked: whitespaceEnabled,
-      run: () => setWhitespaceEnabled(!whitespaceEnabled),
+      run: () => {
+        const on = !whitespaceEnabled;
+        setWhitespaceEnabled(on);
+        void persistSetting("vault", "editor.show_whitespace", on);
+      },
     },
     {
       label: "Show line numbers",
       checked: lineNumbersVisible,
-      run: () => setLineNumbersVisible(!lineNumbersVisible),
+      run: () => {
+        const on = !lineNumbersVisible;
+        setLineNumbersVisible(on);
+        void persistSetting("vault", "editor.show_line_numbers", on);
+      },
     },
     {
       // status: view-heading-breadcrumb-toggle
@@ -1819,7 +2003,11 @@ function renderTrashBin(): void {
 
 trashHeaderEl.addEventListener("click", () => {
   trashBinEl.classList.toggle("collapsed");
-  trashChevronEl.textContent = trashBinEl.classList.contains("collapsed") ? "▸" : "▾";
+  const expanded = !trashBinEl.classList.contains("collapsed");
+  trashChevronEl.textContent = expanded ? "▾" : "▸";
+  if (vaultIsOpen) {
+    void persistSetting("vault", "vault.trash_expanded", expanded);
+  }
 });
 
 // status: tree-trash-empty-action

@@ -17,6 +17,8 @@ pub enum HikerError {
     AlreadyExists(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("config: {0}")]
+    Config(String),
 }
 
 impl From<std::io::Error> for HikerError {

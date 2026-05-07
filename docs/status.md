@@ -84,8 +84,8 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `editor-view-options-menu` | done | `ui/index.html` (`#view-menu-btn`), `ui/src/main.ts` (`buildViewMenuItems`, `viewMenuBtn` click handler) | `View ▾` button on the editor toolbar between the sidebar and related toggles; opens the existing `openContextMenu` popover with checkable rows. State in-memory only per spec |
 | `view-show-chunk-boundaries` | done | `ui/src/editor/chunkBoundaries/index.ts`, `ui/src/main.ts` (`chunkBoundariesCompartment`, `setChunkBoundariesEnabled`, `fetchAndApplyChunkBounds`) | StateField + line-decoration boundary rule + dedicated gutter showing chunk indices. Toggled via View menu; default off. Refreshes on file-open, on save (500ms debounce, same cadence as related), and after watcher silent-reload. Faint gutter hint shown when the file is unsupported / skipped / queued / has zero chunks |
 | `view-live-preview-toggle` | done | `ui/src/main.ts` (`buildViewMenuItems` "Live preview" entry) | wired to `setLivePreviewEnabled`; checkmark reflects `livePreviewEnabled`; default on |
-| `view-render-txt-as-markdown-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-vault-config-toml" |
-| `view-word-wrap-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Waits for settings-section-editor" |
+| `view-render-txt-as-markdown-toggle` | done | `ui/src/main.ts` (`setRenderTxtAsMarkdown`, `buildViewMenuItems` "Render .txt as markdown" entry) | flips both `language` and `livePreview` compartments for the active buffer; persists via `settings-write-back` to `editor.render_txt_as_markdown` |
+| `view-word-wrap-toggle` | done | `ui/src/main.ts` (`wordWrapCompartment`, `setWordWrapEnabled`, `buildViewMenuItems` "Word wrap" entry) | reconfigures CM6 `EditorView.lineWrapping` via its own compartment; persists via `settings-write-back` to `editor.word_wrap` |
 | `view-show-whitespace-toggle` | done | `ui/src/main.ts` (`whitespaceCompartment`, `setWhitespaceEnabled`) | CM6's `highlightWhitespace` in its own compartment; default off; toggled via View menu. Persistence still pending `settings-section-editor` |
 | `view-line-numbers-toggle` | done | `ui/src/main.ts` (`setLineNumbersVisible`), `ui/src/style.css` (`.cm-editor.hide-line-numbers`) | hides `.cm-gutter.cm-lineNumbers` from `basicSetup` via a class on the editor root rather than reconfiguring the extension stack; default visible. Persistence still pending `settings-section-editor` |
 | `view-heading-breadcrumb-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Pairs with view-show-chunk-boundaries" |
@@ -108,7 +108,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `embedder-fastembed-bge-small` | done | `core/src/embed.rs` | bge-small-en-v1.5, 384 dims |
 | `embedder-version-tag` | done | `core/src/embed.rs:18` | embedder_version on notes row |
 | `embedder-spawn-blocking` | done | `core/src/indexer.rs:194` | model load + embed off async pool |
-| `embedder-batch-64` | partial | `core/src/indexer.rs` | batching exists; size not configurable |
+| `embedder-batch-64` | partial | `core/src/indexer.rs` | batching exists; the `[indexing].batch_size` config key (declared in `settings-section-indexing`) is not yet plumbed into the indexer task — the value is loaded but not consumed |
 | `embedder-platform-data-dir` | done | `core/src/embed.rs:65` | `directories` crate |
 | `embedder-module-discipline` | done | `core/src/embed.rs` | trait Embedder; no fastembed leakage |
 | `embedder-first-run-nonblocking` | done | `core/src/indexer.rs` | vault opens; embed defers until model ready |
@@ -177,17 +177,23 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 
 ## Settings (settings.md)
 
-Whole surface is planned. Slugs reserved so they can be cited from code as features land.
+v1 surface landed: TOML loader + auto-create + targeted write-back, editor / indexing / vault sections wired into the existing UI. No generalized settings UI in v1 — the existing in-app toggles persist via `settings-write-back`; everything else is hand-edited TOML and applied on restart. The keymap section stays planned.
 
-| Slug | Status | Notes |
-| ---- | ------ | ----- |
-| `settings-user-config-toml` | planned | per-user `~/.config/hiker/config.toml` |
-| `settings-vault-config-toml` | planned | per-vault `vault/.hiker/config.toml` overrides |
-| `settings-section-indexing` | planned | model selection, reindex, batch size, ignores |
-| `settings-section-keymap` | planned | overrides for keybind-registry by id |
-| `settings-section-editor` | planned | tab size, wrap, theme, font, autosave |
-| `settings-section-vault` | planned | recent vaults, default-on-startup |
-| `settings-schema-version` | planned | top-of-file version, additive migrations |
+| Slug | Status | Evidence | Notes |
+| ---- | ------ | -------- | ----- |
+| `settings-user-config-toml` | done | `core/src/config.rs` (`ConfigPaths::resolve`) | platform config dir via `directories`; auto-created with full defaults on first run |
+| `settings-vault-config-toml` | done | `core/src/config.rs` (`ConfigPaths::resolve`, `Config::load`) | `vault/.hiker/config.toml`; deep-merged over user, vault wins on every key |
+| `settings-load-once-at-startup` | done | `core/src/config.rs` (`Config::load`), `ui/src-tauri/src/lib.rs` (`pick_vault_inner` calls `Config::load`; `VaultSession.config: RwLock<Config>`) | one read per vault open; in-app writes update disk and the in-memory copy together |
+| `settings-strict-load` | done | `core/src/config.rs` (every section uses `#[serde(deny_unknown_fields)]`; `Config::load` checks `schema_version` before deserialize, then validates `indexing.model` + `batch_size`) | unknown keys + type mismatches abort with file:line; mismatch path mirrors `store-version-fail-loud` |
+| `settings-defaults-in-code` | done | `core/src/config.rs` (`Default` impl on `Config`, `EditorConfig`, `IndexingConfig`, `VaultConfig`, `TreeConfig`) | every field `serde(default)`-decorated; one `Default` impl per struct is the source of truth |
+| `settings-auto-create-defaults` | done | `core/src/config.rs` (`read_or_create`, `write_defaults`, `atomic_write`) | missing TOML at load → atomic-write a fresh file with header comment + serialized defaults; tested at `auto_create_writes_defaults` |
+| `settings-write-back` | done | `core/src/config.rs` (`Config::set`, `apply_patch`, eligible-key tables), `ui/src-tauri/src/lib.rs` (`set_setting` Tauri cmd), `ui/src/main.ts` (`persistSetting` plus call sites in View menu, sort menu, sidebar/related toggles, trash header) | closed eligible-key set; `toml_edit::DocumentMut` patches in place so user comments + unknown keys survive; tested at `write_back_patches_in_place_preserving_comments` |
+| `settings-section-editor` | done | `core/src/config.rs` (`EditorConfig`) | `render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `show_chunk_boundaries`, `tab_size` |
+| `settings-section-indexing` | done | `core/src/config.rs` (`IndexingConfig`) | `model`, `batch_size`, `ignored_paths` declared and validated; consumers (embedder, walker filter) still read in-code defaults — config keys exist but aren't yet plumbed through |
+| `settings-section-vault` | done | `core/src/config.rs` (`VaultConfig`) | `recent`, `default`, `sidebar_open`, `related_open`, `trash_expanded`, `tree.sort_by` |
+| `settings-default-vault-autoopen` | done | `core/src/config.rs` (`Config::user_default_vault`), `ui/src-tauri/src/lib.rs` (`try_open_default_vault`, `open_vault_at`), `ui/src/main.ts` (`bootstrapDefaultVault`, called at module init) | reads `vault.default` from user TOML at app bootstrap; missing path warns and falls back to picker without clearing the setting |
+| `settings-section-keymap` | planned | — | stub; loader for `keymap.<binding-id> = "<chord>"` deferred until first user remap |
+| `settings-schema-version` | done | `core/src/config.rs` (`SCHEMA_VERSION`, mismatch check in `Config::load`) | top-level integer; mismatch hard-fails with "schema_version N, this binary expects M" |
 
 
 ## Clustering (clustering.md)
@@ -235,7 +241,7 @@ All planned. The build engine consumed by `suggestions.md`. Lands post-v1.
 | Slug | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
 | `txt-extension-recognized` | done | `core/src/indexer.rs` (`is_indexable_path`, `process_upsert` chunker dispatch) | walker, watcher router, and per-file chunker dispatch all consult `is_indexable_path`; `Chunker` trait + `MarkdownChunker`/`TxtChunker` live under `core::chunker` |
-| `txt-render-as-markdown-default` | partial | `ui/src/main.ts` (`languageExtensionForPath`, `RENDER_TXT_AS_MARKDOWN`) | hardcoded `true` until `settings-vault-config-toml` lands; reconfigured on `openFile` and trash preview |
+| `txt-render-as-markdown-default` | done | `ui/src/main.ts` (`languageExtensionForPath`, `renderTxtAsMarkdown`, seeded in `openVault` from `get_settings`) | per-vault default loaded from `editor.render_txt_as_markdown`; session override is `view-render-txt-as-markdown-toggle` |
 | `txt-chunker-paragraph-splits` | done | `core/src/chunker/txt.rs` (`chunk_txt`, `build_sections`) | Layer 1 baseline subsumed by Layer 3 sentence-packing within sections |
 | `txt-chunker-structure-heuristics` | done | `core/src/chunker/txt.rs` (`detect_headings`, `is_setext_underline`, `looks_like_all_caps_heading`) | ALL-CAPS + setext `===`/`---`; lists/blockquotes flow as content per spec |
 | `txt-chunker-sentence-pack` | done | `core/src/chunker/txt.rs` (`sentence_pack_range`, `segment_sentences`) | ~1200-char soft cap shared with markdown chunker |

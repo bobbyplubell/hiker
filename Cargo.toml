@@ -28,3 +28,5 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
 tracing-appender = "0.2"
+toml = "0.8"
+toml_edit = "0.22"
