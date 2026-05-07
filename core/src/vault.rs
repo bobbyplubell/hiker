@@ -21,6 +21,12 @@ pub struct DirEntryDto {
     pub name: String,
     pub rel_path: String,
     pub kind: EntryKind,
+    /// Filesystem mtime in unix seconds. Same field the watcher and indexer
+    /// use; surfaced to the frontend so the tree can offer mtime-based
+    /// sort orders without a second round trip.
+    ///
+    /// status: tree-sort-options
+    pub mtime: i64,
 }
 
 #[derive(Clone)]
@@ -59,6 +65,15 @@ impl Vault {
         Ok(normalized)
     }
 
+    /// Resolve a vault-relative path to an absolute path on disk, applying
+    /// the same path-escape and symlink-ancestor rejections that
+    /// `read_file` / `write_file` use. Public so the Tauri layer can hand
+    /// absolute paths to OS commands (e.g. reveal-in-file-manager) without
+    /// duplicating the validation logic.
+    pub fn abs_path(&self, rel: &str) -> Result<PathBuf, HikerError> {
+        self.resolve(rel)
+    }
+
     pub fn list_dir(&self, rel: &str) -> Result<Vec<DirEntryDto>, HikerError> {
         let abs = self.resolve(rel)?;
         let mut out = Vec::new();
@@ -81,7 +96,20 @@ impl Vault {
             } else {
                 format!("{}/{}", rel.trim_end_matches('/'), name)
             };
-            out.push(DirEntryDto { name, rel_path, kind });
+            // mtime: best-effort. A failed metadata/system-time call is not a
+            // reason to drop the row — fall back to 0 and let the frontend
+            // sort it as the oldest entry.
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
+                })
+                .unwrap_or(0);
+            out.push(DirEntryDto { name, rel_path, kind, mtime });
         }
         out.sort_by(|a, b| match (&a.kind, &b.kind) {
             (EntryKind::Dir, EntryKind::File) => std::cmp::Ordering::Less,
@@ -285,6 +313,101 @@ pub fn move_note(
             let _ = fs::rename(&to_abs, &from_abs);
             return Err(HikerError::Io(e.to_string()));
         }
+    }
+    Ok(())
+}
+
+/// Atomic folder rename: fs rename of the whole folder + bulk index path
+/// update for every contained `.md` file in a single store transaction. Empty
+/// subfolders move with the rename for free (it's a single fs::rename).
+/// Errors leave both sides untouched (or rolled back if the index update
+/// fails after the fs rename succeeded). Behaviors per editor.md "API & edge
+/// cases":
+///
+/// - target collision → `AlreadyExists`, source untouched
+/// - source missing or not a directory → `NotFound`
+/// - target parent missing → `NotFound`
+/// - non-indexed `.md` files inside (never ingested) and non-md files → fs
+///   rename only, store skips them
+///
+/// Watcher suppression covers the folder root, every contained `.md` member
+/// at its old path, and every member at its new path so cross-platform
+/// notify ordering can't surface a stale Created/Deleted pair.
+pub fn move_folder(
+    vault: &Vault,
+    store: &mut Store,
+    watcher: Option<&Watcher>,
+    from: &str,
+    to: &str,
+) -> Result<(), HikerError> {
+    if from == to {
+        return Ok(());
+    }
+    let from_abs = vault.resolve(from)?;
+    let to_abs = vault.resolve(to)?;
+    let meta = match fs::symlink_metadata(&from_abs) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HikerError::NotFound(from.to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_dir() {
+        return Err(HikerError::NotFound(format!("not a directory: {from}")));
+    }
+    if to_abs.exists() {
+        return Err(HikerError::AlreadyExists(to.to_string()));
+    }
+    match to_abs.parent() {
+        Some(parent) if !parent.exists() => {
+            return Err(HikerError::NotFound(format!("parent of {to}")));
+        }
+        _ => {}
+    }
+    // Don't allow moving a folder into itself or a descendant.
+    if to == from || to.starts_with(&format!("{from}/")) {
+        return Err(HikerError::PathEscape(format!(
+            "cannot move {from} into its own subtree at {to}"
+        )));
+    }
+
+    // Collect indexed-eligible members before the rename so we can build the
+    // (old, new) path pairs the store needs.
+    let members = vault.walk_md_files(from)?;
+    let from_prefix = format!("{from}/");
+    let renames: Vec<(String, String)> = members
+        .iter()
+        .map(|m| {
+            let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
+            (m.clone(), format!("{to}/{suffix}"))
+        })
+        .collect();
+
+    if let Some(w) = watcher {
+        w.suppress(from);
+        w.suppress(to);
+        for (old, new) in &renames {
+            w.suppress(old.clone());
+            w.suppress(new.clone());
+        }
+    }
+
+    fs::rename(&from_abs, &to_abs)?;
+
+    // Re-register suppression so the TTL window starts close to when notify
+    // surfaces its events (post-rename + debounce).
+    if let Some(w) = watcher {
+        w.suppress(from);
+        w.suppress(to);
+        for (old, new) in &renames {
+            w.suppress(old.clone());
+            w.suppress(new.clone());
+        }
+    }
+
+    if let Err(e) = store.rename_notes_by_paths(&renames) {
+        let _ = fs::rename(&to_abs, &from_abs);
+        return Err(HikerError::Io(e.to_string()));
     }
     Ok(())
 }
@@ -622,6 +745,90 @@ mod tests {
             })
             .unwrap();
         id
+    }
+
+    #[test]
+    fn move_folder_renames_dir_and_remaps_indexed_members() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("proj")).unwrap();
+        fs::write(dir.path().join("proj/a.md"), b"a").unwrap();
+        fs::create_dir(dir.path().join("proj/sub")).unwrap();
+        fs::write(dir.path().join("proj/sub/b.md"), b"b").unwrap();
+        // c.md exists on disk but isn't in the index — rename should still
+        // move the file (via fs::rename of the parent) and the store call
+        // simply skips it.
+        fs::write(dir.path().join("proj/sub/c.md"), b"c").unwrap();
+        // An empty subfolder should travel with the rename.
+        fs::create_dir(dir.path().join("proj/empty")).unwrap();
+
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        upsert_stub(&mut store, "proj/a.md");
+        upsert_stub(&mut store, "proj/sub/b.md");
+
+        move_folder(&vault, &mut store, None, "proj", "renamed").unwrap();
+
+        assert!(!dir.path().join("proj").exists());
+        assert!(dir.path().join("renamed/a.md").exists());
+        assert!(dir.path().join("renamed/sub/b.md").exists());
+        assert!(dir.path().join("renamed/sub/c.md").exists());
+        assert!(dir.path().join("renamed/empty").is_dir());
+
+        assert!(store.get_note_by_path("proj/a.md").unwrap().is_none());
+        assert!(store.get_note_by_path("proj/sub/b.md").unwrap().is_none());
+        assert!(store.get_note_by_path("renamed/a.md").unwrap().is_some());
+        assert!(store.get_note_by_path("renamed/sub/b.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn move_folder_into_subfolder_collision_errors() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::create_dir(dir.path().join("b")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        match move_folder(&vault, &mut store, None, "a", "b") {
+            Err(HikerError::AlreadyExists(_)) => {}
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+        // Source untouched.
+        assert!(dir.path().join("a").exists());
+    }
+
+    #[test]
+    fn move_folder_into_own_subtree_errors() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        match move_folder(&vault, &mut store, None, "a", "a/sub") {
+            Err(HikerError::PathEscape(_)) => {}
+            other => panic!("expected PathEscape, got {other:?}"),
+        }
+        assert!(dir.path().join("a").exists());
+    }
+
+    #[test]
+    fn move_folder_source_missing_errors() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        match move_folder(&vault, &mut store, None, "ghost", "x") {
+            Err(HikerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_folder_source_is_file_errors() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("file.md"), b"x").unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        match move_folder(&vault, &mut store, None, "file.md", "renamed.md") {
+            Err(HikerError::NotFound(msg)) => assert!(msg.contains("not a directory")),
+            other => panic!("expected NotFound(not a directory), got {other:?}"),
+        }
     }
 
     #[test]

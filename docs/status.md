@@ -39,25 +39,25 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `save-keybind-mod-s` | done | `ui/src/editor/keybinds.ts:102` | |
 | `keybind-registry` | done | `ui/src/editor/keybinds.ts` | flat list, validate() on duplicates |
 | `save-button` | done | `ui/src/main.ts:127` | disabled when no file or clean |
-| `file-switch-guard-dirty` | done | `ui/src/main.ts:177` | 3-way confirm via window.prompt (rough) |
+| `file-switch-guard-dirty` | done | `ui/src/main.ts:407` | uses `confirm3` real modal |
 | `window-close-guard-dirty` | done | `ui/src/main.ts:319` | |
 | `pre-write-drift-check` | done | `core/src/vault.rs:99` | re-reads + hashes before write |
 | `drift-conflict-modal` | done | `ui/src/main.ts:150` | keep/take/cancel; no diff option |
 | `status-bar-layout` | done | `ui/index.html`, `ui/src/style.css` | three regions |
 | `status-bar-index-label` | done | `ui/src/main.ts:450` | model loading / indexing / indexed / error |
 | `status-bar-path-basename-tooltip` | done | `ui/src/main.ts` (`updateStatus`) | basename in `#status-path`, full rel-path in `title=` |
-| `status-bar-path-reveal` | planned | — | click basename → reveal note in system file explorer (Tauri shell/opener) |
+| `status-bar-path-reveal` | done | `ui/src/main.ts` (statusPathEl click handler), `ui/src-tauri/src/lib.rs` (`reveal_in_file_manager`, `reveal_path` per-OS) | macOS `open -R`, Windows `explorer /select,`, Linux `xdg-open <parent>` (Linux has no portable select-file verb). Suppressed for trash-preview buffers so internal `.hiker/trash/` paths don't leak |
 | `ui-no-sibling-pushout` | done | `ui/src/style.css` (`#status-bar`, `#vault-bar`) | applied to status-bar regions and vault-bar; rule documented in CSS comment at `#status-bar` |
 | `status-bar-goto-line` | planned | — | line:col is display-only |
 | `three-column-layout` | done | `ui/index.html`, `ui/src/style.css` | grid, sides collapsible |
 | `panel-toggle-buttons` | done | `ui/index.html:19` | sidebar + related toggles |
 | `cm6-extension-order` | done | `ui/src/main.ts:113` | basicSetup → lang → save tracking → keymap |
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
-| `drag-and-drop-move` | partial | `ui/src/main.ts` (`attachDnd`) | file DnD wired to Tauri `move_note`; folder drag disabled until walk-and-batch lands |
+| `drag-and-drop-move` | done | `ui/src/main.ts` (`attachDnd`, `performDrop`) | file DnD calls Tauri `move_note`; folder DnD calls Tauri `move_folder` → `core::vault::move_folder` (single fs rename + bulk index path remap via `Store::rename_notes_by_paths`). Empty subfolders move with the rename for free. Buffer follows when the open file is inside the moved subtree |
 | `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler) | auto-suffix `new-note-N.md` via Tauri `create_note`, opens + inline-renames |
 | `tree-refresh-manual` | done | `ui/src/main.ts` (`tree-actions-btn` "Refresh tree" entry) | re-reads dir; restores active highlight; expansion state preserved across refresh via `expandedFolders` set; lives inside the `…` actions menu |
 | `tree-refresh-watcher` | done | `ui/src/main.ts` (`scheduleTreeRefreshFromWatcher`, `hiker:file-changed` listener) | 200ms-debounced `refreshTree` on created/deleted/renamed events; modified events are no-ops (tree shape unchanged); manual `tree-refresh-manual` stays as a backstop. Lifted from v2 → v1; watcher.md "Out of scope for v1" entry now stale |
-| `tree-double-click-rename` | planned | — | double-click row → inline rename (same UX as post-create rename) |
+| `tree-double-click-rename` | done | `ui/src/main.ts` (`renderDir` dblclick handler, `beginInlineRename`) | dblclick on file → inline rename via `move_note`; dblclick on folder → inline rename via `move_folder`. Single-click handlers skip when `event.detail >= 2` so the second click of the dbl doesn't toggle/open. Folder rename remaps `expandedFolders` prefixes so expansion state survives, and the open buffer follows when its path is inside the renamed subtree |
 | `tree-context-menu` | done | `ui/src/main.ts` (`attachContextMenu`, `openContextMenu`) | row menu: Open / Rename / Delete / Properties (greyed); empty-space menu: New note here |
 | `tree-context-delete` | done | `ui/src/main.ts` (`deleteFromTree`) | confirm modal (Cancel default-focus, danger Move-to-trash); folder copy includes recursive note count; closes open buffer if deleted; toast confirmation |
 | `tree-context-properties` | partial | `ui/src/main.ts` (`attachContextMenu`) | menu entry stub disabled; opens nothing until frontmatter editing lands |
@@ -72,10 +72,10 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `tree-trash-restore-action` | done | `ui/src/main.ts` (`openTrashRowMenu`), `ui/src-tauri/src/lib.rs` (`permanent_delete_trash_entry`), `core/src/trash.rs` (`Trash::permanent_delete`) | row right-click → Restore (greyed for orphans) / Delete permanently with confirm |
 | `tree-trash-empty-action` | done | `ui/src/main.ts` (`trashHeaderEl` contextmenu) | header right-click → "Empty trash (N entries)" with confirm; disabled when N == 0 |
 | `tree-trash-orphan-recovery` | done | `core/src/trash.rs` (`list_from_disk`), `ui/src/main.ts` (`openTrashRowMenu`) | orphans listed (italic, muted); Restore disabled with explanation; Empty + Delete permanently still work via `trashed_name` identifier |
-| `confirm3-real-modal` | planned | — | replace `window.prompt` 3-way with proper modal |
+| `confirm3-real-modal` | done | `ui/src/main.ts:1164` (`confirm3`) | overlay + `role=dialog` + `aria-modal`; used by `openFile` dirty guard and elsewhere |
 | `help-panel-keybinds` | planned | — | enumerate keybinds.list() |
 | `tree-toolbar-actions-menu` | done | `ui/index.html` (`#tree-actions-btn`), `ui/src/main.ts` (`treeActionsBtn` click handler) | `…` button next to + New note opens the existing `openContextMenu` popover; hosts Refresh tree / Reindex all / Reindex this file / Sort by |
-| `tree-sort-options` | planned | — | Sort by submenu in `…`: Name A→Z (default) / Name Z→A / Modified newest / Modified oldest; folders grouped first; in-memory state in v1 |
+| `tree-sort-options` | done | `ui/src/main.ts` (`treeSortOrder`, `sortTreeEntries`, `openSortByMenu`), `core/src/vault.rs` (`DirEntryDto.mtime`) | Folders grouped first; chosen order applies within each group. mtime sourced from filesystem metadata in `list_dir` (best-effort: a failed stat falls back to 0). In-memory state per spec; persistence waits for `settings.md`. Submenu rendered as a second flat `openContextMenu` invocation since the menu helper has no nested-submenu support — UX is fine, the current order is also surfaced in the parent entry's label |
 | `tree-row-unsupported-marker` | done | `ui/src/main.ts` (`renderTreeRowLabel`, `isIndexableExt`) | hollow grey suffix dot derived client-side from extension; no Tauri round trip for non-md/txt rows |
 | `tree-row-skipped-marker` | done | `ui/src/main.ts` (`renderTreeRowLabel`, `applyIndexMarker`), `ui/src/style.css` (`#tree li.ix-skipped > .ix-marker`) | amber suffix dot from `index_state_for`; reason in `title=` tooltip |
 | `tree-row-queued-marker` | done | `ui/src/main.ts` (`updateIndexStateForPath` on `started`/`finished`/`skipped`), `ui/src/style.css` (`#tree li.ix-queued > .ix-marker`, `@keyframes ix-queued-pulse`) | pulsing accent suffix dot driven by `hiker:reindex-progress` events |
@@ -98,7 +98,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `store-sqlite-vec-static` | done | `core/src/store.rs` | bundled rusqlite + sqlite-vec |
 | `store-schema-v1` | done | `core/src/store.rs` | notes / chunks / chunk_vecs / path_ids; bumped to `SCHEMA_VERSION = 2` to add `notes.skipped` + `notes.skip_reason` (per `tauri-cmd-file-index-state`). Slug name kept for stability; the schema-version constant tracks the actual on-disk version |
 | `store-version-fail-loud` | done | `core/src/store.rs:17` | no auto-migrate |
-| `store-wal-mode` | partial | `core/src/indexer.rs:154` (comment) | PRAGMA not visibly set in code path |
+| `store-wal-mode` | done | `core/src/store.rs:708` | `pragma_update(None, "journal_mode", "WAL")` plus `synchronous=NORMAL` |
 | `store-module-discipline` | done | `core/src/store.rs` | rusqlite confined to one module |
 | `chunker-heading-bounded` | done | `core/src/chunker.rs:32` | pulldown-cmark walk |
 | `chunker-soft-size-1200` | done | `core/src/chunker.rs:16` | |
@@ -121,11 +121,11 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `ingest-progress-events` | done | `core/src/indexer.rs:55` | hiker:reindex-progress |
 | `related-notes-query` | done | `core/src/store.rs:334` | per-chunk KNN, exclude source, group by note |
 | `related-notes-snippet` | done | `core/src/store.rs:403` | snippet + heading_path |
-| `related-notes-panel-ui` | partial | `ui/index.html`, `ui/src/main.ts` | panel exists; verify file-open + debounced-save refresh |
+| `related-notes-panel-ui` | done | `ui/index.html`, `ui/src/main.ts` (`refreshRelated`, `scheduleRelatedRefresh`) | refresh wired on file-open (`:1411`), debounced-save (`:1526`), and explicit calls (`:353`); cleared on vault swap (`:793`) |
 | `tauri-cmd-related-notes` | done | `ui/src-tauri/src/lib.rs:195` | |
 | `tauri-cmd-index-status` | done | `ui/src-tauri/src/lib.rs:188` | |
 | `tauri-cmd-index` | done | `ui/src-tauri/src/lib.rs:173` | All / Path scopes |
-| `walker-symlink-policy` | partial | not visible in code | spec says don't follow; configuration not confirmed |
+| `walker-symlink-policy` | done | `core/src/vault.rs:163`, `core/src/indexer.rs:792`, `core/src/trash.rs:159` | every `walkdir::WalkDir` call uses `.follow_links(false)` |
 | `move-note-core-cmd` | done | `core/src/vault.rs` (`move_note`) | atomic fs rename + index update with watcher suppression; folder walk lives in `drag-and-drop-move` |
 | `create-note-core-cmd` | done | `core/src/vault.rs` (`Vault::create_note`) | empty file, errors on collision (auto-suffix is the caller's job) |
 | `tauri-cmd-file-index-state` | done | `ui/src-tauri/src/lib.rs` (`index_state_for`, `IndexState`), `core/src/indexer.rs` (`IndexerHandle::is_pending`) | Unsupported via `is_indexable_path`; Queued from indexer's pending-paths set; Skipped + Indexed from `notes` row. Schema bumped to v2 to add `notes.skipped` + `notes.skip_reason` (`store-schema-v1` row covers the v1 baseline; the v2 columns + persistence ride on this slug). Indexer now persists Skipped rows for "file too large" and "not UTF-8" branches in `process_upsert`; `Store::upsert_skipped` handles the row + chunk cleanup |
@@ -163,7 +163,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `watcher-rename-pairing` | done | `core/src/watcher.rs:106` | unpaired → Created/Deleted |
 | `watcher-suppress-self-writes` | done | `core/src/watcher.rs` (`Watcher::suppress`) | TTL-500ms map; bridge thread filters events whose path is currently suppressed |
 | `watcher-ignore-hardcoded` | done | `core/src/watcher.rs:143` | .hiker/, .git/, dotfiles, swap files |
-| `watcher-symlink-policy` | partial | not visible in code | spec disables symlink-following on watcher |
+| `watcher-symlink-policy` | done | `core/src/watcher.rs` (`has_symlink_ancestor`, called from `normalize`) | events whose path has a symlink ancestor under the canonical vault root are dropped at the normalize step, so the indexer never sees content reached through an in-vault symlink regardless of how notify resolves it on the host platform |
 | `watcher-broadcast-channel` | done | `core/src/watcher.rs:54` | tokio broadcast |
 | `watcher-bridge-to-indexer` | done | `ui/src-tauri/src/lib.rs:114` | |
 | `watcher-bridge-to-frontend` | done | `ui/src-tauri/src/lib.rs:122` | hiker:file-changed |

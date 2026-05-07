@@ -416,6 +416,120 @@ async fn move_note_inner(
     result
 }
 
+/// Reveal a vault note in the OS file manager (Finder on macOS, Explorer on
+/// Windows, default file manager on Linux). Backs the status-bar basename
+/// click target.
+///
+/// status: status-bar-path-reveal
+#[tauri::command]
+fn reveal_in_file_manager(state: State<AppState>, rel: String) -> Result<(), HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        let abs = session.vault.abs_path(&rel)?;
+        reveal_path(&abs).map_err(|e| HikerError::Io(e.to_string()))
+    })();
+    log_cmd_result("reveal_in_file_manager", result)
+}
+
+/// Spawn the platform's reveal-in-file-manager command. Runs the spawn
+/// without waiting — the file manager UI is the user's concern, not ours.
+#[cfg(target_os = "macos")]
+fn reveal_path(abs: &std::path::Path) -> std::io::Result<()> {
+    std::process::Command::new("open").arg("-R").arg(abs).spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path(abs: &std::path::Path) -> std::io::Result<()> {
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{}", abs.display()))
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_path(abs: &std::path::Path) -> std::io::Result<()> {
+    // Linux has no portable "select this file" verb. Open the parent
+    // directory in the user's file manager — close enough that the user
+    // can pick the file out by sight, no dependency on a specific DE.
+    let target = abs.parent().unwrap_or(abs);
+    std::process::Command::new("xdg-open").arg(target).spawn()?;
+    Ok(())
+}
+
+/// Folder rename: fs rename of the whole directory + bulk store path remap
+/// for every contained `.md` file. Backs tree drag-and-drop of folder rows.
+/// Empty subfolders move with the rename for free.
+#[tauri::command]
+async fn move_folder(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<(), HikerError> {
+    log_cmd_result("move_folder", move_folder_inner(state, from, to).await)
+}
+
+async fn move_folder_inner(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<(), HikerError> {
+    let (sender, members) = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+        // Pre-suppress every `.md` member at its old AND new path so notify's
+        // platform-specific event ordering (per-child events on some OSes,
+        // single-dir event on others) can't surface stale Created/Deleted
+        // pairs around the move. Folder root suppressed too.
+        session.watcher.suppress(from.clone());
+        session.watcher.suppress(to.clone());
+        let members = session.vault.walk_md_files(&from).unwrap_or_default();
+        let from_prefix = format!("{from}/");
+        for m in &members {
+            session.watcher.suppress(m.clone());
+            let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
+            session.watcher.suppress(format!("{to}/{suffix}"));
+        }
+        (session.indexer.job_sender(), members)
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(IndexJob::MoveFolder {
+            from: from.clone(),
+            to: to.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HikerError::Io("indexer task is shut down".into()))?;
+    let result = reply_rx
+        .await
+        .map_err(|_| HikerError::Io("indexer dropped move_folder reply".into()))?;
+    if let Ok(guard) = state.session.lock() {
+        if let Some(session) = guard.as_ref() {
+            session.watcher.suppress(from.clone());
+            session.watcher.suppress(to.clone());
+            let from_prefix = format!("{from}/");
+            for m in &members {
+                session.watcher.suppress(m.clone());
+                let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
+                session.watcher.suppress(format!("{to}/{suffix}"));
+            }
+        }
+    }
+    result
+}
+
 /// Soft-delete a note or folder. Backs the tree context-menu Delete entry
 /// (`tree-context-delete`). Mirrors `move_note` shape: suppress watcher,
 /// route through the indexer task so all writes go through its owned store
@@ -691,6 +805,8 @@ pub fn run() {
             chunks_for,
             create_note,
             move_note,
+            move_folder,
+            reveal_in_file_manager,
             delete_note,
             restore_trash_entry,
             list_trash,

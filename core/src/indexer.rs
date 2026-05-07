@@ -45,6 +45,14 @@ pub enum IndexJob {
         to: String,
         reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
     },
+    /// Folder-scoped move: fs rename of the whole directory + bulk index
+    /// path update for every contained `.md` member, on the indexer's owned
+    /// store. Reply oneshot returns the outcome.
+    MoveFolder {
+        from: String,
+        to: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+    },
     /// Soft-delete requested by a UI/CLI caller — fs move into vault trash +
     /// store cascade in one shot, on the indexer task. Reply oneshot returns
     /// the resulting `TrashEntry` so the caller can drive an undo toast or
@@ -300,6 +308,12 @@ async fn indexer_loop<F>(
                         )));
                         None
                     }
+                    IndexJob::MoveFolder { reply, .. } => {
+                        let _ = reply.send(Err(crate::error::HikerError::Io(
+                            "embedder unavailable".into(),
+                        )));
+                        None
+                    }
                     IndexJob::DeleteNote { reply, .. } => {
                         let _ = reply.send(Err(crate::error::HikerError::Io(
                             "embedder unavailable".into(),
@@ -516,6 +530,10 @@ async fn handle_simple_job(
             // need to here. Run vault::move_note on the indexer's owned
             // store so all writes flow through one connection.
             let result = crate::vault::move_note(vault, store, None, &from, &to);
+            let _ = reply.send(result);
+        }
+        IndexJob::MoveFolder { from, to, reply } => {
+            let result = crate::vault::move_folder(vault, store, None, &from, &to);
             let _ = reply.send(result);
         }
         IndexJob::DeleteNote { rel, reply } => {

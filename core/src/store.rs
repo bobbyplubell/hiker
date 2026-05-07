@@ -464,6 +464,42 @@ impl Store {
         Ok(removed)
     }
 
+    /// Bulk rename: update `notes.path` for many indexed paths in a single
+    /// transaction. Used by `vault::move_folder` to keep the index consistent
+    /// with the on-disk folder rename — either every member's path updates or
+    /// none do, so a mid-loop failure can't leave the index half-renamed.
+    /// Skips entries that aren't in the index (non-md files, never-ingested
+    /// `.md` files); they have nothing to update.
+    pub fn rename_notes_by_paths(
+        &mut self,
+        renames: &[(String, String)],
+    ) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut updated = 0;
+        for (old, new) in renames {
+            let id_opt: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM path_ids WHERE path = ?1",
+                    params![old],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = id_opt else { continue };
+            tx.execute(
+                "UPDATE notes SET path = ?1 WHERE id = ?2",
+                params![new, id],
+            )?;
+            tx.execute("DELETE FROM path_ids WHERE id = ?1", params![id])?;
+            tx.execute(
+                "INSERT INTO path_ids (path, id) VALUES (?1, ?2)",
+                params![new, id],
+            )?;
+            updated += 1;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Rename: update `notes.path` and add a new `path_ids` row for the new
     /// path. Old path_ids row is removed so search by old path returns None.
     /// Content unchanged — chunks stay valid.

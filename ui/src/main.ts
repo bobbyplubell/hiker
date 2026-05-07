@@ -21,6 +21,7 @@ interface DirEntry {
   name: string;
   rel_path: string;
   kind: EntryKind;
+  mtime: number;
 }
 interface FileWithHash {
   contents: string;
@@ -291,6 +292,12 @@ function updateStatus(): void {
   if (buffer?.preview) basename += " (in trash)";
   statusPathEl.textContent = basename;
   statusPathEl.title = buffer?.preview ? buffer.path : path;
+  // status: status-bar-path-reveal — clickable when a real (non-trash) file
+  // is open. Trash-preview paths live under `.hiker/trash/` and revealing
+  // them would expose internal state, so the gesture is suppressed there.
+  const revealable = !!buffer && !buffer.preview;
+  statusPathEl.classList.toggle("clickable", revealable);
+  statusPathEl.style.cursor = revealable ? "pointer" : "";
   saveBtn.disabled = !buffer || !dirty || buffer.preview === true;
   saveBtn.classList.toggle("dirty", dirty);
 
@@ -438,7 +445,7 @@ async function openFile(rel: string): Promise<void> {
     setReadOnly(false);
     document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
     document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
-    document.querySelector(`#tree li[data-path="${cssEscape(rel)}"]`)?.classList.add("active");
+    await revealInTree(rel);
     updateStatus();
     refreshChunkBoundaries();
   } catch (err) {
@@ -458,14 +465,47 @@ let selectedFolder: string = "";
 // rename / refresh doesn't collapse every open folder.
 const expandedFolders = new Set<string>();
 
+// status: tree-sort-options
+// In-memory only per spec; per-vault persistence waits for `settings.md`.
+type TreeSortOrder = "name-asc" | "name-desc" | "mtime-newest" | "mtime-oldest";
+let treeSortOrder: TreeSortOrder = "name-asc";
+
+function sortTreeEntries(entries: DirEntry[]): DirEntry[] {
+  // Folders always grouped first; the chosen order applies within folders
+  // and within files (per editor.md `tree-sort-options`).
+  const dirs = entries.filter((e) => e.kind === "dir");
+  const files = entries.filter((e) => e.kind === "file");
+  const cmp = sortComparator(treeSortOrder);
+  dirs.sort(cmp);
+  files.sort(cmp);
+  return [...dirs, ...files];
+}
+
+function sortComparator(order: TreeSortOrder): (a: DirEntry, b: DirEntry) => number {
+  switch (order) {
+    case "name-asc":
+      return (a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    case "name-desc":
+      return (a, b) => b.name.toLowerCase().localeCompare(a.name.toLowerCase());
+    case "mtime-newest":
+      return (a, b) => b.mtime - a.mtime;
+    case "mtime-oldest":
+      return (a, b) => a.mtime - b.mtime;
+  }
+}
+
 function parentOf(rel: string): string {
   const idx = rel.lastIndexOf("/");
   return idx >= 0 ? rel.slice(0, idx) : "";
 }
 
 async function renderDir(rel: string, container: HTMLElement): Promise<void> {
-  const entries = await invoke<DirEntry[]>("list_dir", { rel });
+  const entries = sortTreeEntries(await invoke<DirEntry[]>("list_dir", { rel }));
   const ul = document.createElement("ul");
+  // Track pending nested renders so `await renderDir(...)` only resolves once
+  // every reachable expanded subtree is in the DOM. `revealInTree` relies on
+  // this to look up its target row after a refresh.
+  const pendingChildren: Promise<void>[] = [];
   for (const entry of entries) {
     const li = document.createElement("li");
     li.dataset.path = entry.rel_path;
@@ -482,15 +522,25 @@ async function renderDir(rel: string, container: HTMLElement): Promise<void> {
         // append below) — `li.after(...)` needs `li` to have a parent.
         renderTreeRowLabel(li, entry, true);
         const path = entry.rel_path;
-        queueMicrotask(() => {
-          if (!expanded) return;
-          childContainer = document.createElement("div");
-          li.after(childContainer);
-          void renderDir(path, childContainer);
-        });
+        pendingChildren.push(
+          new Promise<void>((resolve) => {
+            queueMicrotask(() => {
+              if (!expanded) {
+                resolve();
+                return;
+              }
+              childContainer = document.createElement("div");
+              li.after(childContainer);
+              renderDir(path, childContainer).then(resolve, resolve);
+            });
+          }),
+        );
       }
       li.addEventListener("click", async (e) => {
         e.stopPropagation();
+        // Skip the second click of a double-click; the dblclick handler
+        // below (rename) takes over.
+        if ((e as MouseEvent).detail >= 2) return;
         selectedFolder = entry.rel_path;
         if (expanded) {
           childContainer?.remove();
@@ -510,13 +560,21 @@ async function renderDir(rel: string, container: HTMLElement): Promise<void> {
     } else {
       li.addEventListener("click", (e) => {
         e.stopPropagation();
+        if ((e as MouseEvent).detail >= 2) return;
         selectedFolder = parentOf(entry.rel_path);
         void openFile(entry.rel_path);
       });
     }
+    // status: tree-double-click-rename
+    li.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      void beginInlineRename(li, entry.rel_path, entry.kind);
+    });
     ul.appendChild(li);
   }
   container.appendChild(ul);
+  await Promise.all(pendingChildren);
 }
 
 // File extensions the indexer chunks. Keep in sync with
@@ -635,19 +693,15 @@ function renderTreeRowLabel(
 
 // status: drag-and-drop-move
 function attachDnd(li: HTMLLIElement, entry: DirEntry): void {
-  // Folder DnD is deferred — folder moves require walking contents and
-  // calling move_note per file in a single tx. Disable drag on dirs for v1
-  // so users don't silently desync the index by renaming a folder on disk
-  // without updating the indexed paths inside it.
-  if (entry.kind === "dir") {
-    li.draggable = false;
-  }
+  // Folder rows are draggable too — the drop calls `move_folder`, which does
+  // a single fs rename + bulk index remap for every contained `.md` file.
+  // Empty subfolders move with the rename for free.
   li.addEventListener("dragstart", (e) => {
-    if (entry.kind === "dir") {
-      e.preventDefault();
-      return;
-    }
     e.dataTransfer?.setData("text/plain", entry.rel_path);
+    e.dataTransfer?.setData(
+      "application/x-hiker-kind",
+      entry.kind === "dir" ? "dir" : "file",
+    );
     if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
     li.classList.add("dragging");
   });
@@ -669,13 +723,20 @@ function attachDnd(li: HTMLLIElement, entry: DirEntry): void {
     li.classList.remove("drop-target");
     const from = e.dataTransfer?.getData("text/plain");
     if (!from) return;
+    const fromKind = e.dataTransfer?.getData("application/x-hiker-kind") === "dir"
+      ? "dir"
+      : "file";
     // Drop onto folder → move into folder. Drop onto file → file's parent.
     const targetFolder = entry.kind === "dir" ? entry.rel_path : parentOf(entry.rel_path);
-    await performDrop(from, targetFolder);
+    await performDrop(from, fromKind, targetFolder);
   });
 }
 
-async function performDrop(from: string, targetFolder: string): Promise<void> {
+async function performDrop(
+  from: string,
+  fromKind: "dir" | "file",
+  targetFolder: string,
+): Promise<void> {
   if (from === targetFolder) return;
   const fromParent = parentOf(from);
   if (fromParent === targetFolder) return; // same parent → no-op per spec
@@ -683,15 +744,22 @@ async function performDrop(from: string, targetFolder: string): Promise<void> {
   // Don't allow dropping a folder into itself or its descendants.
   if (targetFolder === from || targetFolder.startsWith(from + "/")) return;
   const to = targetFolder ? `${targetFolder}/${name}` : name;
+  const cmd = fromKind === "dir" ? "move_folder" : "move_note";
   try {
-    await invoke("move_note", { from, to });
-    if (buffer && buffer.path === from) {
-      buffer.path = to;
-      updateStatus();
+    await invoke(cmd, { from, to });
+    // If the open buffer was inside the moved subtree, follow its new path.
+    if (buffer) {
+      if (buffer.path === from) {
+        buffer.path = to;
+        updateStatus();
+      } else if (fromKind === "dir" && buffer.path.startsWith(from + "/")) {
+        buffer.path = to + buffer.path.slice(from.length);
+        updateStatus();
+      }
     }
     await refreshTree();
   } catch (err) {
-    console.error("move_note failed:", err);
+    console.error(`${cmd} failed:`, err);
     alert(`move failed: ${formatError(err)}`);
   }
 }
@@ -703,6 +771,31 @@ function formatError(err: unknown): string {
     return typeof m === "string" ? m : JSON.stringify(err);
   }
   return JSON.stringify(err);
+}
+
+/// Ensure the tree row for `rel` is visible (ancestor folders expanded) and
+/// marked active, then scroll it into view. Used by `openFile` so opening a
+/// note from the related-notes list, search results, etc. expands the
+/// folders that contain it instead of silently failing the highlight.
+async function revealInTree(rel: string): Promise<void> {
+  // Add every ancestor folder to the expansion set.
+  let added = false;
+  let cursor = parentOf(rel);
+  while (cursor !== "") {
+    if (!expandedFolders.has(cursor)) {
+      expandedFolders.add(cursor);
+      added = true;
+    }
+    cursor = parentOf(cursor);
+  }
+  if (added) {
+    await refreshTree();
+  }
+  const row = document.querySelector(
+    `#tree li[data-path="${cssEscape(rel)}"]`,
+  );
+  row?.classList.add("active");
+  row?.scrollIntoView({ block: "nearest" });
 }
 
 async function refreshTree(): Promise<void> {
@@ -740,7 +833,10 @@ treeEl.addEventListener("drop", async (e) => {
   e.preventDefault();
   const from = e.dataTransfer?.getData("text/plain");
   if (!from) return;
-  await performDrop(from, "");
+  const fromKind = e.dataTransfer?.getData("application/x-hiker-kind") === "dir"
+    ? "dir"
+    : "file";
+  await performDrop(from, fromKind, "");
 });
 
 // status: tree-context-menu — empty-space menu (right-click below the rows)
@@ -855,12 +951,54 @@ treeActionsBtn.addEventListener("click", (e) => {
         }
       },
     },
+    {
+      // status: tree-sort-options
+      label: `Sort by  ▸  ${sortOrderLabel(treeSortOrder)}`,
+      run: () => openSortByMenu(rect.right, rect.bottom),
+    },
   ]);
 });
 
-async function beginInlineRename(li: HTMLLIElement, currentPath: string): Promise<void> {
+function sortOrderLabel(order: TreeSortOrder): string {
+  switch (order) {
+    case "name-asc": return "Name (A→Z)";
+    case "name-desc": return "Name (Z→A)";
+    case "mtime-newest": return "Modified (newest first)";
+    case "mtime-oldest": return "Modified (oldest first)";
+  }
+}
+
+function openSortByMenu(x: number, y: number): void {
+  const orders: TreeSortOrder[] = [
+    "name-asc",
+    "name-desc",
+    "mtime-newest",
+    "mtime-oldest",
+  ];
+  openContextMenu(
+    x,
+    y,
+    orders.map((o) => ({
+      label: sortOrderLabel(o),
+      checked: treeSortOrder === o,
+      run: async () => {
+        if (treeSortOrder === o) return;
+        treeSortOrder = o;
+        await refreshTree();
+      },
+    })),
+  );
+}
+
+async function beginInlineRename(
+  li: HTMLLIElement,
+  currentPath: string,
+  kind: "file" | "dir" = "file",
+): Promise<void> {
   const name = currentPath.split("/").pop()!;
-  const dotIdx = name.lastIndexOf(".");
+  // Folders have no extension to exclude — pre-select the whole basename.
+  // Files preserve the existing "select stem, leave .md" behavior.
+  const dotIdx = kind === "file" ? name.lastIndexOf(".") : -1;
   const stemEnd = dotIdx > 0 ? dotIdx : name.length;
   const input = document.createElement("input");
   input.type = "text";
@@ -880,11 +1018,35 @@ async function beginInlineRename(li: HTMLLIElement, currentPath: string): Promis
       if (commit && newName && newName !== name) {
         const parent = parentOf(currentPath);
         const to = parent ? `${parent}/${newName}` : newName;
+        const cmd = kind === "dir" ? "move_folder" : "move_note";
         try {
-          await invoke("move_note", { from: currentPath, to });
-          if (buffer && buffer.path === currentPath) {
-            buffer.path = to;
-            updateStatus();
+          await invoke(cmd, { from: currentPath, to });
+          if (kind === "dir") {
+            // Preserve expansion state across the rename: any path under
+            // the old folder needs its prefix swapped, and the renamed
+            // folder itself stays expanded if it was before.
+            const fromPrefix = currentPath + "/";
+            const remapped = new Set<string>();
+            for (const p of expandedFolders) {
+              if (p === currentPath) {
+                remapped.add(to);
+              } else if (p.startsWith(fromPrefix)) {
+                remapped.add(to + p.slice(currentPath.length));
+              } else {
+                remapped.add(p);
+              }
+            }
+            expandedFolders.clear();
+            for (const p of remapped) expandedFolders.add(p);
+          }
+          if (buffer) {
+            if (buffer.path === currentPath) {
+              buffer.path = to;
+              updateStatus();
+            } else if (kind === "dir" && buffer.path.startsWith(currentPath + "/")) {
+              buffer.path = to + buffer.path.slice(currentPath.length);
+              updateStatus();
+            }
           }
         } catch (err) {
           console.error("rename failed:", err);
@@ -991,7 +1153,7 @@ function attachContextMenu(li: HTMLLIElement, entry: DirEntry): void {
     }
     items.push({
       label: "Rename",
-      run: () => beginInlineRename(li, entry.rel_path),
+      run: () => beginInlineRename(li, entry.rel_path, entry.kind),
     });
     items.push({
       label: "Delete",
@@ -1243,6 +1405,16 @@ void win.onCloseRequested(async (event) => {
 });
 
 updateStatus();
+
+// status: status-bar-path-reveal
+statusPathEl.addEventListener("click", async () => {
+  if (!buffer || buffer.preview) return;
+  try {
+    await invoke("reveal_in_file_manager", { rel: buffer.path });
+  } catch (err) {
+    console.error("reveal_in_file_manager failed:", err);
+  }
+});
 
 // ---------- panel toggles ----------
 
@@ -1820,6 +1992,15 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
   // Schedule before buffer mutations so the rebuild reads the post-update
   // `buffer.path` (matters for the renamed branch's silent path follow).
   if (ev.kind === "created" || ev.kind === "deleted" || ev.kind === "renamed") {
+    scheduleTreeRefreshFromWatcher();
+  } else if (
+    ev.kind === "modified"
+    && (treeSortOrder === "mtime-newest" || treeSortOrder === "mtime-oldest")
+  ) {
+    // Tree *shape* doesn't change on Modified, but mtime-based sort orders
+    // depend on per-entry mtime — a save reorders rows. Schedule a refresh
+    // only when the chosen sort actually consumes mtime; under name sorts
+    // we keep the existing no-op behavior.
     scheduleTreeRefreshFromWatcher();
   }
   // Don't react while previewing a trash entry — the read-only buffer's path

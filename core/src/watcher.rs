@@ -12,6 +12,7 @@
 //! in docs/status.md.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -149,9 +150,16 @@ fn evict_expired(map: &mut HashMap<String, Instant>) {
 }
 
 /// Translate one debounced raw event into our normalized form. Returns None
-/// if the event is filtered (ignore list, unknown kind, paths outside root).
+/// if the event is filtered (ignore list, unknown kind, paths outside root,
+/// or paths whose existing ancestors include a symlink — see
+/// `watcher-symlink-policy`; notify follows symlinks platform-dependently
+/// when watching recursively, so we drop those events at the normalize step
+/// so the indexer never sees content from outside the canonical vault tree).
 fn normalize(vault_root: &Path, ev: &DebouncedEvent) -> Option<FileEvent> {
     let paths = &ev.paths;
+    if paths.iter().any(|p| has_symlink_ancestor(vault_root, p)) {
+        return None;
+    }
     match ev.event.kind {
         EventKind::Create(_) => {
             let p = paths.first()?;
@@ -219,6 +227,30 @@ fn normalize(vault_root: &Path, ev: &DebouncedEvent) -> Option<FileEvent> {
         }
         _ => None,
     }
+}
+
+/// True if any existing ancestor of `abs_path` *under* `vault_root` is a
+/// symlink. Components above the vault root are ignored (the root itself was
+/// canonicalized at vault open). Non-existent leaves (typical on Deleted
+/// events) walk fine — `symlink_metadata` errors stop the walk early.
+///
+/// status: watcher-symlink-policy
+fn has_symlink_ancestor(vault_root: &Path, abs_path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for comp in abs_path.components() {
+        current.push(comp);
+        if !current.starts_with(vault_root) || current == vault_root {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            // Component doesn't exist on disk (typical mid-rename / deleted
+            // path). The rest of the path can't exist either; stop walking.
+            Err(_) => break,
+        }
+    }
+    false
 }
 
 /// Hard-coded ignore list. Mirrors docs/watcher.md.
@@ -357,6 +389,82 @@ mod tests {
             }
         }
         assert!(saw_visible, "expected to see the unsuppressed write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_symlink_ancestor_detects_symlinked_dir_inside_vault() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(outside.path().join("d")).unwrap();
+        fs::write(outside.path().join("d/leaf.md"), b"x").unwrap();
+        let vault_root = dir.path().canonicalize().unwrap();
+        symlink(outside.path().join("d"), vault_root.join("linked")).unwrap();
+        // Path under the in-vault symlink → must be detected.
+        assert!(has_symlink_ancestor(
+            &vault_root,
+            &vault_root.join("linked").join("leaf.md"),
+        ));
+        // Path through a real directory → must not be flagged.
+        fs::create_dir(vault_root.join("real")).unwrap();
+        fs::write(vault_root.join("real/leaf.md"), b"y").unwrap();
+        assert!(!has_symlink_ancestor(
+            &vault_root,
+            &vault_root.join("real").join("leaf.md"),
+        ));
+        // Non-existent leaf below a real dir → still not flagged.
+        assert!(!has_symlink_ancestor(
+            &vault_root,
+            &vault_root.join("real").join("never-existed.md"),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_drops_events_for_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(outside.path().join("d")).unwrap();
+        // The vault root needs to be canonicalized for `has_symlink_ancestor`'s
+        // starts_with check; tempdir paths are already canonical on Linux.
+        let vault_root = dir.path().canonicalize().unwrap();
+        symlink(outside.path().join("d"), vault_root.join("linked")).unwrap();
+
+        let watcher = Watcher::start(&vault_root).unwrap();
+        let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Write through the symlink — events for paths under `linked/` must
+        // be dropped so the indexer never sees content from outside the
+        // canonical vault tree.
+        fs::write(outside.path().join("d/leaked.md"), b"shh").unwrap();
+        // Drive a positive control so we can stop waiting cleanly.
+        fs::write(vault_root.join("real.md"), b"y").unwrap();
+
+        let started = Instant::now();
+        let mut saw_real = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    let p = match &ev {
+                        FileEvent::Created { path } | FileEvent::Modified { path } => path.clone(),
+                        FileEvent::Deleted { path } => path.clone(),
+                        FileEvent::Renamed { to, .. } => to.clone(),
+                    };
+                    assert!(
+                        !p.starts_with("linked"),
+                        "watcher leaked symlinked-path event: {ev:?}",
+                    );
+                    if p == "real.md" {
+                        saw_real = true;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_real, "expected at least one event for real.md");
     }
 
     #[tokio::test]
