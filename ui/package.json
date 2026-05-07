@@ -10,10 +10,11 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "2.11.0",
+    "@codemirror/lang-markdown": "6.5.0",
     "@codemirror/state": "6.6.0",
     "@codemirror/view": "6.41.1",
-    "@codemirror/lang-markdown": "6.5.0",
+    "@tauri-apps/api": "2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "codemirror": "6.0.2"
   },
   "devDependencies": {

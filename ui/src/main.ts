@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { EditorState, Compartment, type Extension } from "@codemirror/state";
 import { EditorView, ViewPlugin, highlightWhitespace } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -954,16 +955,25 @@ treeEl.addEventListener("contextmenu", (e) => {
   ]);
 });
 
+/// Show the OS folder picker via the JS dialog plugin and, on a
+/// selection, open it through `open_vault_at`. The picker lives entirely
+/// in the frontend per the spec — the backend has no dialog dependency.
 async function openVault(): Promise<void> {
-  let path: string | null;
+  let chosen: string | null;
   try {
-    path = await invoke<string | null>("pick_vault");
+    const picked = await openDialog({ directory: true, multiple: false });
+    chosen = typeof picked === "string" ? picked : null;
   } catch (err) {
-    handleOpenVaultError(err);
+    console.error("folder picker failed:", err);
     return;
   }
-  if (!path) return;
-  await applyOpenedVault(path);
+  if (!chosen) return;
+  try {
+    const display = await invoke<string>("open_vault_at", { path: chosen });
+    await applyOpenedVault(display);
+  } catch (err) {
+    handleOpenVaultError(err);
+  }
 }
 
 function handleOpenVaultError(err: unknown): void {
@@ -1024,20 +1034,39 @@ async function applyOpenedVault(path: string): Promise<void> {
 pickBtn.addEventListener("click", () => void openVault());
 
 // status: settings-default-vault-autoopen
-// Bootstrap: try the user-scope `vault.default` before falling back to
-// the picker. The Tauri command returns null when no default is set or
-// when the configured path no longer exists; either case leaves the user
-// at the standard "click to open vault" surface.
+// Bootstrap: read `vault.default` from the user TOML; if non-empty, try
+// `open_vault_at`. On `HikerError::NotFound` (path no longer resolves —
+// drive unmounted, folder deleted) surface a non-fatal toast and fall
+// through to the JS dialog. The configured `vault.default` is *not*
+// auto-cleared — it represents user intent, not a transient circumstance.
 async function bootstrapDefaultVault(): Promise<void> {
-  let path: string | null;
+  let configured: string | null = null;
   try {
-    path = await invoke<string | null>("try_open_default_vault");
+    configured = await invoke<string | null>("get_default_vault");
   } catch (err) {
-    handleOpenVaultError(err);
-    return;
+    console.error("get_default_vault failed:", err);
   }
-  if (!path) return;
-  await applyOpenedVault(path);
+  if (configured && configured.length > 0) {
+    try {
+      const display = await invoke<string>("open_vault_at", { path: configured });
+      await applyOpenedVault(display);
+      return;
+    } catch (err) {
+      // HikerError is serialized as `{ kind, message }` (see core::error).
+      // `not_found` is the "path no longer resolves" signal that the spec
+      // says should fall through to the picker. Any other error is real
+      // and surfaces as the standard alert.
+      const kind = (err as { kind?: string } | null)?.kind;
+      if (kind === "not_found") {
+        showToast(`Default vault at ${configured} not found — pick a vault`);
+      } else {
+        handleOpenVaultError(err);
+        return;
+      }
+    }
+  }
+  // No configured default, or fell through after a NotFound. Show picker.
+  await openVault();
 }
 
 void bootstrapDefaultVault();

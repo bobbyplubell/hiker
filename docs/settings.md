@@ -103,7 +103,7 @@ Per-user vault management plus per-vault UI startup state.
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
 | `recent` | array of strings | `[]` | User-only in practice. Most-recently-opened vault paths, freshest first. Written by the Open Vault flow via `settings-write-back` (user-scope) |
-| `default` | string | `null` | User-only. Path to a vault to auto-open on startup; consumed by `settings-default-vault-autoopen`. Empty/absent = show the vault picker. Set by an explicit "make this the default vault" UI action when one lands; until then, hand-edit the user TOML |
+| `default` | string | `null` | User-only. Path to a vault the frontend auto-opens on startup; consumed by `settings-default-vault-autoopen`. Empty/absent = show the vault picker. Set by an explicit "make this the default vault" UI action when one lands; until then, hand-edit the user TOML |
 | `sidebar_open` | bool | `true` | Vault-level. Initial open/collapsed state of the file tree (`panel-toggle-buttons`) |
 | `related_open` | bool | `false` | Vault-level. Initial open/collapsed state of the related-notes panel (`panel-toggle-buttons`) |
 | `trash_expanded` | bool | `false` | Vault-level. Initial expanded/collapsed state of the trash row (`tree-trash-bin`) |
@@ -113,13 +113,13 @@ Per-user vault management plus per-vault UI startup state.
 
 #### Default vault auto-open [settings-default-vault-autoopen]
 
-When `vault.default` is set, app bootstrap tries to open that path before showing the picker. The bootstrap path is a separate Tauri command (`try_open_default_vault`) called from frontend init — kept distinct from `pick_vault` so the dialog stays out of the no-op path and the frontend can choose its own UX (a splash, silent retry, or just letting the picker show).
+When `vault.default` is set, the frontend bootstrap auto-opens that path before showing the JS folder dialog. The frontend reads the value via `get_default_vault()` (a small read-only Tauri command) and, if non-empty, calls `open_vault_at(path)` directly. No backend dialog spawning, no "try-and-pick" command — the orchestration lives entirely in the frontend per the rule above.
 
 Failure modes:
 
-- **`vault.default` is unset / the user TOML doesn't exist yet.** Return `Ok(None)`; frontend renders the picker. No log noise — this is the empty-state case.
-- **Configured path no longer exists** (deleted, unmounted drive, typo). Log a `warn!` with the configured path, return `Ok(None)`, fall back to the picker. **Do not auto-clear the setting** — a user with an unplugged USB drive should find the same `vault.default` waiting after they reattach it. The setting is the user's stated intent; the absent path is a transient circumstance.
-- **Path exists but `Vault::open` fails** (permissions, schema mismatch, etc.). Same alert dialog and fall-through as `pick_vault`'s error path — surfaces the real reason rather than masking it as "no default."
+- **`vault.default` is unset / the user TOML doesn't exist yet.** `get_default_vault` returns `Ok(None)`; the bootstrap falls through to the JS dialog. No log noise — this is the empty-state case.
+- **Configured path no longer exists** (deleted, unmounted drive, typo). `open_vault_at` returns `HikerError::NotFound` with the path; the frontend surfaces a non-fatal toast (`"Default vault at <path> not found — pick a vault"`) and falls through to the JS dialog. **Do not auto-clear the setting** — a user with an unplugged USB drive should find the same `vault.default` waiting after they reattach it. The setting is the user's stated intent; the absent path is a transient circumstance.
+- **Path exists but `Vault::open` fails** (permissions, schema mismatch, etc.). Same alert dialog as the manual-open error path — surfaces the real reason rather than masking it as "no default."
 
 Setting `vault.default` from inside the app is deferred until a "make this the default vault" UI action lands; until then, hand-edit the user TOML.
 
@@ -139,7 +139,7 @@ Single `Config::load(vault_root: &Path) -> Result<Config>` in `core::config` is 
 5. Validate cross-field invariants (e.g. `tree.sort_by` is one of the known values; `model` is the supported value). Failures abort.
 6. Return the frozen `Config`.
 
-The Tauri layer calls this once during `pick_vault` (alongside `init_tracing` per `obs-tracing-baseline`) and stashes the result in `tauri::State<Arc<Config>>`. CLI and MCP entry points do the same. No mutation, no `RwLock`. [settings-load-once-at-startup]
+The Tauri layer calls this once inside `open_vault_at` (alongside `init_tracing` per `obs-tracing-baseline`) and stashes the result in `tauri::State<Arc<Config>>`. CLI and MCP entry points call the same `open_vault_at` helper. No mutation, no `RwLock`. [settings-load-once-at-startup]
 
 Open-a-different-vault re-runs `Config::load` against the new vault root. The old `Config` is dropped; in-memory UI state (which view toggles are flipped, which panels are open) does *not* automatically reset to the new defaults — the existing vault-swap reset path in `ui/src/main.ts` handles what should re-init.
 
@@ -172,19 +172,21 @@ Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serd
 
 ## Default vault auto-open
 
-On app startup, if `vault.default` in the user TOML is set and non-empty, the app skips the vault picker and opens that path directly. Empty or absent → show the picker as today. [settings-default-vault-autoopen]
+On app startup, if `vault.default` in the user TOML is set and non-empty, the frontend opens that path directly without showing the vault picker. Empty or absent → show the picker as today. [settings-default-vault-autoopen]
 
-**Read path.** A separate Tauri command, `try_open_default_vault`, is the read-side surface. The frontend calls it once during init, before showing the picker. Returns one of:
+**The picker is a frontend concern.** It's UI; it shouldn't live in Rust. A CLI invocation should never be at risk of spawning a folder dialog. The frontend calls `@tauri-apps/plugin-dialog` from JS when (and only when) it needs the user to pick a folder. The backend exposes one command, `open_vault_at(path)`, that does the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. That command is the same shared helper the CLI / MCP entry points call, with no dialog dependency anywhere in core or in the Tauri command layer.
 
-- `{ kind: "opened", path }` — the configured default existed and was opened; UI proceeds as if the user had picked it manually.
-- `{ kind: "none" }` — no default configured (or empty string); UI shows the picker.
-- `{ kind: "missing", path }` — a default *is* configured but the path no longer resolves (deleted, unmounted, permissions). UI shows the picker; the configured default is *not* auto-cleared (the drive may simply be unplugged — clobbering the setting on a transient failure is the wrong default). A `tracing::warn!` records the miss with the configured path.
+**Frontend bootstrap.** On window init, the frontend:
 
-**Why a sibling command, not folded into `pick_vault`.** `pick_vault` today couples the OS file-picker dialog with the open-a-vault work. Auto-open needs the latter without the former. Splitting them lets the frontend decide UX (silent open, splash, etc.) and keeps the dialog code path clean. The underlying open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push — is shared between both commands and should be factored into one helper that both call. That refactor is the bulk of the work; once it lands, `try_open_default_vault` is a thin wrapper that reads the user TOML, checks `Path::exists`, and calls the helper.
+1. Reads `vault.default` from the user TOML (via a small `get_default_vault()` Tauri command — or whatever read surface exists once it's wired; the point is it's a value lookup, not a side-effecting "try to open" command).
+2. If non-empty, calls `open_vault_at(path)`. On `HikerError::NotFound` (or equivalent — the configured path no longer resolves), logs a `warn!` server-side, surfaces a non-fatal toast on the client (`"Default vault at <path> not found — pick a vault"`), and falls through to step 3. The configured default is **not** auto-cleared (the drive may simply be unplugged — clobbering the setting on a transient failure is the wrong default).
+3. If `vault.default` was empty, or step 2 fell through, opens the JS dialog plugin to let the user pick a folder, then calls `open_vault_at` with the chosen path.
 
-**No first-run interaction.** On a brand-new install, `vault.default` is `null` (the user TOML is auto-created with defaults), so `try_open_default_vault` returns `none` and the picker shows. The "make this the default vault" UI action that *sets* this value is deferred (see "Deferred"); until it lands, users hand-edit the user TOML to opt in.
+**Today's `pick_vault` command goes away.** Its two responsibilities split: the dialog moves to JS, the open work becomes `open_vault_at`. Existing call sites in `ui/src/main.ts` (the "Open vault" button handler) become "JS dialog → `open_vault_at`."
 
-**Reading `vault.default`.** Per "Merge & precedence", `vault.default` is documented as user-only but the loader doesn't enforce it. The auto-open path reads from the merged Config, so a vault TOML that sets `vault.default` would also work — uselessly, since you'd already be in that vault to load its TOML. No special-casing.
+**No first-run interaction.** On a brand-new install, `vault.default` is `null` (the user TOML is auto-created with defaults), so the bootstrap falls through to the picker on first launch. The "make this the default vault" UI action that *sets* this value is deferred (see "Deferred"); until it lands, users hand-edit the user TOML to opt in.
+
+**Reading `vault.default`.** Per "Merge & precedence", `vault.default` is documented as user-only but the loader doesn't enforce it. The bootstrap read targets the user TOML directly (it's the only file available before a vault is open — there's no vault to merge against yet). A `vault.default` set inside a vault TOML is silently meaningless, same as today.
 
 
 ## Module placement

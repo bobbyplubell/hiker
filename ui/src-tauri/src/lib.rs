@@ -11,9 +11,8 @@ use hiker_core::watcher::{FileEvent, Watcher};
 use hiker_core::{embed::FastembedEmbedder, DirEntryDto, HikerError, Vault};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
 
-/// All long-lived state for an open vault. Constructed in `pick_vault`,
+/// All long-lived state for an open vault. Constructed in `open_vault_at`,
 /// dropped on swap.
 struct VaultSession {
     vault: Vault,
@@ -205,58 +204,50 @@ fn set_setting(
     log_cmd_result("set_setting", result)
 }
 
-#[tauri::command]
-async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    log_cmd_result("pick_vault", pick_vault_inner(app).await)
-}
-
-async fn pick_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |folder| {
-        let _ = tx.send(folder);
-    });
-    let folder = rx.await.map_err(|e| e.to_string())?;
-    let Some(path) = folder else { return Ok(None) };
-    let path_buf = path.into_path().map_err(|e| e.to_string())?;
-    open_vault_at(app, path_buf).await
-}
-
-/// Try to auto-open the user-scope `vault.default`. Returns the opened
-/// vault's display path on success, `Ok(None)` when no default is set or
-/// the configured path no longer exists (deleted, unmounted, typo'd).
-/// Per the failure-mode rule in `settings.md`: log a `warn!` and fall
-/// back to the picker; never auto-clear the setting (the user might just
-/// have the drive unplugged).
+/// Read-only lookup of the user-scope `vault.default` field. Used by the
+/// frontend bootstrap to decide whether to auto-open a configured default
+/// vault before falling through to the JS-side folder picker. Returns
+/// `Ok(None)` when no default is set or the user TOML doesn't exist yet;
+/// real I/O / parse failures bubble up as `Err`.
 ///
 /// status: settings-default-vault-autoopen
 #[tauri::command]
-async fn try_open_default_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    log_cmd_result("try_open_default_vault", try_open_default_vault_inner(app).await)
+fn get_default_vault() -> Result<Option<String>, String> {
+    log_cmd_result(
+        "get_default_vault",
+        hiker_core::config::Config::user_default_vault().map_err(|e| e.to_string()),
+    )
 }
 
-async fn try_open_default_vault_inner(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let default = match hiker_core::config::Config::user_default_vault()
-        .map_err(|e| e.to_string())?
-    {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let path = PathBuf::from(&default);
-    if !path.is_dir() {
-        tracing::warn!(
-            configured = %default,
-            "vault.default path no longer exists; falling back to picker. Setting left intact in case the path is just temporarily unavailable."
-        );
-        return Ok(None);
-    }
-    open_vault_at(app, path).await
-}
-
+/// Open the vault at `path`. Single shared entry point for the frontend's
+/// "Open vault" flow, the bootstrap auto-open path, and (eventually) CLI
+/// / MCP entry points. The folder picker is *not* a backend concern —
+/// the frontend uses `@tauri-apps/plugin-dialog` from JS when it needs
+/// one. A path that no longer resolves returns `HikerError::NotFound` so
+/// the bootstrap path can react with a toast + fall-through to picker
+/// rather than auto-clearing the setting.
+///
+/// status: settings-default-vault-autoopen
+#[tauri::command]
 async fn open_vault_at(
     app: tauri::AppHandle,
+    path: String,
+) -> Result<String, HikerError> {
+    log_cmd_result("open_vault_at", open_vault_at_inner(app, PathBuf::from(path)).await)
+}
+
+async fn open_vault_at_inner(
+    app: tauri::AppHandle,
     path_buf: PathBuf,
-) -> Result<Option<String>, String> {
-    let vault = Vault::open(&path_buf).map_err(|e| e.to_string())?;
+) -> Result<String, HikerError> {
+    if !path_buf.is_dir() {
+        tracing::warn!(
+            path = %path_buf.display(),
+            "open_vault_at: path does not resolve to a directory",
+        );
+        return Err(HikerError::NotFound(path_buf.display().to_string()));
+    }
+    let vault = Vault::open(&path_buf).map_err(|e| HikerError::Io(e.to_string()))?;
     let root = vault.root().to_path_buf();
     let display = root.to_string_lossy().into_owned();
 
@@ -278,7 +269,7 @@ async fn open_vault_at(
     // with the current defaults if missing (settings-auto-create-defaults).
     // Strict-load: any unknown key, type mismatch, or schema-version
     // mismatch aborts here with a clear error.
-    let mut config = Config::load(&root).map_err(|e| e.to_string())?;
+    let mut config = Config::load(&root)?;
 
     // Push this vault onto the user-scope `vault.recent` list. Best-effort:
     // if the platform config dir isn't resolvable (sandboxed env), the
@@ -297,7 +288,7 @@ async fn open_vault_at(
     }
 
     // Open the store (creates .hiker/index.db on first run).
-    let store = Store::open(&root).map_err(|e| e.to_string())?;
+    let store = Store::open(&root).map_err(|e| HikerError::Io(e.to_string()))?;
 
     // Spawn the indexer task. The embedder loader runs inside the task on a
     // blocking thread — this call returns immediately.
@@ -307,7 +298,7 @@ async fn open_vault_at(
     });
 
     // Start the filesystem watcher and bridge its events into the indexer.
-    let watcher = Watcher::start(&root).map_err(|e| e.to_string())?;
+    let watcher = Watcher::start(&root).map_err(|e| HikerError::Io(e.to_string()))?;
     let watcher_rx = watcher.subscribe();
     let job_sender = indexer.job_sender();
     tokio::spawn(route_watcher_events(watcher_rx, job_sender));
@@ -357,8 +348,11 @@ async fn open_vault_at(
     };
 
     let state = app.state::<AppState>();
-    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
-    Ok(Some(display))
+    *state
+        .session
+        .lock()
+        .map_err(|_| HikerError::Io("session lock poisoned".into()))? = Some(session);
+    Ok(display)
 }
 
 #[derive(Debug, Deserialize)]
@@ -945,7 +939,8 @@ pub fn run() {
             read_file_with_hash,
             write_file,
             write_file_checked,
-            pick_vault,
+            open_vault_at,
+            get_default_vault,
             index,
             index_status,
             index_state_for,
@@ -962,7 +957,6 @@ pub fn run() {
             permanent_delete_trash_entry,
             get_settings,
             set_setting,
-            try_open_default_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
