@@ -1,0 +1,5 @@
+17:42:11.847312 IP 10.0.1.42.51624 > 93.184.216.34.443: Flags [S], seq 3417829011, win 64240, options [mss 1460,sackOK,TS val 1827361 ecr 0,nop,wscale 7], length 0
+17:42:11.891044 IP 93.184.216.34.443 > 10.0.1.42.51624: Flags [S.], seq 2718281828, ack 3417829012, win 65535, options [mss 1380,sackOK,TS val 4192836 ecr 1827361,nop,wscale 9], length 0
+17:42:11.891201 IP 10.0.1.42.51624 > 93.184.216.34.443: Flags [.], ack 1, win 502, options [nop,nop,TS val 1827362 ecr 4192836], length 0
+17:42:11.892884 IP 10.0.1.42.51624 > 93.184.216.34.443: Flags [P.], seq 1:518, ack 1, win 502, options [nop,nop,TS val 1827362 ecr 4192836], length 517
+17:42:11.937210 IP 93.184.216.34.443 > 10.0.1.42.51624: Flags [.], ack 518, win 137, options [nop,nop,TS val 4192881 ecr 1827362], length 0

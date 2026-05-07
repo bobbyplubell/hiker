@@ -121,6 +121,50 @@ Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never bl
 
 **First-run UX:** model download is non-blocking. Vault opens normally; the indexer starts but defers any embedding work until the model is on disk. Status bar / settings surface the download progress. Search/related queries return empty with a "indexing not yet ready" indicator until the first batch completes. See `settings.md` for tunables (download timing, model selection, batch size, manual reindex triggers). [embedder-first-run-nonblocking]
 
+### Alternative embedder backends (cloud / Ollama)
+
+The `Embedder` trait that hides fastembed-rs also hides any other backend. A second concrete impl, `core::embed::LlmEmbedder`, wraps the [`llm`](https://crates.io/crates/llm) crate's `EmbeddingProvider` trait — providing access to OpenAI, Ollama, Google, Cohere, Mistral, and HuggingFace embedding models. Same trait, same interface, indexer code doesn't change. [embedder-llm-crate-backed]
+
+Why offer this alongside fastembed:
+
+- **Quality ceiling.** OpenAI `text-embedding-3-large` (3072-dim), Voyage v3, Cohere `embed-v4` etc. are noticeably better than bge-small for nuanced retrieval and non-English content.
+- **Bigger chunks.** Cloud embedders accept 8k+ tokens vs. fastembed's 512 cap.
+- **No model download** for users on metered connections / slow disk who already have an Ollama server or are happy paying for cloud calls.
+- **Ollama specifically** lets users who already run Ollama for chat features (basic agent loop or external ACP agent — see `llm.md`) reuse the runtime for embeddings via models like `nomic-embed-text` or `mxbai-embed-large`. One runtime, multiple consumers.
+
+Why fastembed stays the default:
+
+- Volume — embeddings fire on every chunk on every ingest, so cloud bandwidth and per-call cost are real. A 10k-note vault is 50k embedding calls.
+- Privacy — sending every chunk's content to a cloud provider is a sharper concern than occasional generative LLM use.
+- Offline — fastembed works without network; cloud embedders don't (Ollama works offline if the server runs locally).
+- Zero config required for first-run — fastembed downloads its own model, no API key.
+
+Config in `[embedder]` in user/vault TOML, same shape as `[llm]`: [embedder-config-section]
+
+```toml
+[embedder]
+provider = "fastembed"          # default
+model = "bge-small-en-v1.5"
+
+# or:
+# provider = "openai"
+# model = "text-embedding-3-large"
+# api_key_env = "OPENAI_API_KEY"
+
+# or:
+# provider = "ollama"
+# model = "nomic-embed-text"
+# base_url = "http://localhost:11434"
+```
+
+API keys live in environment variables (`api_key_env` names the variable), never in TOML. Same posture as `[llm]`'s provider config.
+
+The existing `embedder_version` column on `notes` (`embedder-version-tag`) keys off provider + model, not just model name — so switching provider naturally triggers re-embed via the existing fail-loud machinery. No new migration code; the schema-version contract already covers it. [embedder-version-tag-includes-provider]
+
+**Module discipline** unchanged — `fastembed-rs` and the `llm` crate both confined to `core::embed`. The `Embedder` trait surface stays narrow; no fastembed *or* `llm` types leak past it. The same crate boundary discipline used in `core::llm` (the generative LLM module — see `llm.md`) applies here.
+
+**ToS posture:** embeddings are always automation-shaped (every chunk on every ingest). Cloud embedding APIs (OpenAI, Cohere, Voyage, etc.) are explicitly priced for automation, so no ACP grey area applies; this is firmly a pay-per-call use case. The interactive-vs-background distinction from `llm.md` is about *generative* LLM access and doesn't carry over.
+
 
 ## Ingest pipeline
 

@@ -1,0 +1,6 @@
+^(?P<scheme>[a-z][a-z0-9+.-]*)://(?:(?P<userinfo>[^@/?#]+)@)?(?P<host>[^:/?#]+)(?::(?P<port>\d+))?(?P<path>/[^?#]*)?(?:\?(?P<query>[^#]*))?(?:#(?P<frag>.*))?$
+
+# Quick test cases:
+#   https://example.com/path?x=1#frag    -> all parts
+#   postgres://user:pw@db.local:5432/app -> userinfo, host, port, path
+#   file:///etc/hosts                    -> empty host, path /etc/hosts

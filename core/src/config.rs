@@ -18,6 +18,7 @@
 // status: settings-section-indexing
 // status: settings-section-vault
 // status: settings-schema-version
+// status: search-mode-state-persisted
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,33 @@ use serde::{Deserialize, Serialize};
 use crate::error::HikerError;
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Cap on the `vault.recent` list. Older entries past this point fall off
+/// when a new vault open pushes onto the front.
+pub const RECENT_VAULTS_CAP: usize = 10;
+
+/// Push `root` to the front of `current`, dedupe by string equality, cap at
+/// `RECENT_VAULTS_CAP` entries. Returns the new list. Pure policy — caller
+/// is responsible for persisting it via `Config::set("vault.recent", ...)`
+/// if needed.
+///
+/// Lives in `core::config` rather than at adapter level so any future
+/// adapter (CLI / MCP) that opens a vault gets the same recent-list shape
+/// without re-implementing the dedupe + cap.
+pub fn push_recent_vault(current: &[String], root: &Path) -> Vec<String> {
+    let display = root.to_string_lossy().into_owned();
+    let mut out = Vec::with_capacity(current.len() + 1);
+    out.push(display.clone());
+    for entry in current {
+        if entry != &display {
+            out.push(entry.clone());
+        }
+        if out.len() >= RECENT_VAULTS_CAP {
+            break;
+        }
+    }
+    out
+}
 
 /// Top-level config struct loaded from the merged user+vault TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +68,8 @@ pub struct Config {
     pub indexing: IndexingConfig,
     #[serde(default)]
     pub vault: VaultConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -53,7 +83,50 @@ impl Default for Config {
             editor: EditorConfig::default(),
             indexing: IndexingConfig::default(),
             vault: VaultConfig::default(),
+            search: SearchConfig::default(),
         }
+    }
+}
+
+/// `[search]` section. Holds discovery-panel state: which backends run by
+/// default (mode toggles), and the per-section collapsed/expanded state
+/// inside the panel. Vault-scoped via `settings-write-back`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub modes: SearchModesConfig,
+    #[serde(default)]
+    pub sections: SearchSectionsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchModesConfig {
+    #[serde(default = "yes")]
+    pub semantic: bool,
+    #[serde(default = "yes")]
+    pub lexical: bool,
+}
+
+impl Default for SearchModesConfig {
+    fn default() -> Self {
+        Self { semantic: true, lexical: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSectionsConfig {
+    #[serde(default = "yes")]
+    pub results_expanded: bool,
+    #[serde(default = "yes")]
+    pub related_expanded: bool,
+}
+
+impl Default for SearchSectionsConfig {
+    fn default() -> Self {
+        Self { results_expanded: true, related_expanded: true }
     }
 }
 
@@ -508,6 +581,10 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },
+    EligibleKey { path: "search.modes.semantic",         ty: ValueType::Bool },
+    EligibleKey { path: "search.modes.lexical",          ty: ValueType::Bool },
+    EligibleKey { path: "search.sections.results_expanded", ty: ValueType::Bool },
+    EligibleKey { path: "search.sections.related_expanded", ty: ValueType::Bool },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[

@@ -1,0 +1,2 @@
+litellm>=1.50
+pyyaml>=6.0

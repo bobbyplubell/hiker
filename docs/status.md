@@ -53,17 +53,17 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `panel-toggle-buttons` | done | `ui/index.html:19` | sidebar + related toggles |
 | `cm6-extension-order` | done | `ui/src/main.ts:113` | basicSetup → lang → save tracking → keymap |
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
-| `drag-and-drop-move` | done | `ui/src/main.ts` (`attachDnd`, `performDrop`) | file DnD calls Tauri `move_note`; folder DnD calls Tauri `move_folder` → `core::vault::move_folder` (single fs rename + bulk index path remap via `Store::rename_notes_by_paths`). Empty subfolders move with the rename for free. Buffer follows when the open file is inside the moved subtree |
-| `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler) | auto-suffix `new-note-N.md` via Tauri `create_note`, opens + inline-renames |
+| `drag-and-drop-move` | done | `ui/src/main.ts` (`attachDnd`, `performDrop`), `core/src/ops.rs` (`move_folder`) | file DnD calls Tauri `move_note`; folder DnD calls Tauri `move_folder` → `core::ops::move_folder` (owns watcher suppression + `IndexJob::MoveFolder` send/await) → indexer-side `core::vault::move_folder` (single fs rename + bulk index path remap via `Store::rename_notes_by_paths`). Empty subfolders move with the rename for free. Buffer follows when the open file is inside the moved subtree |
+| `create-note-button` | done | `ui/src/main.ts` (`new-note-btn` handler), `core/src/ops.rs` (`create_with_suffix`) | name-template parameter (`"new-note"` from Tauri); op owns the suffix loop + watcher suppression + Upsert send |
 | `tree-refresh-manual` | done | `ui/src/main.ts` (`tree-actions-btn` "Refresh tree" entry) | re-reads dir; restores active highlight; expansion state preserved across refresh via `expandedFolders` set; lives inside the `…` actions menu |
 | `tree-refresh-watcher` | done | `ui/src/main.ts` (`scheduleTreeRefreshFromWatcher`, `hiker:file-changed` listener) | 200ms-debounced `refreshTree` on created/deleted/renamed events; modified events are no-ops (tree shape unchanged); manual `tree-refresh-manual` stays as a backstop. Lifted from v2 → v1; watcher.md "Out of scope for v1" entry now stale |
 | `tree-double-click-rename` | done | `ui/src/main.ts` (`renderDir` dblclick handler, `beginInlineRename`) | dblclick on file → inline rename via `move_note`; dblclick on folder → inline rename via `move_folder`. Single-click handlers skip when `event.detail >= 2` so the second click of the dbl doesn't toggle/open. Folder rename remaps `expandedFolders` prefixes so expansion state survives, and the open buffer follows when its path is inside the renamed subtree |
 | `tree-context-menu` | done | `ui/src/main.ts` (`attachContextMenu`, `openContextMenu`) | row menu: Open / Rename / Delete / Properties (greyed); empty-space menu: New note here |
 | `tree-context-delete` | done | `ui/src/main.ts` (`deleteFromTree`) | confirm modal (Cancel default-focus, danger Move-to-trash); folder copy includes recursive note count; closes open buffer if deleted; toast confirmation |
 | `tree-context-properties` | partial | `ui/src/main.ts` (`attachContextMenu`) | menu entry stub disabled; opens nothing until frontmatter editing lands |
-| `delete-note-core-cmd` | done | `core/src/vault.rs` (`delete_note`), `ui/src-tauri/src/lib.rs` (`delete_note` Tauri cmd) | files + folders; routes through `IndexJob::DeleteNote` so writes flow through the indexer's owned store; rollback on store failure |
+| `delete-note-core-cmd` | done | `core/src/ops.rs` (`delete`), `core/src/vault.rs` (`delete_note`), `ui/src-tauri/src/lib.rs` (`delete_note` Tauri cmd) | files + folders; `core::ops::delete` owns watcher suppression + `IndexJob::DeleteNote` send/await; indexer-side `core::vault::delete_note` runs the trash move + index cascade on the owned store; rollback on store failure |
 | `vault-trash` | done | `core/src/trash.rs` | `<vault>/.hiker/trash/` + `manifest.yaml`; collision suffix `_N`; folder moves preserve relative tree; serde_yml + time deps |
-| `vault-trash-restore` | done | `core/src/vault.rs` (`restore_note`), `ui/src-tauri/src/lib.rs` (`restore_trash_entry`), `ui/src/main.ts` (toast Undo button) | reverses delete via fs rename + manifest remove + inline re-ingest; errors if original path now occupied; recreates missing parent; CLI not yet wired |
+| `vault-trash-restore` | done | `core/src/ops.rs` (`restore`), `core/src/vault.rs` (`restore_note`), `ui/src-tauri/src/lib.rs` (`restore_trash_entry`), `ui/src/main.ts` (toast Undo button) | `core::ops::restore` resolves the trash entry up front for pre-suppression, then sends `IndexJob::RestoreFromTrash`; indexer-side `core::vault::restore_note` does the fs rename + manifest remove and the indexer task re-ingests inline. Errors if original path now occupied; recreates missing parent; CLI not yet wired |
 | `vault-trash-empty` | done | `core/src/trash.rs` (`Trash::empty`), `ui/src-tauri/src/lib.rs` (`empty_trash`), `ui/src/main.ts` (header right-click) | confirm modal, no auto-empty in v1; CLI not yet wired |
 | `tree-trash-bin` | done | `ui/index.html` (`#trash-bin`), `ui/src/main.ts` (`refreshTrashBin`, `renderTrashBin`) | pinned at bottom of sidebar; collapsed by default; chevron + count |
 | `tree-trash-disk-listing` | done | `core/src/trash.rs` (`Trash::list_from_disk`), `ui/src-tauri/src/lib.rs` (`list_trash`) | walks `.hiker/trash/`; manifest joined per-entry; orphans flagged |
@@ -89,6 +89,29 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `view-show-whitespace-toggle` | done | `ui/src/main.ts` (`whitespaceCompartment`, `setWhitespaceEnabled`) | CM6's `highlightWhitespace` in its own compartment; default off; toggled via View menu. Persistence still pending `settings-section-editor` |
 | `view-line-numbers-toggle` | done | `ui/src/main.ts` (`setLineNumbersVisible`), `ui/src/style.css` (`.cm-editor.hide-line-numbers`) | hides `.cm-gutter.cm-lineNumbers` from `basicSetup` via a class on the editor root rather than reconfiguring the extension stack; default visible. Persistence still pending `settings-section-editor` |
 | `view-heading-breadcrumb-toggle` | partial | `ui/src/main.ts` (`buildViewMenuItems`) | menu entry stub disabled with tooltip "Pairs with view-show-chunk-boundaries" |
+| `vault-home-screen` | done | `ui/index.html` (`#vault-home`), `ui/src/main.ts` (`refreshVaultHome` and helpers), `ui/src/style.css` (`#vault-home`, `.vault-home-*`) | header + three stacked widgets (stats, recently modified, recently accessed). `setVaultHomeVisible(true)` at the end of `applyOpenedVault` makes the home page the default landing surface on vault open per spec. New-note button calls existing `create_note` against vault root |
+| `vault-home-stats-widget` | done | `core/src/store.rs` (`Store::vault_stats`, `VaultStats`), `ui/src-tauri/src/lib.rs` (`vault_home_stats` Tauri cmd, `VaultHomeStats`), `ui/src/main.ts` (`refreshVaultHomeStats`, `scheduleVaultHomeStatsRefresh`) | five tiles: Notes / Indexed / Chunks / Queued / Skipped. Queued count rides the existing `IndexerHandle::status().queued`. Live-updates via debounced refresh on every terminal `hiker:reindex-progress` event. Unsupported / disk-usage breakdowns deliberately deferred — both need a vault walk |
+| `vault-home-recent-modified` | done | `core/src/store.rs` (`Store::recent_notes_by_mtime`, `RecentNote`), `ui/src-tauri/src/lib.rs` (`recent_notes_modified`), `ui/src/main.ts` (`refreshVaultHomeRecentModified`, `scheduleVaultHomeModifiedRefresh`) | `ORDER BY mtime DESC LIMIT 10` over non-skipped notes. Refresh debounced (400ms) on `hiker:file-changed` for any kind that can shift mtime ranking (created/deleted/renamed/modified). Click on a row opens via `openFile` |
+| `vault-home-recent-accessed` | done | `core/src/store.rs` (`Store::recent_notes_by_access`), `ui/src-tauri/src/lib.rs` (`recent_notes_accessed`), `ui/src/main.ts` (`refreshVaultHomeRecentAccessed`) | `ORDER BY last_accessed_at DESC` excluding NULL. Refreshes on full home re-render; the watcher doesn't drive these since hiker itself is the only writer of `last_accessed_at` and the writes happen via `note_accessed` from `openFile` |
+| `note-access-tracking` | done | `core/src/store.rs` (`SCHEMA_VERSION = 4`, `notes.last_accessed_at`, `Store::touch_note_access`, `NoteRow.last_accessed_at`), `core/src/indexer.rs` (`IndexJob::TouchAccess`, `IndexerHandle::touch_access`, handler in `handle_simple_job`), `ui/src-tauri/src/lib.rs` (`note_accessed` Tauri cmd), `ui/src/main.ts` (fire-and-forget `invoke("note_accessed", { rel })` at end of `openFile`) | schema bumps to v4 (fail-loud + reindex per `store-version-fail-loud`). Touch is fire-and-forget over the indexer mpsc so writes go through the indexer's owned writer. No-op when the note isn't yet indexed — the next ingest creates the row, and subsequent opens record |
+| `vault-home-button` | done | `ui/index.html` (`#home-btn`), `ui/src/main.ts` (`setVaultHomeVisible`, click handler) | icon-only house glyph in vault bar; toggles `#editor-pane.home-view` which swaps `#editor` ↔ `#vault-home`. `openFile` and `openTrashPreview` exit home view so opening any note restores the editor. Default landing surface on vault open. Keybind id `vault.go-home` reserved per editor.md but not yet registered (chord TBD) |
+| `vault-bar-open-vault-icon` | done | `ui/index.html` (`#pick-vault`) | inline-SVG folder glyph; `class="icon-btn"`; `title="Open vault…"` + `aria-label` preserve discoverability; click handler unchanged (`openVault` → `open_vault_at`) |
+| `sidebar-toggle-icon` | done | `ui/index.html` (`#toggle-sidebar`) | inline-SVG safe-dial glyph (rounded-square frame around a circle with spokes); `title="Toggle sidebar"`; click handler unchanged |
+| `discovery-toggle-icon` | done | `ui/index.html` (`#toggle-related`) | inline-SVG magnifying glass; `title="Toggle discovery panel"` (was "Toggle related notes"); click handler unchanged |
+| `view-menu-icon` | done | `ui/index.html` (`#view-menu-btn`) | inline-SVG eye glyph (outline + pupil) replaces text-and-chevron `View ▾`; tooltip + `aria-label="View options"`; click handler unchanged |
+| `mutations-menu-icon` | done | `ui/index.html` (`#mutations-menu-btn`) | inline-SVG wand glyph (diagonal stick + sparkle); icon-only `toolbar-btn`; no click handler — icon reservation, lands with `note-mutations-menu` |
+| `trails-menu-icon` | done | `ui/index.html` (`#trails-menu-btn`) | inline-SVG squiggly-path glyph (sine-wave); icon-only `toolbar-btn`; no click handler — icon reservation, lands with the trails UI |
+| `tree-org-menu-icon` | done | `ui/index.html` (`#tree-org-menu-btn`) | inline-SVG hierarchical-tree glyph (root + two children, connected); icon-only `toolbar-btn`; no click handler — icon reservation, lands with the menu itself |
+| `vault-home-recent-activity-widget` | done | `ui/src/main.ts` (`refreshActivityWidget`, `buildActivityPreviewRow`), `ui/index.html` (`#vault-home-activity`), `ui/src-tauri/src/lib.rs` (`recent_changes`, `changes_count`) | hidden when `changes_count == 0`; preview is top-5 rows; click anywhere in section → detail view; subscribes to `hiker:changes-appended` (300ms debounce) for live refresh |
+| `vault-home-detail-views` | done | `ui/src/main.ts` (`showHomeOverview`, `showHomeDetail`, `refreshVaultHome`), `ui/index.html` (`#vault-home-overview` / `#vault-home-detail`) | overview-vs-detail is a swap inside `#vault-home`; Home button click reruns `refreshVaultHome` which forces overview; note-row click in any detail view exits home to editor |
+| `vault-home-stats-detail` | planned | per-tile detail views (Notes / Indexed / Chunks / Queued / Skipped) parameterized by source tile; Skipped row offers per-row retry via `IndexJob::Upsert force=true` |
+| `vault-home-recent-activity-detail` | done | `ui/src/main.ts` (`renderActivityDetail`, `buildActivityDetailRow`, `openSnapshotPreview`, `doRestoreSnapshot`), `ui/src-tauri/src/lib.rs` (`restore_snapshot`, `change_content`, `rollback_change`) | mental model is version-list (each row = saved version). Row click → opens snapshot read-only in editor (`snapshot-preview-mode`). Per-row `[Restore this version]` writes that row's `content_at(id)` back via `restore_snapshot`, stamps `metadata.restored_from`. `current` badge marks each path's most recent row; `↩ restored` badge marks rows that were themselves a Restore. Hidden on `current` row (no-op) and `'deleted'` rows (no content). The change-shaped flavor (`rollback_change` walking `previous_content_for_path`) stays for MCP agent rollback per `mcp.md`. Inline diff deferred — open in RO covers the review need cleanly |
+| `snapshot-preview-mode` | done | `ui/src/main.ts` (`openSnapshotPreview`, `exitSnapshotPreview`, `setReadOnly(ro, mode)`, `Buffer.snapshotPreview`/`snapshotChangeId`, `isReadOnlyBuffer`), `ui/index.html` (`#snapshot-banner`), `ui/src/style.css` (`#snapshot-banner`) | reuses trash-preview machinery with a separate banner element (amber, not red). Banner shows snapshot metadata + `[Restore this version]` + `[Close preview]`. `isReadOnlyBuffer()` helper extends prior `buffer.preview` checks to cover snapshot mode for save/dirty/watcher guards. Closing returns to the activity detail view. Snapshot-banner Restore writes the previewed version back via the same `doRestoreSnapshot` path as per-row Restore |
+| `vault-home-recent-activity-author-filter` | done | `ui/src/main.ts` (`activeAuthorFilters`, filter-pill rendering inside `renderActivityDetail`) | pills appear only for author classes present in the visible window; default-all-on first time then preserves user toggles within the session; per-vault persistence via `settings-write-back` deferred — no `[home]` eligible-key set yet |
+| `recent-activity-human-icon` | done | `ui/src/main.ts` (`authorPillIcon` user branch) | inline-SVG half-oval body + circle head glyph; rendered inside the `user` pill |
+| `recent-activity-agent-icon` | done | `ui/src/main.ts` (`authorPillIcon` agent branch) | inline-SVG simplified-robot glyph; rendered for `agent:*` rows |
+| `vault-home-recent-activity-unrollback` | done | `ui/src/main.ts` (`recentlyRestoredFromId`, highlight + caption rendering inside `buildActivityDetailRow`) | after a Restore the row that *was* the path's current state gets a soft highlight + "← previous state — click Restore to undo" caption. The action is the same `[Restore this version]` button as anywhere else (no separate primitive); the caption is purely a hint. Append-only chain composes naturally — every row in retention is an addressable Restore target |
+| `vault-home-recents-detail` | planned | full-list versions of Recently Modified / Recently Accessed; lower priority since each preview row already opens on click |
 
 
 ## Index (index.md)
@@ -110,7 +133,10 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `embedder-spawn-blocking` | done | `core/src/indexer.rs:194` | model load + embed off async pool |
 | `embedder-batch-64` | partial | `core/src/indexer.rs` | batching exists; the `[indexing].batch_size` config key (declared in `settings-section-indexing`) is not yet plumbed into the indexer task — the value is loaded but not consumed |
 | `embedder-platform-data-dir` | done | `core/src/embed.rs:65` | `directories` crate |
-| `embedder-module-discipline` | done | `core/src/embed.rs` | trait Embedder; no fastembed leakage |
+| `embedder-module-discipline` | done | `core/src/embed.rs` | trait Embedder; no fastembed leakage; same boundary applies to `llm` crate when `embedder-llm-crate-backed` lands |
+| `embedder-llm-crate-backed` | planned | `core::embed::LlmEmbedder` impl wrapping graniet/`llm`'s `EmbeddingProvider`; supports OpenAI / Ollama / Google / Cohere / Mistral / HuggingFace |
+| `embedder-config-section` | planned | `[embedder]` config: `provider`, `model`, `api_key_env`, `base_url`; user/vault scoped, same shape as `[llm]` |
+| `embedder-version-tag-includes-provider` | planned | `embedder_version` column keys off provider + model so switching provider triggers re-embed via existing fail-loud machinery |
 | `embedder-first-run-nonblocking` | done | `core/src/indexer.rs` | vault opens; embed defers until model ready |
 | `ingest-startup-scan` | done | `core/src/indexer.rs:303` | mtime/size precheck |
 | `ingest-watcher-driven` | done | `core/src/indexer.rs:535` | broadcast → IndexJob |
@@ -126,7 +152,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `tauri-cmd-index-status` | done | `ui/src-tauri/src/lib.rs:188` | |
 | `tauri-cmd-index` | done | `ui/src-tauri/src/lib.rs:173` | All / Path scopes |
 | `walker-symlink-policy` | done | `core/src/vault.rs:163`, `core/src/indexer.rs:792`, `core/src/trash.rs:159` | every `walkdir::WalkDir` call uses `.follow_links(false)` |
-| `move-note-core-cmd` | done | `core/src/vault.rs` (`move_note`) | atomic fs rename + index update with watcher suppression; folder walk lives in `drag-and-drop-move` |
+| `move-note-core-cmd` | done | `core/src/ops.rs` (`move_note`), `core/src/vault.rs` (`move_note`) | `core::ops::move_note` owns watcher suppression + `IndexJob::Move` send/await; indexer-side `core::vault::move_note` runs the atomic fs rename + index update on the owned store. Folder walk lives in `drag-and-drop-move` |
 | `create-note-core-cmd` | done | `core/src/vault.rs` (`Vault::create_note`) | empty file, errors on collision (auto-suffix is the caller's job) |
 | `tauri-cmd-file-index-state` | done | `ui/src-tauri/src/lib.rs` (`index_state_for`, `IndexState`), `core/src/indexer.rs` (`IndexerHandle::is_pending`) | Unsupported via `is_indexable_path`; Queued from indexer's pending-paths set; Skipped + Indexed from `notes` row. Schema bumped to v2 to add `notes.skipped` + `notes.skip_reason` (`store-schema-v1` row covers the v1 baseline; the v2 columns + persistence ride on this slug). Indexer now persists Skipped rows for "file too large" and "not UTF-8" branches in `process_upsert`; `Store::upsert_skipped` handles the row + chunk cleanup |
 | `reindex-all-action` | done | `ui/src/main.ts` (tree-actions menu "Reindex all" entry) | calls `invoke("index", { scope: { kind: "all" } })`; no confirm modal |
@@ -171,7 +197,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `watcher-editor-conflict-dirty` | done | `ui/src/main.ts` (`handleWatcherConflictDirty`) | proactive Keep/Take/Cancel modal; Keep+Cancel leave buffer alone (next save re-prompts via `pre-write-drift-check`); re-entry guard prevents stacked modals |
 | `watcher-editor-deleted-buffer` | done | `ui/src/main.ts` (`hiker:file-changed` listener, deleted branch) | clean → close buffer + "removed externally" toast; dirty → keep buffer + "save to recreate" toast |
 | `watcher-editor-renamed-followup` | done | `ui/src/main.ts` (`hiker:file-changed` listener, renamed branch) | silently sets `buffer.path = ev.to`; tree row stays stale until manual refresh / `tree-refresh-watcher` |
-| `watcher-overflow-rescan` | planned | — | detect notify queue overflow, trigger rescan |
+| `watcher-overflow-rescan` | done | `core/src/watcher.rs` (`FileEvent::Overflow`, `need_rescan` branch in bridge thread), `core/src/indexer.rs` (`route_watcher_events` Overflow → `IndexJob::FullScan`), `ui/src-tauri/src/lib.rs` (`hiker:watcher-overflow` emit), `ui/src/main.ts` (toast listener) | kernel-level rescan flag (Linux Q_OVERFLOW / macOS MustScan / Windows buffer overrun) surfaces as `FileEvent::Overflow`; indexer kicks a non-forced full scan, frontend shows "watcher fell behind — rescanning…" toast and the existing reindex-progress events drive the status bar from there |
 | `watcher-config-ignore-file` | planned | — | `vault/.hiker/ignore` (deferred per spec) |
 
 
@@ -284,6 +310,122 @@ v1 slice is just "init `tracing` and write to a file." Spans, in-app viewer, and
 | `obs-perf-flamegraph` | planned | deferred; one-line `tracing-flame` add when needed |
 
 
+## Search (search.md)
+
+v2 milestone. Vault-wide hybrid search (lexical FTS5 + semantic) hosted in the repurposed discovery panel; type-ahead with debounce + epoch-cancel; engine traits so tantivy can swap in later. Phases 1–4 landed: backend foundation, panel restructure + persistence, type-ahead + result rendering + click-to-chunk, Ctrl-Space focus + arrow/Enter/Tab/Esc nav. The deferred slugs at the bottom of the table are next; they're scoped follow-ups, not v2 blockers.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `search-discovery-panel` | done | `ui/index.html` (#discovery), `ui/src/style.css` (#discovery / .discovery-section / #app.related-collapsed), `ui/src/main.ts` (discovery panel block) — right panel renamed to Discovery with input + collapsible search/related sections; `panel-toggle-buttons` (existing) still flips the panel as a whole |
+| `search-bar-input` | done | `ui/index.html` (#search-input) + `ui/src/style.css` (#search-input) |
+| `search-mode-toggles` | done | `ui/index.html` (#toggle-mode-{semantic,lexical}), `ui/src/main.ts` (`setSearchMode{Semantic,Lexical}`) — S/L pills next to the input; visual `.active` class drives pressed state same as existing toolbar buttons |
+| `search-modes-both-off-disabled` | done | `ui/src/main.ts` (`applySearchInputDisabledState`) — both toggles off → input `disabled` + placeholder swaps to "Enable Semantic or Lexical to search" |
+| `search-mode-state-persisted` | done | `core/src/config.rs` (`SearchConfig`, `SearchModesConfig` defaults true/true) + eligible-key set entries `search.modes.{semantic,lexical}`; `ui/src/main.ts` seeds from `get_settings` on vault open and persists every flip via `persistSetting` |
+| `search-typeahead-debounce` | done | `ui/src/main.ts` (`onSearchInput`, `runSearch`) — 250ms debounce + monotonically-increasing `searchEpoch`; stale responses dropped on the frontend before render. Empty query short-circuits without scheduling and bumps the epoch so any in-flight call drops |
+| `search-empty-collapses-results` | done | `ui/src/main.ts` (`applySearchSectionVisibility`) — non-empty query reveals #search-section, empty hides it; related section keeps the panel content as before |
+| `search-section-collapsible` | done | `ui/src/main.ts` (`applySectionCollapsed`, `setSearchSectionExpanded`, `setRelatedSectionExpanded`) + eligible keys `search.sections.{results_expanded,related_expanded}`; chevron rotates via `.collapsed` class |
+| `search-section-counts` | done | `ui/src/main.ts` — `renderRelated` updates `#related-count`, `renderSearchResults` updates `#search-count` |
+| `search-loading-shimmer` | done | `ui/index.html` (#search-spinner) + `ui/src/main.ts` (toggled by `onSearchInput` / `runSearch`) — minimal "…" spinner shown while a debounced query is in flight; styling can be upgraded later |
+| `search-related-stays-bound` | done | `ui/src/main.ts` — search wiring leaves `refreshRelated` / `scheduleRelatedRefresh` untouched; the related section still updates only on file-open and debounced-save |
+| `search-result-grouped-by-note` | done | `core/src/search.rs` (`group_by_note`) — chunk-level engine output is collapsed to one row per note before fusion, matching `design.md`'s fuse → group rule |
+| `search-result-row` | done | `ui/src/main.ts` (`renderSearchResults`, `appendSnippetWithMarks`) + `ui/src/style.css` (`.search-mark`) — title + heading-path + snippet (literal `<mark>` substrings parsed into styled `<span class="search-mark">` nodes, never via innerHTML) + score |
+| `search-result-click-opens-chunk` | done | `ui/src/main.ts` (`openSearchHit`, `byteOffsetToCharOffset`) — clicking a result row calls `openFile` then dispatches `EditorView.scrollIntoView` at the chunk's `byte_start`, converted UTF-8 byte → UTF-16 char via `TextEncoder`/`TextDecoder` |
+| `search-result-budget` | done | `core/src/search.rs` — `PER_BACKEND_TOP_K = 25`, `FUSED_TOP_K = 20`; configurability deferred to MCP needs |
+| `search-keybind-ctrl-space` | done | `ui/src/main.ts` — registered in CM6 keymap (`search.focusInput` / `Ctrl-Space`) so it wins over startCompletion inside the editor, plus a window-level capture-phase keydown listener for the global case (checks `ctrlKey && !metaKey`, so Cmd-Space on macOS stays Spotlight). Both call `focusSearchInput`, which expands the panel if collapsed and selects existing input contents. The keybind registry doesn't yet have a `scope` field — global half lives outside the registry until that refactor lands |
+| `search-keyboard-nav` | done | `ui/src/main.ts` (`onResultListKeydown`, `setRovingTabIndex`, `focusRow`, search input keydown handler) + `ui/src/style.css` (`.related-item:focus`) — ↑/↓ within a list, vertical wrap between Search-bottom ↔ Related-top only; Enter triggers the row's click handler; Tab uses roving tabindex (one row per list is reachable) so input → search → related → out flows naturally; Esc in the input clears the query (or blurs if already empty), Esc on a row refocuses the input. ↓ from the input jumps to the first available result row |
+| `search-engine-trait` | done | `core/src/search.rs` — `LexicalEngine` + `SemanticEngine` traits with concrete impls in same file; tantivy swap-point preserved |
+| `search-fts5-lexical` | done | `core/src/search.rs` (`Fts5LexicalEngine`) |
+| `search-fts5-schema` | done | `core/src/store.rs` (`ensure_schema`) — contentless `chunks_fts` + sync triggers on `chunks` (insert/update/delete); schema bumped to `SCHEMA_VERSION = 3` |
+| `search-fts5-bm25-snippet` | done | `core/src/search.rs` (`Fts5LexicalEngine::query`) — `ORDER BY bm25` + `snippet(chunks_fts, 0, '<mark>', '</mark>', '…', 32)`; BM25 sign-flipped so higher = better matches the semantic side |
+| `search-semantic-existing-vecs` | done | `core/src/search.rs` (`VecSemanticEngine`) — thin wrapper over `Store::knn_chunks_on` |
+| `search-query-embed-spawn-blocking` | done | `ui/src-tauri/src/lib.rs` (`search_vault_inner`) — query string embed runs on `tokio::task::spawn_blocking` against the indexer's loaded `Arc<dyn Embedder>`, exposed via the new `IndexerHandle::embedder` accessor (filled by a `OnceCell` after the model loads) |
+| `search-rrf-fusion` | done | `core/src/search.rs` (`rrf_fuse`) — k=60, applied when both modes on; group-by-note happens before fuse |
+| `search-rebuild-on-schema-bump` | done | covered by `store-version-fail-loud`: opening a v2 db with this binary aborts with a version-mismatch error; user runs the existing reindex flow |
+| `search-vault-scope-only` | done | `core/src/search.rs` — engine queries hit every non-skipped chunk in the vault; no scope filter; folder/tag/lifecycle filters stay deferred per spec |
+| `search-tauri-cmd` | done | `ui/src-tauri/src/lib.rs` (`search_vault`) returning `SearchResponse { epoch, lexical_hits, semantic_hits, fused }`; both-modes-off / empty-query / model-not-ready short-circuit to empty buckets without erroring |
+| `search-mode-options-menu` | planned | right-click on Semantic/Lexical toggle opens a popover with mode-specific options; reuses `openContextMenu`; left-click still toggles on/off |
+| `search-lexical-options` | planned | umbrella for the lexical right-click menu's row set; flips persist via `settings-write-back` to `search.lexical.*` |
+| `search-lexical-case-sensitive` | planned | post-filter pass on top-25 lexical hits; default off; FTS5 tokenizer stays case-folded |
+| `search-lexical-diacritic-sensitive` | planned | post-filter pass; default off; tokenizer keeps `remove_diacritics 2` |
+| `search-lexical-prefix-match` | planned | rewrite each query token to `token*` before FTS5 `MATCH`; default off |
+| `search-lexical-phrase-mode` | planned | wrap whole query in double quotes for exact-phrase FTS5 match; default off |
+| `search-semantic-options` | planned | umbrella for the semantic right-click menu's row set; flips persist via `settings-write-back` to `search.semantic.*` |
+| `search-semantic-min-similarity` | planned | 0.00–0.95 slider; drops hits below the cosine floor before fusion; default 0.00 |
+| `search-semantic-top-k-override` | planned | numeric override (5–100) of `PER_BACKEND_TOP_K` for the semantic side only; default 25 |
+| `search-semantic-recency-bias` | planned | Off/Mild/Strong RRF blend of `notes.mtime` rank into the semantic score; default Off |
+| `search-folder-scope` | planned | restrict to vault subtree; deferred |
+| `search-lifecycle-filters` | planned | exclude/include archived/redacted/retired; waits on `design.md` lifecycle slugs |
+| `search-tag-scope` | planned | filter by frontmatter tag; waits on auto-tag enrichment |
+| `search-tantivy-swap` | planned | `LexicalEngine` impl over tantivy; triggered by ranking-quality complaints |
+| `search-history` | planned | recent queries dropdown under input |
+| `search-result-snippet-context` | planned | expand row to show surrounding chunks |
+| `search-multi-vault` | planned | vault-level routing axis from `design.md`; needs multi-vault open first |
+| `search-result-pin-as-collection` | planned | promote result set to a saved collection (`design.md` collections) |
+| `search-result-multi-select` | planned | checkbox selection on result rows + select-all in section header; per-query state |
+| `search-bulk-action-tag` | planned | apply/remove a tag across all results or the multi-select subset; depends on auto-tag enrichment landing first |
+| `search-bulk-action-move` | planned | move all results (or multi-select subset) to a folder via `core::ops::move_note`; confirm-with-count |
+| `search-authorship-filter` | planned | pill-row filter on user-authored/agent-authored/imported (`hiker.author:`); reads from Provenance index axis |
+| `search-source-type-filter` | planned | pill-row filter on source type (md / trail / pdf / epub / image / audio / website / transcript); reads `hiker.type:` |
+
+
+## LLM (llm.md)
+
+All deferred. Lands with the v3.5 ACP-client + bundled-agent milestone in `design.md` build order. Architectural decisions (ACP-only, three feature types, ToS posture, etc.) live in the spec; the slugs below are concrete implementable features.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `llm-core-module` | planned | `core::llm` wraps graniet/`llm` crate; multi-provider via single trait + builder; module discipline (only place `llm` crate is imported) |
+| `llm-providers-config` | planned | `vault/.hiker/llm.toml` + user-scope fallback; provider/model/api_key_env/base_url/limits; api keys via env vars |
+| `llm-basic-agent-loop` | planned | `core::agent` — message-history + tool-dispatch loop on top of `core::llm`; default backend for the chat panel; bounded tool-call iterations |
+| `llm-acp-client-optional` | planned | `core::acp` — optional client for external ACP agents (Claude Code / Goose / ...); chat-panel-only; never wired for background or fan-out |
+| `llm-context-injection` | planned | when hiker has high-confidence relevant context for an interactive turn, inject it as Embedded Resource (ACP) or in-prompt context (basic agent loop) |
+| `llm-disable-mode` | planned | `[llm] enabled = false` turns off background + fan-out + chat panel; MCP server stays available |
+| `llm-feature-debounce` | planned | 1–2s coalesce window for save-driven LLM features so save bursts → one prompt |
+| `llm-prompts-file-store` | planned | per-feature markdown files; two-tier (user + vault, vault wins); defaults written on first run |
+| `llm-prompts-mustache-templating` | planned | `{{var}}` substitution; available placeholders documented per-feature in default file's comment header |
+| `llm-prompts-staleness-on-upgrade` | planned | hash bundled defaults; mismatch flags drift in agent log + Prompts tab without clobbering user override |
+| `llm-prompts-settings-tab` | planned | settings UI Prompts tab: editable text, default reference, reset, diff, test affordance |
+| `llm-prompt-test-button` | planned | "test prompt with sample data" affordance in Prompts tab |
+| `llm-audit-log` | planned | `vault/.hiker/agent-log/<YYYY-MM-DD>.jsonl`; one entry per LLM call (any module); daily rotation; full text gated on `[llm.audit] log_full_prompt = true` |
+| `llm-cost-transparency` | planned | status-bar indicator of recent LLM activity; click opens audit log viewer |
+
+
+## Changes log (changes.md)
+
+All planned. Lands with v3 alongside MCP — agent rollback is the load-bearing first consumer; future per-file history view and the future sync layer also build on this substrate.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `changes-log-table` | done | `core/src/changes.rs` (`ensure_schema`, `SCHEMA_VERSION = 1`) | `.hiker/changes.db` with single `changes` table; indexes on `(path, ts)`, `(author, ts)`, `(ts)`; fail-loud on schema mismatch mirroring `store-version-fail-loud` |
+| `changes-store-file` | done | `core/src/changes.rs` (`Changes::open`) | separate from `index.db`; opened at vault open in `ui/src-tauri/src/lib.rs` (`open_vault_at_inner`) |
+| `changes-write-path` | done | `core/src/ops.rs` (`create_with_suffix`, `move_note`, `move_folder`, `delete`, `restore`) + `ui/src-tauri/src/lib.rs` (`write_file`, `write_file_checked`) | every UI-driven mutation appends one row through the shared `Arc<Changes>`. Watcher-driven external-write rows (`author='user'`) deferred — sync / external-edit ingestion isn't load-bearing for the v3 widget; the indexer route is the natural future home per spec |
+| `changes-query-api` | done | `core/src/changes.rs` (`Changes::{recent, recent_by_author, history_for_path, content_at, previous_content_for_path, count}`) | DTO is `ChangeRow` (no rusqlite leakage); content blob fetched separately via `content_at` |
+| `changes-rollback-helper` | done | `core/src/changes.rs` (`previous_content_for_path`, `content_at`) + `ui/src-tauri/src/lib.rs` (`rollback_change`, `restore_snapshot`) | two flavors riding the same primitives per `changes.md` "Rollback": `rollback_change` (change-shaped, walks `previous_content_for_path`, stamps `metadata.rolled_back_from`) for MCP agent rollback per `mcp.md`; `restore_snapshot` (version-shaped, reads `content_at(id)`, stamps `metadata.restored_from`) for the home-page recent-activity widget. Both append a new `'modified'` row; append-only preserved |
+| `changes-baseline-on-first-mutation` | done | `core/src/changes.rs` (`Changes::ensure_baseline`, `has_any_for_path`), `ui/src-tauri/src/lib.rs` (called from `write_file` and `write_file_checked` before each save) | first-save edge case: pre-existing vault files have no prior row, so rollback finds nothing. The save path lazy-snapshots the pre-write content as a `'created'` row tagged `metadata.baseline = true` whenever the path has no rows yet. Idempotent — once any row exists, the call no-ops |
+| `changes-retention` | done | `core/src/changes.rs` (`gc`) + `ui/src-tauri/src/lib.rs` (`open_vault_at_inner` calls `changes.gc(50)` on open) | per-`(path, author)` keep-N policy with `op='deleted'` rows preserved unconditionally; periodic GC task deferred — v1 runs once at vault open which bounds storage well enough for personal use. `[changes]` config section deferred (no eligible-key set yet) |
+
+
+## MCP (mcp.md)
+
+All planned. v3 milestone — in-process MCP server in `mcp-server/` crate, Streamable HTTP transport, rmcp-backed, read + write tool surface, agent rollback via `core::changes`. Architectural decisions (in-process, decoupled crate, transport choice, localhost-trust auth, etc.) live in the spec; the slugs below are concrete implementable features.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `mcp-server-crate` | planned | new `mcp-server/` crate; rmcp Server impl + tokio task lifecycle managed by `ui/src-tauri/src/lib.rs` on vault open/close; no UI imports |
+| `mcp-config-section` | planned | `[mcp]` config: `enabled`, `port`, `discovery_file`, `max_top_k`; `[mcp.tools] writes_enabled`, `allow_redacted_lookup`; `[mcp.audit] log_full_input` |
+| `mcp-port-discovery` | planned | OS-assigned ephemeral port by default; URL written to `vault/.hiker/mcp.json` on bind, removed on shutdown; configurable to a fixed port |
+| `mcp-dynamic-capabilities` | planned | tool list filtered at `initialize` based on backing-feature presence; future tools (trails / landmarks / collections / vision) advertise dynamically |
+| `mcp-error-model` | planned | `HikerError` → JSON-RPC error codes at the boundary; hiker-specific positive codes 1001 (`vault_not_open`), 1002 (`note_not_found`), 1003 (`drift`), 1004 (`disabled`), 1005 (`indexer_unavailable`) |
+| `mcp-lifecycle-aware` | planned | search/get_note/related_notes exclude archived/redacted/retired by default; redacted notes return id+title only regardless of scope |
+| `mcp-audit-log-mcp-calls` | planned | every MCP call (read or write) logs to `vault/.hiker/agent-log/<YYYY-MM-DD>.jsonl` with surface=`mcp-tool-call`; gated by `[mcp.audit] log_full_input` for input bodies |
+| `mcp-tool-search-notes` | planned | wraps `core::search::query`; returns `SearchResponse`; agent-requested `top_k` capped by `[mcp] max_top_k` |
+| `mcp-tool-get-note` | planned | fetch a note by rel_path with `detail` parameter (`digest` / `snippet` / `full`); progressive disclosure per `design.md` MCP surface |
+| `mcp-tool-related-notes` | planned | wraps existing `related-notes-query`; returns `RelatedHit`s |
+| `mcp-tool-write-note` | planned | create or replace note body; optional `expected_hash` enables drift-aware writes; routes through `core::ops` so `changes.db` row + frontmatter authorship stamp are automatic |
+| `mcp-tool-set-frontmatter` | planned | merge frontmatter fields; new `core::ops::set_frontmatter` (existing `vault::write_file` is body-only); auto-stamps `hiker.author: agent-authored` |
+| `mcp-tool-apply-tag-remove-tag` | planned | convenience wrappers over `set_frontmatter` for the common case of tag application/removal |
+
+
 ## CLI (no spec doc yet)
 
 The CLI is a stub today. Slugs reserved for what's implied by other docs.
@@ -297,7 +439,8 @@ The CLI is a stub today. Slugs reserved for what's implied by other docs.
 | `cli-trash-empty` | planned | permanent delete of all trash entries |
 | `cli-reindex` | planned | spec'd in index.md ingest pipeline |
 | `cli-reindex-rebuild` | planned | drop + recreate schema |
-| `cli-eval` | planned | runs golden-set, reports recall@5/@10/MRR (qa.md) |
+| `cli-eval` | dropped | superseded by external Python tool (`eval-synth-tool`); hiker exposes `cli-query` as the primitive the tool calls |
+| `cli-query` | planned | thin CLI primitive that runs a single search/related query and prints results; consumed by the external eval tool until MCP is real |
 | `cli-stats` | planned | sanity dashboards (qa.md) |
 
 
@@ -310,5 +453,6 @@ All planned; build only when there are real notes to evaluate against.
 | `eval-golden-set` | planned | `vault/.hiker/eval.yaml` + `hiker eval` |
 | `eval-thumbs-feedback` | planned | per-row up/down → feedback.jsonl |
 | `eval-sanity-stats` | planned | chunk-distribution, mean top-1 sim, orphans, mutual-top-1 |
-| `eval-synthetic-corpus` | planned | LLM-generated topical notes for bootstrap benchmark |
+| `eval-synthetic-corpus` | planned | LLM-generated topical notes for bootstrap benchmark; implementation lives in `eval-synth-tool` (external Python), not hiker |
+| `eval-synth-tool` | partial | v0 (`gen` subcommand) lives at `tools/eval-synth/eval-synth.py`; topic taxonomy in `topics.yaml`, prompts in `prompts/note.md` + `prompts/note-txt.md`, syntax-paste fixtures in `pastes/<kind>/`. `.md` notes stamp `hiker.provenance: synthetic-corpus` + `hiker.author: imported` per design.md authorship trichotomy. Ground-truth manifest (canonical, including `.txt`) at `<out>/.synth/manifest.jsonl`. Knobs: `--txt-rate` writes a fraction as plain `.txt` (no frontmatter, per txt-ingest.md:105 leading-`---`-is-content rule); `--paste-rate` splices fixture syntax (sql/shell/json/python/tcpdump/regex) into eligible topics — fenced in `.md`, indented/raw/inline in `.txt` to exercise txt-ingest's code-region exclusion (`txt-chunker-guardrails`). Pathology mix (near-dup / topic-drift / very-short / very-long) at ~10%. Runner / scoring / recall@K still deferred until `cli-query` lands |
 | `eval-auto-org` | planned | manual-placement holdout + reconcile-history regression |

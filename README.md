@@ -1,8 +1,25 @@
+<p align="center">
+  <img src="images/icon.png" alt="Hiker" width="160">
+</p>
+
 # Hiker
 
 A personal notes and knowledge system. Plain markdown on disk, semantic search, agent-accessible.
 
 See `design.md` for the implementation design.
+
+
+## What is Hiker?
+
+Hiker is a modernized, multimodal take on Vannevar Bush's memex: a personal knowledge store you actually navigate, not just dump into. Every note lives as plain markdown on the filesystem, but the vault is wrapped in a hybrid lexical and semantic index, related-notes discovery, ordered "trails" through content, pinned "landmarks" in embedding space, and a graph "map" view.
+
+Multimodal means non-markdown sources (PDFs, images, audio, web captures) are ingested via sidecar notes that sit alongside the originals without modifying them. Everything addressable, everything searchable, everything routable through the same primitives whether you are at the keyboard or an agent is reaching in over MCP.
+
+The same vault is navigable by a human in the desktop UI and by agents over MCP, with identical search, related-notes, and trail semantics on both sides.
+
+<p align="center">
+  <img src="images/screenshot_1.png" alt="Hiker editor with sidebar tree, live-preview markdown, and discovery panel" width="900">
+</p>
 
 
 ## Core ideals
@@ -13,20 +30,88 @@ See `design.md` for the implementation design.
 
 3. **Search and relatedness are the core feature, not organization.** Semantic + lexical search and AI-found connections are what make a pile of notes useful. Manual structure is optional on top.
 
-4. **Start unstructured, layer structure later.** A note dropped into the inbox is a first-class citizen. Folders, tags, trees, and trails are things you grow into when they earn their keep — never required upfront.
+4. **Start unstructured, layer structure later.** A note dropped into the inbox is a first-class citizen. Folders, tags, trees, and trails are things you grow into when they earn their keep, never required upfront.
 
 5. **AI proposes, the user disposes.** Auto-generated organization (topic trees, suggested tags, folder placement) always shows up as a draft you approve, modify, or reject. The curated state is authoritative; re-running AI proposes diffs against it, never overwrites.
 
 6. **Originals are sacred.** Non-markdown files (PDFs, images, audio) and external files (a `design.md` inside a project repo) are indexed without being moved or modified. Hiker's metadata lives in its own notes alongside, never injected into files Hiker doesn't own.
 
-7. **Every searchable thing is a note.** Markdown notes, sidecar notes for non-md sources, pointer notes for external files, manifest notes for versioned references — all route through the same primitives. There is no parallel data model for "attachments" or "references"; everything addresses notes by ID and gets uniform handling in search, links, trails, and MCP.
+7. **Every searchable thing is a note.** Markdown notes, sidecar notes for non-md sources, pointer notes for external files, manifest notes for versioned references, all route through the same primitives. There is no parallel data model for "attachments" or "references"; everything addresses notes by ID and gets uniform handling in search, links, trails, and MCP.
 
 8. **One substrate, two readers.** The same vault is navigable by you (UI) and by agents (MCP). Search, related-notes, and trails are exposed identically to both.
 
-9. **Versioning where it has semantic meaning.** External reference docs (datasheets, scraped documentation) get explicit, named, diffable versions. Personal notes don't — they're continuous edits, backed up at the OS level.
+9. **Versioning where it has semantic meaning.** External reference docs (datasheets, scraped documentation) get explicit, named, diffable versions. Personal notes don't, they're continuous edits, backed up at the OS level.
 
 10. **Composable knowledge spaces.** Multiple vaults (personal, work, school) coexist, can be searched together or scoped, and stay independent for sync and lifecycle.
 
 11. **Spatial navigation as a first-class idea.** Trails (ordered walks), landmarks (pinned anchors), and the map (graph view) treat the vault as a place you move through, not just a bag of documents.
 
 12. **Open source, built in Rust, on a small native stack.** Tauri + CodeMirror 6 + a Rust core. Apache-2.0 licensed.
+
+
+## Features
+
+Status legend: **[implemented]** working today, **[in progress]** partially built, **[planned]** specced and not started, **[deferred]** intentionally pushed past v1. Per-feature granularity lives in `docs/status.md`.
+
+### Editor and vault
+
+- **[implemented]** CodeMirror 6 editor with markdown live preview (cursor-line reveal, fade markers, heading styles, fenced code reveal)
+- **[implemented]** Three-column layout: file tree, editor, discovery panel; collapsible sides
+- **[implemented]** File tree with drag-and-drop move, rename, context menu, sortable, refresh-on-watcher
+- **[implemented]** Soft-delete trash with restore, permanent delete, and empty-trash actions
+- **[implemented]** Pre-write drift check and conflict modal for external edits
+- **[implemented]** Vault home screen with stats, recently-modified, and recently-accessed widgets
+- **[implemented]** Per-buffer view options: live preview, word wrap, whitespace, line numbers, render `.txt` as markdown
+- **[implemented]** Plain `.txt` ingest with structure-aware paragraph and sentence packing
+- **[planned]** Frontmatter properties editor, status-bar goto-line, help-panel keybind enumeration
+- **[planned]** Note mutation actions menu (markdown reformat, etc.)
+
+### Index, search, and discovery
+
+- **[implemented]** SQLite + sqlite-vec store, heading-bounded markdown chunker, fastembed (bge-small) embeddings
+- **[implemented]** Filesystem watcher driven incremental indexing, with rename preservation and overflow rescan
+- **[implemented]** Related-notes panel driven by per-chunk KNN
+- **[implemented]** Vault-wide hybrid search (FTS5 lexical + semantic vectors, RRF fusion) in the discovery panel
+- **[implemented]** Type-ahead search with debounce, epoch cancellation, click-to-chunk navigation, full keyboard nav
+- **[in progress]** CLI surface (`hiker reindex`, `hiker query`, trash commands)
+- **[planned]** Pluggable embedder backends (OpenAI, Ollama, Cohere, Mistral, HuggingFace) via the `llm` crate
+- **[planned]** Lexical and semantic option menus (case sensitivity, prefix match, min-similarity, recency bias)
+- **[planned]** Folder, tag, lifecycle, and authorship scoping; multi-vault search; saved-collection results
+- **[planned]** Tantivy lexical engine swap for ranking quality
+
+### Organization and AI assist
+
+- **[planned]** Recursive RAPTOR-shaped clustering with HDBSCAN/GMM, LLM cluster naming, saved topic trees
+- **[planned]** One-shot suggestion proposals (move and tag modes) with markdown audit log and rejection history
+- **[planned]** Confidence-tiered triage: high-confidence auto-apply with undo, medium queued for review
+- **[planned]** Local agent loop on top of a multi-provider LLM core; optional ACP client for external agents (Claude Code, Goose)
+- **[planned]** Per-feature prompt files (user + vault scoped) with settings-tab editor and test affordance
+- **[planned]** LLM audit log and cost-transparency status indicator
+
+### Spatial navigation
+
+- **[planned]** Trails: ordered, memex-style walks through notes
+- **[planned]** Landmarks: pinned anchors with nearest-landmark tagging in embedding space
+- **[planned]** Map: graph visualization of the vault
+
+### Multimodal ingest
+
+- **[implemented]** `.txt` ingest via dedicated chunker
+- **[planned]** PDF sidecars via docling/marker
+- **[planned]** Image sidecars via tesseract OCR
+- **[planned]** Audio sidecars via whisper.cpp
+- **[planned]** Web capture and EPUB sources
+
+### Agent surface
+
+- **[planned]** MCP server (`rmcp`) exposing search, related, trails, and note CRUD with the same semantics as the UI
+
+### Platform
+
+- **[implemented]** Tauri shell, Rust core with strict module discipline (rusqlite, fastembed, notify each isolated to one module)
+- **[implemented]** Per-vault settings (TOML, user + vault layered, strict load, write-back preserving comments)
+- **[implemented]** Tracing-based observability with daily-rotating file logs
+- **[implemented]** Multi-vault open with default-vault auto-open
+- **[deferred]** Tracing spans per pipeline stage, in-app log viewer, frontend log bridge
+- **[deferred]** `.hiker/ignore` config file
+- **[planned]** QA harness: golden-set evaluation, thumbs feedback, synthetic-corpus benchmark

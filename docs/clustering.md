@@ -119,7 +119,9 @@ At level 0 the per-note summary input comes from the existing `Summary` enrichme
 
 Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the suggestions flow shows it but flags it for explicit review before applying.
 
-Model choice: a small local LLM is sufficient. Cluster naming is a much easier task than freeform writing — `Llama-3.2-3B` or similar runs on CPU and produces fine names. The expensive part is summarization quality; for v1-of-clustering, even template-based names ("Notes about X, Y, Z" using top-tf-idf terms) are a reasonable fallback if the LLM dependency is undesirable. Make the summarizer pluggable behind a `core::summarize` trait — same discipline pattern as embedder and store. [cluster-summarize-fallback-tfidf]
+**Routing per `llm.md`:** cluster summarization is a *fan-out* feature (one prompt per cluster, scope determined pre-batch by the cluster set). Calls flow through `core::llm` direct — no agent loop, no ACP. The summarizer's pluggable surface (`core::summarize` trait) is a thin layer *on top of* `core::llm`: the trait owns the prompt template, member-formatting, JSON parsing, and the tf-idf fallback path; the LLM call itself goes through `core::llm`. Same discipline pattern as embedder and store. [cluster-summarize-fallback-tfidf]
+
+Model choice: provider/model are user-configured in `[llm]` per `llm.md`; a small local model via Ollama (e.g. `qwen2.5:3b`) is enough — cluster naming is easier than freeform writing. For users who don't want LLM calls at all, the template-based fallback ("Notes about X, Y, Z" using top-tf-idf terms) is honored by `core::summarize` independently of the configured `[llm]` provider.
 
 
 ## Cost model

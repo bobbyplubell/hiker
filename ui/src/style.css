@@ -1,6 +1,44 @@
 :root {
   font-family: system-ui, sans-serif;
   color-scheme: light dark;
+  /* Shared height for the three top bars (vault-bar, editor-toolbar,
+     discovery-bar) so they line up across columns. */
+  --top-bar-height: 40px;
+  /* Shared height for the bottom strips (editor status bar + collapsed
+     trash header) so the two sidebar/editor columns line up at the
+     bottom. When trash is expanded the header keeps this height; the
+     list flows above it inside the sidebar's scroll container. */
+  --bottom-bar-height: 32px;
+  /* Single source of truth for the accent color used by every active /
+     selected / hover-highlight surface (toggle buttons, tree row hover,
+     trash banner stripe, search-result focus, vault-home recents hover,
+     etc.). Change `--accent` and the matching `rgb` channel below to
+     retheme. Alpha variants are hardcoded rgba so they don't depend on
+     `color-mix` (which some older webviews resolve to invalid, breaking
+     the whole declaration silently). */
+  --accent: #4a90e2;
+  --accent-fill: rgba(74, 144, 226, 0.27);
+  --accent-fill-strong: rgba(74, 144, 226, 0.20);
+  --accent-fill-soft: rgba(74, 144, 226, 0.13);
+  /* Vault-home text palette. `--text-strong` is the highlighted / primary
+     text (filenames in recents, stat tile numbers + labels); `--text-muted`
+     is the secondary text (folder paths, relative-time hints). Swap these
+     to retheme the home page without touching individual rules. */
+  --text-strong: #000;
+  --text-muted: #999;
+}
+
+#vault-bar,
+#editor-toolbar,
+#discovery-bar {
+  box-sizing: border-box;
+  height: var(--top-bar-height);
+}
+
+#status-bar,
+#trash-header {
+  box-sizing: border-box;
+  height: var(--bottom-bar-height);
 }
 
 html, body, #app {
@@ -28,7 +66,7 @@ html, body, #app {
 }
 
 #sidebar,
-#related {
+#discovery {
   overflow: hidden;
   transition: visibility 0.1s;
 }
@@ -37,7 +75,7 @@ html, body, #app {
   visibility: hidden;
 }
 
-#app.related-collapsed #related {
+#app.related-collapsed #discovery {
   visibility: hidden;
 }
 
@@ -60,6 +98,269 @@ html, body, #app {
 #vault-bar > button {
   flex-shrink: 0;
   white-space: nowrap;
+}
+
+/* status: vault-home-button — placeholder pane occupies the editor row
+   when home view is active. Actual content widgets land with
+   vault-home-screen. */
+#editor-pane.home-view #editor {
+  display: none;
+}
+#editor-pane:not(.home-view) #vault-home {
+  display: none;
+}
+/* status: vault-home-screen */
+#vault-home {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: #ccc;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.vault-home-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+  border: none;
+  padding: 0;
+  background: transparent;
+}
+#vault-home-title {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0;
+  color: #ddd;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+#vault-home-new-note {
+  flex-shrink: 0;
+}
+.vault-home-section {
+  margin-bottom: 28px;
+}
+.vault-home-section h2 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #888;
+  margin: 0 0 10px;
+}
+.vault-home-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+.vault-home-stat {
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 10px 12px;
+  color: var(--text-strong);
+}
+.vault-home-stat .num {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+.vault-home-stat .label {
+  font-size: 11px;
+  color: var(--text-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+.vault-home-stat-empty {
+  color: #777;
+  font-style: italic;
+}
+.vault-home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.vault-home-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  /* Same type ramp as the activity-detail rows: 11px muted by default,
+     name standout below at 13px strong. */
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vault-home-list li:hover {
+  background: var(--accent-fill);
+}
+.vault-home-list .name {
+  color: var(--text-strong);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.vault-home-list .rel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.vault-home-list .when {
+  flex-shrink: 0;
+}
+.vault-home-list .empty {
+  color: #777;
+  font-style: italic;
+  padding: 6px 8px;
+  cursor: default;
+}
+.vault-home-list .empty:hover {
+  background: transparent;
+}
+
+/* status: vault-home-recent-activity-widget
+   All activity-row meta (op, author, when, id, badges) share one type
+   ramp: 11px default-font, muted color. The note name is 13px strong.
+   Two sizes, two colors — no mono font, no extra letter-spacing tricks
+   beyond a single uppercase op label. */
+.activity-op,
+.activity-author,
+.activity-id,
+.rollback-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.activity-op {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 56px;
+}
+.activity-id {
+  /* Slightly dimmer than other meta so the id reads as ambient ref data
+     rather than a primary label. */
+  color: #777;
+}
+.activity-author {
+  display: inline-flex;
+  align-items: center;
+}
+.activity-author svg {
+  width: 13px;
+  height: 13px;
+}
+/* Right-pinned cluster on activity rows. Holds [when] [author-icon]
+   [#id] in fixed reading order; `margin-left: auto` pushes the whole
+   group to the row's right edge regardless of how long the path is. */
+.row-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* status: vault-home-detail-views */
+#editor-pane.home-view #vault-home-overview[hidden] { display: none; }
+#editor-pane.home-view #vault-home-detail[hidden] { display: none; }
+.vault-home-detail-count {
+  color: var(--text-muted);
+  font-size: 11px;
+  align-self: baseline;
+}
+/* status: vault-home-recent-activity-author-filter */
+.vault-home-filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+/* Filter pills share the .toolbar-btn type ramp (4px radius, neutral
+   border) so they match every other icon-button in the chrome. The icon
+   sits next to the class label inside a single button. */
+.vault-home-filters .filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vault-home-filters .filter-pill.active {
+  color: var(--text-strong);
+}
+.vault-home-filters .filter-pill svg {
+  width: 12px;
+  height: 12px;
+}
+.vault-home-filters .filter-pill > span {
+  letter-spacing: 0.04em;
+}
+/* Empty state: pill is shown but dimmed so users can see the affordance
+   exists before any rows of that class arrive. Click still toggles —
+   harmless when there's nothing to show. */
+.vault-home-filters .filter-pill.empty {
+  opacity: 0.45;
+}
+
+/* status: vault-home-recent-activity-detail */
+.vault-home-activity-detail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.vault-home-activity-detail-list > li {
+  border-top: 1px solid #2a2a2a;
+  padding: 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.vault-home-activity-detail-list > li.recently-rolled-back {
+  background: rgba(255, 200, 80, 0.04);
+  border-left: 2px solid #b88a36;
+}
+.vault-home-activity-detail-list .row-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+/* Note name is the only standout in the row; everything else inherits
+   the row-line muted/11px ramp above. */
+.vault-home-activity-detail-list .row-line .name {
+  color: var(--text-strong);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.vault-home-activity-detail-list .row-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.vault-home-activity-detail-list button.row-action {
+  border: 1px solid var(--text-muted);
+  background: transparent;
+  color: var(--text-strong);
+  padding: 3px 9px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+.vault-home-activity-detail-list button.row-action:hover {
+  background: var(--accent-fill);
+}
+.vault-home-activity-detail-list .un-rollback-prompt {
+  font-size: 11px;
+  color: #d2a866;
 }
 
 #vault-path {
@@ -110,16 +411,37 @@ html, body, #app {
   background: #8882;
 }
 
-#tree {
+.icon-btn.active {
+  background: var(--accent-fill);
+  border-color: var(--accent);
+}
+
+.icon-btn svg,
+.toolbar-btn svg {
+  display: block;
+}
+
+#vault-bar > .icon-btn {
+  padding: 4px 6px;
+}
+
+#sidebar-scroll {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+#tree {
   padding: 8px;
   font-size: 13px;
-  flex: 1;
+  flex: 1 0 auto;
 }
 
 #tree li.drop-target {
-  background: #4a90e244;
-  outline: 1px dashed #4a90e2;
+  background: var(--accent-fill);
+  outline: 1px dashed var(--accent);
 }
 
 #tree li.dragging {
@@ -131,7 +453,7 @@ html, body, #app {
   font-size: 13px;
   padding: 0 2px;
   margin: 0;
-  border: 1px solid #4a90e2;
+  border: 1px solid var(--accent);
   border-radius: 2px;
   background: Canvas;
   color: CanvasText;
@@ -155,7 +477,7 @@ html, body, #app {
 }
 
 #tree li.active {
-  background: #4a90e244;
+  background: var(--accent-fill);
 }
 
 #editor-pane {
@@ -168,7 +490,7 @@ html, body, #app {
 #editor-toolbar {
   display: flex;
   align-items: center;
-  padding: 4px 8px;
+  padding: 6px 8px;
   border-bottom: 1px solid #8884;
   gap: 6px;
 }
@@ -194,32 +516,160 @@ html, body, #app {
 }
 
 .toolbar-btn.active {
-  background: #4a90e244;
-  border-color: #4a90e2;
+  background: var(--accent-fill);
+  border-color: var(--accent);
 }
 
-#related {
+/* status: search-discovery-panel
+   The right column is the Discovery panel: a fixed input/toggles bar at
+   the top, and a column of collapsible sections below. v2 ships with two
+   sections (search + related); the layout is sized so adding a third
+   doesn't require rewiring. */
+#discovery {
   display: flex;
   flex-direction: column;
   border-left: 1px solid #8884;
   min-height: 0;
 }
 
-#related-header {
-  padding: 6px 10px;
+#discovery-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
   border-bottom: 1px solid #8884;
+  /* status: ui-no-sibling-pushout — input shrinks; toggles never push out */
+  min-width: 0;
+}
+
+#search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 13px;
+  border: 1px solid #8886;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+}
+
+#search-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* status: search-modes-both-off-disabled
+   When both toggles are off the input is disabled; the placeholder shows
+   the hint (set from JS). The disabled visual cue keeps users from
+   typing into a no-op field. */
+#search-input:disabled {
+  color: #888;
+  background: #8881;
+  cursor: not-allowed;
+}
+
+#discovery-bar .toolbar-btn {
+  /* Compact mode toggles next to the input — don't grow with the row. */
+  flex: 0 0 auto;
+  min-width: 28px;
+  padding: 2px 8px;
+  font-weight: 600;
+}
+
+#search-clear-btn {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #888;
+}
+
+#discovery-sections {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.discovery-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid #8884;
+  min-height: 0;
+}
+
+.discovery-section:last-child {
+  border-bottom: none;
+}
+
+.discovery-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
   font-size: 12px;
   font-weight: 600;
   color: #888;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  cursor: pointer;
+  user-select: none;
+  min-width: 0;
 }
 
-#related-list {
+.discovery-section-header:hover {
+  background: #8881;
+}
+
+.discovery-chevron {
+  font-size: 10px;
+  width: 10px;
+  display: inline-block;
+  transition: transform 0.1s;
+}
+
+/* status: search-section-collapsible — collapsed sections rotate the
+   chevron and hide the body. The body uses [hidden] so the chevron's
+   own click handler can flip a single attribute. */
+.discovery-section.collapsed .discovery-chevron {
+  transform: rotate(-90deg);
+}
+
+.discovery-section-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* status: search-section-counts */
+.discovery-section-count {
+  flex: 0 0 auto;
+  font-weight: 400;
+  color: #888;
+  font-size: 11px;
+}
+
+/* status: search-loading-shimmer */
+.discovery-section-spinner {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #888;
+}
+
+.discovery-section-body {
   overflow: auto;
   padding: 6px;
   font-size: 13px;
-  flex: 1;
+}
+
+/* The legacy #related-list is now the related section's body — keep the
+   id so existing JS paths (`relatedListEl`) work. Padding/font/overflow
+   are inherited from `.discovery-section-body`. */
+#related-list,
+#search-list {
+  /* No-op overrides; rules carried by `.discovery-section-body`. The
+     selectors stay so future rules can target them individually. */
 }
 
 .related-item {
@@ -231,6 +681,14 @@ html, body, #app {
 
 .related-item:hover {
   background: #8882;
+}
+
+/* status: search-keyboard-nav — visible focus ring on the keyboard-active
+   row. Distinct from `:hover` so a focused-but-not-hovered row is clear. */
+.related-item:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-fill-soft);
 }
 
 .related-item-title {
@@ -260,6 +718,15 @@ html, body, #app {
   padding: 12px 10px;
 }
 
+/* status: search-fts5-bm25-snippet — highlighted FTS5 snippet hit. The
+   `<mark>` tags are parsed in `appendSnippetWithMarks` and replaced with
+   `.search-mark` spans (no raw HTML rendering). */
+.search-mark {
+  background: #ffe06688;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
 #status-index {
   font-size: 11px;
 }
@@ -276,9 +743,11 @@ html, body, #app {
 /* status: view-line-numbers-toggle
    `basicSetup` includes the line-number gutter; the View menu's "Show line
    numbers" toggle hides it via this class on the editor's root rather than
-   reconfiguring the extension stack. */
-.cm-editor.hide-line-numbers .cm-gutter.cm-lineNumbers {
-  display: none;
+   reconfiguring the extension stack. `!important` is required because CM6's
+   injected base theme sets `display: flex` on gutter elements with higher
+   specificity than a single class chain. */
+.hide-line-numbers .cm-lineNumbers {
+  display: none !important;
 }
 
 /* status: ui-no-sibling-pushout
@@ -323,6 +792,8 @@ html, body, #app {
   background: transparent;
   cursor: pointer;
   color: inherit;
+  white-space: nowrap;
+  min-width: 64px;
 }
 
 #save-btn:disabled {
@@ -368,7 +839,7 @@ html, body, #app {
   background: #e0a040;
 }
 #tree li.ix-queued > .ix-marker {
-  background: #4a90e2;
+  background: var(--accent);
   animation: ix-queued-pulse 1.2s ease-in-out infinite;
 }
 @keyframes ix-queued-pulse {
@@ -430,8 +901,8 @@ html, body, #app {
 }
 
 .modal-btn-primary {
-  background: #4a90e2;
-  border-color: #4a90e2;
+  background: var(--accent);
+  border-color: var(--accent);
   color: white;
 }
 
@@ -440,7 +911,7 @@ html, body, #app {
 }
 
 .modal-btn:focus-visible {
-  outline: 2px solid #4a90e2;
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -481,7 +952,7 @@ html, body, #app {
 }
 
 .ctx-menu-item:hover:not(:disabled) {
-  background: #4a90e2;
+  background: var(--accent);
   color: white;
 }
 
@@ -546,7 +1017,7 @@ html, body, #app {
 #toast .toast-action {
   font: inherit;
   background: transparent;
-  color: #4a90e2;
+  color: var(--accent);
   border: 0;
   padding: 0 4px;
   cursor: pointer;
@@ -564,13 +1035,20 @@ html, body, #app {
   border-top: 1px solid #8884;
   font-size: 12px;
   user-select: none;
-  flex-shrink: 0;
+  flex: 0 0 auto;
 }
 
 #trash-header {
   padding: 6px 10px;
   cursor: pointer;
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#trash-header .trash-icon {
+  flex: 0 0 auto;
 }
 
 #trash-header:hover {
@@ -582,8 +1060,6 @@ html, body, #app {
 }
 
 #trash-list {
-  max-height: 240px;
-  overflow-y: auto;
   padding: 2px 0 6px;
 }
 
@@ -598,8 +1074,8 @@ html, body, #app {
 }
 
 .trash-row.active {
-  background: #4a90e233;
-  border-left-color: #4a90e2;
+  background: var(--accent-fill-strong);
+  border-left-color: var(--accent);
 }
 
 .trash-row.orphaned .trash-row-main {
@@ -630,3 +1106,38 @@ html, body, #app {
   text-align: center;
   letter-spacing: 0.3px;
 }
+
+/* status: vault-home-recent-activity-detail
+   Snapshot preview banner. Less alarming than trash (amber, not red) —
+   this is informational, not a recovery surface. */
+#snapshot-banner {
+  padding: 6px 12px;
+  background: #8a6d2b;
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.snapshot-banner-actions {
+  display: flex;
+  gap: 8px;
+}
+#snapshot-banner button {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  color: #fff;
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+#snapshot-banner button:hover {
+  background: rgba(0, 0, 0, 0.4);
+}
+#snapshot-banner .activity-id {
+  color: rgba(255, 255, 255, 0.65);
+}
+#editor-pane:not(.snapshot-preview) #snapshot-banner { display: none; }

@@ -54,6 +54,25 @@ interface RelatedHit {
   best_heading_path: string | null;
   snippet: string;
 }
+// Mirrors `core::search::NoteHit`. Snippet may carry literal `<mark>...
+// </mark>` substrings for lexical hits; the renderer parses these into
+// styled spans rather than via `innerHTML`.
+interface SearchNoteHit {
+  note_id: string;
+  path: string;
+  title: string;
+  score: number;
+  chunk_id: string;
+  chunk_index: number;
+  heading_path: string | null;
+  snippet: string;
+}
+interface SearchResponse {
+  epoch: number;
+  lexical_hits: SearchNoteHit[];
+  semantic_hits: SearchNoteHit[];
+  fused: SearchNoteHit[];
+}
 interface IndexStatus {
   model_ready: boolean;
   queued: number;
@@ -93,6 +112,10 @@ interface Settings {
     related_open: boolean;
     trash_expanded: boolean;
     tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
+  };
+  search: {
+    modes: { semantic: boolean; lexical: boolean };
+    sections: { results_expanded: boolean; related_expanded: boolean };
   };
 }
 
@@ -136,6 +159,17 @@ const statusCursorEl = document.getElementById("status-cursor")!;
 const statusWordsEl = document.getElementById("status-words")!;
 const statusIndexEl = document.getElementById("status-index")!;
 const relatedListEl = document.getElementById("related-list")!;
+// status: search-discovery-panel
+const searchInputEl = document.getElementById("search-input") as HTMLInputElement;
+const searchClearBtn = document.getElementById("search-clear-btn") as HTMLButtonElement;
+const toggleModeSemanticBtn = document.getElementById("toggle-mode-semantic") as HTMLButtonElement;
+const toggleModeLexicalBtn = document.getElementById("toggle-mode-lexical") as HTMLButtonElement;
+const searchSectionEl = document.getElementById("search-section")!;
+const searchListEl = document.getElementById("search-list")!;
+const searchCountEl = document.getElementById("search-count")!;
+const searchSpinnerEl = document.getElementById("search-spinner")!;
+const relatedSectionEl = document.getElementById("related-section")!;
+const relatedCountEl = document.getElementById("related-count")!;
 const toggleSidebarBtn = document.getElementById("toggle-sidebar") as HTMLButtonElement;
 const toggleRelatedBtn = document.getElementById("toggle-related") as HTMLButtonElement;
 const newNoteBtn = document.getElementById("new-note-btn") as HTMLButtonElement;
@@ -146,6 +180,17 @@ const trashListEl = document.getElementById("trash-list")!;
 const trashChevronEl = document.getElementById("trash-chevron")!;
 const trashLabelEl = document.getElementById("trash-label")!;
 const trashBannerEl = document.getElementById("trash-banner")!;
+const snapshotBannerEl = document.getElementById("snapshot-banner")!;
+const snapshotBannerTextEl = document.getElementById("snapshot-banner-text")!;
+const snapshotBannerRestoreBtn = document.getElementById(
+  "snapshot-banner-restore",
+) as HTMLButtonElement;
+const snapshotBannerCloseBtn = document.getElementById(
+  "snapshot-banner-close",
+) as HTMLButtonElement;
+const homeBtn = document.getElementById("home-btn") as HTMLButtonElement;
+const editorPaneEl = document.getElementById("editor-pane")!;
+const vaultHomeEl = document.getElementById("vault-home")!;
 
 interface Buffer {
   path: string;
@@ -157,9 +202,27 @@ interface Buffer {
   /// Display path for a trash preview (the original_path before deletion).
   /// Used by updateStatus so the basename in the status bar makes sense.
   displayPath?: string;
+  /// True when the buffer is a read-only preview of a changelog snapshot
+  /// (vault-home-recent-activity-detail). Save is disabled; banner shows
+  /// snapshot metadata + Restore + Close. The dirty-switch guard treats
+  /// snapshot previews like trash previews — there's nothing to discard.
+  snapshotPreview?: boolean;
+  /// The change_id whose content this preview is showing. Captured so the
+  /// banner's [Restore] button can write it back without a second lookup.
+  snapshotChangeId?: number;
 }
 
 let buffer: Buffer | null = null;
+
+/// True for any read-only preview buffer (trash entry or changelog
+/// snapshot). Most code paths that previously checked `buffer.preview`
+/// want this broader check — both modes share the "no save, no dirty
+/// state, switch without prompt" behavior. Trash-specific UI (the
+/// "(in trash)" status suffix) keeps the narrower `buffer.preview` check.
+function isReadOnlyBuffer(b: Buffer | null): boolean {
+  return !!(b && (b.preview || b.snapshotPreview));
+}
+
 const language = new Compartment();
 const readOnlyCompartment = new Compartment();
 // status: live-preview-default-on
@@ -284,7 +347,7 @@ function refreshChunkBoundaries(): void {
     return;
   }
   const rel = buffer?.path;
-  if (!rel || buffer?.preview) {
+  if (!rel || isReadOnlyBuffer(buffer)) {
     view.dispatch({ effects: setChunkBoundaries.of(clearChunkBoundariesState()) });
     return;
   }
@@ -357,7 +420,7 @@ export function setLivePreviewEnabled(on: boolean): void {
 }
 
 function isDirty(): boolean {
-  if (!buffer || buffer.preview) return false;
+  if (!buffer || isReadOnlyBuffer(buffer)) return false;
   return view.state.doc.toString() !== buffer.loadedText;
 }
 
@@ -366,21 +429,27 @@ function updateStatus(): void {
   const path = buffer?.preview
     ? (buffer.displayPath ?? buffer.path)
     : (buffer?.path ?? "");
-  const titleSuffix = buffer?.preview ? " (in trash)" : "";
+  const titleSuffix = buffer?.preview
+    ? " (in trash)"
+    : buffer?.snapshotPreview
+      ? " (snapshot)"
+      : "";
   document.title =
     (dirty ? "• " : "") + (path ? `Hiker — ${path}${titleSuffix}` : "Hiker");
   // status: status-bar-path-basename-tooltip
   let basename = path ? (path.split("/").pop() ?? path) : "";
   if (buffer?.preview) basename += " (in trash)";
+  else if (buffer?.snapshotPreview) basename += " (snapshot)";
   statusPathEl.textContent = basename;
   statusPathEl.title = buffer?.preview ? buffer.path : path;
   // status: status-bar-path-reveal — clickable when a real (non-trash) file
   // is open. Trash-preview paths live under `.hiker/trash/` and revealing
   // them would expose internal state, so the gesture is suppressed there.
+  // Snapshot previews share the live file's path so reveal stays sensible.
   const revealable = !!buffer && !buffer.preview;
   statusPathEl.classList.toggle("clickable", revealable);
   statusPathEl.style.cursor = revealable ? "pointer" : "";
-  saveBtn.disabled = !buffer || !dirty || buffer.preview === true;
+  saveBtn.disabled = !buffer || !dirty || isReadOnlyBuffer(buffer);
   saveBtn.classList.toggle("dirty", dirty);
 
   const sel = view.state.selection.main;
@@ -413,6 +482,23 @@ register({
   label: "Save current buffer",
   run: () => {
     void save();
+    return true;
+  },
+});
+// status: search-keybind-ctrl-space
+// Inside the editor, this binding wins over CM6's default `Ctrl-Space →
+// startCompletion`. Outside the editor (tree, status bar, anywhere with
+// focus), the document-level keydown handler installed in
+// `installSearchFocusKeybind()` covers the global case. The keybind
+// registry doesn't currently support a `scope` field — see editor.md
+// "Bindings only fire when the editor has DOM focus" — so the global
+// half lives outside the registry until that scope refactor lands.
+register({
+  id: "search.focusInput",
+  keys: "Ctrl-Space",
+  label: "Focus search input",
+  run: () => {
+    focusSearchInput();
     return true;
   },
 });
@@ -525,11 +611,21 @@ async function openFile(rel: string): Promise<void> {
     // dirty immediately on open.
     buffer = { path: rel, loadedText: view.state.doc.toString(), loadedHash: file.hash };
     setReadOnly(false);
+    // status: vault-home-button — opening a note exits home view per spec
+    // ("clicking any tree row, recents entry, or search result restores the
+    // editor onto whichever note").
+    if (isVaultHomeVisible()) setVaultHomeVisible(false);
     document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
     document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
     await revealInTree(rel);
     updateStatus();
     refreshChunkBoundaries();
+    // status: note-access-tracking — fire-and-forget; the indexer task
+    // stamps `notes.last_accessed_at` if the note is in the index. Errors
+    // here aren't user-visible — recents will simply not include this open.
+    invoke("note_accessed", { rel }).catch((err) => {
+      console.error("note_accessed failed:", err);
+    });
   } catch (err) {
     console.error("openFile failed:", rel, err);
     alert(`open failed: ${err}`);
@@ -678,15 +774,16 @@ async function renderDir(rel: string, container: HTMLElement): Promise<void> {
   await Promise.all(pendingChildren);
 }
 
-// File extensions the indexer chunks. Keep in sync with
-// `is_indexable_path` in core/src/indexer.rs — Unsupported derivation is
-// duplicated client-side per index.md so we don't pay a Tauri round trip
-// on every visible row.
-const INDEXABLE_EXTS = new Set(["md", "markdown", "txt"]);
+// File extensions the indexer chunks. Fetched once at vault open from the
+// `indexable_extensions` Tauri command (single source of truth =
+// `core::indexer::INDEXABLE_EXTENSIONS`) and cached here for the
+// client-side `tree-row-unsupported-marker` derivation so we don't pay a
+// Tauri round trip on every visible row.
+let indexableExts = new Set<string>(["md", "markdown", "txt"]);
 function isIndexableExt(rel: string): boolean {
   const dot = rel.lastIndexOf(".");
   if (dot <= rel.lastIndexOf("/")) return false;
-  return INDEXABLE_EXTS.has(rel.slice(dot + 1).toLowerCase());
+  return indexableExts.has(rel.slice(dot + 1).toLowerCase());
 }
 
 // Per-path index-state cache so re-renders don't re-fetch on every paint.
@@ -780,7 +877,7 @@ function renderTreeRowLabel(
       document
         .querySelectorAll(`#tree li[data-path="${cssEscape(path)}"]`)
         .forEach((el) => applyIndexMarker(el as HTMLElement, state));
-      if (buffer && !buffer.preview && buffer.path === path) {
+      if (buffer && !isReadOnlyBuffer(buffer) && buffer.path === path) {
         renderIndexStatus();
       }
     })
@@ -999,6 +1096,16 @@ async function applyOpenedVault(path: string): Promise<void> {
   vaultIsOpen = true;
   outstandingCount = 0;
 
+  // Refresh the indexable-extension allowlist so the tree's Unsupported
+  // marker derivation matches the backend without per-row round trips.
+  // Failures aren't fatal — the seeded fallback is the v1 set.
+  try {
+    const exts = await invoke<string[]>("indexable_extensions");
+    indexableExts = new Set(exts.map((e) => e.toLowerCase()));
+  } catch (err) {
+    console.error("indexable_extensions failed:", err);
+  }
+
   // status: settings-load-once-at-startup
   // Seed View menu / tree / panel state from the merged settings. Failures
   // here aren't fatal — fall back to whatever the in-memory defaults are.
@@ -1015,6 +1122,11 @@ async function applyOpenedVault(path: string): Promise<void> {
     appEl.classList.toggle("related-collapsed", !s.vault.related_open);
     trashBinEl.classList.toggle("collapsed", !s.vault.trash_expanded);
     trashChevronEl.textContent = s.vault.trash_expanded ? "▾" : "▸";
+    // status: search-mode-state-persisted, search-section-collapsible
+    setSearchModeSemantic(s.search.modes.semantic, false);
+    setSearchModeLexical(s.search.modes.lexical, false);
+    setSearchSectionExpanded(s.search.sections.results_expanded, false);
+    setRelatedSectionExpanded(s.search.sections.related_expanded, false);
     syncToggleButtons();
   } catch (err) {
     console.error("get_settings failed:", err);
@@ -1026,9 +1138,15 @@ async function applyOpenedVault(path: string): Promise<void> {
   // Clear the related-notes panel so hits from the prior vault don't linger
   // until the next file open / save populates it for the new vault.
   void refreshRelated(null);
+  // Likewise, blank the search input/results so prior-vault matches don't
+  // surface in the new vault. status: search-discovery-panel
+  clearSearchPanel();
   startBackgroundIntervals();
   await refreshTree();
   await refreshTrashBin();
+  // status: vault-home-screen — default landing surface on vault open
+  // (no auto-resume of last buffer in v1).
+  setVaultHomeVisible(true);
 }
 
 pickBtn.addEventListener("click", () => void openVault());
@@ -1092,7 +1210,7 @@ treeActionsBtn.addEventListener("click", (e) => {
   e.stopPropagation();
   const rect = treeActionsBtn.getBoundingClientRect();
   const activePath =
-    buffer && !buffer.preview ? buffer.path : null;
+    buffer && !isReadOnlyBuffer(buffer) ? buffer.path : null;
   openContextMenu(rect.right, rect.bottom, [
     {
       // status: tree-refresh-manual
@@ -1564,33 +1682,774 @@ function confirm3(
 }
 
 const win = getCurrentWindow();
+// status: window-close-guard-dirty
+// Always preventDefault and drive the close ourselves via `win.destroy()`.
+// Returning without preventDefault to "let Tauri close" was unreliable in
+// practice (the X button became a no-op), and `win.close()` would re-enter
+// this handler — `destroy()` skips the close-requested round-trip and
+// terminates the window directly.
 void win.onCloseRequested(async (event) => {
-  if (!buffer || !isDirty()) return;
   event.preventDefault();
-  const choice = await confirm3(
-    `${buffer.path} has unsaved changes.`,
-    "Save & close",
-    "Discard & close",
-    "Cancel",
-  );
-  if (choice === "cancel") return;
-  if (choice === "a") {
-    const ok = await save();
-    if (!ok) return;
+  if (buffer && isDirty()) {
+    const choice = await confirm3(
+      `${buffer.path} has unsaved changes.`,
+      "Save & close",
+      "Discard & close",
+      "Cancel",
+    );
+    if (choice === "cancel") return;
+    if (choice === "a") {
+      const ok = await save();
+      if (!ok) return;
+    }
   }
   buffer = null;
-  await win.close();
+  await win.destroy();
 });
 
 updateStatus();
 
 // status: status-bar-path-reveal
 statusPathEl.addEventListener("click", async () => {
-  if (!buffer || buffer.preview) return;
+  if (!buffer || isReadOnlyBuffer(buffer)) return;
   try {
     await invoke("reveal_in_file_manager", { rel: buffer.path });
   } catch (err) {
     console.error("reveal_in_file_manager failed:", err);
+  }
+});
+
+// ---------- vault home view ----------
+
+// status: vault-home-button
+// Icon-only home button in the vault bar that toggles the editor pane to a
+// vault-home view. View toggle, not buffer close — the active buffer stays
+// in memory; opening any note (tree click, search hit, etc.) restores the
+// editor onto whichever note via `setVaultHomeVisible(false)` below.
+//
+// Reserved keybind id: `vault.go-home` (chord TBD per editor.md). Not
+// registered in `keybind-registry` until the chord is decided, matching the
+// "reserved IDs not registered as no-ops in v0" convention in editor.md.
+function isVaultHomeVisible(): boolean {
+  return editorPaneEl.classList.contains("home-view");
+}
+function setVaultHomeVisible(on: boolean): void {
+  editorPaneEl.classList.toggle("home-view", on);
+  vaultHomeEl.hidden = !on;
+  homeBtn.classList.toggle("active", on);
+  if (on) void refreshVaultHome();
+}
+homeBtn.addEventListener("click", () => {
+  setVaultHomeVisible(!isVaultHomeVisible());
+});
+
+// status: vault-home-screen
+// Three stacked widgets: stats / recently modified / recently accessed.
+// Refreshes are coalesced via tiny debounce timers so a flurry of
+// hiker:reindex-progress events doesn't fire one Tauri call per event.
+const vaultHomeTitleEl = document.getElementById("vault-home-title")!;
+const vaultHomeStatsBodyEl = document.getElementById("vault-home-stats-body")!;
+const vaultHomeModifiedListEl = document.getElementById("vault-home-modified-list")!;
+const vaultHomeAccessedListEl = document.getElementById("vault-home-accessed-list")!;
+const vaultHomeNewNoteBtn = document.getElementById("vault-home-new-note") as HTMLButtonElement;
+
+interface VaultHomeStats {
+  total_notes: number;
+  total_chunks: number;
+  indexed: number;
+  skipped: number;
+  queued: number;
+}
+interface RecentNote {
+  path: string;
+  title: string;
+  mtime: number;
+  last_accessed_at: number | null;
+}
+
+async function refreshVaultHome(): Promise<void> {
+  if (!vaultIsOpen) return;
+  vaultHomeTitleEl.textContent = vaultPathEl.textContent || "Vault";
+  // status: vault-home-detail-views — the Home button always returns to
+  // the overview; clicking the home button while in a detail view exits
+  // detail mode rather than re-rendering it.
+  showHomeOverview();
+  await Promise.all([
+    refreshVaultHomeStats(),
+    refreshVaultHomeRecentModified(),
+    refreshVaultHomeRecentAccessed(),
+    refreshActivityWidget(),
+  ]);
+}
+
+async function refreshVaultHomeStats(): Promise<void> {
+  try {
+    const stats = await invoke<VaultHomeStats>("vault_home_stats");
+    renderVaultHomeStats(stats);
+  } catch (err) {
+    console.error("vault_home_stats failed:", err);
+    vaultHomeStatsBodyEl.replaceChildren(
+      buildStatEmpty(`Failed to load stats: ${formatError(err)}`),
+    );
+  }
+}
+
+function renderVaultHomeStats(stats: VaultHomeStats): void {
+  const cells: Array<[string, number]> = [
+    ["Notes", stats.total_notes],
+    ["Indexed", stats.indexed],
+    ["Chunks", stats.total_chunks],
+    ["Queued", stats.queued],
+    ["Skipped", stats.skipped],
+  ];
+  vaultHomeStatsBodyEl.replaceChildren(
+    ...cells.map(([label, num]) => {
+      const cell = document.createElement("div");
+      cell.className = "vault-home-stat";
+      const numEl = document.createElement("div");
+      numEl.className = "num";
+      numEl.textContent = String(num);
+      const lbl = document.createElement("div");
+      lbl.className = "label";
+      lbl.textContent = label;
+      cell.append(numEl, lbl);
+      return cell;
+    }),
+  );
+}
+
+function buildStatEmpty(text: string): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "vault-home-stat-empty";
+  el.textContent = text;
+  return el;
+}
+
+async function refreshVaultHomeRecentModified(): Promise<void> {
+  try {
+    const rows = await invoke<RecentNote[]>("recent_notes_modified", { limit: 10 });
+    renderRecentList(vaultHomeModifiedListEl, rows, "mtime", "No notes indexed yet.");
+  } catch (err) {
+    console.error("recent_notes_modified failed:", err);
+    renderRecentList(vaultHomeModifiedListEl, [], "mtime", `Error: ${formatError(err)}`);
+  }
+}
+
+async function refreshVaultHomeRecentAccessed(): Promise<void> {
+  try {
+    const rows = await invoke<RecentNote[]>("recent_notes_accessed", { limit: 10 });
+    renderRecentList(
+      vaultHomeAccessedListEl,
+      rows,
+      "accessed",
+      "No recently opened notes.",
+    );
+  } catch (err) {
+    console.error("recent_notes_accessed failed:", err);
+    renderRecentList(vaultHomeAccessedListEl, [], "accessed", `Error: ${formatError(err)}`);
+  }
+}
+
+function renderRecentList(
+  ul: HTMLElement,
+  rows: RecentNote[],
+  field: "mtime" | "accessed",
+  emptyText: string,
+): void {
+  if (rows.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = emptyText;
+    ul.replaceChildren(li);
+    return;
+  }
+  ul.replaceChildren(
+    ...rows.map((r) => {
+      const li = document.createElement("li");
+      li.dataset.path = r.path;
+      const ts = field === "mtime" ? r.mtime : (r.last_accessed_at ?? r.mtime);
+      const when = relativeTime(ts);
+      const nameEl = document.createElement("span");
+      nameEl.className = "name";
+      nameEl.textContent = r.title;
+      const relEl = document.createElement("span");
+      relEl.className = "rel";
+      const parent = r.path.includes("/") ? r.path.slice(0, r.path.lastIndexOf("/")) : "";
+      relEl.textContent = parent;
+      const whenEl = document.createElement("span");
+      whenEl.className = "when";
+      whenEl.textContent = when;
+      whenEl.title = new Date(ts * 1000).toLocaleString();
+      li.append(nameEl, relEl, whenEl);
+      li.addEventListener("click", () => void openFile(r.path));
+      ul.appendChild(li);
+      return li;
+    }),
+  );
+}
+
+let vaultHomeStatsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleVaultHomeStatsRefresh(delay = 250): void {
+  if (!isVaultHomeVisible()) return;
+  if (vaultHomeStatsRefreshTimer !== null) clearTimeout(vaultHomeStatsRefreshTimer);
+  vaultHomeStatsRefreshTimer = setTimeout(() => {
+    vaultHomeStatsRefreshTimer = null;
+    void refreshVaultHomeStats();
+  }, delay);
+}
+
+let vaultHomeModifiedRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleVaultHomeModifiedRefresh(delay = 400): void {
+  if (!isVaultHomeVisible()) return;
+  if (vaultHomeModifiedRefreshTimer !== null) clearTimeout(vaultHomeModifiedRefreshTimer);
+  vaultHomeModifiedRefreshTimer = setTimeout(() => {
+    vaultHomeModifiedRefreshTimer = null;
+    void refreshVaultHomeRecentModified();
+  }, delay);
+}
+
+// status: vault-home-recent-activity-widget
+// status: vault-home-recent-activity-detail
+// status: vault-home-recent-activity-author-filter
+// status: vault-home-recent-activity-unrollback
+//
+// Append-only changelog UI: a fourth home-page widget that shows the most
+// recent vault writes (user saves; eventually agent writes via MCP). The
+// widget is hidden when the changelog is empty so a fresh post-upgrade
+// vault doesn't render a confusing zero-count tile. Click the header or
+// any preview row → detail view (overview-body swap; Home button returns).
+//
+// Rollback flow per docs/changes.md "Rollback":
+//   1. resolve prior_content via Tauri `previous_content_for_path`
+//   2. write it back via `rollback_change`, which appends a new modified
+//      row stamped with metadata.rolled_back_from = <id>
+//   3. UI re-fetches `recent_changes` on the next event.
+//
+// Un-rollback is the same primitive — just a rollback to a more recent
+// prior state — so the affordance is "click rollback on a newer row." We
+// add a one-click shortcut: immediately after a rollback, the detail view
+// shows a small "Recently rolled back — restore?" prompt next to the row
+// whose state was reverted away from. Clicking it rolls back to that row.
+type ChangeOp = "created" | "modified" | "deleted" | "renamed";
+interface ChangeRow {
+  id: number;
+  timestamp_ms: number;
+  path: string;
+  op: ChangeOp;
+  author: string;
+  content_hash: string | null;
+  rename_from: string | null;
+  metadata: Record<string, unknown>;
+}
+interface RollbackOutcome {
+  prior_change_id: number;
+  path: string;
+  new_hash: string;
+}
+
+const vaultHomeOverviewEl = document.getElementById("vault-home-overview")!;
+const vaultHomeDetailEl = document.getElementById("vault-home-detail")!;
+const vaultHomeDetailTitleEl = document.getElementById("vault-home-detail-title")!;
+const vaultHomeDetailCountEl = document.getElementById("vault-home-detail-count")!;
+const vaultHomeDetailListEl = document.getElementById("vault-home-detail-list")!;
+const vaultHomeDetailFiltersEl = document.getElementById("vault-home-detail-filters")!;
+const vaultHomeActivitySectionEl = document.getElementById("vault-home-activity")!;
+const vaultHomeActivityHeaderEl = document.getElementById("vault-home-activity-header")!;
+const vaultHomeActivityListEl = document.getElementById("vault-home-activity-list")!;
+
+type DetailView = null | { kind: "recent-activity" };
+let activeDetailView: DetailView = null;
+
+// Persisted per session, not per-vault — spec says detail-view filter
+// state persists per-vault but a session lifetime is fine for v1; the
+// settings key isn't yet plumbed and the widget itself is fresh.
+const activeAuthorFilters: Set<string> = new Set();
+let allFiltersOnce = false;
+
+// After a Restore, the row that was the *current* state for the path
+// immediately before the action gets a soft highlight + "← previous
+// state" caption so the user can one-click their way back. The behavior
+// is the same Restore button as anywhere else — no separate primitive.
+// Cleared on next refresh so it doesn't haunt subsequent visits.
+let recentlyRestoredFromId: number | null = null;
+
+function showHomeOverview(): void {
+  activeDetailView = null;
+  vaultHomeOverviewEl.hidden = false;
+  vaultHomeDetailEl.hidden = true;
+}
+
+function showHomeDetail(kind: "recent-activity"): void {
+  activeDetailView = { kind };
+  vaultHomeOverviewEl.hidden = true;
+  vaultHomeDetailEl.hidden = false;
+  if (kind === "recent-activity") {
+    vaultHomeDetailTitleEl.textContent = "Recent activity";
+    void refreshActivityDetail();
+  }
+}
+
+function opLabel(op: ChangeOp): string {
+  return op;
+}
+
+function authorClass(author: string): string {
+  // "user" → "user"; "agent:claude-code" → "agent"; etc. The class prefix
+  // is the load-bearing distinguishing feature per changes.md.
+  const colon = author.indexOf(":");
+  return colon === -1 ? author : author.slice(0, colon);
+}
+
+function authorPillIcon(cls: string): string {
+  // status: recent-activity-human-icon, recent-activity-agent-icon
+  if (cls === "user") {
+    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="2.4"/><path d="M3.5 13.5c0-2.4 2-4 4.5-4s4.5 1.6 4.5 4"/></svg>`;
+  }
+  if (cls === "agent") {
+    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="8" cy="3" r="0.6" fill="currentColor"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/><line x1="6" y1="11.5" x2="10" y2="11.5"/></svg>`;
+  }
+  // Future: sync, import. Placeholder dot.
+  return `<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/></svg>`;
+}
+
+async function refreshActivityWidget(): Promise<void> {
+  if (!vaultIsOpen) return;
+  if (!isVaultHomeVisible()) return;
+  let count = 0;
+  try {
+    count = await invoke<number>("changes_count");
+  } catch (err) {
+    console.error("changes_count failed:", err);
+  }
+  if (count <= 0) {
+    vaultHomeActivitySectionEl.hidden = true;
+    return;
+  }
+  vaultHomeActivitySectionEl.hidden = false;
+  vaultHomeActivityHeaderEl.textContent = `Recent activity (${count})`;
+  // Tile: top 5 rows. Click anywhere → detail view.
+  let rows: ChangeRow[] = [];
+  try {
+    rows = await invoke<ChangeRow[]>("recent_changes", { limit: 5 });
+  } catch (err) {
+    console.error("recent_changes failed:", err);
+  }
+  vaultHomeActivityListEl.replaceChildren(
+    ...rows.map((r) => buildActivityPreviewRow(r)),
+  );
+  vaultHomeActivityHeaderEl.style.cursor = "pointer";
+  vaultHomeActivityHeaderEl.onclick = () => showHomeDetail("recent-activity");
+}
+
+function buildActivityPreviewRow(r: ChangeRow): HTMLElement {
+  const li = document.createElement("li");
+  const op = document.createElement("span");
+  op.className = "activity-op";
+  op.textContent = opLabel(r.op);
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = r.path.split("/").pop() ?? r.path;
+  const rel = document.createElement("span");
+  rel.className = "rel";
+  rel.textContent = r.path.includes("/")
+    ? r.path.slice(0, r.path.lastIndexOf("/"))
+    : "";
+  // Right-pinned cluster mirrors the detail row: [when] [author-icon]
+  // [#id]. The `.rel` element fills the space between, pushing the
+  // cluster to the right edge.
+  const right = document.createElement("span");
+  right.className = "row-right";
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
+  when.title = new Date(r.timestamp_ms).toLocaleString();
+  const cls = authorClass(r.author);
+  const author = document.createElement("span");
+  author.className = "activity-author";
+  author.innerHTML = authorPillIcon(cls);
+  author.title = r.author;
+  const idEl = document.createElement("span");
+  idEl.className = "activity-id";
+  idEl.textContent = `#${r.id}`;
+  idEl.title = `Snapshot id ${r.id}`;
+  right.append(when, author, idEl);
+
+  // Order: [op] [name] [badge?] [rel-grows] [right-cluster]. Badge sits
+  // before .rel so it rides with the name on the left, matching the
+  // detail-view layout; .rel's flex:1 then absorbs the slack and pushes
+  // the right cluster to the row edge.
+  li.append(op, name);
+  const meta = r.metadata as Record<string, unknown>;
+  const src = (meta?.["restored_from"] ?? meta?.["rolled_back_from"]) as
+    | number
+    | undefined;
+  if (src !== undefined) {
+    const badge = document.createElement("span");
+    badge.className = "rollback-badge";
+    badge.textContent = `↩ #${src}`;
+    badge.title = `This save was a Restore of snapshot #${src}`;
+    li.appendChild(badge);
+  }
+  li.append(rel, right);
+  li.addEventListener("click", () => showHomeDetail("recent-activity"));
+  return li;
+}
+
+let activityRows: ChangeRow[] = [];
+async function refreshActivityDetail(): Promise<void> {
+  try {
+    activityRows = await invoke<ChangeRow[]>("recent_changes", { limit: 200 });
+  } catch (err) {
+    console.error("recent_changes failed:", err);
+    activityRows = [];
+  }
+  renderActivityDetail();
+}
+
+function renderActivityDetail(): void {
+  // Build the set of present author classes from the loaded rows.
+  const presentClasses = new Set<string>();
+  for (const r of activityRows) presentClasses.add(authorClass(r.author));
+
+  // Canonical classes that always get a pill, even when no rows of that
+  // class exist in the visible window. Predictable affordances beat
+  // surprise pills appearing as agents start writing — users can reason
+  // about "where would the agent filter be" before it ever has rows.
+  // Other classes (sync, import) appear dynamically once they have rows.
+  const ALWAYS_SHOW: readonly string[] = ["user", "agent"];
+  const allClasses = new Set<string>([...ALWAYS_SHOW, ...presentClasses]);
+
+  // First render: seed the active-filters set with every visible class so
+  // the default is "all on." Subsequent renders preserve user toggle
+  // state — including the all-off state.
+  if (!allFiltersOnce) {
+    activeAuthorFilters.clear();
+    for (const c of allClasses) activeAuthorFilters.add(c);
+    allFiltersOnce = true;
+  }
+
+  // status: vault-home-recent-activity-author-filter
+  vaultHomeDetailFiltersEl.replaceChildren();
+  const sortedClasses = [...allClasses].sort();
+  for (const cls of sortedClasses) {
+    const pill = document.createElement("button");
+    pill.className = "filter-pill toolbar-btn";
+    pill.type = "button";
+    if (activeAuthorFilters.has(cls)) pill.classList.add("active");
+    const hasRows = presentClasses.has(cls);
+    if (!hasRows) pill.classList.add("empty");
+    pill.innerHTML = authorPillIcon(cls);
+    const lbl = document.createElement("span");
+    lbl.textContent = cls.toUpperCase();
+    pill.appendChild(lbl);
+    pill.title = hasRows
+      ? `Show ${cls} activity`
+      : `No ${cls} activity in the recent window yet`;
+    pill.addEventListener("click", () => {
+      if (activeAuthorFilters.has(cls)) {
+        activeAuthorFilters.delete(cls);
+      } else {
+        activeAuthorFilters.add(cls);
+      }
+      renderActivityDetail();
+    });
+    vaultHomeDetailFiltersEl.appendChild(pill);
+  }
+
+  const visible = activityRows.filter((r) =>
+    activeAuthorFilters.has(authorClass(r.author)),
+  );
+  vaultHomeDetailCountEl.textContent = `${visible.length} of ${activityRows.length}`;
+
+  // Pre-compute per-path latest so each row build doesn't rescan.
+  latestPerPath = buildLatestPerPath(activityRows);
+
+  vaultHomeDetailListEl.replaceChildren(
+    ...visible.map((r) => buildActivityDetailRow(r)),
+  );
+}
+
+// Compute "is this row the current state on disk for its path?" The most
+// recent (highest id) row per path is the current state. Pre-computed once
+// per render so per-row builders don't each scan `activityRows`.
+function buildLatestPerPath(rows: ChangeRow[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    const cur = out.get(r.path);
+    if (cur === undefined || r.id > cur) out.set(r.path, r.id);
+  }
+  return out;
+}
+
+let latestPerPath: Map<string, number> = new Map();
+
+function buildActivityDetailRow(r: ChangeRow): HTMLElement {
+  const li = document.createElement("li");
+  const isRestoreRow =
+    r.metadata && typeof r.metadata === "object" &&
+    ("restored_from" in r.metadata || "rolled_back_from" in r.metadata);
+  const isCurrent = latestPerPath.get(r.path) === r.id;
+  // status: vault-home-recent-activity-unrollback
+  // After a Restore, the row that *was* the current state immediately
+  // before the action gets a soft highlight + caption so the user can
+  // one-click their way back. The behavior is the same Restore button as
+  // anywhere else — no separate primitive — so this is purely a hint.
+  if (recentlyRestoredFromId === r.id) {
+    li.classList.add("recently-rolled-back");
+  }
+
+  // Click anywhere on the row → open the snapshot read-only in the editor.
+  // The deleted-row case has no content blob, so click is a no-op there
+  // (we still show the row so the history reads honestly).
+  const canPreview = r.op !== "deleted";
+  if (canPreview) {
+    li.classList.add("clickable");
+    li.style.cursor = "pointer";
+    li.addEventListener("click", (e) => {
+      // Don't hijack clicks on the action buttons.
+      if ((e.target as HTMLElement).closest("button")) return;
+      void openSnapshotPreview(r);
+    });
+  }
+
+  const line = document.createElement("div");
+  line.className = "row-line";
+
+  const op = document.createElement("span");
+  op.className = "activity-op";
+  op.textContent = opLabel(r.op);
+
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = r.path;
+  if (r.rename_from) name.title = `renamed from ${r.rename_from}`;
+
+  // Right-pinned cluster: [when] [author-icon] [#id]. Wrapped in a single
+  // span with margin-left:auto so the layout stays stable regardless of
+  // how long the path is.
+  const right = document.createElement("span");
+  right.className = "row-right";
+
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
+  when.title = new Date(r.timestamp_ms).toLocaleString();
+
+  const cls = authorClass(r.author);
+  const author = document.createElement("span");
+  author.className = "activity-author";
+  author.innerHTML = authorPillIcon(cls);
+  author.title = r.author; // full author string on hover (e.g. agent:claude-code)
+
+  const idEl = document.createElement("span");
+  idEl.className = "activity-id";
+  idEl.textContent = `#${r.id}`;
+  idEl.title = `Snapshot id ${r.id}`;
+
+  // Badges sit between the name and the right-pinned cluster so they
+  // ride with the name's left-aligned content rather than displacing the
+  // right meta.
+  line.append(op, name);
+  if (isRestoreRow) {
+    const meta = r.metadata as Record<string, unknown>;
+    const src = (meta["restored_from"] ?? meta["rolled_back_from"]) as
+      | number
+      | undefined;
+    const badge = document.createElement("span");
+    badge.className = "rollback-badge";
+    badge.textContent =
+      src !== undefined ? `↩ restored from #${src}` : "↩ restored";
+    badge.title =
+      src !== undefined
+        ? `This save wrote the content of snapshot #${src} back to disk`
+        : "This save was a Restore";
+    line.appendChild(badge);
+  }
+  if (isCurrent) {
+    const cur = document.createElement("span");
+    cur.className = "rollback-badge";
+    cur.textContent = "current";
+    cur.title = "This is the file's current state on disk";
+    line.appendChild(cur);
+  }
+  right.append(when, author, idEl);
+  line.append(right);
+  li.appendChild(line);
+
+  // Actions row. One primary button: Restore — writes THIS row's content
+  // back to disk. Restoring the current state is a no-op (writes the same
+  // bytes back and logs a new row), so we hide the button there.
+  if (canPreview && !isCurrent) {
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.className = "row-action";
+    restoreBtn.textContent = "Restore this version";
+    restoreBtn.title =
+      "Write this snapshot's contents back to the file. Append-only — the restore is itself logged as a new modified event.";
+    restoreBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void doRestoreSnapshot(r);
+    });
+    actions.appendChild(restoreBtn);
+
+    if (recentlyRestoredFromId === r.id) {
+      const prompt = document.createElement("span");
+      prompt.className = "un-rollback-prompt";
+      prompt.textContent = "← previous state — click Restore to undo";
+      actions.appendChild(prompt);
+    }
+
+    li.appendChild(actions);
+  }
+  return li;
+}
+
+async function doRestoreSnapshot(row: ChangeRow): Promise<void> {
+  if (
+    !confirm(
+      `Restore ${row.path} to the version saved at ${new Date(
+        row.timestamp_ms,
+      ).toLocaleString()}?\n\nThe current state stays in the log; this Restore is itself a new logged event.`,
+    )
+  ) {
+    return;
+  }
+  // Capture the row that *was* the current state for this path, before the
+  // restore writes a new one. After refresh, that row gets the "previous
+  // state" highlight so the user can one-click back.
+  const wasCurrentId = latestPerPath.get(row.path) ?? null;
+  try {
+    await invoke<RollbackOutcome>("restore_snapshot", { changeId: row.id });
+    recentlyRestoredFromId = wasCurrentId;
+    await refreshActivityDetail();
+  } catch (err) {
+    alert(`restore failed: ${formatError(err)}`);
+  }
+}
+
+// Open `row` as a read-only preview in the editor. Reuses the trash-preview
+// machinery — same readOnlyCompartment, dirty-switch guard, banner pattern,
+// just different banner element + content. Restore from the banner writes
+// the snapshot back via the same path as per-row Restore.
+async function openSnapshotPreview(row: ChangeRow): Promise<void> {
+  if (buffer && isDirty()) {
+    const choice = await confirm3(
+      `${buffer.path} has unsaved changes.`,
+      "Save & switch",
+      "Discard & switch",
+      "Cancel",
+    );
+    if (choice === "cancel") return;
+    if (choice === "a") {
+      const ok = await save();
+      if (!ok) return;
+    }
+  }
+  let contents: string | null = null;
+  try {
+    contents = await invoke<string | null>("change_content", {
+      changeId: row.id,
+    });
+  } catch (err) {
+    alert(`snapshot preview failed: ${formatError(err)}`);
+    return;
+  }
+  if (contents === null) {
+    alert(
+      "This change has no recorded content (delete events carry no body — preview the prior version to see what was deleted).",
+    );
+    return;
+  }
+  buffer = null;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: contents },
+    effects: [
+      language.reconfigure(languageExtensionForPath(row.path)),
+      livePreviewCompartment.reconfigure(livePreviewExtensionForPath(row.path)),
+    ],
+  });
+  setReadOnly(true, "snapshot");
+  if (isVaultHomeVisible()) setVaultHomeVisible(false);
+  buffer = {
+    path: row.path,
+    loadedText: view.state.doc.toString(),
+    loadedHash: row.content_hash ?? "",
+    snapshotPreview: true,
+    snapshotChangeId: row.id,
+  };
+  // Banner copy: when, who, what, id.
+  const when = new Date(row.timestamp_ms).toLocaleString();
+  snapshotBannerTextEl.replaceChildren();
+  const main = document.createElement("span");
+  main.textContent = `Snapshot of ${row.path} · ${when} · ${row.author} · ${row.op}`;
+  const idSpan = document.createElement("span");
+  idSpan.className = "activity-id";
+  idSpan.style.marginLeft = "8px";
+  idSpan.textContent = `#${row.id}`;
+  idSpan.title = `Snapshot id ${row.id}`;
+  snapshotBannerTextEl.append(main, idSpan);
+  updateStatus();
+  refreshChunkBoundaries();
+}
+
+function exitSnapshotPreview(): void {
+  if (!buffer?.snapshotPreview) return;
+  buffer = null;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: "" },
+  });
+  setReadOnly(false, null);
+  // Return to the activity detail view if it's where the user came from;
+  // otherwise fall back to the home overview.
+  setVaultHomeVisible(true);
+  if (activeDetailView?.kind !== "recent-activity") {
+    showHomeDetail("recent-activity");
+  }
+  updateStatus();
+}
+
+snapshotBannerCloseBtn.addEventListener("click", () => exitSnapshotPreview());
+snapshotBannerRestoreBtn.addEventListener("click", async () => {
+  if (!buffer?.snapshotPreview || buffer.snapshotChangeId === undefined) return;
+  const row = activityRows.find((r) => r.id === buffer?.snapshotChangeId);
+  if (!row) {
+    alert("Snapshot row no longer in view — refresh and try again.");
+    return;
+  }
+  await doRestoreSnapshot(row);
+  // After a successful restore, return to the detail view so the user
+  // sees the new "current" row + the highlighted "previous state" hint.
+  exitSnapshotPreview();
+});
+
+// Live refresh on every changelog append. Light debounce so a save burst
+// → one repaint of the widget. Spec: "few hundred ms" debounce.
+let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleActivityRefresh(delay = 300): void {
+  if (!isVaultHomeVisible()) return;
+  if (activityRefreshTimer !== null) clearTimeout(activityRefreshTimer);
+  activityRefreshTimer = setTimeout(() => {
+    activityRefreshTimer = null;
+    void refreshActivityWidget();
+    if (activeDetailView?.kind === "recent-activity") {
+      void refreshActivityDetail();
+    }
+  }, delay);
+}
+
+void listen("hiker:changes-appended", () => {
+  scheduleActivityRefresh();
+});
+
+vaultHomeNewNoteBtn.addEventListener("click", async () => {
+  try {
+    const created = await invoke<string>("create_note", { folder: "" });
+    await openFile(created);
+  } catch (err) {
+    console.error("vault-home new note failed:", err);
+    alert(`new note failed: ${formatError(err)}`);
   }
 });
 
@@ -1716,6 +2575,495 @@ viewMenuBtn.addEventListener("click", (e) => {
   openContextMenu(rect.left, rect.bottom + 2, buildViewMenuItems());
 });
 
+// ---------- discovery panel (search + related) ----------
+//
+// status: search-discovery-panel
+// status: search-mode-toggles
+//
+// Mode toggles + section collapse state. Defaults match `core::config`'s
+// `SearchConfig::default()`; the values are overwritten from `get_settings`
+// on vault open and persisted via `settings-write-back` on every flip.
+
+let searchModeSemantic = true;
+let searchModeLexical = true;
+
+function applySearchInputDisabledState(): void {
+  // status: search-modes-both-off-disabled
+  // Both toggles off → input is disabled with the hint text. Matches the
+  // spec exactly: explicit failure beats silent fallback. The placeholder
+  // is the visible affordance once disabled.
+  const bothOff = !searchModeSemantic && !searchModeLexical;
+  searchInputEl.disabled = bothOff;
+  searchInputEl.placeholder = bothOff
+    ? "Enable Semantic or Lexical to search"
+    : "Search vault…";
+}
+
+function syncSearchModeButtons(): void {
+  toggleModeSemanticBtn.classList.toggle("active", searchModeSemantic);
+  toggleModeLexicalBtn.classList.toggle("active", searchModeLexical);
+  applySearchInputDisabledState();
+}
+
+function setSearchModeSemantic(on: boolean, persist: boolean): void {
+  searchModeSemantic = on;
+  syncSearchModeButtons();
+  if (persist) {
+    void persistSetting("vault", "search.modes.semantic", on);
+    maybeRerunSearchAfterModeChange();
+  }
+}
+
+function setSearchModeLexical(on: boolean, persist: boolean): void {
+  searchModeLexical = on;
+  syncSearchModeButtons();
+  if (persist) {
+    void persistSetting("vault", "search.modes.lexical", on);
+    maybeRerunSearchAfterModeChange();
+  }
+}
+
+toggleModeSemanticBtn.addEventListener("click", () => {
+  setSearchModeSemantic(!searchModeSemantic, true);
+});
+toggleModeLexicalBtn.addEventListener("click", () => {
+  setSearchModeLexical(!searchModeLexical, true);
+});
+
+// status: search-empty-collapses-results
+// Empty query hides the search-results section; non-empty shows it.
+function applySearchSectionVisibility(): void {
+  const hasQuery = searchInputEl.value.trim().length > 0;
+  searchSectionEl.hidden = !hasQuery;
+}
+
+// status: search-typeahead-debounce
+// 250ms debounce + monotonically-increasing epoch. Stale responses (whose
+// epoch is below the current one) are dropped on the frontend before
+// render. Mirrors the cancel-on-file-switch pattern already used by
+// `refreshRelated`. Empty query short-circuits without scheduling.
+const SEARCH_DEBOUNCE_MS = 250;
+let searchEpoch = 0;
+let searchDebounceTimer: number | null = null;
+
+function applySearchClearButtonVisibility(): void {
+  searchClearBtn.hidden = searchInputEl.value.length === 0;
+}
+
+// status: search-keybind-ctrl-space
+// Focuses the search input. Opens the discovery panel if collapsed
+// (matching the spec's "Opens the discovery panel if collapsed"). Selects
+// existing input contents so a quick re-search retypes naturally.
+function focusSearchInput(): void {
+  // If the panel was collapsed, expand it first. The expand toggles a
+  // CSS class with a `transition: visibility 0.1s` rule on `#discovery`;
+  // calling `.focus()` on the input *during* that transition is a no-op
+  // because the element is still computed-visibility:hidden. Defer the
+  // focus to the next animation frame so the new style is settled.
+  const wasCollapsed = appEl.classList.contains("related-collapsed");
+  if (wasCollapsed) {
+    appEl.classList.remove("related-collapsed");
+    void persistSetting("vault", "vault.related_open", true);
+    syncToggleButtons();
+  }
+  const doFocus = () => {
+    searchInputEl.focus();
+    searchInputEl.select();
+  };
+  if (wasCollapsed) {
+    requestAnimationFrame(doFocus);
+  } else {
+    doFocus();
+  }
+}
+
+// status: search-keyboard-nav
+//
+// ↑/↓ move within the focused result list, with vertical wraparound at
+// the boundary between sections (↓ at the bottom of Search jumps to the
+// top of Related; ↑ at the top of Related jumps to the bottom of Search).
+// Stops at panel boundaries — no wrap from Related's bottom or Search's
+// top.
+// Enter opens the focused row.
+// Tab is handled by the browser via roving tabindex: each section keeps
+// exactly one row with tabindex=0 (the first by default; the most recent
+// arrow target after that), so Tab from the input lands on the first
+// search row, then the first related row, then leaves the panel.
+// Esc in the input clears the query (which collapses the search
+// section via the existing empty-query rule) and blurs.
+// Esc in a result list returns focus to the input.
+
+function discoveryRows(list: HTMLElement): HTMLElement[] {
+  return Array.from(list.querySelectorAll<HTMLElement>(".related-item"));
+}
+
+/// Set tabindex=0 on the row at `idx` and tabindex=-1 on every other row
+/// in the same list. Idempotent. Only one row in a list is Tab-reachable
+/// at a time (roving tabindex pattern).
+function setRovingTabIndex(list: HTMLElement, idx: number): void {
+  const rows = discoveryRows(list);
+  rows.forEach((r, i) => {
+    r.tabIndex = i === idx ? 0 : -1;
+  });
+}
+
+function focusRow(list: HTMLElement, idx: number): boolean {
+  const rows = discoveryRows(list);
+  if (rows.length === 0 || idx < 0 || idx >= rows.length) return false;
+  setRovingTabIndex(list, idx);
+  rows[idx].focus();
+  return true;
+}
+
+function activeRowIndex(list: HTMLElement): number {
+  return discoveryRows(list).findIndex((r) => r === document.activeElement);
+}
+
+// Handle ↑ / ↓ / Enter / Esc on the result lists.
+function onResultListKeydown(e: KeyboardEvent): void {
+  const target = e.target as HTMLElement;
+  if (!target.classList.contains("related-item")) return;
+  const list = target.closest("#search-list, #related-list") as HTMLElement | null;
+  if (!list) return;
+  const idx = activeRowIndex(list);
+  if (idx < 0) return;
+  switch (e.key) {
+    case "ArrowDown": {
+      e.preventDefault();
+      const rows = discoveryRows(list);
+      if (idx + 1 < rows.length) {
+        focusRow(list, idx + 1);
+      } else if (list === searchListEl) {
+        // Bottom of search → top of related.
+        if (!focusRow(relatedListEl, 0)) {
+          // No related rows; stay put.
+        }
+      }
+      // Bottom of related: stop. No wrap to top of search.
+      break;
+    }
+    case "ArrowUp": {
+      e.preventDefault();
+      if (idx > 0) {
+        focusRow(list, idx - 1);
+      } else if (list === relatedListEl) {
+        // Top of related → bottom of search.
+        const searchRows = discoveryRows(searchListEl);
+        if (searchRows.length > 0) {
+          focusRow(searchListEl, searchRows.length - 1);
+        }
+      }
+      // Top of search: stop. No wrap to bottom of related.
+      break;
+    }
+    case "Enter": {
+      e.preventDefault();
+      // The row's click handler is the open path; trigger it.
+      target.click();
+      break;
+    }
+    case "Escape": {
+      e.preventDefault();
+      searchInputEl.focus();
+      break;
+    }
+  }
+}
+
+searchListEl.addEventListener("keydown", onResultListKeydown);
+relatedListEl.addEventListener("keydown", onResultListKeydown);
+
+// Esc in the input clears + blurs (clearing collapses the search section
+// via `applySearchSectionVisibility`).
+searchInputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    if (searchInputEl.value.length > 0) {
+      searchInputEl.value = "";
+      onSearchInput();
+    } else {
+      searchInputEl.blur();
+    }
+  } else if (e.key === "ArrowDown") {
+    // Down from the input should jump into the first available result
+    // section (search if visible, else related). Lets Enter-from-keyboard
+    // flows skip Tab when the user just typed and wants to pick a result.
+    const searchRows = discoveryRows(searchListEl);
+    if (searchRows.length > 0) {
+      e.preventDefault();
+      focusRow(searchListEl, 0);
+      return;
+    }
+    const relatedRows = discoveryRows(relatedListEl);
+    if (relatedRows.length > 0) {
+      e.preventDefault();
+      focusRow(relatedListEl, 0);
+    }
+  }
+});
+
+// status: search-keybind-ctrl-space (global half)
+// Document-level Ctrl-Space handler — matches the spec's "every platform"
+// rule by checking ctrlKey, *not* metaKey, so Cmd-Space on macOS stays
+// Spotlight. Capture phase + preventDefault stops the browser's default
+// (and CM6's startCompletion via the registry binding above when the
+// editor has focus) before downstream handlers see it.
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "Space") {
+      e.preventDefault();
+      focusSearchInput();
+    }
+  },
+  { capture: true },
+);
+
+searchClearBtn.addEventListener("click", () => {
+  searchInputEl.value = "";
+  onSearchInput();
+  searchInputEl.focus();
+});
+
+function onSearchInput(): void {
+  applySearchClearButtonVisibility();
+  applySearchSectionVisibility();
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+  const raw = searchInputEl.value;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    // Bump epoch so any in-flight call drops its results, then clear UI.
+    searchEpoch += 1;
+    searchSpinnerEl.hidden = true;
+    searchListEl.innerHTML = "";
+    searchCountEl.textContent = "";
+    return;
+  }
+  // Both modes off: input is disabled — nothing to do — but the listener
+  // still fires for programmatic value changes. Be defensive.
+  if (!searchModeSemantic && !searchModeLexical) {
+    return;
+  }
+  searchSpinnerEl.hidden = false;
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = null;
+    const epoch = ++searchEpoch;
+    void runSearch(trimmed, epoch);
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+searchInputEl.addEventListener("input", onSearchInput);
+
+async function runSearch(query: string, epoch: number): Promise<void> {
+  try {
+    const resp = await invoke<SearchResponse>("search_vault", {
+      query,
+      modes: { semantic: searchModeSemantic, lexical: searchModeLexical },
+      epoch,
+    });
+    // status: search-typeahead-debounce — drop stale results.
+    if (resp.epoch !== searchEpoch) return;
+    // Pick which bucket to render. Both modes on → fused; one mode on →
+    // that engine's native ranking (already in the bucket).
+    const hits = pickResultBucket(resp);
+    searchSpinnerEl.hidden = true;
+    renderSearchResults(hits);
+  } catch (err) {
+    if (epoch !== searchEpoch) return;
+    console.error("search_vault failed:", err);
+    searchSpinnerEl.hidden = true;
+    searchListEl.innerHTML = `<div class="related-empty">Error: ${String(err)}</div>`;
+    searchCountEl.textContent = "";
+  }
+}
+
+function pickResultBucket(resp: SearchResponse): SearchNoteHit[] {
+  if (searchModeSemantic && searchModeLexical) return resp.fused;
+  if (searchModeLexical) return resp.lexical_hits;
+  if (searchModeSemantic) return resp.semantic_hits;
+  return [];
+}
+
+// status: search-result-row, search-result-grouped-by-note (UI side),
+// search-section-counts
+function renderSearchResults(hits: SearchNoteHit[]): void {
+  searchListEl.innerHTML = "";
+  searchCountEl.textContent = hits.length > 0 ? `(${hits.length})` : "";
+  if (hits.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "related-empty";
+    empty.textContent = "No matches.";
+    searchListEl.appendChild(empty);
+    return;
+  }
+  for (const hit of hits) {
+    const item = document.createElement("div");
+    item.className = "related-item search-item";
+    // Roving tabindex set after the loop; default to -1 so Tab won't
+    // hit every row.
+    item.tabIndex = -1;
+    item.setAttribute("role", "option");
+    item.addEventListener("click", () => void openSearchHit(hit));
+
+    const title = document.createElement("div");
+    title.className = "related-item-title";
+    title.textContent = hit.title;
+    item.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "related-item-meta";
+    const heading = hit.heading_path ? `${hit.heading_path} · ` : "";
+    meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
+    item.appendChild(meta);
+
+    const snippet = document.createElement("div");
+    snippet.className = "related-item-snippet";
+    appendSnippetWithMarks(snippet, hit.snippet);
+    item.appendChild(snippet);
+
+    searchListEl.appendChild(item);
+  }
+  // status: search-keyboard-nav — first row is Tab-reachable; others -1.
+  setRovingTabIndex(searchListEl, 0);
+}
+
+// Render an FTS5 snippet that may contain literal `<mark>` / `</mark>`
+// substrings as text + styled spans. Never `innerHTML` — the rest of the
+// app avoids raw HTML rendering and FTS5's snippet output is the only
+// source of these markers, so a structural parse is enough. Any other
+// `<` is treated as plain text.
+function appendSnippetWithMarks(host: HTMLElement, snippet: string): void {
+  let i = 0;
+  while (i < snippet.length) {
+    const open = snippet.indexOf("<mark>", i);
+    if (open < 0) {
+      host.appendChild(document.createTextNode(snippet.slice(i)));
+      return;
+    }
+    if (open > i) {
+      host.appendChild(document.createTextNode(snippet.slice(i, open)));
+    }
+    const inner = open + "<mark>".length;
+    const close = snippet.indexOf("</mark>", inner);
+    if (close < 0) {
+      // Unterminated <mark> — treat the rest as plain text rather than
+      // dropping anything. Defensive against malformed FTS5 output.
+      host.appendChild(document.createTextNode(snippet.slice(open)));
+      return;
+    }
+    const span = document.createElement("span");
+    span.className = "search-mark";
+    span.textContent = snippet.slice(inner, close);
+    host.appendChild(span);
+    i = close + "</mark>".length;
+  }
+}
+
+// status: search-result-click-opens-chunk
+// Open the note, then look up its chunk bounds and scroll to the matched
+// chunk's byte range. Conversion is byte → char (UTF-8 → UTF-16) because
+// `chunks_for` returns byte offsets while CM6 indexes characters.
+async function openSearchHit(hit: SearchNoteHit): Promise<void> {
+  await openFile(hit.path);
+  // openFile may abort on dirty-buffer cancel; bail if we're not actually
+  // looking at the requested file now.
+  if (buffer?.path !== hit.path) return;
+  try {
+    const bounds = await invoke<ChunkBounds[]>("chunks_for", { rel: hit.path });
+    const target = bounds.find((b) => b.chunk_index === hit.chunk_index);
+    if (!target) return;
+    const docText = view.state.doc.toString();
+    const charOffset = byteOffsetToCharOffset(docText, target.byte_start);
+    const safe = Math.min(charOffset, view.state.doc.length);
+    view.dispatch({
+      selection: { anchor: safe },
+      effects: EditorView.scrollIntoView(safe, { y: "start" }),
+    });
+    view.focus();
+  } catch (err) {
+    console.error("scroll-to-chunk failed:", err);
+  }
+}
+
+function byteOffsetToCharOffset(text: string, byteOffset: number): number {
+  if (byteOffset <= 0) return 0;
+  const enc = new TextEncoder();
+  const bytes = enc.encode(text);
+  if (byteOffset >= bytes.length) return text.length;
+  const dec = new TextDecoder();
+  return dec.decode(bytes.subarray(0, byteOffset)).length;
+}
+
+// Re-run search when a vault is opened: existing query (if any) loses its
+// results when the panel rebinds; clear UI so we don't show prior-vault
+// results against a new vault.
+function clearSearchPanel(): void {
+  searchInputEl.value = "";
+  searchEpoch += 1;
+  searchSpinnerEl.hidden = true;
+  searchListEl.innerHTML = "";
+  searchCountEl.textContent = "";
+  applySearchClearButtonVisibility();
+  applySearchSectionVisibility();
+}
+
+// Re-run when the user flips a mode toggle while a query is active. Without
+// this, switching from "both" to "lexical only" (or back) would leave stale
+// results showing under a now-different mode label until the next keystroke.
+function maybeRerunSearchAfterModeChange(): void {
+  if (searchInputEl.disabled) return;
+  if (searchInputEl.value.trim().length === 0) return;
+  const epoch = ++searchEpoch;
+  searchSpinnerEl.hidden = false;
+  void runSearch(searchInputEl.value.trim(), epoch);
+}
+
+// status: search-section-collapsible
+// Per-section collapsed/expanded state, persisted per-vault. Clicking the
+// header (anywhere on it, not just the chevron — bigger hit target) toggles
+// the corresponding `[hidden]` on the section's body.
+function applySectionCollapsed(
+  section: HTMLElement,
+  body: HTMLElement,
+  expanded: boolean,
+): void {
+  section.classList.toggle("collapsed", !expanded);
+  body.hidden = !expanded;
+}
+
+let searchSectionExpanded = true;
+let relatedSectionExpanded = true;
+
+function setSearchSectionExpanded(expanded: boolean, persist: boolean): void {
+  searchSectionExpanded = expanded;
+  applySectionCollapsed(searchSectionEl, searchListEl, expanded);
+  if (persist) {
+    void persistSetting("vault", "search.sections.results_expanded", expanded);
+  }
+}
+
+function setRelatedSectionExpanded(expanded: boolean, persist: boolean): void {
+  relatedSectionExpanded = expanded;
+  applySectionCollapsed(relatedSectionEl, relatedListEl, expanded);
+  if (persist) {
+    void persistSetting("vault", "search.sections.related_expanded", expanded);
+  }
+}
+
+searchSectionEl
+  .querySelector(".discovery-section-header")!
+  .addEventListener("click", () => {
+    setSearchSectionExpanded(!searchSectionExpanded, true);
+  });
+relatedSectionEl
+  .querySelector(".discovery-section-header")!
+  .addEventListener("click", () => {
+    setRelatedSectionExpanded(!relatedSectionExpanded, true);
+  });
+
 // ---------- related-notes panel ----------
 
 let relatedRequestSeq = 0;
@@ -1725,6 +3073,7 @@ async function refreshRelated(rel: string | null): Promise<void> {
   const seq = ++relatedRequestSeq;
   if (!rel) {
     relatedListEl.innerHTML = "";
+    relatedCountEl.textContent = "";
     return;
   }
   try {
@@ -1740,6 +3089,8 @@ async function refreshRelated(rel: string | null): Promise<void> {
 
 function renderRelated(hits: RelatedHit[]): void {
   relatedListEl.innerHTML = "";
+  // status: search-section-counts — header reflects live count.
+  relatedCountEl.textContent = hits.length > 0 ? `(${hits.length})` : "";
   if (hits.length === 0) {
     const empty = document.createElement("div");
     empty.className = "related-empty";
@@ -1750,6 +3101,8 @@ function renderRelated(hits: RelatedHit[]): void {
   for (const hit of hits) {
     const item = document.createElement("div");
     item.className = "related-item";
+    item.tabIndex = -1;
+    item.setAttribute("role", "option");
     item.addEventListener("click", () => void openFile(hit.path));
 
     const title = document.createElement("div");
@@ -1770,6 +3123,8 @@ function renderRelated(hits: RelatedHit[]): void {
 
     relatedListEl.appendChild(item);
   }
+  // status: search-keyboard-nav
+  setRovingTabIndex(relatedListEl, 0);
 }
 
 function scheduleRelatedRefresh(delayMs: number): void {
@@ -1828,8 +3183,9 @@ function renderIndexStatus(): void {
   }
   // status: status-bar-active-file-index-state
   // Mirror the active buffer's per-file state when it's non-Indexed; fall
-  // back to the aggregate label otherwise (or while previewing trash).
-  if (buffer && !buffer.preview) {
+  // back to the aggregate label otherwise (or while previewing trash /
+  // a snapshot — neither has live index state worth mirroring).
+  if (buffer && !isReadOnlyBuffer(buffer)) {
     const cached = indexStateCache.get(buffer.path);
     if (!cached) {
       if (!isIndexableExt(buffer.path)) {
@@ -1935,6 +3291,9 @@ void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
   }
   renderIndexStatus();
   void pollIndexStatus();
+  // status: vault-home-stats-widget — counts shift on every terminal event;
+  // debounced so a flurry of progress events fires one stats fetch.
+  scheduleVaultHomeStatsRefresh();
 });
 
 function updateIndexStateForPath(path: string, state: IndexState): void {
@@ -1942,7 +3301,7 @@ function updateIndexStateForPath(path: string, state: IndexState): void {
   document
     .querySelectorAll(`#tree li[data-path="${cssEscape(path)}"]`)
     .forEach((el) => applyIndexMarker(el as HTMLElement, state));
-  if (buffer && !buffer.preview && buffer.path === path) {
+  if (buffer && !isReadOnlyBuffer(buffer) && buffer.path === path) {
     renderIndexStatus();
   }
 }
@@ -1953,11 +3312,18 @@ function updateIndexStateForPath(path: string, state: IndexState): void {
 
 let trashItems: TrashListItem[] = [];
 
-function setReadOnly(ro: boolean): void {
+type ReadOnlyMode = "trash" | "snapshot" | null;
+
+/// Set or clear the editor's read-only state. `mode` selects which banner
+/// to show — only one banner is visible at a time. Pass `null` (or omit)
+/// to leave the editor writable and hide both banners.
+function setReadOnly(ro: boolean, mode: ReadOnlyMode = null): void {
   view.dispatch({
     effects: readOnlyCompartment.reconfigure(EditorState.readOnly.of(ro)),
   });
-  trashBannerEl.hidden = !ro;
+  trashBannerEl.hidden = !(ro && mode === "trash");
+  snapshotBannerEl.hidden = !(ro && mode === "snapshot");
+  editorPaneEl.classList.toggle("snapshot-preview", ro && mode === "snapshot");
 }
 
 function relativeTime(unixSecs: number): string {
@@ -1986,7 +3352,7 @@ async function refreshTrashBin(): Promise<void> {
 // status: tree-trash-flat-by-deleted
 function renderTrashBin(): void {
   const n = trashItems.length;
-  trashLabelEl.textContent = n === 0 ? "🗑 Trash" : `🗑 Trash (${n})`;
+  trashLabelEl.textContent = n === 0 ? "Trash" : `Trash (${n})`;
   trashListEl.innerHTML = "";
   for (const item of trashItems) {
     const row = document.createElement("div");
@@ -2143,7 +3509,8 @@ async function openTrashPreview(item: TrashListItem): Promise<void> {
         ),
       ],
     });
-    setReadOnly(true);
+    setReadOnly(true, "trash");
+    if (isVaultHomeVisible()) setVaultHomeVisible(false);
     buffer = {
       path: trashRel,
       loadedText: view.state.doc.toString(),
@@ -2167,6 +3534,10 @@ async function openTrashPreview(item: TrashListItem): Promise<void> {
 
 // Listen for any trash-changing op and re-render. Also clear the preview
 // buffer if the entry being previewed was emptied/restored under us.
+void listen("hiker:watcher-overflow", () => {
+  showToast("Filesystem watcher fell behind — rescanning…");
+});
+
 void listen("hiker:trash-changed", async () => {
   await refreshTrashBin();
   if (buffer?.preview) {
@@ -2210,6 +3581,9 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
   // `buffer.path` (matters for the renamed branch's silent path follow).
   if (ev.kind === "created" || ev.kind === "deleted" || ev.kind === "renamed") {
     scheduleTreeRefreshFromWatcher();
+    // status: vault-home-recent-modified — tree-shape changes can shift
+    // which notes are in the top-N; modified-only events update mtimes.
+    scheduleVaultHomeModifiedRefresh();
   } else if (
     ev.kind === "modified"
     && (treeSortOrder === "mtime-newest" || treeSortOrder === "mtime-oldest")
@@ -2220,10 +3594,15 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
     // we keep the existing no-op behavior.
     scheduleTreeRefreshFromWatcher();
   }
-  // Don't react while previewing a trash entry — the read-only buffer's path
-  // points inside .hiker/trash/ which the watcher already ignores, but guard
-  // defensively so we never mutate a preview buffer.
-  if (!buffer || buffer.preview) return;
+  if (ev.kind === "modified") {
+    scheduleVaultHomeModifiedRefresh();
+  }
+  // Don't react while previewing a trash entry or a snapshot — both are
+  // read-only views; mutating them would corrupt the user's intent. Trash
+  // entries live under .hiker/trash/ which the watcher ignores anyway, but
+  // snapshot previews share the live file path so this guard is the only
+  // thing keeping a watcher event from clobbering the historic content.
+  if (!buffer || isReadOnlyBuffer(buffer)) return;
 
   if (ev.kind === "modified" && ev.path === buffer.path) {
     if (isDirty()) {

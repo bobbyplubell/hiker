@@ -1,0 +1,48 @@
+# Topic taxonomy for synthetic corpus generation.
+#
+# Each topic gets its own subdirectory in the output vault. `crosslinks` lists
+# sibling topics this topic should occasionally reference in prose — those
+# pairs become ground-truth for related-notes evaluation (notes from
+# crosslinked topics should surface each other in semantic search).
+#
+# `paste_kinds` (optional) lists fixture categories from `pastes/<kind>/` that
+# can be spliced into notes for this topic when `--paste-rate` > 0. Used to
+# stress-test mixed prose+syntax content (e.g. `txt-ingest`'s code-region
+# exclusion). Available kinds: sql, shell, json, python, tcpdump, regex.
+#
+# Edit / replace this file freely. Keep it checked in alongside any run
+# whose results you want to reproduce.
+
+topics:
+  - name: distributed-systems
+    crosslinks: [databases, networking, consensus]
+    paste_kinds: [shell, json]
+  - name: databases
+    crosslinks: [distributed-systems, sql, indexing]
+    paste_kinds: [sql]
+  - name: networking
+    crosslinks: [distributed-systems, security]
+    paste_kinds: [tcpdump, shell]
+  - name: consensus
+    crosslinks: [distributed-systems, databases]
+  - name: indexing
+    crosslinks: [databases, search]
+    paste_kinds: [sql]
+  - name: search
+    crosslinks: [indexing, embeddings]
+    paste_kinds: [json, python]
+  - name: embeddings
+    crosslinks: [search, machine-learning]
+    paste_kinds: [python]
+  - name: machine-learning
+    crosslinks: [embeddings, statistics]
+    paste_kinds: [python]
+  - name: statistics
+    crosslinks: [machine-learning]
+    paste_kinds: [python]
+  - name: security
+    crosslinks: [networking]
+    paste_kinds: [shell, regex]
+  - name: sql
+    crosslinks: [databases]
+    paste_kinds: [sql]

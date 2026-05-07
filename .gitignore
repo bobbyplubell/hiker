@@ -3,6 +3,7 @@ node_modules/
 dist/
 ui/src-tauri/gen/
 scratch/
+.venv/
 
 .claude/*
 !.claude/skills/

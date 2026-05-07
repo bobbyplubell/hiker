@@ -44,6 +44,7 @@ pub enum FileEvent {
     Modified { path: String },
     Deleted { path: String },
     Renamed { from: String, to: String },
+    Overflow,
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +90,11 @@ impl Watcher {
                     }
                 };
                 for ev in events {
+                    if ev.event.need_rescan() {
+                        tracing::warn!("watcher: kernel reported event-queue overflow");
+                        let _ = bcast.send(FileEvent::Overflow);
+                        continue;
+                    }
                     if let Some(file_event) = normalize(&root_for_thread, &ev) {
                         if is_suppressed_event(&suppressed_for_thread, &file_event) {
                             tracing::debug!(
@@ -141,6 +147,7 @@ fn is_suppressed_event(map: &SuppressMap, ev: &FileEvent) -> bool {
         | FileEvent::Modified { path }
         | FileEvent::Deleted { path } => guard.contains_key(path),
         FileEvent::Renamed { from, to } => guard.contains_key(from) || guard.contains_key(to),
+        FileEvent::Overflow => false,
     }
 }
 
@@ -452,6 +459,7 @@ mod tests {
                         FileEvent::Created { path } | FileEvent::Modified { path } => path.clone(),
                         FileEvent::Deleted { path } => path.clone(),
                         FileEvent::Renamed { to, .. } => to.clone(),
+                        FileEvent::Overflow => continue,
                     };
                     assert!(
                         !p.starts_with("linked"),

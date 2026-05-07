@@ -127,6 +127,18 @@ Setting `vault.default` from inside the app is deferred until a "make this the d
 
 Stub. v1 does not load keybind overrides; `settings-section-keymap` stays planned. The `keybind-registry` in `editor.md` is shaped to accept overrides — the loader is the missing piece, deferred until a user actually wants to remap something. When it lands the format is `keymap.<binding-id> = "<chord>"`.
 
+### [llm] (deferred — lands with v3.5)
+
+Stub. The full schema lives in `llm.md` (`llm-providers-config`); summarized here so the section list in this doc is complete. Shape: `provider`, `model`, `api_key_env`, `base_url`, `[llm.limits]` for `max_tokens` / `timeout_secs`, `[llm.audit] log_full_prompt`, plus per-feature toggles for background/fan-out features (default off). Loader and validator land alongside the v3.5 milestone; until then the section is unrecognized and `settings-strict-load` will refuse it.
+
+### [embedder] (deferred — lands when cloud/Ollama embedder option ships)
+
+Stub. The full schema lives in `index.md`'s embedder section (`embedder-config-section`); same shape as `[llm]` — `provider`, `model`, `api_key_env`, `base_url`. Default `provider = "fastembed"` matches today's behavior so existing vaults don't change. Until the schema lands, the section is unrecognized and `settings-strict-load` will refuse it.
+
+### [acp] (deferred — lands when `core::acp` ships)
+
+Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables routing the chat panel through an external ACP agent instead of the basic agent loop. Shape: `agent` (registry id, "bundled" alias for the basic loop, or "none" for disable mode). Loader lands with `core::acp` itself.
+
 
 ## Loading lifecycle
 

@@ -245,7 +245,9 @@ Three columns, both sides collapsible: [three-column-layout]
 
   State is supplied by `tauri-cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
 
-- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons (VSCode-style icons or simple labels) — left button toggles the tree, right button toggles the related panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. The same toolbar hosts the `View ▾` menu (see `## View options menu`) and reserves a slot for the deferred `Mutations ▾` menu (see `note-mutations-menu` in "Out of scope" below). [panel-toggle-buttons]
+- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons — left button toggles the tree/sidebar, right button toggles the discovery panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. The same toolbar hosts the View menu button (see `## View options menu`; eye-icon affordance per `view-menu-icon`) and reserves a slot for the deferred Mutations menu (see `note-mutations-menu` in "Out of scope" below). Icons: [panel-toggle-buttons]
+  - **Sidebar toggle icon.** A safe-dial / ship-wheel glyph (round with spokes) inside a rounded-square frame — riffs on the project's "vault" vocabulary. Distinct enough from generic file-tree icons that it doesn't read as just-another-folder. Tooltip "Toggle sidebar." [sidebar-toggle-icon]
+  - **Discovery toggle icon.** A magnifying glass — the panel's primary surface is search-driven retrieval (per `search.md`), so a search glyph is more honest than the generic circled-plus the panel previously used. Tooltip "Toggle discovery panel." Naming aside (the panel hosts search results *and* related-notes *and* future surfaces), the magnifying glass is the most recognizable retrieval glyph users have. [discovery-toggle-icon]
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md). [related-notes-panel-ui]
 
 Default state on first launch: tree open, related panel collapsed. Persistence of these toggles across launches is a settings concern (see settings.md) — for v1 the state lives in-memory only.
@@ -255,7 +257,25 @@ CSS: a 3-column grid where the side columns collapse to width 0 (or `display: no
 
 ## View options menu
 
-The editor pane's top toolbar (`panel-toggle-buttons`) gains a `View ▾` menu button alongside the tree- and related-panel toggles. The menu hosts display-only toggles — flips that change how the active note is rendered without touching the file or the index. Sibling to the deferred `note-mutations-menu`; the split is clean: View changes pixels, Mutations changes bytes. [editor-view-options-menu]
+The editor pane's top toolbar (`panel-toggle-buttons`) gains a View menu button alongside the tree- and related-panel toggles. The menu hosts display-only toggles — flips that change how the active note is rendered without touching the file or the index. Sibling to the deferred `note-mutations-menu`; the split is clean: View changes pixels, Mutations changes bytes. [editor-view-options-menu]
+
+**Icon.** Eye glyph, no text label, no chevron — matches the icon-only treatment of the other toolbar buttons (sidebar wheel, discovery magnifying glass). Tooltip "View options" handles discoverability for the icon-only form. The dropdown arrow that the previous `View ▾` text label implied isn't needed once the affordance is iconified — the click target opens the menu directly, same shape the other icon buttons use to open their popovers. [view-menu-icon]
+
+
+### Toolbar icon palette
+
+The editor pane's top toolbar is converging on icon-only affordances; each menu / button gets a single distinctive glyph in the same visual family (line-weight, frame, sizing). Reserved glyphs:
+
+| Affordance                  | Glyph                                  | Slug                  | Status   |
+| --------------------------- | -------------------------------------- | --------------------- | -------- |
+| Sidebar toggle              | safe-dial / ship-wheel (rounded-square frame, circle with spokes) | `sidebar-toggle-icon` | landed   |
+| Discovery toggle            | magnifying glass                       | `discovery-toggle-icon` | landed |
+| View menu                   | eye                                    | `view-menu-icon`      | planned  |
+| Mutations menu              | wand                                   | `mutations-menu-icon` | reserved (lands with `note-mutations-menu`) |
+| Trails menu                 | squiggly trail (matches the file-tree trail-row icon seedling in `design.md`) | `trails-menu-icon`    | reserved (lands with the future trails UI) |
+| Auto-tree-org (RAPTOR)      | tree                                   | `tree-org-menu-icon`  | reserved (lands with the auto-tree-org affordance from `clustering.md` / `suggestions.md`) |
+
+The mutations/trails/tree-org rows are *icon reservations*, not full feature slugs — the parent UI surfaces (the menus themselves) are deferred to their respective feature specs. Pinning the glyph now keeps the visual language coherent so future spec writers don't have to relitigate the palette.
 
 Each entry is a checkable item — checkmark when active, click flips it, menu closes on click. State is in-memory only for v1. Persistence (per-vault, per-user, or both) is a `settings.md` concern when that surface lands; users will expect toggle state to survive a relaunch, so this menu is one of the first hooks the settings work picks up.
 
@@ -281,6 +301,159 @@ These appear in the menu now so the surface is predictable, but render greyed-ou
 - Content-mutating actions — those live in `note-mutations-menu`.
 - Per-file scoped toggles. The menu's scope is "active buffer at most"; per-file persistence is a frontmatter concern that doesn't exist in v1.
 - Theme / font / color-scheme — those belong in settings, not a quick toggle.
+
+
+## Vault home page
+
+When no note is open, the editor pane shows a vault home page in place of the CM6 editor — a lightweight overview of the vault rather than empty space. Default landing surface on vault open (assuming no auto-resume of last-open buffer); reappears when the user closes the active buffer without opening another. [vault-home-screen]
+
+Three widgets, in this vertical order:
+
+- **Vault stats.** Total notes, total chunks, breakdown by index state (indexed / queued / skipped / unsupported), maybe disk usage of the vault directory. Pulled cheaply from the existing index store via a single Tauri command. Live-updates via the existing `hiker:reindex-progress` events so the counts reflect ongoing work. [vault-home-stats-widget]
+- **Recently modified.** Top N (default 10) notes by filesystem mtime. Reuses the mtime field on `DirEntryDto` (`tree-sort-options`); ordering is just `ORDER BY mtime DESC LIMIT N` against the store's notes rows. Each row shows basename + relative path + relative time ("2 hours ago"). Click → open in editor. [vault-home-recent-modified]
+- **Recently accessed.** Top N notes by user-open time. Requires a new `last_accessed_at` column on the `notes` row, written from the open-file Tauri command path; same row shape and click behavior as recently-modified. [vault-home-recent-accessed]
+
+The new column rides a small slug of its own since the tracking is independent infrastructure (later consumers could include search ranking, habits-of-association, an "activity" view, etc.):
+
+- **Note access tracking.** Add `last_accessed_at INTEGER` to the `notes` row; bump the schema-version constant (same fail-loud + reindex contract as the existing `store-version-fail-loud` / schema bump pattern). Written when a file becomes the active buffer (open from tree, search-result click, recents click, etc.). Read by the recents widget and any future consumer. [note-access-tracking]
+
+Refresh shape: the home page subscribes to `hiker:reindex-progress` for live stat updates and to `hiker:file-changed` for recent-modified updates. The recently-accessed list updates on each open without watcher involvement (the writer is hiker itself).
+
+UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same Tauri call as the tree's existing `create-note-button`.
+
+Out of scope for v1 of the home page: pinned/landmark notes, active-trail display, search shortcuts, discovery hints from clustering, recent-searches list, vocabulary stats, sync status. All slot in as additional widgets as their backing features land.
+
+### Recent activity widget (lands with `core::changes`)
+
+A fourth widget appears on the home page once `core::changes` (per `changes.md`) has any rows — i.e. as soon as any save / rename / delete has happened in this vault since the v3 schema bump. Hidden when the changelog is empty so a fresh post-upgrade vault doesn't show a confusing zero-count tile. [vault-home-recent-activity-widget]
+
+Preview content (the home tile):
+
+- Header: "Recent activity" + count of recent rows.
+- Top 3–5 most recent change events: timestamp, path, op (created / modified / deleted / renamed), author class. Click → detail view (see below).
+- Mixed-author by default — user saves and (when MCP lands) agent writes appear in the same stream. The widget is *not* agent-specific; the agent-activity use case is a filter preset within the same widget rather than a separate surface.
+
+Refresh: subscribes to a new `hiker:changes-appended` event emitted whenever the indexer task appends a row to `core::changes`. Same shape as `hiker:reindex-progress`. Light debounce (a few hundred ms) so save bursts don't repaint per keystroke.
+
+
+### Detail views
+
+Vault home widget tiles support a drill-in pattern. **Click on a widget's tile or header → home view body swaps to a detail view for that widget.** No back button affordance — clicking the Home button in the vault bar always returns to the home overview, regardless of whether you're in the overview or a detail view. Clicking a note row in any detail view exits home and opens the editor on that note (same shape as `openFile` already exits home view today). [vault-home-detail-views]
+
+Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has three states — editor, home overview, home detail. The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; back transitions are via Home button (→ overview) or note-row click (→ editor).
+
+Per-widget detail views, in roughly the order they earn their keep:
+
+- **`vault-home-stats-detail`** — each Stats tile (Notes / Indexed / Chunks / Queued / Skipped) drills in to a list view:
+    - **Notes** — full list of all notes, paginated, sortable by mtime / access / path.
+    - **Indexed** — same shape, filtered to indexed-only.
+    - **Chunks** — per-note chunk count, sortable; flags pathologies (notes with >100 chunks, notes with 0 chunks). Ties into the deferred `eval-sanity-stats` work — gives a real surface for spotting chunker pathology before the formal eval framework lands.
+    - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `tauri-cmd-file-index-state`). Updates on every `hiker:reindex-progress` event.
+    - **Skipped** — list of skipped notes with their reasons (already tracked via `notes.skipped` + `notes.skip_reason`). Per-row "retry" affordance reroutes through `IndexJob::Upsert` with `force=true` so users can manually retry after fixing the underlying issue (file size, encoding).
+- **`vault-home-recent-activity-detail`** — full list from `core::changes::recent`, all author classes. Mental model: **each row is a saved version of the file.** Row layout: op label · path · author · time-ago, plus a `current` badge on the most recent row per path and a `↩ restored` badge on rows that were themselves a Restore. Filter pills (author class) live in the header. [vault-home-recent-activity-detail]
+
+    The interaction shape:
+
+    - **Click a row** → opens that snapshot read-only in the editor. Reuses the same `readOnlyCompartment` + banner pattern as `tree-trash-preview`; the banner reads `Snapshot of <path> · <when> · <author> · <op>` with `[Restore this version]` and `[Close preview]` actions. Closing returns to the activity detail view.
+    - **Per-row `[Restore this version]`** → for power-user single-click without previewing first. Hidden on the `current` row (restoring the current state is a tautology) and on `'deleted'` rows (no content blob to write).
+    - **No separate "Open" button.** That was confusing in an earlier iteration — users expected "open" to show the historic state, not the live file. Click-the-row → snapshot preview is the only path; the live file is reached via the tree, search, or recently-modified.
+    - **No separate "Rollback to before this" button.** That phrasing was confusing because the row IS the version (the content blob lives on the row), and "before this" implied off-by-one mental gymnastics. The `Restore this version` semantics are honest: what you click is what you get.
+
+    Restore writes the row's `content_at(id)` blob back to disk via `vault.write_file_checked`, then appends a new `'modified'` row stamped `metadata.restored_from = id`. Tauri command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, walks `previous_content_for_path`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same log primitives, see `changes.md` "Rollback".
+
+    - **Author-filter pills** — one pill per present author class. Default: all classes pressed (everything visible). User can flip filters; state persists per-vault. Pills only appear when their class has at least one row in the visible window. [vault-home-recent-activity-author-filter]
+    - **`recent-activity-human-icon`** — human glyph (half-oval body + circle head) for the `user` filter pill. Same icon-only style as the editor toolbar palette. Tooltip "Show user activity." [recent-activity-human-icon]
+    - **`recent-activity-agent-icon`** — simplified retro-robot glyph for the `agent:*` filter pill. Tooltip "Show agent activity." Future author classes (sync, import) get their own glyphs in the same family when they land. [recent-activity-agent-icon]
+    - **Un-rollback affordance** — append-only log + per-row content blob means *every* prior state stays restorable, including states that were themselves the result of a Restore. Mechanically, "un-rollback" is just Restore on a more recent prior version — same primitive, no separate operation. UX: rows tagged `metadata.restored_from` show a `↩ restored` badge; immediately after a Restore action, the row that *was* the current state for that path gets a soft highlight + "← previous state — click Restore to undo" caption. The action is the regular `[Restore this version]` button on that row (no separate primitive); the caption is purely a hint. This is materially better than linear undo stacks where redo state vanishes after a subsequent edit; here, every row within retention is equally accessible as a Restore target. [vault-home-recent-activity-unrollback]
+    - **Snapshot read-only preview.** Reuses the trash-preview machinery: `setReadOnly(true, "snapshot")` swaps in the snapshot banner, suppresses the save button + dirty marker, and the dirty-switch guard treats it the same as a trash preview (nothing to discard). The buffer carries `snapshotPreview: true` and `snapshotChangeId` so the banner's Restore action can write back without a re-lookup. Different banner color from trash (amber, not red) — informational, not a recovery surface. [snapshot-preview-mode]
+- **`vault-home-recents-detail`** (lower priority — lands when needed) — full list versions of Recently Modified / Recently Accessed. Less urgent than the stats and agent-activity ones since each preview row already has a click-to-open affordance; the detail view adds filtering / longer history but isn't load-bearing.
+
+Detail views don't get individual stub-slugs for each Stats subview (Notes / Indexed / Chunks / Queued / Skipped) — they're variations of the same `vault-home-stats-detail` slug parameterized by which tile launched them. Adding new tiles in the future just adds parameter values, not new slugs. [vault-home-stats-detail]
+
+UI shape notes:
+
+- Detail view header: tile name (e.g. "Skipped notes") + count.
+- Body: paginated list, virtualized if needed (skipped/indexed lists could be thousands of rows on a large vault).
+- Empty state: a brief "no items" message, since every detail view has a sensible empty case.
+- Sort/filter affordances live in the detail view header, not the home overview tile.
+
+### Vault bar affordances
+
+Two small icon-only buttons live in the vault bar (the strip showing the current vault path). Both are vault-scoped, sit alongside the existing vault path display, and use icon-only styling for compactness; both carry `title=` tooltips so the icons remain discoverable.
+
+- **Home button.** Icon-only (house glyph). Toggles the editor pane to the vault home page (described above). View toggle, not buffer close — the active buffer (if any) stays in memory; clicking any tree row, recents entry, or search result restores the editor onto whichever note. No save protection needed because nothing is closing. Tooltip "Vault home." Reserves the keybind id `vault.go-home` in `keybind-registry` (chord TBD; Cmd/Ctrl-Shift-H is unclaimed and pairs naturally with Ctrl-Space / Ctrl-Shift-F's "vault-level navigation" naming). [vault-home-button]
+- **Open-vault button.** Replaces the existing "Open vault" text button with an icon (folder glyph). Same JS-dialog → `open_vault_at` flow per `settings.md`'s default-vault-autoopen story; this slug is purely the visual swap. Tooltip "Open vault…" preserves discoverability. [vault-bar-open-vault-icon]
+
+
+## Navigation (back / forward)
+
+Browser-style back/forward navigation across editor-pane states. Each user-initiated transition between distinct content surfaces — opening a note, going home, drilling into a home detail view, opening a trash preview — pushes onto a per-vault history stack. Back and forward navigate that stack via vault-bar buttons, trackpad two-finger horizontal swipe (matching browser convention), and a keybind registry entry.
+
+The headline decisions:
+
+- **History is a per-vault in-memory stack of editor-pane content states.** Cleared on vault swap. Not persisted across hiker restarts (matches browser per-window behavior). [navigation-history-stack]
+- **Back and forward buttons live in the vault bar, pinned to the right** (trailing edge, after the vault path display). Icon-only, disabled when no history exists in that direction. [vault-bar-back-button, vault-bar-forward-button]
+- **Two-finger horizontal trackpad swipe** triggers back/forward. Same UX as macOS Safari / Chrome / Firefox. Detection via wheel events with sustained `deltaX` past a threshold; right-swipe = back, left-swipe = forward (matches browser convention). [navigation-trackpad-swipe]
+- **Keybind registry entries** reserve `navigation.back` and `navigation.forward` with platform-conventional chords: Cmd/Ctrl-[ for back, Cmd/Ctrl-] for forward; Alt-Left/Right as additional bindings on Linux/Windows for browser-keyboard parity. [navigation-keybind]
+- **Dirty-buffer protection** integrates with the existing `file-switch-guard-dirty` modal — navigating back/forward into a different note from a dirty buffer fires the same Keep/Discard/Cancel modal save-on-switch already uses. [navigation-dirty-buffer-guard]
+
+
+### What pushes onto the stack
+
+A new history entry is appended for each *content-surface change* the user initiated:
+
+- Opening a note (tree click, search-result click, recents click, drag-drop, wikilink click — when wikilinks land).
+- Switching to vault home (Home button click, navigating to an empty editor state).
+- Drilling into a home detail view (stats tile click, recent-activity tile click, etc.).
+- Opening a trash preview.
+- Returning from a detail view to home overview (Home button click while in detail).
+
+Things that *don't* push:
+
+- Editing a note (typing, save).
+- Tree expand/collapse, panel toggles, filter pill changes within a detail view, search query typing.
+- Buffer reload from a watcher event (the buffer's still on the same file).
+- Programmatic restore from history (back/forward themselves don't push).
+
+When the user navigates back and then opens a new content surface, the forward stack is discarded — same shape as every browser. The history feels predictable.
+
+
+### Vault bar layout
+
+The existing vault-bar order is preserved: Home button, Open-vault button, vault path display (left to right). Back and forward append at the trailing edge — after the vault path, pinned to the right. Browser convention puts navigation arrows leftmost, but the vault bar already has Home / Open-vault at that edge as vault-management controls, and pushing those right to make room for browser-style back/forward would shuffle muscle memory for affordances that are more frequently used. Trailing-edge placement keeps the existing left-edge cluster intact while still putting back/forward in a recognizable, dedicated zone.
+
+Back/forward icon style matches the existing icon-only toolbar treatment (sidebar wheel, discovery magnifying glass, view eye, vault home button, etc.) — minimal arrow glyphs, tooltips, `aria-label`s. Disabled state styling for "no history that direction" should be visibly inert (greyed, no hover effect).
+
+
+### Trackpad swipe shape
+
+Browser convention: two-finger horizontal swipe on a trackpad triggers back/forward. macOS surfaces this as `wheel` events with `deltaX` accumulation; the editor pane's wheel handler watches for sustained horizontal scroll past a threshold (e.g. ~120px of accumulated `deltaX` over a short time window) and fires the navigation. Vertical swipes are ignored.
+
+Optional polish (defer for v1 of the feature; nice-to-have): a small "←" or "→" overlay animation that previews the navigation while the swipe is in progress, cancels if the user reverses before the threshold. Not load-bearing.
+
+Right-swipe = back. Left-swipe = forward. Same as every browser.
+
+Edge cases worth pinning:
+
+- **Inside CodeMirror.** CM6 doesn't intercept horizontal trackpad scroll by default for content that isn't horizontally scrollable, so wheel events with `deltaX` bubble up to the pane handler naturally. If a markdown-source line is horizontally scrolled (rare for prose; possible in code blocks), the swipe should still trigger navigation when `deltaX` substantially exceeds the line's scrollable extent.
+- **Inside scrollable detail-view lists.** Same shape — the list scrolls on `deltaY`, so horizontal swipes pass through.
+- **Touchscreen devices.** v1 of this feature targets trackpads only. Touch swipe gestures via `touchstart`/`touchend` are a separate slug if the project ever ships a touchscreen-friendly variant.
+
+
+### Dirty-buffer interaction
+
+Navigating away from a dirty buffer via back/forward fires the existing `file-switch-guard-dirty` modal (Keep / Discard / Cancel). Cancel aborts the navigation, history isn't mutated. Keep saves and proceeds. Discard reverts and proceeds. Same UX as switching files via the tree today.
+
+Closing the vault while history exists drops the entire stack — no warning, no save protection beyond what already gates vault swap.
+
+
+### Out of scope (this feature)
+
+- **Persisting history across restarts.** Browser-shaped feature: history is per-session.
+- **Tab-style multi-buffer history.** Hiker is single-buffer in v1; if tabs ever land, each tab gets its own history stack.
+- **Visual swipe overlay animation.** Optional polish, deferred until the basic mechanism is real.
+- **Touchscreen swipe gestures.** Trackpad-only for v1.
+- **Rich history menu (right-click → list of last N pages).** Browser-shaped polish, deferred.
 
 
 ## Extension load order (CM6)
@@ -313,4 +486,4 @@ Editor instance is created once at startup and reused across buffer switches; sw
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)
 - External-change watcher integration (v1)
-- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content, with user-selectable backend: tiny local-CPU model (e.g. Qwen2.5-0.5B / SmolLM2 / Gemma-3-270m via `llama.cpp` or `mistral.rs`), local LLM API (any OpenAI-compatible endpoint — Ollama, LM Studio, llama-server), or cloud LLM API. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched and the derived view is opt-in. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. [note-mutations-menu]
+- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched and the derived view is opt-in. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. **Routing (per `llm.md`):** this menu's actions are single-shot deterministic prompts — one click, one prompt, one derived file — so they use `core::llm` direct, *not* `core::agent` or `core::acp`. Provider (Ollama for local, OpenAI / Anthropic / etc. for cloud) is the user's `[llm]` config; no per-feature backend selection in this menu, no in-process model runtime. [note-mutations-menu]

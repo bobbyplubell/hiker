@@ -9,10 +9,18 @@ Known issues in the codebase. Each row is a kebab-case slug, a one-line descript
 
 | Slug | File | Notes |
 | ---- | ---- | ----- |
-| _none_ | | |
 
 
 ## Resolved
+
+Fixed 2026-05-07:
+
+| Slug | Fix |
+| ---- | --- |
+| `bug-show-line-numbers-noop` | broadened the CSS selector to `.hide-line-numbers .cm-lineNumbers` and added `!important` so it wins over CM6's injected base-theme `display` on gutter elements |
+| `bug-default-vault-not-persisted` | `open_vault_at` now also writes `vault.default` (user scope) when it differs from the opened root, alongside the existing `vault.recent` update |
+| `bug-x-button-does-not-close` | `onCloseRequested` now always `preventDefault`s and drives the close itself via `win.destroy()`; the clean-path "let Tauri default-close" branch was unreliable, and `destroy()` avoids re-entering the handler that `close()` would |
+| `bug-save-button-wraps-when-dirty` | added `white-space: nowrap` and a `min-width: 64px` to `#save-btn` so the dirty-state bullet glyph can't push the label onto a second line |
 
 Fixed 2026-05-06:
 

@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, OnceCell};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
@@ -76,6 +76,12 @@ pub enum IndexJob {
     /// indexed paths whose files have vanished. `force` propagates into the
     /// produced child Upserts (see `IndexJob::Upsert`).
     FullScan { force: bool },
+    /// Stamp `notes.last_accessed_at` for an opened note. Fire-and-forget —
+    /// no reply, no progress event; the recents widget reads the column on
+    /// next refresh. No-op when the path isn't yet indexed.
+    ///
+    /// status: note-access-tracking
+    TouchAccess { rel_path: String, ts: i64 },
 }
 
 /// Snapshot of indexer state, served to the UI on demand.
@@ -132,6 +138,13 @@ pub struct IndexerHandle {
     /// mpsc, recv'd, or actively processing). Backs the Queued tree-row
     /// marker via `tauri-cmd-file-index-state`.
     pending: Arc<Mutex<HashSet<String>>>,
+    /// Filled by the indexer task once `embedder_loader` resolves.
+    /// Exposed via `embedder()` so the search command can embed query
+    /// strings off the same loaded model without re-loading. Stays
+    /// `None` while the model is loading and after a load failure
+    /// (search returns empty until ready, mirroring the
+    /// `embedder-first-run-nonblocking` posture).
+    embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
 }
 
 /// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
@@ -183,9 +196,33 @@ impl IndexerHandle {
         self.enqueue(IndexJob::FullScan { force: false }).await
     }
 
+    /// Stamp a note's `last_accessed_at` via the indexer's owned writer.
+    /// Fire-and-forget — caller can drop the future without losing the stamp
+    /// once it's queued. No-op when the note isn't yet indexed.
+    ///
+    /// status: note-access-tracking
+    pub async fn touch_access(
+        &self,
+        rel_path: impl Into<String>,
+        ts: i64,
+    ) -> Result<(), IndexerError> {
+        self.enqueue(IndexJob::TouchAccess {
+            rel_path: rel_path.into(),
+            ts,
+        })
+        .await
+    }
+
 
     pub fn status(&self) -> IndexStatus {
         self.status.borrow().clone()
+    }
+
+    /// Loaded embedder, or `None` while the model is still loading or
+    /// after a load failure. Cheap clone (Arc); intended for the search
+    /// command's query-string embedding hop.
+    pub fn embedder(&self) -> Option<Arc<dyn Embedder>> {
+        self.embedder.get().cloned()
     }
 
     pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressEvent> {
@@ -234,6 +271,7 @@ where
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(PROGRESS_CAPACITY);
     let (status_tx, status_rx) = watch::channel(IndexStatus::default());
     let pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
 
     // Seed total_notes from the store; surface a count failure as
     // last_error rather than silently showing 0 (a corrupted index would
@@ -250,6 +288,7 @@ where
 
     let progress_for_task = progress_tx.clone();
     let pending_for_task = pending.clone();
+    let embedder_cell_for_task = embedder_cell.clone();
     let join = tokio::spawn(indexer_loop(
         vault,
         vault_root,
@@ -259,6 +298,7 @@ where
         progress_for_task,
         status_tx,
         pending_for_task,
+        embedder_cell_for_task,
     ));
 
     IndexerHandle {
@@ -267,6 +307,7 @@ where
         status: status_rx,
         join: Some(join),
         pending,
+        embedder: embedder_cell,
     }
 }
 
@@ -279,6 +320,7 @@ async fn indexer_loop<F>(
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Sender<IndexStatus>,
     pending: Arc<Mutex<HashSet<String>>>,
+    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
 ) where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
@@ -327,6 +369,7 @@ async fn indexer_loop<F>(
                         None
                     }
                     IndexJob::FullScan { .. } => None,
+                    IndexJob::TouchAccess { .. } => None,
                 };
                 if path.is_some() {
                     let _ = progress.send(ProgressEvent::Error {
@@ -346,6 +389,13 @@ async fn indexer_loop<F>(
         s.model_ready = true;
         s.last_error = None;
     });
+    // Publish the loaded embedder so search/related callers can embed
+    // query strings off the same model. `set` only fails if the cell was
+    // already filled (we never fill it elsewhere), so the error is unreachable
+    // — log defensively and move on rather than panicking.
+    if embedder_cell.set(embedder.clone()).is_err() {
+        tracing::error!("indexer: embedder OnceCell already filled");
+    }
     tracing::info!(
         embedder_version = embedder.version(),
         dim = embedder.dim(),
@@ -609,6 +659,16 @@ async fn handle_simple_job(
         }
         IndexJob::FullScan { .. } => {
             unreachable!("FullScan must be handled by the main loop, not handle_simple_job");
+        }
+        // status: note-access-tracking
+        IndexJob::TouchAccess { rel_path, ts } => {
+            if let Err(e) = store.touch_note_access(&rel_path, ts) {
+                tracing::warn!(
+                    error = %e,
+                    path = %rel_path,
+                    "indexer: touch_note_access failed",
+                );
+            }
         }
     }
 }
@@ -903,6 +963,7 @@ pub async fn route_watcher_events(
                         }
                         IndexJob::Rename { from, to }
                     }
+                    FileEvent::Overflow => IndexJob::FullScan { force: false },
                 };
                 if tx.send(job).await.is_err() {
                     break;
@@ -947,15 +1008,21 @@ fn path_extension(rel_path: &str) -> Option<&str> {
     }
 }
 
-/// Whether the indexer considers this path's extension supported. Single
-/// source of truth so the walker, watcher router, and per-file chunker
-/// dispatch agree.
+/// Canonical list of extensions the indexer can chunk + embed. Single
+/// source of truth — the walker, watcher router, per-file chunker dispatch,
+/// `Vault::walk_indexable_files`, and the frontend tree-row markers all
+/// consult this list (the frontend gets it via the `Config` snapshot
+/// returned by `get_settings`, see settings.md). Lower-case; comparisons
+/// elsewhere use `eq_ignore_ascii_case`.
 // status: txt-extension-recognized
+pub const INDEXABLE_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
+
+/// Whether the indexer considers this path's extension supported.
 pub fn is_indexable_path(rel_path: &str) -> bool {
     let Some(ext) = path_extension(rel_path) else { return false };
-    ext.eq_ignore_ascii_case("md")
-        || ext.eq_ignore_ascii_case("markdown")
-        || ext.eq_ignore_ascii_case("txt")
+    INDEXABLE_EXTENSIONS
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
 fn path_to_rel(p: &Path) -> String {

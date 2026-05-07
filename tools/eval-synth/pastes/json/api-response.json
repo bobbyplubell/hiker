@@ -1,0 +1,21 @@
+{
+  "request_id": "01H8X9ZQK4P2N3MR5Y7T6V8W0Z",
+  "took_ms": 47,
+  "results": [
+    {
+      "id": 41827,
+      "score": 0.8214,
+      "title": "Vector index trade-offs",
+      "tags": ["search", "indexing", "ann"],
+      "snippet": "HNSW gives strong recall at the cost of memory; IVF-PQ trades recall for footprint."
+    },
+    {
+      "id": 41902,
+      "score": 0.7651,
+      "title": "Re-ranking with cross-encoders",
+      "tags": ["search", "ranking"],
+      "snippet": "A small cross-encoder over the top-100 from a bi-encoder retriever recovers most lost recall."
+    }
+  ],
+  "next_cursor": null
+}

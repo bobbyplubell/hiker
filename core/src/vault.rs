@@ -182,7 +182,14 @@ impl Vault {
     /// re-index flows that need the same enumeration. `follow_links(false)`
     /// matches `walker-symlink-policy`. Returns an empty vec if `rel` is a
     /// file (callers can branch on dir vs file via fs::metadata first).
-    pub fn walk_md_files(&self, rel: &str) -> Result<Vec<String>, HikerError> {
+    ///
+    /// Filters via `crate::indexer::is_indexable_path` so the same allowlist
+    /// drives bulk operations (folder-move pre-suppression, folder-delete
+    /// member walk, store-side rename batching) that drives single-file
+    /// ingest. Without this, a `.txt` file inside a moved/deleted folder
+    /// would skip pre-suppression and the watcher could race a stale
+    /// `Modified`/`Deleted` past the bulk path remap.
+    pub fn walk_indexable_files(&self, rel: &str) -> Result<Vec<String>, HikerError> {
         let abs = self.resolve(rel)?;
         if !abs.is_dir() {
             return Ok(Vec::new());
@@ -194,17 +201,14 @@ impl Vault {
                 continue;
             }
             let path = entry.path();
-            let is_md = path
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("md"))
-                .unwrap_or(false);
-            if !is_md {
-                continue;
-            }
             let rel_to_vault = path
                 .strip_prefix(&self.root)
                 .map_err(|e| HikerError::Io(format!("strip_prefix: {e}")))?;
-            out.push(rel_to_vault.to_string_lossy().replace('\\', "/"));
+            let rel_str = rel_to_vault.to_string_lossy().replace('\\', "/");
+            if !crate::indexer::is_indexable_path(&rel_str) {
+                continue;
+            }
+            out.push(rel_str);
         }
         Ok(out)
     }
@@ -373,7 +377,7 @@ pub fn move_folder(
 
     // Collect indexed-eligible members before the rename so we can build the
     // (old, new) path pairs the store needs.
-    let members = vault.walk_md_files(from)?;
+    let members = vault.walk_indexable_files(from)?;
     let from_prefix = format!("{from}/");
     let renames: Vec<(String, String)> = members
         .iter()

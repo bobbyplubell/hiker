@@ -20,7 +20,16 @@ use crate::error::HikerError;
 ///
 /// v2 added `notes.skipped` + `notes.skip_reason` so the indexer can
 /// distinguish "skipped on purpose" from "never seen" across launches.
-pub const SCHEMA_VERSION: i32 = 2;
+///
+/// v3 added the `chunks_fts` external-content FTS5 virtual table plus
+/// sync triggers on `chunks`, backing the lexical search engine
+/// (`search-fts5-schema`). External-content means tokens + offsets only —
+/// the chunk text isn't duplicated; FTS5 reads `chunks.text` on demand.
+///
+/// v4 added `notes.last_accessed_at` (NULL until first user-open) so the
+/// vault-home recents widget can sort by user-open time. Tracked
+/// independently of `mtime` since the user may open without modifying.
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Embedding dimension for the v1 model (bge-small-en-v1.5). Pinned here so
 /// the schema and the embedder agree.
@@ -64,6 +73,36 @@ pub struct NoteRow {
     /// Short, stable, human-readable reason — used directly in tooltips and
     /// the status bar (`"file too large"`, `"not UTF-8"`).
     pub skip_reason: Option<String>,
+    /// Unix seconds; updated each time the note becomes the active buffer.
+    /// `None` until the note is first opened. See `note-access-tracking`.
+    pub last_accessed_at: Option<i64>,
+}
+
+/// Compact note row for the vault-home recents widgets. Same shape for both
+/// "recently modified" (sorted by `mtime`) and "recently accessed" (sorted by
+/// `last_accessed_at`); the UI picks the relevant timestamp per widget.
+///
+/// status: vault-home-recent-modified
+/// status: vault-home-recent-accessed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentNote {
+    pub path: String,
+    pub title: String,
+    pub mtime: i64,
+    pub last_accessed_at: Option<i64>,
+}
+
+/// Counts surfaced by the vault-home stats widget. `queued` is filled by the
+/// indexer handle, not the store; the rest come straight off the notes /
+/// chunks tables.
+///
+/// status: vault-home-stats-widget
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaultStats {
+    pub total_notes: u32,
+    pub total_chunks: u32,
+    pub indexed: u32,
+    pub skipped: u32,
 }
 
 /// Stored chunk metadata (without the embedding — fetch via knn_chunks for
@@ -185,7 +224,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, path, content_hash, mtime, size, indexed_at, embedder_version,
-                        skipped, skip_reason
+                        skipped, skip_reason, last_accessed_at
                  FROM notes WHERE path = ?1",
                 params![rel_path],
                 map_note_row,
@@ -200,6 +239,116 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
         Ok(n.max(0) as u32)
+    }
+
+    /// Aggregate counts for the vault-home stats widget. Pulled from the
+    /// notes / chunks tables in three cheap counts; queued / unsupported
+    /// counts live elsewhere (queued on the indexer handle, unsupported is a
+    /// vault-walk concern the home page skips for v1).
+    ///
+    /// status: vault-home-stats-widget
+    pub fn vault_stats(&self) -> Result<VaultStats, StoreError> {
+        let total_notes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes",
+            [],
+            |row| row.get(0),
+        )?;
+        let total_chunks: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        let skipped: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes WHERE skipped = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let indexed = (total_notes - skipped).max(0);
+        Ok(VaultStats {
+            total_notes: total_notes.max(0) as u32,
+            total_chunks: total_chunks.max(0) as u32,
+            indexed: indexed as u32,
+            skipped: skipped.max(0) as u32,
+        })
+    }
+
+    /// Top-N notes by filesystem mtime, descending. Skipped rows excluded —
+    /// they're noise in a "recent activity" surface.
+    ///
+    /// status: vault-home-recent-modified
+    pub fn recent_notes_by_mtime(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecentNote>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, mtime, last_accessed_at
+             FROM notes
+             WHERE skipped = 0
+             ORDER BY mtime DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let path: String = row.get(0)?;
+                let title = title_from_path(&path);
+                Ok(RecentNote {
+                    path,
+                    title,
+                    mtime: row.get(1)?,
+                    last_accessed_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Top-N notes by user-open time, descending. Notes that have never been
+    /// opened (`last_accessed_at IS NULL`) are excluded — the widget is "what
+    /// have I been reading," empty when nothing's been opened yet.
+    ///
+    /// status: vault-home-recent-accessed
+    pub fn recent_notes_by_access(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecentNote>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, mtime, last_accessed_at
+             FROM notes
+             WHERE skipped = 0 AND last_accessed_at IS NOT NULL
+             ORDER BY last_accessed_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let path: String = row.get(0)?;
+                let title = title_from_path(&path);
+                Ok(RecentNote {
+                    path,
+                    title,
+                    mtime: row.get(1)?,
+                    last_accessed_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Stamp `last_accessed_at` for the note at `rel_path`. No-op when the
+    /// note isn't in the index yet (open-before-first-index case); the next
+    /// successful ingest creates the row, and subsequent opens will record.
+    /// Returns true when a row was actually updated.
+    ///
+    /// status: note-access-tracking
+    pub fn touch_note_access(
+        &mut self,
+        rel_path: &str,
+        ts: i64,
+    ) -> Result<bool, StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE notes SET last_accessed_at = ?1 WHERE path = ?2",
+            params![ts, rel_path],
+        )?;
+        Ok(updated > 0)
     }
 
     /// All indexed paths. Used by the full-scan walker to detect notes whose
@@ -724,6 +873,7 @@ fn map_note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
         embedder_version: row.get(6)?,
         skipped: row.get::<_, i64>(7)? != 0,
         skip_reason: row.get(8)?,
+        last_accessed_at: row.get(9)?,
     })
 }
 
@@ -775,7 +925,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             indexed_at       INTEGER NOT NULL,
             embedder_version TEXT NOT NULL,
             skipped          INTEGER NOT NULL DEFAULT 0,
-            skip_reason      TEXT
+            skip_reason      TEXT,
+            last_accessed_at INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -801,6 +952,28 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             id   TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS path_ids_id ON path_ids(id);
+
+        -- status: search-fts5-schema
+        -- External-content FTS5: tokens + offsets only, no duplicated text;
+        -- snippet()/match read chunks.text on demand via the contentless
+        -- linkage. Sync triggers below keep this in lockstep with chunks.
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            text,
+            content='chunks',
+            content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+            INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
         "#,
         dim = EMBED_DIM,
     ))?;
