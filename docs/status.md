@@ -51,6 +51,7 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `status-bar-goto-line` | planned | — | line:col is display-only |
 | `three-column-layout` | done | `ui/index.html`, `ui/src/style.css` | grid, sides collapsible |
 | `panel-toggle-buttons` | done | `ui/index.html:19` | sidebar + related toggles |
+| `side-panel-resize` | planned | — | drag handle on inner edge of sidebar and discovery panel; `col-resize` cursor on hover; per-vault width persistence via `vault.sidebar_width` / `vault.discovery_width`; min/max clamps; toggle still hides wholesale |
 | `cm6-extension-order` | done | `ui/src/main.ts:113` | basicSetup → lang → save tracking → keymap |
 | `cm6-editor-reuse` | done | `ui/src/main.ts:194` | doc replaced via dispatch on switch |
 | `drag-and-drop-move` | done | `ui/src/main.ts` (`attachDnd`, `performDrop`), `core/src/ops.rs` (`move_folder`) | file DnD calls Tauri `move_note`; folder DnD calls Tauri `move_folder` → `core::ops::move_folder` (owns watcher suppression + `IndexJob::MoveFolder` send/await) → indexer-side `core::vault::move_folder` (single fs rename + bulk index path remap via `Store::rename_notes_by_paths`). Empty subfolders move with the rename for free. Buffer follows when the open file is inside the moved subtree |
@@ -227,6 +228,12 @@ v1 surface landed: TOML loader + auto-create + targeted write-back, editor / ind
 | `settings-default-vault-autoopen` | done | `core/src/config.rs` (`Config::user_default_vault`), `ui/src-tauri/src/lib.rs` (`get_default_vault`, `open_vault_at` — single shared open path; no backend dialog), `ui/src/main.ts` (`bootstrapDefaultVault` reads default, auto-opens; falls through to JS dialog via `@tauri-apps/plugin-dialog` on `HikerError::NotFound` with toast) | folder picker is a JS-only concern per spec; backend exposes `open_vault_at(path)` as the single shared entry point. Missing path returns `not_found` → toast + picker fall-through, never clears the setting |
 | `settings-section-keymap` | planned | — | stub; loader for `keymap.<binding-id> = "<chord>"` deferred until first user remap |
 | `settings-schema-version` | done | `core/src/config.rs` (`SCHEMA_VERSION`, mismatch check in `Config::load`) | top-level integer; mismatch hard-fails with "schema_version N, this binary expects M" |
+| `agent-write-review-mode` | planned | — | umbrella opt-in for routing agent-driven writes through the diff viewer before they hit source files; flag exists per surface (`[mcp.tools].review_required`, `[llm.background].review_required`); both default `false` |
+| `agent-write-staging-dir` | planned | — | proposed writes land at `<vault>/.hiker/staging/<rel-path>` plus a `<staging-path>.meta.json` sidecar (surface, prompt slug, source-hash-at-proposal-time, author class); `core::staging` owns stage/list/accept/reject |
+| `agent-write-review-via-diff` | planned | — | Apply / Reject banner actions on `diff-viewer-pane`; Apply does drift-checked `vault.write_file_checked` + `core::changes` row tagged `metadata.reviewed = true` + staging cleanup; Reject deletes proposal with no changelog row |
+| `agent-write-review-queue` | planned | — | "Pending agent changes (N)" home-page widget; row click → diff viewer; subscribes to `hiker:staging-changed`; hidden when N == 0 |
+| `agent-write-review-pending-response` | planned | — | MCP write tools return `status: "staged"` + staging path when review mode is on, so the agent can describe outcomes accurately rather than claiming a write that hasn't landed |
+| `agent-write-staging-retention` | planned | — | stale proposals GC on vault open (default 14 days); configurable retention deferred until asked |
 
 
 ## Clustering (clustering.md)
@@ -383,7 +390,14 @@ All deferred. Lands with the v3.5 ACP-client + bundled-agent milestone in `desig
 | ---- | ------ | ----- |
 | `llm-core-module` | planned | `core::llm` wraps graniet/`llm` crate; multi-provider via single trait + builder; module discipline (only place `llm` crate is imported) |
 | `llm-providers-config` | planned | `vault/.hiker/llm.toml` + user-scope fallback; provider/model/api_key_env/base_url/limits; api keys via env vars |
-| `llm-basic-agent-loop` | planned | `core::agent` — message-history + tool-dispatch loop on top of `core::llm`; default backend for the chat panel; bounded tool-call iterations |
+| `llm-basic-agent-loop` | planned | `core::agent` — message-history + tool-dispatch loop on top of `core::llm`; default backend for the chat panel; bounded tool-call iterations. Tools dispatch through MCP (`agent-tool-routing-via-mcp`); streams `AgentEvent` on `hiker:chat-event`; cap + timeout circuit-breakers per `agent-iteration-cap-prompt` / `agent-tool-call-timeout` |
+| `agent-tool-routing-via-mcp` | planned | `core::agent` calls into the in-process `core::mcp` server for tool dispatch (direct trait dispatch, not HTTP); one tool registry shared with the ACP path; new agent-callable verbs land once in MCP and both backends pick them up |
+| `agent-event-stream-shape` | planned | `AgentEvent` enum on `hiker:chat-event`; `turn_id` + `step_id` discriminators; `TextDelta` / tool-call lifecycle / `IterationCapHit` / `TurnFinished` / `Error`; same enum emitted by `core::agent` and `core::acp` |
+| `agent-chat-command-surface` | planned | `chat_send` / `chat_continue` / `chat_stop` / `chat_cancel` Tauri commands; backend keeps `Arc<Mutex<HashMap<TurnId, TurnState>>>`; per-turn tokio task ownership |
+| `agent-iteration-cap-prompt` | planned | per-turn cap on LLM calls (default 10, `[llm.agent] iteration_cap`); on hit suspends loop and emits `IterationCapHit`; chat panel shows Continue/Stop row; Continue resets cap to full budget |
+| `agent-tool-call-timeout` | planned | default 30s per MCP tool call (`[llm.agent] tool_timeout_secs`); timeout synthesizes a `ToolResult { ok: false }` back into context so the model can recover; not turn-killing |
+| `fanout-event-stream-shape` | planned | separate `FanoutEvent` enum on `hiker:fanout-event` (`JobStarted` / `ItemStarted` / `ItemFinished` / `JobFinished` / `JobCancelled` / `Error`) + `fanout_cancel(job_id)` Tauri command; lands with first fan-out feature (RAPTOR build is the natural anchor) |
+| `note-mutation-progress-toast` | planned | small in-flight indicator with cancel during the `core::llm::chat` single-shot; diff viewer (`diff-viewer-pane`) is the post-completion review surface; non-streaming since the deliverable is a derived file |
 | `llm-acp-client-optional` | planned | `core::acp` — optional client for external ACP agents (Claude Code / Goose / ...); chat-panel-only; never wired for background or fan-out |
 | `llm-context-injection` | planned | when hiker has high-confidence relevant context for an interactive turn, inject it as Embedded Resource (ACP) or in-prompt context (basic agent loop) |
 | `llm-disable-mode` | planned | `[llm] enabled = false` turns off background + fan-out + chat panel; MCP server stays available |
@@ -395,6 +409,34 @@ All deferred. Lands with the v3.5 ACP-client + bundled-agent milestone in `desig
 | `llm-prompt-test-button` | planned | "test prompt with sample data" affordance in Prompts tab |
 | `llm-audit-log` | planned | `vault/.hiker/agent-log/<YYYY-MM-DD>.jsonl`; one entry per LLM call (any module); daily rotation; full text gated on `[llm.audit] log_full_prompt = true` |
 | `llm-cost-transparency` | planned | status-bar indicator of recent LLM activity; click opens audit log viewer |
+| `chat-panel-pinned-bottom` | planned | chat surface lives at the bottom of the discovery panel, pinned and expanding upward; same column as search/related; same `panel-toggle-buttons` toggle |
+| `chat-panel-detached-scroll` | planned | discovery sections (search/related/future) scroll as a unit above the divider; chat region scrolls independently below it |
+| `chat-panel-vertical-resize` | planned | drag handle on the top edge of the chat region; `row-resize` cursor on hover; sibling shape to `side-panel-resize` rotated 90° |
+| `chat-panel-default-height` | planned | first-open default ~30% of the panel; persisted per-vault via `settings-write-back` to `vault.chat_height` |
+
+
+## Diff viewer (diff.md)
+
+All planned. Pane-state surface taking two labeled buffers; first consumers are the note-mutation accept/decline flow and the snapshot-vs-current activity diff. Architectural decisions (pane-state not modal, jsdiff JS-side, CM6 line decorations, consumer-defined banner actions) live in the spec.
+
+| Slug | Status | Notes |
+| ---- | ------ | ----- |
+| `diff-viewer-pane` | planned | fourth `#editor-pane` state alongside editor / home overview / home detail; banner mirrors trash + snapshot preview shape; pushes onto `navigation-history-stack` |
+| `diff-viewer-input-shape` | planned | `{ before: { label, content, meta? }, after: ..., actions?: [DiffAction] }`; consumers pass action labels + handlers; viewer awaits + closes on success |
+| `diff-viewer-line-unified` | planned | red removed / green added / grey context; CM6 read-only EditorView with line decorations; jsdiff Myers; hunk separators with click-to-expand context |
+| `diff-viewer-banner-actions` | planned | up to two consumer-supplied buttons in banner (Replace original / Restore this version / etc.); plus Close |
+| `diff-viewer-respects-dirty-source` | planned | entering diff doesn't fire file-switch-guard (no buffer swap); Replace-original errors when source has unsaved edits rather than dropping them |
+| `note-mutation-diff-review` | planned | mutation result swaps pane to diff viewer with source ↔ derived; derived file isn't otherwise exposed as a buffer in v1 |
+| `note-mutation-replace-original` | planned | banner action: drift-checked write of `after.content` to source via `vault.write_file_checked`; appends `'modified'` row to `core::changes` with `metadata.mutation = "<name>"`; deletes derived |
+| `note-mutation-discard-derived` | planned | banner action: deletes derived file, no activity row, returns pane to editor on unchanged source |
+| `snapshot-preview-diff-toggle` | planned | "Show diff vs current" banner action on `snapshot-preview-mode` swaps to diff viewer with snapshot ↔ current; `[Restore this version]` moves into diff banner unchanged |
+| `activity-detail-diff-between-versions` | planned | multi-select two activity rows + "Diff selected"; pane swaps with both buffers as snapshot blobs; no action buttons (pure inspection); depends on activity-detail multi-select |
+| `diff-viewer-split-view` | planned | side-by-side rendering as banner-anchored mode toggle |
+| `diff-viewer-intraline` | planned | character-level highlights inside changed lines |
+| `diff-viewer-three-way` | planned | third buffer slot for merge / drift-conflict resolution; anchors `drift-conflict-modal`'s deferred "open diff" option |
+| `diff-viewer-ignore-whitespace` | planned | banner toggle to compute diff on whitespace-normalized text |
+| `diff-viewer-export-patch` | planned | "copy as unified-diff patch" affordance |
+| `note-mutation-keep-derived` | planned | third banner action: keep derived alongside source as a separate buffer (lands if the workflow earns it) |
 
 
 ## Changes log (changes.md)

@@ -9,6 +9,7 @@ Known issues in the codebase. Each row is a kebab-case slug, a one-line descript
 
 | Slug | File | Notes |
 | ---- | ---- | ----- |
+| `bug-discovery-sections-overlap-after-toggle-cycles` | `ui/src/main.ts` (`applySectionCollapsed`, `setSearchSectionExpanded`, `setRelatedSectionExpanded`) | after several expand/collapse cycles of the Search results and Related notes sections, the two sections visually overlap. Likely a height / flex layout bug in the discovery panel where the collapse class leaves residual sizing on one section so the next expand stacks on top. Repro: toggle each chevron a handful of times alternately |
 
 
 ## Resolved

@@ -254,6 +254,19 @@ Default state on first launch: tree open, related panel collapsed. Persistence o
 
 CSS: a 3-column grid where the side columns collapse to width 0 (or `display: none`) when toggled. Editor column is `1fr`; sides are fixed widths. Toolbar lives inside the editor column so the buttons sit where the user's eyes naturally are.
 
+### Resizable side columns
+
+Both side columns are user-resizable horizontally via a drag handle on the inner edge — the boundary between the sidebar and the editor, and the boundary between the editor and the discovery panel. Hovering the boundary swaps the cursor to the standard horizontal-resize affordance (`col-resize`); dragging adjusts that column's width live. The editor column stays `1fr` and absorbs the slack, so resizing one side never compresses the other side. [side-panel-resize]
+
+Constraints:
+
+- **Min / max widths.** Each side column has a min width (~160px for the sidebar so file names stay readable; ~220px for the discovery panel so search-result snippets don't wrap into uselessness) and a max width (~50% of the window so the editor column can't be squeezed to nothing). Drags clamp at the bounds; the cursor stays as `col-resize` so the user sees they've hit the limit.
+- **Collapse interaction.** The toggle buttons (`panel-toggle-buttons`) still hide / show the column wholesale — collapse is `display: none`, not "drag width to 0." Re-opening restores the last user-set width.
+- **Persistence.** The two widths persist per-vault via `settings-write-back` to `vault.sidebar_width` / `vault.discovery_width` (eligible-key set grows by two). Defaults match the existing fixed widths so users who never drag see no change.
+- **Implementation.** Plain pointer-event drag on a 4-px-wide handle element absolutely positioned over the column's inner edge. No third-party splitter library; CM6 reflows on the editor column resize for free. The handle is purely visual on hover (subtle accent) — no persistent divider chrome, matches the rest of the UI's "quiet by default" treatment.
+
+The same handle slot exists on both sides regardless of whether the discovery panel is currently showing search-results, related notes, or the chat surface (`chat-panel-pinned-bottom`) — width is a panel-level affordance, not a section-level one.
+
 
 ## View options menu
 
@@ -342,7 +355,7 @@ Refresh: subscribes to a new `hiker:changes-appended` event emitted whenever the
 
 Vault home widget tiles support a drill-in pattern. **Click on a widget's tile or header → home view body swaps to a detail view for that widget.** No back button affordance — clicking the Home button in the vault bar always returns to the home overview, regardless of whether you're in the overview or a detail view. Clicking a note row in any detail view exits home and opens the editor on that note (same shape as `openFile` already exits home view today). [vault-home-detail-views]
 
-Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has three states — editor, home overview, home detail. The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; back transitions are via Home button (→ overview) or note-row click (→ editor).
+Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has four states — editor, home overview, home detail, and the diff viewer (`diff-viewer-pane`, see `diff.md`). The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; the diff viewer is entered from a snapshot preview's "Show diff vs current" action, from the note-mutation accept/decline flow, or from a future drift-conflict review; back transitions are via Home button (→ overview), note-row click (→ editor), or the diff viewer's Close button (→ wherever the user came from).
 
 Per-widget detail views, in roughly the order they earn their keep:
 
@@ -488,4 +501,4 @@ Editor instance is created once at startup and reused across buffer switches; sw
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)
 - External-change watcher integration (v1)
-- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched and the derived view is opt-in. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. **Routing (per `llm.md`):** this menu's actions are single-shot deterministic prompts — one click, one prompt, one derived file — so they use `core::llm` direct, *not* `core::agent` or `core::acp`. Provider (Ollama for local, OpenAI / Anthropic / etc. for cloud) is the user's `[llm]` config; no per-feature backend selection in this menu, no in-process model runtime. [note-mutations-menu]
+- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched until the user accepts. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. **Routing (per `llm.md`):** this menu's actions are single-shot deterministic prompts — one click, one prompt, one derived file — so they use `core::llm` direct, *not* `core::agent` or `core::acp`. Provider (Ollama for local, OpenAI / Anthropic / etc. for cloud) is the user's `[llm]` config; no per-feature backend selection in this menu, no in-process model runtime. **Review surface (per `diff.md`):** when a mutation completes, the editor pane swaps to the diff viewer (`diff-viewer-pane`) with the source on the left and the derived output on the right. Two banner actions — Replace original (`note-mutation-replace-original`, drift-checked write to source + activity row + derived deletion) and Discard derived (`note-mutation-discard-derived`, no activity row, derived deleted). Diff is the only review surface in v1; the derived file isn't otherwise exposed as a buffer. [note-mutations-menu]

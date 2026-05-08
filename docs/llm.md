@@ -104,13 +104,125 @@ Shape:
 - Takes a user message + accumulated history.
 - Calls `core::llm::chat_stream` with a system prompt that describes the available vault tools.
 - Parses tool-call requests from the response (using the `llm` crate's tool-calling support).
-- Dispatches tool calls to hiker's vault primitives (search, get_note, get_chunks, etc.) — for v0 likely calling `core::*` modules directly; eventually possibly via `core::mcp` for consistency with the ACP path.
-- Loops until the model produces a terminal user-facing response (no further tool calls).
+- **Dispatches tool calls through hiker's in-process MCP server** (`core::mcp`), not through direct `core::*` calls. The MCP tool registry is already the source of truth for the agent-facing tool surface (`mcp-tool-search-notes`, `mcp-tool-get-note`, `mcp-tool-write-note`, etc.), and the external ACP path goes through it too. Routing the basic agent loop through the same surface means one tool registry, one set of audit-log shapes, one place to add a new agent-callable verb. The in-process call uses the rmcp client against the local server (no HTTP for the hiker-internal case — direct trait dispatch). [agent-tool-routing-via-mcp]
+- Loops until the model produces a terminal user-facing response (no further tool calls), with the iteration cap and per-tool-call timeout described in the next section as circuit-breakers.
 - Returns a streaming response to the chat panel.
 
 Not trying to compete with Claude Code or Goose — those are full agents with multi-step planning, sub-agent spawning, code execution, etc. This is *just* "let the model search and read the vault, respond." If a user wants more, ACP is the upgrade path.
 
 Tool dispatch surface lives in this module; tool implementations are thin wrappers over existing `core::*` API. [llm-basic-agent-loop]
+
+
+## Chat panel UI
+
+The chat panel is the user-facing surface for interactive features. Whether the backend is `core::agent` (the basic in-hiker loop) or `core::acp` (an external agent), the panel shape is the same — only the bytes flowing through it change.
+
+The headline decisions:
+
+- **The chat panel is the bottom region of the discovery panel** — same right-hand column that already hosts search results and related notes (`search-discovery-panel`). The panel's vertical layout is: discovery sections (search results / related / future surfaces) take the top, the chat surface is **pinned at the bottom and expands upward**. Same column, same width, same toggle button (`panel-toggle-buttons`) flips the whole panel open / closed. [chat-panel-pinned-bottom]
+- **Chat scrolls independently from the sections above it.** The discovery panel becomes a two-region layout: a top region holding the search/related/future sections (which scroll as a unit, same shape as today), and a bottom region holding the chat (which scrolls on its own). Scrolling a long agent transcript doesn't move the search results out of view, and scrolling search results doesn't unanchor the chat input. [chat-panel-detached-scroll]
+- **The chat region is vertically resizable** via a drag handle on its top edge — the boundary between the discovery sections region and the chat region. Standard UX: hovering the boundary swaps the cursor to `row-resize`; dragging up grows the chat region (shrinking the sections region) and vice versa. Same affordance shape as `side-panel-resize`, rotated 90°. [chat-panel-vertical-resize]
+
+Layout sketch (extends the `search.md` discovery-panel diagram):
+
+```
+┌─ Discovery ─────────────────────┐
+│  [search input]      [S] [L]    │  ← input + mode toggles
+│                                 │
+│  ▼ Search results (8)           │  ← scrolls independently
+│    ...                          │
+│  ▼ Related notes (5)            │     of the chat region below
+│    ...                          │
+├─────────────── ↕ ───────────────┤  ← drag handle (chat-panel-vertical-resize)
+│  agent: here's what I found...  │  ← chat transcript
+│  user: also check the inbox     │     scrolls independently
+│  agent: ...                     │
+│                                 │
+│  [chat input]              [↑]  │  ← input pinned at the very bottom
+└─────────────────────────────────┘
+```
+
+Behavior details:
+
+- **Default split.** First open of a vault gives the chat region a small but useful default height (~30% of the panel) so the input is visible without dragging. Persisted per-vault via `settings-write-back` to `vault.chat_height` (eligible-key set grows by one). [chat-panel-default-height]
+- **Min height.** The chat region has a minimum height that fits the input row plus one or two transcript lines — dragging below that snaps to the minimum rather than disappearing. The chat surface doesn't have its own collapse toggle; the discovery panel toggle (`panel-toggle-buttons`) is the only way to hide it, and it hides the whole right column.
+- **Disable mode interaction.** When LLM features are disabled (`llm-features-disable-entirely`), the chat region is removed entirely (not just minimized) — the discovery sections take the full panel height, and the divider handle disappears. Re-enabling LLM features restores the persisted split.
+- **Empty / pre-conversation state.** Before the first turn, the transcript area shows a small placeholder ("Ask about your vault, or pick a suggestion below…") plus optional starter chips. Once a turn lands, the placeholder is gone for the rest of the session. The transcript autoscrolls to the latest message on each turn unless the user has scrolled up — same well-trodden chat-UI rule.
+- **Keybind.** Reserves `chat.focusInput` in `keybind-registry` for focusing the chat input from anywhere (chord TBD; lands when the keybind is wired). Esc in the chat input blurs back to the editor — symmetric with the existing search-input Esc behavior.
+
+The chat region's *contents* (transcript rendering, tool-call display, streaming behavior, attached-context affordances) are out of scope for this section — they ride on top of the placement / resize shape pinned here. Concrete UI shapes for tool-call confirmations, embedded-resource context cards, and the multi-turn affordances live in their own slugs when each backend's interactive surface is implemented (`llm-basic-agent-loop`, `llm-acp-client-optional`).
+
+
+## Event streams and Tauri command surface
+
+The agent loop streams its progress to the chat panel through a typed event channel; the panel calls back into the loop for user-driven actions (continue past a cap, stop, cancel mid-stream). Same shape applies whether the backend is `core::agent` or `core::acp` — the UI only sees the event enum.
+
+### AgentEvent
+
+A discriminated-union enum emitted on the Tauri event `hiker:chat-event`. Every event carries `turn_id` (one per user message) and most carry `step_id` (one per LLM call within a turn — increments on each tool-loop iteration). [agent-event-stream-shape]
+
+```rust
+enum AgentEvent {
+    TurnStarted       { turn_id, user_message_summary }
+    StepStarted       { turn_id, step_id }
+    TextDelta         { turn_id, step_id, text }
+    ToolCallStart     { turn_id, step_id, call_id, tool_name }
+    ToolCallArgsDelta { turn_id, step_id, call_id, args_delta }
+    ToolCallComplete  { turn_id, step_id, call_id, args }
+    ToolResult        { turn_id, step_id, call_id, ok, summary }
+    StepFinished      { turn_id, step_id, finish_reason }
+    IterationCapHit   { turn_id, completed_iterations }
+    TurnFinished      { turn_id, usage, cost_estimate }
+    Error             { turn_id, step_id: Option<u32>, message }
+}
+```
+
+Translation happens at the `core::agent` boundary: provider-specific chunks from the `llm` crate's `chat_stream` are normalized into this enum so the chat panel never sees Anthropic-vs-OpenAI-vs-Ollama shape differences. The ACP path (`core::acp`) emits the same enum so the panel renders both backends identically.
+
+**Why a single global event channel** rather than Tauri 2's per-invoke `Channel<T>`: continue / stop / cancel commands address an existing in-flight turn from a separate Tauri call, which a per-invoke channel doesn't model cleanly. Frontend filters by `turn_id`; one line.
+
+### Tauri command surface
+
+```rust
+chat_send(message, turn_id) -> Result<()>     // start a turn; events stream back
+chat_continue(turn_id)      -> Result<()>     // resume a loop paused at IterationCapHit
+chat_stop(turn_id)          -> Result<()>     // user halt; drops loop state, emits TurnFinished
+chat_cancel(turn_id)        -> Result<()>     // mid-stream abort; cancels the in-flight LLM call too
+```
+
+Backend keeps an `Arc<Mutex<HashMap<TurnId, TurnState>>>` so continue / stop / cancel can address active turns. Each turn owns its tokio task; cancel drops the task handle. Stop preserves whatever has been streamed; cancel is the harsher abort. [agent-chat-command-surface]
+
+### Iteration cap + Continue/Stop prompt
+
+The loop has a per-turn cap on LLM calls. Default **10** (i.e. up to 9 tool roundtrips before the model has to produce a terminal answer). Configurable per-vault under `[llm.agent] iteration_cap` in `llm.toml`.
+
+On hit:
+
+1. The loop suspends; in-memory turn state retained.
+2. `IterationCapHit { turn_id, completed_iterations }` fires.
+3. The chat panel renders a system-style row in the transcript: "Agent has made N tool calls — [Continue] [Stop]."
+4. **Continue** calls `chat_continue(turn_id)`, the loop resumes with the cap **reset to its full budget** (so 10 more), not "+1." Resetting on continue is honest — the user explicitly opted into more work, and incremental "+1" continues would be a worse UX.
+5. **Stop** calls `chat_stop(turn_id)`, which emits `TurnFinished` with `finish_reason = "user_halted"` and drops the turn state.
+
+The cap is a circuit-breaker against runaway tool-call loops, not a hard semantic limit. The prompt makes the pause visible rather than letting "thinking…" spin forever or auto-killing a turn that was about to land its terminal answer. [agent-iteration-cap-prompt]
+
+### Per-tool-call timeout
+
+Each MCP tool call gets a default **30s** timeout (configurable under `[llm.agent] tool_timeout_secs`). On timeout, the loop emits a synthesized `ToolResult { ok: false, summary: "tool timed out" }` back into the model's context so it can decide to retry, try a different tool, or give up. The loop does not bubble timeouts as turn-killing errors — the agent is allowed to recover.
+
+A timed-out tool task is dropped (its tokio handle cancelled) so resources don't leak when the model moves on without it. Repeated timeouts on the same tool name within a turn are not specially handled in v1 — the iteration cap will catch any pathological "retry-the-stuck-tool-forever" loop. [agent-tool-call-timeout]
+
+### Other event shapes (forward refs)
+
+The agent path covers interactive features. Background and fan-out features have intentionally different UI shapes since their concerns aren't streaming text — the shapes are pinned here so they don't accidentally diverge.
+
+- **Fan-out features** emit a separate `FanoutEvent` enum (`JobStarted` / `ItemStarted` / `ItemFinished` / `JobFinished` / `JobCancelled` / `Error`) on `hiker:fanout-event`, plus a `fanout_cancel(job_id)` Tauri command. UI is a progress widget (count, ETA, cancel) per the fan-out feature-type rules above. Lands with the first fan-out feature; RAPTOR build is the natural anchor. [fanout-event-stream-shape]
+- **Background features** have no per-call UI. Failures show a toast; success applies silently. The aggregate `llm-cost-transparency` status-bar indicator is the only persistent surface, reading counts from `llm-audit-log`. No event channel needed.
+- **Note-mutation features** route through `core::llm` direct (per `note-mutations-menu`), so no AgentEvent stream. UI is a small in-flight indicator with cancel during the call, followed by the diff viewer (`diff-viewer-pane`) for accept/decline review per `note-mutation-diff-review`. The single-shot completion fires through `core::llm::chat` (non-streaming) since the deliverable is a derived file rather than a live conversation; streaming-into-the-derived-buffer is an additive UX, not a different architecture. [note-mutation-progress-toast]
+
+### Audit log integration
+
+Every event-emitting surface (agent turns, fan-out items, single-shot mutations, background calls) writes one row to `llm-audit-log` per LLM call. The audit row's `surface` field discriminates (`core::llm | core::agent | core::acp`), and for agent turns the row carries `turn_id` + `step_id` so a debugging trail can correlate panel events with audit entries. Audit writes happen at the `core::llm` boundary, so all four call sites share one writer.
 
 
 ## `core::acp` (optional ACP client)

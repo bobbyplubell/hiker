@@ -140,6 +140,52 @@ Stub. The full schema lives in `index.md`'s embedder section (`embedder-config-s
 Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables routing the chat panel through an external ACP agent instead of the basic agent loop. Shape: `agent` (registry id, "bundled" alias for the basic loop, or "none" for disable mode). Loader lands with `core::acp` itself.
 
 
+## Review-before-apply for agent writes
+
+Agent-driven writes (MCP tool calls, opt-in background features) are higher-risk than user saves: the user didn't author the bytes and may not even have been watching when they landed. Hiker offers an opt-in **review-before-apply** mode that gates these writes through the diff viewer (`diff.md`) using the same staging pattern as the note-mutation flow.
+
+The headline decisions:
+
+- **Off by default; opt-in per write surface.** Existing behavior — agent writes apply directly + append a `core::changes` row — stays the default. Users who want a checkpoint in the loop flip the flag per surface (MCP / background features). [agent-write-review-mode]
+- **Proposed writes land in `.hiker/staging/<rel-path>`** until reviewed. Mirrors `.hiker/derived/` from `note-mutations-menu`; same never-mutate-source rule. The staging file is the proposal; the source on disk is unchanged. The watcher's `.hiker/` ignore covers staging for free. [agent-write-staging-dir]
+- **Review surface is the diff viewer** (`diff-viewer-pane`). Banner shows `before = current source`, `after = proposed staging blob`, plus action buttons: **Apply** (drift-checked write to source via `vault.write_file_checked`, append `core::changes` row tagged `metadata.reviewed = true` and `metadata.review_source = "<surface>"`, delete the staging file) and **Reject** (delete the staging file, no activity row). Same shape as `note-mutation-replace-original` / `note-mutation-discard-derived`. [agent-write-review-via-diff]
+- **Queue surface in vault home.** A "Pending agent changes (N)" widget appears on the home page when the staging dir is non-empty; click → list of proposals; click a row → diff viewer for that proposal. Hidden when N == 0 so an empty queue isn't a constant presence. Subscribes to a new `hiker:staging-changed` event so the widget reflects new proposals live. [agent-write-review-queue]
+- **The agent's response stays honest about staging.** When review mode is on, MCP write tools return success-with-pending semantics — the JSON response carries `status: "staged"` plus the staging path so the agent can describe the outcome accurately ("I staged a change to `note.md`; user review is pending"). The agent doesn't get to claim the write landed when it didn't. [agent-write-review-pending-response]
+
+### Where the config keys live
+
+The keys themselves live in their owning sections (so each surface can describe its own knob in its own doc), with a single review-mode slug spanning them:
+
+- **`[mcp.tools].review_required`** (bool, default `false`) — extends `mcp-config-section`. When true, every successful tool-write (`mcp-tool-write-note`, `mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) routes through the staging dir instead of writing directly. The audit log row carries `surface = "mcp-tool-call"` and `outcome = "staged"`.
+- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section per `llm.md`. When true, debounced background features (auto-tag-on-save, summary-on-save, cluster summarization) write to staging instead of mutating frontmatter directly. The save burst still coalesces to one prompt per `llm-feature-debounce`; the change just doesn't land until the user accepts.
+
+Two flags rather than one because the threat models differ: an interactive agent writing through MCP is a different opt-in decision than silent background automation. A user might trust their own agent enough to skip review on tool calls while still wanting eyes on every auto-tag. The flags are independent.
+
+### Lifecycle of a staged proposal
+
+1. Agent writes through `mcp-tool-write-note` (or a background feature fires). With `review_required = true`, the write target is `<vault>/.hiker/staging/<rel-path>` instead of `<vault>/<rel-path>`. Staging directories are auto-created.
+2. The staging file's content is the agent's proposed bytes. A sidecar `<staging-path>.meta.json` records the surface, the source path's `loadedHash` at proposal time (for drift-detection on apply), the agent author class, and the prompt slug if the surface knows it.
+3. `hiker:staging-changed` fires; the home-page queue widget refreshes.
+4. User opens the proposal in the diff viewer. **Apply** → `vault.write_file_checked` against the meta sidecar's recorded hash. Drift mismatch (the source moved since the proposal was made) surfaces in the existing `drift-conflict-modal` shape; the user picks keep-source / take-staging / cancel. On success: `core::changes` row + staging file + sidecar deleted. **Reject** → both files deleted, no changelog row.
+5. Stale proposals (older than 14 days by default; configurable under the same review-mode keys) GC on vault open. Same shape as `changes-retention`. Defer the configurable retention until a user asks. [agent-write-staging-retention]
+
+The staging dir does *not* count as part of `core::changes` history — proposals that never apply leave no trace beyond the GC log line. Only accepted writes hit the changelog.
+
+### Module placement
+
+- `core::ops::agent_write_note` (and the frontmatter / tag wrappers) gain a branch on the loaded `Config`'s review flag and route to `core::staging` when set. `core::staging::stage(rel, content, meta)` writes the staging file + sidecar atomically.
+- `core::staging::list / accept / reject` — read the staging dir, accept-with-drift-check, reject-and-delete.
+- UI: home-page "Pending agent changes" widget; row click → diff viewer with the staging-aware actions wired in.
+- MCP server response shapes extend per `agent-write-review-pending-response` so the agent surface accurately reflects staging.
+
+### Forward refs
+
+- `diff.md` defines the review viewer (`diff-viewer-pane`, `diff-viewer-banner-actions`); this section's Apply / Reject are concrete instances of the consumer-defined banner action contract.
+- `mcp.md` `mcp-config-section` gets the actual `tools.review_required` row when this lands; `mcp-tool-write-note` and the frontmatter/tag wrappers gain the staging branch.
+- `llm.md` `[llm.background]` config gets `review_required` when background features land.
+- `core::changes` is unchanged — it sees only accepted writes; rejected proposals don't appear.
+
+
 ## Loading lifecycle
 
 Single `Config::load(vault_root: &Path) -> Result<Config>` in `core::config` is the only entry point. Order:
