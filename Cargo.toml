@@ -34,3 +34,4 @@ rmcp = { version = "1.6", default-features = false, features = ["server", "macro
 schemars = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tokio-util = "0.7"
+zstd = "0.13"

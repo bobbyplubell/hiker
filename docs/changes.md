@@ -182,6 +182,45 @@ GC runs as a low-priority job from the indexer task, opportunistically when no o
 Special-case: `op='deleted'` rows are never GC'd by the per-path policy alone — they're the rollback target for "undelete" operations. GC removes them only when the path is fully gone (no recent rows of any kind in retention window) and the trash entry for the original delete is also gone (consistency with `vault-trash`).
 
 
+## Content compression
+
+The `content` BLOB is stored zstd-compressed; `Changes::content_at` and `previous_content_for_path` decode transparently. Markdown compresses 4–8× routinely, and the BLOB is by far the dominant on-disk cost (every other column is small + bounded), so this is where the storage lever is. [changes-content-zstd]
+
+- **Encode at append.** `Changes::append` runs `zstd::encode_all(content, level=3)` before binding the BLOB. Level 3 is zstd's default — fast encode with near-best text ratio at that setting; higher levels gain <10% for ~3× encode time.
+- **Decode at read.** `content_at` and `previous_content_for_path` decode before returning `Vec<u8>`. Consumers (`rollback_change`, `restore_snapshot`, the snapshot-preview buffer, future sync push) see the same plaintext bytes; no DTO change, no API change.
+- **Empty stays cheap, NULL stays NULL.** `op='deleted'` rows skip the encode path; empty files produce a tiny zstd frame.
+
+### Why zstd specifically
+
+- **Text ratio.** zstd at level 3 hits 4–8× on real markdown; structured prose (headings, lists, fences) routinely beats 6×. zlib reaches similar ratios but encodes ~2× slower at comparable settings; lz4 encodes faster but compresses ~1.5–2× worse on text — wrong tradeoff when rows are written rarely (one per save) and read even more rarely (rollback).
+- **Decode speed.** Sub-millisecond for any payload under the indexer's `max_file_size` cap. The activity widget never blocks on it.
+- **Mature Rust crate.** `zstd` (libzstd bindings) exposes byte-slice helpers — no streaming machinery needed for whole-file payloads.
+- **No tuning surface.** Default level 3 is the right answer; no config knob, no per-vault setting. Compression stays invisible to the user.
+
+### Schema migration
+
+The format change bumps `changes.db` `SCHEMA_VERSION` from 1 to 2. Per the migration stance in the next section, "delete and regenerate" is not an option — the filesystem carries no history. So `Changes::open` on a v1 db runs an in-place migration: walk the `changes` table, re-encode each non-NULL `content` BLOB, write back in a single transaction, bump `user_version`. One-shot; subsequent opens see v2 and skip.
+
+This is the first real schema bump for `changes.db`; the v0→v1 path was just `ensure_schema` from no-such-table.
+
+Failure modes:
+
+- Mid-migration crash → transaction rolls back, db stays v1, next open retries. Idempotent by construction.
+- Decode failure on a v2 read → `ChangesError::Corrupt` carrying the row id and content_hash, per `obs-error-context`.
+
+### What's preserved
+
+- **Per-row self-sufficiency.** Every row still carries its own complete post-op content; rollback to row X reads exactly that row's blob. The "every row is structurally identical to every other row" invariant in the Rollback section holds.
+- **GC simplicity.** Retention drops rows independently; no chain dependencies, no checkpoint logic.
+- **The rollback model.** Both flavors (`rollback_change`, `restore_snapshot`) keep working unchanged — they consume `Vec<u8>` from the API and don't care how it's stored.
+
+### Out of scope for this slug
+
+- Periodic GC vs. open-time GC, tiered retention (full-content vs metadata-only rows), time-based pruning, total-size ceiling — separate slugs; each composes orthogonally with compression.
+- Patch / delta storage between consecutive versions. Considered and rejected as the first move: patches entangle GC with chain integrity and break the per-row self-sufficiency invariant. Compression handles the bulk of the storage problem; if measured workload shows it's insufficient, revisit with a reverse-delta-plus-snapshot design rather than a naive forward chain.
+- Encryption at rest. Orthogonal; the future sync layer's posture covers cross-device, and on-disk encryption (if it ever lands) wraps the storage layer rather than this column.
+
+
 ## Schema versioning
 
 `changes.db` has its own schema version, separate from `index.db`'s. Same fail-loud rule as `store-version-fail-loud`: opening a `changes.db` with mismatched schema aborts with a clear error. *Unlike* `index.db`, there's no "regenerate from filesystem" recovery path — the user must restore from backup or accept the loss. The `obs-error-context` discipline applies; the error message names the file and the version mismatch explicitly.

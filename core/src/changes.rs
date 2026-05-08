@@ -34,8 +34,16 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 /// Bumped only when the on-disk schema changes. Pre-real-use policy mirrors
-/// `store-version-fail-loud`: a mismatch is an error, not a migration.
-pub const SCHEMA_VERSION: i32 = 1;
+/// `store-version-fail-loud`: a mismatch is an error, not a migration —
+/// *except* for paths the changelog can't recover from disk regeneration.
+/// v1 → v2 (zstd content) is migrated in place at open per
+/// `changes-content-zstd`.
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// zstd compression level for the `content` BLOB. Level 3 is zstd's default
+/// and matches the spec — fast encode, near-best ratio for prose; higher
+/// levels gain <10% for 3× the encode time.
+const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ChangesError {
@@ -49,6 +57,15 @@ pub enum ChangesError {
     MetadataJson(String),
     #[error("not found: change {0}")]
     NotFound(i64),
+    /// zstd decode failure on a stored `content` BLOB. Carries the row id
+    /// and the post-op `content_hash` so the caller can correlate against
+    /// the activity feed without re-reading the row.
+    #[error("corrupt content for change {id} (content_hash={content_hash:?}): {message}")]
+    Corrupt {
+        id: i64,
+        content_hash: Option<String>,
+        message: String,
+    },
 }
 
 /// One row in the changelog. `content` is fetched separately via
@@ -130,9 +147,9 @@ impl Changes {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
-        ensure_schema(&conn)?;
+        ensure_schema(&mut conn)?;
         let (appended_tx, _) = broadcast::channel(64);
         Ok(Self {
             conn: Mutex::new(conn),
@@ -208,6 +225,14 @@ impl Changes {
         let metadata_str = serde_json::to_string(&append.metadata)
             .map_err(|e| ChangesError::MetadataJson(e.to_string()))?;
         let ts = now_ms();
+        // status: changes-content-zstd
+        // Encode the content blob at append time. Deleted rows pass content=None
+        // and stay NULL; everything else (including empty bodies) goes through
+        // zstd::encode_all so reads can decode uniformly.
+        let encoded: Option<Vec<u8>> = match append.content {
+            Some(bytes) => Some(zstd::encode_all(bytes, ZSTD_LEVEL)?),
+            None => None,
+        };
         let id = {
             let conn = self.conn.lock().expect("changes mutex poisoned");
             conn.execute(
@@ -220,7 +245,7 @@ impl Changes {
                     append.op.as_str(),
                     append.author,
                     append.content_hash,
-                    append.content,
+                    encoded.as_deref(),
                     append.rename_from,
                     metadata_str,
                 ],
@@ -302,16 +327,28 @@ impl Changes {
 
     /// Pull the content blob for a given change row. Returns `None` for
     /// `op='deleted'` rows (which carry no content) and for unknown ids.
+    /// status: changes-content-zstd — decodes the stored zstd frame
+    /// transparently; consumers see plaintext bytes.
     pub fn content_at(&self, change_id: i64) -> Result<Option<Vec<u8>>, ChangesError> {
         let conn = self.conn.lock().expect("changes mutex poisoned");
-        let blob = conn
+        let row = conn
             .query_row(
-                "SELECT content FROM changes WHERE id = ?1",
+                "SELECT content, content_hash FROM changes WHERE id = ?1",
                 params![change_id],
-                |row| row.get::<_, Option<Vec<u8>>>(0),
+                |row| {
+                    let blob: Option<Vec<u8>> = row.get(0)?;
+                    let content_hash: Option<String> = row.get(1)?;
+                    Ok((blob, content_hash))
+                },
             )
             .optional()?;
-        Ok(blob.flatten())
+        let Some((blob, content_hash)) = row else {
+            return Ok(None);
+        };
+        match blob {
+            Some(b) => Ok(Some(decode_blob(change_id, &content_hash, &b)?)),
+            None => Ok(None),
+        }
     }
 
     /// The most recent prior content for `path` strictly before `before_id`,
@@ -331,7 +368,7 @@ impl Changes {
         let conn = self.conn.lock().expect("changes mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT id, content FROM changes
+                "SELECT id, content, content_hash FROM changes
                  WHERE path = ?1 AND id < ?2 AND content IS NOT NULL
                  ORDER BY id DESC
                  LIMIT 1",
@@ -339,11 +376,15 @@ impl Changes {
                 |row| {
                     let id: i64 = row.get(0)?;
                     let content: Vec<u8> = row.get(1)?;
-                    Ok((id, content))
+                    let content_hash: Option<String> = row.get(2)?;
+                    Ok((id, content, content_hash))
                 },
             )
             .optional()?;
-        Ok(row)
+        match row {
+            None => Ok(None),
+            Some((id, blob, hash)) => Ok(Some((id, decode_blob(id, &hash, &blob)?))),
+        }
     }
 
     /// Run a retention pass. Keeps the most recent `keep_per_pair` rows per
@@ -415,10 +456,17 @@ fn configure(conn: &Connection) -> Result<(), ChangesError> {
     Ok(())
 }
 
-fn ensure_schema(conn: &Connection) -> Result<(), ChangesError> {
+fn ensure_schema(conn: &mut Connection) -> Result<(), ChangesError> {
     let user_version: i32 =
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version != 0 && user_version != SCHEMA_VERSION {
+    // status: changes-content-zstd
+    // v1 → v2: re-encode every existing `content` BLOB with zstd. Pre-bump
+    // rows held raw bytes; post-bump rows hold a zstd frame. One-shot
+    // migration in a single transaction so a mid-run crash rolls back to v1
+    // and the next open retries.
+    if user_version == 1 {
+        migrate_v1_to_v2(conn)?;
+    } else if user_version != 0 && user_version != SCHEMA_VERSION {
         return Err(ChangesError::VersionMismatch {
             found: user_version,
             expected: SCHEMA_VERSION,
@@ -450,6 +498,55 @@ fn ensure_schema(conn: &Connection) -> Result<(), ChangesError> {
         );
     }
     Ok(())
+}
+
+/// In-place v1 → v2 migration: walk every row with non-NULL content,
+/// re-encode the raw bytes with zstd, write back, bump `user_version`.
+/// Whole pass in one transaction so a crash rolls back atomically.
+fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), ChangesError> {
+    tracing::info!("changes: migrating v1 → v2 (zstd-encoding content blobs)");
+    let tx = conn.transaction()?;
+    let pairs: Vec<(i64, Vec<u8>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, content FROM changes WHERE content IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut count: usize = 0;
+    {
+        let mut update = tx.prepare("UPDATE changes SET content = ?1 WHERE id = ?2")?;
+        for (id, raw) in pairs {
+            let encoded = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL)?;
+            update.execute(params![encoded, id])?;
+            count += 1;
+        }
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    tracing::info!(
+        rows = count,
+        schema_version = SCHEMA_VERSION,
+        "changes: migration complete",
+    );
+    Ok(())
+}
+
+/// Decode a stored zstd frame to plaintext. Failures surface as
+/// `ChangesError::Corrupt` carrying the row id + content_hash so the
+/// caller can correlate against the activity feed without re-reading.
+fn decode_blob(
+    id: i64,
+    content_hash: &Option<String>,
+    blob: &[u8],
+) -> Result<Vec<u8>, ChangesError> {
+    zstd::decode_all(blob).map_err(|e| ChangesError::Corrupt {
+        id,
+        content_hash: content_hash.clone(),
+        message: e.to_string(),
+    })
 }
 
 fn now_ms() -> i64 {
@@ -676,6 +773,135 @@ mod tests {
         let (_prior_id, prior) =
             c.previous_content_for_path("a.md", mod_id).unwrap().unwrap();
         assert_eq!(prior, b"original");
+    }
+
+    #[test]
+    fn content_round_trip_through_zstd() {
+        let (_dir, c) = fresh();
+        // status: changes-content-zstd
+        // Markdown body big enough to actually exercise the codec rather than
+        // bottom out in zstd's framing overhead.
+        let body = "# Heading\n\n".to_string()
+            + &"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let id = c.append(ChangeAppend {
+            path: "a.md",
+            op: ChangeOp::Modified,
+            author: "user",
+            content_hash: Some("h"),
+            content: Some(body.as_bytes()),
+            rename_from: None,
+            metadata: serde_json::json!({}),
+        }).unwrap();
+        let blob = c.content_at(id).unwrap().expect("content present");
+        assert_eq!(blob, body.as_bytes(), "content round-trips through zstd");
+
+        // Sanity-check that what's actually on disk is *not* the plaintext —
+        // i.e. that we really compressed rather than no-op'd.
+        let conn = Connection::open(c.db_path()).unwrap();
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT content FROM changes WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw != body.as_bytes(), "content should be compressed on disk");
+        assert!(raw.len() < body.len(), "compressed < raw");
+    }
+
+    #[test]
+    fn deleted_rows_keep_null_content() {
+        let (_dir, c) = fresh();
+        let id = c.append(ChangeAppend {
+            path: "a.md",
+            op: ChangeOp::Deleted,
+            author: "user",
+            content_hash: None,
+            content: None,
+            rename_from: None,
+            metadata: serde_json::json!({}),
+        }).unwrap();
+        assert!(c.content_at(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_content_round_trips() {
+        let (_dir, c) = fresh();
+        let id = c.append(ChangeAppend {
+            path: "a.md",
+            op: ChangeOp::Created,
+            author: "user",
+            content_hash: Some(&crate::hash_str("")),
+            content: Some(&[]),
+            rename_from: None,
+            metadata: serde_json::json!({}),
+        }).unwrap();
+        let blob = c.content_at(id).unwrap().expect("empty content present");
+        assert_eq!(blob.len(), 0);
+    }
+
+    #[test]
+    fn v1_to_v2_migration_reencodes_existing_rows() {
+        // Hand-build a v1 db: raw bytes in `content`, user_version = 1.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(".hiker/changes.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                op TEXT NOT NULL,
+                author TEXT NOT NULL,
+                content_hash TEXT,
+                content BLOB,
+                rename_from TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}'
+            );
+            "#,
+        ).unwrap();
+        let body_a = b"first body".to_vec();
+        let body_b = b"second body, slightly different".to_vec();
+        conn.execute(
+            "INSERT INTO changes (timestamp, path, op, author, content_hash, content, metadata)
+             VALUES (?1, 'a.md', 'created', 'user', 'h1', ?2, '{}')",
+            params![1i64, body_a],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO changes (timestamp, path, op, author, content_hash, content, metadata)
+             VALUES (?1, 'b.md', 'modified', 'user', 'h2', ?2, '{}')",
+            params![2i64, body_b],
+        ).unwrap();
+        // Deleted row, NULL content — must survive migration untouched.
+        conn.execute(
+            "INSERT INTO changes (timestamp, path, op, author, metadata)
+             VALUES (?1, 'gone.md', 'deleted', 'user', '{}')",
+            params![3i64],
+        ).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+
+        // Open through `Changes::open` — runs the migration.
+        let c = Changes::open(dir.path()).unwrap();
+
+        // Reads return plaintext.
+        let row_a = c.history_for_path("a.md", 10).unwrap()[0].clone();
+        let row_b = c.history_for_path("b.md", 10).unwrap()[0].clone();
+        let row_d = c.history_for_path("gone.md", 10).unwrap()[0].clone();
+        assert_eq!(c.content_at(row_a.id).unwrap().unwrap(), b"first body");
+        assert_eq!(
+            c.content_at(row_b.id).unwrap().unwrap(),
+            b"second body, slightly different",
+        );
+        assert!(c.content_at(row_d.id).unwrap().is_none());
+
+        // user_version flipped to 2 so the next open is a no-op.
+        let conn = Connection::open(&db_path).unwrap();
+        let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]
