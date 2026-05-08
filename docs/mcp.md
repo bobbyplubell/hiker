@@ -68,6 +68,36 @@ Notably absent from v3:
 - Vision OCR helpers — depend on the extractor pipeline being real. Deferred to v4+.
 
 
+## UI refresh on agent writes
+
+Agent writes route through `core::ops::agent_*`, which suppress the watcher
+around the fs write so notify can't surface a stale event for the path the
+indexer has already remapped. Watcher suppression is load-bearing for
+correctness on rename/delete (see `watcher.md`) and we want the same shape
+for body writes — but it means the UI's existing `hiker:file-changed`
+listener never fires for an agent-authored save, leaving the tree stale
+until the user clicks refresh.
+
+Resolution: ride the existing `hiker:changes-appended` event. Every agent
+write already appends a `Changes` row tagged `author = "agent:<client-id>"`
+(per the audit-trail section below); the existing tokio bridge in
+`ui/src-tauri/src/lib.rs` re-emits each row as `hiker:changes-appended`,
+which the home-page activity widget already consumes. The frontend's tree
++ buffer-reload code subscribes to the same event and applies the same
+post-mutation refresh it would for a watcher event — gated on
+`author.startsWith("agent:")` so non-agent rows (user saves, rollbacks)
+keep flowing through the watcher path unchanged. [mcp-ui-refresh-on-agent-write]
+
+Why not just drop watcher suppression for body writes: it would work for
+`write_note` but the same pattern shouldn't fork between body-write and
+move/delete. One consistent rule is easier to reason about, and the
+event we're piggybacking on is *more* informative than a watcher event
+anyway — it's synchronous with the change, carries the change id (so the
+UI could highlight the agent row in the activity feed), and works
+identically for any future non-watcher write source (sync, import, CLI
+in-process).
+
+
 ## Authorship + audit trail
 
 Every MCP-driven write produces three artifacts, in this order:

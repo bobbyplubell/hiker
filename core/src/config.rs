@@ -70,6 +70,8 @@ pub struct Config {
     pub vault: VaultConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -84,8 +86,87 @@ impl Default for Config {
             indexing: IndexingConfig::default(),
             vault: VaultConfig::default(),
             search: SearchConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
+}
+
+/// `[mcp]` section. Configures the in-process MCP server (see `docs/mcp.md`).
+/// Loader lands alongside the v3 milestone — until then the section is
+/// recognized so users can enable/disable the server and tune top_k caps.
+///
+/// status: mcp-config-section
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// `0` = ephemeral OS-assigned port; otherwise bind that fixed port.
+    #[serde(default)]
+    pub port: u16,
+    /// Vault-relative path to the JSON discovery file written on bind and
+    /// removed on shutdown.
+    #[serde(default = "default_mcp_discovery_file")]
+    pub discovery_file: String,
+    /// Cap on agent-requested `top_k` for `search_notes` / `related_notes`.
+    #[serde(default = "default_mcp_max_top_k")]
+    pub max_top_k: u32,
+    #[serde(default)]
+    pub tools: McpToolsConfig,
+    #[serde(default)]
+    pub audit: McpAuditConfig,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 0,
+            discovery_file: default_mcp_discovery_file(),
+            max_top_k: default_mcp_max_top_k(),
+            tools: McpToolsConfig::default(),
+            audit: McpAuditConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolsConfig {
+    /// Gates the write tools (`write_note`, `set_frontmatter`, `apply_tag`,
+    /// `remove_tag`). Reads are always available when MCP is on.
+    #[serde(default = "yes")]
+    pub writes_enabled: bool,
+    /// If true, agents passing `scope` can fetch redacted bodies. Conservative
+    /// default (false) per spec.
+    #[serde(default = "no")]
+    pub allow_redacted_lookup: bool,
+}
+
+impl Default for McpToolsConfig {
+    fn default() -> Self {
+        Self {
+            writes_enabled: true,
+            allow_redacted_lookup: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAuditConfig {
+    /// Mirror of `[llm.audit] log_full_prompt`. When false (default), the
+    /// JSONL audit log records call metadata but redacts large input bodies.
+    #[serde(default = "no")]
+    pub log_full_input: bool,
+}
+
+fn default_mcp_discovery_file() -> String {
+    ".hiker/mcp.json".to_string()
+}
+
+fn default_mcp_max_top_k() -> u32 {
+    50
 }
 
 /// `[search]` section. Holds discovery-panel state: which backends run by
@@ -145,6 +226,8 @@ pub struct EditorConfig {
     pub show_whitespace: bool,
     #[serde(default = "no")]
     pub show_chunk_boundaries: bool,
+    #[serde(default = "no")]
+    pub hide_frontmatter: bool,
     #[serde(default = "default_tab_size")]
     pub tab_size: u8,
 }
@@ -158,6 +241,7 @@ impl Default for EditorConfig {
             show_line_numbers: true,
             show_whitespace: false,
             show_chunk_boundaries: false,
+            hide_frontmatter: false,
             tab_size: 2,
         }
     }
@@ -577,6 +661,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.show_line_numbers",      ty: ValueType::Bool },
     EligibleKey { path: "editor.show_whitespace",        ty: ValueType::Bool },
     EligibleKey { path: "editor.show_chunk_boundaries",  ty: ValueType::Bool },
+    EligibleKey { path: "editor.hide_frontmatter",       ty: ValueType::Bool },
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },

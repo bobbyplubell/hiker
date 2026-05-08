@@ -225,6 +225,15 @@ impl IndexerHandle {
         self.embedder.get().cloned()
     }
 
+    /// Closure form of `embedder()` — usable across module boundaries
+    /// without exporting the `OnceCell` type. The returned closure clones
+    /// the inner Arc on each call (cheap), or yields `None` while the
+    /// model is still loading or after a load failure.
+    pub fn embedder_provider(&self) -> Arc<dyn Fn() -> Option<Arc<dyn Embedder>> + Send + Sync> {
+        let cell = self.embedder.clone();
+        Arc::new(move || cell.get().cloned())
+    }
+
     pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressEvent> {
         self.progress.subscribe()
     }

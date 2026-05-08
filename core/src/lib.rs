@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod config;
 pub mod embed;
 pub mod error;
+pub mod frontmatter;
 pub mod hash;
 pub mod indexer;
 pub mod observability;

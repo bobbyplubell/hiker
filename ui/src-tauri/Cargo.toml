@@ -17,5 +17,6 @@ tauri-plugin-dialog = "2"
 serde.workspace = true
 serde_json.workspace = true
 hiker-core.workspace = true
+hiker-mcp-server = { path = "../../mcp-server" }
 tokio.workspace = true
 tracing.workspace = true

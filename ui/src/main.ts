@@ -16,6 +16,7 @@ import {
   setChunkBoundaries,
   type ChunkBounds,
 } from "./editor/chunkBoundaries";
+import { hideFrontmatter } from "./editor/hideFrontmatter";
 
 type EntryKind = "dir" | "file";
 interface DirEntry {
@@ -98,6 +99,7 @@ interface Settings {
     show_line_numbers: boolean;
     show_whitespace: boolean;
     show_chunk_boundaries: boolean;
+    hide_frontmatter: boolean;
     tab_size: number;
   };
   indexing: {
@@ -242,6 +244,15 @@ let chunkBoundariesEnabled = false;
 let chunkBoundariesRequestSeq = 0;
 let chunkBoundariesDebounce: number | null = null;
 
+// status: view-hide-frontmatter-toggle
+// Dedicated compartment so the View menu can flip frontmatter folding
+// without touching language / live-preview state. Default off — most users
+// hand-curate their frontmatter and want it visible. Useful primarily when
+// agent stamps (mcp-tool-set-frontmatter, apply_tag) accumulate enough
+// fields to push body content off-screen.
+const hideFrontmatterCompartment = new Compartment();
+let hideFrontmatterEnabled = false;
+
 // status: view-show-whitespace-toggle
 // Default off. CM6's `highlightWhitespace` is a single extension wired into
 // its own compartment so the View menu can flip it without touching anything
@@ -370,6 +381,13 @@ export function setChunkBoundariesEnabled(on: boolean): void {
     effects: chunkBoundariesCompartment.reconfigure(on ? chunkBoundaries() : []),
   });
   refreshChunkBoundaries();
+}
+
+export function setHideFrontmatterEnabled(on: boolean): void {
+  hideFrontmatterEnabled = on;
+  view.dispatch({
+    effects: hideFrontmatterCompartment.reconfigure(on ? hideFrontmatter() : []),
+  });
 }
 
 export function setWhitespaceEnabled(on: boolean): void {
@@ -514,6 +532,7 @@ const view = new EditorView({
       language.of(markdown()),
       livePreviewCompartment.of(livePreview()),
       chunkBoundariesCompartment.of([]),
+      hideFrontmatterCompartment.of([]),
       whitespaceCompartment.of([]),
       readOnlyCompartment.of(EditorState.readOnly.of(false)),
       statusUpdater,
@@ -1117,6 +1136,7 @@ async function applyOpenedVault(path: string): Promise<void> {
     setLineNumbersVisible(s.editor.show_line_numbers);
     setWhitespaceEnabled(s.editor.show_whitespace);
     setChunkBoundariesEnabled(s.editor.show_chunk_boundaries);
+    setHideFrontmatterEnabled(s.editor.hide_frontmatter);
     treeSortOrder = sortOrderFromSettings(s.vault.tree.sort_by);
     appEl.classList.toggle("sidebar-collapsed", !s.vault.sidebar_open);
     appEl.classList.toggle("related-collapsed", !s.vault.related_open);
@@ -2439,9 +2459,86 @@ function scheduleActivityRefresh(delay = 300): void {
   }, delay);
 }
 
-void listen("hiker:changes-appended", () => {
+// status: mcp-ui-refresh-on-agent-write
+// Agent writes (per `mcp.md`) suppress the watcher around their fs writes for
+// the same correctness reasons move/delete do, so `hiker:file-changed` never
+// fires for them. Ride the changes broadcast instead: any row whose author
+// starts with "agent:" applies the same tree-refresh + active-buffer reload
+// shape the watcher handler would have. Non-agent rows (user saves,
+// rollbacks) keep flowing through the watcher path so we don't double-refresh.
+void listen<ChangeRow>("hiker:changes-appended", (event) => {
   scheduleActivityRefresh();
+  const row = event.payload;
+  if (!row.author.startsWith("agent:")) return;
+  void handleAgentChange(row);
 });
+
+async function handleAgentChange(row: ChangeRow): Promise<void> {
+  // Tree-shape changes mirror the watcher handler's branches.
+  if (row.op === "created" || row.op === "deleted" || row.op === "renamed") {
+    scheduleTreeRefreshFromWatcher();
+    scheduleVaultHomeModifiedRefresh();
+  } else if (
+    row.op === "modified"
+    && (treeSortOrder === "mtime-newest" || treeSortOrder === "mtime-oldest")
+  ) {
+    // Same rationale as the watcher path: mtime-based sorts depend on per-row
+    // mtime and a save reorders rows.
+    scheduleTreeRefreshFromWatcher();
+  }
+  if (row.op === "modified") {
+    scheduleVaultHomeModifiedRefresh();
+  }
+
+  // Active-buffer reload. Skip read-only previews (snapshot / trash) for the
+  // same reason the watcher handler does — they're historic views the agent
+  // shouldn't be allowed to clobber.
+  if (!buffer || isReadOnlyBuffer(buffer)) return;
+
+  if (row.op === "modified" && row.path === buffer.path) {
+    if (isDirty()) {
+      // The user is mid-edit on a file the agent just rewrote. Don't silently
+      // overwrite their buffer — surface a toast and let the next save's
+      // drift check resolve it. Same posture as `handleWatcherConflictDirty`
+      // but synchronous: agent writes are server-driven so a modal prompt
+      // would interrupt the user without warning.
+      showToast(`${row.path} was rewritten by an agent; save to keep yours.`);
+      return;
+    }
+    try {
+      const fresh = await invoke<FileWithHash>("read_file_with_hash", { rel: row.path });
+      if (fresh.hash !== buffer.loadedHash) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: fresh.contents },
+        });
+        buffer.loadedText = view.state.doc.toString();
+        buffer.loadedHash = fresh.hash;
+        updateStatus();
+        scheduleChunkBoundariesRefresh(500);
+      }
+    } catch (err) {
+      console.error("agent-change silent reload failed:", err);
+    }
+    return;
+  }
+
+  if (row.op === "deleted" && row.path === buffer.path) {
+    if (isDirty()) {
+      showToast(`${row.path} was removed by an agent; save to recreate.`);
+    } else {
+      buffer = null;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+      updateStatus();
+      showToast(`${row.path} was removed by an agent`);
+    }
+    return;
+  }
+
+  if (row.op === "renamed" && row.rename_from === buffer.path) {
+    buffer.path = row.path;
+    updateStatus();
+  }
+}
 
 vaultHomeNewNoteBtn.addEventListener("click", async () => {
   try {
@@ -2518,6 +2615,16 @@ function buildViewMenuItems(): CtxMenuItem[] {
         const on = !chunkBoundariesEnabled;
         setChunkBoundariesEnabled(on);
         void persistSetting("vault", "editor.show_chunk_boundaries", on);
+      },
+    },
+    {
+      // status: view-hide-frontmatter-toggle
+      label: "Hide frontmatter",
+      checked: hideFrontmatterEnabled,
+      run: () => {
+        const on = !hideFrontmatterEnabled;
+        setHideFrontmatterEnabled(on);
+        void persistSetting("vault", "editor.hide_frontmatter", on);
       },
     },
     {

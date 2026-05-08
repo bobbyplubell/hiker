@@ -423,6 +423,187 @@ pub async fn restore(
     result
 }
 
+/// Agent write of a note's full body. Routes through the indexer so the
+/// post-write upsert runs against the same writer the UI uses; appends an
+/// `author='agent:<client_id>'` changelog row with the post-write content
+/// blob (rollback substrate per `mcp.md`'s authorship + audit-trail spec).
+///
+/// `expected_hash` enables drift-aware writes (`write_file_checked` shape):
+/// `Some(h)` runs the on-disk hash compare and errors `DiskDrift` if the
+/// file has changed since the agent last read it; `None` is an unconditional
+/// write. Returns the new content hash.
+///
+/// status: mcp-tool-write-note
+pub async fn agent_write_note(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    changes: Option<&Arc<Changes>>,
+    client_id: &str,
+    tool: &str,
+    rel: &str,
+    content: &str,
+    expected_hash: Option<&str>,
+) -> Result<String, HikerError> {
+    watcher.suppress(rel.to_string());
+
+    // Snapshot the pre-write content as a baseline if this is the first time
+    // hiker has touched the path (mirrors the UI's `ensure_baseline` hook on
+    // user saves so rollback of an agent-authored save has somewhere to go).
+    if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel)) {
+        if let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash) {
+            tracing::warn!(error = %e, "changes: ensure_baseline failed (agent write)");
+        }
+    }
+
+    let abs = vault.abs_path(rel)?;
+    let existed = abs.exists();
+    let new_hash = match expected_hash {
+        Some(h) => vault.write_file_checked(rel, h, content)?,
+        None => {
+            vault.write_file(rel, content)?;
+            hash_str(content)
+        }
+    };
+
+    // Re-suppress so the TTL window starts close to when notify surfaces the
+    // post-write event.
+    watcher.suppress(rel.to_string());
+
+    let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
+    let author = format!("agent:{client_id}");
+    let metadata = serde_json::json!({"tool": tool});
+    append_change_best_effort(
+        changes,
+        ChangeAppend {
+            path: rel,
+            op,
+            author: &author,
+            content_hash: Some(&new_hash),
+            content: Some(content.as_bytes()),
+            rename_from: None,
+            metadata,
+        },
+    );
+
+    // Re-index the new content so search/related see the agent's changes.
+    let _ = jobs
+        .send(IndexJob::Upsert {
+            rel_path: rel.to_string(),
+            force: false,
+        })
+        .await;
+
+    Ok(new_hash)
+}
+
+/// Agent merge of frontmatter fields. Reads the existing file, merges
+/// `fields` into the frontmatter (recursing into nested maps), stamps
+/// `hiker.author: agent-authored`, and writes the result. Errors if the
+/// note doesn't exist (`NotFound`) — frontmatter on a missing file would
+/// require deciding whether to create it, and the spec defers that to
+/// `write_note` instead.
+///
+/// status: mcp-tool-set-frontmatter
+pub async fn agent_set_frontmatter(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    changes: Option<&Arc<Changes>>,
+    client_id: &str,
+    tool: &str,
+    rel: &str,
+    fields: serde_json::Value,
+) -> Result<String, HikerError> {
+    let existing = vault.read_file(rel)?;
+    let merged = crate::frontmatter::merge_agent_patch(&existing, fields)
+        .map_err(|e| HikerError::Io(format!("frontmatter: {e}")))?;
+    agent_write_note(
+        watcher, jobs, vault, changes, client_id, tool, rel, &merged, None,
+    )
+    .await
+}
+
+/// Agent tag append. Convenience over `agent_set_frontmatter` for the most
+/// common case. Idempotent — re-applying an already-present tag is a no-op
+/// (still writes since the file's content hash may differ on whitespace,
+/// but the resulting tag list is unique).
+///
+/// status: mcp-tool-apply-tag-remove-tag
+pub async fn agent_apply_tag(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    changes: Option<&Arc<Changes>>,
+    client_id: &str,
+    tool: &str,
+    rel: &str,
+    tag: &str,
+) -> Result<String, HikerError> {
+    let existing_tags = read_existing_tags(vault, rel)?;
+    let mut tags = existing_tags;
+    if !tags.iter().any(|t| t == tag) {
+        tags.push(tag.to_string());
+    }
+    agent_set_frontmatter(
+        watcher,
+        jobs,
+        vault,
+        changes,
+        client_id,
+        tool,
+        rel,
+        serde_json::json!({"tags": tags}),
+    )
+    .await
+}
+
+/// Agent tag removal. No-op if the tag isn't present. Mirrors `agent_apply_tag`.
+///
+/// status: mcp-tool-apply-tag-remove-tag
+pub async fn agent_remove_tag(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    changes: Option<&Arc<Changes>>,
+    client_id: &str,
+    tool: &str,
+    rel: &str,
+    tag: &str,
+) -> Result<String, HikerError> {
+    let mut tags = read_existing_tags(vault, rel)?;
+    tags.retain(|t| t != tag);
+    agent_set_frontmatter(
+        watcher,
+        jobs,
+        vault,
+        changes,
+        client_id,
+        tool,
+        rel,
+        serde_json::json!({"tags": tags}),
+    )
+    .await
+}
+
+fn read_existing_tags(vault: &Vault, rel: &str) -> Result<Vec<String>, HikerError> {
+    let src = vault.read_file(rel)?;
+    let split = crate::frontmatter::split(&src);
+    let Some(fm) = split.frontmatter else {
+        return Ok(Vec::new());
+    };
+    let serde_yml::Value::Mapping(m) = fm else {
+        return Ok(Vec::new());
+    };
+    let Some(serde_yml::Value::Sequence(seq)) = m.get("tags") else {
+        return Ok(Vec::new());
+    };
+    Ok(seq
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect())
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => hash_str(s),

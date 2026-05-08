@@ -55,7 +55,15 @@ struct VaultSession {
     ///
     /// Convention only: nothing in the type prevents a writer call. Read
     /// commands stick to the `&self` methods on `Store`.
-    read_store: Mutex<Store>,
+    read_store: Arc<Mutex<Store>>,
+    /// status: mcp-server-crate
+    /// In-process MCP server task — bound on vault open, dropped on swap.
+    /// `None` when the vault is opened with `[mcp] enabled = false` or when
+    /// the bind failed (logged but non-fatal — vault open still succeeds).
+    /// Held purely for its `Drop` side effect (cancel the task + remove the
+    /// discovery file); never read directly.
+    #[allow(dead_code)]
+    mcp: Option<hiker_mcp::McpServerHandle>,
 }
 
 struct AppState {
@@ -432,7 +440,7 @@ async fn open_vault_at_inner(
     // both connections see committed writes without locking; the sqlite-vec
     // extension auto-registers process-once. See `VaultSession.read_store`.
     let read_store =
-        Mutex::new(Store::open(&root).map_err(|e| HikerError::Io(e.to_string()))?);
+        Arc::new(Mutex::new(Store::open(&root).map_err(|e| HikerError::Io(e.to_string()))?));
 
     // Spawn the indexer task. The embedder loader runs inside the task on a
     // blocking thread — this call returns immediately.
@@ -486,6 +494,18 @@ async fn open_vault_at_inner(
     // load completes.
     let _ = indexer.full_scan().await;
 
+    // status: mcp-server-crate
+    // Start the in-process MCP server. Failure to bind logs and continues —
+    // the user's vault is more important than MCP availability.
+    let mcp = match start_mcp(&vault, &root, &indexer, &watcher, &changes, &read_store, &config).await {
+        Ok(handle) => Some(handle),
+        Err(hiker_mcp::StartError::Disabled) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp: start failed");
+            None
+        }
+    };
+
     let session = VaultSession {
         vault,
         root,
@@ -494,6 +514,7 @@ async fn open_vault_at_inner(
         changes,
         config: RwLock::new(config),
         read_store,
+        mcp,
     };
 
     let state = app.state::<AppState>();
@@ -1448,6 +1469,32 @@ fn lookup_change_path(changes: &Changes, change_id: i64) -> Result<String, Hiker
         .find(|r| r.id == change_id)
         .map(|r| r.path)
         .ok_or_else(|| HikerError::NotFound(format!("change {change_id}")))
+}
+
+/// Wire the MCP server up against the vault session's handles. The server
+/// task lives until the returned handle is dropped (which happens when the
+/// `VaultSession` containing it is dropped — i.e. on vault swap or app
+/// shutdown).
+async fn start_mcp(
+    vault: &Vault,
+    root: &PathBuf,
+    indexer: &IndexerHandle,
+    watcher: &Arc<Watcher>,
+    changes: &Arc<Changes>,
+    read_store: &Arc<Mutex<Store>>,
+    config: &Config,
+) -> Result<hiker_mcp::McpServerHandle, hiker_mcp::StartError> {
+    let deps = hiker_mcp::McpDeps {
+        vault: vault.clone(),
+        vault_root: root.clone(),
+        read_store: read_store.clone(),
+        jobs: indexer.job_sender(),
+        watcher: watcher.clone(),
+        changes: changes.clone(),
+        embedder_provider: indexer.embedder_provider(),
+        config: config.mcp.clone(),
+    };
+    hiker_mcp::start(deps).await
 }
 
 pub fn run() {

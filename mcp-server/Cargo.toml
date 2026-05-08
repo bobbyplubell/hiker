@@ -4,9 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "hiker-mcp"
-path = "src/main.rs"
+[lib]
+name = "hiker_mcp"
+path = "src/lib.rs"
 
 [dependencies]
 hiker-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "fs", "net"] }
+tokio-util.workspace = true
+tracing.workspace = true
+time.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "fs", "rt-multi-thread", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

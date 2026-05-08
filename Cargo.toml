@@ -30,3 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
 tracing-appender = "0.2"
 toml = "0.8"
 toml_edit = "0.22"
+rmcp = { version = "1.6", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+schemars = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio-util = "0.7"

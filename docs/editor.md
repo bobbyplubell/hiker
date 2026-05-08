@@ -285,6 +285,8 @@ Each entry is a checkable item — checkmark when active, click flips it, menu c
 
   This is genuinely a debugging-grade view of the chunker's output — useful while txt-ingest is hardening, and useful long after as a sanity check when chunker behavior changes.
 
+- **Hide frontmatter** — visually collapse the leading `---\n…\n---\n` YAML block into a single placeholder line (`▸ frontmatter (N lines)`) without touching the file. Detection mirrors `core::frontmatter::split` exactly — the block must start at byte 0 with `---\n` and have a closing `---\n` line before any body content; an unterminated or non-leading block is ignored. CodeMirror integration: a `Decoration.replace({block: true})` over the byte range, recomputed off `state.doc` so edits inside or around the block update the placeholder line count immediately. Default off; persistence via `editor.hide_frontmatter` (`settings-section-editor`). Motivated by agent-stamped frontmatter (`mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) accumulating into a tall block that pushes the actual prose off screen — flipping this on lets the user read the body without manually scrolling past metadata that's already visible elsewhere (the activity widget, file detail views). [view-hide-frontmatter-toggle]
+
 ### Reserved entries (greyed in v1, enabled when their backing feature lands)
 
 These appear in the menu now so the surface is predictable, but render greyed-out with a tooltip naming the dependency. Putting the slot up front is also a forcing function for designing each backing feature with the toggle in mind.

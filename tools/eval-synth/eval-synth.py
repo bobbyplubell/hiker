@@ -90,10 +90,12 @@ PASTE_LANG = {
 TXT_PASTE_STYLES = ["indented", "raw", "inline"]
 
 
-def slugify(s: str) -> str:
+def slugify(s: str, max_len: int = 80) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("-")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
     return s or "untitled"
 
 
@@ -198,13 +200,24 @@ def allocate_counts(topics: list[dict], total: int) -> dict[str, int]:
     return counts
 
 
+class EmptyCompletion(RuntimeError):
+    """Raised when the provider returned no usable text (None / blank)."""
+
+
 def llm_complete(model: str, prompt: str, max_tokens: int) -> str:
     resp = litellm.completion(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
     )
-    return resp.choices[0].message.content or ""
+    choice = resp.choices[0]
+    text = (choice.message.content or "").strip()
+    if not text:
+        finish = getattr(choice, "finish_reason", "?")
+        raise EmptyCompletion(
+            f"empty content (finish_reason={finish}); reasoning model? bump --max-tokens or pick a non-thinking model"
+        )
+    return text
 
 
 def load_paste_library(root: Path) -> dict[str, list[tuple[str, str]]]:
