@@ -36,7 +36,8 @@
 }
 
 #status-bar,
-#trash-header {
+#trash-header,
+#chat-resize-handle {
   box-sizing: border-box;
   height: var(--bottom-bar-height);
 }
@@ -47,10 +48,180 @@ html, body, #app {
   overflow: hidden;
 }
 
+/* status: four-region-layout, top-strip-layout
+   Top strip across the full width, then the existing three-column grid
+   below. The top strip auto-sizes to its content; the body row absorbs
+   the rest of the viewport (1fr) so collapsing the sidebar / discovery
+   panel still works exactly as before. */
 #app {
   display: grid;
   grid-template-columns: 280px 1fr 320px;
-  grid-template-rows: 100%;
+  grid-template-rows: auto 1fr;
+}
+
+#top-strip {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid #8884;
+  font-size: 12px;
+  box-sizing: border-box;
+  height: var(--top-bar-height);
+  /* The strip is the OS title bar (decorations: false in tauri.conf).
+     `data-tauri-drag-region` on the element handles the drag itself;
+     this rule kills the I-beam cursor over empty space so the affordance
+     reads as draggable chrome rather than selectable text. */
+  cursor: default;
+  user-select: none;
+}
+
+/* Custom window controls (Min / Max / Close) shown in the top strip
+   because the OS chrome is gone. */
+#window-controls {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+.win-ctrl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 100%;
+  min-height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.win-ctrl:hover {
+  background: #8882;
+}
+.win-ctrl-close:hover {
+  background: #e81123;
+  color: white;
+}
+
+#top-strip-leading {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+#top-strip-leading > button {
+  flex-shrink: 0;
+}
+
+/* Repositioned vault-path label sits between the leading cluster and the
+   tab strip. status: ui-no-sibling-pushout. */
+#top-strip > #vault-path {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 30%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+}
+
+/* status: editor-tab-strip — fills the rest of the row. */
+#tab-strip {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+#tab-strip::-webkit-scrollbar {
+  height: 4px;
+}
+
+/* status: editor-tab-strip / -active-state / -dirty-marker / -overflow
+   Flat tabs with a uniform bottom border (not folder-tab style). Border
+   on every tab; no fill when inactive; grey fill on active. */
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 180px;
+  min-width: 6ch;
+  max-width: 240px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid #8884;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+}
+.tab:hover {
+  background: #8881;
+}
+.tab--active {
+  background: #8883;
+  color: var(--text-strong);
+}
+.tab-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* status: editor-preview-tab — italic title for preview tabs only. */
+.tab--preview .tab-label {
+  font-style: italic;
+}
+.tab-folder-hint {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: 4px;
+}
+.tab-close {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 2px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+.tab-close:hover {
+  background: #8883;
+}
+.tab-dirty-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f0a020;
+}
+/* On hover, swap the dirty dot for a close × per editor-tab-dirty-marker. */
+.tab:hover .tab-dirty-dot {
+  display: none;
+}
+.tab:not(:hover) .tab-close-shadow {
+  display: none;
 }
 
 #app.sidebar-collapsed {
@@ -109,6 +280,235 @@ html, body, #app {
 #editor-pane:not(.home-view) #vault-home {
   display: none;
 }
+
+/* status: settings-pane-mode — sub-mode of editor-pane state. The CM6
+   editor and vault-home are both hidden; the settings pane occupies the
+   editor row. Same shape as `home-view` to keep one mental model. */
+#editor-pane.settings-view #editor,
+#editor-pane.settings-view #vault-home {
+  display: none;
+}
+#editor-pane:not(.settings-view) #settings-pane {
+  display: none;
+}
+#settings-pane {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: #ccc;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.settings-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.settings-header h1 {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0;
+  color: #ddd;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.settings-card {
+  margin-bottom: 24px;
+  border: 1px solid #2c2c2c;
+  border-radius: 4px;
+  padding: 0;
+}
+.settings-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid #2c2c2c;
+}
+.settings-card.collapsed .settings-card-header {
+  border-bottom: none;
+}
+.settings-card-chevron {
+  width: 12px;
+  display: inline-block;
+  text-align: center;
+  color: #888;
+}
+.settings-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #aaa;
+  flex: 1;
+  min-width: 0;
+}
+.settings-card-deferred-note {
+  font-size: 11px;
+  color: #777;
+  font-style: italic;
+  flex-shrink: 0;
+}
+/* status: settings-pane-scope-toggle */
+.settings-scope-toggle {
+  display: inline-flex;
+  border: 1px solid #333;
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.settings-scope-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.settings-scope-toggle button.active {
+  background: var(--accent-fill);
+  color: var(--text-strong);
+}
+.settings-card-body {
+  padding: 4px 0;
+}
+.settings-card.collapsed .settings-card-body {
+  display: none;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  min-height: 28px;
+}
+.settings-row:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.015);
+}
+.settings-row-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+.settings-row-desc {
+  font-size: 11px;
+  color: #777;
+  display: block;
+  margin-top: 2px;
+}
+.settings-row-control {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-row-readonly {
+  font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, monospace);
+  color: var(--text-muted);
+  font-size: 12px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* status: settings-pane-readonly-display */
+.settings-row-info {
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: #888;
+  cursor: pointer;
+}
+/* status: settings-pane-reset-row */
+.settings-row-reset {
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+.settings-row-reset:disabled {
+  color: #555;
+  cursor: default;
+}
+/* Match the shared input shape used by `#search-input` / `.chat-input`:
+   transparent over the surrounding card bg, soft `#8886` border, accent
+   focus outline. Keeps every form field in the app on one set of tokens. */
+.settings-row-input {
+  background: transparent;
+  border: 1px solid #8886;
+  border-radius: 4px;
+  color: inherit;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.settings-row-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.settings-row-input[type="number"] {
+  width: 64px;
+}
+.settings-row-checkbox {
+  width: 14px;
+  height: 14px;
+}
+.settings-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #2c2c2c;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.settings-footer .schema {
+  flex: 1;
+}
+.settings-footer button {
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 3px;
+  color: var(--text-strong);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.settings-popover {
+  position: fixed;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-strong);
+  z-index: 1000;
+  max-width: 360px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.settings-popover .source {
+  color: #888;
+  font-size: 11px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+.settings-popover button {
+  margin-top: 8px;
+}
 /* status: vault-home-screen */
 #vault-home {
   overflow: auto;
@@ -138,7 +538,11 @@ html, body, #app {
   min-width: 0;
 }
 #vault-home-new-note {
+  /* Text button, not an icon — opt out of the toolbar-btn square sizing. */
   flex-shrink: 0;
+  width: auto;
+  height: auto;
+  padding: 4px 10px;
 }
 .vault-home-section {
   margin-bottom: 28px;
@@ -301,6 +705,25 @@ html, body, #app {
 .vault-home-filters .filter-pill > span {
   letter-spacing: 0.04em;
 }
+/* status: vault-home-recent-activity-author-filter, queue-detail-filter-tasks,
+   queue-detail-filter-index — icon-only filter pill: drop the trailing text
+   slot's gap and bump the SVG up since there's no label competing for space. */
+.vault-home-filters .filter-pill-icon-only {
+  gap: 0;
+  padding: 4px 6px;
+}
+.vault-home-filters .filter-pill-icon-only svg {
+  width: 16px;
+  height: 16px;
+}
+/* Queue-detail pills should match other toolbar icons in the chrome
+   (the top strip's `.toolbar-btn svg` default of 18px). Forced because
+   both the parent `.vault-home-filters .filter-pill-icon-only svg` rule
+   and `.toolbar-btn svg` would otherwise clip the size lower. */
+.queue-detail-pills .queue-pill.filter-pill-icon-only svg {
+  width: 18px !important;
+  height: 18px !important;
+}
 /* Empty state: pill is shown but dimmed so users can see the affordance
    exists before any rows of that class arrive. Click still toggles —
    harmless when there's nothing to show. */
@@ -373,9 +796,11 @@ html, body, #app {
 
 #tree-toolbar {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   gap: 4px;
-  padding: 6px 8px;
+  padding: 0 8px;
+  height: var(--top-bar-height);
+  box-sizing: border-box;
   border-bottom: 1px solid #8884;
 }
 
@@ -398,7 +823,12 @@ html, body, #app {
 .icon-btn {
   font: inherit;
   font-size: 14px;
-  padding: 2px 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid #8884;
   border-radius: 4px;
   background: transparent;
@@ -416,9 +846,16 @@ html, body, #app {
   border-color: var(--accent);
 }
 
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .icon-btn svg,
 .toolbar-btn svg {
   display: block;
+  width: 18px;
+  height: 18px;
 }
 
 #vault-bar > .icon-btn {
@@ -501,7 +938,12 @@ html, body, #app {
 
 .toolbar-btn {
   font: inherit;
-  padding: 2px 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid #8884;
   border-radius: 4px;
   background: transparent;
@@ -520,6 +962,11 @@ html, body, #app {
   border-color: var(--accent);
 }
 
+.toolbar-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* status: search-discovery-panel
    The right column is the Discovery panel: a fixed input/toggles bar at
    the top, and a column of collapsible sections below. v2 ships with two
@@ -530,6 +977,11 @@ html, body, #app {
   flex-direction: column;
   border-left: 1px solid #8884;
   min-height: 0;
+  /* `position: relative` anchors the chat session-picker popover, which
+     positions itself with `left` / `bottom` against this aside's
+     bounding box. Without it, absolute coords fall through to the
+     viewport and the menu floats off to the left. */
+  position: relative;
 }
 
 #discovery-bar {
@@ -569,10 +1021,9 @@ html, body, #app {
 }
 
 #discovery-bar .toolbar-btn {
-  /* Compact mode toggles next to the input — don't grow with the row. */
+  /* Compact mode toggles next to the input — don't grow with the row.
+     Padding stays 0 so the 18×18 svg has the full 28×28 to render in. */
   flex: 0 0 auto;
-  min-width: 28px;
-  padding: 2px 8px;
   font-weight: 600;
 }
 
@@ -582,19 +1033,596 @@ html, body, #app {
   color: #888;
 }
 
+/* status: chat-panel-detached-scroll — sections region scrolls as a
+   unit above the divider; chat region scrolls independently below. */
 #discovery-sections {
-  flex: 1;
+  flex: 1 1 auto;
   overflow: auto;
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
 
-.discovery-section {
+/* status: chat-panel-vertical-resize — drag handle on the top edge of
+   the chat region; doubles as the collapse-toggle bar with a centered
+   .toolbar-btn that toggles the chat region. Mirrors the trash header /
+   status bar height per the bottom-bar trio. */
+#chat-resize-handle {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  min-height: 24px;
+  background: transparent;
+  border-top: 1px solid #8884;
+  cursor: row-resize;
+  user-select: none;
+  position: relative;
+}
+
+#chat-resize-handle:hover,
+#chat-resize-handle.dragging {
+  background: #8881;
+}
+
+.chat-handle-spacer {
+  flex: 1 1 auto;
+}
+
+/* Buttons inside the handle: small, low-chrome, never grab focus on click. */
+.chat-handle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: 11px;
+  color: inherit;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.chat-handle-btn:hover {
+  background: #8882;
+  border-color: #8884;
+}
+
+.chat-handle-btn-square {
+  padding: 2px;
+  width: 20px;
+  height: 20px;
+  justify-content: center;
+}
+
+.chat-handle-btn-square.active {
+  background: #8881;
+  border-color: #8884;
+}
+
+/* status: chat-session-new-button — left-side dropdown trigger.
+   Distinct from generic .chat-handle-btn so the truncation rule only
+   applies here (the square collapse button mustn't shrink). */
+.chat-session-menu-btn {
+  max-width: 60%;
+  overflow: hidden;
+}
+
+#chat-session-menu-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-session-menu-chevron {
+  font-size: 9px;
+  opacity: 0.7;
+  flex: 0 0 auto;
+}
+
+/* @-mention autocomplete popover (chat-input-at-autocomplete). Anchors
+   above the chat input inside the discovery panel. */
+.chat-at-popover {
+  z-index: 25;
+  background: var(--cm-background, #fff);
+  color: inherit;
+  border: 1px solid #8886;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px #0003;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 4px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.chat-at-popover-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.chat-at-popover-row.selected {
+  background: #5588dd33;
+}
+
+.chat-at-popover-row.disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.chat-at-popover-row-label {
+  flex: 0 0 auto;
+  font-weight: 500;
+}
+
+.chat-at-popover-row-hint {
+  flex: 1 1 auto;
+  color: #888;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Popover floats above the handle inside the discovery panel. */
+.chat-session-menu-popover {
+  z-index: 20;
+  background: var(--cm-background, #fff);
+  color: inherit;
+  border: 1px solid #8886;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px #0003;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 4px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.chat-session-menu-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  font-size: 12px;
+}
+
+.chat-session-menu-row:hover {
+  background: #8882;
+}
+
+.chat-session-menu-row.active {
+  background: #8881;
+  font-weight: 600;
+}
+
+.chat-session-menu-row-new {
+  color: #58a;
+  font-weight: 500;
+}
+
+.chat-session-menu-row-icon {
+  display: inline-flex;
+  width: 14px;
+  justify-content: center;
+  font-weight: 600;
+}
+
+.chat-session-menu-row-date {
+  flex: 0 0 auto;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  color: #888;
+}
+
+.chat-session-menu-row-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-session-menu-row-count {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #888;
+}
+
+/* status: chat-session-trash */
+.chat-session-menu-row-trash {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #888;
+  cursor: pointer;
+  /* Hidden by default; revealed on row hover so the menu reads cleanly
+     when the user is just scanning the list. */
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.chat-session-menu-row:hover .chat-session-menu-row-trash {
+  opacity: 1;
+}
+
+.chat-session-menu-row-trash:hover {
+  background: #c441;
+  border-color: #c44a;
+  color: #c44;
+}
+
+.chat-session-menu-sep {
+  border-top: 1px solid #8884;
+  margin: 4px 0;
+}
+
+/* When collapsed: chat-region shrinks to nothing, the handle stays so the
+   user can re-expand. Resize is disabled (no point dragging a hidden
+   region). */
+#app.chat-collapsed #chat-region {
+  display: none;
+}
+
+#app.chat-collapsed #chat-resize-handle {
+  cursor: default;
+}
+
+
+/* status: chat-panel-pinned-bottom
+   Bottom region of the discovery panel, pinned and expanding upward.
+   Default flex-basis ~30% per `chat-panel-default-height`; overridden
+   inline from JS once the persisted value loads. */
+#chat-region {
+  flex: 0 0 30%;
+  min-height: 80px;
   display: flex;
   flex-direction: column;
-  border-bottom: 1px solid #8884;
+  border-top: 1px solid #8884;
+  min-width: 0;
+}
+
+/* When llm is disabled (or the chat region is otherwise hidden), the
+   handle goes too — sections fill the panel as they did pre-chat. */
+#app.chat-disabled #chat-region,
+#app.chat-disabled #chat-resize-handle {
+  display: none;
+}
+
+.chat-transcript {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 10px;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   min-height: 0;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.chat-msg-role {
+  font-size: 10px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.chat-msg-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 8px 8px 2px 8px;
+  max-width: 85%;
+}
+
+.chat-msg-user .chat-msg-role {
+  display: none;
+}
+
+.chat-msg-assistant {
+  align-self: flex-start;
+  max-width: 95%;
+}
+
+/* status: chat-panel-markdown-render
+   Tame the default CodeMirror chrome so the read-only markdown view
+   blends into the chat bubble — no border, transparent background, no
+   focus outline, font matches the surrounding panel. */
+.chat-md-host .cm-editor {
+  background: transparent;
+  font: inherit;
+  font-size: inherit;
+}
+.chat-md-host .cm-editor.cm-focused {
+  outline: none;
+}
+.chat-md-host .cm-scroller {
+  font-family: inherit;
+  line-height: 1.4;
+  overflow: visible;
+}
+.chat-md-host .cm-content {
+  padding: 0;
+  caret-color: transparent;
+}
+.chat-md-host .cm-line {
+  padding: 0;
+}
+
+.chat-tool-call {
+  border: 1px solid #8884;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  background: #8881;
+}
+
+.chat-tool-call-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-weight: 600;
+  color: #888;
+}
+
+.chat-tool-call-args,
+.chat-tool-call-result {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.chat-tool-call-result.ok {
+  color: #4a4;
+}
+
+.chat-tool-call-result.fail {
+  color: #c44;
+}
+
+/* status: chat-panel-tool-call-collapsible */
+.chat-tool-call-head {
+  cursor: pointer;
+  user-select: none;
+}
+
+.chat-tool-call-chevron {
+  display: inline-block;
+  transition: transform 80ms;
+}
+
+.chat-tool-call:not(.collapsed) .chat-tool-call-chevron {
+  transform: rotate(90deg);
+}
+
+.chat-tool-call-args-summary {
+  color: #888;
+  font-weight: 400;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-tool-call-result-summary {
+  color: #888;
+  font-weight: 400;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-tool-call-result-summary.ok {
+  color: #4a4;
+}
+
+.chat-tool-call-result-summary.fail {
+  color: #c44;
+}
+
+.chat-tool-call-expanded {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid #8884;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* The `[hidden]` attribute alone is not enough — the rule above sets
+   `display: flex`, which beats the UA `display: none` from `[hidden]`.
+   Override explicitly when collapsed. */
+.chat-tool-call.collapsed .chat-tool-call-expanded {
+  display: none;
+}
+
+.chat-tool-call-json {
+  margin: 0;
+  padding: 4px 6px;
+  background: #0001;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.chat-tool-call-copy {
+  align-self: flex-start;
+  font-size: 10px;
+  padding: 2px 6px;
+}
+
+/* status: chat-panel-note-link-render */
+.chat-note-link {
+  color: #58a;
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+
+.chat-note-link:hover {
+  text-decoration: underline solid;
+}
+
+.chat-cap-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  margin: 4px 0;
+  border: 1px dashed #8886;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #888;
+  background: #8881;
+}
+
+.chat-cap-row button {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+.chat-msg-system {
+  align-self: stretch;
+  text-align: center;
+  font-size: 11px;
+  color: #888;
+  padding: 4px 0;
+}
+
+.chat-msg-error {
+  align-self: stretch;
+  font-size: 12px;
+  color: #c44;
+  background: #c441;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+/* status: chat-panel-thinking-indicator
+   Pulsing-dots placeholder rendered while the agent is "quiet" (between
+   user send / tool result and the next streaming event). Three dots
+   fade in/out on a staggered cycle so the row reads as a wave. */
+.chat-msg-thinking {
+  align-self: flex-start;
+  display: inline-flex;
+  /* `.chat-msg` sets flex-direction: column, which the cascade applies
+     here too — must be overridden so the dots line up horizontally. */
+  flex-direction: row;
+  gap: 3px;
+  padding: 4px 10px;
+  font-size: 18px;
+  line-height: 1;
+  color: #888;
+}
+
+.chat-thinking-dot {
+  animation: chat-thinking-pulse 1.2s ease-in-out infinite;
+  opacity: 0.2;
+}
+
+.chat-thinking-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.chat-thinking-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes chat-thinking-pulse {
+  0%, 80%, 100% { opacity: 0.2; }
+  40%           { opacity: 1; }
+}
+
+.chat-form {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid #8884;
+  align-items: end;
+  flex: 0 0 auto;
+}
+
+.chat-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  border: 1px solid #8886;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  resize: none;
+  max-height: 120px;
+  line-height: 1.4;
+}
+
+.chat-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.chat-input:disabled {
+  color: #888;
+  background: #8881;
+}
+
+.chat-send-btn {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.chat-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* status: bug-discovery-sections-overlap-after-toggle-cycles
+   `#discovery-sections` is the single scroll context (per its
+   `overflow: auto`). Sections take their natural height — no
+   `display: flex` / `min-height: 0` here, otherwise the section's
+   inner body's `overflow: auto` competes with the container's scroll
+   and one panel ends up visually overlapping the next on expand
+   transitions. */
+.discovery-section {
+  border-bottom: 1px solid #8884;
 }
 
 .discovery-section:last-child {
@@ -658,7 +1686,9 @@ html, body, #app {
 }
 
 .discovery-section-body {
-  overflow: auto;
+  /* No `overflow: auto` — the parent `#discovery-sections` is the
+     single scroll context, and a nested scroll here makes long
+     section bodies clip and the layout overlap on toggle. */
   padding: 6px;
   font-size: 13px;
 }
@@ -784,28 +1814,6 @@ html, body, #app {
   flex-shrink: 1;
 }
 
-#save-btn {
-  font: inherit;
-  padding: 2px 8px;
-  border: 1px solid #8884;
-  border-radius: 4px;
-  background: transparent;
-  cursor: pointer;
-  color: inherit;
-  white-space: nowrap;
-  min-width: 64px;
-}
-
-#save-btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-#save-btn.dirty::before {
-  content: "● ";
-  color: #e0a040;
-}
-
 .badge {
   padding: 1px 6px;
   border: 1px solid #8884;
@@ -884,6 +1892,31 @@ html, body, #app {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* status: multi-buffer-window-close-guard */
+.modal-dirty-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.modal-dirty-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid #8882;
+}
+.modal-dirty-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .modal-btn {
@@ -1097,47 +2130,276 @@ html, body, #app {
   text-overflow: ellipsis;
 }
 
-/* status: tree-trash-preview */
-#trash-banner {
-  padding: 6px 12px;
-  background: #c0392b;
-  color: white;
-  font-size: 12px;
-  text-align: center;
-  letter-spacing: 0.3px;
-}
-
-/* status: vault-home-recent-activity-detail
-   Snapshot preview banner. Less alarming than trash (amber, not red) —
-   this is informational, not a recovery surface. */
-#snapshot-banner {
-  padding: 6px 12px;
-  background: #8a6d2b;
-  color: #fff;
-  font-size: 12px;
-  letter-spacing: 0.3px;
+/* status: tree-trash-preview, snapshot-preview-mode
+   Mode-specific controls live in the editor toolbar's center cluster
+   (#mode-controls) instead of separate colored banners. Quieter — same
+   icon-only language as the rest of the toolbar. */
+#mode-controls {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 6px;
+  min-width: 0;
 }
-.snapshot-banner-actions {
-  display: flex;
-  gap: 8px;
-}
-#snapshot-banner button {
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.5);
-  color: #fff;
-  padding: 3px 10px;
-  border-radius: 3px;
-  cursor: pointer;
+#mode-controls .mode-label {
+  color: var(--text-muted);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 360px;
 }
-#snapshot-banner button:hover {
-  background: rgba(0, 0, 0, 0.4);
+#mode-controls .mode-label .mode-id {
+  color: var(--text-muted);
+  opacity: 0.65;
+  margin-left: 6px;
 }
-#snapshot-banner .activity-id {
-  color: rgba(255, 255, 255, 0.65);
+.status-snapshot-id {
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
 }
-#editor-pane:not(.snapshot-preview) #snapshot-banner { display: none; }
+
+/* status: diff-renderer
+   Diff is no longer its own pane — the renderer paints into the main
+   editor's CM6 view. The decoration classes (cm-diff-add / cm-diff-del /
+   cm-diff-sep) are registered as a CM6 `baseTheme` from `diffTheme` in
+   `ui/src/diff/index.ts`; nothing extra needs to live here. */
+
+/* status: queue-detail-shared-page, task-queue-row-pulsing-leased
+   Detail page lives inside `#vault-home` and inherits its padding +
+   typography. Structural elements reuse `.vault-home-header`,
+   `.vault-home-section`, and `.toolbar-btn` so the chrome matches the
+   rest of the home / detail surfaces. */
+.queue-detail-pills {
+  /* Same shape as `.vault-home-filters` (square 4px-radius toolbar
+     buttons), pulled out here only to scope the active-state colors. */
+  margin-bottom: 16px;
+}
+.queue-detail-pills .queue-pill {
+  font-size: 12px;
+  padding: 3px 10px;
+  color: var(--text-muted);
+}
+.queue-detail-pills .queue-pill.active {
+  background: var(--accent-fill);
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+.queue-detail-toggles {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+}
+.queue-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.queue-toggle-label input[type="checkbox"] {
+  margin: 0;
+}
+.queue-toggle-label select.toolbar-btn {
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.queue-toggle-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+  font-style: italic;
+}
+.queue-toggle-status.error { color: #d75d5d; font-style: normal; }
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid #2a2a2a;
+  font-size: 12px;
+}
+.queue-row:first-child { border-top: none; }
+/* Priority pill: square chip matching the same border ramp as other
+   chrome buttons. Color comes from a left-edge accent so the chip
+   itself stays neutral. */
+.queue-pri {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid #8884;
+  border-radius: 3px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 38px;
+  text-align: center;
+}
+/* status: vault-bar-queue-button — promote the high-priority red to a
+   custom property so the failed-task indicator can share it. */
+:root {
+  --queue-pri-high-color: #d68a78;
+  --queue-pri-high-border: #c25a4d66;
+  --queue-active-pulse-color: #5da7e6;
+}
+.queue-pri-high   { color: var(--queue-pri-high-color); border-color: var(--queue-pri-high-border); }
+.queue-pri-normal { color: var(--text-muted); }
+.queue-pri-low    { color: #777; }
+.queue-kind {
+  color: var(--text-strong);
+}
+.queue-summary {
+  color: var(--text-muted);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-state {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.queue-state-ok { color: #6da76d; }
+.queue-state-err { color: #d75d5d; }
+.queue-state-cancelled { color: #777; }
+.queue-state-leased { color: var(--text-strong); }
+.queue-pulse-dot {
+  display: inline-block;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  margin-left: 4px;
+  background: currentColor;
+  animation: queue-pulse 1.2s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes queue-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* status: vault-bar-queue-button
+   Status indicator overlaid on the new vault-bar queue button. Pulsing
+   blue when something is active; dim red (HIGH-priority pill color) for
+   unread failures. Both share one DOM node — the JS toggles a class. */
+.queue-btn-indicator {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.queue-btn-indicator.queue-indicator-active {
+  background: var(--queue-active-pulse-color);
+  animation: queue-pulse 1.4s ease-in-out infinite;
+}
+.queue-btn-indicator.queue-indicator-failed {
+  background: var(--queue-pri-high-color);
+  opacity: 0.85;
+}
+#queue-btn { position: relative; }
+
+/* status: task-queue-row-details — click-to-expand panel under each
+   row showing prompt / response / error / metadata. */
+.queue-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+.queue-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.queue-row-clickable .queue-row-head { cursor: pointer; }
+.queue-row.expanded {
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.03));
+  border-radius: 4px;
+}
+.queue-row-details {
+  padding: 8px 4px 4px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+.queue-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.queue-detail-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.queue-detail-pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-strong);
+}
+.queue-detail-pre-err {
+  border-color: var(--queue-pri-high-border);
+  color: var(--queue-pri-high-color);
+}
+.queue-detail-pre-meta {
+  color: var(--text-muted);
+}
+.queue-detail-loading,
+.queue-detail-error {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.queue-detail-error { color: var(--queue-pri-high-color); }
+.queue-worker {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.queue-cancel {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+}
+.queue-cancel:hover { color: #d75d5d; }
+
+/* status: queue-detail-shared-row-primitive */
+.queue-source-badge {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 4px;
+  border: 1px solid #8884;
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-weight: 500;
+  min-width: 38px;
+  text-align: center;
+}

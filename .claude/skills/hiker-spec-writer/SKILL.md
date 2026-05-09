@@ -25,11 +25,20 @@ Match the existing docs. Concretely:
 
 Tone: opinionated, precise, conversational where it helps, no corporate hedging. Read `clustering.md`, `observability.md`, and `txt-ingest.md` as examples — these are recent and embody the current style.
 
+**Specs describe the present desired state, not the history of how we got there.** This is load-bearing — the user has been explicit that the docs are not a running change log. The git log, PRs, and squash-merge messages cover history; the spec is what we want the project *to be*.
+
 Do **not**:
 - Write multi-paragraph docstrings or filler.
 - Add change-log notes inside the doc ("added 2026-05-06"). The git history is the change log.
 - Use emojis.
-- Include backwards-compatibility shims or "we used to do X but now…" — the spec describes the present state.
+- Write "we used to do X but now…" — the spec describes the present state.
+- Include "Affected slugs in other docs" / "Migrations" / "Cross-doc edits" change-log sections. When a new spec changes how an existing feature works, edit the existing spec to describe the *new* behavior; don't leave the old description in place with a "superseded by" pointer.
+- Write headlines or paragraphs framed as "X replaces / supersedes / rewrites Y." State what X *is*; if the reader cares about Y they'll see it's gone from the spec.
+- Keep slugs whose only purpose is marking a supersession event (e.g. `feature-x-supersedes-feature-y`). The replacement feature has its own slugs; a supersession marker is pure history.
+- Reference removed slugs by name in spec prose. If a slug isn't in `status.md` anymore, it shouldn't be cited as either active or "previously known as."
+- Write narratives about implementation drift, prior bugs that motivated a decision, or "the gap let X happen." If the rule is load-bearing, just state the rule.
+
+Future ideas are different from history. **Future / deferred items belong in the doc** — they're forward-looking ("we might do this later") and they get a slug + a planned row. The only time to remove a future idea is when it's been *explicitly rejected* (the user has said "we won't do that"); at that point delete the entry rather than turning it into negative-space commentary about what won't happen. Forward-looking "Out of scope" lists are also fine — they describe the spec's boundaries, not its history.
 
 ## Slugs
 
@@ -75,6 +84,17 @@ For specs that include slugs deferred to "we may do this later" (e.g. `obs-perf-
 2. If the edit adds new features, treat each as a new slug and follow the registry rules.
 3. If the edit reshapes an existing feature, decide: still the same slug, or genuinely a new feature? When in doubt, keep the slug and update its row in `status.md`.
 4. Never silently drop a slug — if a feature is removed, mark its row in `status.md` removed (or delete the row and note in the squash-merge commit message).
+
+## When a new spec changes existing behavior
+
+When a new spec materially changes how an existing feature works (the cluster editor's per-node policies replacing global confidence tiers; the task queue absorbing fan-out + note-mutation routing):
+
+1. **Rewrite the existing spec to describe the new behavior** in place. The old description goes; the new description takes its slot.
+2. **Update `status.md` rows** for the affected slugs to describe the *current* feature, not the change. If a slug's described feature no longer exists in the spec, delete the row entirely — don't leave a "superseded" or "removed" tombstone (the git log carries that).
+3. **Drop inline slug markers** in the rewritten spec for any slug whose feature is now described elsewhere.
+4. **Don't write change-log paragraphs** in the new spec ("X repoints Y", "Z collapses into W", "this section supersedes that section"). The new spec just says what the feature is; the old spec doesn't say it anymore. Anyone reading the diff to understand the change reads the git diff.
+
+The exceptions are `status.md` and `bug_tracking.md` — both reflect *current code state vs. spec state*, so they legitimately track the gap and the work needed to close it. Specs themselves describe the desired state only.
 
 ## Common pitfalls
 

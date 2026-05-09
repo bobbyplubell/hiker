@@ -25,16 +25,17 @@ Save action: writes current doc to `currentPath` via the `write_file` core comma
 Triggers (all funnel into the same save function):
 
 - Mod-S keybind [save-keybind-mod-s]
-- Save button in the status bar (visible always; disabled when no file is open or when not dirty) [save-button]
-- Future: autosave on idle / on blur (deferred — opt-in setting later)
+- Save button in the editor toolbar (floppy-disk icon, just left of the View options button; visible always; disabled when no file is open or when not dirty) [save-button]
+
+Save writes the user's file. Crash-recovery autosave (sidecar shadow copies of dirty buffers, NPP shape) is a separate mechanism — see `autosave.md`. The two paths don't overlap: saving clears the autosave sidecar for that path, autosave never touches the user's file.
 
 Dirty indicator:
 
 - Window title shows `• Hiker — <path>` when dirty, `Hiker — <path>` when clean. [dirty-window-title]
-- Status bar save button shows a filled-dot icon when dirty, empty when clean.
-- Active file in the tree shows a small dot suffix when its buffer is dirty. [dirty-tree-dot]
+- Active file in the tree shows a small dot suffix when its buffer is dirty. The active tab in the strip shows the same dot. [dirty-tree-dot]
+- The save button itself doesn't carry a dirty marker — its enabled/disabled state is the signal, and the tab + tree dots already cover the redundant case.
 
-File-switch guard: clicking another file while the current buffer is dirty pops a confirm dialog with three options — Save & switch, Discard & switch, Cancel. Cancel keeps the current buffer active. The same guard applies to closing the window: a `before-close` listener on the Tauri window cancels the close if dirty and prompts; user choice (save / discard / cancel) decides whether the close proceeds. [file-switch-guard-dirty, window-close-guard-dirty]
+File-switch guard fires on **explicit close** of a dirty tab (× / middle-click / `tab.close` keybind) — a confirm dialog with three options: Save & close, Discard & close, Cancel. Cancel keeps the tab open. Switching away from a dirty tab via tab click / file-tree click / search-result click does *not* fire the guard — the buffer stays dirty in memory. Window-close guard fires on `before-close` and lists every dirty tab with per-tab Save / Discard checkboxes plus Save All / Discard All / Cancel actions. [file-switch-guard-dirty, window-close-guard-dirty, multi-buffer-window-close-guard]
 
 External changes: two mechanisms, layered.
 
@@ -97,7 +98,7 @@ Override mechanism (deferred): a user keybind file (`vault/.hiker/keybinds.toml`
 
 Bottom strip across the editor pane only (not under the tree). Three regions: [status-bar-layout]
 
-- left: save button + dirty dot, current file **basename** (e.g. `note.md`), with the full vault-relative path in a `title=` tooltip on hover. [status-bar-path-basename-tooltip]
+- left: current file **basename** (e.g. `note.md`), with the full vault-relative path in a `title=` tooltip on hover. [status-bar-path-basename-tooltip]
 - center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later. [status-bar-index-label]
 
   When the *active buffer*'s file is in a non-indexed state (per `tauri-cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
@@ -107,7 +108,6 @@ Why basename rather than full path: the file tree already shows location, the wi
 
 Click targets:
 
-- save button → save action
 - file basename → reveal the file in the system file explorer (Finder on macOS, File Explorer on Windows, default file manager on Linux). Implemented via Tauri's shell/opener API. Tracked as `status-bar-path-reveal`. [status-bar-path-reveal]
 - line:col → opens a goto-line input (deferred; click is a no-op in v0) [status-bar-goto-line]
 
@@ -119,11 +119,26 @@ Every status-bar region — and any other horizontal toolbar / strip elsewhere i
 
 ## Layout (v1)
 
-Three columns, both sides collapsible: [three-column-layout]
+Four regions: top strip across the window, then three columns below it (sidebar / editor / discovery), both side columns collapsible. [four-region-layout]
 
-- **Left**: file tree (existing `#sidebar`). Collapsible. Supports drag-and-drop to move notes between folders — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command. [drag-and-drop-move]
+- **Top**: a single horizontal strip across the full width of the window. Leading cluster of icon buttons on the left (Back / Forward / Home / Queue / Settings / Open vault) plus the active vault path label, then the tab strip filling the rest of the row. See `## Top strip` below. [top-strip-layout]
+- **Left**: sidebar. Collapsible. Mode-switchable (Files / Cluster trees / Trails). In Files mode it hosts the file tree, including drag-and-drop note moves — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command. [drag-and-drop-move]
 
-  Tree toolbar at the top of the sidebar: a wide **+ New note** button and a small **`…`** actions menu next to it. The asymmetry is the point — new-note is a frequent action; the menu is the bucket for everything else. [tree-toolbar-actions-menu]
+  ### Sidebar mode switcher
+
+  The sidebar's content is mode-switchable. Three modes:
+
+  - **Files** (default) — file tree as described in this section. The `+ New note` / `…` actions row + the trash bin pinned at the bottom are filetree-specific chrome.
+  - **Cluster trees** — switches the sidebar body to the cluster editor (per `cluster-editor.md`); filetree chrome hides; the cluster editor brings its own header (tree-name selector, "Suggest reorganization" action, mode-specific `…` menu).
+  - **Trails** — reserved slot, greyed in v1; lands when trails do.
+
+  The switcher itself is a **side-by-side icon-only button row** at the top of the sidebar — three icons in a single horizontal row, no labels, pressed-state on the active mode. Sits at the very top of the sidebar (the position where the four vault-level icon buttons used to live before they moved to the top strip). Clicking switches the body in place; the editor pane on the right is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing (eligible-key set grows by one). [sidebar-mode-switcher]
+
+  The sidebar's collapse toggle (`sidebar-toggle-icon`) keeps its existing behavior — it hides the whole sidebar regardless of mode. Modes share one collapse state. [sidebar-mode-shared-collapse]
+
+  The Trash bin is filetree-specific and only appears in Files mode; future modes that want a pinned-bottom region bring their own. [sidebar-trash-files-mode-only]
+
+  Tree toolbar at the top of the Files-mode sidebar (below the mode switcher): a wide **+ New note** button and a small **`…`** actions menu next to it. The asymmetry is the point — new-note is a frequent action; the menu is the bucket for everything else. The toolbar hides in non-Files modes; each mode brings its own header chrome. [tree-toolbar-actions-menu]
 
   - **New note** creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [create-note-button]
   - **`…` menu** opens a small popover with the v1 entries below. Adding new entries is intentionally low-friction — the menu is the catch-all for low-frequency tree-scoped actions, so future verbs slot in here rather than growing the toolbar.
@@ -245,9 +260,28 @@ Three columns, both sides collapsible: [three-column-layout]
 
   State is supplied by `tauri-cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
 
-- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons — left button toggles the tree/sidebar, right button toggles the discovery panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. The same toolbar hosts the View menu button (see `## View options menu`; eye-icon affordance per `view-menu-icon`) and reserves a slot for the deferred Mutations menu (see `note-mutations-menu` in "Out of scope" below). Icons: [panel-toggle-buttons]
+  ### Tree source visibility
+
+  The file tree shows regular vault notes by default. Other source categories — chat sessions, imported sessions from other agents, future categories — are hidden by default and opt in via per-category vault settings, each surfacing its category as a virtual top-level group in the tree.
+
+  Mechanism: a small registry that names each visible-in-tree source category, the setting key that controls it, the on-disk path the category covers, and the group label. The registry is consulted by the tree renderer when assembling the top-level list; categories whose toggles are off skip the rendering pass but stay indexed and search-reachable. Each source-providing spec adds a row to the registry — `llm.md` adds the native-sessions row and the imported-sessions row; future categories (e.g., snapshots, derived files if they ever surface) plug in the same way. [tree-source-visibility-toggles]
+
+  Default values for every category are `false` — tree starts quiet, the user opts each category in. Settings live under `vault.show_<category>_in_tree` and ride the existing eligibility model (per `settings-vault-config-toml`) so they persist per-vault. The settings UI gets a small "Tree visibility" group under the vault settings section listing every registered category as a checkbox. [tree-source-visibility-settings-ui]
+
+  Search and related-notes are independent of these toggles — a category being hidden from the tree never removes it from search. The toggles are about navigation chrome, not data scoping. [tree-source-visibility-orthogonal-to-search]
+
+  v1 categories at registry seeding:
+
+  | Category           | Setting key                          | Path                              | Owning spec |
+  | ------------------ | ------------------------------------ | --------------------------------- | ----------- |
+  | Native sessions    | `vault.show_sessions_in_tree`        | `.hiker/sessions/`                | `llm.md` (`chat-session-show-in-tree-toggle`) |
+  | Imported sessions  | `vault.show_imported_sessions_in_tree` | `.hiker/sessions/imported/`     | `llm.md` (`chat-session-imported-show-in-tree-toggle`) |
+
+  Future categories slot in by adding a row, an eligibility entry, and a one-line render rule. No changes to the tree-rendering code beyond the registry pull.
+
+- **Center**: editor pane with a thin toolbar strip across its top, then the editor below, then the existing status bar. Toolbar holds two toggle buttons — left button toggles the tree/sidebar, right button toggles the discovery panel. Both buttons are always visible; their pressed/unpressed state reflects whether the corresponding panel is open. The same toolbar hosts Save (floppy icon), the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`), the View menu button (eye icon, see `## View options menu`), and the Mutations menu (wand, see `## Note-mutations menu`). Between the left toggle and the right-hand cluster sits a centered `#mode-controls` slot (between two flex spacers) that lights up with mode-specific icon buttons + a label — read-only preview modes (trash / snapshot / staging review) populate it with their verbs. See `## Mode controls slot` below. Empty when the buffer is in plain editing mode. Icons: [panel-toggle-buttons]
   - **Sidebar toggle icon.** A safe-dial / ship-wheel glyph (round with spokes) inside a rounded-square frame — riffs on the project's "vault" vocabulary. Distinct enough from generic file-tree icons that it doesn't read as just-another-folder. Tooltip "Toggle sidebar." [sidebar-toggle-icon]
-  - **Discovery toggle icon.** A magnifying glass — the panel's primary surface is search-driven retrieval (per `search.md`), so a search glyph is more honest than the generic circled-plus the panel previously used. Tooltip "Toggle discovery panel." Naming aside (the panel hosts search results *and* related-notes *and* future surfaces), the magnifying glass is the most recognizable retrieval glyph users have. [discovery-toggle-icon]
+  - **Discovery toggle icon.** A magnifying glass — the panel's primary surface is search-driven retrieval (per `search.md`). Tooltip "Toggle discovery panel." Naming aside (the panel hosts search results *and* related-notes *and* future surfaces), the magnifying glass is the most recognizable retrieval glyph users have. [discovery-toggle-icon]
 - **Right**: related-notes panel. Collapsible. Renders `RelatedHit[]` from `related_notes(currentPath)`. Updated on file-open and on save (debounced 500ms per index.md). [related-notes-panel-ui]
 
 Default state on first launch: tree open, related panel collapsed. Persistence of these toggles across launches is a settings concern (see settings.md) — for v1 the state lives in-memory only.
@@ -268,11 +302,43 @@ Constraints:
 The same handle slot exists on both sides regardless of whether the discovery panel is currently showing search-results, related notes, or the chat surface (`chat-panel-pinned-bottom`) — width is a panel-level affordance, not a section-level one.
 
 
+## Mode controls slot
+
+The editor toolbar reserves a centered `#mode-controls` slot between two flex spacers. The slot is empty during normal editing; entering a read-only preview mode populates it with mode-specific icon-only buttons plus a short text label naming the mode. One slot, one render function (`renderModeControls`), per-mode populators. [editor-toolbar-mode-controls]
+
+Why a single toolbar slot rather than per-mode banners:
+
+- **Consistent visual language.** The icons match the rest of the editor toolbar palette (sidebar wheel, discovery glass, View eye, etc.) — same line-weight, sizing, hover treatment. Per-mode banners would mean a separate visual family (full-width strips with their own colors) that fights the surrounding chrome.
+- **Less DOM and CSS.** No separate banner elements, no per-mode show/hide logic. The slot is `replaceChildren()`-rebuilt every transition. Idempotent: same inputs → same DOM.
+- **Discoverable once.** Users learn "label + icons in the toolbar center = something special is going on" once and the pattern carries across snapshot / trash / staging / dirty-buffer-diff / future modes.
+
+What lands in the slot:
+
+- A short text label naming the mode ("Snapshot preview" / "Trash preview" / "Diff · snapshot ↔ current" / "Staging review" / "Diff · buffer ↔ disk"). Title attribute carries metadata (path, timestamp, author, change id, etc.) — hover reveals it without spending toolbar real estate.
+- A row of small icon-only buttons for the mode's verbs: Diff toggle (when applicable, see `diff.md`'s `mode-controls-diff-toggle`), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons.
+
+`renderModeControls()` reads the current buffer state (`buffer.mode.kind`, `isDirty()`, etc.) and the diff-active flag and rebuilds the slot's children. Called on every transition that affects the slot — buffer swap, mode entry/exit, dirty toggling, diff on/off.
+
+Per-mode populators live in `ui/src/main.ts` — `renderSnapshotControls(diffActive: bool)`, `renderTrashControls()`, `renderDirtyBufferControls(diffActive: bool)`, and (future) `renderStagingControls()`. Each appends label + icons; none mutates state directly. State changes go through the existing buffer/preview API.
+
+### Dirty-buffer Diff toggle
+
+A diff toggle lives in the editor toolbar (just right of Save). Always visible; greyed when there's nothing to diff against (no buffer, file not on disk, buffer clean). Click toggles the diff view against the only currently-implemented target — **on-disk** — flipping the editor view between the live editable buffer and a read-only line-level diff (live buffer vs last-loaded content) via the existing `diff-renderer` primitive. The flip is non-destructive: live buffer state is preserved while the diff is shown; toggling back returns the user's cursor + selection. **Right-click opens a target-picker** — a small context menu listing diff targets so future ones (last save, snapshot, staging-review base, etc.) can slot in without splitting the affordance into multiple buttons. v1 lists "Diff against on-disk" (or "Hide diff" while active). [editor-diff-vs-disk-toggle]
+
+Why this lives here, not in some mutation-specific surface: any time the user has unsaved edits — whether they typed them, a mutation landed in the buffer, or some other in-buffer source — "what did I actually change vs. what's on disk" is a useful question. One feature, one toggle, all dirty-buffer cases covered. The mutation flow consumes this toggle as its review surface; hand-edit-and-diff before saving consumes it too.
+
+Constraints:
+
+- **Hidden when not dirty.** Toggle disappears entirely the moment `isDirty()` flips to false (clean buffer means there's nothing to diff against disk).
+- **Hidden inside other preview modes.** Snapshot / trash / staging modes already populate the slot with their own mode-specific Diff toggle; the dirty-buffer toggle doesn't double up.
+- **Disabled when the file doesn't exist on disk yet** (newly-created buffer the user hasn't saved). Tooltip: "Save first to diff against disk."
+
+
 ## View options menu
 
 The editor pane's top toolbar (`panel-toggle-buttons`) gains a View menu button alongside the tree- and related-panel toggles. The menu hosts display-only toggles — flips that change how the active note is rendered without touching the file or the index. Sibling to the deferred `note-mutations-menu`; the split is clean: View changes pixels, Mutations changes bytes. [editor-view-options-menu]
 
-**Icon.** Eye glyph, no text label, no chevron — matches the icon-only treatment of the other toolbar buttons (sidebar wheel, discovery magnifying glass). Tooltip "View options" handles discoverability for the icon-only form. The dropdown arrow that the previous `View ▾` text label implied isn't needed once the affordance is iconified — the click target opens the menu directly, same shape the other icon buttons use to open their popovers. [view-menu-icon]
+**Icon.** Eye glyph, no text label, no chevron — matches the icon-only treatment of the other toolbar buttons (sidebar wheel, discovery magnifying glass). Tooltip "View options" handles discoverability for the icon-only form. The click target opens the menu directly, same shape the other icon buttons use to open their popovers. [view-menu-icon]
 
 
 ### Toolbar icon palette
@@ -318,6 +384,50 @@ These appear in the menu now so the surface is predictable, but render greyed-ou
 - Theme / font / color-scheme — those belong in settings, not a quick toggle.
 
 
+## Note-mutations menu
+
+A top-bar button on the editor pane hosting content-mutation actions on the active note. Sibling to View options (`editor-view-options-menu`); the split is clean — View changes pixels, Mutations changes bytes. Icon-only button using the wand glyph (`mutations-menu-icon`). Click opens a popover listing the mutations applicable to the active buffer. [note-mutations-menu]
+
+Mutations are LLM-driven content rewrites of the active note. Single-note user-initiated mutations apply **as buffer edits** — there is no separate review surface, no derived file, no explicit Apply/Reject verbs. Save accepts, Ctrl-Z reverts, the existing dirty-buffer + drift-check + changes-log machinery handles everything else. The shape is uniform across all current and future mutations:
+
+1. The user clicks a mutation entry. Hiker submits a `Direct`-shape task to `core::tasks` (per `task-queue.md`) at `High` priority — the user is watching. The task carries the buffer's *live* text (not last-saved, same rule as `chat-active-note-context-injection`) so the mutation operates on what the user sees. The buffer is set read-only for the duration of the task, and the source tab is pinned (a preview tab promotes to sticky on submit per `editor-preview-tab-promotion` so a preview-slot swap can't displace the buffer the result needs to land on). [note-mutation-buffer-ro-while-in-flight]
+2. The queue's direct-LLM worker drains the task by calling `core::llm::chat` with the mutation's prompt. External MCP-attached clients can also drain the task per the queue's worker rules. The home-page Task queue widget (`task-queue-home-widget`) is the in-flight progress surface — no per-mutation toast.
+3. On `TaskCompleted`: the result replaces the source buffer's content as a single CM6 transaction, the buffer's read-only flag clears, and the buffer becomes dirty. Works whether the source tab is the active one (dispatch through the live editor view) or a background tab (rewrite the tab's saved CM6 state in place via a transaction off the existing state, preserving history so Ctrl-Z reverts the whole replacement as one undo step on activation). The user reviews by reading the buffer; the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) flips the editor view to a line-level diff against on-disk content for explicit comparison. **Save** writes the mutated content through the regular save path (which handles `pre-write-drift-check` + appends a `'modified'` row to `core::changes`). **Ctrl-Z** reverts the mutation as a single undo step. If the user closed the source tab mid-flight (only possible from the explicit close path, since the tab is RO + pinned during the flight), the result is dropped silently — no toast, no held state. [note-mutation-applies-as-buffer-edit]
+4. On `TaskFailed`, the buffer's read-only flag clears and a toast surfaces the error. No content change. On `TaskCancelled` (user cancels via the queue widget), the buffer's read-only flag clears, no content change, no toast.
+
+[note-mutations-menu-task-shape]
+
+**Changes-log lineage.** When a mutation lands on the buffer, hiker stashes a `pending_changes_metadata` field on the buffer carrying `{ mutation: "<mutation-kind>" }`. The next save consumes this stash: the resulting `'modified'` row's `metadata` field carries `mutation: "<kind>"` so the recent-activity widget and any future filter can identify mutation-derived edits. Subsequent saves don't carry the tag — it's a one-shot stamp on the save that accepts the mutation. [note-mutation-stash-changes-tag]
+
+**The user can keep editing during in-flight only by *not* triggering RO** — but the buffer is RO, so they can read and scroll but can't type. Switching buffers is fine; the in-flight mutation locks only its source buffer. If the user closes the source buffer mid-flight, the task continues and the result lands via the toast in step 4.
+
+### v1 mutation: Reformat as markdown
+
+The first concrete mutation: reformat the active note's content as clean markdown. Useful for `.txt` files (per `txt-ingest.md`'s LLM-rewrite option) and for `.md` files whose markup has rotted (uneven heading levels, broken list nesting, inconsistent emphasis). [note-mutation-reformat-as-markdown]
+
+Submits a task with `kind: NoteMutation { mutation: ReformatAsMarkdown, source_path }` and `payload` carrying the buffer's live text + the source extension. The prompt template lives at the user/vault prompt-store path `note_mutation_reformat_as_markdown.md` (per `llm-prompts-file-store`); the bundled default is registered in `core::prompts::bundled_defaults()`.
+
+### Mutations-menu button states
+
+- **Enabled** when the active buffer is an editable note (`buffer.mode.kind === "file"`) of an indexable extension (`.md` / `.markdown` / `.txt`) and has at least one byte of content.
+- **Disabled** during read-only preview modes (trash / snapshot / staging review) — mutating from inside a review surface would be confusing. Tooltip explains why.
+- **Disabled with "Mutation in progress…" tooltip** when there is an active or leased task whose `kind: NoteMutation { source_path }` matches the active buffer's path. The buffer is RO during this window for the same reason. Only one in-flight mutation per source path (`note-mutation-one-in-flight-per-path`).
+
+When only one mutation entry is enabled (the v1 case), the popover still opens — clicks-to-action stay one shape so users learn it once. As more mutations land, they slot in alphabetically.
+
+### Batch mutations
+
+Single-note in-buffer is the right shape when the user is watching one note land. **Batch mutations** (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks; the user can't watch N buffers at once. Batch results route through the **staging surface** (per `settings.md`'s staging-preview-mode) — the same surface used for agent writes the user wasn't there for. Apply / Reject per file, or use the bulk Apply / Reject actions on the home-page "Pending changes" widget.
+
+Batch entry points are deferred to v2; they slot into:
+
+- **A folder-context bulk action** invoked from the file tree (`note-mutation-batch-from-folder`, deferred).
+- **A search-result bulk action** alongside the already-reserved `search-bulk-action-tag` / `search-bulk-action-move` (`note-mutation-batch-from-search`, deferred).
+- **A CLI command** (`hiker mutate <kind> <glob>`, deferred).
+
+All three converge on the same staging-driven flow; no batch-specific review surface. [note-mutation-batch-via-staging]
+
+
 ## Vault home page
 
 When no note is open, the editor pane shows a vault home page in place of the CM6 editor — a lightweight overview of the vault rather than empty space. Default landing surface on vault open (assuming no auto-resume of last-open buffer); reappears when the user closes the active buffer without opening another. [vault-home-screen]
@@ -353,9 +463,9 @@ Refresh: subscribes to a new `hiker:changes-appended` event emitted whenever the
 
 ### Detail views
 
-Vault home widget tiles support a drill-in pattern. **Click on a widget's tile or header → home view body swaps to a detail view for that widget.** No back button affordance — clicking the Home button in the vault bar always returns to the home overview, regardless of whether you're in the overview or a detail view. Clicking a note row in any detail view exits home and opens the editor on that note (same shape as `openFile` already exits home view today). [vault-home-detail-views]
+Vault home widget tiles support a drill-in pattern. **Click on a widget's tile or header → home view body swaps to a detail view for that widget.** No back button affordance within the home view itself — clicking the Home button in the top strip always returns to the home overview, regardless of whether you're in the overview or a detail view. Clicking a note row in any detail view exits home and opens the editor on that note (same shape as `openFile` already exits home view today). [vault-home-detail-views]
 
-Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has four states — editor, home overview, home detail, and the diff viewer (`diff-viewer-pane`, see `diff.md`). The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; the diff viewer is entered from a snapshot preview's "Show diff vs current" action, from the note-mutation accept/decline flow, or from a future drift-conflict review; back transitions are via Home button (→ overview), note-row click (→ editor), or the diff viewer's Close button (→ wherever the user came from).
+Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has four states — editor, home overview, home detail, and the settings surface (`settings-pane-mode`, see `settings.md` `## Settings UI shell`). The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; the gear (`vault-bar-settings-icon`) toggles editor ↔ settings; back transitions are via Home button (→ overview), note-row click (→ editor), or the gear button (→ editor). Read-only review surfaces (trash preview, snapshot preview, staging review preview) are sub-modes of the editor state — they share the editor's CM6 view, and the editor toolbar's centered `#mode-controls` slot lights up with mode-specific icon buttons + a label (see `## Mode controls slot`). Where applicable, a Diff toggle in that slot flips the view between the consumer's content and the line-level diff (see `diff.md`). The dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) lives in the editor toolbar instead of `#mode-controls` — always visible alongside Save, greyed when no diff target applies.
 
 Per-widget detail views, in roughly the order they earn their keep:
 
@@ -392,25 +502,102 @@ UI shape notes:
 - Empty state: a brief "no items" message, since every detail view has a sensible empty case.
 - Sort/filter affordances live in the detail view header, not the home overview tile.
 
-### Vault bar affordances
+## Top strip
 
-Two small icon-only buttons live in the vault bar (the strip showing the current vault path). Both are vault-scoped, sit alongside the existing vault path display, and use icon-only styling for compactness; both carry `title=` tooltips so the icons remain discoverable.
+A single horizontal strip across the very top of the window. Holds the vault-level icon-button cluster on the left, the vault path label, and the multi-buffer tab strip filling the rest of the row. Replaces the standalone vault bar — the four icon buttons that previously lived at the top of the sidebar (Home / Queue / Settings / Open vault) move out to this strip. [top-strip-layout]
 
-- **Home button.** Icon-only (house glyph). Toggles the editor pane to the vault home page (described above). View toggle, not buffer close — the active buffer (if any) stays in memory; clicking any tree row, recents entry, or search result restores the editor onto whichever note. No save protection needed because nothing is closing. Tooltip "Vault home." Reserves the keybind id `vault.go-home` in `keybind-registry` (chord TBD; Cmd/Ctrl-Shift-H is unclaimed and pairs naturally with Ctrl-Space / Ctrl-Shift-F's "vault-level navigation" naming). [vault-home-button]
-- **Open-vault button.** Replaces the existing "Open vault" text button with an icon (folder glyph). Same JS-dialog → `open_vault_at` flow per `settings.md`'s default-vault-autoopen story; this slug is purely the visual swap. Tooltip "Open vault…" preserves discoverability. [vault-bar-open-vault-icon]
+### Top strip leading cluster
+
+Icon-only buttons, left-to-right, in this order:
+
+- **Back button.** Disabled when no back history. Standard arrow glyph. [top-strip-back-button]
+- **Forward button.** Same. [top-strip-forward-button]
+- **Home button.** House glyph. Toggles the editor pane to the vault home page. View toggle, not buffer close — the active buffer (if any) stays in memory; clicking any tree row, recents entry, search result, or tab restores the editor onto whichever note. Tooltip "Vault home." Reserves the keybind id `vault.go-home` in `keybind-registry`. [vault-home-button]
+- **Queue button.** List-with-pulse glyph. Opens the shared queue detail page (per `task-queue.md`'s `queue-detail-shared-page`). A small indicator superimposed on the icon shows the count of `Queued + Leased` tasks; hidden when zero. The icon pulses subtly when anything is `Leased`. Tooltip "Background work" (or "Background work (N active)" when N > 0). [vault-bar-queue-button]
+- **Settings button.** Gear glyph. Toggles the editor pane to the settings surface (`settings-pane-mode`). Same view-toggle behavior as Home — the active buffer stays in memory. Pressed/unpressed state reflects whether the settings pane is currently visible. Tooltip "Settings." Keybind `settings.open` — Cmd-, on macOS, Ctrl-, elsewhere. [vault-bar-settings-icon]
+- **Open-vault button.** Folder glyph. Triggers the JS dialog → `open_vault_at` flow per `settings.md`'s default-vault-autoopen story. Tooltip "Open vault…". [vault-bar-open-vault-icon]
+
+The vault-path label sits to the right of the icon cluster, before the tab strip — same shape it has today, just relocated. Truncates with ellipsis when space is tight (per `ui-no-sibling-pushout`).
+
+The slug names retain the `vault-bar-` prefix even though there's no vault bar anymore — slugs name the *feature*, not the location, and the buttons themselves haven't fundamentally changed shape. (`vault-home-button` already has no prefix; the others stay as-is.)
+
+### Tab strip
+
+Browser-style multi-buffer tabs. Each tab represents one open buffer; click switches to it; × closes it (with the existing dirty-buffer save/discard/cancel modal). The strip fills the remaining horizontal space after the leading cluster + vault path. [editor-tab-strip]
+
+- **Tab content.** Basename of the open buffer's path. When two open buffers share a basename, both render with a folder hint (`notes.md (research/)` vs `notes.md (inbox/)`). Tooltip on hover shows the full vault-relative path. [editor-tab-disambiguation]
+- **Active vs inactive.** Active tab has a distinct background; inactive tabs are visually muted with × revealed on hover. The active tab is the one whose buffer the editor pane is currently showing. [editor-tab-active-state]
+- **Dirty marker.** A small colored dot appears on dirty tabs in place of the default × glyph; on hover the dot becomes the close × so the user can still close from the dirty state (which fires the existing save/discard/cancel modal). [editor-tab-dirty-marker]
+- **Overflow.** Browser pattern — tabs shrink to a minimum width before any overflow handling fires; once shrunk to minimum, the strip becomes horizontally scrollable with chevron buttons at each edge; a "more (N)" dropdown lists tabs that scrolled off. The active tab always stays visible (auto-scrolls into view on activation). [editor-tab-overflow]
+- **Keybinds**, all reserved in `keybind-registry`:
+    - `tab.close` = Cmd/Ctrl-W — close active tab.
+    - `tab.next` = Cmd/Ctrl-Tab — cycle to next tab.
+    - `tab.previous` = Cmd/Ctrl-Shift-Tab — cycle to previous tab.
+    - `tab.jump-N` = Cmd/Ctrl-1 through Cmd/Ctrl-9 — jump to tab at that 1-indexed position; Cmd/Ctrl-9 jumps to the last tab regardless of count (browser convention).
+    - Middle-click on any tab also closes (browser convention).
+    [editor-tab-keybinds]
+- **Right-click context menu.** Verbs: Close / Close others / Close all to the right / Reveal in tree. The reveal-in-tree action selects the tab's note in the file tree, expanding parent folders as needed. [editor-tab-context-menu]
+- **No `+` button.** New notes have a clear home in the sidebar's `+ New note` affordance (and any future "new tab" verb in keybinds); duplicating it in the tab strip splits the surface for no gain.
+
+### Tab strip behavior with the rest of the app
+
+- **File-tree click on an already-open file** switches to its tab rather than reloading. Click on a not-yet-open file opens a new tab and switches to it. [multi-buffer-tree-click-switches-tab]
+- **Search-result, recents, wikilink, and any other "open this note" entry point** behave the same: existing tab → switch; not yet open → new tab.
+- **Mode-controls slot, View menu, Mutations menu, chat panel "active note" injection, navigation history** all operate on the active tab, no change.
+- **In-flight-mutation RO** (`note-mutation-buffer-ro-while-in-flight`) applies to the source tab regardless of whether it's currently active. The dirty marker on a tab whose buffer is mid-mutation reads as a normal dirty dot; users learn the queue widget / inline indicator as the source-of-truth for "what's working in the background."
+
+### Multi-buffer model
+
+- **In-memory while the vault is open; tab state restores on next open.** The set of open buffers is in-memory state during a session — closes, switches, and dirty content all live in RAM. The autosave layer (`autosave.md`) round-trips a tab-state snapshot (open paths + active path + preview-slot path) to `.hiker/autosave/index.json`, so the next vault open silently reopens the same set of tabs. Per-buffer dirty content recovery rides the same store, prompting via the recovery modal. [multi-buffer-in-memory-only]
+- **No max open count.** A user with 50 tabs gets browser-style overflow; that's a UX signal, not a system constraint.
+- **No max retention timer.** Tabs stay until the user closes them.
+- **`file-switch-guard-dirty` is close-time only.** Navigating *to* a dirty tab is fine — the dirty buffer stays dirty in memory. The save/discard/cancel modal only fires when the user closes the tab (× / middle-click / Cmd-W) or closes the window. The existing nav-time fire is dropped. [multi-buffer-no-switch-guard]
+- **Window-close guard.** When the user tries to quit the app or close the window with any dirty tab, a confirmation modal lists every dirty tab with per-tab Save / Discard checkboxes plus Save All / Discard All / Cancel actions. Cancel returns the user to the app with all tabs intact; Save All saves each dirty tab in turn (with drift-conflict handling per the existing `pre-write-drift-check` if any source has changed under the buffer); Discard All drops all dirty state and exits. [multi-buffer-window-close-guard]
+- **Navigation history stays unified** across all tabs (one stack per vault). Back/forward navigates between content surfaces regardless of which tab they were in; the corresponding tab activates as part of the back/forward action.
+
+
+### Preview tabs
+
+VSCode-style "preview" tab. Single-clicking a note from any browse-y entry point (tree, search results, related notes, recents, wikilink, chat note-link, `@`-mention click) opens it in a single shared preview slot rather than spawning a new tab; clicking the next note replaces the preview's contents in place. The user can browse through ten search hits without ending up with ten tabs. The preview tab promotes to a regular sticky tab the moment the user signals intent — by editing, by double-clicking the tab, by dragging it, or by picking "Keep open" from the tab context menu.
+
+The headline decisions:
+
+- **At most one preview tab exists at a time.** Opening another note while a preview tab is active replaces that preview's buffer in place — same tab slot, same tab DOM node, just different contents. The replacement is a single doc swap (same as today's tab-switch path), not a close-then-open. [editor-preview-tab]
+- **Visual treatment is italic title only.** No different background, no border, no extra glyph — preview tabs render exactly like sticky tabs except the title text is italicized. Active vs inactive shading and the dirty marker rules are unchanged (preview tabs are never dirty — see promotion). The italic is the only visual signal because it's the only one users actually need: "this tab will go away if I open another file." [editor-preview-tab]
+- **Every click-driven open-note callsite uses the preview slot by default.** File-tree click, search-result click, related-notes click, recents click, wikilink click (when wikilinks land), chat note-link click, `@`-mention click in the chat panel — all route through `openFile(rel, { preview: true })`. The set is uniform on purpose; carving exceptions per surface ("recents always sticky," "wikilinks always preview") would be a worse mental model than "click is preview, Mod-click is sticky." [editor-preview-tab-from-open-callsites]
+- **Mod-click on any open-note callsite forces a sticky tab.** Skips the preview slot, opens directly into a new sticky tab. Mirrors the browser convention "Mod-click opens in new tab"; same gesture meaning here. Drag-from-tree (when that's a thing) is also implicitly sticky — drag intent is more directed than click intent. [editor-preview-tab-mod-click-sticky]
+- **Promotion paths.** Edit the buffer, double-click the tab, drag the tab to reorder, or pick "Keep open" from the tab right-click menu. Save is implicit (saving requires dirty, which requires edit, which already promoted). Each promotion clears the italic and removes the tab from the preview slot; the tab keeps its position in the strip. **Edit-as-promotion is what makes preview tabs never dirty** — the moment the user types, the tab is sticky, so the existing dirty-buffer machinery (`file-switch-guard-dirty`, `multi-buffer-window-close-guard`) doesn't need to know about preview tabs at all. [editor-preview-tab-promotion]
+
+Behavior details:
+
+- **Replacing a preview is not "closing" it.** No dirty guard fires (preview is never dirty), the tab DOM node persists, only the buffer behind it changes. The replaced buffer is dropped from `openBuffers` since it has no tab anymore.
+- **Activating a preview tab from a different sticky tab** is a normal tab switch, not a re-open. The italic stays — the preview is still a preview until promoted.
+- **Closing a preview tab** uses the same close path as any tab. No dirty guard fires (it's never dirty), the slot is empty afterward and the next click-open creates a fresh preview.
+- **Keybinds.** No new keybinds. `tab.close`, `tab.next`, `tab.previous`, `tab.jump-N` all operate on the active tab regardless of preview state.
+- **Tab right-click menu** gains one verb when the active tab is the preview: **Keep open** (promotes to sticky). Greyed when the tab is already sticky. The other verbs (Close / Close others / Close all to the right / Reveal in tree) are unchanged.
+- **Bulk close verbs** treat the preview tab like any other tab — "Close others" closes the preview if it isn't the target.
+- **No persistence across vault re-open.** Tabs are already in-memory only per `multi-buffer-in-memory-only`; preview state is too. Vault swap clears the preview slot along with everything else.
+- **Tree double-click stays bound to inline rename** per `tree-double-click-rename`. Promoting via double-click on the *tree row* would conflict; the tab double-click covers the canonical VSCode gesture.
+- **Programmatic opens skip preview.** Restore-from-trash, new-note creation, the right-click "Open" tree verb, and any other non-user-click path open sticky — these are directed actions, not browsing. The `openFile` parameter is `{ preview: false }` (or omitted) at those callsites.
+
+Out of scope for this feature:
+
+- **Pin a sticky tab to never auto-close.** Hiker has no auto-close behavior to begin with; pinning is a VSCode artifact of split-view + restore semantics that don't apply here.
+- **Multiple preview slots.** Single slot is the point. Two preview tabs would lose the "click another to replace" mental model.
+- **Hover-to-preview from the tree.** VSCode doesn't do this either; the click-is-preview rule already gives users a cheap way to peek.
 
 
 ## Navigation (back / forward)
 
-Browser-style back/forward navigation across editor-pane states. Each user-initiated transition between distinct content surfaces — opening a note, going home, drilling into a home detail view, opening a trash preview — pushes onto a per-vault history stack. Back and forward navigate that stack via vault-bar buttons, trackpad two-finger horizontal swipe (matching browser convention), and a keybind registry entry.
+Browser-style back/forward navigation across editor-pane states. Each user-initiated transition between distinct content surfaces — opening a note, going home, drilling into a home detail view, opening a trash preview, switching tabs — pushes onto a per-vault history stack. Back and forward navigate that stack via the top strip's leading-cluster buttons, trackpad two-finger horizontal swipe (matching browser convention), and a keybind registry entry.
 
 The headline decisions:
 
 - **History is a per-vault in-memory stack of editor-pane content states.** Cleared on vault swap. Not persisted across hiker restarts (matches browser per-window behavior). [navigation-history-stack]
-- **Back and forward buttons live in the vault bar, pinned to the right** (trailing edge, after the vault path display). Icon-only, disabled when no history exists in that direction. [vault-bar-back-button, vault-bar-forward-button]
+- **Back and forward buttons live in the top strip's leading cluster** (leftmost, before Home / Queue / Settings / Open). Icon-only, disabled when no history exists in that direction. Browser-leading-left placement keeps all vault-level navigation controls together; per-buffer navigation lives separately in the tab strip. [top-strip-back-button, top-strip-forward-button]
 - **Two-finger horizontal trackpad swipe** triggers back/forward. Same UX as macOS Safari / Chrome / Firefox. Detection via wheel events with sustained `deltaX` past a threshold; right-swipe = back, left-swipe = forward (matches browser convention). [navigation-trackpad-swipe]
 - **Keybind registry entries** reserve `navigation.back` and `navigation.forward` with platform-conventional chords: Cmd/Ctrl-[ for back, Cmd/Ctrl-] for forward; Alt-Left/Right as additional bindings on Linux/Windows for browser-keyboard parity. [navigation-keybind]
-- **Dirty-buffer protection** integrates with the existing `file-switch-guard-dirty` modal — navigating back/forward into a different note from a dirty buffer fires the same Keep/Discard/Cancel modal save-on-switch already uses. [navigation-dirty-buffer-guard]
+- **Dirty-buffer protection** is moot for back/forward navigation under multi-buffer — navigating to a different tab leaves the prior tab dirty in memory rather than closing it. The save/discard/cancel modal only fires on explicit tab close + window close (per `multi-buffer-no-switch-guard` / `multi-buffer-window-close-guard`).
 
 
 ### What pushes onto the stack
@@ -433,13 +620,6 @@ Things that *don't* push:
 When the user navigates back and then opens a new content surface, the forward stack is discarded — same shape as every browser. The history feels predictable.
 
 
-### Vault bar layout
-
-The existing vault-bar order is preserved: Home button, Open-vault button, vault path display (left to right). Back and forward append at the trailing edge — after the vault path, pinned to the right. Browser convention puts navigation arrows leftmost, but the vault bar already has Home / Open-vault at that edge as vault-management controls, and pushing those right to make room for browser-style back/forward would shuffle muscle memory for affordances that are more frequently used. Trailing-edge placement keeps the existing left-edge cluster intact while still putting back/forward in a recognizable, dedicated zone.
-
-Back/forward icon style matches the existing icon-only toolbar treatment (sidebar wheel, discovery magnifying glass, view eye, vault home button, etc.) — minimal arrow glyphs, tooltips, `aria-label`s. Disabled state styling for "no history that direction" should be visibly inert (greyed, no hover effect).
-
-
 ### Trackpad swipe shape
 
 Browser convention: two-finger horizontal swipe on a trackpad triggers back/forward. macOS surfaces this as `wheel` events with `deltaX` accumulation; the editor pane's wheel handler watches for sustained horizontal scroll past a threshold (e.g. ~120px of accumulated `deltaX` over a short time window) and fires the navigation. Vertical swipes are ignored.
@@ -457,7 +637,7 @@ Edge cases worth pinning:
 
 ### Dirty-buffer interaction
 
-Navigating away from a dirty buffer via back/forward fires the existing `file-switch-guard-dirty` modal (Keep / Discard / Cancel). Cancel aborts the navigation, history isn't mutated. Keep saves and proceeds. Discard reverts and proceeds. Same UX as switching files via the tree today.
+Back/forward navigation under multi-buffer doesn't need a dirty-buffer guard — the dirty buffer stays in its tab, the navigation just activates a different tab (or pane state). The save/discard/cancel modal only fires on explicit tab close + window close.
 
 Closing the vault while history exists drops the entire stack — no warning, no save protection beyond what already gates vault swap.
 
@@ -497,8 +677,6 @@ Editor instance is created once at startup and reused across buffer switches; sw
 - Wikilink rendering and autocomplete
 - Widget-based rendering (images, math, embeds, callouts)
 - Multi-buffer / tabs / split panes
-- Autosave timer
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)
 - External-change watcher integration (v1)
-- **Note-mutations menu** — a top-bar button on the editor pane hosting content-mutation actions on the active note. First candidate is markdown reformat (per `txt-ingest.md`'s deferred LLM-rewrite option) for `.txt` and messy `.md` content. Output goes to `.hiker/derived/<rel-path>.md` per the never-mutate-source rule; the source file is never touched until the user accepts. Other content-mutation actions slot into the same menu as they're specced. Not in v1; recorded here so the surface is reserved. **Routing (per `llm.md`):** this menu's actions are single-shot deterministic prompts — one click, one prompt, one derived file — so they use `core::llm` direct, *not* `core::agent` or `core::acp`. Provider (Ollama for local, OpenAI / Anthropic / etc. for cloud) is the user's `[llm]` config; no per-feature backend selection in this menu, no in-process model runtime. **Review surface (per `diff.md`):** when a mutation completes, the editor pane swaps to the diff viewer (`diff-viewer-pane`) with the source on the left and the derived output on the right. Two banner actions — Replace original (`note-mutation-replace-original`, drift-checked write to source + activity row + derived deletion) and Discard derived (`note-mutation-discard-derived`, no activity row, derived deleted). Diff is the only review surface in v1; the derived file isn't otherwise exposed as a buffer. [note-mutations-menu]

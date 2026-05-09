@@ -14,19 +14,27 @@
 //! Handle is dropped at vault close — the cancellation token tears the
 //! task down and removes the discovery file.
 
+pub mod agent_bridge;
 pub mod audit;
 pub mod discovery;
 pub mod handler;
+
+pub use agent_bridge::{
+    agent_tool_defs, agent_tool_defs_filtered, agent_tool_defs_with, McpAgentDispatcher,
+};
+pub use handler::HikerHandler;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use hiker_core::audit::AgentLog;
 use hiker_core::changes::Changes;
-use hiker_core::config::McpConfig;
+use hiker_core::config::{McpConfig, TasksConfig};
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
 use hiker_core::store::Store;
+use hiker_core::tasks::Queue as TaskQueue;
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
 use rmcp::transport::streamable_http_server::{
@@ -36,7 +44,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::AuditLog;
-use crate::handler::HikerHandler;
 
 /// All shared dependencies the MCP server needs from the rest of the app.
 /// Constructed by `ui/src-tauri::open_vault_at` and consumed by `start`.
@@ -53,6 +60,28 @@ pub struct McpDeps {
     /// case rather than blocking.
     pub embedder_provider: Arc<dyn Fn() -> Option<Arc<dyn Embedder>> + Send + Sync>,
     pub config: McpConfig,
+    /// status: mcp-tool-toggles
+    /// Shared, mutable per-tool config. The Tauri `set_setting`
+    /// command swaps the contents in place so the next dispatched tool
+    /// call sees the new gate without a vault re-open. `host` and
+    /// `port` aren't included here because they control the TCP bind
+    /// and changing them mid-flight would require rebinding the
+    /// listener — those stay restart-bound.
+    pub tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    /// Shared agent-log writer (see `core::audit`). MCP tool calls
+    /// record through this so all surfaces — `core::agent`, `core::llm`,
+    /// `mcp-tool-call` — land in the same daily JSONL.
+    pub audit: Arc<AgentLog>,
+    /// Shared task queue. The `task_*` tools route through this.
+    pub tasks: Arc<TaskQueue>,
+    /// `[tasks]` config — drives lease defaults + the chat-agent
+    /// expose toggle.
+    pub tasks_config: TasksConfig,
+    /// Mirror of `[llm] enabled`. The `task_*` tools guard on this; with
+    /// LLM disabled, the queue's purpose is gone, so the tools answer
+    /// `1004 disabled` rather than letting external agents check work
+    /// out that no one will drain.
+    pub llm_enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +105,12 @@ pub struct McpServerHandle {
     discovery_path: PathBuf,
     cancel: CancellationToken,
     join: Option<JoinHandle<()>>,
+    /// status: agent-tool-routing-via-mcp
+    /// In-process handler used by the basic agent loop's `ToolDispatcher`.
+    /// Shares the same `HikerState` (audit log, tool registry, error
+    /// model) as the rmcp-side handlers, so the basic agent and external
+    /// rmcp clients see one tool surface.
+    agent_handler: Arc<HikerHandler>,
 }
 
 impl McpServerHandle {
@@ -87,6 +122,11 @@ impl McpServerHandle {
     }
     pub fn url(&self) -> String {
         format!("http://{}/mcp", self.addr)
+    }
+    /// Handler for in-process tool dispatch (basic agent loop). Cheap to
+    /// clone — wraps an `Arc<HikerState>`.
+    pub fn agent_handler(&self) -> Arc<HikerHandler> {
+        self.agent_handler.clone()
     }
     /// Stop the listener and wait briefly for the task to finish. Removing
     /// the discovery file is part of shutdown so a stale file never lingers
@@ -118,7 +158,22 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         return Err(StartError::Disabled);
     }
 
-    let bind_addr = format!("127.0.0.1:{}", deps.config.port);
+    // status: mcp-bind-host-configurable
+    // Default host is 127.0.0.1 — anything else exposes vault contents
+    // to whoever can reach the listening port. The settings UI surfaces
+    // a warning row when the user picks a non-loopback bind so the
+    // consequences are visible at the choice site, not buried.
+    let host = if deps.config.host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        deps.config.host.clone()
+    };
+    let bind_addr = if host.contains(':') && !host.starts_with('[') {
+        // Bare IPv6 literal — bracket it for the "host:port" join.
+        format!("[{host}]:{}", deps.config.port)
+    } else {
+        format!("{host}:{}", deps.config.port)
+    };
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|source| StartError::Bind { addr: bind_addr.clone(), source })?;
@@ -136,12 +191,10 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
     )
     .map_err(|e| StartError::Io(format!("discovery file: {e}")))?;
 
-    // Audit log lives at vault/.hiker/agent-log/<YYYY-MM-DD>.jsonl. Shared
-    // across this server's tools; the per-day file is opened on demand.
-    let audit = Arc::new(AuditLog::new(
-        deps.vault_root.join(".hiker").join("agent-log"),
-        deps.config.audit.log_full_input,
-    ));
+    // MCP tool calls share the session's agent log via this thin
+    // wrapper that carries the input-redaction toggle. `core::audit`
+    // owns the on-disk JSONL writer.
+    let audit = Arc::new(AuditLog::new(deps.audit.clone(), deps.config.audit.log_full_input));
 
     let cancel = CancellationToken::new();
     let cancel_for_service = cancel.clone();
@@ -158,7 +211,13 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         changes: deps.changes,
         embedder_provider: deps.embedder_provider,
         config: deps.config.clone(),
+        tools: deps.tools.clone(),
         audit,
+        tasks: deps.tasks,
+        default_lease_secs: deps.tasks_config.lease.default_secs,
+        max_lease_secs: deps.tasks_config.lease.max_secs,
+        expose_tasks_to_chat_agent: deps.tasks_config.expose_to_chat_agent,
+        llm_enabled: deps.llm_enabled,
     });
     let factory_state = handler_state.clone();
     let service: StreamableHttpService<HikerHandler, LocalSessionManager> =
@@ -189,10 +248,13 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         "mcp: server bound",
     );
 
+    let agent_handler = Arc::new(HikerHandler::new(handler_state));
+
     Ok(McpServerHandle {
         addr,
         discovery_path,
         cancel,
         join: Some(join),
+        agent_handler,
     })
 }

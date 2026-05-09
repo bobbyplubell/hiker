@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::TreeSortBy;
 use crate::error::HikerError;
 use crate::hash::hash_str;
 use crate::store::Store;
@@ -74,7 +75,16 @@ impl Vault {
         self.resolve(rel)
     }
 
-    pub fn list_dir(&self, rel: &str) -> Result<Vec<DirEntryDto>, HikerError> {
+    /// status: bug-tree-sort-in-ui (fixed)
+    /// List a directory's immediate children, pre-sorted to the configured
+    /// order. Folders are always grouped before files (display invariant
+    /// shared across UI / CLI / MCP); the chosen order applies *within*
+    /// each group.
+    pub fn list_dir(
+        &self,
+        rel: &str,
+        sort_by: TreeSortBy,
+    ) -> Result<Vec<DirEntryDto>, HikerError> {
         let abs = self.resolve(rel)?;
         let mut out = Vec::new();
         for entry in fs::read_dir(&abs)? {
@@ -114,7 +124,7 @@ impl Vault {
         out.sort_by(|a, b| match (&a.kind, &b.kind) {
             (EntryKind::Dir, EntryKind::File) => std::cmp::Ordering::Less,
             (EntryKind::File, EntryKind::Dir) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            _ => compare_entries(a, b, sort_by),
         });
         Ok(out)
     }
@@ -1051,6 +1061,24 @@ mod tests {
 /// Reject any path whose existing ancestors include a symlink. Components
 /// that don't exist yet (typical for create_note) are fine — we only check
 /// what's currently on disk.
+/// status: bug-tree-sort-in-ui (fixed) — order policy lives next to
+/// `list_dir` so the same comparator runs across UI/CLI/MCP.
+fn compare_entries(a: &DirEntryDto, b: &DirEntryDto, sort_by: TreeSortBy) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match sort_by {
+        TreeSortBy::NameAsc => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        TreeSortBy::NameDesc => b.name.to_lowercase().cmp(&a.name.to_lowercase()),
+        TreeSortBy::MtimeDesc => match b.mtime.cmp(&a.mtime) {
+            Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            o => o,
+        },
+        TreeSortBy::MtimeAsc => match a.mtime.cmp(&b.mtime) {
+            Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            o => o,
+        },
+    }
+}
+
 fn ensure_no_symlink_components(root: &Path, candidate: &Path) -> Result<(), HikerError> {
     let mut current = PathBuf::new();
     for comp in candidate.components() {

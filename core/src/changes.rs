@@ -80,6 +80,57 @@ pub struct ChangeRow {
     pub content_hash: Option<String>,
     pub rename_from: Option<String>,
     pub metadata: serde_json::Value,
+    /// status: bug-latest-per-path-computed-over-visible-window (fixed)
+    /// True when this row is the most recent change for its `path` across
+    /// the whole changelog (i.e. its `id` is `MAX(id)` partitioned by
+    /// path). Computed by the SQL query, not over a paginated client-side
+    /// window — so the "current" badge stays correct even when an older
+    /// version pages out. The append-only `appended_tx` broadcast leaves
+    /// this field at `false`; subscribers re-fetching via `recent` /
+    /// `history_for_path` get the up-to-date value.
+    #[serde(default)]
+    pub is_current: bool,
+    /// status: bug-author-class-string-parsing-in-ui (fixed)
+    /// Coarse author classification derived from `author`. The wire format
+    /// of `author` is `class[:identifier]`; UIs and filter pills only ever
+    /// need the class half, so it's surfaced as a typed enum here rather
+    /// than re-parsed at every call site. Stays in sync with `author` by
+    /// being computed in `map_row` whenever a row is loaded.
+    #[serde(default)]
+    pub author_class: AuthorClass,
+}
+
+/// Coarse author taxonomy from `design.md`'s authorship trichotomy
+/// (user / agent / sync / import). The wire format of `ChangeRow.author`
+/// is `class[:identifier]` — e.g. `agent:claude-code`, `sync:phone`. This
+/// enum carries the class half typed so consumers don't have to parse the
+/// string. `Other` is a forward-compat slot for unknown future classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorClass {
+    #[default]
+    User,
+    Agent,
+    Sync,
+    Import,
+    Other,
+}
+
+impl AuthorClass {
+    /// Parse the class prefix from a wire-format `author` string.
+    pub fn from_author(author: &str) -> Self {
+        let class = match author.find(':') {
+            Some(i) => &author[..i],
+            None => author,
+        };
+        match class {
+            "user" => AuthorClass::User,
+            "agent" => AuthorClass::Agent,
+            "sync" => AuthorClass::Sync,
+            "import" => AuthorClass::Import,
+            _ => AuthorClass::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +305,7 @@ impl Changes {
         };
         // Notify subscribers (Tauri bridge etc.) without holding the
         // connection mutex. Send failure when there are no receivers — fine.
+        let author_class = AuthorClass::from_author(append.author);
         let _ = self.appended_tx.send(ChangeRow {
             id,
             timestamp_ms: ts,
@@ -263,6 +315,10 @@ impl Changes {
             content_hash: append.content_hash.map(|s| s.to_string()),
             rename_from: append.rename_from.map(|s| s.to_string()),
             metadata: append.metadata,
+            // A freshly appended row is by definition the current state for
+            // its path. Re-fetches via `recent` will compute this from SQL.
+            is_current: true,
+            author_class,
         });
         Ok(id)
     }
@@ -270,12 +326,7 @@ impl Changes {
     /// Most recent N rows across the whole vault, descending by id.
     pub fn recent(&self, limit: usize) -> Result<Vec<ChangeRow>, ChangesError> {
         let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata
-             FROM changes
-             ORDER BY id DESC
-             LIMIT ?1",
-        )?;
+        let mut stmt = conn.prepare(LIST_SQL_BY_ID)?;
         let rows = stmt
             .query_map(params![limit as i64], map_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -290,13 +341,7 @@ impl Changes {
         limit: usize,
     ) -> Result<Vec<ChangeRow>, ChangesError> {
         let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata
-             FROM changes
-             WHERE author LIKE ?1
-             ORDER BY id DESC
-             LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(LIST_SQL_BY_AUTHOR)?;
         let rows = stmt
             .query_map(params![author_pattern, limit as i64], map_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -312,13 +357,7 @@ impl Changes {
         limit: usize,
     ) -> Result<Vec<ChangeRow>, ChangesError> {
         let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata
-             FROM changes
-             WHERE path = ?1
-             ORDER BY id DESC
-             LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(LIST_SQL_BY_PATH)?;
         let rows = stmt
             .query_map(params![path, limit as i64], map_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -432,20 +471,55 @@ impl Changes {
     }
 }
 
+/// status: bug-latest-per-path-computed-over-visible-window (fixed)
+/// Shared SELECT shape that joins `is_current` (id == MAX(id) partitioned
+/// by path) onto every row. Correlated subquery is fine — the
+/// `changes_path_ts` index makes the per-path MAX cheap.
+const LIST_SQL_BY_ID: &str = "
+    SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata,
+           id = (SELECT MAX(id) FROM changes c2 WHERE c2.path = changes.path) AS is_current
+    FROM changes
+    ORDER BY id DESC
+    LIMIT ?1
+";
+
+const LIST_SQL_BY_AUTHOR: &str = "
+    SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata,
+           id = (SELECT MAX(id) FROM changes c2 WHERE c2.path = changes.path) AS is_current
+    FROM changes
+    WHERE author LIKE ?1
+    ORDER BY id DESC
+    LIMIT ?2
+";
+
+const LIST_SQL_BY_PATH: &str = "
+    SELECT id, timestamp, path, op, author, content_hash, rename_from, metadata,
+           id = (SELECT MAX(id) FROM changes c2 WHERE c2.path = changes.path) AS is_current
+    FROM changes
+    WHERE path = ?1
+    ORDER BY id DESC
+    LIMIT ?2
+";
+
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
     let op_str: String = row.get(3)?;
     let op = ChangeOp::parse(&op_str).unwrap_or(ChangeOp::Modified);
     let metadata_str: String = row.get(7)?;
     let metadata = serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({}));
+    let is_current: i64 = row.get(8).unwrap_or(0);
+    let author: String = row.get(4)?;
+    let author_class = AuthorClass::from_author(&author);
     Ok(ChangeRow {
         id: row.get(0)?,
         timestamp_ms: row.get(1)?,
         path: row.get(2)?,
         op,
-        author: row.get(4)?,
+        author,
         content_hash: row.get(5)?,
         rename_from: row.get(6)?,
         metadata,
+        is_current: is_current != 0,
+        author_class,
     })
 }
 
@@ -595,6 +669,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].op, ChangeOp::Modified);
         assert_eq!(rows[1].op, ChangeOp::Created);
+        // status: bug-latest-per-path-computed-over-visible-window (fixed)
+        // Most recent row for `a.md` is the Modified one; the Created row
+        // is no longer current.
+        assert!(rows[0].is_current);
+        assert!(!rows[1].is_current);
     }
 
     #[test]

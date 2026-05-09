@@ -1,8 +1,10 @@
+mod chat;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use hiker_core::changes::{ChangeOp, ChangeRow, Changes};
-use hiker_core::config::{Config, SettingsScope};
+use hiker_core::config::{Config, SettingsScope, TreeSortBy};
 use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
@@ -16,9 +18,9 @@ use tauri::{Emitter, Manager, State};
 
 /// All long-lived state for an open vault. Constructed in `open_vault_at`,
 /// dropped on swap.
-struct VaultSession {
+pub(crate) struct VaultSession {
     vault: Vault,
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     indexer: IndexerHandle,
     /// Held to keep the watcher alive; dropping this closes the broadcast.
     /// Also referenced by `create_note` / `move_note` to register self-write
@@ -36,7 +38,7 @@ struct VaultSession {
     /// status: settings-load-once-at-startup
     /// Frozen merged user+vault settings. `set_setting` writes through to
     /// disk via `Config::set` and swaps the in-memory copy in this RwLock.
-    config: RwLock<Config>,
+    pub(crate) config: RwLock<Config>,
     /// Long-lived read-side store handle. The indexer task owns the writer
     /// connection (one per vault); this is a *second* connection against
     /// the same on-disk db, used by every read-side Tauri command
@@ -62,12 +64,52 @@ struct VaultSession {
     /// the bind failed (logged but non-fatal — vault open still succeeds).
     /// Held purely for its `Drop` side effect (cancel the task + remove the
     /// discovery file); never read directly.
-    #[allow(dead_code)]
-    mcp: Option<hiker_mcp::McpServerHandle>,
+    pub(crate) mcp: Option<hiker_mcp::McpServerHandle>,
+    /// status: agent-chat-command-surface
+    /// Per-turn live state for the basic agent loop (`core::agent`). See
+    /// `chat.rs`. Outlives any single `chat_send`/`chat_continue` call so
+    /// cap-hit pauses can be resumed mid-session.
+    pub(crate) chat: Arc<chat::ChatRegistry>,
+    /// status: llm-prompts-file-store
+    /// Loaded once at vault open and shared across every chat turn so we
+    /// don't re-read disk on every `chat_send`. The user-edited prompt
+    /// file is the authoritative surface; relaunching hiker picks up
+    /// changes (matches the rest of the settings-load-once-at-startup
+    /// discipline).
+    pub(crate) prompts: Arc<hiker_core::prompts::Prompts>,
+    /// status: llm-audit-log
+    /// Shared JSONL audit-log writer. Every LLM-driven surface
+    /// (`core::agent`, `core::llm`, MCP tool calls) records through
+    /// this single writer so all rows land in one daily file. See
+    /// `core::audit`.
+    pub(crate) audit: Arc<hiker_core::audit::AgentLog>,
+    /// status: task-queue-core-module
+    /// Shared work queue for non-interactive LLM jobs. Plumbed into the
+    /// MCP server (so external rmcp clients + the basic chat agent reach
+    /// the same `task_*` surface) and drained by the in-process direct
+    /// worker.
+    pub(crate) tasks: Arc<hiker_core::tasks::Queue>,
+    /// CancellationToken used to wind down the direct worker + queue
+    /// maintenance task on vault swap. Dropped with the session.
+    pub(crate) tasks_cancel: tokio_util::sync::CancellationToken,
+    /// status: mcp-tool-toggles
+    /// Shared `[mcp.tools]` config — also held by the MCP handler so
+    /// per-tool toggles apply live. Mutated by `set_setting` /
+    /// `reload_config`.
+    pub(crate) mcp_tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
 }
 
-struct AppState {
-    session: Mutex<Option<VaultSession>>,
+impl Drop for VaultSession {
+    fn drop(&mut self) {
+        // Stop the direct worker + queue maintenance/event-pump tasks.
+        // Safe to call multiple times — `CancellationToken::cancel` is
+        // idempotent.
+        self.tasks_cancel.cancel();
+    }
+}
+
+pub(crate) struct AppState {
+    pub(crate) session: Mutex<Option<VaultSession>>,
 }
 
 fn with_vault<R>(
@@ -95,11 +137,27 @@ fn log_cmd_result<T, E: std::fmt::Display>(
 }
 
 #[tauri::command]
-fn list_dir(state: State<AppState>, rel: String) -> Result<Vec<DirEntryDto>, String> {
-    log_cmd_result(
-        "list_dir",
-        with_vault(&state, |v| v.list_dir(&rel).map_err(|e| e.to_string())),
-    )
+fn list_dir(
+    state: State<AppState>,
+    rel: String,
+    sort: Option<TreeSortBy>,
+) -> Result<Vec<DirEntryDto>, String> {
+    let result = (|| -> Result<Vec<DirEntryDto>, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let order = match sort {
+            Some(o) => o,
+            None => session
+                .config
+                .read()
+                .map_err(|_| "config lock poisoned".to_string())?
+                .vault
+                .tree
+                .sort_by,
+        };
+        session.vault.list_dir(&rel, order).map_err(|e| e.to_string())
+    })();
+    log_cmd_result("list_dir", result)
 }
 
 #[tauri::command]
@@ -128,8 +186,26 @@ fn read_file_with_hash(state: State<AppState>, rel: String) -> Result<FileWithHa
     )
 }
 
+/// status: note-mutation-stash-changes-tag
+/// Build the `metadata` JSON for a save's changes-row. Frontend may pass
+/// `extra_metadata` to stamp one-shot context (e.g.
+/// `{ "mutation": "<kind>" }` for the save that accepts an in-buffer
+/// mutation). Object inputs are taken as-is; non-object / `None` falls
+/// back to the empty object — same default as before this hook landed.
+fn merge_extra_metadata(extra: Option<serde_json::Value>) -> serde_json::Value {
+    match extra {
+        Some(serde_json::Value::Object(_)) => extra.unwrap(),
+        _ => serde_json::json!({}),
+    }
+}
+
 #[tauri::command]
-fn write_file(state: State<AppState>, rel: String, contents: String) -> Result<(), String> {
+fn write_file(
+    state: State<AppState>,
+    rel: String,
+    contents: String,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let guard = state.session.lock().map_err(|e| e.to_string())?;
         let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
@@ -169,7 +245,7 @@ fn write_file(state: State<AppState>, rel: String, contents: String) -> Result<(
             content_hash: Some(&hash),
             content: Some(contents.as_bytes()),
             rename_from: None,
-            metadata: serde_json::json!({}),
+            metadata: merge_extra_metadata(extra_metadata),
         }) {
             tracing::warn!(error = %e, "changes: append (write_file) failed");
         }
@@ -184,6 +260,7 @@ fn write_file_checked(
     rel: String,
     expected_hash: String,
     contents: String,
+    extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, hiker_core::HikerError> {
     let result = (|| {
         let guard = state
@@ -225,7 +302,7 @@ fn write_file_checked(
             content_hash: Some(&new_hash),
             content: Some(contents.as_bytes()),
             rename_from: None,
-            metadata: serde_json::json!({}),
+            metadata: merge_extra_metadata(extra_metadata),
         }) {
             tracing::warn!(error = %e, "changes: append (write_file_checked) failed");
         }
@@ -263,24 +340,42 @@ fn get_settings(state: State<AppState>) -> Result<Config, String> {
 ///
 /// status: settings-write-back
 #[tauri::command]
-fn set_setting(
-    state: State<AppState>,
+async fn set_setting(
+    state: State<'_, AppState>,
     scope: SettingsScope,
     key: String,
     value: serde_json::Value,
 ) -> Result<Config, HikerError> {
-    let result = (|| {
-        let root = {
-            let guard = state
-                .session
-                .lock()
-                .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
-            let session = guard
-                .as_ref()
-                .ok_or_else(|| HikerError::Config("no vault open".into()))?;
-            session.root.clone()
-        };
-        let updated = Config::set(scope, &key, value, &root)?;
+    let result = set_setting_inner(state, scope, key, value).await;
+    log_cmd_result("set_setting", result)
+}
+
+async fn set_setting_inner(
+    state: State<'_, AppState>,
+    scope: SettingsScope,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Config, HikerError> {
+    // Snapshot the previous mcp config (for the bind-restart decision)
+    // and the vault root before doing any disk I/O.
+    let (root, prev_mcp) = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+        let cfg = session
+            .config
+            .read()
+            .map_err(|_| HikerError::Config("config lock poisoned".into()))?;
+        (session.root.clone(), cfg.mcp.clone())
+    };
+    let updated = Config::set(scope, &key, value, &root)?;
+    // Apply the live in-memory updates (config swap, queue cfg,
+    // mcp tool gates).
+    {
         let guard = state
             .session
             .lock()
@@ -293,9 +388,212 @@ fn set_setting(
             .write()
             .map_err(|_| HikerError::Config("config lock poisoned".into()))?;
         *w = updated.clone();
+        drop(w);
+        session.tasks.set_cfg(updated.tasks.clone());
+        match session.mcp_tools.write() {
+            Ok(mut tools) => *tools = updated.mcp.tools.clone(),
+            Err(_) => {} // poisoned — best-effort
+        };
+    }
+    // status: mcp-bind-host-configurable
+    // Bind-affecting change → tear the MCP server down and start it
+    // back up so port/host/discovery-file flips apply without a vault
+    // re-open. `mcp.tools.*` is already live via the shared RwLock so
+    // it's excluded; everything else in `[mcp]` (enabled, host, port,
+    // discovery_file, max_top_k, audit.log_full_input) takes effect
+    // through a server restart.
+    let bind_changed = prev_mcp.enabled != updated.mcp.enabled
+        || prev_mcp.host != updated.mcp.host
+        || prev_mcp.port != updated.mcp.port
+        || prev_mcp.discovery_file != updated.mcp.discovery_file
+        || prev_mcp.max_top_k != updated.mcp.max_top_k
+        || prev_mcp.audit.log_full_input != updated.mcp.audit.log_full_input;
+    if bind_changed {
+        restart_mcp_server(&state, &updated).await;
+    }
+    Ok(updated)
+}
+
+/// Tear down the existing in-process MCP server (if any) and bring up a
+/// fresh one against the latest config. Failures during the restart log
+/// at warn but don't propagate — a stale-but-running server is worse
+/// UX than the user thinking their toggle didn't apply, but a setting
+/// flip shouldn't kill the whole vault session.
+///
+/// status: mcp-bind-host-configurable
+async fn restart_mcp_server(state: &State<'_, AppState>, updated: &Config) {
+    // Pull the deps we need under the sync lock, then drop it before
+    // any `.await` so we don't hold a std::sync::Mutex across the
+    // bind. Take the old handle out of the session first so its `Drop`
+    // (which cancels the axum task and removes the discovery file)
+    // fires before we attempt to bind the new one.
+    let restart_inputs = {
+        let mut guard = match state.session.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(session) = guard.as_mut() else { return };
+        let old = session.mcp.take();
+        let inputs = (
+            session.vault.clone(),
+            session.root.clone(),
+            session.indexer.job_sender(),
+            session.indexer.embedder_provider(),
+            session.read_store.clone(),
+            session.watcher.clone(),
+            session.changes.clone(),
+            session.audit.clone(),
+            session.tasks.clone(),
+            session.mcp_tools.clone(),
+        );
+        drop(old);
+        inputs
+    };
+    if !updated.mcp.enabled {
+        return;
+    }
+    let (vault, root, jobs, embedder_provider, read_store, watcher, changes, audit, tasks, mcp_tools) =
+        restart_inputs;
+    let deps = hiker_mcp::McpDeps {
+        vault,
+        vault_root: root,
+        read_store,
+        jobs,
+        watcher,
+        changes,
+        embedder_provider,
+        config: updated.mcp.clone(),
+        tools: mcp_tools,
+        audit,
+        tasks,
+        tasks_config: updated.tasks.clone(),
+        llm_enabled: updated.llm.enabled,
+    };
+    match hiker_mcp::start(deps).await {
+        Ok(handle) => {
+            if let Ok(mut guard) = state.session.lock() {
+                if let Some(session) = guard.as_mut() {
+                    session.mcp = Some(handle);
+                }
+            }
+        }
+        Err(hiker_mcp::StartError::Disabled) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp: restart failed");
+        }
+    }
+}
+
+/// Read a single TOML scope's contents (user or vault) without merging or
+/// triggering auto-create. Backs the settings pane's per-section scope
+/// toggle: each section card shows the values that the *currently-displayed
+/// file alone* would contribute. Missing file → `Config::default()`.
+///
+/// status: settings-pane-scope-toggle
+#[tauri::command]
+fn get_settings_scoped(
+    state: State<AppState>,
+    scope: SettingsScope,
+) -> Result<Config, HikerError> {
+    let result = (|| {
+        let root = {
+            let guard = state
+                .session
+                .lock()
+                .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+            session.root.clone()
+        };
+        Config::read_file_only(scope, &root)
+    })();
+    log_cmd_result("get_settings_scoped", result)
+}
+
+/// Force `Config::load` to re-run and swap the in-memory copy. Backs the
+/// settings pane's manual-refresh affordance for the "user hand-edited the
+/// TOML while the pane was open" case.
+///
+/// status: settings-pane-manual-refresh
+#[tauri::command]
+fn reload_config(state: State<AppState>) -> Result<Config, HikerError> {
+    let result = (|| {
+        let root = {
+            let guard = state
+                .session
+                .lock()
+                .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+            session.root.clone()
+        };
+        let updated = Config::load(&root)?;
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| HikerError::Config("session lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| HikerError::Config("no vault open".into()))?;
+        let mut w = session
+            .config
+            .write()
+            .map_err(|_| HikerError::Config("config lock poisoned".into()))?;
+        *w = updated.clone();
+        drop(w);
+        session.tasks.set_cfg(updated.tasks.clone());
+        if let Ok(mut tools) = session.mcp_tools.write() {
+            *tools = updated.mcp.tools.clone();
+        }
         Ok(updated)
     })();
-    log_cmd_result("set_setting", result)
+    log_cmd_result("reload_config", result)
+}
+
+/// Resolve the absolute path of one config TOML and reveal it in the OS file
+/// manager. Used by the settings pane's "Open user/vault config.toml"
+/// affordances and the read-only-row popovers.
+///
+/// status: settings-pane-open-toml-link
+#[tauri::command]
+fn reveal_config_file(
+    state: State<AppState>,
+    scope: SettingsScope,
+) -> Result<(), HikerError> {
+    let result = (|| {
+        let root = {
+            let guard = state
+                .session
+                .lock()
+                .map_err(|_| HikerError::Io("session lock poisoned".into()))?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| HikerError::Io("no vault open".into()))?;
+            session.root.clone()
+        };
+        let paths = hiker_core::config::ConfigPaths::resolve(&root);
+        let abs = match scope {
+            SettingsScope::User => paths
+                .user
+                .ok_or_else(|| HikerError::Config("no platform config dir available".into()))?,
+            SettingsScope::Vault => paths.vault,
+        };
+        // Settings TOMLs auto-create on first `Config::load`, so a vault
+        // that was opened normally already has both files. If the user TOML
+        // dir was unresolvable that branch errored above; this fallback
+        // covers the rare "file deleted between open and reveal" case.
+        let target = if abs.exists() {
+            abs
+        } else if let Some(parent) = abs.parent() {
+            parent.to_path_buf()
+        } else {
+            abs
+        };
+        reveal_path(&target).map_err(|e| HikerError::Io(e.to_string()))
+    })();
+    log_cmd_result("reveal_config_file", result)
 }
 
 /// Read-only lookup of the user-scope `vault.default` field. Used by the
@@ -490,14 +788,118 @@ async fn open_vault_at_inner(
         }
     });
 
+    // status: bug-index-status-polled-not-pushed (fixed)
+    // Forward status snapshots to the frontend so it can drop its 2s poll.
+    // Emit the seeded value first (queued/total_notes/last_error are populated
+    // before the indexer task even runs), then on every change.
+    let app_for_status = app.clone();
+    let mut status_rx = indexer.subscribe_status();
+    tokio::spawn(async move {
+        let _ = app_for_status.emit("hiker:index-status", &*status_rx.borrow_and_update());
+        while status_rx.changed().await.is_ok() {
+            let _ = app_for_status.emit("hiker:index-status", &*status_rx.borrow_and_update());
+        }
+    });
+
     // Kick the initial scan. Returns immediately; jobs flow as the model
     // load completes.
     let _ = indexer.full_scan().await;
 
+    // status: llm-audit-log
+    // One shared JSONL agent-log writer for every LLM-driven surface in
+    // this session (core::agent turns, core::llm direct, mcp-tool-call).
+    // `[llm.audit] log_full_prompt` mirrors the obs-no-content default;
+    // callers that carry user content (the MCP wrapper) consult the
+    // toggle before stuffing bodies into `details`. Constructed before
+    // `start_mcp` so the MCP server can share the same writer.
+    let audit = Arc::new(hiker_core::audit::AgentLog::new(
+        root.join(".hiker").join("agent-log"),
+        config.llm.audit.log_full_prompt,
+    ));
+
+    // status: task-queue-core-module
+    // Stand up the unified work queue and the direct-LLM worker. Always
+    // construct the queue so the MCP server can advertise `task_*`
+    // (gated separately on `[mcp] enabled`); the direct worker only
+    // spawns when both `[llm] enabled` and `[tasks] direct_worker.enabled`
+    // are true (per `task-queue-respects-llm-disable`).
+    let tasks = Arc::new(hiker_core::tasks::Queue::new(config.tasks.clone()));
+    let tasks_cancel = tokio_util::sync::CancellationToken::new();
+    {
+        // Forward queue events to the frontend.
+        let app_for_queue = app.clone();
+        let mut rx = tasks.subscribe();
+        let cancel = tasks_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    ev = rx.recv() => match ev {
+                        Ok(e) => { let _ = app_for_queue.emit("hiker:queue-event", &e); }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            }
+        });
+        // Maintenance tick: requeue expired leases + GC terminal rows.
+        let q_for_tick = tasks.clone();
+        let cancel_for_tick = tasks_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_for_tick.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                        q_for_tick.tick_maintenance().await;
+                    }
+                }
+            }
+        });
+        // Direct-LLM worker. Spawned whenever `[llm] enabled = true` —
+        // the per-iteration `direct_worker.enabled` check inside
+        // `run_direct_worker` honors live toggles from the settings UI
+        // without a vault restart. (Spawning still requires `[llm]
+        // enabled` because we need a valid LlmClient; flipping LLM on/off
+        // remains restart-bound for now.)
+        if config.llm.enabled {
+            match hiker_core::llm::GraniteLlmClient::from_config(&config.llm) {
+                Ok(client) => {
+                    let llm_client: Arc<dyn hiker_core::llm::LlmClient> = Arc::new(client);
+                    let q = tasks.clone();
+                    let audit_for_worker = audit.clone();
+                    let cancel = tasks_cancel.clone();
+                    let parallelism = config.tasks.direct_worker.parallelism.max(1);
+                    for _ in 0..parallelism {
+                        let q = (*q).clone();
+                        let client = llm_client.clone();
+                        let audit = Some(audit_for_worker.clone());
+                        let cancel = cancel.clone();
+                        tokio::spawn(async move {
+                            hiker_core::tasks::run_direct_worker(q, client, audit, cancel).await;
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "tasks: direct worker not started (llm client build failed)",
+                    );
+                }
+            }
+        }
+    }
+
+    // status: mcp-tool-toggles
+    // Shared per-tool gate config. Held by the MCP handler so dispatches
+    // read it live; updated by `set_setting` so flips in the settings UI
+    // apply without a vault restart.
+    let mcp_tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>> =
+        Arc::new(std::sync::RwLock::new(config.mcp.tools.clone()));
+
     // status: mcp-server-crate
     // Start the in-process MCP server. Failure to bind logs and continues —
     // the user's vault is more important than MCP availability.
-    let mcp = match start_mcp(&vault, &root, &indexer, &watcher, &changes, &read_store, &config).await {
+    let mcp = match start_mcp(&vault, &root, &indexer, &watcher, &changes, &read_store, &config, &audit, &tasks, &mcp_tools).await {
         Ok(handle) => Some(handle),
         Err(hiker_mcp::StartError::Disabled) => None,
         Err(e) => {
@@ -505,6 +907,84 @@ async fn open_vault_at_inner(
             None
         }
     };
+
+    // status: llm-prompts-file-store
+    // Load the prompt store once at vault open; auto-creates user-scope
+    // defaults on first run. Cached on the session so chat_send doesn't
+    // re-read disk per turn.
+    let prompts = Arc::new(
+        hiker_core::prompts::Prompts::load(&root)
+            .map_err(|e| HikerError::Io(format!("prompts: {e}")))?,
+    );
+
+    // status: llm-prompts-staleness-on-upgrade
+    // Surface bundled-default drift once per session. Writes both a
+    // tracing warn and an audit-log row per stale feature so the future
+    // Prompts-tab can read either surface.
+    match hiker_core::prompts::Prompts::staleness(&root) {
+        Ok(stale) => {
+            for feature in &stale {
+                tracing::warn!(
+                    feature = %feature,
+                    "prompts: bundled default has drifted from the user's stamped hash; review and merge if desired",
+                );
+                audit.record(&hiker_core::audit::AuditEntry {
+                    surface: "core::agent",
+                    feature,
+                    status: "stale_prompt",
+                    error: None,
+                    turn_id: None,
+                    step_id: None,
+                    details: serde_json::json!({
+                        "message": "bundled default drifted; user override not clobbered",
+                    }),
+                });
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "prompts: staleness check failed"),
+    }
+
+    // status: llm-providers-config
+    // API-key preflight: surface a missing key at vault open rather
+    // than waiting for the user's first chat send to fail. Logs *and*
+    // emits `hiker:llm-warning` so the frontend can render a user-visible
+    // toast. Per the spec's two-source rule, the literal `api_key`
+    // (user-scope TOML) takes precedence; if it's set we don't need an
+    // env var. Skipped when LLM is disabled or the provider doesn't
+    // need a key (Ollama et al — empty `api_key_env` AND empty literal).
+    if config.llm.enabled {
+        let literal = config.llm.provider.api_key.as_str();
+        let env_name = config.llm.provider.api_key_env.as_str();
+        let literal_set = !literal.is_empty();
+        let env_named_and_unset =
+            !env_name.is_empty() && std::env::var(env_name).is_err();
+        if !literal_set && env_named_and_unset {
+            tracing::warn!(
+                env = %env_name,
+                backend = %config.llm.provider.backend,
+                "llm: no api key — literal unset and env var missing; chat will fail until set",
+            );
+            let _ = app.emit(
+                "hiker:llm-warning",
+                serde_json::json!({
+                    "kind": "missing_api_key",
+                    "env": env_name,
+                    "message": format!(
+                        "{env_name} unset and no literal api_key — chat will fail until you set one in Settings or your shell",
+                    ),
+                }),
+            );
+        }
+    }
+
+    let chat_registry = Arc::new(chat::ChatRegistry::default());
+    // status: chat-session-resume-latest
+    // Adopt the most-recent on-disk session as the active one (if any
+    // exist). The registry's `active` slot drives `chat_session_active`,
+    // which the frontend calls on vault open to seed the panel.
+    if let Err(e) = chat::resume_latest_at_open(&chat_registry, &root, &config) {
+        tracing::warn!(error = %e, "sessions: resume_latest_at_open failed");
+    }
 
     let session = VaultSession {
         vault,
@@ -515,6 +995,12 @@ async fn open_vault_at_inner(
         config: RwLock::new(config),
         read_store,
         mcp,
+        chat: chat_registry,
+        prompts,
+        audit,
+        tasks,
+        tasks_cancel,
+        mcp_tools,
     };
 
     let state = app.state::<AppState>();
@@ -597,14 +1083,31 @@ fn index_state_for(state: State<AppState>, rel: String) -> Result<IndexState, St
     log_cmd_result("index_state_for", result)
 }
 
-/// Canonical list of file extensions the indexer chunks. Frontend caches
-/// this once at vault open and uses it for client-side row classification
-/// (the `tree-row-unsupported-marker` derivation) so we don't pay a Tauri
-/// round trip per visible row. Single source of truth =
-/// `core::indexer::INDEXABLE_EXTENSIONS`.
+/// Recursive count of indexable files under a folder. Backs the
+/// delete-confirm modal so the UI doesn't have to walk the tree itself
+/// via N round-trip `list_dir` calls. Empty vec / 0 for a file path.
+/// Filters via `core::indexer::is_indexable_path` so the count matches
+/// the indexer's allowlist (md / markdown / txt at v1) — same rule that
+/// drives `tauri-cmd-file-index-state`.
 #[tauri::command]
-fn indexable_extensions() -> Vec<&'static str> {
-    hiker_core::indexer::INDEXABLE_EXTENSIONS.to_vec()
+fn count_notes_in(state: State<AppState>, rel: String) -> Result<u32, String> {
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let files = session.vault.walk_indexable_files(&rel).map_err(|e| e.to_string())?;
+        Ok(u32::try_from(files.len()).unwrap_or(u32::MAX))
+    })();
+    log_cmd_result("count_notes_in", result)
+}
+
+/// status: diff-core-module
+/// Thin wrapper over `core::diff::compute`. Pure text-in / diff-out — no
+/// session lock, no I/O, no async. The UI passes both strings (current
+/// buffer text, snapshot blob via `change_content`, derived file via
+/// `read_file`, etc.) and renders the returned `DiffResult`.
+#[tauri::command]
+fn compute_diff(before: String, after: String) -> hiker_core::diff::DiffResult {
+    hiker_core::diff::compute(&before, &after)
 }
 
 #[tauri::command]
@@ -943,14 +1446,27 @@ fn permanent_delete_trash_entry(
 /// status: tauri-cmd-chunks-for-path
 #[tauri::command]
 fn chunks_for(state: State<AppState>, rel: String) -> Result<Vec<ChunkBounds>, String> {
-    let result = (|| {
+    let result = (|| -> Result<Vec<ChunkBounds>, String> {
         let guard = state.session.lock().map_err(|e| e.to_string())?;
         let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
-        read_store.chunk_bounds_for(&rel).map_err(|e| e.to_string())
+        let mut bounds = {
+            let read_store = session
+                .read_store
+                .lock()
+                .map_err(|_| "read_store mutex poisoned".to_string())?;
+            read_store.chunk_bounds_for(&rel).map_err(|e| e.to_string())?
+        };
+        // status: bug-byte-to-char-conversion-in-ui (fixed)
+        // Read the file once and enrich each row's UTF-8 byte offsets with
+        // matching UTF-16 char offsets. JS strings (and CM6) index by UTF-16
+        // code units, so this saves the frontend from re-doing the encode
+        // step every time it wants to map a chunk into the editor.
+        if !bounds.is_empty() {
+            if let Ok(text) = session.vault.read_file(&rel) {
+                hiker_core::store::enrich_char_offsets(&text, &mut bounds);
+            }
+        }
+        Ok(bounds)
     })();
     log_cmd_result("chunks_for", result)
 }
@@ -988,6 +1504,7 @@ async fn search_vault_inner(
             lexical_hits: Vec::new(),
             semantic_hits: Vec::new(),
             fused: Vec::new(),
+            hits: Vec::new(),
         });
     }
     // Embed the query string (only when semantic is on) on the blocking
@@ -1168,6 +1685,73 @@ async fn note_accessed(state: State<'_, AppState>, rel: String) -> Result<(), St
         .await
         .map_err(|e| e.to_string());
     log_cmd_result("note_accessed", send_result)
+}
+
+/// Resolve a chat `@<rel-path-without-extension>` token to a concrete
+/// vault path + file body. Probes `.md`, `.markdown`, `.txt` in order.
+/// Errors with "note not found: <rel>" if no extension resolves — the
+/// frontend toasts this and aborts the send (per `chat-input-at-note`).
+///
+/// status: chat-input-at-note
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtNoteResolved {
+    pub rel_path: String,
+    pub content: String,
+}
+
+#[tauri::command]
+fn chat_resolve_at_note(
+    state: State<AppState>,
+    rel_no_ext: String,
+) -> Result<AtNoteResolved, String> {
+    let result = (|| -> Result<AtNoteResolved, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let vault = session.vault.clone();
+        drop(guard);
+        for ext in hiker_core::indexer::INDEXABLE_EXTENSIONS {
+            let candidate = format!("{}.{}", rel_no_ext, ext);
+            if let Ok(abs) = vault.abs_path(&candidate) {
+                if abs.is_file() {
+                    if let Ok(content) = vault.read_file(&candidate) {
+                        return Ok(AtNoteResolved {
+                            rel_path: candidate,
+                            content,
+                        });
+                    }
+                }
+            }
+        }
+        Err(format!("note not found: {rel_no_ext}"))
+    })();
+    log_cmd_result("chat_resolve_at_note", result)
+}
+
+/// Notes-table autocomplete for the chat `@`-mention popover. Empty
+/// `prefix` returns the most-recently-accessed notes; non-empty filters by
+/// case-insensitive basename substring with prefix-matches ranked first.
+/// `limit` defaults to 10 to match the spec.
+///
+/// status: chat-input-at-autocomplete-tauri-cmd
+#[tauri::command]
+fn chat_at_autocomplete(
+    state: State<AppState>,
+    prefix: String,
+    limit: Option<u32>,
+) -> Result<Vec<hiker_core::store::AtSuggestion>, String> {
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let read_store = session
+            .read_store
+            .lock()
+            .map_err(|_| "read_store mutex poisoned".to_string())?;
+        read_store
+            .at_autocomplete(&prefix, limit.unwrap_or(10) as usize)
+            .map_err(|e| e.to_string())
+    })();
+    log_cmd_result("chat_at_autocomplete", result)
 }
 
 // ---------- changelog query / rollback commands ----------
@@ -1471,6 +2055,262 @@ fn lookup_change_path(changes: &Changes, change_id: i64) -> Result<String, Hiker
         .ok_or_else(|| HikerError::NotFound(format!("change {change_id}")))
 }
 
+/// status: task-queue-home-widget
+/// status: task-queue-event-stream
+/// Snapshot the current task-queue rows. Frontend seeds its local mirror
+/// with this once at mount and applies `hiker:queue-event` deltas after.
+#[tauri::command]
+async fn tasks_snapshot(
+    state: State<'_, AppState>,
+) -> Result<Vec<hiker_core::tasks::TaskRecord>, String> {
+    let queue = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session.tasks.clone()
+    };
+    log_cmd_result("tasks_snapshot", Ok::<_, String>(queue.snapshot().await))
+}
+
+/// status: task-queue-row-details
+/// Lazy inspection: prompt + final result + final error + metadata for
+/// a single task id. Returns `None` if the id has already been GC'd
+/// past `terminal_retention_secs` (the user can scroll the queue tile
+/// fast enough to miss the row).
+#[tauri::command]
+async fn task_details(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<hiker_core::tasks::TaskDetails>, String> {
+    let queue = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session.tasks.clone()
+    };
+    log_cmd_result("task_details", Ok::<_, String>(queue.details(&id).await))
+}
+
+/// status: task-queue-row-cancel-action
+/// Cancel a task by id. Behavior depends on lease state — see
+/// `core::tasks::Queue::cancel`.
+#[tauri::command]
+async fn tasks_cancel(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let queue = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session.tasks.clone()
+    };
+    queue.cancel(&id).await;
+    log_cmd_result("tasks_cancel", Ok::<(), String>(()))
+}
+
+// ---------- note-mutation producer surface ----------
+//
+// status: note-mutations-menu
+// status: note-mutations-menu-task-shape
+// status: note-mutation-reformat-as-markdown
+// status: note-mutation-replace-original
+// status: note-mutation-discard-derived
+//
+// The mutations menu submits a `Direct` `High`-priority task carrying the
+// buffer's *live* text (per `chat-active-note-context-injection`'s same
+// rule) plus the source extension. The direct-LLM worker drains it and
+// produces text; on success the awaiter spawned here emits
+// `hiker:note-mutation-applied` carrying the result content + the
+// source-hash captured at submit time so the frontend can replace the
+// open buffer (or hold + toast if the buffer was closed).
+
+/// Frontend payload for a successful mutation result. The frontend
+/// dispatches a single CM6 transaction replacing the active buffer's
+/// content (when the buffer is still open and its content hash matches
+/// `source_hash_at_submit`) or holds the result for a click-to-apply
+/// toast (when the buffer has been closed).
+#[derive(Debug, Clone, Serialize)]
+struct NoteMutationAppliedEvent<'a> {
+    task_id: &'a str,
+    source_path: &'a str,
+    mutation_kind: &'a str,
+    content: &'a str,
+    source_hash_at_submit: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NoteMutationFailedEvent<'a> {
+    task_id: &'a str,
+    source_path: &'a str,
+    mutation: &'a str,
+    error: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteMutationSubmitOutcome {
+    pub task_id: String,
+}
+
+/// status: note-mutations-menu-task-shape
+/// Submit a note-mutation task. `mutation` selects the prompt feature key
+/// and is recorded in the changes-row metadata when the user accepts
+/// (`note-mutation-replace-original`). Returns the task id immediately;
+/// callers watch `hiker:queue-event` (and the new
+/// `hiker:note-mutation-completed` / `-failed` events) for terminal state.
+#[tauri::command]
+async fn submit_note_mutation(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    rel: String,
+    mutation: String,
+    source_extension: String,
+    content: String,
+) -> Result<NoteMutationSubmitOutcome, String> {
+    let outcome = submit_note_mutation_inner(state, app, rel, mutation, source_extension, content)
+        .await;
+    log_cmd_result("submit_note_mutation", outcome)
+}
+
+async fn submit_note_mutation_inner(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    rel: String,
+    mutation: String,
+    source_extension: String,
+    content: String,
+) -> Result<NoteMutationSubmitOutcome, String> {
+    if mutation != "reformat-as-markdown" {
+        return Err(format!("unknown mutation: {mutation}"));
+    }
+
+    // Grab the per-vault handles we need before awaiting anywhere — clone
+    // out from under the sync mutex. The source hash captured here is the
+    // pre-mutation on-disk hash; the frontend uses it at apply-time to
+    // decide whether the buffer's content still matches what the LLM saw.
+    let (queue, prompts, source_hash) = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let source_hash = session
+            .vault
+            .read_file_with_hash(&rel)
+            .map(|(_, h)| h)
+            .map_err(|e| e.to_string())?;
+        (
+            session.tasks.clone(),
+            session.prompts.clone(),
+            source_hash,
+        )
+    };
+
+    let title = std::path::Path::new(&rel)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&rel)
+        .to_string();
+
+    let prompt = prompts
+        .render(
+            "note_mutation_reformat_as_markdown",
+            [
+                ("title", title.as_str()),
+                ("content", content.as_str()),
+                ("source_extension", source_extension.as_str()),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+    let task = hiker_core::tasks::Task {
+        id: String::new(),
+        kind: hiker_core::tasks::TaskKind::NoteMutation {
+            mutation: mutation.clone(),
+            source_path: rel.clone(),
+        },
+        priority: hiker_core::tasks::Priority::High,
+        shape: hiker_core::tasks::TaskShape::Direct,
+        payload: hiker_core::tasks::TaskPayload {
+            prompt,
+            inputs: serde_json::Value::Null,
+        },
+        output_schema: None,
+        submitted_at: std::time::SystemTime::now(),
+        metadata: serde_json::json!({
+            "source_hash_at_submit": source_hash,
+        }),
+    };
+
+    let handle = queue.submit(task).await;
+    let task_id = handle.id.clone();
+
+    // Spawn the awaiter. On Completed → emit the result content as a
+    // frontend event so the UI can replace the open buffer in a single
+    // CM6 transaction (or hold + toast if the buffer is closed). On
+    // Failed → toast via event. On Cancelled → silent (the user
+    // already knows; queue events drive the widget).
+    let app_for_await = app.clone();
+    let rel_for_await = rel.clone();
+    let mutation_for_await = mutation.clone();
+    let source_hash_for_await = source_hash.clone();
+    let task_id_for_await = task_id.clone();
+    tokio::spawn(async move {
+        let task_id = task_id_for_await;
+        let outcome = handle.await_outcome().await;
+        match outcome {
+            hiker_core::tasks::TaskOutcome::Completed { value, .. } => {
+                let body_owned: String;
+                let result_body: &str = match &value {
+                    serde_json::Value::String(s) => s.as_str(),
+                    other => {
+                        body_owned = serde_json::to_string_pretty(other)
+                            .unwrap_or_else(|_| other.to_string());
+                        body_owned.as_str()
+                    }
+                };
+                // Empty / whitespace-only completions almost certainly
+                // mean the provider returned a malformed or refused
+                // response — replacing the buffer with empty bytes is a
+                // worse failure than surfacing the problem.
+                if result_body.trim().is_empty() {
+                    let _ = app_for_await.emit(
+                        "hiker:note-mutation-failed",
+                        &NoteMutationFailedEvent {
+                            task_id: &task_id,
+                            source_path: &rel_for_await,
+                            mutation: &mutation_for_await,
+                            error: "empty response from LLM provider",
+                        },
+                    );
+                    return;
+                }
+                let _ = app_for_await.emit(
+                    "hiker:note-mutation-applied",
+                    &NoteMutationAppliedEvent {
+                        task_id: &task_id,
+                        source_path: &rel_for_await,
+                        mutation_kind: &mutation_for_await,
+                        content: result_body,
+                        source_hash_at_submit: &source_hash_for_await,
+                    },
+                );
+            }
+            hiker_core::tasks::TaskOutcome::Failed { error, .. } => {
+                let _ = app_for_await.emit(
+                    "hiker:note-mutation-failed",
+                    &NoteMutationFailedEvent {
+                        task_id: &task_id,
+                        source_path: &rel_for_await,
+                        mutation: &mutation_for_await,
+                        error: &error,
+                    },
+                );
+            }
+            hiker_core::tasks::TaskOutcome::Cancelled { .. } => {
+                // No preview, no toast — the queue widget already showed
+                // the cancellation.
+            }
+        }
+    });
+
+    Ok(NoteMutationSubmitOutcome { task_id })
+}
+
 /// Wire the MCP server up against the vault session's handles. The server
 /// task lives until the returned handle is dropped (which happens when the
 /// `VaultSession` containing it is dropped — i.e. on vault swap or app
@@ -1483,6 +2323,9 @@ async fn start_mcp(
     changes: &Arc<Changes>,
     read_store: &Arc<Mutex<Store>>,
     config: &Config,
+    audit: &Arc<hiker_core::audit::AgentLog>,
+    tasks: &Arc<hiker_core::tasks::Queue>,
+    mcp_tools: &Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
 ) -> Result<hiker_mcp::McpServerHandle, hiker_mcp::StartError> {
     let deps = hiker_mcp::McpDeps {
         vault: vault.clone(),
@@ -1493,6 +2336,11 @@ async fn start_mcp(
         changes: changes.clone(),
         embedder_provider: indexer.embedder_provider(),
         config: config.mcp.clone(),
+        tools: mcp_tools.clone(),
+        audit: audit.clone(),
+        tasks: tasks.clone(),
+        tasks_config: config.tasks.clone(),
+        llm_enabled: config.llm.enabled,
     };
     hiker_mcp::start(deps).await
 }
@@ -1514,7 +2362,8 @@ pub fn run() {
             index,
             index_status,
             index_state_for,
-            indexable_extensions,
+            count_notes_in,
+            compute_diff,
             related_notes,
             search_vault,
             chunks_for,
@@ -1528,6 +2377,9 @@ pub fn run() {
             empty_trash,
             permanent_delete_trash_entry,
             get_settings,
+            get_settings_scoped,
+            reload_config,
+            reveal_config_file,
             set_setting,
             vault_home_stats,
             recent_notes_modified,
@@ -1538,6 +2390,21 @@ pub fn run() {
             change_content,
             rollback_change,
             restore_snapshot,
+            chat::chat_send,
+            chat::chat_continue,
+            chat::chat_stop,
+            chat::chat_cancel,
+            chat::chat_session_new,
+            chat::chat_session_active,
+            chat::chat_session_list,
+            chat::chat_session_open,
+            chat::chat_session_delete,
+            chat_at_autocomplete,
+            chat_resolve_at_note,
+            tasks_snapshot,
+            tasks_cancel,
+            task_details,
+            submit_note_mutation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

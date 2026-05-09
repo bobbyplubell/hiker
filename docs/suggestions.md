@@ -10,10 +10,10 @@ Two flows live on top of the same engine:
 The headline decisions:
 
 - **Suggestions are ephemeral by default.** No durable curated tree, no per-note placement provenance, no `hiker.placement` frontmatter. The filesystem is the only source of truth for organization. [suggestions-one-shot-flow]
-- **Proposals are markdown with checkboxes.** Open them in the editor like any note, check the items you want, hit "Apply." The file becomes the audit log. [suggestions-proposal-md]
-- **Per-line granularity.** Each note × action pair is its own checkbox. Apply a whole cluster, a single note, or any subset; mix-and-match modes per note where useful.
+- **The cluster editor (per `cluster-editor.md`) is the primary review surface.** The markdown proposal format below remains as the on-disk serialization — readable, hand-editable, parseable — and as the audit log of what was applied; users who prefer text editing can flip to a markdown view inside the cluster editor or open the file directly. The structured tree-view UI subsumes the per-line-checkbox flow as the user's working surface for one-shot suggestions. [suggestions-proposal-md]
+- **Per-line granularity.** Each note × action pair is its own checkbox in the markdown form, or a leaf row in the cluster editor. Apply a whole cluster, a single note, or any subset; mix-and-match modes per note where useful.
 - **Two output modes per suggestion: move or tag.** Move = filesystem rename into a (possibly new) folder. Tag = write to the note's frontmatter, no fs change. Configurable per cluster, overridable per note. [suggestions-mode-move, suggestions-mode-tag]
-- **Confidence drives auto-apply only in saved-tree triage.** One-shot suggestions never auto-apply — they're always reviewed. Triage applies high-confidence routes automatically with a prominent Undo; medium-confidence queues for review; low stays put. [triage-confidence-tiers]
+- **Saved-tree triage runs per-node policies (per `cluster-editor.md`), not a single confidence threshold.** Confidence is still computed by the matcher but applies as a per-policy parameter on the matched node rather than a global threshold. The pending-review panel (`triage-pending-review-panel`) still exists — it's where matches against `review`-policy nodes land.
 
 
 ## One-shot suggestions
@@ -118,32 +118,19 @@ Setting `tag_field = "tags"` writes cluster tags to the user's main `tags:` list
 
 ## Saved-tree triage
 
-The one-shot flow is for "I want to look at my whole vault and reorganize." Triage is the complementary mode: the user has a tree they like, saves it, and from then on every new note in `inbox/` gets routed against it without re-clustering.
+The one-shot flow is for "I want to look at my whole vault and reorganize." Triage is the complementary mode: the user saves a tree as the active triage classifier, and from then on every new note in `inbox/` gets routed against it without re-clustering.
 
-```bash
-hiker suggest save <proposal>           # save the tree currently in <proposal> as the triage classifier
-hiker suggest triage [--scope inbox]    # run triage manually
-```
+The save-as-triage entry point lives in the cluster editor (`cluster-editor-save-as-triage`); a `hiker suggest save <proposal>` CLI parity command exists for headless workflows. The on-disk shape, draft persistence, per-node policy program, and the editor surface itself are specced in `cluster-editor.md`. This section covers the runtime — when triage fires and how its matches resolve to actions.
 
-Saving captures the cluster centroids, names, target folders/tags, and the per-cluster default action mode into `.hiker/saved-tree.yaml`. Only one saved tree at a time per vault — re-saving replaces it. (Multiple saved trees per vault are deferred; one is enough until real use shows the need.) [triage-saved-tree]
+Triage runs through `core::tasks` (per `task-queue.md`) on three pathways:
 
-Triage runs:
+1. **On save** — when a note inside the configured triage scope (default `inbox/`) is saved, hiker enqueues a `RaptorTriageMatch` task at `Normal` priority.
+2. **Manually** — `hiker suggest triage [--scope inbox]` enumerates the scope and submits one task per note.
+3. **Scheduled rerun** (opt-in) — `[suggestions.triage] scheduled_rerun` cron-shape config; `Low`-priority submissions over a configurable scope.
 
-1. On note save, when the file is in a triage-scope folder (default `inbox/`).
-2. Manually via `hiker suggest triage`.
-3. Optionally on a schedule (deferred — `--watch` mode mirroring the `hiker reconcile --watch` idea but for triage).
+Each task runs the greedy centroid descent classifier (`cluster-place-greedy-descent`), produces a target node and confidence, and applies the matched node's resolved policy (per the per-node policy walk-up in `cluster-editor.md`). The pending-review panel (`triage-pending-review-panel`) is where matches against `review`-policy nodes land. [triage-classifier-engine]
 
-The classifier is the greedy centroid descent algorithm from `clustering.md`'s `cluster-place-greedy-descent` slug — repurposed from its original placement-system role. Cheap (one descent per note, no LLM, no re-clustering), produces a target cluster + confidence score. [triage-classifier-engine]
-
-**Confidence tiers drive behavior:** [triage-confidence-tiers]
-
-- **High** (≥ 0.85 by default) — auto-apply the cluster's default action (move or tag). Show a non-blocking toast: "Routed `whisper-notes.md` to `research/embeddings/` · Undo (10s)". Undo reverses the action and writes the note's id+action to the rejection log so the same route doesn't fire again. [triage-auto-undo-toast]
-- **Medium** (0.5–0.85) — queue in a "Pending suggestions" panel. User reviews when ready (accept/reject per item, same shape as the one-shot proposal but persistent). [triage-pending-review-panel]
-- **Low** (< 0.5) — leave the note in inbox; no action. Logged at `info!` so the user can see "low-confidence: skipped" if they care.
-
-Thresholds configurable per-vault under `[suggestions]` in `config.toml`. Defaults are deliberately conservative.
-
-**The "auto" in auto-organize is bounded.** Even in triage mode, the system will not move a note out of any folder *other* than the configured triage scope (default `inbox/`). Notes the user has placed elsewhere are off-limits to triage — moving them is an explicit user action via DnD or `hiker mv`. This is the load-bearing safety rule that makes triage non-scary: the worst case for an over-eager classifier is "wrong subfolder under inbox," never "your important note got moved out from under you."
+**The "auto" in auto-organize is bounded.** Even in triage mode, the system will not move a note out of any folder *other* than the configured triage scope (default `inbox/`). Notes the user has placed elsewhere are off-limits to triage — moving them is an explicit user action via DnD or `hiker mv`. The worst case for an over-eager classifier is "wrong subfolder under inbox," never "your important note got moved out from under you."
 
 
 ## Pinning (deferred)
@@ -170,7 +157,7 @@ Module discipline mirrors the other engines: `core::suggest` consumes plain Rust
 
 ## Out of scope
 
-- A durable curated tree alongside the filesystem (the explicit design pivot away from the original `design.md:248` framing — see the rewritten section there).
+- A durable curated tree alongside the filesystem. The filesystem is the only source of truth for organization; the tree is a recommendation tool, not a structural overlay.
 - Multi-axis suggestions (semantic + temporal + entity trees applied together). One semantic tree per run.
 - Cross-vault suggestions. One vault per run.
 - Per-note `hiker.placement` provenance. Replaced by the one-decision-per-suggestion model: when the user accepts, the move/tag *is* the decision; nothing extra needs to be tracked.

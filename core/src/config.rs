@@ -72,6 +72,10 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub tasks: TasksConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -87,8 +91,281 @@ impl Default for Config {
             vault: VaultConfig::default(),
             search: SearchConfig::default(),
             mcp: McpConfig::default(),
+            llm: LlmConfig::default(),
+            tasks: TasksConfig::default(),
         }
     }
+}
+
+/// `[tasks]` section. Configures the unified work queue (`core::tasks`).
+/// See `docs/task-queue.md`.
+///
+/// status: task-queue-settings-section
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TasksConfig {
+    #[serde(default)]
+    pub worker_preference: WorkerPreferenceCfg,
+    #[serde(default = "default_terminal_retention_secs")]
+    pub terminal_retention_secs: u64,
+    #[serde(default)]
+    pub direct_worker: DirectWorkerConfig,
+    /// Whether the in-process basic chat agent gets the `task_*` MCP
+    /// tools advertised in its tool set. External rmcp clients are
+    /// unaffected — they always see `task_*` when `[mcp] enabled = true`.
+    #[serde(default = "yes")]
+    pub expose_to_chat_agent: bool,
+    #[serde(default)]
+    pub lease: LeaseConfig,
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            worker_preference: WorkerPreferenceCfg::default(),
+            terminal_retention_secs: default_terminal_retention_secs(),
+            direct_worker: DirectWorkerConfig::default(),
+            expose_to_chat_agent: true,
+            lease: LeaseConfig::default(),
+        }
+    }
+}
+
+impl TasksConfig {
+    /// Grace window the direct worker waits before becoming eligible for
+    /// a newly-queued task, per `worker_preference`. `internal` = 0,
+    /// `auto` = 1s, `external` = 5s.
+    pub fn direct_grace(&self) -> std::time::Duration {
+        match self.worker_preference {
+            WorkerPreferenceCfg::Internal => std::time::Duration::from_secs(0),
+            WorkerPreferenceCfg::Auto => std::time::Duration::from_secs(1),
+            WorkerPreferenceCfg::External => std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPreferenceCfg {
+    Auto,
+    Internal,
+    External,
+}
+
+impl Default for WorkerPreferenceCfg {
+    fn default() -> Self {
+        WorkerPreferenceCfg::Auto
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectWorkerConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_direct_parallelism")]
+    pub parallelism: u8,
+}
+
+impl Default for DirectWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            parallelism: default_direct_parallelism(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    #[serde(default = "default_lease_default_secs")]
+    pub default_secs: u64,
+    #[serde(default = "default_lease_max_secs")]
+    pub max_secs: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            default_secs: default_lease_default_secs(),
+            max_secs: default_lease_max_secs(),
+        }
+    }
+}
+
+fn default_terminal_retention_secs() -> u64 {
+    60
+}
+
+fn default_direct_parallelism() -> u8 {
+    1
+}
+
+fn default_lease_default_secs() -> u64 {
+    60
+}
+
+fn default_lease_max_secs() -> u64 {
+    600
+}
+
+/// `[llm]` section. Configures generative LLM access for `core::llm` and
+/// the basic agent loop (`core::agent`). Mirrors the shape pinned in
+/// `docs/llm.md` §`core::llm` and the v3.5 stub in `docs/settings.md`.
+///
+/// status: llm-providers-config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Master switch. When false, `core::llm` is treated as unavailable
+    /// (background / fan-out / chat panel all no-op). Reserved for
+    /// `llm-disable-mode`; left here so the loader doesn't reject the key
+    /// once that slug lands.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: LlmProviderConfig,
+    #[serde(default)]
+    pub limits: LlmLimitsConfig,
+    #[serde(default)]
+    pub agent: LlmAgentConfig,
+    #[serde(default)]
+    pub audit: LlmAuditConfig,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: LlmProviderConfig::default(),
+            limits: LlmLimitsConfig::default(),
+            agent: LlmAgentConfig::default(),
+            audit: LlmAuditConfig::default(),
+        }
+    }
+}
+
+/// `[llm.provider]` — backend selection and connection-shaped knobs. API
+/// keys are *never* stored in TOML; `api_key_env` names an environment
+/// variable that the runtime reads at provider construction time. Empty
+/// strings on `api_key_env` / `base_url` are treated as unset (the TOML
+/// auto-create writes the field even when blank, so the loader has to
+/// tolerate that case rather than aborting).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProviderConfig {
+    /// Backend id (`anthropic` / `openai` / `ollama` / `google` / ...). The
+    /// canonical list lives in graniet/`llm`'s `LLMBackend::FromStr`; the
+    /// runtime validates this when the client is built.
+    #[serde(default = "default_llm_backend")]
+    pub backend: String,
+    /// Model id within the chosen backend.
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// Name of the env var holding the API key. Empty = no key (e.g. local
+    /// Ollama). Used as the fallback when `api_key` (user-scope literal)
+    /// is empty.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// User-scope literal API key. Plain text on disk in the platform
+    /// config dir; takes precedence over `api_key_env` when set. The
+    /// eligibility list refuses writes to this field from the vault
+    /// TOML so a synced vault can't carry the secret. Empty by default;
+    /// users who want shell-managed keys should leave this empty and
+    /// set `api_key_env`. See `llm.md` §`[llm-providers-config]`.
+    #[serde(default)]
+    pub api_key: String,
+    /// Optional override (Ollama URL, OpenAI-compatible proxy, etc.).
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl Default for LlmProviderConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_llm_backend(),
+            model: default_llm_model(),
+            api_key_env: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmLimitsConfig {
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_llm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for LlmLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_llm_max_tokens(),
+            timeout_secs: default_llm_timeout_secs(),
+        }
+    }
+}
+
+/// `[llm.agent]` — basic agent loop tunables. Defaults match the
+/// circuit-breaker numbers pinned in `llm.md`.
+///
+/// status: agent-iteration-cap-prompt
+/// status: agent-tool-call-timeout
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAgentConfig {
+    #[serde(default = "default_iteration_cap")]
+    pub iteration_cap: u32,
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
+}
+
+impl Default for LlmAgentConfig {
+    fn default() -> Self {
+        Self {
+            iteration_cap: default_iteration_cap(),
+            tool_timeout_secs: default_tool_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAuditConfig {
+    /// Mirror of `[mcp.audit] log_full_input`. When false (default), the
+    /// JSONL audit log records call metadata but redacts large prompt
+    /// bodies.
+    #[serde(default = "no")]
+    pub log_full_prompt: bool,
+}
+
+fn default_llm_backend() -> String {
+    "anthropic".to_string()
+}
+
+fn default_llm_model() -> String {
+    "claude-sonnet-4-7".to_string()
+}
+
+fn default_llm_max_tokens() -> u32 {
+    4096
+}
+
+fn default_llm_timeout_secs() -> u64 {
+    60
+}
+
+fn default_iteration_cap() -> u32 {
+    10
+}
+
+fn default_tool_timeout_secs() -> u64 {
+    30
 }
 
 /// `[mcp]` section. Configures the in-process MCP server (see `docs/mcp.md`).
@@ -101,6 +378,12 @@ impl Default for Config {
 pub struct McpConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Bind host. Defaults to `127.0.0.1` (loopback-only, matching the
+    /// localhost-trust auth model). Anything else exposes vault contents
+    /// to whoever can reach the listening port — the settings UI shows
+    /// a warning. See `mcp-bind-host-configurable`.
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
     /// `0` = ephemeral OS-assigned port; otherwise bind that fixed port.
     #[serde(default)]
     pub port: u16,
@@ -121,6 +404,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            host: default_mcp_host(),
             port: 0,
             discovery_file: default_mcp_discovery_file(),
             max_top_k: default_mcp_max_top_k(),
@@ -133,14 +417,62 @@ impl Default for McpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpToolsConfig {
-    /// Gates the write tools (`write_note`, `set_frontmatter`, `apply_tag`,
-    /// `remove_tag`). Reads are always available when MCP is on.
+    /// Master gate for the write tools (`write_note`, `set_frontmatter`,
+    /// `apply_tag`, `remove_tag`). Kept for backwards compatibility with
+    /// existing TOMLs — when false, every write tool refuses with `1004
+    /// disabled` regardless of the per-tool flags below.
     #[serde(default = "yes")]
     pub writes_enabled: bool,
-    /// If true, agents passing `scope` can fetch redacted bodies. Conservative
-    /// default (false) per spec.
+    /// If true, agents passing `scope` can fetch redacted bodies.
+    /// Conservative default (false) per spec.
     #[serde(default = "no")]
     pub allow_redacted_lookup: bool,
+    // Per-tool toggles (status: mcp-tool-toggles). Default true.
+    // Reads:
+    #[serde(default = "yes")] pub search_notes_enabled: bool,
+    #[serde(default = "yes")] pub get_note_enabled: bool,
+    #[serde(default = "yes")] pub related_notes_enabled: bool,
+    // Writes (also gated by `writes_enabled` master flag):
+    #[serde(default = "yes")] pub write_note_enabled: bool,
+    #[serde(default = "yes")] pub set_frontmatter_enabled: bool,
+    #[serde(default = "yes")] pub apply_tag_enabled: bool,
+    #[serde(default = "yes")] pub remove_tag_enabled: bool,
+    // Task-queue tools (also gated by `[tasks] expose_to_chat_agent`
+    // for the in-process chat agent path):
+    #[serde(default = "yes")] pub task_checkout_enabled: bool,
+    #[serde(default = "yes")] pub task_submit_enabled: bool,
+    #[serde(default = "yes")] pub task_fail_enabled: bool,
+    #[serde(default = "yes")] pub task_heartbeat_enabled: bool,
+    #[serde(default = "yes")] pub task_list_enabled: bool,
+}
+
+impl McpToolsConfig {
+    /// Live check used by the dispatch path. Combines the per-tool
+    /// flag with the relevant master gate.
+    pub fn tool_allowed(&self, name: &str) -> bool {
+        let is_write = matches!(
+            name,
+            "write_note" | "set_frontmatter" | "apply_tag" | "remove_tag"
+        );
+        if is_write && !self.writes_enabled {
+            return false;
+        }
+        match name {
+            "search_notes" => self.search_notes_enabled,
+            "get_note" => self.get_note_enabled,
+            "related_notes" => self.related_notes_enabled,
+            "write_note" => self.write_note_enabled,
+            "set_frontmatter" => self.set_frontmatter_enabled,
+            "apply_tag" => self.apply_tag_enabled,
+            "remove_tag" => self.remove_tag_enabled,
+            "task_checkout" => self.task_checkout_enabled,
+            "task_submit" => self.task_submit_enabled,
+            "task_fail" => self.task_fail_enabled,
+            "task_heartbeat" => self.task_heartbeat_enabled,
+            "task_list" => self.task_list_enabled,
+            _ => true, // unknown tools fall through to the dispatcher's "unknown tool" error
+        }
+    }
 }
 
 impl Default for McpToolsConfig {
@@ -148,6 +480,18 @@ impl Default for McpToolsConfig {
         Self {
             writes_enabled: true,
             allow_redacted_lookup: false,
+            search_notes_enabled: true,
+            get_note_enabled: true,
+            related_notes_enabled: true,
+            write_note_enabled: true,
+            set_frontmatter_enabled: true,
+            apply_tag_enabled: true,
+            remove_tag_enabled: true,
+            task_checkout_enabled: true,
+            task_submit_enabled: true,
+            task_fail_enabled: true,
+            task_heartbeat_enabled: true,
+            task_list_enabled: true,
         }
     }
 }
@@ -159,6 +503,10 @@ pub struct McpAuditConfig {
     /// JSONL audit log records call metadata but redacts large input bodies.
     #[serde(default = "no")]
     pub log_full_input: bool,
+}
+
+fn default_mcp_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_mcp_discovery_file() -> String {
@@ -301,6 +649,17 @@ pub struct VaultConfig {
     pub related_open: bool,
     #[serde(default = "no")]
     pub trash_expanded: bool,
+    /// Chat region height as a fraction of the discovery panel height.
+    /// status: chat-panel-default-height
+    #[serde(default = "default_chat_height")]
+    pub chat_height: f32,
+    /// Surface `.hiker/sessions/` as a virtual top-level "Sessions" group
+    /// in the tree. Default off — sessions stay hidden alongside other
+    /// `.hiker/` sidecars. Search and related-notes always include
+    /// sessions regardless of this toggle.
+    /// status: chat-session-show-in-tree-toggle
+    #[serde(default = "no")]
+    pub show_sessions_in_tree: bool,
     #[serde(default)]
     pub tree: TreeConfig,
 }
@@ -313,9 +672,15 @@ impl Default for VaultConfig {
             sidebar_open: true,
             related_open: false,
             trash_expanded: false,
+            chat_height: default_chat_height(),
+            show_sessions_in_tree: false,
             tree: TreeConfig::default(),
         }
     }
+}
+
+fn default_chat_height() -> f32 {
+    0.30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +766,34 @@ impl Config {
             .and_then(|v| v.get("default"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()))
+    }
+
+    /// Read a single file (user or vault TOML) without merging or
+    /// triggering auto-create. Missing files return `Config::default()` so
+    /// the settings UI's per-section scope toggle can show "what this file
+    /// alone contributes" against the current schema's defaults. Parse
+    /// errors and unknown-field errors bubble up — the same strict-load
+    /// posture as `Config::load`.
+    ///
+    /// status: settings-pane-scope-toggle
+    pub fn read_file_only(scope: SettingsScope, vault_root: &Path) -> Result<Self, HikerError> {
+        let paths = ConfigPaths::resolve(vault_root);
+        let path = match scope {
+            SettingsScope::User => match paths.user.as_ref() {
+                Some(p) => p.clone(),
+                None => return Ok(Self::default()),
+            },
+            SettingsScope::Vault => paths.vault.clone(),
+        };
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            HikerError::Config(format!("read {}: {e}", path.display()))
+        })?;
+        toml::from_str(&raw).map_err(|e: toml::de::Error| {
+            HikerError::Config(format!("parse {}: {e}", path.display()))
+        })
     }
 
     /// Load and merge the user + vault TOMLs. Auto-creates either file with
@@ -652,6 +1045,16 @@ enum ValueType {
     StringArray,
     /// `name_asc | name_desc | mtime_desc | mtime_asc`.
     TreeSortBy,
+    /// Floating-point fraction in `[0.0, 1.0]`.
+    UnitFraction,
+    /// Positive integer (fits in u32). Used for the LLM/agent knobs
+    /// (`max_tokens`, `iteration_cap`, etc.) where 0 is meaningless.
+    PositiveInt,
+    /// `auto | internal | external` for `[tasks] worker_preference`.
+    WorkerPreference,
+    /// `0..=65535` — used for `[mcp] port`. Distinct from `PositiveInt`
+    /// because port `0` means "ephemeral / OS-assigned" and is valid.
+    Port,
 }
 
 const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -665,16 +1068,111 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
+    EligibleKey { path: "vault.chat_height",             ty: ValueType::UnitFraction },
+    EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },
     EligibleKey { path: "search.modes.semantic",         ty: ValueType::Bool },
     EligibleKey { path: "search.modes.lexical",          ty: ValueType::Bool },
     EligibleKey { path: "search.sections.results_expanded", ty: ValueType::Bool },
     EligibleKey { path: "search.sections.related_expanded", ty: ValueType::Bool },
+    // LLM section. Per-vault override (provider key / model / cap can
+    // be tuned per workspace) shares the same eligibility set as user
+    // scope so the per-section [User]/[Vault] toggle in the settings
+    // pane can write either side.
+    EligibleKey { path: "llm.enabled",                      ty: ValueType::Bool },
+    EligibleKey { path: "llm.provider.backend",             ty: ValueType::String },
+    EligibleKey { path: "llm.provider.model",               ty: ValueType::String },
+    EligibleKey { path: "llm.provider.api_key_env",         ty: ValueType::String },
+    // `llm.provider.api_key` deliberately omitted from the vault list:
+    // the literal key must never travel with a synced vault TOML. See
+    // `llm.md` §`[llm-providers-config]` and `ELIGIBLE_USER` below.
+    EligibleKey { path: "llm.provider.base_url",            ty: ValueType::String },
+    EligibleKey { path: "llm.limits.max_tokens",            ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.limits.timeout_secs",          ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.agent.iteration_cap",          ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.agent.tool_timeout_secs",      ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.audit.log_full_prompt",        ty: ValueType::Bool },
+    // [tasks] section. Per-vault override: every key is eligible at
+    // vault scope per `task-queue-settings-section`.
+    EligibleKey { path: "tasks.worker_preference",          ty: ValueType::WorkerPreference },
+    EligibleKey { path: "tasks.terminal_retention_secs",    ty: ValueType::PositiveInt },
+    EligibleKey { path: "tasks.direct_worker.enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "tasks.direct_worker.parallelism",  ty: ValueType::PositiveInt },
+    EligibleKey { path: "tasks.expose_to_chat_agent",       ty: ValueType::Bool },
+    EligibleKey { path: "tasks.lease.default_secs",         ty: ValueType::PositiveInt },
+    EligibleKey { path: "tasks.lease.max_secs",             ty: ValueType::PositiveInt },
+    // status: mcp-settings-ui-section
+    // [mcp] section. Vault-scope by default — the discovery file lives
+    // in the vault, so per-vault overrides are the natural shape.
+    EligibleKey { path: "mcp.enabled",                      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.host",                         ty: ValueType::String },
+    EligibleKey { path: "mcp.port",                         ty: ValueType::Port },
+    EligibleKey { path: "mcp.max_top_k",                    ty: ValueType::PositiveInt },
+    // [mcp.tools] — master gates + per-tool toggles
+    // (status: mcp-tool-toggles).
+    EligibleKey { path: "mcp.tools.writes_enabled",         ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.allow_redacted_lookup",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.search_notes_enabled",   ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.get_note_enabled",       ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.related_notes_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.write_note_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "vault.recent",  ty: ValueType::StringArray },
     EligibleKey { path: "vault.default", ty: ValueType::String },
+    // LLM section. Default scope for the settings pane is `user` so
+    // API-key env name + provider live in the platform config dir; the
+    // vault TOML can still override per-workspace via the eligible-vault
+    // duplicates above.
+    EligibleKey { path: "llm.enabled",                      ty: ValueType::Bool },
+    EligibleKey { path: "llm.provider.backend",             ty: ValueType::String },
+    EligibleKey { path: "llm.provider.model",               ty: ValueType::String },
+    EligibleKey { path: "llm.provider.api_key_env",         ty: ValueType::String },
+    // `api_key` (literal) is user-scope only — see the spec posture in
+    // `llm.md`. The vault eligibility list above intentionally omits it
+    // so a `set_setting(Vault, "llm.provider.api_key", ...)` call is
+    // rejected with the standard "not user-mutable in v1" error.
+    EligibleKey { path: "llm.provider.api_key",             ty: ValueType::String },
+    EligibleKey { path: "llm.provider.base_url",            ty: ValueType::String },
+    EligibleKey { path: "llm.limits.max_tokens",            ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.limits.timeout_secs",          ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.agent.iteration_cap",          ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.agent.tool_timeout_secs",      ty: ValueType::PositiveInt },
+    EligibleKey { path: "llm.audit.log_full_prompt",        ty: ValueType::Bool },
+    // worker_preference is also valid at user scope (per `task-queue.md`'s
+    // settings eligibility note); the rest of `[tasks]` is vault-only.
+    EligibleKey { path: "tasks.worker_preference",          ty: ValueType::WorkerPreference },
+    // [mcp] — user scope is supported as a global default (the vault
+    // table above wins per `core::config` merge order).
+    EligibleKey { path: "mcp.enabled",                      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.host",                         ty: ValueType::String },
+    EligibleKey { path: "mcp.port",                         ty: ValueType::Port },
+    EligibleKey { path: "mcp.max_top_k",                    ty: ValueType::PositiveInt },
+    EligibleKey { path: "mcp.tools.writes_enabled",         ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.allow_redacted_lookup",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.search_notes_enabled",   ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.get_note_enabled",       ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.related_notes_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.write_note_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
 ];
 
 fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {
@@ -704,6 +1202,25 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
             s.as_str(),
             "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc"
         ),
+        (ValueType::UnitFraction, J::Number(n)) => n
+            .as_f64()
+            .map(|f| (0.0..=1.0).contains(&f))
+            .unwrap_or(false),
+        // Positive integer that fits u32. JSON.stringify on a JS
+        // number-without-fraction parses back as an integer, so
+        // `as_u64` returns Some only for true integer values; floats
+        // are rejected, which is what we want for `max_tokens` etc.
+        (ValueType::PositiveInt, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u >= 1 && u <= u32::MAX as u64)
+            .unwrap_or(false),
+        (ValueType::WorkerPreference, J::String(s)) => {
+            matches!(s.as_str(), "auto" | "internal" | "external")
+        }
+        (ValueType::Port, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= u16::MAX as u64)
+            .unwrap_or(false),
         _ => false,
     };
     if !ok {
@@ -766,6 +1283,23 @@ fn json_to_toml_item(value: &serde_json::Value) -> toml_edit::Item {
     match value {
         J::Bool(b) => toml_edit::value(*b),
         J::String(s) => toml_edit::value(s.as_str()),
+        J::Number(n) => {
+            // Try integer before float — `serde_json::Number::as_f64`
+            // succeeds for both shapes, and routing every integer
+            // through the float branch would write `4096.0` to TOML
+            // and then fail strict-load against `u32` fields. JSON
+            // produced by JS for an integer (no decimal point) parses
+            // here with `as_i64() = Some(_)`, so this branch wins for
+            // PositiveInt rows; floats (e.g. `vault.chat_height = 0.3`)
+            // fall through to the float branch as before.
+            if let Some(i) = n.as_i64() {
+                toml_edit::value(i)
+            } else if let Some(f) = n.as_f64() {
+                toml_edit::value(f)
+            } else {
+                toml_edit::Item::None
+            }
+        }
         J::Null => toml_edit::Item::None,
         J::Array(arr) => {
             let mut a = toml_edit::Array::new();
@@ -776,8 +1310,8 @@ fn json_to_toml_item(value: &serde_json::Value) -> toml_edit::Item {
             }
             toml_edit::value(a)
         }
-        J::Number(_) | J::Object(_) => {
-            // validate_value rejects these for our eligible-key set, so this
+        J::Object(_) => {
+            // validate_value rejects this for our eligible-key set, so this
             // branch is unreachable in practice. Falling back to None keeps
             // the function total without panicking.
             toml_edit::Item::None
@@ -945,5 +1479,97 @@ ignored_paths = ["bar/"]
         )
         .unwrap();
         assert_eq!(cfg.vault.tree.sort_by, TreeSortBy::MtimeDesc);
+    }
+
+    #[test]
+    fn write_back_positive_int_persists_as_integer_not_float() {
+        // Regression test: a JS-side `4096` arrives as a JSON integer.
+        // We need it written to TOML as `4096`, not `4096.0`, so the
+        // strict-load `u32`-typed reader doesn't reject it on the next
+        // launch.
+        let dir = tempdir().unwrap();
+        let cfg = Config::set(
+            SettingsScope::Vault,
+            "llm.limits.max_tokens",
+            serde_json::json!(4096),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg.llm.limits.max_tokens, 4096);
+        // Confirm the on-disk shape is integer-valued.
+        let raw = fs::read_to_string(dir.path().join(".hiker").join("config.toml")).unwrap();
+        assert!(
+            raw.contains("max_tokens = 4096") && !raw.contains("max_tokens = 4096.0"),
+            "expected `max_tokens = 4096` in TOML, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn write_back_positive_int_rejects_zero_and_floats() {
+        let dir = tempdir().unwrap();
+        // Zero is not a positive integer.
+        assert!(Config::set(
+            SettingsScope::Vault,
+            "llm.agent.iteration_cap",
+            serde_json::json!(0),
+            dir.path(),
+        )
+        .is_err());
+        // Float is rejected even when its value is integer-equivalent;
+        // serde_json carries the no-decimal vs. decimal distinction.
+        assert!(Config::set(
+            SettingsScope::Vault,
+            "llm.agent.iteration_cap",
+            serde_json::json!(10.5),
+            dir.path(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn write_back_api_key_refused_in_vault_scope() {
+        // Spec posture: the literal API key must never live in the
+        // vault TOML (which travels with Syncthing/git). The
+        // eligibility list refuses the write.
+        let dir = tempdir().unwrap();
+        let err = Config::set(
+            SettingsScope::Vault,
+            "llm.provider.api_key",
+            serde_json::json!("sk-secret"),
+            dir.path(),
+        )
+        .expect_err("vault scope must refuse api_key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("api_key") && msg.contains("not user-mutable"),
+            "got: {msg}",
+        );
+        // User scope still lists the key even though the actual on-disk
+        // write goes to the platform config dir (skipped here for test
+        // isolation; see write_back_llm_keys_eligible_via_vault_scope).
+        assert!(eligible_key(SettingsScope::User, "llm.provider.api_key").is_ok());
+    }
+
+    #[test]
+    fn write_back_llm_keys_eligible_via_vault_scope() {
+        let dir = tempdir().unwrap();
+        // The settings pane's per-section [User]/[Vault] toggle relies
+        // on the LLM keys being writable from either side. We assert
+        // the vault-scope path here — the user-scope write goes to the
+        // platform config dir which isn't isolated per test, but
+        // `eligible_key` covers both scopes uniformly via ELIGIBLE_USER
+        // / ELIGIBLE_VAULT (both lists carry the LLM keys).
+        let cfg = Config::set(
+            SettingsScope::Vault,
+            "llm.provider.model",
+            serde_json::json!("claude-haiku-4-5"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg.llm.provider.model, "claude-haiku-4-5");
+        // Spot-check the eligibility lookup directly so the both-scope
+        // promise doesn't regress.
+        assert!(eligible_key(SettingsScope::User, "llm.provider.api_key_env").is_ok());
+        assert!(eligible_key(SettingsScope::Vault, "llm.audit.log_full_prompt").is_ok());
     }
 }

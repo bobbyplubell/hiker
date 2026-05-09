@@ -20,6 +20,7 @@ time.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -5,13 +5,12 @@
 // rendering-only fold, recomputed off `state.doc` so edits inside or around
 // the block update the placeholder line count immediately.
 //
-// Detection mirrors `core::frontmatter::split`: the block must start at
-// byte 0 with `---\n` (line 1 is exactly `---`) and have a closing `---`
-// line before any body content. An unterminated frontmatter block is a
-// no-op so users editing one mid-flight can still see what they're typing.
+// Range detection lives in `../frontmatter.ts` and is shared with the
+// livePreview pass-through styling so the two CM6 surfaces can't drift.
 
 import type { Extension } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType } from "@codemirror/view";
+import { findFrontmatter } from "../frontmatter";
 
 class FrontmatterPlaceholder extends WidgetType {
   constructor(public readonly lineCount: number) {
@@ -30,33 +29,6 @@ class FrontmatterPlaceholder extends WidgetType {
   override ignoreEvent(): boolean {
     return false;
   }
-}
-
-interface FrontmatterRange {
-  from: number;
-  to: number;
-  lineCount: number;
-}
-
-function findFrontmatter(doc: import("@codemirror/state").Text): FrontmatterRange | null {
-  if (doc.lines < 2) return null;
-  if (doc.line(1).text !== "---") return null;
-  // Walk forward looking for a closing `---` line. Stop searching at a
-  // reasonable cap so a runaway file (a `---` at byte 0 with no closer for
-  // 10k lines) doesn't pin a frame walking the whole doc — matches the
-  // chunker's posture of bailing on unterminated frontmatter.
-  const cap = Math.min(doc.lines, 1000);
-  for (let n = 2; n <= cap; n++) {
-    if (doc.line(n).text === "---") {
-      const close = doc.line(n);
-      // Replace through the newline after the closing `---` so the body
-      // starts at the next line cleanly. `close.to` is the position before
-      // the newline; +1 includes it (clamped to doc end).
-      const to = Math.min(doc.length, close.to + 1);
-      return { from: 0, to, lineCount: n };
-    }
-  }
-  return null;
 }
 
 const frontmatterDecorations = EditorView.decorations.compute(

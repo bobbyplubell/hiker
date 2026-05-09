@@ -78,6 +78,78 @@ pub struct NoteRow {
     pub last_accessed_at: Option<i64>,
 }
 
+/// One row in the chat `@`-mention autocomplete popover. Vault-relative
+/// path with the indexable extension stripped (token format is
+/// `@<rel-path-without-extension>`), plus the basename and parent
+/// directory for two-line rendering, and `last_accessed_at` so the
+/// frontend can format a recency hint if it wants.
+///
+/// status: chat-input-at-autocomplete-tauri-cmd
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtSuggestion {
+    /// Vault-relative path with the file extension stripped — exactly
+    /// what gets inserted into the chat input as `@<rel_path>`.
+    pub rel_path: String,
+    /// Filename minus extension; rendered as the primary label.
+    pub basename: String,
+    /// Containing folder, vault-relative; empty when the note sits at
+    /// the vault root. Rendered as a muted hint to disambiguate notes
+    /// with the same basename.
+    pub parent_dir: String,
+    /// Unix seconds; `None` until the note has been opened at least
+    /// once. The popover orders by recency on the backend, so the UI
+    /// usually doesn't need to consult this directly.
+    pub last_accessed_at: Option<i64>,
+}
+
+impl AtSuggestion {
+    fn from_path(path: String, last_accessed_at: Option<i64>) -> Self {
+        let basename_full = basename_of(&path).to_string();
+        let stem = strip_indexable_extension(&basename_full).to_string();
+        let parent_dir = match path.rfind('/') {
+            Some(i) => path[..i].to_string(),
+            None => String::new(),
+        };
+        let rel_path = if parent_dir.is_empty() {
+            stem.clone()
+        } else {
+            format!("{parent_dir}/{stem}")
+        };
+        AtSuggestion {
+            rel_path,
+            basename: stem,
+            parent_dir,
+            last_accessed_at,
+        }
+    }
+}
+
+fn basename_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Strip a known indexable extension (`.md`, `.markdown`, `.txt`) from the
+/// basename. Other extensions stay intact — the autocomplete should never
+/// see them since the query filters skipped + non-indexable rows by virtue
+/// of the indexer's allowlist, but if one slips through we leave the
+/// filename as-is rather than mangling it.
+fn strip_indexable_extension(basename: &str) -> &str {
+    for ext in crate::indexer::INDEXABLE_EXTENSIONS {
+        let dotted = format!(".{ext}");
+        if basename.len() > dotted.len()
+            && basename[basename.len() - dotted.len()..]
+                .eq_ignore_ascii_case(&dotted)
+        {
+            return &basename[..basename.len() - dotted.len()];
+        }
+    }
+    basename
+}
+
 /// Compact note row for the vault-home recents widgets. Same shape for both
 /// "recently modified" (sorted by `mtime`) and "recently accessed" (sorted by
 /// `last_accessed_at`); the UI picks the relevant timestamp per widget.
@@ -121,12 +193,91 @@ pub struct ChunkRow {
 /// Public chunk-bounds DTO returned by `chunk_bounds_for` — the wire shape
 /// for the chunk-boundary editor decoration. Omits `text` and `note_id` to
 /// keep the payload small; the UI only needs offsets + heading_path.
+///
+/// status: bug-byte-to-char-conversion-in-ui (fixed)
+/// `char_start` / `char_end` are UTF-16 code-unit offsets into the source
+/// note, computed in core via `enrich_char_offsets`. The chunker emits
+/// byte offsets natively; the UI used to convert them via `TextEncoder`,
+/// which made the UI the seam for a representation translation that
+/// belongs next to the data. Both are populated here so frontend / CLI /
+/// MCP all see the same shape and the conversion only ever happens once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkBounds {
     pub chunk_index: u32,
     pub byte_start: u64,
     pub byte_end: u64,
+    /// UTF-16 code unit offset into the note's plain text. JS strings are
+    /// UTF-16, so this is what CM6 / the editor consumes directly.
+    pub char_start: u64,
+    pub char_end: u64,
     pub heading_path: Option<String>,
+}
+
+/// Walk `text` once and replace `char_start` / `char_end` on every entry
+/// in `bounds` with the UTF-16 offset corresponding to its byte offset.
+/// Single linear pass — chunks are already sorted by `chunk_index`, but
+/// the byte offsets they report aren't required to be monotonic, so we
+/// build a fresh sorted index of unique byte positions and binary-search
+/// each into that table. For the typical ~hundreds-of-chunks-per-note
+/// shape this stays cheap.
+///
+/// status: bug-byte-to-char-conversion-in-ui (fixed)
+pub fn enrich_char_offsets(text: &str, bounds: &mut [ChunkBounds]) {
+    if bounds.is_empty() {
+        return;
+    }
+    // Collect distinct byte targets we need char offsets for.
+    let mut targets: Vec<u64> = bounds
+        .iter()
+        .flat_map(|b| [b.byte_start, b.byte_end])
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+
+    // Walk the string once; for each char, record the (byte_pos, utf16_pos).
+    // utf16_pos uses `encode_utf16().count()` per char so surrogate pairs
+    // contribute 2.
+    let mut byte_to_utf16: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let total_bytes = text.len() as u64;
+    let mut byte_pos: u64 = 0;
+    let mut utf16_pos: u64 = 0;
+    let mut targets_iter = targets.iter().peekable();
+    // Map any leading targets at position 0 first.
+    while let Some(&&t) = targets_iter.peek() {
+        if t == 0 {
+            byte_to_utf16.insert(0, 0);
+            targets_iter.next();
+        } else {
+            break;
+        }
+    }
+    for ch in text.chars() {
+        let ch_bytes = ch.len_utf8() as u64;
+        let ch_units = ch.len_utf16() as u64;
+        byte_pos += ch_bytes;
+        utf16_pos += ch_units;
+        while let Some(&&t) = targets_iter.peek() {
+            if t <= byte_pos {
+                byte_to_utf16.insert(t, utf16_pos);
+                targets_iter.next();
+            } else {
+                break;
+            }
+        }
+        if targets_iter.peek().is_none() {
+            break;
+        }
+    }
+    // Anything past the document end clamps to the doc-end utf16 length.
+    while let Some(&t) = targets_iter.next() {
+        byte_to_utf16.insert(t, utf16_pos);
+        let _ = total_bytes;
+    }
+
+    for b in bounds.iter_mut() {
+        b.char_start = *byte_to_utf16.get(&b.byte_start).unwrap_or(&0);
+        b.char_end = *byte_to_utf16.get(&b.byte_end).unwrap_or(&b.char_start);
+    }
 }
 
 /// One hit from a KNN query. `score` is similarity (higher = closer); we
@@ -333,6 +484,66 @@ impl Store {
         Ok(rows)
     }
 
+    /// Notes whose basename (filename minus extension) loosely matches the
+    /// given prefix, ranked by match quality + recency. Backs the chat
+    /// `@`-autocomplete popover (`chat-input-at-autocomplete-tauri-cmd`).
+    ///
+    /// Empty prefix → most-recently-accessed notes (NULLs last via
+    /// `ORDER BY last_accessed_at IS NULL, last_accessed_at DESC`).
+    /// Non-empty prefix → case-insensitive `LIKE %prefix%` substring on the
+    /// basename, ordered by basename-prefix-match-quality (rank 0: starts
+    /// with the prefix; rank 1: contains it elsewhere) then by recency.
+    /// Skipped rows are excluded.
+    ///
+    /// status: chat-input-at-autocomplete-tauri-cmd
+    pub fn at_autocomplete(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<AtSuggestion>, StoreError> {
+        let limit = limit.max(1) as i64;
+        // SQL pulls all non-skipped rows ordered by recency; Rust filters by
+        // basename + ranks. The basename match is awkward in pure SQL (no
+        // rsplit), and personal-vault scale (≤ tens of thousands of notes)
+        // makes the in-memory pass cheap. If a vault ever pushes past that,
+        // swap to FTS5 over basenames.
+        let mut stmt = self.conn.prepare(
+            "SELECT path, last_accessed_at
+             FROM notes
+             WHERE skipped = 0
+             ORDER BY last_accessed_at IS NULL, last_accessed_at DESC, path ASC",
+        )?;
+        let all = stmt
+            .query_map([], |row| {
+                let path: String = row.get(0)?;
+                let last: Option<i64> = row.get(1)?;
+                Ok((path, last))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let lower = prefix.to_lowercase();
+        let mut scored: Vec<(u8, usize, String, Option<i64>)> = Vec::new();
+        for (i, (path, last)) in all.into_iter().enumerate() {
+            let basename = basename_of(&path);
+            let stem = strip_indexable_extension(basename);
+            let stem_lower = stem.to_lowercase();
+            if !lower.is_empty() {
+                let Some(pos) = stem_lower.find(&lower) else { continue };
+                let rank: u8 = if pos == 0 { 0 } else { 1 };
+                scored.push((rank, i, path, last));
+            } else {
+                scored.push((0, i, path, last));
+            }
+        }
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.truncate(limit as usize);
+
+        Ok(scored
+            .into_iter()
+            .map(|(_, _, path, last)| AtSuggestion::from_path(path, last))
+            .collect())
+    }
+
     /// Stamp `last_accessed_at` for the note at `rel_path`. No-op when the
     /// note isn't in the index yet (open-before-first-index case); the next
     /// successful ingest creates the row, and subsequent opens will record.
@@ -382,6 +593,11 @@ impl Store {
                     chunk_index: row.get::<_, i64>(0)? as u32,
                     byte_start: row.get::<_, i64>(1)? as u64,
                     byte_end: row.get::<_, i64>(2)? as u64,
+                    // Filled in by `enrich_char_offsets` in the Tauri layer
+                    // (it has access to the file contents). Default to 0
+                    // so callers that don't enrich still get a valid DTO.
+                    char_start: 0,
+                    char_end: 0,
                     heading_path: row.get(3)?,
                 })
             })?
@@ -1373,5 +1589,83 @@ mod tests {
         let (_dir, store) = fresh_store();
         let res = store.knn_chunks(&[0.0; 10], 5, None);
         assert!(matches!(res, Err(StoreError::EmbedDim { .. })));
+    }
+
+    #[test]
+    fn at_autocomplete_orders_by_recency_and_filters_by_basename() {
+        let (_dir, mut store) = fresh_store();
+        for (path, accessed) in &[
+            ("alpha.md", Some(100)),
+            ("research/whisper-notes.md", Some(300)),
+            ("research/embeddings/whisper-rust.md", Some(200)),
+            ("inbox/scratch.md", None),
+            ("notes.md", Some(400)),
+            ("misc/notes.md", Some(50)),
+        ] {
+            let id = new_id();
+            store
+                .upsert_note(NoteUpsert {
+                    id: &id,
+                    path,
+                    content_hash: "h",
+                    mtime: 1,
+                    size: 1,
+                    indexed_at: 1,
+                    embedder_version: "t",
+                    chunks: vec![(mk_chunk(0, "x"), unit_vec(0.0))],
+                })
+                .unwrap();
+            if let Some(ts) = *accessed {
+                store.touch_note_access(path, ts).unwrap();
+            }
+        }
+
+        // Empty prefix → recents-first, NULLs last.
+        let recents = store.at_autocomplete("", 10).unwrap();
+        let paths: Vec<&str> = recents.iter().map(|s| s.rel_path.as_str()).collect();
+        assert_eq!(paths[0], "notes");
+        assert_eq!(paths[1], "research/whisper-notes");
+        // Extension stripped.
+        assert!(!recents.iter().any(|s| s.rel_path.ends_with(".md")));
+        // basename + parent_dir populated.
+        let whisper = recents
+            .iter()
+            .find(|s| s.basename == "whisper-notes")
+            .unwrap();
+        assert_eq!(whisper.parent_dir, "research");
+
+        // Non-empty prefix: substring match against basename, prefix-match
+        // ranks ahead of substring-elsewhere.
+        let hits = store.at_autocomplete("whisper", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|s| s.rel_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["research/whisper-notes", "research/embeddings/whisper-rust"]
+        );
+
+        // Disambiguation: "notes" matches both notes.md and misc/notes.md
+        // (both have basename `notes`); each carries its full rel_path.
+        let hits = store.at_autocomplete("notes", 10).unwrap();
+        let paths: std::collections::HashSet<&str> =
+            hits.iter().map(|s| s.rel_path.as_str()).collect();
+        assert!(paths.contains("notes"));
+        assert!(paths.contains("misc/notes"));
+        assert!(paths.contains("research/whisper-notes"));
+
+        // Limit honored.
+        let limited = store.at_autocomplete("", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn at_autocomplete_skips_skipped_rows() {
+        let (_dir, mut store) = fresh_store();
+        let id = new_id();
+        let _ = id;
+        store
+            .upsert_skipped("huge.md", "file too large", 1, 1)
+            .unwrap();
+        let hits = store.at_autocomplete("", 10).unwrap();
+        assert!(hits.iter().all(|h| h.basename != "huge"));
     }
 }

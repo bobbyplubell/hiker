@@ -17,6 +17,7 @@ import {
 } from "@codemirror/view";
 import type { Extension } from "@codemirror/state";
 import type { Text } from "@codemirror/state";
+import { findFrontmatter } from "../frontmatter";
 
 interface ActiveSet {
   // status: live-preview-cursor-line-reveal
@@ -67,28 +68,19 @@ function buildDecorations(view: EditorView): DecorationSet {
 
   // Frontmatter. status: live-preview-frontmatter-passthrough
   // lang-markdown's default parser doesn't emit a FrontMatter node, so we
-  // detect the leading `---`/`---` (or `...`) block ourselves and apply a
-  // line decoration. Spec: styled-but-plain block, no marker fading, no kv
-  // parsing. Cheaper than wiring a custom MarkdownConfig.
-  if (doc.length > 0 && doc.line(1).text === "---") {
-    let closeLine = -1;
-    const limit = Math.min(doc.lines, 200);
-    for (let n = 2; n <= limit; n++) {
-      const t = doc.line(n).text;
-      if (t === "---" || t === "...") {
-        closeLine = n;
-        break;
-      }
-    }
-    if (closeLine > 0) {
-      for (let n = 1; n <= closeLine; n++) {
-        const ln = doc.line(n);
-        out.push({
-          from: ln.from,
-          to: ln.from,
-          deco: Decoration.line({ class: "cm-lp-frontmatter" }),
-        });
-      }
+  // detect the leading block via the shared `../frontmatter` helper and
+  // emit per-line decorations. Spec: styled-but-plain block, no marker
+  // fading, no kv parsing. Live-preview historically accepted a `...`
+  // closer too, preserved via the helper's `acceptDotsClose` flag.
+  const fm = findFrontmatter(doc, true);
+  if (fm) {
+    for (let n = 1; n <= fm.lineCount; n++) {
+      const ln = doc.line(n);
+      out.push({
+        from: ln.from,
+        to: ln.from,
+        deco: Decoration.line({ class: "cm-lp-frontmatter" }),
+      });
     }
   }
 

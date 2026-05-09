@@ -91,6 +91,12 @@ pub struct SearchResponse {
     pub lexical_hits: Vec<NoteHit>,
     pub semantic_hits: Vec<NoteHit>,
     pub fused: Vec<NoteHit>,
+    /// status: bug-search-result-bucket-pick-in-ui (fixed)
+    /// Which bucket consumers should render. Both modes on → `fused`
+    /// (RRF, capped at FUSED_TOP_K). One mode on → that engine's full
+    /// PER_BACKEND_TOP_K-ranked bucket. Both off → empty. Picking lives
+    /// in core so the UI, MCP, and CLI never diverge on the rule.
+    pub hits: Vec<NoteHit>,
 }
 
 /// Lexical search. `Fts5LexicalEngine` is the v2 concrete impl; tantivy
@@ -370,12 +376,38 @@ pub fn query(
         Vec::new()
     };
 
+    let hits = pick_bucket(&lexical_hits, &semantic_hits, &fused, modes);
+
     Ok(SearchResponse {
         epoch,
         lexical_hits,
         semantic_hits,
         fused,
+        hits,
     })
+}
+
+/// status: bug-search-result-bucket-pick-in-ui (fixed)
+/// Pick the canonical bucket to render given the request's mode flags.
+/// Both modes on → `fused` (RRF over the per-backend results). One mode on
+/// → that engine's full per-backend ranking (no FUSED_TOP_K truncation, so
+/// callers see the same count they'd see if they ran a single-engine
+/// query). Both off → empty.
+pub fn pick_bucket(
+    lexical_hits: &[NoteHit],
+    semantic_hits: &[NoteHit],
+    fused: &[NoteHit],
+    modes: SearchModes,
+) -> Vec<NoteHit> {
+    if modes.lexical && modes.semantic {
+        fused.to_vec()
+    } else if modes.lexical {
+        lexical_hits.to_vec()
+    } else if modes.semantic {
+        semantic_hits.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn title_from_path(path: &str) -> String {
@@ -585,6 +617,7 @@ mod tests {
         assert!(resp.lexical_hits.is_empty());
         assert!(resp.semantic_hits.is_empty());
         assert!(resp.fused.is_empty());
+        assert!(resp.hits.is_empty());
     }
 
     #[test]
@@ -615,6 +648,7 @@ mod tests {
         assert_eq!(resp.lexical_hits.len(), 1);
         assert!(resp.semantic_hits.is_empty());
         assert_eq!(resp.fused.len(), 1);
+        assert_eq!(resp.hits.len(), 1);
     }
 
     fn mk_hit(id: &str, score: f32) -> NoteHit {

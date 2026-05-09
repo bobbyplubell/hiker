@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { EditorState, Compartment, type Extension } from "@codemirror/state";
-import { EditorView, ViewPlugin, highlightWhitespace } from "@codemirror/view";
+import { EditorView, ViewPlugin, type ViewUpdate, highlightWhitespace } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { register, validate, toCMKeymap } from "./editor/keybinds";
@@ -17,74 +17,62 @@ import {
   type ChunkBounds,
 } from "./editor/chunkBoundaries";
 import { hideFrontmatter } from "./editor/hideFrontmatter";
+import { diffExtensions, resetDiffDecorations } from "./diff";
+import { mountChatPanel, ActiveSessionDto } from "./chat";
+import { mountSettingsPane, type SettingsPaneApi } from "./settings";
+import {
+  mountSnapshotPreview,
+  type SnapshotPreviewApi,
+  type ChangeRow,
+} from "./snapshotPreview";
+import { mountTrash, type TrashApi } from "./trash";
+import {
+  mountTree,
+  type TreeApi,
+  type IndexState,
+  sortOrderFromSettings,
+} from "./tree";
+import { openContextMenu, type CtxMenuItem } from "./widgets/contextMenu";
+import { showToast } from "./widgets/toast";
+import { confirm3, confirmWindowClose } from "./widgets/confirm";
+import { mountVaultHome, type VaultHomeApi } from "./vaultHome";
+import { mountQueueDetail, type QueueDetailApi } from "./queueDetail";
+import { mountMutationsMenu, type MutationsMenuApi } from "./mutations";
+import {
+  mountDirtyBufferDiff,
+  type DirtyBufferDiffApi,
+} from "./dirtyBufferDiff";
+import { mountTabStrip, type TabStripApi } from "./tabStrip";
+import { mountDiscovery, type DiscoveryApi } from "./discovery";
+import {
+  mountNavigation,
+  installNavigationSwipe,
+  type NavApi,
+  type NavState,
+} from "./navigation";
+import {
+  mountModeControls,
+  type ModeControlsApi,
+  iconButton,
+  ICON_DIFF,
+  ICON_RESTORE,
+  ICON_CLOSE,
+} from "./modeControls";
 
-type EntryKind = "dir" | "file";
-interface DirEntry {
-  name: string;
-  rel_path: string;
-  kind: EntryKind;
-  mtime: number;
-}
+// `DirEntry` re-exported from `./tree`.
 interface FileWithHash {
   contents: string;
   hash: string;
 }
-interface TrashEntry {
-  id: string;
-  original_path: string;
-  trashed_name: string;
-  original_mtime: number;
-  deleted_at: number;
-  kind: "file" | "folder";
-  members?: string[] | null;
-}
-interface TrashListItem {
-  id: string | null;
-  trashed_name: string;
-  original_path: string | null;
-  deleted_at: number;
-  kind: "file" | "folder";
-  member_count: number | null;
-  orphaned: boolean;
-}
-interface RelatedHit {
-  note_id: string;
-  path: string;
-  title: string;
-  score: number;
-  best_heading_path: string | null;
-  snippet: string;
-}
-// Mirrors `core::search::NoteHit`. Snippet may carry literal `<mark>...
-// </mark>` substrings for lexical hits; the renderer parses these into
-// styled spans rather than via `innerHTML`.
-interface SearchNoteHit {
-  note_id: string;
-  path: string;
-  title: string;
-  score: number;
-  chunk_id: string;
-  chunk_index: number;
-  heading_path: string | null;
-  snippet: string;
-}
-interface SearchResponse {
-  epoch: number;
-  lexical_hits: SearchNoteHit[];
-  semantic_hits: SearchNoteHit[];
-  fused: SearchNoteHit[];
-}
+// `TrashEntry` / `TrashListItem` now live in `./trash`.
+// `RelatedHit` / `SearchNoteHit` / `SearchResponse` now live in `./discovery`.
 interface IndexStatus {
   model_ready: boolean;
   queued: number;
   total_notes: number;
   last_error: string | null;
 }
-type IndexState =
-  | { kind: "indexed" }
-  | { kind: "unsupported" }
-  | { kind: "skipped"; reason: string }
-  | { kind: "queued" };
+// `IndexState` re-exported from `./tree`.
 
 // status: settings-load-once-at-startup
 // Mirror of core::config::Config for the frontend. Returned by
@@ -113,12 +101,22 @@ interface Settings {
     sidebar_open: boolean;
     related_open: boolean;
     trash_expanded: boolean;
+    chat_height: number;
+    show_sessions_in_tree: boolean;
     tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
   };
   search: {
     modes: { semantic: boolean; lexical: boolean };
     sections: { results_expanded: boolean; related_expanded: boolean };
   };
+  llm: {
+    enabled: boolean;
+    provider: { backend: string; model: string; api_key_env: string; base_url: string };
+    limits: { max_tokens: number; timeout_secs: number };
+    agent: { iteration_cap: number; tool_timeout_secs: number };
+    audit: { log_full_prompt: boolean };
+  };
+  mcp: unknown;
 }
 
 type SettingsScope = "user" | "vault";
@@ -140,6 +138,37 @@ async function persistSetting(
   }
 }
 
+// Apply a freshly loaded `Settings` snapshot to every UI surface that
+// reflects a setting. Called on vault open and again whenever the settings
+// pane writes through `set_setting` / `reload_config` so the View menu,
+// tree sort, panel collapse states, etc. stay in sync with the on-disk
+// canonical values.
+function applySettingsToUi(s: Settings): void {
+  renderTxtAsMarkdown = s.editor.render_txt_as_markdown;
+  setLivePreviewEnabled(s.editor.live_preview);
+  setWordWrapEnabled(s.editor.word_wrap);
+  setLineNumbersVisible(s.editor.show_line_numbers);
+  setWhitespaceEnabled(s.editor.show_whitespace);
+  setChunkBoundariesEnabled(s.editor.show_chunk_boundaries);
+  setHideFrontmatterEnabled(s.editor.hide_frontmatter);
+  void tree.setSortOrder(sortOrderFromSettings(s.vault.tree.sort_by), false);
+  appEl.classList.toggle("sidebar-collapsed", !s.vault.sidebar_open);
+  appEl.classList.toggle("related-collapsed", !s.vault.related_open);
+  trashBinEl.classList.toggle("collapsed", !s.vault.trash_expanded);
+  trashChevronEl.textContent = s.vault.trash_expanded ? "▾" : "▸";
+  // status: chat-panel-default-height, llm-disable-mode (UI half)
+  chatPanel.setEnabled(s.llm.enabled);
+  if (typeof s.vault.chat_height === "number") {
+    chatPanel.setHeight(s.vault.chat_height);
+  }
+  // status: search-mode-state-persisted, search-section-collapsible
+  discovery.setMode("semantic", s.search.modes.semantic, false);
+  discovery.setMode("lexical", s.search.modes.lexical, false);
+  discovery.setSectionExpanded("results", s.search.sections.results_expanded, false);
+  discovery.setSectionExpanded("related", s.search.sections.related_expanded, false);
+  syncToggleButtons();
+}
+
 type ProgressEvent =
   | { kind: "model_loaded" }
   | { kind: "started"; path: string }
@@ -156,6 +185,7 @@ const editorEl = document.getElementById("editor")!;
 const pickBtn = document.getElementById("pick-vault") as HTMLButtonElement;
 const vaultPathEl = document.getElementById("vault-path")!;
 const saveBtn = document.getElementById("save-btn") as HTMLButtonElement;
+const diffBtn = document.getElementById("diff-btn") as HTMLButtonElement;
 const statusPathEl = document.getElementById("status-path")!;
 const statusCursorEl = document.getElementById("status-cursor")!;
 const statusWordsEl = document.getElementById("status-words")!;
@@ -181,48 +211,180 @@ const trashHeaderEl = document.getElementById("trash-header")!;
 const trashListEl = document.getElementById("trash-list")!;
 const trashChevronEl = document.getElementById("trash-chevron")!;
 const trashLabelEl = document.getElementById("trash-label")!;
-const trashBannerEl = document.getElementById("trash-banner")!;
-const snapshotBannerEl = document.getElementById("snapshot-banner")!;
-const snapshotBannerTextEl = document.getElementById("snapshot-banner-text")!;
-const snapshotBannerRestoreBtn = document.getElementById(
-  "snapshot-banner-restore",
-) as HTMLButtonElement;
-const snapshotBannerCloseBtn = document.getElementById(
-  "snapshot-banner-close",
-) as HTMLButtonElement;
+const modeControlsEl = document.getElementById("mode-controls")!;
 const homeBtn = document.getElementById("home-btn") as HTMLButtonElement;
+const settingsBtn = document.getElementById("settings-btn") as HTMLButtonElement;
+const settingsPaneEl = document.getElementById("settings-pane")!;
 const editorPaneEl = document.getElementById("editor-pane")!;
 const vaultHomeEl = document.getElementById("vault-home")!;
+// status: chat-panel-pinned-bottom
+const discoveryPanelEl = document.getElementById("discovery")!;
+const chatRegionEl = document.getElementById("chat-region")!;
+const chatHandleEl = document.getElementById("chat-resize-handle")!;
+const chatCollapseBtnEl = document.getElementById("chat-collapse-btn") as HTMLButtonElement;
+const chatTranscriptEl = document.getElementById("chat-transcript")!;
+const chatFormEl = document.getElementById("chat-form") as HTMLFormElement;
+const chatInputEl = document.getElementById("chat-input") as HTMLTextAreaElement;
+const chatSendBtnEl = document.getElementById("chat-send-btn") as HTMLButtonElement;
+const chatSessionMenuBtnEl = document.getElementById("chat-session-menu-btn") as HTMLButtonElement;
+const chatSessionMenuLabelEl = document.getElementById("chat-session-menu-label")!;
+
+const chatPanel = mountChatPanel({
+  appEl,
+  regionEl: chatRegionEl,
+  handleEl: chatHandleEl,
+  collapseBtnEl: chatCollapseBtnEl,
+  sessionMenuBtnEl: chatSessionMenuBtnEl,
+  sessionMenuLabelEl: chatSessionMenuLabelEl,
+  panelEl: discoveryPanelEl,
+  transcriptEl: chatTranscriptEl,
+  formEl: chatFormEl,
+  inputEl: chatInputEl,
+  sendBtnEl: chatSendBtnEl,
+  onResizePersist: (fraction) => {
+    if (!vaultIsOpen) return;
+    void persistSetting("vault", "vault.chat_height", fraction);
+  },
+  // status: chat-panel-note-link-render
+  // status: editor-preview-tab-from-open-callsites
+  onOpenNoteLink: (rel) => {
+    void openFile(rel, { preview: true });
+  },
+  // status: chat-active-note-context-injection
+  // Pull the live editor text from the open buffer; preview-mode buffers
+  // (trash / snapshot / mutation) deliberately don't inject — they're
+  // derived views, not the user's working note.
+  getActiveNote: () => {
+    if (!buffer || isReadOnlyBuffer(buffer)) return null;
+    return { relPath: buffer.path, bufferText: view.state.doc.toString() };
+  },
+  // status: chat-input-at-selection
+  // Pull the active editor's current selection. Empty selection → null;
+  // preview-mode buffers also return null since they're derived views.
+  getActiveSelection: () => {
+    if (!buffer || isReadOnlyBuffer(buffer)) return null;
+    const { from, to } = view.state.selection.main;
+    if (from === to) return null;
+    const text = view.state.sliceDoc(from, to);
+    if (!text.trim()) return null;
+    const startLine = view.state.doc.lineAt(from).number;
+    const endLine = view.state.doc.lineAt(to).number;
+    const lineRange =
+      startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+    return { relPath: buffer.path, text, lineRange };
+  },
+  toast: (message) => showToast(message, undefined, 6000),
+});
+
+/// Discriminated union of buffer modes. `file` is the normal editable
+/// buffer; the other two are read-only previews. Bundling per-mode state
+/// onto the variant makes invalid combinations (e.g. a trash buffer with
+/// a snapshot row) unrepresentable, and lets save / dirty / status code
+/// narrow once via `mode.kind`.
+type BufferMode =
+  | { kind: "file" }
+  | { kind: "trash"; displayPath: string }
+  | {
+      kind: "snapshot";
+      row: ChangeRow;
+      changeId: number;
+      /// status: snapshot-preview-diff-toggle
+      /// True when the snapshot's CM6 view currently renders the diff vs
+      /// current rather than the snapshot blob.
+      diffActive: boolean;
+    };
 
 interface Buffer {
   path: string;
   loadedText: string;
   loadedHash: string;
-  /// True when the buffer is a read-only preview of a trash entry. Save is
-  /// disabled and the file-switch dirty guard skips this buffer.
-  preview?: boolean;
-  /// Display path for a trash preview (the original_path before deletion).
-  /// Used by updateStatus so the basename in the status bar makes sense.
-  displayPath?: string;
-  /// True when the buffer is a read-only preview of a changelog snapshot
-  /// (vault-home-recent-activity-detail). Save is disabled; banner shows
-  /// snapshot metadata + Restore + Close. The dirty-switch guard treats
-  /// snapshot previews like trash previews — there's nothing to discard.
-  snapshotPreview?: boolean;
-  /// The change_id whose content this preview is showing. Captured so the
-  /// banner's [Restore] button can write it back without a second lookup.
-  snapshotChangeId?: number;
+  mode: BufferMode;
+  /// status: note-mutation-stash-changes-tag
+  /// One-shot stash consumed by the next save: when a mutation lands on
+  /// the buffer (`note-mutation-applies-as-buffer-edit`) we set
+  /// `{ mutation: "<kind>" }` so the resulting `'modified'` `core::changes`
+  /// row carries `metadata.mutation`. Cleared post-save; subsequent saves
+  /// don't carry it.
+  pendingChangesMetadata: Record<string, unknown> | null;
+  /// status: editor-preview-tab
+  /// True while this buffer occupies the single preview slot. Promoted
+  /// to false (= sticky) on first edit, double-click of the tab, drag,
+  /// or "Keep open" right-click verb. Preview tabs are *never dirty* by
+  /// construction — the moment a doc-changing transaction lands the
+  /// promotion fires before the dirty check, so the existing dirty-
+  /// buffer machinery ignores this field entirely.
+  preview: boolean;
 }
 
 let buffer: Buffer | null = null;
 
-/// True for any read-only preview buffer (trash entry or changelog
-/// snapshot). Most code paths that previously checked `buffer.preview`
-/// want this broader check — both modes share the "no save, no dirty
-/// state, switch without prompt" behavior. Trash-specific UI (the
-/// "(in trash)" status suffix) keeps the narrower `buffer.preview` check.
+// status: editor-tab-strip, multi-buffer-in-memory-only
+// Open file-mode buffers, keyed by vault-relative path. The active one
+// is mirrored into `buffer` above so existing single-buffer call sites
+// (save / mutations / view menu / status bar) keep reading `buffer`
+// directly. Per-buffer EditorState (`savedState`) is captured on tab
+// switch so undo history / selection / scroll persist.
+//
+// Snapshot / trash buffers are *transient previews* on top of the
+// active tab — they don't get their own tab entry. When a preview
+// opens, we stash the current file buffer's state into the registry
+// (so closing the preview restores it), then point `buffer` at the
+// transient preview shape.
+interface OpenBufferEntry {
+  buffer: Buffer;
+  /// CM6 state captured at last tab-deactivate. `null` until the user
+  /// switches away from this tab for the first time.
+  savedState: EditorState | null;
+  /// Order of last activation; drives "switch to most recent" on close.
+  lastActivatedAt: number;
+}
+const openBuffers = new Map<string, OpenBufferEntry>();
+let activePath: string | null = null;
+let activationCounter = 0;
+
+// status: editor-tab-strip
+// status: editor-preview-tab
+// At most one preview tab exists at a time. Holds the path of the
+// currently-previewed buffer or `null` when no preview slot is in use.
+// Cleared on promotion, on close of the preview tab, or on vault swap.
+let previewTabPath: string | null = null;
+
+// status: note-mutation-buffer-ro-while-in-flight
+// Source paths with an active or leased `NoteMutation` task. Populated
+// by `mountMutationsMenu`'s `onInFlightChanged` hook driven off
+// `hiker:queue-event`. The active buffer is set RO while its path is
+// in this set; cleared from terminal events.
+const inFlightMutationPaths = new Set<string>();
+
+// Forward-declared so the early top-level `updateStatus()` paint can safely
+// call `mutationsMenu?.refreshButtonState()` before the actual mount runs
+// further down. Without the forward declaration, `mutationsMenu` is in TDZ
+// at the first paint and *any* reference (including `?.`) throws — the
+// throw aborts module init mid-file, which used to manifest as
+// "Cannot access 'taskQueueTile' before initialization" downstream because
+// the rest of the module never ran.
+let mutationsMenu: MutationsMenuApi | null = null;
+// Same forward-decl shape as `mutationsMenu` above: the initial top-level
+// `updateStatus()` paint runs before either mount, so a `const` reference
+// would TDZ-throw and abort module init. `let` + null seed lets the early
+// callers no-op safely; the actual mounts assign these further down.
+let modeControls: ModeControlsApi | null = null;
+let dirtyBufferDiff: DirtyBufferDiffApi | null = null;
+let tabStrip: TabStripApi | null = null;
+// status: navigation-history-stack
+// Forward-declared so transition sites (`activateTabInner`, `openFile`,
+// `closeTab`, etc.) can call `nav?.checkpoint()` before the actual mount
+// runs further down. Same TDZ-avoidance shape as `mutationsMenu` above.
+let nav: NavApi | null = null;
+function checkpointNav(): void {
+  nav?.checkpoint();
+}
+
+/// True for any read-only preview buffer (trash / snapshot). Most code paths
+/// share the "no save, no dirty state, switch without prompt" behavior;
+/// trash-specific or snapshot-specific UI narrows on `mode.kind` directly.
 function isReadOnlyBuffer(b: Buffer | null): boolean {
-  return !!(b && (b.preview || b.snapshotPreview));
+  return !!(b && b.mode.kind !== "file");
 }
 
 const language = new Compartment();
@@ -444,31 +606,44 @@ function isDirty(): boolean {
 
 function updateStatus(): void {
   const dirty = isDirty();
-  const path = buffer?.preview
-    ? (buffer.displayPath ?? buffer.path)
-    : (buffer?.path ?? "");
-  const titleSuffix = buffer?.preview
-    ? " (in trash)"
-    : buffer?.snapshotPreview
-      ? " (snapshot)"
-      : "";
+  // status: editor-preview-tab-promotion
+  // Preview tabs are never dirty by construction. Any code path that
+  // produces dirty state — user typing, mutation apply, programmatic
+  // doc swap that doesn't reset loadedText — promotes the preview to
+  // sticky. Keeps the invariant downstream (file-switch-guard-dirty,
+  // window-close guard, etc.) without those sites needing to know.
+  if (dirty) promotePreviewIfActive();
+  const isTrash = buffer?.mode.kind === "trash";
+  const isSnap = buffer?.mode.kind === "snapshot";
+  const path =
+    buffer?.mode.kind === "trash"
+      ? buffer.mode.displayPath
+      : (buffer?.path ?? "");
+  const titleSuffix = isTrash ? " (in trash)" : isSnap ? " (snapshot)" : "";
   document.title =
     (dirty ? "• " : "") + (path ? `Hiker — ${path}${titleSuffix}` : "Hiker");
   // status: status-bar-path-basename-tooltip
   let basename = path ? (path.split("/").pop() ?? path) : "";
-  if (buffer?.preview) basename += " (in trash)";
-  else if (buffer?.snapshotPreview) basename += " (snapshot)";
-  statusPathEl.textContent = basename;
-  statusPathEl.title = buffer?.preview ? buffer.path : path;
+  if (isTrash) basename += " (in trash)";
+  else if (isSnap) basename += " (snapshot)";
+  statusPathEl.replaceChildren(document.createTextNode(basename));
+  if (buffer?.mode.kind === "snapshot") {
+    const idEl = document.createElement("span");
+    idEl.className = "status-snapshot-id";
+    idEl.textContent = `#${buffer.mode.changeId}`;
+    idEl.title = `Snapshot id ${buffer.mode.changeId}`;
+    statusPathEl.appendChild(idEl);
+  }
+  statusPathEl.title = isTrash ? (buffer as Buffer).path : path;
   // status: status-bar-path-reveal — clickable when a real (non-trash) file
   // is open. Trash-preview paths live under `.hiker/trash/` and revealing
   // them would expose internal state, so the gesture is suppressed there.
   // Snapshot previews share the live file's path so reveal stays sensible.
-  const revealable = !!buffer && !buffer.preview;
+  const revealable = !!buffer && !isTrash;
   statusPathEl.classList.toggle("clickable", revealable);
   statusPathEl.style.cursor = revealable ? "pointer" : "";
   saveBtn.disabled = !buffer || !dirty || isReadOnlyBuffer(buffer);
-  saveBtn.classList.toggle("dirty", dirty);
+  refreshDiffButton();
 
   const sel = view.state.selection.main;
   const line = view.state.doc.lineAt(sel.head);
@@ -478,17 +653,57 @@ function updateStatus(): void {
   const words = text.trim() === "" ? 0 : text.trim().split(/\s+/).length;
   statusWordsEl.textContent = `${words} word${words === 1 ? "" : "s"}`;
 
+  // status: dirty-tree-dot
+  // Only the *active* buffer's LI carries the dirty class. Drop it from
+  // any other LIs first — without this, switching tabs / opening another
+  // note can leave a stale `.dirty` class on the outgoing tab's row
+  // (`view.setState` + the follow-up effects dispatch fire `updateStatus`
+  // while `buffer` still points at the outgoing tab, so `isDirty()` is
+  // briefly true against `view.state.doc` containing the *target's*
+  // content vs the outgoing buffer's `loadedText` — that one tick stamps
+  // the wrong row).
+  document.querySelectorAll("#tree li.dirty").forEach((el) => {
+    if (!buffer || el.getAttribute("data-path") !== buffer.path) {
+      el.classList.remove("dirty");
+    }
+  });
   if (buffer) {
     const li = document.querySelector(`#tree li[data-path="${cssEscape(buffer.path)}"]`);
     li?.classList.toggle("dirty", dirty);
   }
   // Center status label mirrors the active buffer's index state.
   renderIndexStatus();
+  // status: note-mutations-menu
+  // The wand button's enabled state depends on the active buffer's
+  // path / mode / extension / dirtiness — re-evaluate whenever the
+  // status bar refreshes (covers buffer swap, save, dirty toggle, mode
+  // entry/exit). `mutationsMenu` is forward-declared with `let` because
+  // the initial top-level `updateStatus()` paint runs before the mount;
+  // a `const` reference would throw on the TDZ access and abort module
+  // init (taking `taskQueueTile` and the rest of the file down with it).
+  mutationsMenu?.refreshButtonState();
+  // status: editor-diff-vs-disk-toggle
+  // Mode-controls re-renders the `file`-mode renderer (which shows the
+  // dirty-buffer Diff toggle when isDirty) on every doc edit so the
+  // toggle appears/disappears with the dirty flag. Cheap (replaceChildren).
+  // If the buffer goes clean while the diff is on, force the toggle off
+  // so the editor returns to its live editable state.
+  if (
+    !dirty
+    && buffer?.mode.kind === "file"
+    && dirtyBufferDiff?.isActive()
+  ) {
+    dirtyBufferDiff?.forceOff();
+  }
+  modeControls?.render();
+  // status: editor-tab-dirty-marker — tab strip mirrors per-tab dirty state.
+  tabStrip?.render();
 }
 
 const statusUpdater = ViewPlugin.fromClass(
   class {
-    update() {
+    update(u: ViewUpdate) {
+      void u;
       updateStatus();
     }
   },
@@ -516,7 +731,89 @@ register({
   keys: "Ctrl-Space",
   label: "Focus search input",
   run: () => {
-    focusSearchInput();
+    discovery.focusInput();
+    return true;
+  },
+});
+// status: chat-session-new-button
+// Reserved keybind for the "New chat session" affordance. The shortcut
+// itself is bound here so power users can fire it without touching the
+// button; the button still ships the same call.
+register({
+  id: "chat.new-session",
+  keys: "Mod-Shift-n",
+  label: "Start a new chat session",
+  run: () => {
+    void chatPanel.newSession();
+    return true;
+  },
+});
+// status: editor-tab-keybinds
+// Tab close / cycle / jump. Registered in the CM6 keymap so the editor
+// case works; a window-level keydown listener (further down) covers the
+// case where focus is outside CM6 (tree, sidebar, status bar). Two
+// sinks for one set of bindings is a wart of `keybind-registry`'s
+// editor-only scope; the spec acknowledges it under "When a future
+// binding needs to fire outside the editor".
+register({
+  id: "tab.close",
+  keys: "Mod-w",
+  label: "Close active tab",
+  run: () => {
+    if (activePath) void closeTab(activePath);
+    return true;
+  },
+});
+register({
+  id: "tab.next",
+  keys: "Ctrl-Tab",
+  label: "Next tab",
+  run: () => {
+    cycleTab(+1);
+    return true;
+  },
+});
+register({
+  id: "tab.previous",
+  keys: "Ctrl-Shift-Tab",
+  label: "Previous tab",
+  run: () => {
+    cycleTab(-1);
+    return true;
+  },
+});
+for (let i = 1; i <= 9; i++) {
+  const idx = i;
+  register({
+    id: `tab.jump-${idx}`,
+    keys: `Mod-${idx}`,
+    label: `Jump to tab ${idx === 9 ? "(last)" : idx}`,
+    run: () => {
+      jumpToTab(idx);
+      return true;
+    },
+  });
+}
+// status: navigation-keybind
+// Browser-conventional Cmd/Ctrl-[ for back, Cmd/Ctrl-] for forward.
+// Registered in CM6 so they fire when the editor has focus; a window-
+// level keydown handler further down covers tree / sidebar / status-bar
+// focus and adds the Linux/Windows-conventional Alt-Left / Alt-Right.
+register({
+  id: "navigation.back",
+  keys: "Mod-[",
+  label: "Navigate back",
+  run: () => {
+    void nav?.back();
+    return true;
+  },
+});
+register({
+  id: "navigation.forward",
+  keys: "Mod-]",
+  label: "Navigate forward",
+  run: () => {
+    void nav?.forward();
     return true;
   },
 });
@@ -535,6 +832,7 @@ const view = new EditorView({
       hideFrontmatterCompartment.of([]),
       whitespaceCompartment.of([]),
       readOnlyCompartment.of(EditorState.readOnly.of(false)),
+      ...diffExtensions(),
       statusUpdater,
       toCMKeymap(),
     ],
@@ -544,22 +842,107 @@ const view = new EditorView({
 saveBtn.addEventListener("click", async () => {
   const ok = await save();
   if (ok) {
-    scheduleRelatedRefresh(500);
+    discovery.scheduleRelatedRefresh(buffer?.path ?? null, 500);
     scheduleChunkBoundariesRefresh(500);
   }
+});
+
+// status: editor-diff-vs-disk-toggle
+// Toolbar diff button. Click toggles the only currently-implemented diff
+// target ("on-disk"); right-click opens a target-picker menu so future
+// targets (chunk boundaries, last save, snapshot, …) can slot in here
+// without splitting buttons. Greyed when there's nothing to diff against
+// — buffer not editable, file not on disk, or buffer clean.
+function diffButtonAvailable(): boolean {
+  if (!buffer || buffer.mode.kind !== "file") return false;
+  if (buffer.loadedHash === "") return false;
+  return isDirty();
+}
+function refreshDiffButton(): void {
+  const available = diffButtonAvailable();
+  const active = dirtyBufferDiff?.isActive() ?? false;
+  diffBtn.disabled = !available && !active;
+  diffBtn.classList.toggle("active", active);
+  diffBtn.title = active
+    ? "Hide diff"
+    : available
+      ? "Diff vs on-disk"
+      : "Nothing to diff";
+}
+diffBtn.addEventListener("click", () => {
+  if (diffBtn.disabled) return;
+  void dirtyBufferDiff?.toggle();
+});
+diffBtn.addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  const available = diffButtonAvailable();
+  const active = dirtyBufferDiff?.isActive() ?? false;
+  const items: CtxMenuItem[] = [
+    {
+      label: active ? "Hide diff" : "Diff against on-disk",
+      disabled: !available && !active,
+      run: () => void dirtyBufferDiff?.toggle(),
+    },
+  ];
+  openContextMenu(ev.clientX, ev.clientY, items);
+});
+
+// status: snapshot-preview-mode
+// Mount the snapshot-preview module. Hosted state — `buffer`, the CM6 view,
+// the dirty/save flow, render-mode-controls — flow in via the deps; the
+// module owns the diff-toggle in-flight guard and orchestrates the open /
+// close / toggle / restore lifecycle.
+const snapshotPreview: SnapshotPreviewApi = mountSnapshotPreview({
+  view,
+  getBuffer: () => buffer,
+  setBuffer: (b) => {
+    buffer = b as Buffer | null;
+  },
+  language,
+  livePreviewCompartment,
+  hideFrontmatterCompartment,
+  languageExtensionForPath,
+  livePreviewExtensionForPath,
+  getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
+  setReadOnly,
+  updateStatus,
+  refreshChunkBoundaries,
+  renderModeControls: () => modeControls?.render(),
+  isDirty,
+  save,
+  // Returning to the activity detail view if it's where the user came from;
+  // otherwise fall back to the home overview.
+  onClose: () => {
+    vaultHome.setVisible(true);
+    if (vaultHome.activeDetailView()?.kind !== "recent-activity") {
+      vaultHome.showDetail("recent-activity");
+    }
+  },
+  onRestore: (row) => vaultHome.doRestoreSnapshot(row),
+  isVaultHomeVisible: () => vaultHome.isVisible(),
+  setVaultHomeVisible: (on) => vaultHome.setVisible(on),
+  formatError,
 });
 
 async function save(): Promise<boolean> {
   if (!buffer) return false;
   const contents = view.state.doc.toString();
+  // status: note-mutation-stash-changes-tag
+  // One-shot consume of the stash on a successful save; cleared post-
+  // success so subsequent saves are tagless. Errors leave the stash in
+  // place so a retry (e.g. after a drift-conflict "Keep mine") still
+  // carries the tag.
+  const stash = buffer.pendingChangesMetadata;
   try {
     const newHash = await invoke<string>("write_file_checked", {
       rel: buffer.path,
       expectedHash: buffer.loadedHash,
       contents,
+      extraMetadata: stash,
     });
     buffer.loadedText = view.state.doc.toString();
     buffer.loadedHash = newHash;
+    buffer.pendingChangesMetadata = null;
     updateStatus();
     return true;
   } catch (err) {
@@ -588,6 +971,10 @@ async function handleSaveError(err: unknown): Promise<boolean> {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: fresh.contents } });
       buffer.loadedText = view.state.doc.toString();
       buffer.loadedHash = fresh.hash;
+      // Discarding our edits also discards any pending mutation tag —
+      // the bytes about to be persistent on the next save are disk's,
+      // not the mutation's.
+      buffer.pendingChangesMetadata = null;
       return true;
     }
     return false;
@@ -597,51 +984,241 @@ async function handleSaveError(err: unknown): Promise<boolean> {
   return false;
 }
 
-async function openFile(rel: string): Promise<void> {
-  if (buffer && isDirty()) {
-    const choice = await confirm3(
-      `${buffer.path} has unsaved changes.`,
-      "Save & switch",
-      "Discard & switch",
-      "Cancel",
-    );
-    if (choice === "cancel") return;
-    if (choice === "a") {
-      const ok = await save();
-      if (!ok) return;
-    }
+// status: multi-buffer-tree-click-switches-tab
+// status: editor-tab-strip
+// Tab activation. Saves the previously-active file buffer's CM6 state
+// (so undo history / selection / scroll persist across tab switches)
+// then restores the target buffer's content + state. If `target` has no
+// saved state yet (freshly opened, never switched away from), we
+// dispatch its loadedText into the live state instead of `setState`.
+function activateTabInner(rel: string): void {
+  const target = openBuffers.get(rel);
+  if (!target) return;
+  // Persist the outgoing tab's state.
+  if (buffer && buffer.mode.kind === "file") {
+    const out = openBuffers.get(buffer.path);
+    if (out) out.savedState = view.state;
   }
+  resetDiffDecorations(view);
+  if (target.savedState) {
+    view.setState(target.savedState);
+    // setState restores compartments to whatever the target's saved
+    // state had; we re-apply path-dependent + global compartments so
+    // toggles (live preview, hide-frontmatter, word wrap, etc.) reflect
+    // the user's *current* preferences rather than the snapshotted ones.
+    view.dispatch({
+      effects: [
+        language.reconfigure(languageExtensionForPath(target.buffer.path)),
+        livePreviewCompartment.reconfigure(
+          livePreviewEnabled ? livePreviewExtensionForPath(target.buffer.path) : [],
+        ),
+        hideFrontmatterCompartment.reconfigure(
+          hideFrontmatterEnabled ? hideFrontmatter() : [],
+        ),
+        readOnlyCompartment.reconfigure(
+          EditorState.readOnly.of(inFlightMutationPaths.has(target.buffer.path)),
+        ),
+      ],
+    });
+  } else {
+    // First activation — dispatch loadedText into the existing state.
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: target.buffer.loadedText },
+      effects: [
+        language.reconfigure(languageExtensionForPath(target.buffer.path)),
+        livePreviewCompartment.reconfigure(
+          livePreviewEnabled ? livePreviewExtensionForPath(target.buffer.path) : [],
+        ),
+        hideFrontmatterCompartment.reconfigure(
+          hideFrontmatterEnabled ? hideFrontmatter() : [],
+        ),
+        readOnlyCompartment.reconfigure(
+          EditorState.readOnly.of(inFlightMutationPaths.has(target.buffer.path)),
+        ),
+      ],
+    });
+    // The dispatch normalized loadedText through CM's doc — re-read so
+    // isDirty() doesn't immediately flag the buffer dirty after open.
+    target.buffer.loadedText = view.state.doc.toString();
+  }
+  buffer = target.buffer;
+  activePath = rel;
+  target.lastActivatedAt = ++activationCounter;
+  if (vaultHome.isVisible()) vaultHome.setVisible(false);
+  if (settingsPane.isVisible()) void settingsPane.setVisible(false);
+  document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
+  void revealInTree(rel);
+  updateStatus();
+  refreshChunkBoundaries();
+  tabStrip?.render();
+  checkpointNav();
+  // status: note-access-tracking
+  invoke("note_accessed", { rel }).catch((err) => {
+    console.error("note_accessed failed:", err);
+  });
+}
+
+// status: editor-preview-tab
+// Swap the currently-previewed tab's buffer in place. Same tab DOM
+// node, same activation order; only the path / contents / loadedHash
+// change. The previously-previewed buffer drops from `openBuffers`
+// under its old key (no other tab references it).
+async function replacePreviewWith(newRel: string): Promise<void> {
+  const oldPath = previewTabPath!;
+  const file = await invoke<FileWithHash>("read_file_with_hash", { rel: newRel });
+  const entry = openBuffers.get(oldPath);
+  if (!entry) {
+    // Stale state — fall back to the normal open path.
+    previewTabPath = null;
+    return;
+  }
+  resetDiffDecorations(view);
+  buffer = null;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: file.contents },
+    effects: [
+      language.reconfigure(languageExtensionForPath(newRel)),
+      livePreviewCompartment.reconfigure(livePreviewExtensionForPath(newRel)),
+      readOnlyCompartment.reconfigure(
+        EditorState.readOnly.of(inFlightMutationPaths.has(newRel)),
+      ),
+    ],
+  });
+  const replaced: Buffer = {
+    path: newRel,
+    loadedText: view.state.doc.toString(),
+    loadedHash: file.hash,
+    mode: { kind: "file" },
+    pendingChangesMetadata: null,
+    preview: true,
+  };
+  openBuffers.delete(oldPath);
+  openBuffers.set(newRel, {
+    buffer: replaced,
+    // Discard the prior buffer's savedState — it belongs to a different
+    // file's content and would clobber the new doc on activation.
+    savedState: null,
+    lastActivatedAt: ++activationCounter,
+  });
+  previewTabPath = newRel;
+  buffer = replaced;
+  activePath = newRel;
+  if (vaultHome.isVisible()) vaultHome.setVisible(false);
+  if (settingsPane.isVisible()) void settingsPane.setVisible(false);
+  document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
+  await revealInTree(newRel);
+  updateStatus();
+  refreshChunkBoundaries();
+  tabStrip?.render();
+  // status: navigation-history-stack — preview-replace prunes the
+  // displaced path from history so back/forward never tries to revive it.
+  nav?.pruneTab(oldPath);
+  checkpointNav();
+  invoke("note_accessed", { rel: newRel }).catch((err) => {
+    console.error("note_accessed failed:", err);
+  });
+}
+
+// status: editor-preview-tab-promotion
+// Flip the active preview tab to sticky. Idempotent — safe to call
+// every doc-change tick. Re-renders the tab strip so the italic clears.
+function promotePreviewIfActive(): void {
+  if (!buffer || buffer.mode.kind !== "file" || !buffer.preview) return;
+  buffer.preview = false;
+  if (previewTabPath === buffer.path) previewTabPath = null;
+  tabStrip?.render();
+}
+
+// status: editor-preview-tab-promotion
+// Promote a specific preview tab (by path) to sticky. Used by the
+// double-click and "Keep open" tab-context-menu paths so the user can
+// promote a tab they aren't actively editing.
+function promotePreviewByPath(rel: string): void {
+  const entry = openBuffers.get(rel);
+  if (!entry || !entry.buffer.preview) return;
+  entry.buffer.preview = false;
+  if (previewTabPath === rel) previewTabPath = null;
+  tabStrip?.render();
+}
+
+async function openFile(
+  rel: string,
+  opts?: { preview?: boolean },
+): Promise<void> {
+  const wantPreview = opts?.preview === true;
+  // status: multi-buffer-tree-click-switches-tab
+  // If a tab for this path is already open, switch to it — never reload
+  // from disk (would clobber any unsaved edits or in-buffer mutation).
+  if (openBuffers.has(rel)) {
+    activateTabInner(rel);
+    return;
+  }
+  // status: editor-preview-tab
+  // If a preview tab is open and the caller wants the preview slot,
+  // replace the existing preview's buffer in place rather than spawning
+  // a new tab. The tab DOM node + tab key in `openBuffers` persists
+  // (after a path remap) so the slot reads as the same tab to the user.
+  // No dirty guard: preview tabs are never dirty by construction.
+  if (wantPreview && previewTabPath !== null && previewTabPath !== rel) {
+    try {
+      await replacePreviewWith(rel);
+    } catch (err) {
+      console.error("openFile (preview replace) failed:", rel, err);
+      alert(`open failed: ${err}`);
+    }
+    return;
+  }
+  // status: multi-buffer-no-switch-guard — no dirty-modal on tab open.
+  // Switching tabs leaves the prior buffer dirty in memory. The guard
+  // only fires on explicit close (× / Cmd-W) or window-close.
   try {
     const file = await invoke<FileWithHash>("read_file_with_hash", { rel });
-    // Clear buffer before dispatch: the dispatch fires a synchronous
-    // ViewPlugin update, and if `buffer` still pointed at the previous note
-    // that update would compare the new doc text against the old note's
-    // loadedText and flag the old note as dirty in the tree.
+    // Persist outgoing tab's state before we dispatch into the view.
+    if (buffer && buffer.mode.kind === "file") {
+      const out = openBuffers.get(buffer.path);
+      if (out) out.savedState = view.state;
+    }
+    resetDiffDecorations(view);
     buffer = null;
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: file.contents },
       effects: [
         language.reconfigure(languageExtensionForPath(rel)),
         livePreviewCompartment.reconfigure(livePreviewExtensionForPath(rel)),
+        readOnlyCompartment.reconfigure(
+          EditorState.readOnly.of(inFlightMutationPaths.has(rel)),
+        ),
       ],
     });
-    // Compare against CM's canonical doc representation (it normalizes CRLF
-    // and similar on input), not the raw file string, or the buffer reads
-    // dirty immediately on open.
-    buffer = { path: rel, loadedText: view.state.doc.toString(), loadedHash: file.hash };
-    setReadOnly(false);
-    // status: vault-home-button — opening a note exits home view per spec
-    // ("clicking any tree row, recents entry, or search result restores the
-    // editor onto whichever note").
-    if (isVaultHomeVisible()) setVaultHomeVisible(false);
+    // Compare against CM's canonical doc representation (CRLF normalized),
+    // not the raw file string, or the buffer reads dirty on open.
+    const newBuf: Buffer = {
+      path: rel,
+      loadedText: view.state.doc.toString(),
+      loadedHash: file.hash,
+      mode: { kind: "file" },
+      pendingChangesMetadata: null,
+      preview: wantPreview,
+    };
+    openBuffers.set(rel, {
+      buffer: newBuf,
+      savedState: null,
+      lastActivatedAt: ++activationCounter,
+    });
+    if (wantPreview) previewTabPath = rel;
+    buffer = newBuf;
+    activePath = rel;
+    if (vaultHome.isVisible()) vaultHome.setVisible(false);
+    if (settingsPane.isVisible()) void settingsPane.setVisible(false);
     document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
     document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
     await revealInTree(rel);
     updateStatus();
     refreshChunkBoundaries();
-    // status: note-access-tracking — fire-and-forget; the indexer task
-    // stamps `notes.last_accessed_at` if the note is in the index. Errors
-    // here aren't user-visible — recents will simply not include this open.
+    tabStrip?.render();
+    checkpointNav();
     invoke("note_accessed", { rel }).catch((err) => {
       console.error("note_accessed failed:", err);
     });
@@ -651,334 +1228,182 @@ async function openFile(rel: string): Promise<void> {
   }
 }
 
+// status: editor-tab-strip
+// Close a tab. If dirty, fires the existing close-time confirm3 modal
+// (file-switch-guard-dirty's surviving entry point per multi-buffer-no-
+// switch-guard). On confirmed close, removes the entry from the
+// registry; if it was active, activates the most-recently-used remaining
+// tab (or clears the editor when none remain).
+async function closeTab(rel: string): Promise<void> {
+  const entry = openBuffers.get(rel);
+  if (!entry) return;
+  const isActive = activePath === rel;
+  const dirty = isActive ? isDirty() :
+    entry.buffer.loadedText !==
+      (entry.savedState?.doc.toString() ?? entry.buffer.loadedText);
+  if (dirty) {
+    // We need the dirty buffer's edits visible in the modal context —
+    // the user wants to see what they're saving/discarding. If it's
+    // not the active tab, switch to it first so the editor shows the
+    // pending content while the modal is up.
+    if (!isActive) activateTabInner(rel);
+    const choice = await confirm3(
+      `${rel} has unsaved changes.`,
+      "Save & close",
+      "Discard & close",
+      "Cancel",
+    );
+    if (choice === "cancel") return;
+    if (choice === "a") {
+      const ok = await save();
+      if (!ok) return;
+    }
+  }
+  openBuffers.delete(rel);
+  // status: editor-preview-tab — clear the slot if we just closed it.
+  if (previewTabPath === rel) previewTabPath = null;
+  // status: navigation-history-stack — drop history entries pointing at
+  // the closed tab so back/forward never tries to revive a vanished buffer.
+  nav?.pruneTab(rel);
+  if (activePath === rel) {
+    // Pick the most-recently-used remaining tab.
+    let next: string | null = null;
+    let bestSeen = -1;
+    for (const [p, e] of openBuffers) {
+      if (e.lastActivatedAt > bestSeen) {
+        bestSeen = e.lastActivatedAt;
+        next = p;
+      }
+    }
+    if (next) {
+      activateTabInner(next);
+    } else {
+      // No tabs left — clear the editor. Mirror what the existing
+      // delete-from-tree path does.
+      buffer = null;
+      activePath = null;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+      setReadOnly(false);
+      vaultHome.setVisible(true);
+      updateStatus();
+    }
+  }
+  tabStrip?.render();
+  checkpointNav();
+}
+
+// status: editor-tab-keybinds
+function cycleTab(delta: 1 | -1): void {
+  const order = [...openBuffers.keys()];
+  if (order.length === 0) return;
+  const idx = activePath ? order.indexOf(activePath) : -1;
+  const next =
+    idx < 0
+      ? order[0]
+      : order[(idx + delta + order.length) % order.length];
+  activateTabInner(next);
+}
+
+function jumpToTab(n: number): void {
+  const order = [...openBuffers.keys()];
+  if (order.length === 0) return;
+  // Cmd/Ctrl-9 jumps to the last tab regardless of count (browser
+  // convention) per editor-tab-keybinds.
+  const idx = n === 9 ? order.length - 1 : Math.min(n - 1, order.length - 1);
+  if (idx < 0) return;
+  activateTabInner(order[idx]);
+}
+
+function tabSnapshots(): {
+  path: string;
+  basename: string;
+  folder: string;
+  dirty: boolean;
+  preview: boolean;
+}[] {
+  const out: {
+    path: string;
+    basename: string;
+    folder: string;
+    dirty: boolean;
+    preview: boolean;
+  }[] = [];
+  for (const [path, entry] of openBuffers) {
+    const slash = path.lastIndexOf("/");
+    const basename = slash >= 0 ? path.slice(slash + 1) : path;
+    const folder = slash >= 0 ? path.slice(0, slash) : "";
+    const isActive = path === activePath && buffer?.mode.kind === "file";
+    const dirty = isActive
+      ? isDirty()
+      : entry.savedState !== null
+        ? entry.savedState.doc.toString() !== entry.buffer.loadedText
+        : false;
+    out.push({ path, basename, folder, dirty, preview: entry.buffer.preview });
+  }
+  return out;
+}
+
 const cssEscape = (s: string): string => CSS.escape(s);
 
-// Tracks the folder a "+ New note" click should target. Updated when the
-// user clicks a folder row or a file row (file → its parent). Empty string
-// means vault root.
-let selectedFolder: string = "";
-
-// Persists folder expansion state across `refreshTree` calls so a delete /
-// rename / refresh doesn't collapse every open folder.
-const expandedFolders = new Set<string>();
-
-// status: tree-sort-options
-// Default loaded from `vault.tree.sort_by` (per `settings-section-vault`);
-// flips persist via `settings-write-back`.
-type TreeSortOrder = "name-asc" | "name-desc" | "mtime-newest" | "mtime-oldest";
-let treeSortOrder: TreeSortOrder = "name-asc";
-
-function sortOrderFromSettings(s: Settings["vault"]["tree"]["sort_by"]): TreeSortOrder {
-  switch (s) {
-    case "name_asc": return "name-asc";
-    case "name_desc": return "name-desc";
-    case "mtime_desc": return "mtime-newest";
-    case "mtime_asc": return "mtime-oldest";
-  }
-}
-
-function sortOrderToSettings(o: TreeSortOrder): Settings["vault"]["tree"]["sort_by"] {
-  switch (o) {
-    case "name-asc": return "name_asc";
-    case "name-desc": return "name_desc";
-    case "mtime-newest": return "mtime_desc";
-    case "mtime-oldest": return "mtime_asc";
-  }
-}
-
-function sortTreeEntries(entries: DirEntry[]): DirEntry[] {
-  // Folders always grouped first; the chosen order applies within folders
-  // and within files (per editor.md `tree-sort-options`).
-  const dirs = entries.filter((e) => e.kind === "dir");
-  const files = entries.filter((e) => e.kind === "file");
-  const cmp = sortComparator(treeSortOrder);
-  dirs.sort(cmp);
-  files.sort(cmp);
-  return [...dirs, ...files];
-}
-
-function sortComparator(order: TreeSortOrder): (a: DirEntry, b: DirEntry) => number {
-  switch (order) {
-    case "name-asc":
-      return (a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-    case "name-desc":
-      return (a, b) => b.name.toLowerCase().localeCompare(a.name.toLowerCase());
-    case "mtime-newest":
-      return (a, b) => b.mtime - a.mtime;
-    case "mtime-oldest":
-      return (a, b) => a.mtime - b.mtime;
-  }
-}
-
-function parentOf(rel: string): string {
-  const idx = rel.lastIndexOf("/");
-  return idx >= 0 ? rel.slice(0, idx) : "";
-}
-
-async function renderDir(rel: string, container: HTMLElement): Promise<void> {
-  const entries = sortTreeEntries(await invoke<DirEntry[]>("list_dir", { rel }));
-  const ul = document.createElement("ul");
-  // Track pending nested renders so `await renderDir(...)` only resolves once
-  // every reachable expanded subtree is in the DOM. `revealInTree` relies on
-  // this to look up its target row after a refresh.
-  const pendingChildren: Promise<void>[] = [];
-  for (const entry of entries) {
-    const li = document.createElement("li");
-    li.dataset.path = entry.rel_path;
-    li.dataset.kind = entry.kind;
-    li.draggable = true;
-    renderTreeRowLabel(li, entry);
-    attachDnd(li, entry);
-    attachContextMenu(li, entry);
-    if (entry.kind === "dir") {
-      let expanded = expandedFolders.has(entry.rel_path);
-      let childContainer: HTMLElement | null = null;
-      if (expanded) {
-        // Render children deferred until after the li is in the DOM (the
-        // append below) — `li.after(...)` needs `li` to have a parent.
-        renderTreeRowLabel(li, entry, true);
-        const path = entry.rel_path;
-        pendingChildren.push(
-          new Promise<void>((resolve) => {
-            queueMicrotask(() => {
-              if (!expanded) {
-                resolve();
-                return;
-              }
-              childContainer = document.createElement("div");
-              li.after(childContainer);
-              renderDir(path, childContainer).then(resolve, resolve);
-            });
-          }),
-        );
-      }
-      li.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        // Skip the second click of a double-click; the dblclick handler
-        // below (rename) takes over.
-        if ((e as MouseEvent).detail >= 2) return;
-        selectedFolder = entry.rel_path;
-        if (expanded) {
-          childContainer?.remove();
-          childContainer = null;
-          expanded = false;
-          expandedFolders.delete(entry.rel_path);
-          renderTreeRowLabel(li, entry, false);
-        } else {
-          childContainer = document.createElement("div");
-          li.after(childContainer);
-          await renderDir(entry.rel_path, childContainer);
-          expanded = true;
-          expandedFolders.add(entry.rel_path);
-          renderTreeRowLabel(li, entry, true);
-        }
-      });
-    } else {
-      li.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if ((e as MouseEvent).detail >= 2) return;
-        selectedFolder = parentOf(entry.rel_path);
-        void openFile(entry.rel_path);
-      });
-    }
-    // status: tree-double-click-rename
-    li.addEventListener("dblclick", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      void beginInlineRename(li, entry.rel_path, entry.kind);
-    });
-    ul.appendChild(li);
-  }
-  container.appendChild(ul);
-  await Promise.all(pendingChildren);
-}
-
-// File extensions the indexer chunks. Fetched once at vault open from the
-// `indexable_extensions` Tauri command (single source of truth =
-// `core::indexer::INDEXABLE_EXTENSIONS`) and cached here for the
-// client-side `tree-row-unsupported-marker` derivation so we don't pay a
-// Tauri round trip on every visible row.
-let indexableExts = new Set<string>(["md", "markdown", "txt"]);
-function isIndexableExt(rel: string): boolean {
-  const dot = rel.lastIndexOf(".");
-  if (dot <= rel.lastIndexOf("/")) return false;
-  return indexableExts.has(rel.slice(dot + 1).toLowerCase());
-}
-
-// Per-path index-state cache so re-renders don't re-fetch on every paint.
-// Cleared on tree refresh and updated by progress-event handlers.
-const indexStateCache = new Map<string, IndexState>();
-const inflightStateFetches = new Set<string>();
-
-async function fetchIndexState(rel: string): Promise<IndexState> {
-  // status: tree-row-skipped-marker / tree-row-queued-marker
-  const state = await invoke<IndexState>("index_state_for", { rel });
-  indexStateCache.set(rel, state);
-  return state;
-}
-
-function applyIndexMarker(li: HTMLElement, state: IndexState | null): void {
-  li.classList.remove("ix-unsupported", "ix-skipped", "ix-queued", "ix-indexed");
-  li.removeAttribute("data-ix-reason");
-  // Suffix dot lives in a child span so it sits on the same side as the
-  // dirty dot (li::after) without fighting it for the single ::after slot.
-  let marker = li.querySelector<HTMLSpanElement>(":scope > .ix-marker");
-  if (state && state.kind !== "indexed") {
-    if (!marker) {
-      marker = document.createElement("span");
-      marker.className = "ix-marker";
-      li.append(marker);
-    }
-  } else if (marker) {
-    marker.remove();
-  }
-  if (!state) {
-    li.removeAttribute("title");
-    return;
-  }
-  switch (state.kind) {
-    case "unsupported":
-      li.classList.add("ix-unsupported");
-      li.removeAttribute("title");
-      break;
-    case "skipped":
-      li.classList.add("ix-skipped");
-      li.dataset.ixReason = state.reason;
-      li.title = `Skipped — ${state.reason}`;
-      break;
-    case "queued":
-      li.classList.add("ix-queued");
-      li.removeAttribute("title");
-      break;
-    case "indexed":
-      li.classList.add("ix-indexed");
-      li.removeAttribute("title");
-      break;
-  }
-}
-
-// status: tree-row-unsupported-marker / tree-row-skipped-marker / tree-row-queued-marker
-function renderTreeRowLabel(
-  li: HTMLLIElement,
-  entry: DirEntry,
-  expanded = false,
-): void {
-  li.textContent = "";
-  // Folders: just the chevron + name. Spec is explicit that folders are
-  // never marked.
-  if (entry.kind === "dir") {
-    li.append(document.createTextNode((expanded ? "▾ " : "▸ ") + entry.name));
-    return;
-  }
-  li.append(document.createTextNode(entry.name));
-
-  const cached = indexStateCache.get(entry.rel_path);
-  if (cached) {
-    applyIndexMarker(li, cached);
-    return;
-  }
-  // Cheap client-side Unsupported derivation: if the extension has no
-  // chunker, set the marker immediately and skip the round trip.
-  if (!isIndexableExt(entry.rel_path)) {
-    const state: IndexState = { kind: "unsupported" };
-    indexStateCache.set(entry.rel_path, state);
-    applyIndexMarker(li, state);
-    return;
-  }
-  // Lazy fetch for the rest. Multiple visible rows can request the same
-  // path during a refresh; coalesce.
-  const path = entry.rel_path;
-  if (inflightStateFetches.has(path)) return;
-  inflightStateFetches.add(path);
-  void fetchIndexState(path)
-    .then((state) => {
-      // Re-find the row (it may have been re-rendered); apply.
-      document
-        .querySelectorAll(`#tree li[data-path="${cssEscape(path)}"]`)
-        .forEach((el) => applyIndexMarker(el as HTMLElement, state));
-      if (buffer && !isReadOnlyBuffer(buffer) && buffer.path === path) {
-        renderIndexStatus();
-      }
-    })
-    .catch((err) => {
-      console.error("index_state_for failed:", path, err);
-    })
-    .finally(() => {
-      inflightStateFetches.delete(path);
-    });
-}
-
-// status: drag-and-drop-move
-function attachDnd(li: HTMLLIElement, entry: DirEntry): void {
-  // Folder rows are draggable too — the drop calls `move_folder`, which does
-  // a single fs rename + bulk index remap for every contained `.md` file.
-  // Empty subfolders move with the rename for free.
-  li.addEventListener("dragstart", (e) => {
-    e.dataTransfer?.setData("text/plain", entry.rel_path);
-    e.dataTransfer?.setData(
-      "application/x-hiker-kind",
-      entry.kind === "dir" ? "dir" : "file",
-    );
-    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-    li.classList.add("dragging");
-  });
-  li.addEventListener("dragend", () => li.classList.remove("dragging"));
-
-  li.addEventListener("dragover", (e) => {
-    const src = e.dataTransfer?.types.includes("text/plain");
-    if (!src) return;
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    li.classList.add("drop-target");
-  });
-  li.addEventListener("dragleave", () => li.classList.remove("drop-target"));
-
-  li.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    li.classList.remove("drop-target");
-    const from = e.dataTransfer?.getData("text/plain");
-    if (!from) return;
-    const fromKind = e.dataTransfer?.getData("application/x-hiker-kind") === "dir"
-      ? "dir"
-      : "file";
-    // Drop onto folder → move into folder. Drop onto file → file's parent.
-    const targetFolder = entry.kind === "dir" ? entry.rel_path : parentOf(entry.rel_path);
-    await performDrop(from, fromKind, targetFolder);
-  });
-}
-
-async function performDrop(
-  from: string,
-  fromKind: "dir" | "file",
-  targetFolder: string,
-): Promise<void> {
-  if (from === targetFolder) return;
-  const fromParent = parentOf(from);
-  if (fromParent === targetFolder) return; // same parent → no-op per spec
-  const name = from.split("/").pop()!;
-  // Don't allow dropping a folder into itself or its descendants.
-  if (targetFolder === from || targetFolder.startsWith(from + "/")) return;
-  const to = targetFolder ? `${targetFolder}/${name}` : name;
-  const cmd = fromKind === "dir" ? "move_folder" : "move_note";
-  try {
-    await invoke(cmd, { from, to });
-    // If the open buffer was inside the moved subtree, follow its new path.
+// status: tree-* (see ./tree)
+// Sidebar tree owns its own state (expanded folders, sort order, debounce,
+// index-state cache) inside the module; host wires DOM ids and editor-coupled
+// callbacks via deps. The wrapper functions below preserve the old call-site
+// shape (`refreshTree`, `revealInTree`, `scheduleTreeRefreshFromWatcher`).
+const tree: TreeApi = mountTree({
+  treeEl,
+  newNoteBtn,
+  treeActionsBtn,
+  cssEscape,
+  formatError,
+  getBuffer: () => buffer,
+  isReadOnlyBuffer: (b) => isReadOnlyBuffer(b as Buffer | null),
+  setBufferPath: (newPath) => {
     if (buffer) {
-      if (buffer.path === from) {
-        buffer.path = to;
-        updateStatus();
-      } else if (fromKind === "dir" && buffer.path.startsWith(from + "/")) {
-        buffer.path = to + buffer.path.slice(from.length);
-        updateStatus();
-      }
+      buffer.path = newPath;
+      updateStatus();
     }
-    await refreshTree();
-  } catch (err) {
-    console.error(`${cmd} failed:`, err);
-    alert(`move failed: ${formatError(err)}`);
-  }
+  },
+  isDirty,
+  openFile,
+  clearOpenBufferIfWithin: (deletedRel) => {
+    // status: editor-tab-strip — drop any tabs whose paths fall under
+    // the deleted prefix so they don't linger as broken references.
+    const drop = [...openBuffers.keys()].filter(
+      (p) => p === deletedRel || p.startsWith(deletedRel + "/"),
+    );
+    for (const p of drop) openBuffers.delete(p);
+    // status: editor-preview-tab — drop preview slot pointer if dropped.
+    if (previewTabPath !== null && drop.includes(previewTabPath)) {
+      previewTabPath = null;
+    }
+    if (
+      buffer &&
+      (buffer.path === deletedRel ||
+        buffer.path.startsWith(deletedRel + "/"))
+    ) {
+      buffer = null;
+      activePath = null;
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: "" },
+      });
+      updateStatus();
+    }
+    tabStrip?.render();
+  },
+  refreshTrashBin,
+  renderIndexStatus,
+  persistSetting,
+});
+
+function refreshTree(): Promise<void> {
+  return tree.refresh();
+}
+function revealInTree(rel: string): Promise<void> {
+  return tree.revealPath(rel);
+}
+function scheduleTreeRefreshFromWatcher(): void {
+  tree.notifyWatcher();
 }
 
 function formatError(err: unknown): string {
@@ -989,87 +1414,6 @@ function formatError(err: unknown): string {
   }
   return JSON.stringify(err);
 }
-
-/// Ensure the tree row for `rel` is visible (ancestor folders expanded) and
-/// marked active, then scroll it into view. Used by `openFile` so opening a
-/// note from the related-notes list, search results, etc. expands the
-/// folders that contain it instead of silently failing the highlight.
-async function revealInTree(rel: string): Promise<void> {
-  // Add every ancestor folder to the expansion set.
-  let added = false;
-  let cursor = parentOf(rel);
-  while (cursor !== "") {
-    if (!expandedFolders.has(cursor)) {
-      expandedFolders.add(cursor);
-      added = true;
-    }
-    cursor = parentOf(cursor);
-  }
-  if (added) {
-    await refreshTree();
-  }
-  const row = document.querySelector(
-    `#tree li[data-path="${cssEscape(rel)}"]`,
-  );
-  row?.classList.add("active");
-  row?.scrollIntoView({ block: "nearest" });
-}
-
-async function refreshTree(): Promise<void> {
-  treeEl.innerHTML = "";
-  await renderDir("", treeEl);
-  // Restore active highlight on the open file, if any.
-  if (buffer) {
-    document
-      .querySelector(`#tree li[data-path="${cssEscape(buffer.path)}"]`)
-      ?.classList.add("active");
-  }
-}
-
-// status: tree-refresh-watcher
-// Debounce a single tree rebuild across bursts of watcher events (git
-// checkout, mass copy, multi-file rename). 200ms matches the watcher's own
-// debounce window so a single logical fs change → at most one rebuild.
-let treeRefreshDebounce: number | null = null;
-function scheduleTreeRefreshFromWatcher(): void {
-  if (treeRefreshDebounce !== null) window.clearTimeout(treeRefreshDebounce);
-  treeRefreshDebounce = window.setTimeout(() => {
-    treeRefreshDebounce = null;
-    void refreshTree();
-  }, 200);
-}
-
-// Tree-root drop zone: dropping on empty space below the tree moves to root.
-treeEl.addEventListener("dragover", (e) => {
-  if (!e.dataTransfer?.types.includes("text/plain")) return;
-  e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-});
-treeEl.addEventListener("drop", async (e) => {
-  // Only handle drops that fell through every li (li handlers stopPropagation).
-  e.preventDefault();
-  const from = e.dataTransfer?.getData("text/plain");
-  if (!from) return;
-  const fromKind = e.dataTransfer?.getData("application/x-hiker-kind") === "dir"
-    ? "dir"
-    : "file";
-  await performDrop(from, fromKind, "");
-});
-
-// status: tree-context-menu — empty-space menu (right-click below the rows)
-treeEl.addEventListener("contextmenu", (e) => {
-  // li handlers stopPropagation, so this only fires on real empty space.
-  e.preventDefault();
-  openContextMenu(e.clientX, e.clientY, [
-    {
-      label: "New note here",
-      run: async () => {
-        selectedFolder = "";
-        newNoteBtn.click();
-      },
-    },
-  ]);
-});
 
 /// Show the OS folder picker via the JS dialog plugin and, on a
 /// selection, open it through `open_vault_at`. The picker lives entirely
@@ -1111,62 +1455,64 @@ async function applyOpenedVault(path: string): Promise<void> {
   const basename = path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? path;
   vaultPathEl.textContent = basename;
   vaultPathEl.title = path;
-  selectedFolder = "";
+  tree.setSelectedFolder("");
   vaultIsOpen = true;
   outstandingCount = 0;
-
-  // Refresh the indexable-extension allowlist so the tree's Unsupported
-  // marker derivation matches the backend without per-row round trips.
-  // Failures aren't fatal — the seeded fallback is the v1 set.
-  try {
-    const exts = await invoke<string[]>("indexable_extensions");
-    indexableExts = new Set(exts.map((e) => e.toLowerCase()));
-  } catch (err) {
-    console.error("indexable_extensions failed:", err);
-  }
+  // status: task-queue-home-widget
+  // Tile mounts pre-vault-open; re-fetch settings + snapshot now.
+  void taskQueueTile.refresh();
 
   // status: settings-load-once-at-startup
   // Seed View menu / tree / panel state from the merged settings. Failures
   // here aren't fatal — fall back to whatever the in-memory defaults are.
   try {
     const s = await invoke<Settings>("get_settings");
-    renderTxtAsMarkdown = s.editor.render_txt_as_markdown;
-    setLivePreviewEnabled(s.editor.live_preview);
-    setWordWrapEnabled(s.editor.word_wrap);
-    setLineNumbersVisible(s.editor.show_line_numbers);
-    setWhitespaceEnabled(s.editor.show_whitespace);
-    setChunkBoundariesEnabled(s.editor.show_chunk_boundaries);
-    setHideFrontmatterEnabled(s.editor.hide_frontmatter);
-    treeSortOrder = sortOrderFromSettings(s.vault.tree.sort_by);
-    appEl.classList.toggle("sidebar-collapsed", !s.vault.sidebar_open);
-    appEl.classList.toggle("related-collapsed", !s.vault.related_open);
-    trashBinEl.classList.toggle("collapsed", !s.vault.trash_expanded);
-    trashChevronEl.textContent = s.vault.trash_expanded ? "▾" : "▸";
-    // status: search-mode-state-persisted, search-section-collapsible
-    setSearchModeSemantic(s.search.modes.semantic, false);
-    setSearchModeLexical(s.search.modes.lexical, false);
-    setSearchSectionExpanded(s.search.sections.results_expanded, false);
-    setRelatedSectionExpanded(s.search.sections.related_expanded, false);
-    syncToggleButtons();
+    applySettingsToUi(s);
   } catch (err) {
     console.error("get_settings failed:", err);
   }
   // Stale per-path state from a prior vault must not leak into the new one
   // (paths can collide across vaults).
-  indexStateCache.clear();
-  inflightStateFetches.clear();
+  tree.clearCaches();
+  // status: multi-buffer-in-memory-only — open buffers don't persist
+  // across vault swaps; clear them along with the rest of per-vault state.
+  openBuffers.clear();
+  // status: editor-preview-tab — preview slot doesn't survive vault swap.
+  previewTabPath = null;
+  activePath = null;
+  buffer = null;
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+  tabStrip?.render();
   // Clear the related-notes panel so hits from the prior vault don't linger
   // until the next file open / save populates it for the new vault.
-  void refreshRelated(null);
+  void discovery.refreshRelated(null);
+  // status: chat-panel-pinned-bottom — drop transcript and any in-flight
+  // turn so the new vault starts clean.
+  chatPanel.reset();
+  // status: chat-session-resume-latest
+  // Re-seed the panel from the most-recent on-disk session (if any).
+  // The backend's `resume_latest_at_open` already adopted it as active;
+  // we just paint the rendered transcript here.
+  try {
+    const active = await invoke<ActiveSessionDto | null>("chat_session_active");
+    chatPanel.hydrate(active);
+  } catch (err) {
+    console.error("chat_session_active failed:", err);
+  }
   // Likewise, blank the search input/results so prior-vault matches don't
   // surface in the new vault. status: search-discovery-panel
-  clearSearchPanel();
+  discovery.clear();
   startBackgroundIntervals();
   await refreshTree();
   await refreshTrashBin();
+  // status: navigation-history-stack — history is per-vault, so swapping
+  // vaults drops the stack along with `openBuffers`. Cleared *before*
+  // `vaultHome.setVisible(true)` below so the home page becomes the
+  // first checkpoint on the new vault rather than landing on a stale tail.
+  nav?.reset();
   // status: vault-home-screen — default landing surface on vault open
   // (no auto-resume of last buffer in v1).
-  setVaultHomeVisible(true);
+  vaultHome.setVisible(true);
 }
 
 pickBtn.addEventListener("click", () => void openVault());
@@ -1209,521 +1555,105 @@ async function bootstrapDefaultVault(): Promise<void> {
 
 void bootstrapDefaultVault();
 
-// status: create-note-button
-newNoteBtn.addEventListener("click", async () => {
-  try {
-    const created = await invoke<string>("create_note", { folder: selectedFolder });
-    await refreshTree();
-    await openFile(created);
-    const li = document.querySelector(`#tree li[data-path="${cssEscape(created)}"]`) as
-      | HTMLLIElement
-      | null;
-    if (li) await beginInlineRename(li, created);
-  } catch (err) {
-    console.error("create_note failed:", err);
-    alert(`new note failed: ${formatError(err)}`);
-  }
-});
-
-// status: tree-toolbar-actions-menu
-treeActionsBtn.addEventListener("click", (e) => {
-  e.stopPropagation();
-  const rect = treeActionsBtn.getBoundingClientRect();
-  const activePath =
-    buffer && !isReadOnlyBuffer(buffer) ? buffer.path : null;
-  openContextMenu(rect.right, rect.bottom, [
-    {
-      // status: tree-refresh-manual
-      label: "Refresh tree",
-      run: async () => {
-        await refreshTree();
-        await refreshTrashBin();
-      },
-    },
-    {
-      // status: reindex-all-action
-      label: "Reindex all",
-      run: async () => {
-        try {
-          await invoke("index", { scope: { kind: "all" } });
-        } catch (err) {
-          console.error("reindex all failed:", err);
-          alert(`reindex failed: ${formatError(err)}`);
-        }
-      },
-    },
-    {
-      // status: reindex-current-file-action
-      label: "Reindex this file",
-      disabled: activePath === null,
-      run: async () => {
-        if (!activePath) return;
-        try {
-          await invoke("index", { scope: { kind: "path", rel: activePath } });
-        } catch (err) {
-          console.error("reindex file failed:", err);
-          alert(`reindex failed: ${formatError(err)}`);
-        }
-      },
-    },
-    {
-      // status: tree-sort-options
-      label: `Sort by  ▸  ${sortOrderLabel(treeSortOrder)}`,
-      run: () => openSortByMenu(rect.right, rect.bottom),
-    },
-  ]);
-});
-
-function sortOrderLabel(order: TreeSortOrder): string {
-  switch (order) {
-    case "name-asc": return "Name (A→Z)";
-    case "name-desc": return "Name (Z→A)";
-    case "mtime-newest": return "Modified (newest first)";
-    case "mtime-oldest": return "Modified (oldest first)";
-  }
-}
-
-function openSortByMenu(x: number, y: number): void {
-  const orders: TreeSortOrder[] = [
-    "name-asc",
-    "name-desc",
-    "mtime-newest",
-    "mtime-oldest",
-  ];
-  openContextMenu(
-    x,
-    y,
-    orders.map((o) => ({
-      label: sortOrderLabel(o),
-      checked: treeSortOrder === o,
-      run: async () => {
-        if (treeSortOrder === o) return;
-        treeSortOrder = o;
-        await refreshTree();
-        void persistSetting("vault", "vault.tree.sort_by", sortOrderToSettings(o));
-      },
-    })),
-  );
-}
-
-async function beginInlineRename(
-  li: HTMLLIElement,
-  currentPath: string,
-  kind: "file" | "dir" = "file",
-): Promise<void> {
-  const name = currentPath.split("/").pop()!;
-  // Folders have no extension to exclude — pre-select the whole basename.
-  // Files preserve the existing "select stem, leave .md" behavior.
-  const dotIdx = kind === "file" ? name.lastIndexOf(".") : -1;
-  const stemEnd = dotIdx > 0 ? dotIdx : name.length;
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "tree-rename-input";
-  input.value = name;
-  li.textContent = "";
-  li.appendChild(input);
-  input.focus();
-  input.setSelectionRange(0, stemEnd);
-
-  await new Promise<void>((resolve) => {
-    let done = false;
-    const finish = async (commit: boolean) => {
-      if (done) return;
-      done = true;
-      const newName = input.value.trim();
-      if (commit && newName && newName !== name) {
-        const parent = parentOf(currentPath);
-        const to = parent ? `${parent}/${newName}` : newName;
-        const cmd = kind === "dir" ? "move_folder" : "move_note";
-        try {
-          await invoke(cmd, { from: currentPath, to });
-          if (kind === "dir") {
-            // Preserve expansion state across the rename: any path under
-            // the old folder needs its prefix swapped, and the renamed
-            // folder itself stays expanded if it was before.
-            const fromPrefix = currentPath + "/";
-            const remapped = new Set<string>();
-            for (const p of expandedFolders) {
-              if (p === currentPath) {
-                remapped.add(to);
-              } else if (p.startsWith(fromPrefix)) {
-                remapped.add(to + p.slice(currentPath.length));
-              } else {
-                remapped.add(p);
-              }
-            }
-            expandedFolders.clear();
-            for (const p of remapped) expandedFolders.add(p);
-          }
-          if (buffer) {
-            if (buffer.path === currentPath) {
-              buffer.path = to;
-              updateStatus();
-            } else if (kind === "dir" && buffer.path.startsWith(currentPath + "/")) {
-              buffer.path = to + buffer.path.slice(currentPath.length);
-              updateStatus();
-            }
-          }
-        } catch (err) {
-          console.error("rename failed:", err);
-          alert(`rename failed: ${formatError(err)}`);
-        }
-      }
-      await refreshTree();
-      resolve();
-    };
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        void finish(true);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        void finish(false);
-      }
-    });
-    input.addEventListener("blur", () => void finish(true));
-  });
-}
-
-// status: tree-context-menu
-interface CtxMenuItem {
-  label: string;
-  run?: () => void | Promise<void>;
-  disabled?: boolean;
-  danger?: boolean;
-  checked?: boolean;
-  tooltip?: string;
-}
-
-let openMenuEl: HTMLElement | null = null;
-
-function closeContextMenu(): void {
-  if (openMenuEl) {
-    openMenuEl.remove();
-    openMenuEl = null;
-  }
-}
-
-function openContextMenu(x: number, y: number, items: CtxMenuItem[]): void {
-  closeContextMenu();
-  const menu = document.createElement("div");
-  menu.className = "ctx-menu";
-  menu.setAttribute("role", "menu");
-  for (const item of items) {
-    const btn = document.createElement("button");
-    let cls = "ctx-menu-item";
-    if (item.danger) cls += " danger";
-    if (item.checked !== undefined) cls += " checkable";
-    if (item.checked) cls += " checked";
-    btn.className = cls;
-    btn.textContent = item.label;
-    btn.disabled = item.disabled === true;
-    if (item.tooltip) btn.title = item.tooltip;
-    btn.addEventListener("click", async () => {
-      closeContextMenu();
-      if (item.run) await item.run();
-    });
-    menu.appendChild(btn);
-  }
-  document.body.appendChild(menu);
-  // Position: clamp inside the viewport so the menu doesn't get clipped
-  // when the click lands near the right/bottom edge.
-  const rect = menu.getBoundingClientRect();
-  const left = Math.min(x, window.innerWidth - rect.width - 4);
-  const top = Math.min(y, window.innerHeight - rect.height - 4);
-  menu.style.left = `${Math.max(4, left)}px`;
-  menu.style.top = `${Math.max(4, top)}px`;
-  openMenuEl = menu;
-
-  const onDocDown = (ev: MouseEvent) => {
-    if (!menu.contains(ev.target as Node)) closeContextMenu();
-  };
-  const onKey = (ev: KeyboardEvent) => {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      closeContextMenu();
-    }
-  };
-  // mousedown so a click outside dismisses before its own click handler fires.
-  setTimeout(() => {
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onKey, true);
-  });
-  const cleanup = new MutationObserver(() => {
-    if (!document.body.contains(menu)) {
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onKey, true);
-      cleanup.disconnect();
-    }
-  });
-  cleanup.observe(document.body, { childList: true });
-}
-
-function attachContextMenu(li: HTMLLIElement, entry: DirEntry): void {
-  li.addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const items: CtxMenuItem[] = [];
-    if (entry.kind === "file") {
-      items.push({ label: "Open", run: () => openFile(entry.rel_path) });
-    }
-    items.push({
-      label: "Rename",
-      run: () => beginInlineRename(li, entry.rel_path, entry.kind),
-    });
-    items.push({
-      label: "Delete",
-      danger: true,
-      run: () => deleteFromTree(entry),
-    });
-    // status: tree-context-properties — greyed-out stub until frontmatter
-    // editing exists.
-    items.push({ label: "Properties", disabled: true });
-    openContextMenu(e.clientX, e.clientY, items);
-  });
-}
-
-// status: tree-context-delete
-async function deleteFromTree(entry: DirEntry): Promise<void> {
-  let memberCount = 0;
-  if (entry.kind === "dir") {
-    try {
-      memberCount = await countNotesIn(entry.rel_path);
-    } catch (err) {
-      console.error("countNotesIn failed:", err);
-    }
-  }
-  const bufferUnderEntry =
-    !!buffer &&
-    (buffer.path === entry.rel_path ||
-      buffer.path.startsWith(entry.rel_path + "/"));
-  const dirtyTail = bufferUnderEntry && isDirty()
-    ? " Unsaved changes will be discarded."
-    : "";
-  const message =
-    entry.kind === "dir"
-      ? `Move ${entry.rel_path} and ${memberCount} note${memberCount === 1 ? "" : "s"} inside it to trash?${dirtyTail}`
-      : `Move ${entry.rel_path} to trash?${dirtyTail}`;
-
-  const ok = await confirmDanger(message, "Move to trash");
-  if (!ok) return;
-
-  try {
-    const result = await invoke<TrashEntry>("delete_note", { rel: entry.rel_path });
-    // If the deleted file (or a folder containing it) was the open buffer, clear it.
-    if (
-      buffer &&
-      (buffer.path === entry.rel_path || buffer.path.startsWith(entry.rel_path + "/"))
-    ) {
-      buffer = null;
-      view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: "" },
-      });
-      updateStatus();
-    }
-    await refreshTree();
-    const message =
-      result.kind === "folder"
-        ? `Moved ${result.original_path} to trash (${result.members?.length ?? 0} notes)`
-        : `Moved ${result.original_path} to trash`;
-    showToast(message, {
-      label: "Undo",
-      run: async () => {
-        try {
-          const restored = await invoke<TrashEntry>("restore_trash_entry", { id: result.id });
-          await refreshTree();
-          showToast(`Restored ${restored.original_path}`);
-        } catch (err) {
-          console.error("restore_trash_entry failed:", err);
-          alert(`restore failed: ${formatError(err)}`);
-        }
-      },
-    });
-  } catch (err) {
-    console.error("delete_note failed:", err);
-    alert(`delete failed: ${formatError(err)}`);
-  }
-}
-
-async function countNotesIn(rel: string): Promise<number> {
-  let count = 0;
-  const entries = await invoke<DirEntry[]>("list_dir", { rel });
-  for (const e of entries) {
-    if (e.kind === "file" && e.name.toLowerCase().endsWith(".md")) {
-      count += 1;
-    } else if (e.kind === "dir") {
-      count += await countNotesIn(e.rel_path);
-    }
-  }
-  return count;
-}
-
-function confirmDanger(message: string, dangerLabel: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-    const dialog = document.createElement("div");
-    dialog.className = "modal-dialog";
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    const msg = document.createElement("p");
-    msg.className = "modal-message";
-    msg.textContent = message;
-    const btnRow = document.createElement("div");
-    btnRow.className = "modal-buttons";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "modal-btn";
-    cancelBtn.textContent = "Cancel";
-    const dangerBtn = document.createElement("button");
-    dangerBtn.className = "modal-btn modal-btn-danger";
-    dangerBtn.textContent = dangerLabel;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    const finish = (v: boolean) => {
-      document.removeEventListener("keydown", onKey, true);
-      overlay.remove();
-      previouslyFocused?.focus?.();
-      resolve(v);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); finish(false); }
-      else if (e.key === "Enter") { e.preventDefault(); finish(false); }
-    };
-    cancelBtn.addEventListener("click", () => finish(false));
-    dangerBtn.addEventListener("click", () => finish(true));
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) finish(false);
-    });
-    document.addEventListener("keydown", onKey, true);
-    btnRow.append(dangerBtn, cancelBtn);
-    dialog.append(msg, btnRow);
-    overlay.append(dialog);
-    document.body.append(overlay);
-    // Default focus on Cancel — destructive action requires a deliberate move.
-    cancelBtn.focus();
-  });
-}
-
-let toastTimer: number | null = null;
-interface ToastAction {
-  label: string;
-  run: () => void | Promise<void>;
-}
-function showToast(message: string, action?: ToastAction, ttlMs = 5000): void {
-  let toast = document.getElementById("toast") as HTMLDivElement | null;
-  if (!toast) {
-    toast = document.createElement("div");
-    toast.id = "toast";
-    document.body.appendChild(toast);
-  }
-  toast.innerHTML = "";
-  const msgEl = document.createElement("span");
-  msgEl.className = "toast-message";
-  msgEl.textContent = message;
-  toast.appendChild(msgEl);
-  if (action) {
-    const btn = document.createElement("button");
-    btn.className = "toast-action";
-    btn.textContent = action.label;
-    btn.addEventListener("click", async () => {
-      // Hide immediately on click so a slow restore doesn't leave the toast lingering.
-      toast?.classList.remove("visible");
-      if (toastTimer !== null) window.clearTimeout(toastTimer);
-      await action.run();
-    });
-    toast.appendChild(btn);
-  }
-  toast.classList.add("visible");
-  if (toastTimer !== null) window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => {
-    toast?.classList.remove("visible");
-  }, ttlMs);
-}
-
-function confirm3(
-  message: string,
-  a: string,
-  b: string,
-  cancel: string,
-): Promise<"a" | "b" | "cancel"> {
-  return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-
-    const dialog = document.createElement("div");
-    dialog.className = "modal-dialog";
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-
-    const msg = document.createElement("p");
-    msg.className = "modal-message";
-    msg.textContent = message;
-
-    const btnRow = document.createElement("div");
-    btnRow.className = "modal-buttons";
-
-    const aBtn = document.createElement("button");
-    aBtn.className = "modal-btn modal-btn-primary";
-    aBtn.textContent = a;
-    const bBtn = document.createElement("button");
-    bBtn.className = "modal-btn";
-    bBtn.textContent = b;
-    const cBtn = document.createElement("button");
-    cBtn.className = "modal-btn";
-    cBtn.textContent = cancel;
-
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    const finish = (choice: "a" | "b" | "cancel") => {
-      document.removeEventListener("keydown", onKey, true);
-      overlay.remove();
-      previouslyFocused?.focus?.();
-      resolve(choice);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); finish("cancel"); }
-      else if (e.key === "Enter") { e.preventDefault(); finish("a"); }
-      else if (e.key === "1") { e.preventDefault(); finish("a"); }
-      else if (e.key === "2") { e.preventDefault(); finish("b"); }
-    };
-
-    aBtn.addEventListener("click", () => finish("a"));
-    bBtn.addEventListener("click", () => finish("b"));
-    cBtn.addEventListener("click", () => finish("cancel"));
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) finish("cancel");
-    });
-    document.addEventListener("keydown", onKey, true);
-
-    btnRow.append(cBtn, bBtn, aBtn);
-    dialog.append(msg, btnRow);
-    overlay.append(dialog);
-    document.body.append(overlay);
-    aBtn.focus();
-  });
-}
+// New-note button, tree-actions menu (Refresh / Reindex / Sort by),
+// inline rename, attachContextMenu, deleteFromTree, countNotesIn,
+// sortOrderLabel, openSortByMenu — all moved to ./tree.
 
 const win = getCurrentWindow();
-// status: window-close-guard-dirty
+
+// Custom window controls (decorations: false in tauri.conf.json — the
+// top strip is the title bar, so we provide our own min/max/close +
+// drag-to-move). Tauri 2's `data-tauri-drag-region` attribute only
+// matches the exact event target, which makes clicks on inner
+// containers (vault-path span, leading-cluster wrapper, empty tab-strip
+// space) fall through and not initiate a drag. A mousedown listener on
+// the whole strip that excludes interactive descendants gives us the
+// behavior the OS title bar used to: drag to move, double-click to
+// maximize, click on a button to do its action.
+const topStripEl = document.getElementById("top-strip");
+function isInteractiveTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof Element)) return false;
+  return !!t.closest(
+    "button, input, textarea, a, [role='tab'], [role='button']",
+  );
+}
+topStripEl?.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (isInteractiveTarget(e.target)) return;
+  e.preventDefault();
+  void win.startDragging();
+});
+topStripEl?.addEventListener("dblclick", (e) => {
+  if (isInteractiveTarget(e.target)) return;
+  void win.toggleMaximize();
+});
+document.getElementById("win-min")?.addEventListener("click", () => {
+  void win.minimize();
+});
+document.getElementById("win-max")?.addEventListener("click", () => {
+  void win.toggleMaximize();
+});
+document.getElementById("win-close")?.addEventListener("click", () => {
+  // Routes through the same `onCloseRequested` handler below so the
+  // multi-buffer-window-close-guard fires.
+  void win.close();
+});
+// status: window-close-guard-dirty, multi-buffer-window-close-guard
 // Always preventDefault and drive the close ourselves via `win.destroy()`.
-// Returning without preventDefault to "let Tauri close" was unreliable in
-// practice (the X button became a no-op), and `win.close()` would re-enter
-// this handler — `destroy()` skips the close-requested round-trip and
-// terminates the window directly.
+// Returning without preventDefault to "let Tauri default-close" is
+// unreliable (X button becomes a no-op), and `win.close()` would re-enter
+// this handler — `destroy()` skips the close-requested round-trip.
+//
+// Multi-buffer-aware: enumerate every dirty tab; if any are dirty, show
+// the multi-buffer modal listing each path with per-tab Save / Discard
+// radios plus Save All / Discard All / Cancel.
 void win.onCloseRequested(async (event) => {
   event.preventDefault();
-  if (buffer && isDirty()) {
-    const choice = await confirm3(
-      `${buffer.path} has unsaved changes.`,
-      "Save & close",
-      "Discard & close",
-      "Cancel",
-    );
-    if (choice === "cancel") return;
-    if (choice === "a") {
-      const ok = await save();
-      if (!ok) return;
+  // Persist the active tab's edits into its buffer's loadedText so the
+  // dirty enumeration sees consistent state for it.
+  const dirtyPaths: string[] = [];
+  for (const [p, entry] of openBuffers) {
+    let dirty: boolean;
+    if (p === activePath && buffer?.mode.kind === "file") {
+      dirty = isDirty();
+    } else if (entry.savedState) {
+      dirty = entry.savedState.doc.toString() !== entry.buffer.loadedText;
+    } else {
+      dirty = false;
     }
+    if (dirty) dirtyPaths.push(p);
   }
+  if (dirtyPaths.length > 0) {
+    const choice = await confirmWindowClose(dirtyPaths);
+    if (choice.kind === "cancel") return;
+    // Save-helper: switches to each path then runs save() so drift
+    // checks fire against the right buffer's hash.
+    const saveOne = async (p: string): Promise<boolean> => {
+      if (activePath !== p || buffer?.mode.kind !== "file") {
+        activateTabInner(p);
+      }
+      return await save();
+    };
+    if (choice.kind === "save-all") {
+      for (const p of dirtyPaths) {
+        const ok = await saveOne(p);
+        if (!ok) return; // user cancelled a drift modal — abort close
+      }
+    } else if (choice.kind === "per-tab") {
+      for (const p of dirtyPaths) {
+        if (choice.choices[p] === "save") {
+          const ok = await saveOne(p);
+          if (!ok) return;
+        }
+        // discard → no-op; we're about to destroy the window anyway
+      }
+    }
+    // discard-all: nothing to do; fall through.
+  }
+  openBuffers.clear();
+  previewTabPath = null;
   buffer = null;
+  activePath = null;
   await win.destroy();
 });
 
@@ -1740,768 +1670,597 @@ statusPathEl.addEventListener("click", async () => {
 });
 
 // ---------- vault home view ----------
+// Vault-home (overview tiles + recent-activity detail) lives in `./vaultHome`.
+// `vaultHome` is defined below, after `settingsPane` (the home/settings
+// mutual-exclusion uses `settingsPane.isVisible()` in `onBeforeShow`).
+// Forward refs from earlier mounts (e.g. `snapshotPreview.onClose`) reach
+// `vaultHome` via closures resolved at call time, after init completes.
 
-// status: vault-home-button
-// Icon-only home button in the vault bar that toggles the editor pane to a
-// vault-home view. View toggle, not buffer close — the active buffer stays
-// in memory; opening any note (tree click, search hit, etc.) restores the
-// editor onto whichever note via `setVaultHomeVisible(false)` below.
-//
-// Reserved keybind id: `vault.go-home` (chord TBD per editor.md). Not
-// registered in `keybind-registry` until the chord is decided, matching the
-// "reserved IDs not registered as no-ops in v0" convention in editor.md.
-function isVaultHomeVisible(): boolean {
-  return editorPaneEl.classList.contains("home-view");
-}
-function setVaultHomeVisible(on: boolean): void {
-  editorPaneEl.classList.toggle("home-view", on);
-  vaultHomeEl.hidden = !on;
-  homeBtn.classList.toggle("active", on);
-  if (on) void refreshVaultHome();
-}
-homeBtn.addEventListener("click", () => {
-  setVaultHomeVisible(!isVaultHomeVisible());
-});
-
-// status: vault-home-screen
-// Three stacked widgets: stats / recently modified / recently accessed.
-// Refreshes are coalesced via tiny debounce timers so a flurry of
-// hiker:reindex-progress events doesn't fire one Tauri call per event.
-const vaultHomeTitleEl = document.getElementById("vault-home-title")!;
-const vaultHomeStatsBodyEl = document.getElementById("vault-home-stats-body")!;
-const vaultHomeModifiedListEl = document.getElementById("vault-home-modified-list")!;
-const vaultHomeAccessedListEl = document.getElementById("vault-home-accessed-list")!;
-const vaultHomeNewNoteBtn = document.getElementById("vault-home-new-note") as HTMLButtonElement;
-
-interface VaultHomeStats {
-  total_notes: number;
-  total_chunks: number;
-  indexed: number;
-  skipped: number;
-  queued: number;
-}
-interface RecentNote {
-  path: string;
-  title: string;
-  mtime: number;
-  last_accessed_at: number | null;
-}
-
-async function refreshVaultHome(): Promise<void> {
-  if (!vaultIsOpen) return;
-  vaultHomeTitleEl.textContent = vaultPathEl.textContent || "Vault";
-  // status: vault-home-detail-views — the Home button always returns to
-  // the overview; clicking the home button while in a detail view exits
-  // detail mode rather than re-rendering it.
-  showHomeOverview();
-  await Promise.all([
-    refreshVaultHomeStats(),
-    refreshVaultHomeRecentModified(),
-    refreshVaultHomeRecentAccessed(),
-    refreshActivityWidget(),
-  ]);
-}
-
-async function refreshVaultHomeStats(): Promise<void> {
-  try {
-    const stats = await invoke<VaultHomeStats>("vault_home_stats");
-    renderVaultHomeStats(stats);
-  } catch (err) {
-    console.error("vault_home_stats failed:", err);
-    vaultHomeStatsBodyEl.replaceChildren(
-      buildStatEmpty(`Failed to load stats: ${formatError(err)}`),
-    );
-  }
-}
-
-function renderVaultHomeStats(stats: VaultHomeStats): void {
-  const cells: Array<[string, number]> = [
-    ["Notes", stats.total_notes],
-    ["Indexed", stats.indexed],
-    ["Chunks", stats.total_chunks],
-    ["Queued", stats.queued],
-    ["Skipped", stats.skipped],
-  ];
-  vaultHomeStatsBodyEl.replaceChildren(
-    ...cells.map(([label, num]) => {
-      const cell = document.createElement("div");
-      cell.className = "vault-home-stat";
-      const numEl = document.createElement("div");
-      numEl.className = "num";
-      numEl.textContent = String(num);
-      const lbl = document.createElement("div");
-      lbl.className = "label";
-      lbl.textContent = label;
-      cell.append(numEl, lbl);
-      return cell;
-    }),
-  );
-}
-
-function buildStatEmpty(text: string): HTMLElement {
-  const el = document.createElement("div");
-  el.className = "vault-home-stat-empty";
-  el.textContent = text;
-  return el;
-}
-
-async function refreshVaultHomeRecentModified(): Promise<void> {
-  try {
-    const rows = await invoke<RecentNote[]>("recent_notes_modified", { limit: 10 });
-    renderRecentList(vaultHomeModifiedListEl, rows, "mtime", "No notes indexed yet.");
-  } catch (err) {
-    console.error("recent_notes_modified failed:", err);
-    renderRecentList(vaultHomeModifiedListEl, [], "mtime", `Error: ${formatError(err)}`);
-  }
-}
-
-async function refreshVaultHomeRecentAccessed(): Promise<void> {
-  try {
-    const rows = await invoke<RecentNote[]>("recent_notes_accessed", { limit: 10 });
-    renderRecentList(
-      vaultHomeAccessedListEl,
-      rows,
-      "accessed",
-      "No recently opened notes.",
-    );
-  } catch (err) {
-    console.error("recent_notes_accessed failed:", err);
-    renderRecentList(vaultHomeAccessedListEl, [], "accessed", `Error: ${formatError(err)}`);
-  }
-}
-
-function renderRecentList(
-  ul: HTMLElement,
-  rows: RecentNote[],
-  field: "mtime" | "accessed",
-  emptyText: string,
-): void {
-  if (rows.length === 0) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = emptyText;
-    ul.replaceChildren(li);
-    return;
-  }
-  ul.replaceChildren(
-    ...rows.map((r) => {
-      const li = document.createElement("li");
-      li.dataset.path = r.path;
-      const ts = field === "mtime" ? r.mtime : (r.last_accessed_at ?? r.mtime);
-      const when = relativeTime(ts);
-      const nameEl = document.createElement("span");
-      nameEl.className = "name";
-      nameEl.textContent = r.title;
-      const relEl = document.createElement("span");
-      relEl.className = "rel";
-      const parent = r.path.includes("/") ? r.path.slice(0, r.path.lastIndexOf("/")) : "";
-      relEl.textContent = parent;
-      const whenEl = document.createElement("span");
-      whenEl.className = "when";
-      whenEl.textContent = when;
-      whenEl.title = new Date(ts * 1000).toLocaleString();
-      li.append(nameEl, relEl, whenEl);
-      li.addEventListener("click", () => void openFile(r.path));
-      ul.appendChild(li);
-      return li;
-    }),
-  );
-}
-
-let vaultHomeStatsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleVaultHomeStatsRefresh(delay = 250): void {
-  if (!isVaultHomeVisible()) return;
-  if (vaultHomeStatsRefreshTimer !== null) clearTimeout(vaultHomeStatsRefreshTimer);
-  vaultHomeStatsRefreshTimer = setTimeout(() => {
-    vaultHomeStatsRefreshTimer = null;
-    void refreshVaultHomeStats();
-  }, delay);
-}
-
-let vaultHomeModifiedRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleVaultHomeModifiedRefresh(delay = 400): void {
-  if (!isVaultHomeVisible()) return;
-  if (vaultHomeModifiedRefreshTimer !== null) clearTimeout(vaultHomeModifiedRefreshTimer);
-  vaultHomeModifiedRefreshTimer = setTimeout(() => {
-    vaultHomeModifiedRefreshTimer = null;
-    void refreshVaultHomeRecentModified();
-  }, delay);
-}
-
-// status: vault-home-recent-activity-widget
-// status: vault-home-recent-activity-detail
-// status: vault-home-recent-activity-author-filter
-// status: vault-home-recent-activity-unrollback
-//
-// Append-only changelog UI: a fourth home-page widget that shows the most
-// recent vault writes (user saves; eventually agent writes via MCP). The
-// widget is hidden when the changelog is empty so a fresh post-upgrade
-// vault doesn't render a confusing zero-count tile. Click the header or
-// any preview row → detail view (overview-body swap; Home button returns).
-//
-// Rollback flow per docs/changes.md "Rollback":
-//   1. resolve prior_content via Tauri `previous_content_for_path`
-//   2. write it back via `rollback_change`, which appends a new modified
-//      row stamped with metadata.rolled_back_from = <id>
-//   3. UI re-fetches `recent_changes` on the next event.
-//
-// Un-rollback is the same primitive — just a rollback to a more recent
-// prior state — so the affordance is "click rollback on a newer row." We
-// add a one-click shortcut: immediately after a rollback, the detail view
-// shows a small "Recently rolled back — restore?" prompt next to the row
-// whose state was reverted away from. Clicking it rolls back to that row.
-type ChangeOp = "created" | "modified" | "deleted" | "renamed";
-interface ChangeRow {
-  id: number;
-  timestamp_ms: number;
-  path: string;
-  op: ChangeOp;
-  author: string;
-  content_hash: string | null;
-  rename_from: string | null;
-  metadata: Record<string, unknown>;
-}
-interface RollbackOutcome {
-  prior_change_id: number;
-  path: string;
-  new_hash: string;
-}
-
-const vaultHomeOverviewEl = document.getElementById("vault-home-overview")!;
-const vaultHomeDetailEl = document.getElementById("vault-home-detail")!;
-const vaultHomeDetailTitleEl = document.getElementById("vault-home-detail-title")!;
-const vaultHomeDetailCountEl = document.getElementById("vault-home-detail-count")!;
-const vaultHomeDetailListEl = document.getElementById("vault-home-detail-list")!;
-const vaultHomeDetailFiltersEl = document.getElementById("vault-home-detail-filters")!;
-const vaultHomeActivitySectionEl = document.getElementById("vault-home-activity")!;
-const vaultHomeActivityHeaderEl = document.getElementById("vault-home-activity-header")!;
-const vaultHomeActivityListEl = document.getElementById("vault-home-activity-list")!;
-
-type DetailView = null | { kind: "recent-activity" };
-let activeDetailView: DetailView = null;
-
-// Persisted per session, not per-vault — spec says detail-view filter
-// state persists per-vault but a session lifetime is fine for v1; the
-// settings key isn't yet plumbed and the widget itself is fresh.
-const activeAuthorFilters: Set<string> = new Set();
-let allFiltersOnce = false;
-
-// After a Restore, the row that was the *current* state for the path
-// immediately before the action gets a soft highlight + "← previous
-// state" caption so the user can one-click their way back. The behavior
-// is the same Restore button as anywhere else — no separate primitive.
-// Cleared on next refresh so it doesn't haunt subsequent visits.
-let recentlyRestoredFromId: number | null = null;
-
-function showHomeOverview(): void {
-  activeDetailView = null;
-  vaultHomeOverviewEl.hidden = false;
-  vaultHomeDetailEl.hidden = true;
-}
-
-function showHomeDetail(kind: "recent-activity"): void {
-  activeDetailView = { kind };
-  vaultHomeOverviewEl.hidden = true;
-  vaultHomeDetailEl.hidden = false;
-  if (kind === "recent-activity") {
-    vaultHomeDetailTitleEl.textContent = "Recent activity";
-    void refreshActivityDetail();
-  }
-}
-
-function opLabel(op: ChangeOp): string {
-  return op;
-}
-
-function authorClass(author: string): string {
-  // "user" → "user"; "agent:claude-code" → "agent"; etc. The class prefix
-  // is the load-bearing distinguishing feature per changes.md.
-  const colon = author.indexOf(":");
-  return colon === -1 ? author : author.slice(0, colon);
-}
-
-function authorPillIcon(cls: string): string {
-  // status: recent-activity-human-icon, recent-activity-agent-icon
-  if (cls === "user") {
-    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="2.4"/><path d="M3.5 13.5c0-2.4 2-4 4.5-4s4.5 1.6 4.5 4"/></svg>`;
-  }
-  if (cls === "agent") {
-    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="8" cy="3" r="0.6" fill="currentColor"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/><line x1="6" y1="11.5" x2="10" y2="11.5"/></svg>`;
-  }
-  // Future: sync, import. Placeholder dot.
-  return `<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/></svg>`;
-}
-
-async function refreshActivityWidget(): Promise<void> {
-  if (!vaultIsOpen) return;
-  if (!isVaultHomeVisible()) return;
-  let count = 0;
-  try {
-    count = await invoke<number>("changes_count");
-  } catch (err) {
-    console.error("changes_count failed:", err);
-  }
-  if (count <= 0) {
-    vaultHomeActivitySectionEl.hidden = true;
-    return;
-  }
-  vaultHomeActivitySectionEl.hidden = false;
-  vaultHomeActivityHeaderEl.textContent = `Recent activity (${count})`;
-  // Tile: top 5 rows. Click anywhere → detail view.
-  let rows: ChangeRow[] = [];
-  try {
-    rows = await invoke<ChangeRow[]>("recent_changes", { limit: 5 });
-  } catch (err) {
-    console.error("recent_changes failed:", err);
-  }
-  vaultHomeActivityListEl.replaceChildren(
-    ...rows.map((r) => buildActivityPreviewRow(r)),
-  );
-  vaultHomeActivityHeaderEl.style.cursor = "pointer";
-  vaultHomeActivityHeaderEl.onclick = () => showHomeDetail("recent-activity");
-}
-
-function buildActivityPreviewRow(r: ChangeRow): HTMLElement {
-  const li = document.createElement("li");
-  const op = document.createElement("span");
-  op.className = "activity-op";
-  op.textContent = opLabel(r.op);
-  const name = document.createElement("span");
-  name.className = "name";
-  name.textContent = r.path.split("/").pop() ?? r.path;
-  const rel = document.createElement("span");
-  rel.className = "rel";
-  rel.textContent = r.path.includes("/")
-    ? r.path.slice(0, r.path.lastIndexOf("/"))
-    : "";
-  // Right-pinned cluster mirrors the detail row: [when] [author-icon]
-  // [#id]. The `.rel` element fills the space between, pushing the
-  // cluster to the right edge.
-  const right = document.createElement("span");
-  right.className = "row-right";
-  const when = document.createElement("span");
-  when.className = "when";
-  when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
-  when.title = new Date(r.timestamp_ms).toLocaleString();
-  const cls = authorClass(r.author);
-  const author = document.createElement("span");
-  author.className = "activity-author";
-  author.innerHTML = authorPillIcon(cls);
-  author.title = r.author;
-  const idEl = document.createElement("span");
-  idEl.className = "activity-id";
-  idEl.textContent = `#${r.id}`;
-  idEl.title = `Snapshot id ${r.id}`;
-  right.append(when, author, idEl);
-
-  // Order: [op] [name] [badge?] [rel-grows] [right-cluster]. Badge sits
-  // before .rel so it rides with the name on the left, matching the
-  // detail-view layout; .rel's flex:1 then absorbs the slack and pushes
-  // the right cluster to the row edge.
-  li.append(op, name);
-  const meta = r.metadata as Record<string, unknown>;
-  const src = (meta?.["restored_from"] ?? meta?.["rolled_back_from"]) as
-    | number
-    | undefined;
-  if (src !== undefined) {
-    const badge = document.createElement("span");
-    badge.className = "rollback-badge";
-    badge.textContent = `↩ #${src}`;
-    badge.title = `This save was a Restore of snapshot #${src}`;
-    li.appendChild(badge);
-  }
-  li.append(rel, right);
-  li.addEventListener("click", () => showHomeDetail("recent-activity"));
-  return li;
-}
-
-let activityRows: ChangeRow[] = [];
-async function refreshActivityDetail(): Promise<void> {
-  try {
-    activityRows = await invoke<ChangeRow[]>("recent_changes", { limit: 200 });
-  } catch (err) {
-    console.error("recent_changes failed:", err);
-    activityRows = [];
-  }
-  renderActivityDetail();
-}
-
-function renderActivityDetail(): void {
-  // Build the set of present author classes from the loaded rows.
-  const presentClasses = new Set<string>();
-  for (const r of activityRows) presentClasses.add(authorClass(r.author));
-
-  // Canonical classes that always get a pill, even when no rows of that
-  // class exist in the visible window. Predictable affordances beat
-  // surprise pills appearing as agents start writing — users can reason
-  // about "where would the agent filter be" before it ever has rows.
-  // Other classes (sync, import) appear dynamically once they have rows.
-  const ALWAYS_SHOW: readonly string[] = ["user", "agent"];
-  const allClasses = new Set<string>([...ALWAYS_SHOW, ...presentClasses]);
-
-  // First render: seed the active-filters set with every visible class so
-  // the default is "all on." Subsequent renders preserve user toggle
-  // state — including the all-off state.
-  if (!allFiltersOnce) {
-    activeAuthorFilters.clear();
-    for (const c of allClasses) activeAuthorFilters.add(c);
-    allFiltersOnce = true;
-  }
-
-  // status: vault-home-recent-activity-author-filter
-  vaultHomeDetailFiltersEl.replaceChildren();
-  const sortedClasses = [...allClasses].sort();
-  for (const cls of sortedClasses) {
-    const pill = document.createElement("button");
-    pill.className = "filter-pill toolbar-btn";
-    pill.type = "button";
-    if (activeAuthorFilters.has(cls)) pill.classList.add("active");
-    const hasRows = presentClasses.has(cls);
-    if (!hasRows) pill.classList.add("empty");
-    pill.innerHTML = authorPillIcon(cls);
-    const lbl = document.createElement("span");
-    lbl.textContent = cls.toUpperCase();
-    pill.appendChild(lbl);
-    pill.title = hasRows
-      ? `Show ${cls} activity`
-      : `No ${cls} activity in the recent window yet`;
-    pill.addEventListener("click", () => {
-      if (activeAuthorFilters.has(cls)) {
-        activeAuthorFilters.delete(cls);
-      } else {
-        activeAuthorFilters.add(cls);
-      }
-      renderActivityDetail();
-    });
-    vaultHomeDetailFiltersEl.appendChild(pill);
-  }
-
-  const visible = activityRows.filter((r) =>
-    activeAuthorFilters.has(authorClass(r.author)),
-  );
-  vaultHomeDetailCountEl.textContent = `${visible.length} of ${activityRows.length}`;
-
-  // Pre-compute per-path latest so each row build doesn't rescan.
-  latestPerPath = buildLatestPerPath(activityRows);
-
-  vaultHomeDetailListEl.replaceChildren(
-    ...visible.map((r) => buildActivityDetailRow(r)),
-  );
-}
-
-// Compute "is this row the current state on disk for its path?" The most
-// recent (highest id) row per path is the current state. Pre-computed once
-// per render so per-row builders don't each scan `activityRows`.
-function buildLatestPerPath(rows: ChangeRow[]): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const r of rows) {
-    const cur = out.get(r.path);
-    if (cur === undefined || r.id > cur) out.set(r.path, r.id);
-  }
-  return out;
-}
-
-let latestPerPath: Map<string, number> = new Map();
-
-function buildActivityDetailRow(r: ChangeRow): HTMLElement {
-  const li = document.createElement("li");
-  const isRestoreRow =
-    r.metadata && typeof r.metadata === "object" &&
-    ("restored_from" in r.metadata || "rolled_back_from" in r.metadata);
-  const isCurrent = latestPerPath.get(r.path) === r.id;
-  // status: vault-home-recent-activity-unrollback
-  // After a Restore, the row that *was* the current state immediately
-  // before the action gets a soft highlight + caption so the user can
-  // one-click their way back. The behavior is the same Restore button as
-  // anywhere else — no separate primitive — so this is purely a hint.
-  if (recentlyRestoredFromId === r.id) {
-    li.classList.add("recently-rolled-back");
-  }
-
-  // Click anywhere on the row → open the snapshot read-only in the editor.
-  // The deleted-row case has no content blob, so click is a no-op there
-  // (we still show the row so the history reads honestly).
-  const canPreview = r.op !== "deleted";
-  if (canPreview) {
-    li.classList.add("clickable");
-    li.style.cursor = "pointer";
-    li.addEventListener("click", (e) => {
-      // Don't hijack clicks on the action buttons.
-      if ((e.target as HTMLElement).closest("button")) return;
-      void openSnapshotPreview(r);
-    });
-  }
-
-  const line = document.createElement("div");
-  line.className = "row-line";
-
-  const op = document.createElement("span");
-  op.className = "activity-op";
-  op.textContent = opLabel(r.op);
-
-  const name = document.createElement("span");
-  name.className = "name";
-  name.textContent = r.path;
-  if (r.rename_from) name.title = `renamed from ${r.rename_from}`;
-
-  // Right-pinned cluster: [when] [author-icon] [#id]. Wrapped in a single
-  // span with margin-left:auto so the layout stays stable regardless of
-  // how long the path is.
-  const right = document.createElement("span");
-  right.className = "row-right";
-
-  const when = document.createElement("span");
-  when.className = "when";
-  when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
-  when.title = new Date(r.timestamp_ms).toLocaleString();
-
-  const cls = authorClass(r.author);
-  const author = document.createElement("span");
-  author.className = "activity-author";
-  author.innerHTML = authorPillIcon(cls);
-  author.title = r.author; // full author string on hover (e.g. agent:claude-code)
-
-  const idEl = document.createElement("span");
-  idEl.className = "activity-id";
-  idEl.textContent = `#${r.id}`;
-  idEl.title = `Snapshot id ${r.id}`;
-
-  // Badges sit between the name and the right-pinned cluster so they
-  // ride with the name's left-aligned content rather than displacing the
-  // right meta.
-  line.append(op, name);
-  if (isRestoreRow) {
-    const meta = r.metadata as Record<string, unknown>;
-    const src = (meta["restored_from"] ?? meta["rolled_back_from"]) as
-      | number
-      | undefined;
-    const badge = document.createElement("span");
-    badge.className = "rollback-badge";
-    badge.textContent =
-      src !== undefined ? `↩ restored from #${src}` : "↩ restored";
-    badge.title =
-      src !== undefined
-        ? `This save wrote the content of snapshot #${src} back to disk`
-        : "This save was a Restore";
-    line.appendChild(badge);
-  }
-  if (isCurrent) {
-    const cur = document.createElement("span");
-    cur.className = "rollback-badge";
-    cur.textContent = "current";
-    cur.title = "This is the file's current state on disk";
-    line.appendChild(cur);
-  }
-  right.append(when, author, idEl);
-  line.append(right);
-  li.appendChild(line);
-
-  // Actions row. One primary button: Restore — writes THIS row's content
-  // back to disk. Restoring the current state is a no-op (writes the same
-  // bytes back and logs a new row), so we hide the button there.
-  if (canPreview && !isCurrent) {
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-
-    const restoreBtn = document.createElement("button");
-    restoreBtn.className = "row-action";
-    restoreBtn.textContent = "Restore this version";
-    restoreBtn.title =
-      "Write this snapshot's contents back to the file. Append-only — the restore is itself logged as a new modified event.";
-    restoreBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void doRestoreSnapshot(r);
-    });
-    actions.appendChild(restoreBtn);
-
-    if (recentlyRestoredFromId === r.id) {
-      const prompt = document.createElement("span");
-      prompt.className = "un-rollback-prompt";
-      prompt.textContent = "← previous state — click Restore to undo";
-      actions.appendChild(prompt);
-    }
-
-    li.appendChild(actions);
-  }
-  return li;
-}
-
-async function doRestoreSnapshot(row: ChangeRow): Promise<void> {
-  if (
-    !confirm(
-      `Restore ${row.path} to the version saved at ${new Date(
-        row.timestamp_ms,
-      ).toLocaleString()}?\n\nThe current state stays in the log; this Restore is itself a new logged event.`,
-    )
-  ) {
-    return;
-  }
-  // Capture the row that *was* the current state for this path, before the
-  // restore writes a new one. After refresh, that row gets the "previous
-  // state" highlight so the user can one-click back.
-  const wasCurrentId = latestPerPath.get(row.path) ?? null;
-  try {
-    await invoke<RollbackOutcome>("restore_snapshot", { changeId: row.id });
-    recentlyRestoredFromId = wasCurrentId;
-    await refreshActivityDetail();
-  } catch (err) {
-    alert(`restore failed: ${formatError(err)}`);
-  }
-}
-
-// Open `row` as a read-only preview in the editor. Reuses the trash-preview
-// machinery — same readOnlyCompartment, dirty-switch guard, banner pattern,
-// just different banner element + content. Restore from the banner writes
-// the snapshot back via the same path as per-row Restore.
-async function openSnapshotPreview(row: ChangeRow): Promise<void> {
-  if (buffer && isDirty()) {
+// status: settings-pane-mode
+// status: vault-bar-settings-icon
+// Settings pane sub-mode of the editor pane. Mutually exclusive with the
+// vault-home view; opening either drops the other. Dirty-buffer guard is
+// the same `confirm3` modal `openFile` uses (file-switch-guard-dirty).
+const settingsPane: SettingsPaneApi = mountSettingsPane({
+  paneEl: settingsPaneEl,
+  editorPaneEl,
+  settingsBtn,
+  vaultPathEl,
+  guardDirtyBuffer: async () => {
+    if (!buffer || !isDirty()) return true;
     const choice = await confirm3(
       `${buffer.path} has unsaved changes.`,
       "Save & switch",
       "Discard & switch",
       "Cancel",
     );
-    if (choice === "cancel") return;
-    if (choice === "a") {
-      const ok = await save();
-      if (!ok) return;
-    }
-  }
-  let contents: string | null = null;
-  try {
-    contents = await invoke<string | null>("change_content", {
-      changeId: row.id,
-    });
-  } catch (err) {
-    alert(`snapshot preview failed: ${formatError(err)}`);
-    return;
-  }
-  if (contents === null) {
-    alert(
-      "This change has no recorded content (delete events carry no body — preview the prior version to see what was deleted).",
-    );
-    return;
-  }
-  buffer = null;
-  view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: contents },
-    effects: [
-      language.reconfigure(languageExtensionForPath(row.path)),
-      livePreviewCompartment.reconfigure(livePreviewExtensionForPath(row.path)),
-    ],
-  });
-  setReadOnly(true, "snapshot");
-  if (isVaultHomeVisible()) setVaultHomeVisible(false);
-  buffer = {
-    path: row.path,
-    loadedText: view.state.doc.toString(),
-    loadedHash: row.content_hash ?? "",
-    snapshotPreview: true,
-    snapshotChangeId: row.id,
-  };
-  // Banner copy: when, who, what, id.
-  const when = new Date(row.timestamp_ms).toLocaleString();
-  snapshotBannerTextEl.replaceChildren();
-  const main = document.createElement("span");
-  main.textContent = `Snapshot of ${row.path} · ${when} · ${row.author} · ${row.op}`;
-  const idSpan = document.createElement("span");
-  idSpan.className = "activity-id";
-  idSpan.style.marginLeft = "8px";
-  idSpan.textContent = `#${row.id}`;
-  idSpan.title = `Snapshot id ${row.id}`;
-  snapshotBannerTextEl.append(main, idSpan);
-  updateStatus();
-  refreshChunkBoundaries();
-}
-
-function exitSnapshotPreview(): void {
-  if (!buffer?.snapshotPreview) return;
-  buffer = null;
-  view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: "" },
-  });
-  setReadOnly(false, null);
-  // Return to the activity detail view if it's where the user came from;
-  // otherwise fall back to the home overview.
-  setVaultHomeVisible(true);
-  if (activeDetailView?.kind !== "recent-activity") {
-    showHomeDetail("recent-activity");
-  }
-  updateStatus();
-}
-
-snapshotBannerCloseBtn.addEventListener("click", () => exitSnapshotPreview());
-snapshotBannerRestoreBtn.addEventListener("click", async () => {
-  if (!buffer?.snapshotPreview || buffer.snapshotChangeId === undefined) return;
-  const row = activityRows.find((r) => r.id === buffer?.snapshotChangeId);
-  if (!row) {
-    alert("Snapshot row no longer in view — refresh and try again.");
-    return;
-  }
-  await doRestoreSnapshot(row);
-  // After a successful restore, return to the detail view so the user
-  // sees the new "current" row + the highlighted "previous state" hint.
-  exitSnapshotPreview();
+    if (choice === "cancel") return false;
+    if (choice === "a") return await save();
+    return true;
+  },
+  onEnter: () => {
+    // Drop home view; the editor's CM6 view is hidden by the
+    // `settings-view` CSS class, so no explicit teardown is needed.
+    if (vaultHome.isVisible()) vaultHome.setVisible(false);
+  },
+  onSettingApplied: (cfg) => {
+    // Mirror the seeding `applyOpenedVault` does on first vault open so
+    // every UI surface that reads from settings stays in sync after a
+    // pane-driven flip — same way the View menu's persistSetting calls
+    // already do for their specific keys.
+    applySettingsToUi(cfg);
+  },
 });
 
-// Live refresh on every changelog append. Light debounce so a save burst
-// → one repaint of the widget. Spec: "few hundred ms" debounce.
-let activityRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleActivityRefresh(delay = 300): void {
-  if (!isVaultHomeVisible()) return;
-  if (activityRefreshTimer !== null) clearTimeout(activityRefreshTimer);
-  activityRefreshTimer = setTimeout(() => {
-    activityRefreshTimer = null;
-    void refreshActivityWidget();
-    if (activeDetailView?.kind === "recent-activity") {
-      void refreshActivityDetail();
+settingsBtn.addEventListener("click", () => {
+  void settingsPane.toggle();
+});
+
+// status: settings-pane-keybind
+// `settings.open` chord: `Mod-,` (Cmd-, on macOS, Ctrl-, elsewhere). Same
+// dual-half shape as `search-keybind-ctrl-space` — registered in CM6 so it
+// wins inside the editor, plus a window-level handler for everywhere else.
+register({
+  id: "settings.open",
+  keys: "Mod-,",
+  label: "Open settings",
+  run: () => {
+    void settingsPane.toggle();
+    return true;
+  },
+});
+
+window.addEventListener(
+  "keydown",
+  (e) => {
+    // Match Mod-,: meta on macOS, ctrl elsewhere. Skip when the editor has
+    // focus (the registry-side binding handles that case) so we don't
+    // double-toggle.
+    if (e.key !== "," || e.altKey || e.shiftKey) return;
+    const isMac = navigator.platform.toLowerCase().includes("mac");
+    const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    if (!mod) return;
+    if ((e.target as HTMLElement | null)?.closest(".cm-editor")) return;
+    e.preventDefault();
+    void settingsPane.toggle();
+  },
+  { capture: true },
+);
+
+// status: vault-home-screen
+// Vault-home view (overview tiles + recent-activity detail) lives in
+// `./vaultHome`. This module owns activity rows, recently-restored
+// highlight, author filters, and the stats-refresh debounce. Snapshot
+// preview / note open route back here via callbacks so the module never
+// touches editor state directly.
+const vaultHome: VaultHomeApi = mountVaultHome({
+  editorPaneEl,
+  vaultHomeEl,
+  homeBtn,
+  vaultPathEl,
+  titleEl: document.getElementById("vault-home-title")!,
+  statsBodyEl: document.getElementById("vault-home-stats-body")!,
+  modifiedListEl: document.getElementById("vault-home-modified-list")!,
+  accessedListEl: document.getElementById("vault-home-accessed-list")!,
+  newNoteBtn: document.getElementById("vault-home-new-note") as HTMLButtonElement,
+  overviewEl: document.getElementById("vault-home-overview")!,
+  detailEl: document.getElementById("vault-home-detail")!,
+  detailTitleEl: document.getElementById("vault-home-detail-title")!,
+  detailCountEl: document.getElementById("vault-home-detail-count")!,
+  detailListEl: document.getElementById("vault-home-detail-list")!,
+  detailFiltersEl: document.getElementById("vault-home-detail-filters")!,
+  activitySectionEl: document.getElementById("vault-home-activity")!,
+  activityHeaderEl: document.getElementById("vault-home-activity-header")!,
+  activityListEl: document.getElementById("vault-home-activity-list")!,
+  formatError,
+  getVaultIsOpen: () => vaultIsOpen,
+  onOpenNote: (rel, opts) => openFile(rel, opts),
+  onOpenSnapshot: (row) => snapshotPreview.open(row),
+  onBeforeShow: () => {
+    if (settingsPane.isVisible()) void settingsPane.setVisible(false);
+    if (queueDetail.isVisible()) {
+      queueDetail.setVisible(false);
+      const ovEl = document.getElementById("vault-home-overview");
+      if (ovEl) ovEl.hidden = false;
     }
-  }, delay);
+  },
+});
+
+// status: task-queue-home-detail-view
+const queueDetail: QueueDetailApi = mountQueueDetail({
+  containerEl: document.getElementById("vault-home-queue-detail")!,
+});
+
+// status: navigation-history-stack
+// status: top-strip-back-button, top-strip-forward-button
+// status: navigation-trackpad-swipe, navigation-keybind
+// Per-vault back/forward stack across editor-pane content surfaces.
+// Mounted after the surfaces it observes (vault home / settings / queue
+// detail / snapshot preview / trash) so `inferCurrent()` and `apply()`
+// can read/drive them. Reset on vault swap; pruned on tab close + on
+// preview-slot replacement.
+const navBackBtn = document.getElementById("nav-back-btn") as HTMLButtonElement;
+const navForwardBtn = document.getElementById("nav-forward-btn") as HTMLButtonElement;
+
+function inferNavState(): NavState {
+  if (queueDetail.isVisible()) return { kind: "queue-detail" };
+  if (vaultHome.isVisible()) {
+    const d = vaultHome.activeDetailView();
+    if (d && d.kind === "recent-activity") {
+      return { kind: "home-detail", view: "recent-activity" };
+    }
+    return { kind: "home" };
+  }
+  if (settingsPane.isVisible()) return { kind: "settings" };
+  if (buffer && buffer.mode.kind === "trash") {
+    const trashedName = buffer.path.replace(/^\.hiker\/trash\//, "");
+    return { kind: "trash-preview", trashedName };
+  }
+  if (buffer && buffer.mode.kind === "snapshot") {
+    return {
+      kind: "snapshot-preview",
+      changeId: buffer.mode.changeId,
+      row: buffer.mode.row,
+    };
+  }
+  if (activePath !== null && buffer && buffer.mode.kind === "file") {
+    return { kind: "tab", path: activePath };
+  }
+  return { kind: "empty" };
 }
+
+async function applyNavState(s: NavState): Promise<boolean> {
+  switch (s.kind) {
+    case "tab": {
+      if (!openBuffers.has(s.path)) return false;
+      // If a preview / settings / home is currently up, activateTabInner
+      // already drops them via its own setVisible(false) calls.
+      activateTabInner(s.path);
+      return true;
+    }
+    case "home": {
+      vaultHome.setVisible(true);
+      return true;
+    }
+    case "home-detail": {
+      vaultHome.setVisible(true);
+      vaultHome.showDetail(s.view);
+      return true;
+    }
+    case "queue-detail": {
+      vaultHome.setVisible(true);
+      const ovEl = document.getElementById("vault-home-overview");
+      if (ovEl) ovEl.hidden = true;
+      queueDetail.setVisible(true);
+      queueDetail.setFilter("tasks");
+      return true;
+    }
+    case "settings": {
+      const ok = await settingsPane.setVisible(true);
+      // `setVisible` returns false when the dirty-buffer guard cancels
+      // the entry; treat it as "couldn't restore" so navigate() skips on.
+      return ok;
+    }
+    case "trash-preview": {
+      const item = trash.items().find((i) => i.trashed_name === s.trashedName);
+      if (!item) return false;
+      await trash.openPreview(item);
+      return true;
+    }
+    case "snapshot-preview": {
+      await snapshotPreview.open(s.row);
+      return true;
+    }
+    case "empty": {
+      // Nothing to do — closeTab's no-tabs-left branch already routes to
+      // the home view, so the empty state isn't actually re-enterable.
+      return false;
+    }
+  }
+}
+
+function paintNavButtons(): void {
+  navBackBtn.disabled = !nav!.canBack();
+  navForwardBtn.disabled = !nav!.canForward();
+}
+
+nav = mountNavigation({
+  inferCurrent: inferNavState,
+  apply: applyNavState,
+  onChange: paintNavButtons,
+});
+
+navBackBtn.addEventListener("click", () => {
+  void nav!.back();
+});
+navForwardBtn.addEventListener("click", () => {
+  void nav!.forward();
+});
+
+// status: navigation-history-stack
+// Snapshot preview replaces the singleton `buffer` without mutating any
+// observed DOM attribute, so the MutationObserver above can't detect the
+// transition. Wrap its openers to checkpoint after the buffer flip lands.
+// Trash gets the same treatment further down (after `trash` is mounted).
+// The wrappers also fire on back/forward apply, where the nav module's
+// `restoring` flag turns the checkpoint into a no-op.
+{
+  const _snapOpen = snapshotPreview.open;
+  snapshotPreview.open = async (row) => {
+    await _snapOpen.call(snapshotPreview, row);
+    checkpointNav();
+  };
+  const _snapClose = snapshotPreview.close;
+  snapshotPreview.close = () => {
+    _snapClose.call(snapshotPreview);
+    checkpointNav();
+  };
+}
+
+// status: navigation-trackpad-swipe
+// Two-finger horizontal trackpad swipe → back/forward. Right-swipe = back,
+// left-swipe = forward (browser convention). Threshold ~120px accumulated
+// `deltaX`. See `navigation/index.ts` for the wheel-event heuristic.
+installNavigationSwipe({
+  back: () => void nav!.back(),
+  forward: () => void nav!.forward(),
+});
+
+// status: navigation-history-stack
+// Observe DOM-driven content-surface flips (settings ↔ home ↔ queue-detail
+// ↔ home-detail) so the navigation stack records them without each
+// surface module having to call into nav directly. The `restoring` flag
+// inside the navigation module suppresses checkpoints during back/forward
+// apply, so this observer doesn't cause infinite recursion.
+{
+  const obs = new MutationObserver(() => checkpointNav());
+  obs.observe(editorPaneEl, { attributes: true, attributeFilter: ["class"] });
+  const homeOverviewEl = document.getElementById("vault-home-overview");
+  const homeDetailEl = document.getElementById("vault-home-detail");
+  const homeQueueDetailEl = document.getElementById("vault-home-queue-detail");
+  if (homeOverviewEl) {
+    obs.observe(homeOverviewEl, { attributes: true, attributeFilter: ["hidden"] });
+  }
+  if (homeDetailEl) {
+    obs.observe(homeDetailEl, { attributes: true, attributeFilter: ["hidden"] });
+  }
+  if (homeQueueDetailEl) {
+    obs.observe(homeQueueDetailEl, { attributes: true, attributeFilter: ["hidden"] });
+  }
+}
+
+// status: editor-diff-vs-disk-toggle
+// Dirty-buffer Diff toggle: per `diff.md`'s `editor-diff-vs-disk-toggle`,
+// `#mode-controls` shows a single Diff toggle for any dirty editable
+// buffer. Module owns selection/viewport save+restore, in-flight guard,
+// and the markdown-compartment reconfigure (per the "Markdown-rendering
+// coupling" rule in `diff.md`).
+dirtyBufferDiff = mountDirtyBufferDiff({
+  view,
+  getBuffer: () => buffer,
+  livePreviewCompartment,
+  hideFrontmatterCompartment,
+  livePreviewExtensionForPath,
+  getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
+  setReadOnly: (ro) => setReadOnly(ro),
+  renderModeControls: () => modeControls?.render(),
+  refreshChunkBoundaries,
+  formatError,
+});
+
+// status: note-mutations-menu
+const mutationsMenuBtn = document.getElementById(
+  "mutations-menu-btn",
+) as HTMLButtonElement;
+mutationsMenu = mountMutationsMenu(
+  {
+    buttonEl: mutationsMenuBtn,
+    getBuffer: () => buffer,
+    getActiveBufferText: () => {
+      if (!buffer || isReadOnlyBuffer(buffer)) return null;
+      return view.state.doc.toString();
+    },
+    formatError,
+  },
+  {
+    // status: note-mutation-buffer-ro-while-in-flight
+    onInFlightChanged: (path, inFlight) => {
+      if (inFlight) {
+        inFlightMutationPaths.add(path);
+        // status: editor-preview-tab-promotion
+        // Pin the source tab on submit so it can't be replaced by a
+        // preview-slot swap mid-flight (the result needs an open
+        // buffer to land on). Idempotent on already-sticky tabs.
+        promotePreviewByPath(path);
+      } else {
+        inFlightMutationPaths.delete(path);
+      }
+      // If the active buffer is the one whose in-flight state just
+      // changed, mirror it in the editor.
+      if (buffer && buffer.mode.kind === "file" && buffer.path === path) {
+        setReadOnly(inFlight);
+      }
+      modeControls?.render();
+    },
+  },
+);
+
+// status: note-mutation-applies-as-buffer-edit
+// Apply a mutation result to the open file-mode buffer at `path` as a
+// single CM6 transaction (one undo step). Works whether the target tab
+// is the *active* one (dispatch through the live `view`) or a
+// *background* tab (mutate the entry's saved CM6 state in place so the
+// new content is there when the user activates it). Drift-checked
+// against `expectedSourceHash`: if the buffer's `loadedHash` no longer
+// matches, drop silently — the user's edits during the mutation flight
+// trumped the LLM's output. Also stamps `pendingChangesMetadata` so
+// the next save tags the `'modified'` row with `metadata.mutation`.
+// Tab is left dirty (`loadedText` stays at pre-mutation), surfacing the
+// dirty marker in the strip + tree. If the buffer isn't open at all
+// (user closed the tab mid-flight), the result is dropped silently.
+function applyMutationToBuffer(
+  path: string,
+  content: string,
+  mutationKind: string,
+  expectedSourceHash: string,
+): void {
+  const entry = openBuffers.get(path);
+  if (!entry) return;
+  if (entry.buffer.loadedHash !== expectedSourceHash) {
+    // Drift: user edited during the in-flight window. Per spec the
+    // buffer is RO during the flight, so this branch is rare but
+    // possible (drift-from-disk via watcher, force-reload, etc.).
+    return;
+  }
+  entry.buffer.pendingChangesMetadata = { mutation: mutationKind };
+  const isActive = activePath === path && buffer?.path === path;
+  if (isActive) {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: content },
+    });
+    // Terminal queue event also clears RO via `onInFlightChanged`;
+    // clearing here is idempotent + defensive.
+    setReadOnly(false);
+    updateStatus();
+  } else if (entry.savedState) {
+    // Background tab. Update the saved CM6 state in place via a
+    // transaction off the existing state — preserves history so Ctrl-Z
+    // on activation reverts the whole replacement as one undo step
+    // (same shape as the active path).
+    const tr = entry.savedState.update({
+      changes: {
+        from: 0,
+        to: entry.savedState.doc.length,
+        insert: content,
+      },
+    });
+    entry.savedState = tr.state;
+    // Re-render so the tab strip's dirty dot reflects the change.
+    tabStrip?.render();
+  }
+}
+
+interface NoteMutationAppliedEvent {
+  task_id: string;
+  source_path: string;
+  mutation_kind: string;
+  content: string;
+  source_hash_at_submit: string;
+}
+void listen<NoteMutationAppliedEvent>("hiker:note-mutation-applied", (ev) => {
+  const p = ev.payload;
+  applyMutationToBuffer(
+    p.source_path,
+    p.content,
+    p.mutation_kind,
+    p.source_hash_at_submit,
+  );
+});
+
+// status: task-queue-home-widget
+// status: task-queue-home-widget-respects-llm-disable
+// status: vault-bar-queue-button
+// Wire the home-page Task queue tile + the new vault-bar queue button.
+// The tile shows a one-line "X active · Y succeeded · Z failed" summary
+// (middots) since vault open; the vault-bar button shows a pulsing blue
+// dot when anything is active and a dim red dot if any task has failed
+// since the last time the user viewed the queue. Hidden / inert entirely
+// when `[llm] enabled = false`.
+const taskQueueTile = (() => {
+  const tasksSection = document.getElementById("vault-home-tasks");
+  const tasksHeader = document.getElementById("vault-home-tasks-header");
+  const tasksSummary = document.getElementById("vault-home-tasks-summary");
+  const queueBtnEl = document.getElementById("queue-btn") as HTMLButtonElement | null;
+  const queueIndicatorEl = document.getElementById("queue-btn-indicator");
+
+  let activeCount = 0;
+  let succeededCount = 0;
+  let failedCount = 0;
+  let unreadFailure = false;
+  let llmEnabled = true;
+
+  const SUMMARY_DOT = " · ";
+  function paintSummary(): void {
+    if (!tasksSection || !tasksSummary) return;
+    if (!llmEnabled) {
+      tasksSection.hidden = true;
+      return;
+    }
+    tasksSection.hidden = false;
+    if (activeCount + succeededCount + failedCount === 0) {
+      tasksSummary.textContent = "No tasks queued";
+      return;
+    }
+    tasksSummary.textContent = [
+      `${activeCount} active`,
+      `${succeededCount} succeeded`,
+      `${failedCount} failed`,
+    ].join(SUMMARY_DOT);
+  }
+
+  function paintIndicator(): void {
+    if (!queueBtnEl || !queueIndicatorEl) return;
+    if (!llmEnabled) {
+      queueBtnEl.hidden = true;
+      queueIndicatorEl.hidden = true;
+      return;
+    }
+    queueBtnEl.hidden = false;
+    if (activeCount > 0) {
+      queueIndicatorEl.hidden = false;
+      queueIndicatorEl.classList.add("queue-indicator-active");
+      queueIndicatorEl.classList.toggle("queue-indicator-failed", false);
+      return;
+    }
+    queueIndicatorEl.classList.remove("queue-indicator-active");
+    if (unreadFailure) {
+      queueIndicatorEl.hidden = false;
+      queueIndicatorEl.classList.add("queue-indicator-failed");
+      return;
+    }
+    queueIndicatorEl.hidden = true;
+    queueIndicatorEl.classList.remove("queue-indicator-failed");
+  }
+
+  function repaint(): void {
+    paintSummary();
+    paintIndicator();
+  }
+
+  function openQueueDetail(): void {
+    if (!llmEnabled) return;
+    // Vault home owns the overview ↔ detail toggle; show home first
+    // and then swap into the queue detail. The home button stays the
+    // back-out path.
+    vaultHome.setVisible(true);
+    const ovEl = document.getElementById("vault-home-overview");
+    if (ovEl) ovEl.hidden = true;
+    queueDetail.setVisible(true);
+    queueDetail.setFilter("tasks");
+    // Visiting the queue clears the "unread failure" indicator. Active
+    // pulse stays — that's a live-state mirror, not a notification.
+    unreadFailure = false;
+    paintIndicator();
+  }
+
+  if (tasksHeader) {
+    tasksHeader.style.cursor = "pointer";
+    tasksHeader.addEventListener("click", openQueueDetail);
+  }
+  if (queueBtnEl) {
+    queueBtnEl.addEventListener("click", openQueueDetail);
+  }
+
+  void listen<{ event: string }>("hiker:queue-event", (ev) => {
+    const k = ev.payload.event;
+    if (k === "task_queued") {
+      activeCount += 1;
+    } else if (k === "task_completed") {
+      activeCount = Math.max(0, activeCount - 1);
+      succeededCount += 1;
+    } else if (k === "task_failed") {
+      activeCount = Math.max(0, activeCount - 1);
+      failedCount += 1;
+      // Only flag the indicator red if the user isn't currently looking
+      // at the queue — otherwise the dot would light up under their
+      // cursor for no reason.
+      if (!queueDetail.isVisible()) unreadFailure = true;
+    } else if (k === "task_cancelled") {
+      activeCount = Math.max(0, activeCount - 1);
+    }
+    repaint();
+  });
+
+  async function refresh(): Promise<void> {
+    try {
+      const cfg = await invoke<{ llm: { enabled: boolean } }>("get_settings");
+      llmEnabled = cfg.llm.enabled;
+    } catch {
+      // No vault open yet — keep the tile + button hidden until
+      // refresh() runs again.
+      llmEnabled = false;
+    }
+    try {
+      const rows = await invoke<Array<{ state: string }>>("tasks_snapshot");
+      activeCount = 0;
+      succeededCount = 0;
+      failedCount = 0;
+      for (const r of rows) {
+        if (r.state === "queued" || r.state === "leased") activeCount += 1;
+        else if (r.state === "completed") succeededCount += 1;
+        else if (r.state === "failed") failedCount += 1;
+      }
+      // Fresh vault → no unread state to inherit.
+      unreadFailure = false;
+    } catch {
+      activeCount = 0;
+      succeededCount = 0;
+      failedCount = 0;
+      unreadFailure = false;
+    }
+    repaint();
+  }
+  repaint();
+  void refresh();
+  return { refresh };
+})();
+
+// Snapshot-preview lifecycle: callers go through the `snapshotPreview`
+// API directly (e.g. `snapshotPreview.open(row)` from vault-home; the
+// mode-controls renderer above wires its toolbar buttons in the same way).
+
+// status: bug-activity-refresh-polled-not-pushed (fixed)
+// vault-home owns the recents/activity refresh; the listener routes through
+// `vaultHome.notifyChangesAppended()`.
 
 // status: mcp-ui-refresh-on-agent-write
 // Agent writes (per `mcp.md`) suppress the watcher around their fs writes for
 // the same correctness reasons move/delete do, so `hiker:file-changed` never
 // fires for them. Ride the changes broadcast instead: any row whose author
-// starts with "agent:" applies the same tree-refresh + active-buffer reload
-// shape the watcher handler would have. Non-agent rows (user saves,
-// rollbacks) keep flowing through the watcher path so we don't double-refresh.
+// is `agent` applies the same tree-refresh + active-buffer reload shape the
+// watcher handler would have. Non-agent rows (user saves, rollbacks) keep
+// flowing through the watcher path so we don't double-refresh.
 void listen<ChangeRow>("hiker:changes-appended", (event) => {
-  scheduleActivityRefresh();
+  vaultHome.notifyChangesAppended();
   const row = event.payload;
-  if (!row.author.startsWith("agent:")) return;
+  if (row.author_class !== "agent") return;
   void handleAgentChange(row);
 });
 
 async function handleAgentChange(row: ChangeRow): Promise<void> {
-  // Tree-shape changes mirror the watcher handler's branches.
   if (row.op === "created" || row.op === "deleted" || row.op === "renamed") {
     scheduleTreeRefreshFromWatcher();
-    scheduleVaultHomeModifiedRefresh();
   } else if (
     row.op === "modified"
-    && (treeSortOrder === "mtime-newest" || treeSortOrder === "mtime-oldest")
+    && (tree.getSortOrder() === "mtime-newest" || tree.getSortOrder() === "mtime-oldest")
   ) {
-    // Same rationale as the watcher path: mtime-based sorts depend on per-row
-    // mtime and a save reorders rows.
     scheduleTreeRefreshFromWatcher();
   }
-  if (row.op === "modified") {
-    scheduleVaultHomeModifiedRefresh();
-  }
 
-  // Active-buffer reload. Skip read-only previews (snapshot / trash) for the
-  // same reason the watcher handler does — they're historic views the agent
-  // shouldn't be allowed to clobber.
   if (!buffer || isReadOnlyBuffer(buffer)) return;
 
   if (row.op === "modified" && row.path === buffer.path) {
     if (isDirty()) {
-      // The user is mid-edit on a file the agent just rewrote. Don't silently
-      // overwrite their buffer — surface a toast and let the next save's
-      // drift check resolve it. Same posture as `handleWatcherConflictDirty`
-      // but synchronous: agent writes are server-driven so a modal prompt
-      // would interrupt the user without warning.
       showToast(`${row.path} was rewritten by an agent; save to keep yours.`);
       return;
     }
@@ -2526,9 +2285,14 @@ async function handleAgentChange(row: ChangeRow): Promise<void> {
     if (isDirty()) {
       showToast(`${row.path} was removed by an agent; save to recreate.`);
     } else {
+      // status: editor-tab-strip — drop the tab for the removed path.
+      openBuffers.delete(row.path);
+      if (previewTabPath === row.path) previewTabPath = null;
       buffer = null;
+      activePath = null;
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
       updateStatus();
+      tabStrip?.render();
       showToast(`${row.path} was removed by an agent`);
     }
     return;
@@ -2539,16 +2303,6 @@ async function handleAgentChange(row: ChangeRow): Promise<void> {
     updateStatus();
   }
 }
-
-vaultHomeNewNoteBtn.addEventListener("click", async () => {
-  try {
-    const created = await invoke<string>("create_note", { folder: "" });
-    await openFile(created);
-  } catch (err) {
-    console.error("vault-home new note failed:", err);
-    alert(`new note failed: ${formatError(err)}`);
-  }
-});
 
 // ---------- panel toggles ----------
 
@@ -2675,238 +2429,53 @@ function buildViewMenuItems(): CtxMenuItem[] {
   ];
 }
 
-viewMenuBtn.addEventListener("click", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  const rect = viewMenuBtn.getBoundingClientRect();
-  openContextMenu(rect.left, rect.bottom + 2, buildViewMenuItems());
-});
+// View menu button click handler installed by `mountModeControls`.
 
 // ---------- discovery panel (search + related) ----------
-//
-// status: search-discovery-panel
-// status: search-mode-toggles
-//
-// Mode toggles + section collapse state. Defaults match `core::config`'s
-// `SearchConfig::default()`; the values are overwritten from `get_settings`
-// on vault open and persisted via `settings-write-back` on every flip.
-
-let searchModeSemantic = true;
-let searchModeLexical = true;
-
-function applySearchInputDisabledState(): void {
-  // status: search-modes-both-off-disabled
-  // Both toggles off → input is disabled with the hint text. Matches the
-  // spec exactly: explicit failure beats silent fallback. The placeholder
-  // is the visible affordance once disabled.
-  const bothOff = !searchModeSemantic && !searchModeLexical;
-  searchInputEl.disabled = bothOff;
-  searchInputEl.placeholder = bothOff
-    ? "Enable Semantic or Lexical to search"
-    : "Search vault…";
-}
-
-function syncSearchModeButtons(): void {
-  toggleModeSemanticBtn.classList.toggle("active", searchModeSemantic);
-  toggleModeLexicalBtn.classList.toggle("active", searchModeLexical);
-  applySearchInputDisabledState();
-}
-
-function setSearchModeSemantic(on: boolean, persist: boolean): void {
-  searchModeSemantic = on;
-  syncSearchModeButtons();
-  if (persist) {
-    void persistSetting("vault", "search.modes.semantic", on);
-    maybeRerunSearchAfterModeChange();
-  }
-}
-
-function setSearchModeLexical(on: boolean, persist: boolean): void {
-  searchModeLexical = on;
-  syncSearchModeButtons();
-  if (persist) {
-    void persistSetting("vault", "search.modes.lexical", on);
-    maybeRerunSearchAfterModeChange();
-  }
-}
-
-toggleModeSemanticBtn.addEventListener("click", () => {
-  setSearchModeSemantic(!searchModeSemantic, true);
-});
-toggleModeLexicalBtn.addEventListener("click", () => {
-  setSearchModeLexical(!searchModeLexical, true);
-});
-
-// status: search-empty-collapses-results
-// Empty query hides the search-results section; non-empty shows it.
-function applySearchSectionVisibility(): void {
-  const hasQuery = searchInputEl.value.trim().length > 0;
-  searchSectionEl.hidden = !hasQuery;
-}
-
-// status: search-typeahead-debounce
-// 250ms debounce + monotonically-increasing epoch. Stale responses (whose
-// epoch is below the current one) are dropped on the frontend before
-// render. Mirrors the cancel-on-file-switch pattern already used by
-// `refreshRelated`. Empty query short-circuits without scheduling.
-const SEARCH_DEBOUNCE_MS = 250;
-let searchEpoch = 0;
-let searchDebounceTimer: number | null = null;
-
-function applySearchClearButtonVisibility(): void {
-  searchClearBtn.hidden = searchInputEl.value.length === 0;
-}
-
-// status: search-keybind-ctrl-space
-// Focuses the search input. Opens the discovery panel if collapsed
-// (matching the spec's "Opens the discovery panel if collapsed"). Selects
-// existing input contents so a quick re-search retypes naturally.
-function focusSearchInput(): void {
-  // If the panel was collapsed, expand it first. The expand toggles a
-  // CSS class with a `transition: visibility 0.1s` rule on `#discovery`;
-  // calling `.focus()` on the input *during* that transition is a no-op
-  // because the element is still computed-visibility:hidden. Defer the
-  // focus to the next animation frame so the new style is settled.
-  const wasCollapsed = appEl.classList.contains("related-collapsed");
-  if (wasCollapsed) {
-    appEl.classList.remove("related-collapsed");
-    void persistSetting("vault", "vault.related_open", true);
-    syncToggleButtons();
-  }
-  const doFocus = () => {
-    searchInputEl.focus();
-    searchInputEl.select();
-  };
-  if (wasCollapsed) {
-    requestAnimationFrame(doFocus);
-  } else {
-    doFocus();
-  }
-}
-
-// status: search-keyboard-nav
-//
-// ↑/↓ move within the focused result list, with vertical wraparound at
-// the boundary between sections (↓ at the bottom of Search jumps to the
-// top of Related; ↑ at the top of Related jumps to the bottom of Search).
-// Stops at panel boundaries — no wrap from Related's bottom or Search's
-// top.
-// Enter opens the focused row.
-// Tab is handled by the browser via roving tabindex: each section keeps
-// exactly one row with tabindex=0 (the first by default; the most recent
-// arrow target after that), so Tab from the input lands on the first
-// search row, then the first related row, then leaves the panel.
-// Esc in the input clears the query (which collapses the search
-// section via the existing empty-query rule) and blurs.
-// Esc in a result list returns focus to the input.
-
-function discoveryRows(list: HTMLElement): HTMLElement[] {
-  return Array.from(list.querySelectorAll<HTMLElement>(".related-item"));
-}
-
-/// Set tabindex=0 on the row at `idx` and tabindex=-1 on every other row
-/// in the same list. Idempotent. Only one row in a list is Tab-reachable
-/// at a time (roving tabindex pattern).
-function setRovingTabIndex(list: HTMLElement, idx: number): void {
-  const rows = discoveryRows(list);
-  rows.forEach((r, i) => {
-    r.tabIndex = i === idx ? 0 : -1;
-  });
-}
-
-function focusRow(list: HTMLElement, idx: number): boolean {
-  const rows = discoveryRows(list);
-  if (rows.length === 0 || idx < 0 || idx >= rows.length) return false;
-  setRovingTabIndex(list, idx);
-  rows[idx].focus();
-  return true;
-}
-
-function activeRowIndex(list: HTMLElement): number {
-  return discoveryRows(list).findIndex((r) => r === document.activeElement);
-}
-
-// Handle ↑ / ↓ / Enter / Esc on the result lists.
-function onResultListKeydown(e: KeyboardEvent): void {
-  const target = e.target as HTMLElement;
-  if (!target.classList.contains("related-item")) return;
-  const list = target.closest("#search-list, #related-list") as HTMLElement | null;
-  if (!list) return;
-  const idx = activeRowIndex(list);
-  if (idx < 0) return;
-  switch (e.key) {
-    case "ArrowDown": {
-      e.preventDefault();
-      const rows = discoveryRows(list);
-      if (idx + 1 < rows.length) {
-        focusRow(list, idx + 1);
-      } else if (list === searchListEl) {
-        // Bottom of search → top of related.
-        if (!focusRow(relatedListEl, 0)) {
-          // No related rows; stay put.
-        }
-      }
-      // Bottom of related: stop. No wrap to top of search.
-      break;
+// Search input + mode toggles + lexical/semantic results + related-notes
+// panel + collapsible sections + roving-tabindex keyboard nav all live in
+// `./discovery`. Host wires DOM ids and the editor-coupled callbacks
+// (`onOpenNote`, `onScrollToChunk`).
+const discovery: DiscoveryApi = mountDiscovery({
+  appEl,
+  inputEl: searchInputEl,
+  clearBtn: searchClearBtn,
+  toggleSemanticBtn: toggleModeSemanticBtn,
+  toggleLexicalBtn: toggleModeLexicalBtn,
+  searchSectionEl,
+  searchListEl,
+  searchCountEl,
+  searchSpinnerEl,
+  relatedSectionEl,
+  relatedListEl,
+  relatedCountEl,
+  onOpenNote: (rel, opts) => openFile(rel, opts),
+  onScrollToChunk: async (rel, chunkIndex) => {
+    if (buffer?.path !== rel) return;
+    try {
+      const bounds = await invoke<ChunkBounds[]>("chunks_for", { rel });
+      const target = bounds.find((b) => b.chunk_index === chunkIndex);
+      if (!target) return;
+      const safe = Math.min(target.char_start, view.state.doc.length);
+      view.dispatch({
+        selection: { anchor: safe },
+        effects: EditorView.scrollIntoView(safe, { y: "start" }),
+      });
+      view.focus();
+    } catch (err) {
+      console.error("scroll-to-chunk failed:", err);
     }
-    case "ArrowUp": {
-      e.preventDefault();
-      if (idx > 0) {
-        focusRow(list, idx - 1);
-      } else if (list === relatedListEl) {
-        // Top of related → bottom of search.
-        const searchRows = discoveryRows(searchListEl);
-        if (searchRows.length > 0) {
-          focusRow(searchListEl, searchRows.length - 1);
-        }
-      }
-      // Top of search: stop. No wrap to bottom of related.
-      break;
+  },
+  persistSetting,
+  expandPanelIfCollapsed: () => {
+    const wasCollapsed = appEl.classList.contains("related-collapsed");
+    if (wasCollapsed) {
+      appEl.classList.remove("related-collapsed");
+      void persistSetting("vault", "vault.related_open", true);
+      syncToggleButtons();
     }
-    case "Enter": {
-      e.preventDefault();
-      // The row's click handler is the open path; trigger it.
-      target.click();
-      break;
-    }
-    case "Escape": {
-      e.preventDefault();
-      searchInputEl.focus();
-      break;
-    }
-  }
-}
-
-searchListEl.addEventListener("keydown", onResultListKeydown);
-relatedListEl.addEventListener("keydown", onResultListKeydown);
-
-// Esc in the input clears + blurs (clearing collapses the search section
-// via `applySearchSectionVisibility`).
-searchInputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    e.preventDefault();
-    if (searchInputEl.value.length > 0) {
-      searchInputEl.value = "";
-      onSearchInput();
-    } else {
-      searchInputEl.blur();
-    }
-  } else if (e.key === "ArrowDown") {
-    // Down from the input should jump into the first available result
-    // section (search if visible, else related). Lets Enter-from-keyboard
-    // flows skip Tab when the user just typed and wants to pick a result.
-    const searchRows = discoveryRows(searchListEl);
-    if (searchRows.length > 0) {
-      e.preventDefault();
-      focusRow(searchListEl, 0);
-      return;
-    }
-    const relatedRows = discoveryRows(relatedListEl);
-    if (relatedRows.length > 0) {
-      e.preventDefault();
-      focusRow(relatedListEl, 0);
-    }
-  }
+    return wasCollapsed;
+  },
 });
 
 // status: search-keybind-ctrl-space (global half)
@@ -2920,348 +2489,106 @@ window.addEventListener(
   (e) => {
     if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "Space") {
       e.preventDefault();
-      focusSearchInput();
+      discovery.focusInput();
     }
   },
   { capture: true },
 );
 
-searchClearBtn.addEventListener("click", () => {
-  searchInputEl.value = "";
-  onSearchInput();
-  searchInputEl.focus();
-});
-
-function onSearchInput(): void {
-  applySearchClearButtonVisibility();
-  applySearchSectionVisibility();
-  if (searchDebounceTimer !== null) {
-    window.clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = null;
-  }
-  const raw = searchInputEl.value;
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) {
-    // Bump epoch so any in-flight call drops its results, then clear UI.
-    searchEpoch += 1;
-    searchSpinnerEl.hidden = true;
-    searchListEl.innerHTML = "";
-    searchCountEl.textContent = "";
-    return;
-  }
-  // Both modes off: input is disabled — nothing to do — but the listener
-  // still fires for programmatic value changes. Be defensive.
-  if (!searchModeSemantic && !searchModeLexical) {
-    return;
-  }
-  searchSpinnerEl.hidden = false;
-  searchDebounceTimer = window.setTimeout(() => {
-    searchDebounceTimer = null;
-    const epoch = ++searchEpoch;
-    void runSearch(trimmed, epoch);
-  }, SEARCH_DEBOUNCE_MS);
-}
-
-searchInputEl.addEventListener("input", onSearchInput);
-
-async function runSearch(query: string, epoch: number): Promise<void> {
-  try {
-    const resp = await invoke<SearchResponse>("search_vault", {
-      query,
-      modes: { semantic: searchModeSemantic, lexical: searchModeLexical },
-      epoch,
-    });
-    // status: search-typeahead-debounce — drop stale results.
-    if (resp.epoch !== searchEpoch) return;
-    // Pick which bucket to render. Both modes on → fused; one mode on →
-    // that engine's native ranking (already in the bucket).
-    const hits = pickResultBucket(resp);
-    searchSpinnerEl.hidden = true;
-    renderSearchResults(hits);
-  } catch (err) {
-    if (epoch !== searchEpoch) return;
-    console.error("search_vault failed:", err);
-    searchSpinnerEl.hidden = true;
-    searchListEl.innerHTML = `<div class="related-empty">Error: ${String(err)}</div>`;
-    searchCountEl.textContent = "";
-  }
-}
-
-function pickResultBucket(resp: SearchResponse): SearchNoteHit[] {
-  if (searchModeSemantic && searchModeLexical) return resp.fused;
-  if (searchModeLexical) return resp.lexical_hits;
-  if (searchModeSemantic) return resp.semantic_hits;
-  return [];
-}
-
-// status: search-result-row, search-result-grouped-by-note (UI side),
-// search-section-counts
-function renderSearchResults(hits: SearchNoteHit[]): void {
-  searchListEl.innerHTML = "";
-  searchCountEl.textContent = hits.length > 0 ? `(${hits.length})` : "";
-  if (hits.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "related-empty";
-    empty.textContent = "No matches.";
-    searchListEl.appendChild(empty);
-    return;
-  }
-  for (const hit of hits) {
-    const item = document.createElement("div");
-    item.className = "related-item search-item";
-    // Roving tabindex set after the loop; default to -1 so Tab won't
-    // hit every row.
-    item.tabIndex = -1;
-    item.setAttribute("role", "option");
-    item.addEventListener("click", () => void openSearchHit(hit));
-
-    const title = document.createElement("div");
-    title.className = "related-item-title";
-    title.textContent = hit.title;
-    item.appendChild(title);
-
-    const meta = document.createElement("div");
-    meta.className = "related-item-meta";
-    const heading = hit.heading_path ? `${hit.heading_path} · ` : "";
-    meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
-    item.appendChild(meta);
-
-    const snippet = document.createElement("div");
-    snippet.className = "related-item-snippet";
-    appendSnippetWithMarks(snippet, hit.snippet);
-    item.appendChild(snippet);
-
-    searchListEl.appendChild(item);
-  }
-  // status: search-keyboard-nav — first row is Tab-reachable; others -1.
-  setRovingTabIndex(searchListEl, 0);
-}
-
-// Render an FTS5 snippet that may contain literal `<mark>` / `</mark>`
-// substrings as text + styled spans. Never `innerHTML` — the rest of the
-// app avoids raw HTML rendering and FTS5's snippet output is the only
-// source of these markers, so a structural parse is enough. Any other
-// `<` is treated as plain text.
-function appendSnippetWithMarks(host: HTMLElement, snippet: string): void {
-  let i = 0;
-  while (i < snippet.length) {
-    const open = snippet.indexOf("<mark>", i);
-    if (open < 0) {
-      host.appendChild(document.createTextNode(snippet.slice(i)));
+// status: editor-tab-keybinds
+// Window-level listener for the tab keybinds so they fire even when
+// focus is outside CM6 (file tree, status bar, sidebar). The CM6
+// keymap registrations above cover the editor-focus case; this handler
+// covers the rest. Skip when the user is typing into an input (so
+// Cmd-W in a textarea doesn't hijack normal close-line behavior — but
+// in Tauri there's no browser tab to close anyway, so we always handle
+// it; we only skip the tab-cycle / number keys for inputs because
+// those have meaningful in-input behavior).
+window.addEventListener(
+  "keydown",
+  (e) => {
+    // status: navigation-keybind
+    // Alt-Left / Alt-Right (Linux/Windows browser convention) — fire
+    // regardless of modifier-state of Mod, before the Mod gate below
+    // since these don't require Cmd/Ctrl.
+    if (e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        void nav?.back();
+        return;
+      }
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        void nav?.forward();
+        return;
+      }
+    }
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod) return;
+    const target = e.target as HTMLElement | null;
+    const inInput =
+      target?.tagName === "INPUT"
+      || target?.tagName === "TEXTAREA"
+      || target?.isContentEditable;
+    // status: navigation-keybind
+    // Cmd/Ctrl-[ / Cmd/Ctrl-] — back/forward when focus is outside CM6
+    // (editor focus is covered by the registry-side bindings above).
+    if (!e.shiftKey && !e.altKey) {
+      if (e.key === "[") {
+        e.preventDefault();
+        void nav?.back();
+        return;
+      }
+      if (e.key === "]") {
+        e.preventDefault();
+        void nav?.forward();
+        return;
+      }
+    }
+    // Cmd/Ctrl-W → close active tab. Always fires (Tauri has no browser
+    // tab to close).
+    if (e.key === "w" && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      if (activePath) void closeTab(activePath);
       return;
     }
-    if (open > i) {
-      host.appendChild(document.createTextNode(snippet.slice(i, open)));
-    }
-    const inner = open + "<mark>".length;
-    const close = snippet.indexOf("</mark>", inner);
-    if (close < 0) {
-      // Unterminated <mark> — treat the rest as plain text rather than
-      // dropping anything. Defensive against malformed FTS5 output.
-      host.appendChild(document.createTextNode(snippet.slice(open)));
+    // Cmd/Ctrl-Tab cycle. Only when not typing — in an input the user
+    // expects normal Tab behavior.
+    if (e.key === "Tab" && !inInput) {
+      e.preventDefault();
+      cycleTab(e.shiftKey ? -1 : +1);
       return;
     }
-    const span = document.createElement("span");
-    span.className = "search-mark";
-    span.textContent = snippet.slice(inner, close);
-    host.appendChild(span);
-    i = close + "</mark>".length;
-  }
-}
-
-// status: search-result-click-opens-chunk
-// Open the note, then look up its chunk bounds and scroll to the matched
-// chunk's byte range. Conversion is byte → char (UTF-8 → UTF-16) because
-// `chunks_for` returns byte offsets while CM6 indexes characters.
-async function openSearchHit(hit: SearchNoteHit): Promise<void> {
-  await openFile(hit.path);
-  // openFile may abort on dirty-buffer cancel; bail if we're not actually
-  // looking at the requested file now.
-  if (buffer?.path !== hit.path) return;
-  try {
-    const bounds = await invoke<ChunkBounds[]>("chunks_for", { rel: hit.path });
-    const target = bounds.find((b) => b.chunk_index === hit.chunk_index);
-    if (!target) return;
-    const docText = view.state.doc.toString();
-    const charOffset = byteOffsetToCharOffset(docText, target.byte_start);
-    const safe = Math.min(charOffset, view.state.doc.length);
-    view.dispatch({
-      selection: { anchor: safe },
-      effects: EditorView.scrollIntoView(safe, { y: "start" }),
-    });
-    view.focus();
-  } catch (err) {
-    console.error("scroll-to-chunk failed:", err);
-  }
-}
-
-function byteOffsetToCharOffset(text: string, byteOffset: number): number {
-  if (byteOffset <= 0) return 0;
-  const enc = new TextEncoder();
-  const bytes = enc.encode(text);
-  if (byteOffset >= bytes.length) return text.length;
-  const dec = new TextDecoder();
-  return dec.decode(bytes.subarray(0, byteOffset)).length;
-}
-
-// Re-run search when a vault is opened: existing query (if any) loses its
-// results when the panel rebinds; clear UI so we don't show prior-vault
-// results against a new vault.
-function clearSearchPanel(): void {
-  searchInputEl.value = "";
-  searchEpoch += 1;
-  searchSpinnerEl.hidden = true;
-  searchListEl.innerHTML = "";
-  searchCountEl.textContent = "";
-  applySearchClearButtonVisibility();
-  applySearchSectionVisibility();
-}
-
-// Re-run when the user flips a mode toggle while a query is active. Without
-// this, switching from "both" to "lexical only" (or back) would leave stale
-// results showing under a now-different mode label until the next keystroke.
-function maybeRerunSearchAfterModeChange(): void {
-  if (searchInputEl.disabled) return;
-  if (searchInputEl.value.trim().length === 0) return;
-  const epoch = ++searchEpoch;
-  searchSpinnerEl.hidden = false;
-  void runSearch(searchInputEl.value.trim(), epoch);
-}
-
-// status: search-section-collapsible
-// Per-section collapsed/expanded state, persisted per-vault. Clicking the
-// header (anywhere on it, not just the chevron — bigger hit target) toggles
-// the corresponding `[hidden]` on the section's body.
-function applySectionCollapsed(
-  section: HTMLElement,
-  body: HTMLElement,
-  expanded: boolean,
-): void {
-  section.classList.toggle("collapsed", !expanded);
-  body.hidden = !expanded;
-}
-
-let searchSectionExpanded = true;
-let relatedSectionExpanded = true;
-
-function setSearchSectionExpanded(expanded: boolean, persist: boolean): void {
-  searchSectionExpanded = expanded;
-  applySectionCollapsed(searchSectionEl, searchListEl, expanded);
-  if (persist) {
-    void persistSetting("vault", "search.sections.results_expanded", expanded);
-  }
-}
-
-function setRelatedSectionExpanded(expanded: boolean, persist: boolean): void {
-  relatedSectionExpanded = expanded;
-  applySectionCollapsed(relatedSectionEl, relatedListEl, expanded);
-  if (persist) {
-    void persistSetting("vault", "search.sections.related_expanded", expanded);
-  }
-}
-
-searchSectionEl
-  .querySelector(".discovery-section-header")!
-  .addEventListener("click", () => {
-    setSearchSectionExpanded(!searchSectionExpanded, true);
-  });
-relatedSectionEl
-  .querySelector(".discovery-section-header")!
-  .addEventListener("click", () => {
-    setRelatedSectionExpanded(!relatedSectionExpanded, true);
-  });
-
-// ---------- related-notes panel ----------
-
-let relatedRequestSeq = 0;
-let relatedDebounce: number | null = null;
-
-async function refreshRelated(rel: string | null): Promise<void> {
-  const seq = ++relatedRequestSeq;
-  if (!rel) {
-    relatedListEl.innerHTML = "";
-    relatedCountEl.textContent = "";
-    return;
-  }
-  try {
-    const hits = await invoke<RelatedHit[]>("related_notes", { rel, topK: 10 });
-    if (seq !== relatedRequestSeq) return;
-    renderRelated(hits);
-  } catch (err) {
-    if (seq !== relatedRequestSeq) return;
-    console.error("related_notes failed:", err);
-    relatedListEl.innerHTML = `<div class="related-empty">Error: ${String(err)}</div>`;
-  }
-}
-
-function renderRelated(hits: RelatedHit[]): void {
-  relatedListEl.innerHTML = "";
-  // status: search-section-counts — header reflects live count.
-  relatedCountEl.textContent = hits.length > 0 ? `(${hits.length})` : "";
-  if (hits.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "related-empty";
-    empty.textContent = "No related notes yet.";
-    relatedListEl.appendChild(empty);
-    return;
-  }
-  for (const hit of hits) {
-    const item = document.createElement("div");
-    item.className = "related-item";
-    item.tabIndex = -1;
-    item.setAttribute("role", "option");
-    item.addEventListener("click", () => void openFile(hit.path));
-
-    const title = document.createElement("div");
-    title.className = "related-item-title";
-    title.textContent = hit.title;
-    item.appendChild(title);
-
-    const meta = document.createElement("div");
-    meta.className = "related-item-meta";
-    const heading = hit.best_heading_path ? `${hit.best_heading_path} · ` : "";
-    meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
-    item.appendChild(meta);
-
-    const snippet = document.createElement("div");
-    snippet.className = "related-item-snippet";
-    snippet.textContent = hit.snippet;
-    item.appendChild(snippet);
-
-    relatedListEl.appendChild(item);
-  }
-  // status: search-keyboard-nav
-  setRovingTabIndex(relatedListEl, 0);
-}
-
-function scheduleRelatedRefresh(delayMs: number): void {
-  if (relatedDebounce !== null) {
-    window.clearTimeout(relatedDebounce);
-  }
-  relatedDebounce = window.setTimeout(() => {
-    void refreshRelated(buffer?.path ?? null);
-  }, delayMs);
-}
+    // Cmd/Ctrl-1..9 → jump to tab. Skip in inputs.
+    if (!inInput && !e.shiftKey && !e.altKey) {
+      const n = parseInt(e.key, 10);
+      if (n >= 1 && n <= 9) {
+        e.preventDefault();
+        jumpToTab(n);
+      }
+    }
+  },
+  { capture: true },
+);
 
 let bufferPathInterval: number | null = null;
-let indexStatusInterval: number | null = null;
 let lastSeenBufferPath: string | null = null;
 
+// status: bug-index-status-polled-not-pushed (fixed)
+// `index_status` is now pushed from the indexer over `hiker:index-status`
+// (see the listener below). The 2s poll has been removed; the buffer-path
+// watcher stays — that one's a separate UI concern (active-buffer changes
+// drive the related-notes refresh).
 function startBackgroundIntervals(): void {
   if (bufferPathInterval !== null) window.clearInterval(bufferPathInterval);
-  if (indexStatusInterval !== null) window.clearInterval(indexStatusInterval);
   bufferPathInterval = window.setInterval(() => {
     if (!vaultIsOpen) return;
     const cur = buffer?.path ?? null;
     if (cur !== lastSeenBufferPath) {
       lastSeenBufferPath = cur;
-      scheduleRelatedRefresh(0);
+      discovery.scheduleRelatedRefresh(cur, 0);
     }
   }, 250);
-  indexStatusInterval = window.setInterval(() => {
-    if (!vaultIsOpen) return;
-    void pollIndexStatus();
-  }, 2000);
 }
 
 // ---------- index status indicator ----------
@@ -3293,24 +2620,17 @@ function renderIndexStatus(): void {
   // back to the aggregate label otherwise (or while previewing trash /
   // a snapshot — neither has live index state worth mirroring).
   if (buffer && !isReadOnlyBuffer(buffer)) {
-    const cached = indexStateCache.get(buffer.path);
+    const cached = tree.getIndexState(buffer.path);
     if (!cached) {
-      if (!isIndexableExt(buffer.path)) {
-        const s: IndexState = { kind: "unsupported" };
-        indexStateCache.set(buffer.path, s);
-      } else if (!inflightStateFetches.has(buffer.path)) {
-        const path = buffer.path;
-        inflightStateFetches.add(path);
-        void fetchIndexState(path)
-          .catch((err) => console.error("index_state_for failed:", path, err))
-          .finally(() => {
-            inflightStateFetches.delete(path);
-            // Re-render once the fetch resolves so the label can switch.
-            if (buffer && buffer.path === path) renderIndexStatus();
-          });
-      }
+      const path = buffer.path;
+      void tree
+        .fetchIndexState(path)
+        .catch((err) => console.error("index_state_for failed:", path, err))
+        .finally(() => {
+          if (buffer && buffer.path === path) renderIndexStatus();
+        });
     }
-    const state = indexStateCache.get(buffer.path);
+    const state = tree.getIndexState(buffer.path);
     if (state) {
       switch (state.kind) {
         case "unsupported":
@@ -3334,14 +2654,16 @@ function renderIndexStatus(): void {
   statusIndexEl.textContent = `Indexed (${indexStatus.total_notes} notes)`;
 }
 
-async function pollIndexStatus(): Promise<void> {
-  try {
-    indexStatus = await invoke<IndexStatus>("index_status");
-    renderIndexStatus();
-  } catch {
-    // No vault open — leave label empty.
-  }
-}
+// status: bug-index-status-polled-not-pushed (fixed)
+// Status snapshots arrive over `hiker:index-status` whenever the indexer's
+// watch::Sender<IndexStatus> changes. The Tauri bridge emits the seeded
+// value as soon as the vault opens and on every subsequent change.
+void listen<IndexStatus>("hiker:index-status", (event) => {
+  indexStatus = event.payload;
+  renderIndexStatus();
+  // Stats counts shift with model_ready / total_notes / last_error too.
+  vaultHome.scheduleStatsRefresh();
+});
 
 void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
   const ev = event.payload;
@@ -3371,7 +2693,7 @@ void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
       if (ev.kind === "finished") {
         updateIndexStateForPath(ev.path, { kind: "indexed" });
         if (buffer && ev.path === buffer.path) {
-          scheduleRelatedRefresh(100);
+          discovery.scheduleRelatedRefresh(buffer?.path ?? null, 100);
         }
       } else if (ev.kind === "skipped") {
         // "unchanged" is a no-op skip (file already indexed); only persist
@@ -3382,14 +2704,14 @@ void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
           updateIndexStateForPath(ev.path, { kind: "skipped", reason: ev.reason });
         }
       } else if (ev.kind === "deleted") {
-        indexStateCache.delete(ev.path);
+        tree.deleteIndexState(ev.path);
       } else if (ev.kind === "renamed") {
-        const prior = indexStateCache.get(ev.from);
-        indexStateCache.delete(ev.from);
+        const prior = tree.getIndexState(ev.from);
+        tree.deleteIndexState(ev.from);
         if (prior) updateIndexStateForPath(ev.to, prior);
       } else if (ev.kind === "error" && ev.path) {
         // Refetch on next render — error state isn't itself a marker.
-        indexStateCache.delete(ev.path);
+        tree.deleteIndexState(ev.path);
       }
       break;
     case "scan_complete":
@@ -3397,17 +2719,56 @@ void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
       break;
   }
   renderIndexStatus();
-  void pollIndexStatus();
   // status: vault-home-stats-widget — counts shift on every terminal event;
   // debounced so a flurry of progress events fires one stats fetch.
-  scheduleVaultHomeStatsRefresh();
+  // The full IndexStatus snapshot (model_ready / queued / total_notes /
+  // last_error) rides `hiker:index-status` per
+  // `bug-index-status-polled-not-pushed` (fixed); progress events only own
+  // the per-path marker + outstanding-count bookkeeping.
+  vaultHome.scheduleStatsRefresh();
 });
 
 function updateIndexStateForPath(path: string, state: IndexState): void {
-  indexStateCache.set(path, state);
+  tree.setIndexState(path, state);
+  // Force a re-render of the row(s) by toggling marker classes via DOM.
+  // The tree module's lazy fetch path also writes the cache; this branch
+  // covers progress events that resolve a state without a render trigger.
   document
     .querySelectorAll(`#tree li[data-path="${cssEscape(path)}"]`)
-    .forEach((el) => applyIndexMarker(el as HTMLElement, state));
+    .forEach((el) => {
+      const li = el as HTMLElement;
+      li.classList.remove("ix-unsupported", "ix-skipped", "ix-queued", "ix-indexed");
+      li.removeAttribute("data-ix-reason");
+      let marker = li.querySelector<HTMLSpanElement>(":scope > .ix-marker");
+      if (state.kind !== "indexed") {
+        if (!marker) {
+          marker = document.createElement("span");
+          marker.className = "ix-marker";
+          li.append(marker);
+        }
+      } else if (marker) {
+        marker.remove();
+      }
+      switch (state.kind) {
+        case "unsupported":
+          li.classList.add("ix-unsupported");
+          li.removeAttribute("title");
+          break;
+        case "skipped":
+          li.classList.add("ix-skipped");
+          li.dataset.ixReason = state.reason;
+          li.title = `Skipped — ${state.reason}`;
+          break;
+        case "queued":
+          li.classList.add("ix-queued");
+          li.removeAttribute("title");
+          break;
+        case "indexed":
+          li.classList.add("ix-indexed");
+          li.removeAttribute("title");
+          break;
+      }
+    });
   if (buffer && !isReadOnlyBuffer(buffer) && buffer.path === path) {
     renderIndexStatus();
   }
@@ -3415,251 +2776,218 @@ function updateIndexStateForPath(path: string, state: IndexState): void {
 
 
 // ---------- trash bin ----------
-// status: tree-trash-bin
+// Trash bin (sidebar collapsible, list rendering, row context menu,
+// restore/purge, read-only preview) lives in `./trash`. The host wires it
+// to DOM elements and the editor view via the deps below.
+const trash: TrashApi = mountTrash({
+  binEl: trashBinEl,
+  headerEl: trashHeaderEl,
+  listEl: trashListEl,
+  chevronEl: trashChevronEl,
+  labelEl: trashLabelEl,
+  view,
+  language,
+  livePreviewCompartment,
+  languageExtensionForPath,
+  livePreviewExtensionForPath,
+  getBuffer: () => buffer,
+  setBuffer: (b) => {
+    buffer = b as Buffer | null;
+  },
+  setReadOnly,
+  updateStatus,
+  refreshChunkBoundaries,
+  isDirty,
+  save,
+  cssEscape,
+  isVaultIsOpen: () => vaultIsOpen,
+  persistSetting,
+  isVaultHomeVisible: () => vaultHome.isVisible(),
+  setVaultHomeVisible: (on) => vaultHome.setVisible(on),
+  refreshTree,
+  formatError,
+});
+function refreshTrashBin(): Promise<void> {
+  return trash.refresh();
+}
 
-let trashItems: TrashListItem[] = [];
+// status: navigation-history-stack
+// Mirror of the snapshot wrap above — trash preview also bypasses the
+// editor-pane MutationObserver, so checkpoint after open/close.
+{
+  const _trashOpen = trash.openPreview;
+  trash.openPreview = async (item) => {
+    await _trashOpen.call(trash, item);
+    checkpointNav();
+  };
+  const _trashClose = trash.closePreview;
+  trash.closePreview = () => {
+    _trashClose.call(trash);
+    checkpointNav();
+  };
+}
+type ReadOnlyMode = "trash" | "snapshot" | "mutation" | null;
 
-type ReadOnlyMode = "trash" | "snapshot" | null;
-
-/// Set or clear the editor's read-only state. `mode` selects which banner
-/// to show — only one banner is visible at a time. Pass `null` (or omit)
-/// to leave the editor writable and hide both banners.
-function setReadOnly(ro: boolean, mode: ReadOnlyMode = null): void {
+/// Set or clear the editor's read-only state. Mode-specific UI (the
+/// label + action icons in the toolbar's center cluster) is driven by
+/// `renderModeControls`, which inspects buffer state and diff visibility
+/// directly — `mode` here is purely for legacy call-site clarity and
+/// triggers a re-render after the read-only toggle takes effect.
+function setReadOnly(ro: boolean, _mode: ReadOnlyMode = null): void {
   view.dispatch({
     effects: readOnlyCompartment.reconfigure(EditorState.readOnly.of(ro)),
   });
-  trashBannerEl.hidden = !(ro && mode === "trash");
-  snapshotBannerEl.hidden = !(ro && mode === "snapshot");
-  editorPaneEl.classList.toggle("snapshot-preview", ro && mode === "snapshot");
+  modeControls?.render();
 }
 
-function relativeTime(unixSecs: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  const d = now - unixSecs;
-  if (d < 60) return "just now";
-  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
-  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
-  if (d < 86400 * 2) return "yesterday";
-  if (d < 86400 * 7) return `${Math.floor(d / 86400)}d ago`;
-  const date = new Date(unixSecs * 1000);
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-async function refreshTrashBin(): Promise<void> {
-  if (!vaultIsOpen) return;
-  try {
-    trashItems = await invoke<TrashListItem[]>("list_trash");
-  } catch (err) {
-    console.error("list_trash failed:", err);
-    trashItems = [];
-  }
-  renderTrashBin();
-}
-
-// status: tree-trash-flat-by-deleted
-function renderTrashBin(): void {
-  const n = trashItems.length;
-  trashLabelEl.textContent = n === 0 ? "Trash" : `Trash (${n})`;
-  trashListEl.innerHTML = "";
-  for (const item of trashItems) {
-    const row = document.createElement("div");
-    row.className = "trash-row";
-    if (item.orphaned) row.classList.add("orphaned");
-    row.dataset.trashedName = item.trashed_name;
-
-    const main = document.createElement("div");
-    main.className = "trash-row-main";
-    const glyph = item.kind === "folder" ? "▸ " : "  ";
-    const display = item.original_path
-      ? (item.original_path.split("/").pop() ?? item.original_path)
-      : item.trashed_name;
-    let label = `${glyph}${display}`;
-    if (item.kind === "folder") {
-      const count =
-        item.member_count === null ? "?" : String(item.member_count);
-      label += ` (${count} note${item.member_count === 1 ? "" : "s"})`;
-    }
-    main.textContent = label;
-    row.appendChild(main);
-
-    const meta = document.createElement("div");
-    meta.className = "trash-row-meta";
-    const when = relativeTime(item.deleted_at);
-    const orig = item.original_path ?? "(no original location recorded)";
-    meta.textContent = `${when} · ${orig}`;
-    row.appendChild(meta);
-
-    // Click → preview (file rows only). Folders are no-op per default.
-    if (item.kind === "file") {
-      row.addEventListener("click", () => void openTrashPreview(item));
-    }
-    row.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      openTrashRowMenu(e.clientX, e.clientY, item);
-    });
-
-    trashListEl.appendChild(row);
-  }
-}
-
-trashHeaderEl.addEventListener("click", () => {
-  trashBinEl.classList.toggle("collapsed");
-  const expanded = !trashBinEl.classList.contains("collapsed");
-  trashChevronEl.textContent = expanded ? "▾" : "▸";
-  if (vaultIsOpen) {
-    void persistSetting("vault", "vault.trash_expanded", expanded);
-  }
+// status: editor-toolbar-mode-controls, mode-controls-diff-toggle
+// Mode-specific controls (snapshot / trash labels + action icons) live in
+// `./modeControls`. Each owning module registers its renderer here; the
+// host swaps based on the active buffer's `mode.kind`. The View ▾ menu
+// shares the same toolbar host and its menu items live in
+// `buildViewMenuItems` above (kept here because they bind to host-level
+// View settings).
+modeControls = mountModeControls({
+  hostEl: modeControlsEl,
+  viewMenuBtn,
+  buildViewMenuItems,
+  getActiveMode: () => buffer?.mode.kind ?? null,
 });
 
-// status: tree-trash-empty-action
-trashHeaderEl.addEventListener("contextmenu", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  const n = trashItems.length;
-  openContextMenu(e.clientX, e.clientY, [
-    {
-      label: n === 0 ? "Empty trash" : `Empty trash (${n} entries)`,
-      danger: true,
-      disabled: n === 0,
-      run: async () => {
-        const ok = await confirmDanger(
-          `Permanently delete ${n} trash ${n === 1 ? "entry" : "entries"}? This cannot be undone.`,
-          "Empty trash",
-        );
-        if (!ok) return;
-        try {
-          await invoke("empty_trash");
-        } catch (err) {
-          console.error("empty_trash failed:", err);
-          alert(`empty failed: ${formatError(err)}`);
-        }
-      },
-    },
-  ]);
-});
-
-// status: tree-trash-restore-action
-function openTrashRowMenu(x: number, y: number, item: TrashListItem): void {
-  const items: CtxMenuItem[] = [];
-  if (item.id) {
-    items.push({
-      label: "Restore",
-      run: async () => {
-        try {
-          const restored = await invoke<TrashEntry>("restore_trash_entry", { id: item.id });
-          showToast(`Restored ${restored.original_path}`);
-          await refreshTree();
-        } catch (err) {
-          console.error("restore_trash_entry failed:", err);
-          alert(`restore failed: ${formatError(err)}`);
-        }
-      },
-    });
-  } else {
-    // status: tree-trash-orphan-recovery
-    items.push({
-      label: "Restore (no original location recorded)",
-      disabled: true,
-    });
-  }
-  items.push({
-    label: "Delete permanently",
-    danger: true,
-    run: async () => {
-      const target = item.original_path ?? item.trashed_name;
-      const ok = await confirmDanger(
-        `Permanently delete ${target}? This cannot be undone.`,
-        "Delete permanently",
-      );
-      if (!ok) return;
-      try {
-        await invoke("permanent_delete_trash_entry", { trashedName: item.trashed_name });
-      } catch (err) {
-        console.error("permanent_delete_trash_entry failed:", err);
-        alert(`delete failed: ${formatError(err)}`);
+// status: editor-tab-strip
+tabStrip = mountTabStrip({
+  hostEl: document.getElementById("tab-strip")!,
+  getTabs: () => tabSnapshots(),
+  getActivePath: () =>
+    buffer?.mode.kind === "file" ? activePath : null,
+  onActivate: (path) => activateTabInner(path),
+  onClose: (path) => void closeTab(path),
+  onCloseOthers: (path) => {
+    void (async () => {
+      const others = [...openBuffers.keys()].filter((p) => p !== path);
+      for (const p of others) {
+        await closeTab(p);
+        // closeTab may have aborted on Cancel — if the tab still exists,
+        // bail out of the bulk operation.
+        if (openBuffers.has(p)) return;
       }
-    },
-  });
-  openContextMenu(x, y, items);
-}
+    })();
+  },
+  onCloseToRight: (path) => {
+    void (async () => {
+      const order = [...openBuffers.keys()];
+      const idx = order.indexOf(path);
+      if (idx < 0) return;
+      const targets = order.slice(idx + 1);
+      for (const p of targets) {
+        await closeTab(p);
+        if (openBuffers.has(p)) return;
+      }
+    })();
+  },
+  onRevealInTree: (path) => {
+    void revealInTree(path);
+  },
+  // status: editor-preview-tab-promotion
+  onPromote: (path) => promotePreviewByPath(path),
+});
 
-// status: tree-trash-preview
-async function openTrashPreview(item: TrashListItem): Promise<void> {
-  // Same dirty-switch guard as openFile, since opening a preview replaces
-  // the active buffer.
-  if (buffer && isDirty()) {
-    const choice = await confirm3(
-      `${buffer.path} has unsaved changes.`,
-      "Save & switch",
-      "Discard & switch",
-      "Cancel",
-    );
-    if (choice === "cancel") return;
-    if (choice === "a") {
-      const ok = await save();
-      if (!ok) return;
-    }
+modeControls?.register("snapshot", (host) => {
+  if (buffer?.mode.kind !== "snapshot") return;
+  const row = buffer.mode.row;
+  const diffActive = buffer.mode.diffActive;
+  const label = document.createElement("span");
+  label.className = "mode-label";
+  label.textContent = diffActive ? "Diff · snapshot ↔ current" : "Snapshot preview";
+  if (row) {
+    const when = new Date(row.timestamp_ms).toLocaleString();
+    label.title = `${row.path} · ${when} · ${row.author} · #${row.id}`;
   }
-  const trashRel = `.hiker/trash/${item.trashed_name}`;
-  try {
-    const file = await invoke<FileWithHash>("read_file_with_hash", { rel: trashRel });
-    buffer = null;
-    view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: file.contents },
-      effects: [
-        language.reconfigure(
-          languageExtensionForPath(item.original_path ?? item.trashed_name),
-        ),
-        livePreviewCompartment.reconfigure(
-          livePreviewExtensionForPath(item.original_path ?? item.trashed_name),
-        ),
-      ],
-    });
-    setReadOnly(true, "trash");
-    if (isVaultHomeVisible()) setVaultHomeVisible(false);
-    buffer = {
-      path: trashRel,
-      loadedText: view.state.doc.toString(),
-      loadedHash: file.hash,
-      preview: true,
-      displayPath: item.original_path ?? item.trashed_name,
-    };
-    document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
-    document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
-    const row = trashListEl.querySelector(
-      `.trash-row[data-trashed-name="${cssEscape(item.trashed_name)}"]`,
+  host.appendChild(label);
+  // status: mode-controls-diff-toggle
+  // Hidden for `op = "deleted"` rows — there's no `before` blob to diff
+  // against, so the toggle's affordance lies. Other rows always offer it.
+  if (row && row.op !== "deleted") {
+    host.appendChild(
+      iconButton({
+        title: diffActive ? "Hide diff" : "Show diff vs current",
+        pressed: diffActive,
+        svg: ICON_DIFF,
+        onClick: () => snapshotPreview.toggleDiff(),
+      }),
     );
-    row?.classList.add("active");
-    updateStatus();
-    refreshChunkBoundaries();
-  } catch (err) {
-    console.error("openTrashPreview failed:", err);
-    alert(`preview failed: ${formatError(err)}`);
   }
-}
+  host.appendChild(
+    iconButton({
+      title: "Restore this version",
+      svg: ICON_RESTORE,
+      onClick: () => snapshotPreview.restore(),
+    }),
+  );
+  host.appendChild(
+    iconButton({
+      title: "Close preview",
+      svg: ICON_CLOSE,
+      onClick: () => snapshotPreview.close(),
+    }),
+  );
+});
 
-// Listen for any trash-changing op and re-render. Also clear the preview
-// buffer if the entry being previewed was emptied/restored under us.
+// status: note-mutation-buffer-ro-while-in-flight
+// `#mode-controls` renderer for the regular `file` buffer state.
+// Surfaces the "Reformatting…" pill while a `NoteMutation` task is in
+// flight on the active path (so the user knows why the buffer is RO).
+// The dirty-buffer Diff toggle moved to the editor toolbar
+// (`editor-diff-vs-disk-toggle`) so it's always visible alongside Save.
+modeControls?.register("file", (host) => {
+  if (!buffer || buffer.mode.kind !== "file") return;
+  const path = buffer.path;
+  if (inFlightMutationPaths.has(path)) {
+    const pill = document.createElement("span");
+    pill.className = "mode-label mode-label-pending";
+    pill.textContent = "Reformatting…";
+    pill.title = `${path} — note-mutation in progress`;
+    host.appendChild(pill);
+  }
+});
+
+modeControls?.register("trash", (host) => {
+  const label = document.createElement("span");
+  label.className = "mode-label";
+  label.textContent = "Trash preview";
+  const displayPath =
+    buffer?.mode.kind === "trash"
+      ? buffer.mode.displayPath
+      : (buffer?.path ?? "");
+  label.title = `${displayPath} — restore via the trash bin's right-click menu`;
+  host.appendChild(label);
+  host.appendChild(
+    iconButton({
+      title: "Close preview",
+      svg: ICON_CLOSE,
+      onClick: () => trash.closePreview(),
+    }),
+  );
+});
+
+// Watcher overflow toast; trash-changed listener lives inside the trash
+// module now (it owns the cleanup of a previewed entry that vanished).
 void listen("hiker:watcher-overflow", () => {
   showToast("Filesystem watcher fell behind — rescanning…");
 });
 
-void listen("hiker:trash-changed", async () => {
-  await refreshTrashBin();
-  if (buffer?.preview) {
-    const stillThere = trashItems.some(
-      (i) => `.hiker/trash/${i.trashed_name}` === buffer?.path,
-    );
-    if (!stillThere) {
-      buffer = null;
-      view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: "" },
-      });
-      setReadOnly(false);
-      updateStatus();
-    }
-  }
+interface LlmWarningPayload {
+  kind: string;
+  env?: string;
+  message: string;
+}
+// status: llm-providers-config
+// API-key preflight surface (per llm.md §Disable mode): the backend
+// emits this on vault open when [llm].enabled = true and the configured
+// api_key_env is unset, so the user sees the problem before they try to
+// chat. Longer TTL than the default toast so the message is readable.
+void listen<LlmWarningPayload>("hiker:llm-warning", (event) => {
+  showToast(event.payload.message, undefined, 8000);
 });
 
 // ---------- watcher → editor integration ----------
@@ -3690,10 +3018,14 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
     scheduleTreeRefreshFromWatcher();
     // status: vault-home-recent-modified — tree-shape changes can shift
     // which notes are in the top-N; modified-only events update mtimes.
-    scheduleVaultHomeModifiedRefresh();
+    // External edits don't ride core::changes (deferred per `changes-write-path`
+    // notes), so the watcher path keeps refreshing the recents widget directly
+    // for that case. Internal saves are covered by `hiker:changes-appended` →
+    // `refreshOnChangesAppended` upstream.
+    vaultHome.notifyRecentModified();
   } else if (
     ev.kind === "modified"
-    && (treeSortOrder === "mtime-newest" || treeSortOrder === "mtime-oldest")
+    && (tree.getSortOrder() === "mtime-newest" || tree.getSortOrder() === "mtime-oldest")
   ) {
     // Tree *shape* doesn't change on Modified, but mtime-based sort orders
     // depend on per-entry mtime — a save reorders rows. Schedule a refresh
@@ -3702,7 +3034,7 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
     scheduleTreeRefreshFromWatcher();
   }
   if (ev.kind === "modified") {
-    scheduleVaultHomeModifiedRefresh();
+    vaultHome.notifyRecentModified();
   }
   // Don't react while previewing a trash entry or a snapshot — both are
   // read-only views; mutating them would corrupt the user's intent. Trash
@@ -3744,9 +3076,14 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
     if (isDirty()) {
       showToast(`${path} was removed on disk; save to recreate.`);
     } else {
+      // status: editor-tab-strip — drop the tab for the removed path.
+      openBuffers.delete(path);
+      if (previewTabPath === path) previewTabPath = null;
       buffer = null;
+      activePath = null;
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
       updateStatus();
+      tabStrip?.render();
       showToast(`${path} was removed externally`);
     }
     return;

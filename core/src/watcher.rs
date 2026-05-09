@@ -262,6 +262,13 @@ fn has_symlink_ancestor(vault_root: &Path, abs_path: &Path) -> bool {
 
 /// Hard-coded ignore list. Mirrors docs/watcher.md.
 pub fn is_ignored(rel: &str) -> bool {
+    // status: chat-session-show-in-tree-toggle
+    // `.hiker/sessions/` is the one carve-out: session markdown files
+    // ride the indexer (and watcher) so search / related-notes can
+    // surface past investigations regardless of the show-in-tree toggle.
+    if rel.starts_with(".hiker/sessions/") {
+        return false;
+    }
     if rel.starts_with(".hiker/") || rel == ".hiker" {
         return true;
     }

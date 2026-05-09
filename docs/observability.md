@@ -123,7 +123,51 @@ Per-subsystem instrumentation slots already reserved:
 
 ### Frontend bridge [obs-frontend-bridge]
 
-The webview can't emit `tracing` events directly. A `log_from_frontend(level, message, fields)` Tauri command emits the corresponding event server-side. Mostly for surfacing UI-side errors into the unified log. Defer until there's a real frontend error worth catching.
+The webview can't emit `tracing` events directly. A thin Tauri command pipes UI events into the same subscriber so `vault/.hiker/logs/hiker.log` becomes the unified log for both halves of the app. Promoted out of "wait for a real error" once a UI audit found dozens of `console.error` / silent-catch sites scattered across panels with no on-disk trail. Lands alongside the IPC-client refactor (`bug-tauri-invoke-scattered-no-ipc-client`) so per-call IPC errors are logged once at the wrapper, not at every panel.
+
+**Tauri command.** One command, fields-as-payload:
+
+```rust
+#[tauri::command]
+fn log_from_frontend(
+    level: String,        // "error" | "warn" | "info" | "debug" | "trace"
+    target: String,       // dotted module path, e.g. "ui::tree"
+    message: String,      // grep-stable human string
+    fields: serde_json::Map<String, serde_json::Value>, // structured kv
+) { ... }
+```
+
+Inside the command, dispatch on `level` to the matching `tracing::event!` macro with `target = target.as_str()`, the `message`, and each entry of `fields` flattened as `key = %value` (stringify scalars; serialize objects/arrays as compact JSON — same shape as `error = %e`). Unknown levels round-trip as `warn!` with a `level_unknown` field rather than erroring; the bridge should never become the reason a UI error is lost.
+
+**Allowed targets.** Constrain `target` to the prefix `ui::` (panel name as the second segment): `ui::tree`, `ui::discovery`, `ui::chat`, `ui::ipc`, `ui::app`. Reject anything else with a `warn!` and a `bad_target` field — keeps the namespace clean for filtering.
+
+**No content.** The same `obs-no-content` and `obs-no-secrets` rules apply: panels MUST NOT pass note body text, embeddings, or auth tokens through `fields`. Discipline-only — the bridge doesn't strip — but the `Logger` wrapper on the UI side (below) is the canonical place to enforce this; reviewers should reject any `Logger.*` call that includes buffer text.
+
+**UI-side wrapper.** A `ui/src/logger.ts` module owns all calls to the bridge. Public surface:
+
+```ts
+export const Logger = {
+  error(target: UiTarget, message: string, fields?: Fields): void,
+  warn(target: UiTarget, message: string, fields?: Fields): void,
+  info(target: UiTarget, message: string, fields?: Fields): void,
+  debug(target: UiTarget, message: string, fields?: Fields): void,
+};
+```
+
+`UiTarget` is a string-literal union (`"ui::tree" | "ui::discovery" | ...`) so the namespace is type-checked. `Fields` is `Record<string, string | number | boolean>` plus a special `err: unknown` slot that the wrapper passes through `describeErr()` (the existing main-side helper) before sending — so `Logger.error("ui::tree", "refresh failed", { err })` always logs a string, never an `Error` instance. Internally the wrapper calls `invoke("log_from_frontend", { level, target, message, fields })` and, on its own failure, falls back to `console.error` (the bridge dying must not infinite-loop the logger).
+
+The wrapper also dual-writes to the devtools `console.<level>` so dev workflow doesn't change — devtools stay useful, the file just gains parity.
+
+**Migration target.** Every `console.error` / `alert(formatErr(...))` / silent `catch {}` in `ui/src/**` migrates to `Logger.error(...)`. The IPC client (`bug-tauri-invoke-scattered-no-ipc-client`) catches every `invoke` error once and routes through `Logger.error("ui::ipc", "<command> failed", { err, command })` — that single site replaces dozens of per-panel try/catches.
+
+**Levels by site type:**
+
+- `error` — IPC failure that the user can see (toast / red banner / aborted action).
+- `warn` — IPC failure the UI swallows on purpose (e.g. `persistSetting` fire-and-forget — the user already saw the local effect succeed).
+- `info` — vault open/close, panel mount/unmount, settings reload. Low volume, high signal for understanding "what was the app doing when it broke."
+- `debug` — chatty per-event diagnostics (search debounce fired, watcher refresh queued). Off by default once `obs-env-filter` lands; for now, written but filtered by the `INFO` default.
+
+**Out of scope for this slug.** No `console.log` interception, no `window.onerror` global trap, no source-mapped stack traces. Those are useful but each is a follow-up: a dedicated `obs-frontend-uncaught` slug can land later if the `Logger.*` migration leaves blind spots.
 
 ### In-app log viewer
 

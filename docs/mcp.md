@@ -9,7 +9,7 @@ The headline decisions:
 - **rmcp as the implementation library.** Official Anthropic Rust SDK named in `design.md`'s target stack. Same wrap-it-in-our-own-trait discipline as graniet/`llm`: hiker's MCP-facing code defines its own tool surface; the rmcp Server wires it to the wire. [mcp-rmcp-backed]
 - **Read + write tools both.** Read: `search_notes`, `get_note`, `related_notes`. Write: `set_frontmatter`, `apply_tag`, `write_note`. Every write stamps `hiker.author: agent-authored` and appends a `changes.db` row tagged `author='agent:<client-id>'` per `changes.md`. [mcp-tool-surface]
 - **Agent rollback via `core::changes`.** No separate snapshot directory. Agent writes log to `changes.db` like any other write; the home page's agent-activity widget (per `editor.md`) and detail view query that log to render the activity feed and drive rollback. [mcp-rollback-via-changes]
-- **Localhost-trust auth for v3.** No token. The HTTP server binds to `127.0.0.1` only (never an external interface), and any process on the local machine that can reach the port can connect. Token-based auth is deferred until there's a concrete multi-user-machine or shared-host need. The discovery file is local-readable but not network-reachable. [mcp-localhost-trust]
+- **Localhost-trust auth for v3.** No token. The HTTP server defaults to binding `127.0.0.1` only and any process on the local machine that can reach the port can connect. The bind address is configurable per `mcp-bind-host-configurable`; flipping it to a non-loopback interface keeps the same auth model — i.e. *anyone who can reach the port is trusted* — so the settings UI shows a warning when the user picks anything else. Token-based auth is deferred until there's a concrete multi-user-machine or shared-host need. The discovery file is local-readable but not network-reachable. [mcp-localhost-trust]
 - **Random ephemeral port written to a discovery file.** Port chosen by the OS at startup; written to `vault/.hiker/mcp.json` with the URL the agent should connect to. Most security gain over a fixed port; agents read the discovery file (already in the vault directory they have access to). Configurable to a fixed port if a user wants stability for static MCP config. [mcp-port-discovery]
 - **Dynamic capability advertising.** Tools that depend on unbuilt features (`list_trails`, `list_landmarks`, `list_collections`, vision OCR helpers) aren't advertised at `initialize` time. Agents see only what's actually backed by working code. [mcp-dynamic-capabilities]
 
@@ -59,6 +59,21 @@ All writes route through `core::ops` (or directly through the indexer for finer-
 - **`write_note(rel_path: string, content: string, expected_hash?: string)`** — create or replace a note's body. If `expected_hash` is provided, the write is a `write_file_checked` (drift-aware); without it, an unconditional write. Returns the new content hash. Used by agents creating new notes or regenerating content. [mcp-tool-write-note]
 - **`set_frontmatter(rel_path: string, fields: map<string, json>)`** — merge frontmatter fields into a note. Implementation merges into the existing frontmatter via a small frontmatter-aware writer (`core::ops::set_frontmatter`, new — currently `core::vault::write_file` is body-only). Stamps `hiker.author: agent-authored` automatically. Used for tag application, summary writes, status changes. [mcp-tool-set-frontmatter]
 - **`apply_tag(rel_path: string, tag: string)`** / **`remove_tag(rel_path: string, tag: string)`** — convenience wrappers over `set_frontmatter` for the most common case. [mcp-tool-apply-tag]
+
+### Task queue tools
+
+When `core::tasks` lands (per `task-queue.md`), the MCP server gains four more tools so external rmcp clients — Claude Code, Codex, the user's ACP-acting-as-MCP-client — can drain hiker's non-interactive LLM work. The same tools are in-process-dispatched to the basic chat agent's tool set when `[tasks] expose_to_chat_agent = true`, so the queue's checkout/submit surface is one tool registry shared across the chat agent and external clients.
+
+- **`task_checkout(types?, shapes?, min_priority?, lease_secs?)`** — return the next eligible task or null; stamps a lease against the calling rmcp client id. [tasks-mcp-tool-checkout]
+- **`task_submit(task_id, value)`** — write the result; validates against the task's `output_schema` if any. [tasks-mcp-tool-submit]
+- **`task_fail(task_id, error)`** — agent gives up. [tasks-mcp-tool-fail]
+- **`task_heartbeat(task_id)`** — extend the current lease. [tasks-mcp-tool-heartbeat]
+
+Plus a read-only `task_list(states?, types?)` for queue inspection. [tasks-mcp-tool-list]
+
+Two new positive error codes ride this surface: `1006` (`stale_lease`) and `1007` (`schema_violation`). See `task-queue.md` for behavior.
+
+Cancellation is **not** an MCP tool. External agents learn cancellation via `stale_lease` on submit; mid-work cancellation push (rmcp server→client streamable notification) is `task-queue-mcp-cancel-notification`, deferred.
 
 Notably absent from v3:
 
@@ -113,13 +128,14 @@ Why both `changes.db` rows and JSONL entries: `changes.db` is content-change log
 
 rmcp's Streamable HTTP transport: single endpoint accepting POST for client→server messages and GET (with SSE upgrade) for server→client streaming. JSON-RPC 2.0 over the wire.
 
-**Bind address.** `127.0.0.1` only. Never `0.0.0.0`. The server is local-only by construction; users wanting LAN/remote access need to set up their own reverse proxy and own the security implications. [mcp-bind-localhost-only]
+**Bind address.** Default `127.0.0.1` (localhost-only). Configurable in `[mcp] host` for users who need LAN access for an agent on another machine; the settings UI surfaces this as a string field with a warning that anything other than `127.0.0.1` exposes vault contents to whoever can reach the listening port (the auth model is still localhost-trust per `mcp-localhost-trust`, so a non-loopback bind effectively means *trust everyone on the LAN*). Default stays loopback so users have to opt into the broader exposure. `0.0.0.0` is allowed for the all-interfaces case; users running their own reverse proxy can bind there and gate the proxy. [mcp-bind-host-configurable]
 
 **Port.** Default ephemeral (port 0 → OS-assigned). Configurable in `[mcp]`:
 
 ```toml
 [mcp]
 enabled = true                 # turns the whole server on/off
+host = "127.0.0.1"             # bind address; localhost-trust auth requires careful thought before changing
 port = 0                       # 0 = ephemeral; otherwise a fixed port
 discovery_file = ".hiker/mcp.json"   # vault-relative; written on bind, removed on shutdown
 max_top_k = 50                 # cap on agent-requested top_k for search/related
@@ -183,17 +199,54 @@ Full `[mcp]` schema:
 ```toml
 [mcp]
 enabled = true                       # off → server doesn't bind, no MCP
+host = "127.0.0.1"                   # bind address; non-loopback exposes vault — see warning above
 port = 0                             # 0 = ephemeral
 discovery_file = ".hiker/mcp.json"   # vault-relative
 max_top_k = 50
 
 [mcp.tools]
-writes_enabled = true                # gate on/off for the write tools (set_frontmatter / apply_tag / write_note); reads always available when MCP is on
-allow_redacted_lookup = false        # if true, agents passing scope can fetch redacted bodies; default conservative
+# Master gate kept for backwards-compat: when false, every write tool is
+# refused with `1004 disabled` regardless of the per-tool flags below.
+writes_enabled = true
+allow_redacted_lookup = false
+
+# Per-tool toggles. Default true. Independent of `writes_enabled` —
+# flipping this off hides the tool from `agent_tool_defs` and rejects
+# direct rmcp calls with `1004 disabled` even when `writes_enabled` is on.
+search_notes_enabled = true
+get_note_enabled = true
+related_notes_enabled = true
+write_note_enabled = true
+set_frontmatter_enabled = true
+apply_tag_enabled = true
+remove_tag_enabled = true
+task_checkout_enabled = true
+task_submit_enabled = true
+task_fail_enabled = true
+task_heartbeat_enabled = true
+task_list_enabled = true
 
 [mcp.audit]
 log_full_input = false               # mirror of [llm.audit] log_full_prompt; default off
 ```
+
+Per-tool toggles apply live (a flip in the settings pane re-gates the next dispatch immediately, no vault restart). Bind-affecting changes — `enabled` / `host` / `port` / `discovery_file` / `max_top_k` / `audit.log_full_input` — trigger an in-place restart of the MCP server task: the existing handle drops (cancelling the axum task and removing the discovery file), then `hiker_mcp::start(...)` rebinds against the updated config. The restart is done from `set_setting` while keeping the vault session intact. [mcp-tool-toggles, mcp-server-restart-on-config-change, mcp-config-section]
+
+
+## Settings UI section
+
+The settings pane (`settings-pane-section-list`) gets a dedicated `mcp` section with the schema above as interactive rows. [mcp-settings-ui-section]
+
+- **Enabled** — bool. Master gate; when off the server doesn't bind.
+- **Host** — string. Default `127.0.0.1`. The pane renders a warning row underneath when the value is anything other than `127.0.0.1` / `localhost` / `::1` so the user sees the LAN-exposure consequence right where they set it.
+- **Port** — positive integer (`0` = ephemeral). Restart-bound.
+- **Discovery file** — read-only display of the vault-relative path.
+- **Max top-k** — positive integer.
+- **Per-tool toggles** — one bool row per advertised tool, plus the legacy `writes_enabled` master gate. Live-applied.
+- **Allow redacted lookup** — bool. Live-applied.
+- **Log full input** — bool, mirrors `llm.audit.log_full_prompt`.
+
+Defaults to `vault` scope (matches the `[tasks]` section) — MCP config is per-vault by nature (the discovery file lives in the vault). User scope still works for users who want a global default; eligibility list mirrors the toml shape.
 
 Loader and validator land alongside the v3 milestone. Until then the section is unrecognized and `settings-strict-load` will refuse it. [mcp-config-section]
 

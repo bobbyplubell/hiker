@@ -238,6 +238,16 @@ impl IndexerHandle {
         self.progress.subscribe()
     }
 
+    /// status: bug-index-status-polled-not-pushed (fixed)
+    /// Subscribe to status changes (model_ready / queued / total_notes /
+    /// last_error). The Tauri bridge forwards each change as
+    /// `hiker:index-status` so the frontend can drop its 2s `index_status`
+    /// poll. Initial value is observable via `borrow()` on the receiver
+    /// without waiting for the next change.
+    pub fn subscribe_status(&self) -> watch::Receiver<IndexStatus> {
+        self.status.clone()
+    }
+
     /// Clone the auto-tracking job sender. Each `send(IndexJob::Upsert{..})`
     /// updates the pending-paths set so `is_pending` reflects queued jobs
     /// without the caller having to remember.

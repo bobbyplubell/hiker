@@ -52,6 +52,14 @@ async fn boot(config: McpConfig) -> Booted {
     let idx = start_indexer(vault.clone(), store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     });
+    let audit = Arc::new(hiker_core::audit::AgentLog::new(
+        td.path().join(".hiker").join("agent-log"),
+        config.audit.log_full_input,
+    ));
+    let tasks = std::sync::Arc::new(hiker_core::tasks::Queue::new(
+        hiker_core::config::TasksConfig::default(),
+    ));
+    let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
     let deps = McpDeps {
         vault,
         vault_root: td.path().to_path_buf(),
@@ -61,6 +69,11 @@ async fn boot(config: McpConfig) -> Booted {
         changes,
         embedder_provider: idx.embedder_provider(),
         config,
+        tools: mcp_tools,
+        audit,
+        tasks,
+        tasks_config: hiker_core::config::TasksConfig::default(),
+        llm_enabled: false,
     };
     let handle = start(deps).await.expect("start mcp");
     let url = handle.url();
@@ -278,7 +291,7 @@ async fn write_tools_disabled_returns_1004() {
     let cfg = McpConfig {
         tools: McpToolsConfig {
             writes_enabled: false,
-            allow_redacted_lookup: false,
+            ..McpToolsConfig::default()
         },
         ..McpConfig::default()
     };
@@ -377,17 +390,15 @@ async fn audit_redacts_input_when_log_full_input_off() {
         let raw = std::fs::read_to_string(&path).unwrap();
         for line in raw.lines() {
             let row: serde_json::Value = serde_json::from_str(line).unwrap();
-            if row["tool"] == "search_notes" {
+            if row["feature"] == "search_notes" {
                 found = true;
                 assert_eq!(row["surface"], "mcp-tool-call");
                 assert_eq!(row["status"], "ok");
                 // Query should be redacted to a length descriptor, not echoed.
-                assert!(row["input"]["query"].is_object(), "expected redaction object: {row}");
-                assert_eq!(row["input"]["query"]["redacted"], true);
-                assert_eq!(
-                    row["input"]["query"]["len"],
-                    "redactedneedlephrase".len(),
-                );
+                let input = &row["details"]["input"];
+                assert!(input["query"].is_object(), "expected redaction object: {row}");
+                assert_eq!(input["query"]["redacted"], true);
+                assert_eq!(input["query"]["len"], "redactedneedlephrase".len());
                 assert!(
                     !line.contains("redactedneedlephrase"),
                     "raw query leaked: {line}",

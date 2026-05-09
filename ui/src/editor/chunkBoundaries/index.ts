@@ -5,9 +5,10 @@
 // docs/editor.md "View options menu" for the spec — this is a debugging-
 // grade view, useful for sanity-checking chunker behavior.
 //
-// Backend (`tauri-cmd-chunks-for-path`) returns byte offsets. CM6 works in
-// JS string positions (UTF-16 code units), so byte_start is mapped onto a
-// CM line by walking the doc once, accumulating UTF-8 byte counts.
+// Backend (`tauri-cmd-chunks-for-path`) returns both byte offsets and
+// UTF-16 `char_start`/`char_end` populated in core (per
+// `bug-byte-to-char-conversion-in-ui` (fixed)). CM6 works in JS string
+// positions, so we use `char_start` directly with `doc.lineAt`.
 
 import { StateEffect, StateField, type Extension } from "@codemirror/state";
 import {
@@ -21,6 +22,9 @@ export interface ChunkBounds {
   chunk_index: number;
   byte_start: number;
   byte_end: number;
+  /** UTF-16 code-unit offsets, computed in core. */
+  char_start: number;
+  char_end: number;
   heading_path: string | null;
 }
 
@@ -146,39 +150,20 @@ const chunkTheme = EditorView.baseTheme({
   },
 });
 
-/**
- * Convert a UTF-8 byte offset to a CM6 line number (1-indexed). Walks the
- * doc accumulating per-line byte counts; the chunker uses LF-counted byte
- * offsets, so we use `+ 1` per line break (matching the on-disk shape).
- *
- * If the offset falls past the doc, returns the last line.
- */
-export function byteOffsetToLine(view: EditorView, byteOffset: number): number {
-  if (byteOffset <= 0) return 1;
-  const doc = view.state.doc;
-  const enc = new TextEncoder();
-  let bytesSoFar = 0;
-  for (let n = 1; n <= doc.lines; n++) {
-    const ln = doc.line(n);
-    const lineBytes = enc.encode(ln.text).length;
-    // The boundary lands within this line (inclusive of the leading position).
-    if (bytesSoFar + lineBytes >= byteOffset) return n;
-    bytesSoFar += lineBytes + 1;
-    if (bytesSoFar >= byteOffset) return Math.min(n + 1, doc.lines);
-  }
-  return doc.lines;
-}
-
 export function chunkBoundsToState(
   view: EditorView,
   bounds: ChunkBounds[],
 ): ChunkBoundariesState {
   if (bounds.length === 0) return emptyState;
+  const doc = view.state.doc;
   const entries: ChunkLineEntry[] = [];
   for (const b of bounds) {
+    // status: bug-byte-to-char-conversion-in-ui (fixed)
+    // `char_start` is UTF-16 from core; CM6 indexes by code unit too.
+    const pos = Math.min(Math.max(b.char_start, 0), doc.length);
     entries.push({
       chunkIndex: b.chunk_index,
-      lineNumber: byteOffsetToLine(view, b.byte_start),
+      lineNumber: doc.lineAt(pos).number,
     });
   }
   entries.sort((a, b) => a.lineNumber - b.lineNumber);
