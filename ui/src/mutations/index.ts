@@ -20,8 +20,8 @@
 // source_path when the buffer has been closed, per
 // `note-mutation-pending-apply-toast`).
 
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Ipc } from "../ipc";
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 
@@ -39,10 +39,6 @@ interface QueueEventLite {
   // We capture the source_path keyed by task id at queued time so the
   // terminal events (which only carry `id`) can clear in-flight state.
   kind?: { type?: string; source_path?: string };
-}
-
-interface SubmitOutcome {
-  task_id: string;
 }
 
 interface BufferLike {
@@ -151,7 +147,7 @@ export function mountMutationsMenu(
     if (text === null) return;
     const ext = pathExtension(rel) || "md";
     try {
-      await invoke<SubmitOutcome>("submit_note_mutation", {
+      await Ipc.submitNoteMutation({
         rel,
         mutation,
         sourceExtension: ext,

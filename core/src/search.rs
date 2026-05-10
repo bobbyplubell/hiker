@@ -91,7 +91,6 @@ pub struct SearchResponse {
     pub lexical_hits: Vec<NoteHit>,
     pub semantic_hits: Vec<NoteHit>,
     pub fused: Vec<NoteHit>,
-    /// status: bug-search-result-bucket-pick-in-ui (fixed)
     /// Which bucket consumers should render. Both modes on → `fused`
     /// (RRF, capped at FUSED_TOP_K). One mode on → that engine's full
     /// PER_BACKEND_TOP_K-ranked bucket. Both off → empty. Picking lives
@@ -387,7 +386,6 @@ pub fn query(
     })
 }
 
-/// status: bug-search-result-bucket-pick-in-ui (fixed)
 /// Pick the canonical bucket to render given the request's mode flags.
 /// Both modes on → `fused` (RRF over the per-backend results). One mode on
 /// → that engine's full per-backend ranking (no FUSED_TOP_K truncation, so

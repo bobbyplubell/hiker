@@ -80,7 +80,6 @@ pub struct ChangeRow {
     pub content_hash: Option<String>,
     pub rename_from: Option<String>,
     pub metadata: serde_json::Value,
-    /// status: bug-latest-per-path-computed-over-visible-window (fixed)
     /// True when this row is the most recent change for its `path` across
     /// the whole changelog (i.e. its `id` is `MAX(id)` partitioned by
     /// path). Computed by the SQL query, not over a paginated client-side
@@ -90,7 +89,6 @@ pub struct ChangeRow {
     /// `history_for_path` get the up-to-date value.
     #[serde(default)]
     pub is_current: bool,
-    /// status: bug-author-class-string-parsing-in-ui (fixed)
     /// Coarse author classification derived from `author`. The wire format
     /// of `author` is `class[:identifier]`; UIs and filter pills only ever
     /// need the class half, so it's surfaced as a typed enum here rather
@@ -471,7 +469,6 @@ impl Changes {
     }
 }
 
-/// status: bug-latest-per-path-computed-over-visible-window (fixed)
 /// Shared SELECT shape that joins `is_current` (id == MAX(id) partitioned
 /// by path) onto every row. Correlated subquery is fine — the
 /// `changes_path_ts` index makes the per-path MAX cheap.
@@ -669,7 +666,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].op, ChangeOp::Modified);
         assert_eq!(rows[1].op, ChangeOp::Created);
-        // status: bug-latest-per-path-computed-over-visible-window (fixed)
         // Most recent row for `a.md` is the Modified one; the Created row
         // is no longer current.
         assert!(rows[0].is_current);

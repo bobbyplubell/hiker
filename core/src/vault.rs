@@ -75,7 +75,6 @@ impl Vault {
         self.resolve(rel)
     }
 
-    /// status: bug-tree-sort-in-ui (fixed)
     /// List a directory's immediate children, pre-sorted to the configured
     /// order. Folders are always grouped before files (display invariant
     /// shared across UI / CLI / MCP); the chosen order applies *within*
@@ -1061,8 +1060,6 @@ mod tests {
 /// Reject any path whose existing ancestors include a symlink. Components
 /// that don't exist yet (typical for create_note) are fine — we only check
 /// what's currently on disk.
-/// status: bug-tree-sort-in-ui (fixed) — order policy lives next to
-/// `list_dir` so the same comparator runs across UI/CLI/MCP.
 fn compare_entries(a: &DirEntryDto, b: &DirEntryDto, sort_by: TreeSortBy) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match sort_by {

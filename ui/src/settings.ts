@@ -20,7 +20,7 @@
 // other key is read-only with an info popover that opens its file in the
 // system file manager via `reveal_config_file`.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Ipc } from "./ipc";
 
 // Mirror of `core::config::SettingsScope`. Snake-case for serde.
 export type SettingsScope = "user" | "vault";
@@ -52,6 +52,8 @@ export interface SettingsConfig {
     related_open: boolean;
     trash_expanded: boolean;
     chat_height: number;
+    sidebar_width: number;
+    discovery_width: number;
     show_sessions_in_tree: boolean;
     tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
   };
@@ -99,6 +101,8 @@ const DEFAULTS = {
     related_open: false,
     trash_expanded: false,
     chat_height: 0.30,
+    sidebar_width: 280,
+    discovery_width: 320,
     show_sessions_in_tree: false,
     tree: { sort_by: "name_asc" as const },
   },
@@ -489,7 +493,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     // status: settings-pane-manual-refresh
     refresh.addEventListener("click", async () => {
       try {
-        const cfg = await invoke<SettingsConfig>("reload_config");
+        const cfg = await Ipc.reloadConfig();
         deps.onSettingApplied(cfg);
         await render();
       } catch (err) {
@@ -545,7 +549,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
       const lbl = document.createElement("div");
       lbl.className = "settings-row-label";
       lbl.style.fontStyle = "italic";
-      lbl.style.color = "#888";
+      lbl.classList.add("txt-muted");
       lbl.textContent = spec.deferred;
       stub.appendChild(lbl);
       body.appendChild(stub);
@@ -587,11 +591,11 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
 
   async function loadScopedConfig(scope: SettingsScope): Promise<SettingsConfig> {
     try {
-      return await invoke<SettingsConfig>("get_settings_scoped", { scope });
+      return await Ipc.getSettingsScoped({ scope });
     } catch (err) {
       console.error("get_settings_scoped failed:", err);
       // Fall back to the merged in-memory copy so the pane still renders.
-      return await invoke<SettingsConfig>("get_settings");
+      return await Ipc.getSettings();
     }
   }
 
@@ -771,7 +775,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     open.type = "button";
     open.textContent = "Open in file manager";
     open.addEventListener("click", () => {
-      void invoke("reveal_config_file", { scope }).catch((err) => {
+      void Ipc.revealConfigFile({ scope }).catch((err) => {
         console.error("reveal_config_file failed:", err);
       });
       closePopover();
@@ -811,7 +815,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     // which is acceptable in v1. Persist failures fall through silently
     // (logged) — re-rendering would also yank focus.
     try {
-      const cfg = await invoke<SettingsConfig>("set_setting", {
+      const cfg = await Ipc.setSetting({
         scope: writeScope,
         key,
         value,
@@ -834,7 +838,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
       btn.type = "button";
       btn.textContent = scope === "user" ? "Open user config.toml" : "Open vault config.toml";
       btn.addEventListener("click", () => {
-        void invoke("reveal_config_file", { scope }).catch((err) => {
+        void Ipc.revealConfigFile({ scope }).catch((err) => {
           console.error("reveal_config_file failed:", err);
         });
       });

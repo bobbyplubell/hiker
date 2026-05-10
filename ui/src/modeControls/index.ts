@@ -34,14 +34,6 @@ export function iconButton(spec: IconBtnSpec): HTMLButtonElement {
   return btn;
 }
 
-// status: snapshot-preview-diff-toggle (icon)
-export const ICON_DIFF =
-  '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="8" x2="13" y2="8"/><polyline points="5,5 2,8 5,11"/><polyline points="11,5 14,8 11,11"/></svg>';
-export const ICON_RESTORE =
-  '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.5-3.5"/><polyline points="2,2 2,5 5,5"/></svg>';
-export const ICON_CLOSE =
-  '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>';
-
 /// A renderer paints whatever it wants into the supplied host element.
 /// Called every time `render()` fires — should be idempotent.
 export type ModeRenderer = (host: HTMLElement) => void;

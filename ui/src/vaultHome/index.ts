@@ -12,31 +12,19 @@
 // stats-refresh debounce. Snapshot preview / note open are routed back to
 // the host via callbacks so this module never touches the editor.
 
-import { invoke } from "@tauri-apps/api/core";
 import type { ChangeRow, ChangeOp } from "../snapshotPreview";
-
-interface VaultHomeStats {
-  total_notes: number;
-  total_chunks: number;
-  indexed: number;
-  skipped: number;
-  queued: number;
-}
-interface RecentNote {
-  path: string;
-  title: string;
-  mtime: number;
-  last_accessed_at: number | null;
-}
-interface RollbackOutcome {
-  prior_change_id: number;
-  path: string;
-  new_hash: string;
-}
+import { Ipc, type VaultHomeStats, type RecentNote } from "../ipc";
+import { Logger } from "../logger";
+import { Icons } from "../icons";
+import {
+  createPanelController,
+  type PanelController,
+  type PanelDeps,
+} from "../panels/controller";
 
 type DetailView = null | { kind: "recent-activity" };
 
-export interface VaultHomeDeps {
+export interface VaultHomeDeps extends PanelDeps {
   editorPaneEl: HTMLElement;
   vaultHomeEl: HTMLElement;
   homeBtn: HTMLButtonElement;
@@ -55,15 +43,7 @@ export interface VaultHomeDeps {
   activitySectionEl: HTMLElement;
   activityHeaderEl: HTMLElement;
   activityListEl: HTMLElement;
-  formatError: (err: unknown) => string;
   getVaultIsOpen: () => boolean;
-  /// Opening a note exits home view per spec ("clicking any tree row,
-  /// recents entry, or search result restores the editor"). Host owns the
-  /// editor state.
-  onOpenNote: (
-    rel: string,
-    opts?: { preview?: boolean },
-  ) => void | Promise<void>;
   /// Open a snapshot read-only in the editor. Host wires this to
   /// `snapshotPreview.open`.
   onOpenSnapshot: (row: ChangeRow) => void | Promise<void>;
@@ -73,8 +53,9 @@ export interface VaultHomeDeps {
 }
 
 export interface VaultHomeApi {
-  isVisible(): boolean;
-  setVisible(on: boolean): void;
+  // `isVisible` / `setVisible` live on the `PanelController` wrapper,
+  // not the api — host code reads `vaultHome.isVisible()` /
+  // `vaultHome.setVisible(on)` directly off the controller.
   refresh(): Promise<void>;
   showDetail(kind: "recent-activity"): void;
   /// Fired on every `hiker:changes-appended` event. No-op when home isn't
@@ -107,20 +88,26 @@ function relativeTime(unixSecs: number): string {
 
 function authorPillIcon(cls: string): string {
   // status: recent-activity-human-icon, recent-activity-agent-icon
-  if (cls === "user") {
-    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="2.4"/><path d="M3.5 13.5c0-2.4 2-4 4.5-4s4.5 1.6 4.5 4"/></svg>`;
-  }
-  if (cls === "agent") {
-    return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="8" cy="3" r="0.6" fill="currentColor"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/><line x1="6" y1="11.5" x2="10" y2="11.5"/></svg>`;
-  }
-  return `<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/></svg>`;
+  if (cls === "user") return Icons.user();
+  if (cls === "agent") return Icons.robot({ size: 12, strokeWidth: 1.4 });
+  return Icons.dot();
 }
 
 function opLabel(op: ChangeOp): string {
   return op;
 }
 
-export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
+export type VaultHomeController = PanelController<VaultHomeApi>;
+
+// Vault home owns its own visibility — `setVisible(on)` toggles the
+// `home-view` class on the editor pane, hides the panel root, and syncs
+// the home toolbar button. The controller's `setVisible` routes through
+// the shared `onSetVisible` hook so the home button click and any
+// future host-driven flip share one path. `isVisible` reads the editor
+// pane's class rather than a tracked boolean — a few legacy host paths
+// still toggle it directly, and reading the DOM ensures the controller
+// stays in sync if that happens.
+export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   let activeDetailView: DetailView = null;
   const activeAuthorFilters: Set<string> = new Set();
   let allFiltersOnce = false;
@@ -130,14 +117,6 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
 
   function isVisible(): boolean {
     return deps.editorPaneEl.classList.contains("home-view");
-  }
-
-  function setVisible(on: boolean): void {
-    if (on) deps.onBeforeShow?.();
-    deps.editorPaneEl.classList.toggle("home-view", on);
-    deps.vaultHomeEl.hidden = !on;
-    deps.homeBtn.classList.toggle("active", on);
-    if (on) void refresh();
   }
 
   async function refresh(): Promise<void> {
@@ -154,12 +133,12 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
 
   async function refreshStats(): Promise<void> {
     try {
-      const stats = await invoke<VaultHomeStats>("vault_home_stats");
+      const stats = await Ipc.vaultHomeStats();
       renderStats(stats);
     } catch (err) {
-      console.error("vault_home_stats failed:", err);
+      Logger.error("ui::vault-home", "vault_home_stats failed", { err });
       deps.statsBodyEl.replaceChildren(
-        buildStatEmpty(`Failed to load stats: ${deps.formatError(err)}`),
+        buildStatEmpty(`Failed to load stats: ${deps.formatErr(err)}`),
       );
     }
   }
@@ -197,22 +176,68 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
 
   async function refreshRecentModified(): Promise<void> {
     try {
-      const rows = await invoke<RecentNote[]>("recent_notes_modified", { limit: 10 });
+      const rows = await Ipc.recentNotesModified({ limit: 10 });
       renderRecentList(deps.modifiedListEl, rows, "mtime", "No notes indexed yet.");
     } catch (err) {
-      console.error("recent_notes_modified failed:", err);
-      renderRecentList(deps.modifiedListEl, [], "mtime", `Error: ${deps.formatError(err)}`);
+      Logger.error("ui::vault-home", "recent_notes_modified failed", { err });
+      renderRecentList(deps.modifiedListEl, [], "mtime", `Error: ${deps.formatErr(err)}`);
     }
   }
 
   async function refreshRecentAccessed(): Promise<void> {
     try {
-      const rows = await invoke<RecentNote[]>("recent_notes_accessed", { limit: 10 });
+      const rows = await Ipc.recentNotesAccessed({ limit: 10 });
       renderRecentList(deps.accessedListEl, rows, "accessed", "No recently opened notes.");
     } catch (err) {
-      console.error("recent_notes_accessed failed:", err);
-      renderRecentList(deps.accessedListEl, [], "accessed", `Error: ${deps.formatError(err)}`);
+      Logger.error("ui::vault-home", "recent_notes_accessed failed", { err });
+      renderRecentList(deps.accessedListEl, [], "accessed", `Error: ${deps.formatErr(err)}`);
     }
+  }
+
+  // Pure builder for one recent-notes row. No event listeners attached
+  // here — click handling rides container-level delegation on the host
+  // `<ul>` (see `attachRecentListDelegation`). `data-path` carries the
+  // hit's vault-relative path so the delegated handler can resolve back
+  // to it via `closest("[data-path]")`.
+  function domForRecentRow(r: RecentNote, field: "mtime" | "accessed"): HTMLElement {
+    const li = document.createElement("li");
+    li.dataset.path = r.path;
+    const ts = field === "mtime" ? r.mtime : (r.last_accessed_at ?? r.mtime);
+    const when = relativeTime(ts);
+    const nameEl = document.createElement("span");
+    nameEl.className = "name";
+    nameEl.textContent = r.title;
+    const relEl = document.createElement("span");
+    relEl.className = "rel";
+    const parent = r.path.includes("/") ? r.path.slice(0, r.path.lastIndexOf("/")) : "";
+    relEl.textContent = parent;
+    const whenEl = document.createElement("span");
+    whenEl.className = "when";
+    whenEl.textContent = when;
+    whenEl.title = new Date(ts * 1000).toLocaleString();
+    li.append(nameEl, relEl, whenEl);
+    return li;
+  }
+
+  function onRecentListClick(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const row = target.closest<HTMLElement>("li[data-path]");
+    if (!row) return;
+    const rel = row.dataset.path;
+    if (!rel) return;
+    const sticky = e.metaKey || e.ctrlKey;
+    void deps.openNote(rel, { preview: !sticky });
+  }
+
+  // Container-level click delegation. Attached once per list element on
+  // first render to avoid stacking listeners across `replaceChildren`
+  // calls.
+  const wiredRecentLists = new WeakSet<HTMLElement>();
+  function ensureRecentListDelegation(ul: HTMLElement): void {
+    if (wiredRecentLists.has(ul)) return;
+    ul.addEventListener("click", onRecentListClick);
+    wiredRecentLists.add(ul);
   }
 
   function renderRecentList(
@@ -221,6 +246,7 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
     field: "mtime" | "accessed",
     emptyText: string,
   ): void {
+    ensureRecentListDelegation(ul);
     if (rows.length === 0) {
       const li = document.createElement("li");
       li.className = "empty";
@@ -228,34 +254,7 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
       ul.replaceChildren(li);
       return;
     }
-    ul.replaceChildren(
-      ...rows.map((r) => {
-        const li = document.createElement("li");
-        li.dataset.path = r.path;
-        const ts = field === "mtime" ? r.mtime : (r.last_accessed_at ?? r.mtime);
-        const when = relativeTime(ts);
-        const nameEl = document.createElement("span");
-        nameEl.className = "name";
-        nameEl.textContent = r.title;
-        const relEl = document.createElement("span");
-        relEl.className = "rel";
-        const parent = r.path.includes("/") ? r.path.slice(0, r.path.lastIndexOf("/")) : "";
-        relEl.textContent = parent;
-        const whenEl = document.createElement("span");
-        whenEl.className = "when";
-        whenEl.textContent = when;
-        whenEl.title = new Date(ts * 1000).toLocaleString();
-        li.append(nameEl, relEl, whenEl);
-        // status: editor-preview-tab-from-open-callsites
-        // status: editor-preview-tab-mod-click-sticky
-        li.addEventListener("click", (e) => {
-          const sticky = e.metaKey || e.ctrlKey;
-          void deps.onOpenNote(r.path, { preview: !sticky });
-        });
-        ul.appendChild(li);
-        return li;
-      }),
-    );
+    ul.replaceChildren(...rows.map((r) => domForRecentRow(r, field)));
   }
 
   function scheduleStatsRefresh(): void {
@@ -288,9 +287,9 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
     if (!isVisible()) return;
     let count = 0;
     try {
-      count = await invoke<number>("changes_count");
+      count = await Ipc.changesCount();
     } catch (err) {
-      console.error("changes_count failed:", err);
+      Logger.error("ui::vault-home", "changes_count failed", { err });
     }
     if (count <= 0) {
       deps.activitySectionEl.hidden = true;
@@ -300,9 +299,9 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
     deps.activityHeaderEl.textContent = `Recent activity (${count})`;
     let rows: ChangeRow[] = [];
     try {
-      rows = await invoke<ChangeRow[]>("recent_changes", { limit: 5 });
+      rows = await Ipc.recentChanges({ limit: 5 });
     } catch (err) {
-      console.error("recent_changes failed:", err);
+      Logger.error("ui::vault-home", "recent_changes failed", { err });
     }
     deps.activityListEl.replaceChildren(
       ...rows.map((r) => buildActivityPreviewRow(r)),
@@ -360,9 +359,9 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
 
   async function refreshActivityDetail(): Promise<void> {
     try {
-      activityRows = await invoke<ChangeRow[]>("recent_changes", { limit: 200 });
+      activityRows = await Ipc.recentChanges({ limit: 200 });
     } catch (err) {
-      console.error("recent_changes failed:", err);
+      Logger.error("ui::vault-home", "recent_changes failed", { err });
       activityRows = [];
     }
     renderActivityDetail();
@@ -537,11 +536,11 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
     );
     const wasCurrentId = wasCurrentRow?.id ?? null;
     try {
-      await invoke<RollbackOutcome>("restore_snapshot", { changeId: row.id });
+      await Ipc.restoreSnapshot({ changeId: row.id });
       recentlyRestoredFromId = wasCurrentId;
       await refreshActivityDetail();
     } catch (err) {
-      alert(`restore failed: ${deps.formatError(err)}`);
+      alert(`restore failed: ${deps.formatErr(err)}`);
     }
   }
 
@@ -561,21 +560,19 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
 
   // Wire the home button + new-note button.
   deps.homeBtn.addEventListener("click", () => {
-    setVisible(!isVisible());
+    controller.setVisible(!controller.isVisible());
   });
   deps.newNoteBtn.addEventListener("click", async () => {
     try {
-      const created = await invoke<string>("create_note", { folder: "" });
-      await deps.onOpenNote(created);
+      const created = await Ipc.createNote({ folder: "" });
+      await deps.openNote(created);
     } catch (err) {
-      console.error("vault-home new note failed:", err);
-      alert(`new note failed: ${deps.formatError(err)}`);
+      Logger.error("ui::vault-home", "new note failed", { err });
+      alert(`new note failed: ${deps.formatErr(err)}`);
     }
   });
 
-  return {
-    isVisible,
-    setVisible,
+  const api: VaultHomeApi = {
     refresh,
     showDetail,
     notifyChangesAppended,
@@ -584,4 +581,22 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeApi {
     doRestoreSnapshot,
     activeDetailView: () => activeDetailView,
   };
+
+  // Visibility flips the home view on/off. Both the home-button click
+  // (handled inside the module) and any host-driven flip route through
+  // the same `onSetVisible` hook so the editor-pane class, panel root,
+  // toolbar button state, and the on-show refresh share one path.
+  const controller = createPanelController<VaultHomeApi>(api, {
+    initialVisible: isVisible(),
+    applyOnMount: false,
+    onSetVisible: (on) => {
+      if (on) deps.onBeforeShow?.();
+      deps.editorPaneEl.classList.toggle("home-view", on);
+      deps.vaultHomeEl.hidden = !on;
+      deps.homeBtn.classList.toggle("active", on);
+      if (on) void refresh();
+    },
+  });
+
+  return controller;
 }

@@ -3,6 +3,7 @@ mod chat;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
+use hiker_core::autosave::{Autosave, RecoveredEntry, TabState};
 use hiker_core::changes::{ChangeOp, ChangeRow, Changes};
 use hiker_core::config::{Config, SettingsScope, TreeSortBy};
 use hiker_core::indexer::{
@@ -35,6 +36,12 @@ pub(crate) struct VaultSession {
     /// Subscribed by a tokio task that re-emits each append as
     /// `hiker:changes-appended` for the home-page activity widget.
     changes: Arc<Changes>,
+    /// status: autosave-backend-module
+    /// Owns all `<vault>/.hiker/autosave/` writes and recovery. Same
+    /// module-discipline shape as `core::store` / `core::changes` —
+    /// every Tauri `autosave_*` command wraps a 5–15 line call into
+    /// this handle.
+    autosave: Arc<Autosave>,
     /// status: settings-load-once-at-startup
     /// Frozen merged user+vault settings. `set_setting` writes through to
     /// disk via `Config::set` and swaps the in-memory copy in this RwLock.
@@ -252,6 +259,87 @@ fn write_file(
         Ok(())
     })();
     log_cmd_result("write_file", result)
+}
+
+/// Open `rel` for editing — read its bytes and mint an opaque
+/// `BufferToken`. The UI seeds CM6 with `contents` and round-trips the
+/// token verbatim through `commit_buffer`; it never holds the hash.
+#[tauri::command]
+fn open_for_edit(
+    state: State<AppState>,
+    rel: String,
+) -> Result<hiker_core::ops::OpenForEditOutcome, hiker_core::HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
+        hiker_core::ops::open_for_edit(&session.vault, &rel)
+    })();
+    log_cmd_result("open_for_edit", result)
+}
+
+/// Commit a buffer's new text using the drift-check encoded in `token`.
+/// Returns `Written { new_hash, token }` on success or `DriftDetected
+/// { current_disk_text, current_hash }` on conflict — the UI shows its
+/// modal and dispatches to `resolve_drift`.
+#[tauri::command]
+fn commit_buffer(
+    state: State<AppState>,
+    token: hiker_core::ops::BufferToken,
+    new_text: String,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<hiker_core::ops::CommitOutcome, hiker_core::HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
+        hiker_core::ops::commit_buffer(
+            &session.vault,
+            Some(&session.changes),
+            &token,
+            &new_text,
+            extra_metadata.unwrap_or(serde_json::json!({})),
+        )
+    })();
+    log_cmd_result("commit_buffer", result)
+}
+
+/// Dispatch the user's drift-resolution choice. Modal copy + default
+/// focus stay in the UI; this is the typed action surface.
+#[tauri::command]
+fn resolve_drift(
+    state: State<AppState>,
+    rel: String,
+    choice: hiker_core::ops::DriftChoice,
+    new_text: String,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<hiker_core::ops::DriftResolution, hiker_core::HikerError> {
+    let result = (|| {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| hiker_core::HikerError::Io("lock poisoned".into()))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| hiker_core::HikerError::Io("no vault open".into()))?;
+        hiker_core::ops::resolve_drift(
+            &session.vault,
+            Some(&session.changes),
+            &rel,
+            choice,
+            &new_text,
+            extra_metadata.unwrap_or(serde_json::json!({})),
+        )
+    })();
+    log_cmd_result("resolve_drift", result)
 }
 
 #[tauri::command]
@@ -704,6 +792,13 @@ async fn open_vault_at_inner(
         Changes::open(&root).map_err(|e| HikerError::Io(format!("changes db: {e}")))?,
     );
 
+    // status: autosave-backend-module, autosave-store-layout
+    // Open the per-vault autosave store. Failure is fatal at vault open
+    // (a future tick would just keep failing silently otherwise).
+    let autosave = Arc::new(
+        Autosave::open(&root).map_err(|e| HikerError::Io(format!("autosave: {e}")))?,
+    );
+
     // One-shot retention pass at vault open. Bounds storage without a
     // periodic task; spec calls for "low-priority job from the indexer
     // task, opportunistically when no other work is queued" — vault open
@@ -788,7 +883,6 @@ async fn open_vault_at_inner(
         }
     });
 
-    // status: bug-index-status-polled-not-pushed (fixed)
     // Forward status snapshots to the frontend so it can drop its 2s poll.
     // Emit the seeded value first (queued/total_notes/last_error are populated
     // before the indexer task even runs), then on every change.
@@ -992,6 +1086,7 @@ async fn open_vault_at_inner(
         indexer,
         watcher,
         changes,
+        autosave,
         config: RwLock::new(config),
         read_store,
         mcp,
@@ -1456,7 +1551,6 @@ fn chunks_for(state: State<AppState>, rel: String) -> Result<Vec<ChunkBounds>, S
                 .map_err(|_| "read_store mutex poisoned".to_string())?;
             read_store.chunk_bounds_for(&rel).map_err(|e| e.to_string())?
         };
-        // status: bug-byte-to-char-conversion-in-ui (fixed)
         // Read the file once and enrich each row's UTF-8 byte offsets with
         // matching UTF-16 char offsets. JS strings (and CM6) index by UTF-16
         // code units, so this saves the frontend from re-doing the encode
@@ -2311,6 +2405,131 @@ async fn submit_note_mutation_inner(
     Ok(NoteMutationSubmitOutcome { task_id })
 }
 
+// ---------- frontend-bridge logger ----------
+
+/// status: obs-frontend-bridge
+/// Wire-side level enum for the `log_from_frontend` command. Tagged via
+/// serde's snake_case so the JS payload `{ level: "error", ... }` round-trips
+/// without an extra string match — Tauri's serde-driven arg deserialization
+/// rejects garbage at the seam rather than at a `match` inside the body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// status: obs-frontend-bridge
+/// Pipe a structured event from the webview into the unified `tracing`
+/// stream so `vault/.hiker/logs/hiker.log` is the single log file for both
+/// halves of the app.
+///
+/// The `target` is constrained by convention to the `ui::` prefix — anything
+/// else is rewritten to `ui::bad_target` and a `bad_target` field is recorded
+/// rather than rejecting; the bridge should never become the reason a UI
+/// error is lost. Each `fields` entry is flattened as a stringified key/value
+/// pair on the event (matching the `error = %e` shape used in core).
+///
+/// Discipline: callers (the `Logger` wrapper in `ui/src/logger.ts`) MUST NOT
+/// pass note body text, embeddings, or auth tokens through `fields`. Same
+/// `obs-no-content` / `obs-no-secrets` rule that applies to every other
+/// event in the system.
+#[tauri::command]
+fn log_from_frontend(
+    level: LogLevel,
+    target: String,
+    message: String,
+    fields: serde_json::Value,
+) {
+    // Flatten `fields` (expected to be an object) into a single compact JSON
+    // string so the event carries one structured `fields` value rather than a
+    // dynamic field set — `tracing::event!` field names are `'static` and
+    // can't be built from a runtime map. Compact JSON keeps grep behavior
+    // sane: fields land as `fields={"command":"open_vault_at",...}` in the
+    // log line.
+    let fields_str = match &fields {
+        serde_json::Value::Object(_) => fields.to_string(),
+        serde_json::Value::Null => "{}".to_string(),
+        // Non-object payload is a caller bug; log as-is so it's grep-able
+        // rather than dropping it.
+        other => other.to_string(),
+    };
+
+    let target_str = if target.starts_with("ui::") {
+        target.as_str()
+    } else {
+        // Stay in the `ui::` namespace so log filtering by target keeps
+        // working even when a caller passes the wrong shape.
+        "ui::bad_target"
+    };
+    let bad_target: Option<&str> = if target.starts_with("ui::") {
+        None
+    } else {
+        Some(target.as_str())
+    };
+
+    match level {
+        LogLevel::Trace => {
+            tracing::event!(
+                target: "hiker::ui_bridge",
+                tracing::Level::TRACE,
+                ui_target = target_str,
+                fields = %fields_str,
+                bad_target = bad_target,
+                "{}",
+                message
+            );
+        }
+        LogLevel::Debug => {
+            tracing::event!(
+                target: "hiker::ui_bridge",
+                tracing::Level::DEBUG,
+                ui_target = target_str,
+                fields = %fields_str,
+                bad_target = bad_target,
+                "{}",
+                message
+            );
+        }
+        LogLevel::Info => {
+            tracing::event!(
+                target: "hiker::ui_bridge",
+                tracing::Level::INFO,
+                ui_target = target_str,
+                fields = %fields_str,
+                bad_target = bad_target,
+                "{}",
+                message
+            );
+        }
+        LogLevel::Warn => {
+            tracing::event!(
+                target: "hiker::ui_bridge",
+                tracing::Level::WARN,
+                ui_target = target_str,
+                fields = %fields_str,
+                bad_target = bad_target,
+                "{}",
+                message
+            );
+        }
+        LogLevel::Error => {
+            tracing::event!(
+                target: "hiker::ui_bridge",
+                tracing::Level::ERROR,
+                ui_target = target_str,
+                fields = %fields_str,
+                bad_target = bad_target,
+                "{}",
+                message
+            );
+        }
+    }
+}
+
 /// Wire the MCP server up against the vault session's handles. The server
 /// task lives until the returned handle is dropped (which happens when the
 /// `VaultSession` containing it is dropped — i.e. on vault swap or app
@@ -2345,6 +2564,118 @@ async fn start_mcp(
     hiker_mcp::start(deps).await
 }
 
+// status: autosave-backend-module
+// Tauri command surface for the autosave layer. Each command parses args
+// → calls `Autosave::*` → returns DTO; one-to-one with the Rust API per
+// the spec.
+
+fn with_autosave<R>(
+    state: &State<AppState>,
+    f: impl FnOnce(&Autosave) -> Result<R, String>,
+) -> Result<R, String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+    f(&session.autosave)
+}
+
+#[tauri::command]
+fn autosave_write(
+    state: State<AppState>,
+    path: String,
+    contents: String,
+) -> Result<(), String> {
+    // Hash on the backend — frontend doesn't carry a blake3 dep, and
+    // hashing a markdown buffer at 5s tick cadence is sub-millisecond
+    // anyway. Same hash function (blake3) the rest of core uses, so
+    // recover()'s on-disk-hash comparison stays apples-to-apples.
+    let bytes = contents.as_bytes();
+    let buffer_hash = hiker_core::hash_str(&contents);
+    log_cmd_result(
+        "autosave_write",
+        with_autosave(&state, |a| {
+            a.write(&path, bytes, &buffer_hash)
+                .map_err(|e| e.to_string())
+        }),
+    )
+}
+
+#[tauri::command]
+fn autosave_clear(state: State<AppState>, path: String) -> Result<(), String> {
+    log_cmd_result(
+        "autosave_clear",
+        with_autosave(&state, |a| a.clear(&path).map_err(|e| e.to_string())),
+    )
+}
+
+#[tauri::command]
+fn autosave_save_tab_state(
+    state: State<AppState>,
+    state_payload: TabState,
+) -> Result<(), String> {
+    log_cmd_result(
+        "autosave_save_tab_state",
+        with_autosave(&state, |a| {
+            a.save_tab_state(state_payload).map_err(|e| e.to_string())
+        }),
+    )
+}
+
+#[tauri::command]
+fn autosave_load_tab_state(state: State<AppState>) -> Result<Option<TabState>, String> {
+    log_cmd_result(
+        "autosave_load_tab_state",
+        with_autosave(&state, |a| a.load_tab_state().map_err(|e| e.to_string())),
+    )
+}
+
+/// Wire DTO for `autosave_recover` — the autosaved bytes ride as a UTF-8
+/// string since hiker is a markdown editor and the frontend's CM6 can
+/// only restore text-typed content. Non-UTF-8 sidecars (which shouldn't
+/// happen for markdown buffers) become lossy strings; the recovery flow
+/// still surfaces them so the user isn't silently denied their work.
+#[derive(Serialize)]
+struct RecoveredEntryDto {
+    path: String,
+    autosave_id: String,
+    autosaved_content: String,
+    autosaved_hash: String,
+    on_disk_hash: Option<String>,
+    saved_at_ms: i64,
+}
+
+impl From<RecoveredEntry> for RecoveredEntryDto {
+    fn from(e: RecoveredEntry) -> Self {
+        Self {
+            path: e.path,
+            autosave_id: e.autosave_id,
+            autosaved_content: String::from_utf8_lossy(&e.autosaved_content).into_owned(),
+            autosaved_hash: e.autosaved_hash,
+            on_disk_hash: e.on_disk_hash,
+            saved_at_ms: e.saved_at_ms,
+        }
+    }
+}
+
+#[tauri::command]
+fn autosave_recover(state: State<AppState>) -> Result<Vec<RecoveredEntryDto>, String> {
+    log_cmd_result(
+        "autosave_recover",
+        with_autosave(&state, |a| {
+            a.recover()
+                .map(|v| v.into_iter().map(RecoveredEntryDto::from).collect())
+                .map_err(|e| e.to_string())
+        }),
+    )
+}
+
+#[tauri::command]
+fn autosave_discard(state: State<AppState>, path: String) -> Result<(), String> {
+    log_cmd_result(
+        "autosave_discard",
+        with_autosave(&state, |a| a.discard(&path).map_err(|e| e.to_string())),
+    )
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2357,6 +2688,9 @@ pub fn run() {
             read_file_with_hash,
             write_file,
             write_file_checked,
+            open_for_edit,
+            commit_buffer,
+            resolve_drift,
             open_vault_at,
             get_default_vault,
             index,
@@ -2405,6 +2739,13 @@ pub fn run() {
             tasks_cancel,
             task_details,
             submit_note_mutation,
+            autosave_write,
+            autosave_clear,
+            autosave_save_tab_state,
+            autosave_load_tab_state,
+            autosave_recover,
+            autosave_discard,
+            log_from_frontend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

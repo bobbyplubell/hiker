@@ -47,12 +47,12 @@ const frontmatterDecorations = EditorView.decorations.compute(
 
 const frontmatterTheme = EditorView.baseTheme({
   ".cm-frontmatter-folded": {
-    color: "#888",
+    color: "var(--text-muted)",
     fontStyle: "italic",
     fontSize: "0.85em",
     padding: "2px 8px",
-    borderLeft: "2px solid #ccc",
-    backgroundColor: "rgba(0, 0, 0, 0.03)",
+    borderLeft: "2px solid var(--text-default)",
+    backgroundColor: "var(--bg-panel-elevated)",
     cursor: "default",
     userSelect: "none",
   },

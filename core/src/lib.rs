@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod audit;
+pub mod autosave;
 pub mod changes;
 pub mod chunker;
 pub mod config;

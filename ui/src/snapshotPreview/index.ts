@@ -11,12 +11,10 @@
 // vault-home's `doRestoreSnapshot` via the `onRestore` dep so activity rows
 // and the recently-rolled-back highlight refresh correctly.
 
-import { invoke } from "@tauri-apps/api/core";
-import type { EditorView } from "@codemirror/view";
-import type { Compartment, Extension } from "@codemirror/state";
-import { renderDiff, clearDiff, resetDiffDecorations } from "../diff";
+import { Ipc } from "../ipc";
 import { hideFrontmatter } from "../editor/hideFrontmatter";
 import { confirm3 } from "../widgets/confirm";
+import type { EditorHost } from "../app/editor";
 
 export type ChangeOp = "created" | "modified" | "deleted" | "renamed";
 
@@ -40,11 +38,6 @@ export interface ChangeRow {
   is_current: boolean;
 }
 
-interface FileWithHash {
-  contents: string;
-  hash: string;
-}
-
 export type SnapshotBufferMode = {
   kind: "snapshot";
   row: ChangeRow;
@@ -55,30 +48,22 @@ export type SnapshotBufferMode = {
 interface BufferLike {
   path: string;
   loadedText: string;
-  loadedHash: string;
+  /// Snapshot previews are read-only; the token slot is always `null`
+  /// (no commits ride this code path — restore goes through a separate
+  /// Tauri command).
+  token: unknown | null;
   mode: { kind: string } & Record<string, unknown>;
 }
 
 export interface SnapshotPreviewDeps {
-  view: EditorView;
+  editor: EditorHost;
   /// Returns the current open buffer (typed loose to avoid coupling this
   /// module to the host's full Buffer interface — only `mode` discriminator
   /// and a few common fields are read).
   getBuffer: () => BufferLike | null;
   setBuffer: (b: BufferLike | null) => void;
-  language: Compartment;
-  livePreviewCompartment: Compartment;
-  hideFrontmatterCompartment: Compartment;
-  languageExtensionForPath: (rel: string) => Extension;
-  livePreviewExtensionForPath: (rel: string) => Extension;
   getHideFrontmatterEnabled: () => boolean;
-  setReadOnly: (ro: boolean, mode?: "trash" | "snapshot" | null) => void;
-  updateStatus: () => void;
-  refreshChunkBoundaries: () => void;
   renderModeControls: () => void;
-  /// Save-on-switch flow: dirty-buffer guard before opening the preview.
-  isDirty: () => boolean;
-  save: () => Promise<boolean>;
   /// Host reaction when the user closes the preview — typically returns
   /// to the recent-activity detail view.
   onClose: () => void;
@@ -107,7 +92,7 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
 
   async function open(row: ChangeRow): Promise<void> {
     const buffer = deps.getBuffer();
-    if (buffer && deps.isDirty()) {
+    if (buffer && deps.editor.isDirty()) {
       const choice = await confirm3(
         `${buffer.path} has unsaved changes.`,
         "Save & switch",
@@ -116,15 +101,13 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
       );
       if (choice === "cancel") return;
       if (choice === "a") {
-        const ok = await deps.save();
+        const ok = await deps.editor.save();
         if (!ok) return;
       }
     }
     let contents: string | null = null;
     try {
-      contents = await invoke<string | null>("change_content", {
-        changeId: row.id,
-      });
+      contents = await Ipc.changeContent({ changeId: row.id });
     } catch (err) {
       alert(`snapshot preview failed: ${deps.formatError(err)}`);
       return;
@@ -136,25 +119,25 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
       return;
     }
     deps.setBuffer(null);
-    deps.view.dispatch({
-      changes: { from: 0, to: deps.view.state.doc.length, insert: contents },
+    deps.editor.dispatch({
+      changes: { from: 0, to: deps.editor.getDocLength(), insert: contents },
       effects: [
-        deps.language.reconfigure(deps.languageExtensionForPath(row.path)),
-        deps.livePreviewCompartment.reconfigure(
-          deps.livePreviewExtensionForPath(row.path),
+        deps.editor.language.reconfigure(deps.editor.languageExtensionForPath(row.path)),
+        deps.editor.livePreviewCompartment.reconfigure(
+          deps.editor.livePreviewExtensionForPath(row.path),
         ),
       ],
     });
     if (deps.isVaultHomeVisible()) deps.setVaultHomeVisible(false);
     deps.setBuffer({
       path: row.path,
-      loadedText: deps.view.state.doc.toString(),
-      loadedHash: row.content_hash ?? "",
+      loadedText: deps.editor.getActiveText(),
+      token: null,
       mode: { kind: "snapshot", row, changeId: row.id, diffActive: false },
     });
-    deps.setReadOnly(true, "snapshot");
-    deps.updateStatus();
-    deps.refreshChunkBoundaries();
+    deps.editor.setReadOnly(true);
+    deps.editor.updateStatus();
+    deps.editor.refreshChunkBoundaries();
   }
 
   function close(): void {
@@ -162,14 +145,14 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
     if (buffer?.mode.kind !== "snapshot") return;
     // Drop any diff decorations the toggle may have applied so the next
     // buffer doesn't inherit them.
-    resetDiffDecorations(deps.view);
+    deps.editor.resetDiffDecorations();
     deps.setBuffer(null);
-    deps.view.dispatch({
-      changes: { from: 0, to: deps.view.state.doc.length, insert: "" },
+    deps.editor.dispatch({
+      changes: { from: 0, to: deps.editor.getDocLength(), insert: "" },
     });
-    deps.setReadOnly(false, null);
+    deps.editor.setReadOnly(false);
     deps.onClose();
-    deps.updateStatus();
+    deps.editor.updateStatus();
   }
 
   async function toggleDiff(): Promise<void> {
@@ -182,28 +165,27 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
     diffToggleInFlight = true;
     try {
       if (mode.diffActive) {
-        clearDiff(deps.view, buffer.loadedText);
-        deps.view.dispatch({
+        deps.editor.clearDiff(buffer.loadedText);
+        deps.editor.dispatch({
           effects: [
-            deps.livePreviewCompartment.reconfigure(
-              deps.livePreviewExtensionForPath(row.path),
+            deps.editor.livePreviewCompartment.reconfigure(
+              deps.editor.livePreviewExtensionForPath(row.path),
             ),
-            deps.hideFrontmatterCompartment.reconfigure(
+            deps.editor.hideFrontmatterCompartment.reconfigure(
               deps.getHideFrontmatterEnabled() ? hideFrontmatter() : [],
             ),
           ],
         });
         mode.diffActive = false;
         deps.renderModeControls();
-        deps.refreshChunkBoundaries();
+        deps.editor.refreshChunkBoundaries();
         return;
       }
       let currentContent: string;
       try {
-        const cur = await invoke<FileWithHash>("read_file_with_hash", {
-          rel: row.path,
-        });
-        currentContent = cur.contents;
+        // Pure read for the diff target — no token needed since this
+        // is a one-shot read-only comparison, not a commit setup.
+        currentContent = await Ipc.readFile({ rel: row.path });
       } catch (err) {
         alert(`could not load current ${row.path}: ${deps.formatError(err)}`);
         return;
@@ -216,13 +198,13 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
         return;
       }
       const when = new Date(row.timestamp_ms).toLocaleString();
-      deps.view.dispatch({
+      deps.editor.dispatch({
         effects: [
-          deps.livePreviewCompartment.reconfigure([]),
-          deps.hideFrontmatterCompartment.reconfigure([]),
+          deps.editor.livePreviewCompartment.reconfigure([]),
+          deps.editor.hideFrontmatterCompartment.reconfigure([]),
         ],
       });
-      await renderDiff(deps.view, {
+      await deps.editor.renderDiff({
         before: {
           label: `${row.path} · snapshot ${when}`,
           content: buffer.loadedText,
@@ -235,7 +217,7 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
       });
       (after.mode as unknown as SnapshotBufferMode).diffActive = true;
       deps.renderModeControls();
-      deps.refreshChunkBoundaries();
+      deps.editor.refreshChunkBoundaries();
     } finally {
       diffToggleInFlight = false;
     }

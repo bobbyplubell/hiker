@@ -17,38 +17,17 @@
 // search/related epoch counters, and section-collapse state. The host wires
 // DOM ids and the editor-coupled `onOpenNote` / `onScrollToChunk` callbacks.
 
-import { invoke } from "@tauri-apps/api/core";
 import type { ChunkBounds } from "../editor/chunkBoundaries";
+import { Ipc, type RelatedHit, type SearchNoteHit } from "../ipc";
+import { Logger } from "../logger";
+import {
+  createPanelController,
+  type PanelController,
+  type PanelDeps,
+} from "../panels/controller";
+import { Classes, Selectors } from "../style/classes";
 
-interface RelatedHit {
-  note_id: string;
-  path: string;
-  title: string;
-  score: number;
-  best_heading_path: string | null;
-  snippet: string;
-}
-
-interface SearchNoteHit {
-  note_id: string;
-  path: string;
-  title: string;
-  score: number;
-  chunk_id: string;
-  chunk_index: number;
-  heading_path: string | null;
-  snippet: string;
-}
-
-interface SearchResponse {
-  epoch: number;
-  lexical_hits: SearchNoteHit[];
-  semantic_hits: SearchNoteHit[];
-  fused: SearchNoteHit[];
-  hits: SearchNoteHit[];
-}
-
-export interface DiscoveryDeps {
+export interface DiscoveryDeps extends PanelDeps {
   appEl: HTMLElement;
   inputEl: HTMLInputElement;
   clearBtn: HTMLButtonElement;
@@ -61,19 +40,10 @@ export interface DiscoveryDeps {
   relatedSectionEl: HTMLElement;
   relatedListEl: HTMLElement;
   relatedCountEl: HTMLElement;
-  /// Called when the user clicks a result. Host opens the file (and may
-  /// reject via a dirty-buffer guard).
-  onOpenNote: (rel: string, opts?: { preview?: boolean }) => Promise<void>;
-  /// Called after `onOpenNote` completes when the search hit specifies a
+  /// Called after `openNote` completes when the search hit specifies a
   /// chunk_index. Host is responsible for fetching `chunks_for` and
   /// scrolling the editor — this module only signals "open at chunk N."
   onScrollToChunk: (rel: string, chunkIndex: number) => Promise<void>;
-  /// Persist a setting key/value via `set_setting`.
-  persistSetting: (
-    scope: "user" | "vault",
-    key: string,
-    value: unknown,
-  ) => Promise<void>;
   /// Sidebar/related toggle state — focusing the search input expands the
   /// panel via the host's existing toggle mechanism so the existing
   /// persistence and toggle-button sync runs through one path.
@@ -98,7 +68,15 @@ export interface DiscoveryApi {
 
 const SEARCH_DEBOUNCE_MS = 250;
 
-export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
+export type DiscoveryController = PanelController<DiscoveryApi>;
+
+// Discovery's own DOM lives inside `<aside id="discovery">` whose
+// visibility is sidebar-managed by the host (the `appEl.classList`
+// `related-collapsed` flag). The controller exposes
+// `isVisible: () => true; setVisible: noop` per the bug row's guidance —
+// the migration here is purely about moving the factory's API under
+// `controller.api` and bundling cross-panel uniforms (`PanelDeps`).
+export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
   let searchModeSemantic = true;
   let searchModeLexical = true;
   let searchEpoch = 0;
@@ -127,7 +105,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
     else searchModeLexical = on;
     syncToggleButtons();
     if (persist) {
-      void deps.persistSetting("vault", `search.modes.${mode}`, on);
+      void deps.settings.setVaultSetting(`search.modes.${mode}`, on);
       maybeRerunSearchAfterModeChange();
     }
   }
@@ -153,7 +131,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
 
   // status: search-keyboard-nav
   function discoveryRows(list: HTMLElement): HTMLElement[] {
-    return Array.from(list.querySelectorAll<HTMLElement>(".related-item"));
+    return Array.from(list.querySelectorAll<HTMLElement>(Selectors.RELATED_ITEM));
   }
 
   function setRovingTabIndex(list: HTMLElement, idx: number): void {
@@ -177,7 +155,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
 
   function onResultListKeydown(e: KeyboardEvent): void {
     const target = e.target as HTMLElement;
-    if (!target.classList.contains("related-item")) return;
+    if (!target.classList.contains(Classes.RELATED_ITEM)) return;
     const list = target.closest("#search-list, #related-list") as HTMLElement | null;
     if (!list) return;
     const idx = activeRowIndex(list);
@@ -246,7 +224,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
 
   async function runSearch(query: string, epoch: number): Promise<void> {
     try {
-      const resp = await invoke<SearchResponse>("search_vault", {
+      const resp = await Ipc.searchNotes({
         query,
         modes: { semantic: searchModeSemantic, lexical: searchModeLexical },
         epoch,
@@ -256,11 +234,46 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       renderSearchResults(resp.hits);
     } catch (err) {
       if (epoch !== searchEpoch) return;
-      console.error("search_vault failed:", err);
+      Logger.error("ui::discovery", "search_vault failed", { err });
       deps.searchSpinnerEl.hidden = true;
       deps.searchListEl.innerHTML = `<div class="related-empty">Error: ${String(err)}</div>`;
       deps.searchCountEl.textContent = "";
     }
+  }
+
+  // Pure builder for one search-result row. No event listeners attached
+  // here — click handling rides container-level delegation on
+  // `searchListEl` (see the `click` listener wiring below). The row
+  // carries a `data-rel` attribute so the delegated handler can resolve
+  // back to the hit's path; chunk index is carried on `data-chunk-index`
+  // for the scroll-to-chunk follow-up. Keyboard nav stays unchanged
+  // because it dispatches a synthetic `click()` on the focused row,
+  // which the container listener picks up identically.
+  function domForSearchResult(hit: SearchNoteHit): HTMLElement {
+    const item = document.createElement("div");
+    item.className = `${Classes.RELATED_ITEM} search-item`;
+    item.tabIndex = -1;
+    item.setAttribute("role", "option");
+    item.dataset.rel = hit.path;
+    item.dataset.chunkIndex = String(hit.chunk_index);
+
+    const title = document.createElement("div");
+    title.className = "related-item-title";
+    title.textContent = hit.title;
+    item.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "related-item-meta";
+    const heading = hit.heading_path ? `${hit.heading_path} · ` : "";
+    meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
+    item.appendChild(meta);
+
+    const snippet = document.createElement("div");
+    snippet.className = "related-item-snippet";
+    appendSnippetWithMarks(snippet, hit.snippet);
+    item.appendChild(snippet);
+
+    return item;
   }
 
   function renderSearchResults(hits: SearchNoteHit[]): void {
@@ -274,36 +287,33 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       return;
     }
     for (const hit of hits) {
-      const item = document.createElement("div");
-      item.className = "related-item search-item";
-      item.tabIndex = -1;
-      item.setAttribute("role", "option");
-      // status: editor-preview-tab-from-open-callsites
-      // status: editor-preview-tab-mod-click-sticky
-      item.addEventListener("click", (e) => {
-        const sticky = e.metaKey || e.ctrlKey;
-        void openSearchHit(hit, { preview: !sticky });
-      });
-
-      const title = document.createElement("div");
-      title.className = "related-item-title";
-      title.textContent = hit.title;
-      item.appendChild(title);
-
-      const meta = document.createElement("div");
-      meta.className = "related-item-meta";
-      const heading = hit.heading_path ? `${hit.heading_path} · ` : "";
-      meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
-      item.appendChild(meta);
-
-      const snippet = document.createElement("div");
-      snippet.className = "related-item-snippet";
-      appendSnippetWithMarks(snippet, hit.snippet);
-      item.appendChild(snippet);
-
-      deps.searchListEl.appendChild(item);
+      deps.searchListEl.appendChild(domForSearchResult(hit));
     }
     setRovingTabIndex(deps.searchListEl, 0);
+  }
+
+  function onSearchListClick(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const row = target.closest<HTMLElement>("[data-rel]");
+    if (!row || !deps.searchListEl.contains(row)) return;
+    const rel = row.dataset.rel;
+    if (!rel) return;
+    const chunkIndexRaw = row.dataset.chunkIndex;
+    const chunkIndex = chunkIndexRaw !== undefined ? Number(chunkIndexRaw) : NaN;
+    const sticky = e.metaKey || e.ctrlKey;
+    void openSearchHitByPath(rel, Number.isFinite(chunkIndex) ? chunkIndex : null, {
+      preview: !sticky,
+    });
+  }
+
+  async function openSearchHitByPath(
+    rel: string,
+    chunkIndex: number | null,
+    opts?: { preview?: boolean },
+  ): Promise<void> {
+    await deps.openNote(rel, opts);
+    if (chunkIndex !== null) await deps.onScrollToChunk(rel, chunkIndex);
   }
 
   function appendSnippetWithMarks(host: HTMLElement, snippet: string): void {
@@ -331,14 +341,6 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
     }
   }
 
-  async function openSearchHit(
-    hit: SearchNoteHit,
-    opts?: { preview?: boolean },
-  ): Promise<void> {
-    await deps.onOpenNote(hit.path, opts);
-    await deps.onScrollToChunk(hit.path, hit.chunk_index);
-  }
-
   function clear(): void {
     deps.inputEl.value = "";
     searchEpoch += 1;
@@ -358,7 +360,6 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
   }
 
   // status: search-section-collapsible
-  // status: bug-discovery-sections-overlap-after-toggle-cycles (fixed)
   //
   // The previous helper toggled both `[hidden]` on the body AND a
   // `.collapsed` class on the section. CSS using flex layout on the
@@ -391,13 +392,13 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       searchSectionExpanded = expanded;
       applySectionCollapsed(deps.searchSectionEl, deps.searchListEl, expanded);
       if (persist) {
-        void deps.persistSetting("vault", "search.sections.results_expanded", expanded);
+        void deps.settings.setVaultSetting("search.sections.results_expanded", expanded);
       }
     } else {
       relatedSectionExpanded = expanded;
       applySectionCollapsed(deps.relatedSectionEl, deps.relatedListEl, expanded);
       if (persist) {
-        void deps.persistSetting("vault", "search.sections.related_expanded", expanded);
+        void deps.settings.setVaultSetting("search.sections.related_expanded", expanded);
       }
     }
   }
@@ -411,14 +412,46 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       return;
     }
     try {
-      const hits = await invoke<RelatedHit[]>("related_notes", { rel, topK: 10 });
+      const hits = await Ipc.relatedNotes({ rel, topK: 10 });
       if (seq !== relatedRequestSeq) return;
       renderRelated(hits);
     } catch (err) {
       if (seq !== relatedRequestSeq) return;
-      console.error("related_notes failed:", err);
+      Logger.error("ui::discovery", "related_notes failed", { err });
       deps.relatedListEl.innerHTML = `<div class="related-empty">Error: ${String(err)}</div>`;
     }
+  }
+
+  // Pure builder for one related-notes row. No event listeners attached
+  // here — click handling rides container-level delegation on
+  // `relatedListEl`. The row carries `data-rel` so the delegated handler
+  // can resolve back to the hit's path. Keyboard nav (Enter dispatches a
+  // synthetic click on the focused row) is picked up identically by the
+  // delegated listener.
+  function domForRelatedRow(hit: RelatedHit): HTMLElement {
+    const item = document.createElement("div");
+    item.className = Classes.RELATED_ITEM;
+    item.tabIndex = -1;
+    item.setAttribute("role", "option");
+    item.dataset.rel = hit.path;
+
+    const title = document.createElement("div");
+    title.className = "related-item-title";
+    title.textContent = hit.title;
+    item.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "related-item-meta";
+    const heading = hit.best_heading_path ? `${hit.best_heading_path} · ` : "";
+    meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
+    item.appendChild(meta);
+
+    const snippet = document.createElement("div");
+    snippet.className = "related-item-snippet";
+    snippet.textContent = hit.snippet;
+    item.appendChild(snippet);
+
+    return item;
   }
 
   function renderRelated(hits: RelatedHit[]): void {
@@ -432,36 +465,20 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       return;
     }
     for (const hit of hits) {
-      const item = document.createElement("div");
-      item.className = "related-item";
-      item.tabIndex = -1;
-      item.setAttribute("role", "option");
-      // status: editor-preview-tab-from-open-callsites
-      // status: editor-preview-tab-mod-click-sticky
-      item.addEventListener("click", (e) => {
-        const sticky = e.metaKey || e.ctrlKey;
-        void deps.onOpenNote(hit.path, { preview: !sticky });
-      });
-
-      const title = document.createElement("div");
-      title.className = "related-item-title";
-      title.textContent = hit.title;
-      item.appendChild(title);
-
-      const meta = document.createElement("div");
-      meta.className = "related-item-meta";
-      const heading = hit.best_heading_path ? `${hit.best_heading_path} · ` : "";
-      meta.textContent = `${heading}score ${hit.score.toFixed(3)}`;
-      item.appendChild(meta);
-
-      const snippet = document.createElement("div");
-      snippet.className = "related-item-snippet";
-      snippet.textContent = hit.snippet;
-      item.appendChild(snippet);
-
-      deps.relatedListEl.appendChild(item);
+      deps.relatedListEl.appendChild(domForRelatedRow(hit));
     }
     setRovingTabIndex(deps.relatedListEl, 0);
+  }
+
+  function onRelatedListClick(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const row = target.closest<HTMLElement>("[data-rel]");
+    if (!row || !deps.relatedListEl.contains(row)) return;
+    const rel = row.dataset.rel;
+    if (!rel) return;
+    const sticky = e.metaKey || e.ctrlKey;
+    void deps.openNote(rel, { preview: !sticky });
   }
 
   function scheduleRelatedRefresh(rel: string | null, delayMs: number): void {
@@ -479,6 +496,10 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
   deps.toggleLexicalBtn.addEventListener("click", () => {
     setMode("lexical", !searchModeLexical, true);
   });
+  // Container-level click delegation; rows are pure DOM with a
+  // `data-rel` hook the handler resolves via `closest`.
+  deps.searchListEl.addEventListener("click", onSearchListClick);
+  deps.relatedListEl.addEventListener("click", onRelatedListClick);
   deps.searchListEl.addEventListener("keydown", onResultListKeydown);
   deps.relatedListEl.addEventListener("keydown", onResultListKeydown);
   deps.inputEl.addEventListener("input", onSearchInput);
@@ -521,7 +542,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
       setSectionExpanded("related", !relatedSectionExpanded, true);
     });
 
-  return {
+  const api: DiscoveryApi = {
     refreshRelated,
     scheduleRelatedRefresh,
     setMode,
@@ -530,6 +551,13 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryApi {
     clear,
     focusInput,
   };
+  return createPanelController<DiscoveryApi>(api, {
+    initialVisible: true,
+    applyOnMount: false,
+    onSetVisible: () => {
+      // Sidebar-managed; no panel-level visibility toggle.
+    },
+  });
 }
 
 // Re-export `ChunkBounds` consumers may need from here for type imports if

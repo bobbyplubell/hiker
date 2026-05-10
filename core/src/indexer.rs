@@ -238,7 +238,6 @@ impl IndexerHandle {
         self.progress.subscribe()
     }
 
-    /// status: bug-index-status-polled-not-pushed (fixed)
     /// Subscribe to status changes (model_ready / queued / total_notes /
     /// last_error). The Tauri bridge forwards each change as
     /// `hiker:index-status` so the frontend can drop its 2s `index_status`

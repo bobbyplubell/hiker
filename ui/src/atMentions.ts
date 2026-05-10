@@ -12,7 +12,7 @@
 // status: chat-input-at-note
 // status: chat-input-at-autocomplete
 
-import { invoke } from "@tauri-apps/api/core";
+import { Ipc, type AtSuggestion } from "./ipc";
 
 export type ParsedAtToken =
   | { kind: "selection"; start: number; end: number; raw: string }
@@ -23,13 +23,6 @@ export type ParsedAtToken =
       end: number;
       raw: string;
     };
-
-interface AtSuggestion {
-  relPath: string;
-  basename: string;
-  parentDir: string;
-  lastAccessedAt: number | null;
-}
 
 const TOKEN_BODY_RE = /^[A-Za-z0-9/._\-]+/;
 
@@ -218,7 +211,7 @@ export function mountAtMentions(opts: AtMentionsOptions): AtMentionsApi {
     }
     let suggestions: AtSuggestion[] = [];
     try {
-      suggestions = await invoke<AtSuggestion[]>("chat_at_autocomplete", {
+      suggestions = await Ipc.chatAtAutocomplete({
         prefix: ctx.prefix,
         limit: 10,
       });

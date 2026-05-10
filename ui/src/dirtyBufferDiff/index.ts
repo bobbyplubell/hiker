@@ -12,11 +12,9 @@
 // user's editing context — flipping to diff isn't destructive to live
 // editor state.
 
-import { invoke } from "@tauri-apps/api/core";
-import type { EditorView } from "@codemirror/view";
-import type { Compartment, Extension } from "@codemirror/state";
-import { renderDiff, clearDiff } from "../diff";
+import { Ipc } from "../ipc";
 import { hideFrontmatter } from "../editor/hideFrontmatter";
+import type { EditorHost } from "../app/editor";
 
 interface BufferLike {
   path: string;
@@ -30,15 +28,10 @@ interface SavedViewState {
 }
 
 export interface DirtyBufferDiffDeps {
-  view: EditorView;
+  editor: EditorHost;
   getBuffer: () => BufferLike | null;
-  livePreviewCompartment: Compartment;
-  hideFrontmatterCompartment: Compartment;
-  livePreviewExtensionForPath: (rel: string) => Extension;
   getHideFrontmatterEnabled: () => boolean;
-  setReadOnly: (ro: boolean) => void;
   renderModeControls: () => void;
-  refreshChunkBoundaries: () => void;
   formatError: (err: unknown) => string;
 }
 
@@ -60,19 +53,19 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
   let saved: { content: string; view: SavedViewState } | null = null;
 
   function captureViewState(): SavedViewState {
-    const sel = deps.view.state.selection.main;
+    const sel = deps.editor.getState().selection.main;
     return {
       selection: { anchor: sel.anchor, head: sel.head },
-      scrollTop: deps.view.scrollDOM.scrollTop,
+      scrollTop: deps.editor.scrollDOM.scrollTop,
     };
   }
 
   function restoreViewState(s: SavedViewState): void {
-    const docLen = deps.view.state.doc.length;
+    const docLen = deps.editor.getDocLength();
     const anchor = Math.min(s.selection.anchor, docLen);
     const head = Math.min(s.selection.head, docLen);
-    deps.view.dispatch({ selection: { anchor, head } });
-    deps.view.scrollDOM.scrollTop = s.scrollTop;
+    deps.editor.dispatch({ selection: { anchor, head } });
+    deps.editor.scrollDOM.scrollTop = s.scrollTop;
   }
 
   async function toggle(): Promise<void> {
@@ -85,13 +78,13 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
         // Off: restore the live editable buffer + selection + viewport,
         // restore markdown compartments, clear RO.
         const restore = saved;
-        clearDiff(deps.view, restore?.content ?? buffer.loadedText);
-        deps.view.dispatch({
+        deps.editor.clearDiff(restore?.content ?? buffer.loadedText);
+        deps.editor.dispatch({
           effects: [
-            deps.livePreviewCompartment.reconfigure(
-              deps.livePreviewExtensionForPath(buffer.path),
+            deps.editor.livePreviewCompartment.reconfigure(
+              deps.editor.livePreviewExtensionForPath(buffer.path),
             ),
-            deps.hideFrontmatterCompartment.reconfigure(
+            deps.editor.hideFrontmatterCompartment.reconfigure(
               deps.getHideFrontmatterEnabled() ? hideFrontmatter() : [],
             ),
           ],
@@ -99,17 +92,17 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
         if (restore) restoreViewState(restore.view);
         saved = null;
         active = false;
-        deps.setReadOnly(false);
+        deps.editor.setReadOnly(false);
         deps.renderModeControls();
-        deps.refreshChunkBoundaries();
+        deps.editor.refreshChunkBoundaries();
         return;
       }
       // On: snapshot the live buffer state, compute the diff, render.
-      const liveContent = deps.view.state.doc.toString();
+      const liveContent = deps.editor.getActiveText();
       saved = { content: liveContent, view: captureViewState() };
       let result: unknown;
       try {
-        result = await invoke("compute_diff", {
+        result = await Ipc.computeDiff({
           before: buffer.loadedText,
           after: liveContent,
         });
@@ -124,10 +117,10 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
         saved = null;
         return;
       }
-      deps.view.dispatch({
+      deps.editor.dispatch({
         effects: [
-          deps.livePreviewCompartment.reconfigure([]),
-          deps.hideFrontmatterCompartment.reconfigure([]),
+          deps.editor.livePreviewCompartment.reconfigure([]),
+          deps.editor.hideFrontmatterCompartment.reconfigure([]),
         ],
       });
       // `renderDiff` accepts the full `DiffInput` (re-running compute) or,
@@ -136,7 +129,7 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
       // dispatch and decoration application via the IPC result it has
       // already in hand.
       void result; // computed for parity with snapshot's IPC call
-      await renderDiff(deps.view, {
+      await deps.editor.renderDiff({
         before: {
           label: `${buffer.path} · disk`,
           content: buffer.loadedText,
@@ -146,10 +139,10 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
           content: liveContent,
         },
       });
-      deps.setReadOnly(true);
+      deps.editor.setReadOnly(true);
       active = true;
       deps.renderModeControls();
-      deps.refreshChunkBoundaries();
+      deps.editor.refreshChunkBoundaries();
     } finally {
       inFlight = false;
     }
@@ -159,14 +152,14 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
     if (!active) return;
     const buffer = deps.getBuffer();
     const restore = saved;
-    clearDiff(deps.view, restore?.content ?? buffer?.loadedText ?? "");
+    deps.editor.clearDiff(restore?.content ?? buffer?.loadedText ?? "");
     if (buffer && buffer.mode.kind === "file") {
-      deps.view.dispatch({
+      deps.editor.dispatch({
         effects: [
-          deps.livePreviewCompartment.reconfigure(
-            deps.livePreviewExtensionForPath(buffer.path),
+          deps.editor.livePreviewCompartment.reconfigure(
+            deps.editor.livePreviewExtensionForPath(buffer.path),
           ),
-          deps.hideFrontmatterCompartment.reconfigure(
+          deps.editor.hideFrontmatterCompartment.reconfigure(
             deps.getHideFrontmatterEnabled() ? hideFrontmatter() : [],
           ),
         ],
@@ -174,9 +167,9 @@ export function mountDirtyBufferDiff(deps: DirtyBufferDiffDeps): DirtyBufferDiff
     }
     saved = null;
     active = false;
-    deps.setReadOnly(false);
+    deps.editor.setReadOnly(false);
     deps.renderModeControls();
-    deps.refreshChunkBoundaries();
+    deps.editor.refreshChunkBoundaries();
   }
 
   return {

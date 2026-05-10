@@ -16,7 +16,14 @@
 // own state (expanded folders, sort order, debounce, index-state cache);
 // host wires DOM ids and editor-coupled callbacks through `deps`.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Ipc } from "../ipc";
+import { Logger } from "../logger";
+import {
+  createPanelController,
+  type PanelController,
+  type PanelDeps,
+} from "../panels/controller";
+import { Classes, IX_STATE_CLASSES } from "../style/classes";
 
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
@@ -28,16 +35,6 @@ export interface DirEntry {
   rel_path: string;
   kind: EntryKind;
   mtime: number;
-}
-
-interface TrashEntry {
-  id: string;
-  original_path: string;
-  trashed_name: string;
-  original_mtime: number;
-  deleted_at: number;
-  kind: "file" | "folder";
-  members?: string[] | null;
 }
 
 export type IndexState =
@@ -90,12 +87,11 @@ function parentOf(rel: string): string {
 // richer Buffer satisfies this structurally without coupling.
 type BufferLike = { path: string; mode: { kind: string } };
 
-export interface TreeDeps {
+export interface TreeDeps extends PanelDeps {
   treeEl: HTMLElement;
   newNoteBtn: HTMLButtonElement;
   treeActionsBtn: HTMLButtonElement;
   cssEscape: (s: string) => string;
-  formatError: (err: unknown) => string;
   getBuffer: () => BufferLike | null;
   /// True when buffer is a read-only preview (snapshot/trash). Used by the
   /// tree-actions menu's "Reindex this file" gate.
@@ -104,7 +100,6 @@ export interface TreeDeps {
   /// Called when a folder rename's recursive path remap touches the open
   /// buffer's path; host updates `buffer.path` + status.
   isDirty: () => boolean;
-  openFile: (rel: string, opts?: { preview?: boolean }) => Promise<void>;
   /// Called from `deleteFromTree` to clear the buffer when its path falls
   /// inside the deleted subtree.
   clearOpenBufferIfWithin: (deletedRel: string) => void;
@@ -112,11 +107,6 @@ export interface TreeDeps {
   /// Re-render the status-bar index label when the active buffer's index
   /// state resolves lazily.
   renderIndexStatus: () => void;
-  persistSetting: (
-    scope: "user" | "vault",
-    key: string,
-    value: unknown,
-  ) => Promise<void>;
 }
 
 export interface TreeApi {
@@ -133,7 +123,15 @@ export interface TreeApi {
   fetchIndexState(rel: string): Promise<IndexState>;
 }
 
-export function mountTree(deps: TreeDeps): TreeApi {
+export type TreeController = PanelController<TreeApi>;
+
+// The tree panel's visibility is sidebar-managed by the host (the
+// `appEl.classList` `sidebar-collapsed` flag), not flipped at the panel
+// level. The controller exposes `isVisible: () => true; setVisible: noop`
+// per the bug row's guidance — the migration here is purely about moving
+// the factory's API under `controller.api` and bundling cross-panel
+// uniforms (`PanelDeps`).
+export function mountTree(deps: TreeDeps): TreeController {
   // Tracks the folder a "+ New note" click should target.
   let selectedFolder = "";
 
@@ -148,13 +146,13 @@ export function mountTree(deps: TreeDeps): TreeApi {
   const inflightStateFetches = new Set<string>();
 
   async function fetchIndexState(rel: string): Promise<IndexState> {
-    const state = await invoke<IndexState>("index_state_for", { rel });
+    const state = await Ipc.indexStateFor({ rel });
     indexStateCache.set(rel, state);
     return state;
   }
 
   function applyIndexMarker(li: HTMLElement, state: IndexState | null): void {
-    li.classList.remove("ix-unsupported", "ix-skipped", "ix-queued", "ix-indexed");
+    li.classList.remove(...IX_STATE_CLASSES);
     li.removeAttribute("data-ix-reason");
     let marker = li.querySelector<HTMLSpanElement>(":scope > .ix-marker");
     if (state && state.kind !== "indexed") {
@@ -172,20 +170,20 @@ export function mountTree(deps: TreeDeps): TreeApi {
     }
     switch (state.kind) {
       case "unsupported":
-        li.classList.add("ix-unsupported");
+        li.classList.add(Classes.IX_UNSUPPORTED);
         li.removeAttribute("title");
         break;
       case "skipped":
-        li.classList.add("ix-skipped");
+        li.classList.add(Classes.IX_SKIPPED);
         li.dataset.ixReason = state.reason;
         li.title = `Skipped — ${state.reason}`;
         break;
       case "queued":
-        li.classList.add("ix-queued");
+        li.classList.add(Classes.IX_QUEUED);
         li.removeAttribute("title");
         break;
       case "indexed":
-        li.classList.add("ix-indexed");
+        li.classList.add(Classes.IX_INDEXED);
         li.removeAttribute("title");
         break;
     }
@@ -229,7 +227,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
         }
       })
       .catch((err) => {
-        console.error("index_state_for failed:", path, err);
+        Logger.error("ui::tree", "index_state_for failed", { path, err });
       })
       .finally(() => {
         inflightStateFetches.delete(path);
@@ -254,14 +252,14 @@ export function mountTree(deps: TreeDeps): TreeApi {
       e.preventDefault();
       e.stopPropagation();
       if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-      li.classList.add("drop-target");
+      li.classList.add(Classes.DROP_TARGET);
     });
-    li.addEventListener("dragleave", () => li.classList.remove("drop-target"));
+    li.addEventListener("dragleave", () => li.classList.remove(Classes.DROP_TARGET));
 
     li.addEventListener("drop", async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      li.classList.remove("drop-target");
+      li.classList.remove(Classes.DROP_TARGET);
       const from = e.dataTransfer?.getData("text/plain");
       if (!from) return;
       const fromKind =
@@ -285,9 +283,12 @@ export function mountTree(deps: TreeDeps): TreeApi {
     const name = from.split("/").pop()!;
     if (targetFolder === from || targetFolder.startsWith(from + "/")) return;
     const to = targetFolder ? `${targetFolder}/${name}` : name;
-    const cmd = fromKind === "dir" ? "move_folder" : "move_note";
     try {
-      await invoke(cmd, { from, to });
+      if (fromKind === "dir") {
+        await Ipc.moveFolder({ from, to });
+      } else {
+        await Ipc.moveNote({ from, to });
+      }
       const buffer = deps.getBuffer();
       if (buffer) {
         if (buffer.path === from) {
@@ -298,76 +299,51 @@ export function mountTree(deps: TreeDeps): TreeApi {
       }
       await refresh();
     } catch (err) {
-      console.error(`${cmd} failed:`, err);
-      alert(`move failed: ${deps.formatError(err)}`);
+      Logger.error("ui::tree", "move failed", { err });
+      alert(`move failed: ${deps.formatErr(err)}`);
     }
   }
 
+  // Pure builder for one tree row. Produces the `<li>` with `data-path`
+  // and `data-kind` attributes the delegated click handler reads via
+  // `closest("[data-path]")`. No click listener attached here — click
+  // routes through container-level delegation on `treeEl` (see
+  // `onTreeClick`). The inherently per-row dnd / context-menu / dblclick
+  // listeners are still attached at row creation in `renderDir` because
+  // they depend on per-row data the global delegation can't reconstruct
+  // (drag state, inline-rename target, contextmenu items).
+  function domForTreeRow(entry: DirEntry, expanded: boolean): HTMLLIElement {
+    const li = document.createElement("li");
+    li.dataset.path = entry.rel_path;
+    li.dataset.kind = entry.kind;
+    li.draggable = true;
+    renderTreeRowLabel(li, entry, expanded);
+    return li;
+  }
+
   async function renderDir(rel: string, container: HTMLElement): Promise<void> {
-    const entries = await invoke<DirEntry[]>("list_dir", {
+    const entries = await Ipc.listDir({
       rel,
       sort: sortOrderToSettings(treeSortOrder),
     });
     const ul = document.createElement("ul");
     const pendingChildren: Promise<void>[] = [];
     for (const entry of entries) {
-      const li = document.createElement("li");
-      li.dataset.path = entry.rel_path;
-      li.dataset.kind = entry.kind;
-      li.draggable = true;
-      renderTreeRowLabel(li, entry);
+      const expanded = entry.kind === "dir" && expandedFolders.has(entry.rel_path);
+      const li = domForTreeRow(entry, expanded);
       attachDnd(li, entry);
       attachContextMenu(li, entry);
-      if (entry.kind === "dir") {
-        let expanded = expandedFolders.has(entry.rel_path);
-        let childContainer: HTMLElement | null = null;
-        if (expanded) {
-          renderTreeRowLabel(li, entry, true);
-          const path = entry.rel_path;
-          pendingChildren.push(
-            new Promise<void>((resolve) => {
-              queueMicrotask(() => {
-                if (!expanded) {
-                  resolve();
-                  return;
-                }
-                childContainer = document.createElement("div");
-                li.after(childContainer);
-                renderDir(path, childContainer).then(resolve, resolve);
-              });
-            }),
-          );
-        }
-        li.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          if ((e as MouseEvent).detail >= 2) return;
-          selectedFolder = entry.rel_path;
-          if (expanded) {
-            childContainer?.remove();
-            childContainer = null;
-            expanded = false;
-            expandedFolders.delete(entry.rel_path);
-            renderTreeRowLabel(li, entry, false);
-          } else {
-            childContainer = document.createElement("div");
-            li.after(childContainer);
-            await renderDir(entry.rel_path, childContainer);
-            expanded = true;
-            expandedFolders.add(entry.rel_path);
-            renderTreeRowLabel(li, entry, true);
-          }
-        });
-      } else {
-        li.addEventListener("click", (e) => {
-          e.stopPropagation();
-          if ((e as MouseEvent).detail >= 2) return;
-          selectedFolder = parentOf(entry.rel_path);
-          // status: editor-preview-tab-from-open-callsites
-          // status: editor-preview-tab-mod-click-sticky
-          const me = e as MouseEvent;
-          const sticky = me.metaKey || me.ctrlKey;
-          void deps.openFile(entry.rel_path, { preview: !sticky });
-        });
+      if (entry.kind === "dir" && expanded) {
+        const path = entry.rel_path;
+        pendingChildren.push(
+          new Promise<void>((resolve) => {
+            queueMicrotask(() => {
+              const childContainer = document.createElement("div");
+              li.after(childContainer);
+              renderDir(path, childContainer).then(resolve, resolve);
+            });
+          }),
+        );
       }
       li.addEventListener("dblclick", (e) => {
         e.preventDefault();
@@ -379,6 +355,57 @@ export function mountTree(deps: TreeDeps): TreeApi {
     container.appendChild(ul);
     await Promise.all(pendingChildren);
   }
+
+  // Container-level click delegation. Resolves the clicked row via
+  // `closest("[data-path]")`; folder rows toggle expansion through the
+  // `expandedFolders` set + an on-demand child-container DOM mutation,
+  // file rows route through `deps.openNote`. Double-click is suppressed
+  // (the per-row `dblclick` handler owns inline rename).
+  async function onTreeClick(e: MouseEvent): Promise<void> {
+    if (e.detail >= 2) return;
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const li = target.closest<HTMLLIElement>("li[data-path]");
+    if (!li || !deps.treeEl.contains(li)) return;
+    e.stopPropagation();
+    const rel = li.dataset.path ?? "";
+    const kind = li.dataset.kind === "dir" ? "dir" : "file";
+    if (kind === "dir") {
+      selectedFolder = rel;
+      // The child container, when expanded, lives as the next sibling
+      // `<div>` after the `<li>` (see `renderDir`'s expansion path).
+      const next = li.nextElementSibling;
+      const childIsContainer =
+        next instanceof HTMLDivElement && next.previousElementSibling === li;
+      const isExpanded = expandedFolders.has(rel);
+      // Reconstruct an ad-hoc DirEntry for the relabel — only `kind`,
+      // `name`, `rel_path` are read by `renderTreeRowLabel`.
+      const entry: DirEntry = {
+        kind: "dir",
+        name: rel.split("/").pop() ?? rel,
+        rel_path: rel,
+        mtime: 0,
+      };
+      if (isExpanded) {
+        if (childIsContainer) next.remove();
+        expandedFolders.delete(rel);
+        renderTreeRowLabel(li, entry, false);
+      } else {
+        const childContainer = document.createElement("div");
+        li.after(childContainer);
+        await renderDir(rel, childContainer);
+        expandedFolders.add(rel);
+        renderTreeRowLabel(li, entry, true);
+      }
+    } else {
+      selectedFolder = parentOf(rel);
+      const sticky = e.metaKey || e.ctrlKey;
+      void deps.openNote(rel, { preview: !sticky });
+    }
+  }
+  deps.treeEl.addEventListener("click", (e) => {
+    void onTreeClick(e);
+  });
 
   async function refresh(): Promise<void> {
     deps.treeEl.innerHTML = "";
@@ -450,9 +477,12 @@ export function mountTree(deps: TreeDeps): TreeApi {
         if (commit && newName && newName !== name) {
           const parent = parentOf(currentPath);
           const to = parent ? `${parent}/${newName}` : newName;
-          const cmd = kind === "dir" ? "move_folder" : "move_note";
           try {
-            await invoke(cmd, { from: currentPath, to });
+            if (kind === "dir") {
+              await Ipc.moveFolder({ from: currentPath, to });
+            } else {
+              await Ipc.moveNote({ from: currentPath, to });
+            }
             if (kind === "dir") {
               const fromPrefix = currentPath + "/";
               const remapped = new Set<string>();
@@ -480,8 +510,8 @@ export function mountTree(deps: TreeDeps): TreeApi {
               }
             }
           } catch (err) {
-            console.error("rename failed:", err);
-            alert(`rename failed: ${deps.formatError(err)}`);
+            Logger.error("ui::tree", "rename failed", { err });
+            alert(`rename failed: ${deps.formatErr(err)}`);
           }
         }
         await refresh();
@@ -506,7 +536,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
       e.stopPropagation();
       const items: CtxMenuItem[] = [];
       if (entry.kind === "file") {
-        items.push({ label: "Open", run: () => deps.openFile(entry.rel_path) });
+        items.push({ label: "Open", run: () => deps.openNote(entry.rel_path) });
       }
       items.push({
         label: "Rename",
@@ -523,7 +553,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
   }
 
   async function countNotesIn(rel: string): Promise<number> {
-    return invoke<number>("count_notes_in", { rel });
+    return Ipc.countNotesIn({ rel });
   }
 
   async function deleteFromTree(entry: DirEntry): Promise<void> {
@@ -532,7 +562,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
       try {
         memberCount = await countNotesIn(entry.rel_path);
       } catch (err) {
-        console.error("countNotesIn failed:", err);
+        Logger.error("ui::tree", "countNotesIn failed", { err });
       }
     }
     const buffer = deps.getBuffer();
@@ -552,9 +582,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
     if (!ok) return;
 
     try {
-      const result = await invoke<TrashEntry>("delete_note", {
-        rel: entry.rel_path,
-      });
+      const result = await Ipc.deleteNote({ rel: entry.rel_path });
       deps.clearOpenBufferIfWithin(entry.rel_path);
       await refresh();
       const toastMsg =
@@ -565,20 +593,18 @@ export function mountTree(deps: TreeDeps): TreeApi {
         label: "Undo",
         run: async () => {
           try {
-            const restored = await invoke<TrashEntry>("restore_trash_entry", {
-              id: result.id,
-            });
+            const restored = await Ipc.restoreTrashEntry({ id: result.id });
             await refresh();
             showToast(`Restored ${restored.original_path}`);
           } catch (err) {
-            console.error("restore_trash_entry failed:", err);
-            alert(`restore failed: ${deps.formatError(err)}`);
+            Logger.error("ui::tree", "restore_trash_entry failed", { err });
+            alert(`restore failed: ${deps.formatErr(err)}`);
           }
         },
       });
     } catch (err) {
-      console.error("delete_note failed:", err);
-      alert(`delete failed: ${deps.formatError(err)}`);
+      Logger.error("ui::tree", "delete_note failed", { err });
+      alert(`delete failed: ${deps.formatErr(err)}`);
     }
   }
 
@@ -610,8 +636,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
     treeSortOrder = order;
     await refresh();
     if (persist) {
-      void deps.persistSetting(
-        "vault",
+      void deps.settings.setVaultSetting(
         "vault.tree.sort_by",
         sortOrderToSettings(order),
       );
@@ -654,18 +679,16 @@ export function mountTree(deps: TreeDeps): TreeApi {
   // status: create-note-button — toolbar's "+ New note" button.
   deps.newNoteBtn.addEventListener("click", async () => {
     try {
-      const created = await invoke<string>("create_note", {
-        folder: selectedFolder,
-      });
+      const created = await Ipc.createNote({ folder: selectedFolder });
       await refresh();
-      await deps.openFile(created);
+      await deps.openNote(created);
       const li = document.querySelector(
         `#tree li[data-path="${deps.cssEscape(created)}"]`,
       ) as HTMLLIElement | null;
       if (li) await beginInlineRename(li, created);
     } catch (err) {
-      console.error("create_note failed:", err);
-      alert(`new note failed: ${deps.formatError(err)}`);
+      Logger.error("ui::tree", "create_note failed", { err });
+      alert(`new note failed: ${deps.formatErr(err)}`);
     }
   });
 
@@ -688,10 +711,10 @@ export function mountTree(deps: TreeDeps): TreeApi {
         label: "Reindex all",
         run: async () => {
           try {
-            await invoke("index", { scope: { kind: "all" } });
+            await Ipc.index({ scope: { kind: "all" } });
           } catch (err) {
-            console.error("reindex all failed:", err);
-            alert(`reindex failed: ${deps.formatError(err)}`);
+            Logger.error("ui::tree", "reindex all failed", { err });
+            alert(`reindex failed: ${deps.formatErr(err)}`);
           }
         },
       },
@@ -701,12 +724,12 @@ export function mountTree(deps: TreeDeps): TreeApi {
         run: async () => {
           if (!activePath) return;
           try {
-            await invoke("index", {
+            await Ipc.index({
               scope: { kind: "path", rel: activePath },
             });
           } catch (err) {
-            console.error("reindex file failed:", err);
-            alert(`reindex failed: ${deps.formatError(err)}`);
+            Logger.error("ui::tree", "reindex file failed", { err });
+            alert(`reindex failed: ${deps.formatErr(err)}`);
           }
         },
       },
@@ -717,7 +740,7 @@ export function mountTree(deps: TreeDeps): TreeApi {
     ]);
   });
 
-  return {
+  const api: TreeApi = {
     refresh,
     revealPath,
     setSortOrder,
@@ -739,4 +762,12 @@ export function mountTree(deps: TreeDeps): TreeApi {
     },
     fetchIndexState,
   };
+
+  return createPanelController<TreeApi>(api, {
+    initialVisible: true,
+    applyOnMount: false,
+    onSetVisible: () => {
+      // Sidebar-managed; no panel-level visibility toggle.
+    },
+  });
 }

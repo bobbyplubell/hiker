@@ -12,8 +12,20 @@
 // stay strictly separate at the data layer — this module is only the
 // rendering primitive + a small in-memory mirror of each event channel.
 
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Ipc } from "../ipc";
+import { Logger } from "../logger";
+import {
+  createSettingsManager,
+  type SettingsManager,
+} from "../settings/manager";
+import {
+  createPanelController,
+  type PanelController,
+  type PanelDeps,
+} from "../panels/controller";
+import { Classes, Selectors } from "../style/classes";
+import { Icons } from "../icons";
 
 type Priority = "low" | "normal" | "high";
 type TaskShape = "direct" | "agent";
@@ -77,8 +89,8 @@ type QueueEvent =
 // when the LLM-tasks pill is on.
 type FilterPill = "tasks" | "embedding";
 
-const ROBOT_ICON_SVG = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="8" cy="3" r="0.6" fill="currentColor"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/><line x1="6" y1="11.5" x2="10" y2="11.5"/></svg>`;
-const BRAIN_ICON_SVG = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="0.9" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M8 2.4c-1.4-.9-3.3-.4-3.9 1-1.3.1-2.1 1.3-1.7 2.4-.7.7-.6 1.9.2 2.4-.4.8 0 1.9 1 2.2.1 1.2 1.3 2 2.5 1.7.5.7 1.5.9 2.2.4"/><path d="M8 2.4c1.4-.9 3.3-.4 3.9 1 1.3.1 2.1 1.3 1.7 2.4.7.7.6 1.9-.2 2.4.4.8 0 1.9-1 2.2-.1 1.2-1.3 2-2.5 1.7-.5.7-1.5.9-2.2.4"/><path d="M8 2.7v11"/><path d="M5.2 4.6c.5.3.6 1 .2 1.5"/><path d="M3.7 6.9c.6.1 1 .7.8 1.3"/><path d="M4.2 9.3c.6-.1 1.2.3 1.3.9"/><path d="M6.4 11c.5-.3 1.2-.1 1.5.4"/><path d="M10.8 4.6c-.5.3-.6 1-.2 1.5"/><path d="M12.3 6.9c-.6.1-1 .7-.8 1.3"/><path d="M11.8 9.3c-.6-.1-1.2.3-1.3.9"/><path d="M9.6 11c-.5-.3-1.2-.1-1.5.4"/></svg>`;
+const ROBOT_ICON_SVG = Icons.robot();
+const BRAIN_ICON_SVG = Icons.brain();
 
 // status: queue-detail-embedding-row-shape
 // Mirror of `hiker_core::indexer::ProgressEvent` (snake_case discriminant).
@@ -104,20 +116,27 @@ interface IndexRow {
   seq: number;
 }
 
-export interface QueueDetailDeps {
+export interface QueueDetailDeps extends PanelDeps {
   containerEl: HTMLElement;
 }
 
 export interface QueueDetailApi {
-  setVisible(on: boolean): void;
-  isVisible(): boolean;
+  // `isVisible` / `setVisible` live on the `PanelController` wrapper.
   setFilter(f: FilterPill): void;
   /// Tear down event subscriptions. Currently never called (the page
   /// stays mounted for the lifetime of the app).
   destroy(): Promise<void>;
 }
 
-export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
+export type QueueDetailController = PanelController<QueueDetailApi>;
+
+// Queue detail is a full-pane content surface (mounted into
+// `vault-home-queue-detail`). Visibility maps to the container's
+// `hidden` attribute; flipping it on seeds a fresh tasks snapshot so a
+// long-paused page picks up rows that arrived while it was hidden.
+// Both the host's "show queue detail" verb and any future internal
+// trigger route through the controller's single `onSetVisible` hook.
+export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
   const taskRows = new Map<string, TaskRecord>();
   // Cap the embedding mirror so a long-running index pass doesn't grow
   // the local map without bound. Active rows are unbounded (one per
@@ -140,8 +159,8 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
       <h1 id="queue-detail-title">Background work</h1>
     </header>
     <div class="queue-detail-pills vault-home-filters" role="group" aria-label="Background work filters">
-      <button class="toolbar-btn queue-pill filter-pill-icon-only" data-filter="tasks" type="button" title="LLM tasks" aria-label="Toggle LLM tasks">${ROBOT_ICON_SVG}</button>
-      <button class="toolbar-btn queue-pill filter-pill-icon-only" data-filter="embedding" type="button" title="Embedding" aria-label="Toggle embedding tasks">${BRAIN_ICON_SVG}</button>
+      <button class="toolbar-btn ${Classes.QUEUE_PILL} filter-pill-icon-only" data-filter="tasks" type="button" title="LLM tasks" aria-label="Toggle LLM tasks">${ROBOT_ICON_SVG}</button>
+      <button class="toolbar-btn ${Classes.QUEUE_PILL} filter-pill-icon-only" data-filter="embedding" type="button" title="Embedding" aria-label="Toggle embedding tasks">${BRAIN_ICON_SVG}</button>
     </div>
     <div class="queue-detail-toggles" data-section="toggles" hidden>
       <label class="queue-toggle-label">
@@ -174,7 +193,7 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     </section>
   `;
 
-  for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>(".queue-pill"))) {
+  for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>(Selectors.QUEUE_PILLS))) {
     btn.addEventListener("click", () => {
       const f = btn.getAttribute("data-filter") as FilterPill;
       togglePill(f);
@@ -196,38 +215,44 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
   );
   const statusEl = root.querySelector<HTMLElement>("[data-toggle-status]");
 
-  function flashStatus(msg: string, isError = false): void {
-    if (!statusEl) return;
-    statusEl.textContent = msg;
-    statusEl.classList.toggle("error", isError);
-    setTimeout(() => {
-      if (statusEl.textContent === msg) statusEl.textContent = "";
-    }, 2400);
-  }
-
-  async function persistSetting(key: string, value: unknown): Promise<void> {
-    try {
-      await invoke("set_setting", { scope: "vault", key, value });
-      flashStatus("Saved");
-    } catch (e) {
-      console.error(`set_setting ${key} failed:`, e);
-      flashStatus(String(e), true);
-    }
-  }
+  // Local `SettingsManager` that flashes the toggles-tray status string on
+  // success/error. The shared try/catch + Logger.error + flash pattern
+  // lives once in `createSettingsManager`; this surface just supplies the
+  // flash callback so the prior "Saved" / "Error: ..." UX is preserved.
+  const settings: SettingsManager = createSettingsManager({
+    logTarget: "ui::queue-detail",
+    flash: (msg, isError) => {
+      if (!statusEl) return;
+      statusEl.textContent = msg;
+      statusEl.classList.toggle("error", isError);
+      setTimeout(() => {
+        if (statusEl.textContent === msg) statusEl.textContent = "";
+      }, 2400);
+    },
+  });
 
   if (directToggle) {
     directToggle.addEventListener("change", () => {
-      void persistSetting("tasks.direct_worker.enabled", directToggle.checked);
+      void settings.setVaultSetting(
+        "tasks.direct_worker.enabled",
+        directToggle.checked,
+      );
     });
   }
   if (exposeToggle) {
     exposeToggle.addEventListener("change", () => {
-      void persistSetting("tasks.expose_to_chat_agent", exposeToggle.checked);
+      void settings.setVaultSetting(
+        "tasks.expose_to_chat_agent",
+        exposeToggle.checked,
+      );
     });
   }
   if (prefSelect) {
     prefSelect.addEventListener("change", () => {
-      void persistSetting("tasks.worker_preference", prefSelect.value);
+      void settings.setVaultSetting(
+        "tasks.worker_preference",
+        prefSelect.value,
+      );
     });
   }
 
@@ -236,16 +261,20 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     direct_worker: { enabled: boolean };
     expose_to_chat_agent: boolean;
   }
-  void invoke<{ tasks: TasksConfigShape }>("get_settings")
+  void Ipc.getSettings<{ tasks: TasksConfigShape }>()
     .then((cfg) => {
       if (directToggle) directToggle.checked = cfg.tasks.direct_worker.enabled;
       if (exposeToggle) exposeToggle.checked = cfg.tasks.expose_to_chat_agent;
       if (prefSelect) prefSelect.value = cfg.tasks.worker_preference;
     })
-    .catch(() => {});
+    .catch((err) => {
+      Logger.error("ui::queue-detail", "get_settings (tasks pane) failed", {
+        err,
+      });
+    });
 
   function paintPills(): void {
-    for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>(".queue-pill"))) {
+    for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>(Selectors.QUEUE_PILLS))) {
       const f = btn.getAttribute("data-filter") as FilterPill;
       btn.classList.toggle("active", activeFilters.has(f));
     }
@@ -278,6 +307,35 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     render();
   }
   paintPills();
+
+  // Container-level click delegation for queue rows. Cancel buttons
+  // carry `data-action="cancel"`; the row root carries `data-task-id`
+  // (only `core::tasks` rows — embedding rows are inert at the click
+  // layer per `queue-detail-embedding-row-shape`). The delegated
+  // handler resolves both via `closest()` so per-row listeners aren't
+  // re-bound on every `replaceChildren` cycle.
+  root.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const li = target.closest<HTMLElement>("li.queue-row[data-task-id]");
+    if (!li || !root.contains(li)) return;
+    const taskId = li.dataset.taskId;
+    if (!taskId) return;
+    const cancelBtn = target.closest<HTMLElement>('[data-action="cancel"]');
+    if (cancelBtn && li.contains(cancelBtn)) {
+      e.stopPropagation();
+      void Ipc.tasksCancel({ id: taskId }).catch((err) => {
+        Logger.error("ui::queue-detail", "tasks_cancel failed", { err });
+      });
+      return;
+    }
+    // Only the row's head toggles the details panel — clicks inside an
+    // expanded `.queue-row-details` (e.g. on a `<pre>`) must not collapse
+    // the panel out from under the user.
+    const head = target.closest<HTMLElement>(".queue-row-head");
+    if (!head || !li.contains(head)) return;
+    toggleDetails(li, taskId);
+  });
 
   function applyEvent(ev: QueueEvent): void {
     switch (ev.event) {
@@ -339,12 +397,12 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
 
   async function seedSnapshot(): Promise<void> {
     try {
-      const rows = await invoke<TaskRecord[]>("tasks_snapshot");
+      const rows = await Ipc.tasksSnapshot<TaskRecord>();
       taskRows.clear();
       for (const r of rows) taskRows.set(r.id, r);
       render();
     } catch (e) {
-      console.error("tasks_snapshot failed:", e);
+      Logger.error("ui::queue-detail", "tasks_snapshot failed", { err: e });
     }
   }
 
@@ -462,9 +520,14 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
   // another row to swap.
   let expandedTaskId: string | null = null;
 
-  function buildRow(r: TaskRecord, terminal: boolean): HTMLElement {
+  // Pure builder for one task row. No event listeners attached — the
+  // container-level click handler on `root` reads `data-task-id` /
+  // `data-action="cancel"` to dispatch toggle-expand vs. cancel. Cancel
+  // button carries the `data-action="cancel"` hook so the delegated
+  // handler can short-circuit before toggling the row.
+  function domForTaskRow(r: TaskRecord, terminal: boolean): HTMLElement {
     const li = document.createElement("li");
-    li.className = "queue-row";
+    li.className = "queue-row queue-row-clickable";
     li.dataset.taskId = r.id;
     const kindLabel = r.kind.type;
     const head = document.createElement("div");
@@ -479,28 +542,13 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
           ? `<span class="queue-worker">worker: ${escapeHtml(workerLabel(r.worker))}</span>`
           : ""
       }
+      ${
+        terminal
+          ? ""
+          : `<button class="queue-cancel" data-action="cancel" title="Cancel" type="button">✕</button>`
+      }
     `;
     li.appendChild(head);
-    if (!terminal) {
-      const cancel = document.createElement("button");
-      cancel.className = "queue-cancel";
-      cancel.title = "Cancel";
-      cancel.textContent = "✕";
-      cancel.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void invoke("tasks_cancel", { id: r.id }).catch((err) => {
-          console.error("tasks_cancel failed:", err);
-        });
-      });
-      head.appendChild(cancel);
-    }
-    li.classList.add("queue-row-clickable");
-    head.addEventListener("click", (e) => {
-      // The cancel button stops propagation, but be defensive against
-      // future controls living inside the row.
-      if ((e.target as HTMLElement).closest(".queue-cancel")) return;
-      toggleDetails(li, r.id);
-    });
     if (expandedTaskId === r.id) {
       // Re-render kept the row expanded — refetch + repaint the panel
       // so result/error update when the row terminalizes.
@@ -557,7 +605,7 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     panel.innerHTML = `<div class="queue-detail-section queue-detail-loading">Loading…</div>`;
     let details: TaskDetailsDto | null;
     try {
-      details = await invoke<TaskDetailsDto | null>("task_details", { id: taskId });
+      details = await Ipc.taskDetails<TaskDetailsDto>({ id: taskId });
     } catch (err) {
       panel.innerHTML = `<div class="queue-detail-section queue-detail-error">${escapeHtml(
         String(err),
@@ -614,7 +662,11 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
       .replaceAll('"', "&quot;");
   }
 
-  function buildIndexRow(r: IndexRow): HTMLElement {
+  // Pure builder for one embedding-queue row. Stateless, no listeners —
+  // `core::indexer` rows have no per-row cancel (per `queue-detail-
+  // embedding-row-shape`) and no expandable details, so the delegated
+  // click handler on `root` simply ignores them (no `data-task-id`).
+  function domForIndexRow(r: IndexRow): HTMLElement {
     const li = document.createElement("li");
     li.className = "queue-row queue-row-index";
     // Empty priority slot — the indexer doesn't have priorities; the
@@ -643,8 +695,8 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     return li;
   }
 
-  function buildTaskRowWithBadge(r: TaskRecord, terminal: boolean): HTMLElement {
-    const row = buildRow(r, terminal);
+  function domForTaskRowWithBadge(r: TaskRecord, terminal: boolean): HTMLElement {
+    const row = domForTaskRow(r, terminal);
     const badge = document.createElement("span");
     badge.className = "queue-source-badge queue-source-task";
     badge.textContent = "task";
@@ -708,8 +760,8 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     });
 
     const renderItem = (item: ActiveItem | FinishedItem | QueuedItem, terminal: boolean) => {
-      if (item.kind === "task") return buildTaskRowWithBadge(item.row, terminal);
-      return buildIndexRow(item.row);
+      if (item.kind === "task") return domForTaskRowWithBadge(item.row, terminal);
+      return domForIndexRow(item.row);
     };
 
     const activeEl = root.querySelector<HTMLElement>('[data-list="active"]')!;
@@ -720,18 +772,13 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
     finishedEl.replaceChildren(...finished.map((it) => renderItem(it, true)));
   }
 
-  function setVisible(on: boolean): void {
-    visible = on;
-    root.hidden = !on;
-    if (on) {
-      void seedSnapshot();
-    }
-  }
-  setVisible(false);
+  // Initial state: hidden. The DOM is arranged below before the
+  // controller's `onSetVisible` is wired so the helper's `applyOnMount`
+  // doesn't double-fire the seed-snapshot side effect.
+  root.hidden = true;
+  visible = false;
 
-  return {
-    setVisible,
-    isVisible: () => visible,
+  const api: QueueDetailApi = {
     setFilter,
     destroy: async () => {
       if (unlistenQueue) {
@@ -744,4 +791,14 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailApi {
       }
     },
   };
+
+  return createPanelController<QueueDetailApi>(api, {
+    initialVisible: false,
+    applyOnMount: false,
+    onSetVisible: (on) => {
+      visible = on;
+      root.hidden = !on;
+      if (on) void seedSnapshot();
+    },
+  });
 }

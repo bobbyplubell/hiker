@@ -9,24 +9,114 @@
      bottom. When trash is expanded the header keeps this height; the
      list flows above it inside the sidebar's scroll container. */
   --bottom-bar-height: 32px;
-  /* Single source of truth for the accent color used by every active /
-     selected / hover-highlight surface (toggle buttons, tree row hover,
-     trash banner stripe, search-result focus, vault-home recents hover,
-     etc.). Change `--accent` and the matching `rgb` channel below to
-     retheme. Alpha variants are hardcoded rgba so they don't depend on
-     `color-mix` (which some older webviews resolve to invalid, breaking
-     the whole declaration silently). */
+
+  /* ============================================================
+     Color tokens — single source of truth for the whole stylesheet.
+     Rules below reference these only; no rule should reach for a
+     bare hex / rgba literal. The :root { ... } block here is the
+     spot a future `[data-theme="dark"]` (or system-pref media query)
+     can override every visual without touching another selector.
+     ============================================================ */
+
+  /* --- Accent (the "hiker blue" used by every active / selected /
+         focused surface). `--accent-fill*` are hardcoded rgba so
+         older webviews that resolve `color-mix` to invalid don't
+         silently break the whole declaration. --- */
   --accent: #4a90e2;
   --accent-fill: rgba(74, 144, 226, 0.27);
   --accent-fill-strong: rgba(74, 144, 226, 0.20);
   --accent-fill-soft: rgba(74, 144, 226, 0.13);
-  /* Vault-home text palette. `--text-strong` is the highlighted / primary
-     text (filenames in recents, stat tile numbers + labels); `--text-muted`
-     is the secondary text (folder paths, relative-time hints). Swap these
-     to retheme the home page without touching individual rules. */
+  --accent-hover: #3a80d2;
+  --accent-soft-fill: #5588dd33;          /* @-mention selected row */
+  --accent-link: #58a;                    /* chat note links */
+  --accent-link-hover: #6aa8f0;           /* toast action hover */
+  --accent-link-bright: #3b82f6;          /* livePreview link (light) */
+  --accent-link-bright-hover: #60a5fa;    /* livePreview link (dark) */
+  --accent-chunk: #d97757;                /* chunk-boundary rule + gutter */
+  --accent-on-strong: #fff;               /* text on filled accent surface */
+
+  /* --- Text (foreground) ---
+         Strong is the primary text color (filenames, stat-tile values).
+         Default is body / settings / vault-home text.
+         Muted folds together what was previously #888 / #999 / #aaa —
+         the three were within visual rounding of each other and only
+         drifted because each rule picked a fresh hex. */
   --text-strong: #000;
-  --text-muted: #999;
+  --text-default: #ccc;                   /* settings/vault-home body (was #ccc + #ddd) */
+  --text-muted: #999;                     /* secondary (was #888 + #999 + #aaa) */
+  --text-dim: #777;                       /* tertiary / id refs */
+  --text-faint: #555;                     /* disabled rows */
+
+  /* --- Surface overlays (neutral grey alpha — the historical `#888X`
+         family). Theme-agnostic because they're already alpha over
+         whatever bg sits beneath, but pulling them into tokens means
+         a future theme can override the alpha curve in one place. --- */
+  --surface-hover-soft: #8881;
+  --surface-hover: #8882;
+  --surface-active: #8883;
+  --border-default: #8884;
+  --border-strong: #8886;
+
+  /* --- Solid surfaces / dividers --- */
+  --bg-app: #1a1a1a;                      /* base app bg (unused today; declared for future theme) */
+  --bg-popover: #1a1a1a;                  /* settings info popover */
+  --bg-toast: #222;
+  --bg-pre: #0001;                        /* chat-tool-call json bg */
+  --bg-zebra: rgba(255, 255, 255, 0.015); /* settings odd-row */
+  --bg-panel-elevated: rgba(255, 255, 255, 0.03);
+  --bg-panel-elevated-strong: rgba(255, 255, 255, 0.04);
+  --border-panel-strong: rgba(255, 255, 255, 0.06);
+  --border-divider: #2a2a2a;              /* card / list dividers (was #2a2a2a + #2c2c2c) */
+  --border-input: #333;
+
+  /* --- Shadows / overlay washes --- */
+  --shadow-soft: #0003;                   /* popover */
+  --shadow-strong: #0006;                 /* modal / toast / context menu */
+  --bg-overlay-modal: #0008;              /* modal backdrop */
+
+  /* --- Danger / error --- */
+  --danger: #c0392b;                      /* modal-btn-danger, ctx-menu danger */
+  --danger-hover: #a83224;
+  --danger-close-hover: #e81123;          /* window close button hover */
+  --danger-text: #c44;                    /* chat tool-call fail / error msg text */
+  --danger-fill: #c441;                   /* chat error msg bg / session-trash hover */
+  --danger-border: #c44a;
+  --danger-text-strong: #d75d5d;          /* queue error states */
+
+  /* --- Warn / dirty --- */
+  --warn: #e0a040;                        /* dirty dot, skipped marker (was #e0a040 + #f0a020) */
+  --warn-strong: #b88a36;                 /* rolled-back row left-edge */
+  --warn-soft-text: #d2a866;              /* un-rollback prompt text */
+  --warn-fill: rgba(255, 200, 80, 0.04);  /* rolled-back row bg */
+  --highlight-mark: #ffe06688;            /* FTS5 snippet <mark> */
+
+  /* --- Success --- */
+  --success: #4a4;                        /* chat tool-call ok */
+  --success-strong: #6da76d;              /* queue ok */
+
+  /* --- Diff (decoration fills painted into the editor's CM6 view) --- */
+  --diff-add-fill: rgba(60, 180, 100, 0.18);
+  --diff-del-fill: rgba(220, 80, 80, 0.18);
+  --diff-sep-border: rgba(255, 255, 255, 0.12);
+
+  /* --- Live-preview neutral overlays (50% grey alpha — intentionally
+         theme-agnostic, used by livePreview's CM6 baseTheme for inline
+         code + fence-line bg). --- */
+  --lp-code-bg: rgba(127, 127, 127, 0.15);
+  --lp-fence-bg: rgba(127, 127, 127, 0.08);
+
+  /* --- Queue (high-priority chip + active pulse) --- */
+  --queue-pri-high-color: #d68a78;
+  --queue-pri-high-border: #c25a4d66;
+  --queue-active-pulse-color: #5da7e6;
 }
+
+/* ============================================================
+   TS-side helpers — class hooks for *.ts modules that previously
+   set `el.style.color = "#hex"` directly. The class assigns the
+   color from a token so retheming flows through :root above.
+   ============================================================ */
+.txt-muted { color: var(--text-muted); }
 
 #vault-bar,
 #editor-toolbar,
@@ -54,8 +144,14 @@ html, body, #app {
    the rest of the viewport (1fr) so collapsing the sidebar / discovery
    panel still works exactly as before. */
 #app {
+  /* status: side-panel-resize — column widths come from these vars so
+     the resize-handle drag can update them live; defaults match the
+     prior fixed pixel widths. `set_setting("vault.sidebar_width" /
+     "vault.discovery_width", ...)` persists per-vault. */
+  --sidebar-width: 280px;
+  --discovery-width: 320px;
   display: grid;
-  grid-template-columns: 280px 1fr 320px;
+  grid-template-columns: var(--sidebar-width) 1fr var(--discovery-width);
   grid-template-rows: auto 1fr;
 }
 
@@ -67,7 +163,7 @@ html, body, #app {
   gap: 8px;
   min-width: 0;
   padding: 6px 8px;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
   font-size: 12px;
   box-sizing: border-box;
   height: var(--top-bar-height);
@@ -102,10 +198,10 @@ html, body, #app {
   border-radius: 4px;
 }
 .win-ctrl:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 .win-ctrl-close:hover {
-  background: #e81123;
+  background: var(--danger-close-hover);
   color: white;
 }
 
@@ -159,7 +255,7 @@ html, body, #app {
   max-width: 240px;
   padding: 4px 8px;
   background: transparent;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   color: var(--text-muted);
   font-size: 12px;
@@ -169,10 +265,10 @@ html, body, #app {
   box-sizing: border-box;
 }
 .tab:hover {
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 .tab--active {
-  background: #8883;
+  background: var(--surface-active);
   color: var(--text-strong);
 }
 .tab-label {
@@ -207,14 +303,14 @@ html, body, #app {
   padding: 0;
 }
 .tab-close:hover {
-  background: #8883;
+  background: var(--surface-active);
 }
 .tab-dirty-dot {
   flex-shrink: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #f0a020;
+  background: var(--warn);
 }
 /* On hover, swap the dirty dot for a close × per editor-tab-dirty-marker. */
 .tab:hover .tab-dirty-dot {
@@ -225,15 +321,43 @@ html, body, #app {
 }
 
 #app.sidebar-collapsed {
-  grid-template-columns: 0 1fr 320px;
+  grid-template-columns: 0 1fr var(--discovery-width);
 }
 
 #app.related-collapsed {
-  grid-template-columns: 280px 1fr 0;
+  grid-template-columns: var(--sidebar-width) 1fr 0;
 }
 
 #app.sidebar-collapsed.related-collapsed {
   grid-template-columns: 0 1fr 0;
+}
+
+/* status: side-panel-resize — 4px drag handle absolutely positioned over
+   the inner edge of each side column. Sits on top of any column content
+   (z-index above the panel chrome). The collapsed-column rules below
+   hide both panels wholesale, which already hides the handle with them. */
+#sidebar-resize-handle,
+#discovery-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  z-index: 10;
+  cursor: col-resize;
+  background: transparent;
+  user-select: none;
+}
+#sidebar-resize-handle {
+  right: 0;
+}
+#discovery-resize-handle {
+  left: 0;
+}
+#sidebar-resize-handle:hover,
+#sidebar-resize-handle.dragging,
+#discovery-resize-handle:hover,
+#discovery-resize-handle.dragging {
+  background: var(--accent);
 }
 
 #sidebar,
@@ -253,8 +377,9 @@ html, body, #app {
 #sidebar {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #8884;
+  border-right: 1px solid var(--border-default);
   min-height: 0;
+  position: relative;
 }
 
 #vault-bar {
@@ -262,7 +387,7 @@ html, body, #app {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
   font-size: 12px;
 }
 
@@ -294,7 +419,7 @@ html, body, #app {
 #settings-pane {
   overflow: auto;
   padding: 24px 32px 48px;
-  color: #ccc;
+  color: var(--text-default);
   font-size: 13px;
   line-height: 1.45;
 }
@@ -309,7 +434,7 @@ html, body, #app {
   font-size: 20px;
   font-weight: 500;
   margin: 0;
-  color: #ddd;
+  color: var(--text-default);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -317,7 +442,7 @@ html, body, #app {
 }
 .settings-card {
   margin-bottom: 24px;
-  border: 1px solid #2c2c2c;
+  border: 1px solid var(--border-divider);
   border-radius: 4px;
   padding: 0;
 }
@@ -328,7 +453,7 @@ html, body, #app {
   padding: 8px 12px;
   cursor: pointer;
   user-select: none;
-  border-bottom: 1px solid #2c2c2c;
+  border-bottom: 1px solid var(--border-divider);
 }
 .settings-card.collapsed .settings-card-header {
   border-bottom: none;
@@ -337,27 +462,27 @@ html, body, #app {
   width: 12px;
   display: inline-block;
   text-align: center;
-  color: #888;
+  color: var(--text-muted);
 }
 .settings-card-title {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: #aaa;
+  color: var(--text-muted);
   flex: 1;
   min-width: 0;
 }
 .settings-card-deferred-note {
   font-size: 11px;
-  color: #777;
+  color: var(--text-dim);
   font-style: italic;
   flex-shrink: 0;
 }
 /* status: settings-pane-scope-toggle */
 .settings-scope-toggle {
   display: inline-flex;
-  border: 1px solid #333;
+  border: 1px solid var(--border-input);
   border-radius: 3px;
   overflow: hidden;
   flex-shrink: 0;
@@ -388,7 +513,7 @@ html, body, #app {
   min-height: 28px;
 }
 .settings-row:nth-child(odd) {
-  background: rgba(255, 255, 255, 0.015);
+  background: var(--bg-zebra);
 }
 .settings-row-label {
   flex: 1;
@@ -398,7 +523,7 @@ html, body, #app {
 }
 .settings-row-desc {
   font-size: 11px;
-  color: #777;
+  color: var(--text-dim);
   display: block;
   margin-top: 2px;
 }
@@ -420,7 +545,7 @@ html, body, #app {
 /* status: settings-pane-readonly-display */
 .settings-row-info {
   background: transparent;
-  border: 1px solid #333;
+  border: 1px solid var(--border-input);
   border-radius: 50%;
   width: 18px;
   height: 18px;
@@ -428,13 +553,13 @@ html, body, #app {
   align-items: center;
   justify-content: center;
   font-size: 10px;
-  color: #888;
+  color: var(--text-muted);
   cursor: pointer;
 }
 /* status: settings-pane-reset-row */
 .settings-row-reset {
   background: transparent;
-  border: 1px solid #333;
+  border: 1px solid var(--border-input);
   border-radius: 3px;
   color: var(--text-muted);
   font-size: 11px;
@@ -442,15 +567,15 @@ html, body, #app {
   cursor: pointer;
 }
 .settings-row-reset:disabled {
-  color: #555;
+  color: var(--text-faint);
   cursor: default;
 }
 /* Match the shared input shape used by `#search-input` / `.chat-input`:
-   transparent over the surrounding card bg, soft `#8886` border, accent
-   focus outline. Keeps every form field in the app on one set of tokens. */
+   transparent over the surrounding card bg, soft `--border-strong` border,
+   accent focus outline. Keeps every form field in the app on one set of tokens. */
 .settings-row-input {
   background: transparent;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   color: inherit;
   font-size: 12px;
@@ -472,7 +597,7 @@ html, body, #app {
   align-items: center;
   gap: 12px;
   padding-top: 12px;
-  border-top: 1px solid #2c2c2c;
+  border-top: 1px solid var(--border-divider);
   font-size: 11px;
   color: var(--text-muted);
 }
@@ -481,7 +606,7 @@ html, body, #app {
 }
 .settings-footer button {
   background: transparent;
-  border: 1px solid #333;
+  border: 1px solid var(--border-input);
   border-radius: 3px;
   color: var(--text-strong);
   font-size: 11px;
@@ -490,18 +615,18 @@ html, body, #app {
 }
 .settings-popover {
   position: fixed;
-  background: #1a1a1a;
-  border: 1px solid #333;
+  background: var(--bg-popover);
+  border: 1px solid var(--border-input);
   border-radius: 4px;
   padding: 10px 12px;
   font-size: 12px;
   color: var(--text-strong);
   z-index: 1000;
   max-width: 360px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 12px var(--shadow-strong);
 }
 .settings-popover .source {
-  color: #888;
+  color: var(--text-muted);
   font-size: 11px;
   margin-top: 4px;
   word-break: break-all;
@@ -513,7 +638,7 @@ html, body, #app {
 #vault-home {
   overflow: auto;
   padding: 24px 32px 48px;
-  color: #ccc;
+  color: var(--text-default);
   font-size: 13px;
   line-height: 1.45;
 }
@@ -531,7 +656,7 @@ html, body, #app {
   font-size: 20px;
   font-weight: 500;
   margin: 0;
-  color: #ddd;
+  color: var(--text-default);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -552,7 +677,7 @@ html, body, #app {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: #888;
+  color: var(--text-muted);
   margin: 0 0 10px;
 }
 .vault-home-stats-grid {
@@ -580,7 +705,7 @@ html, body, #app {
   margin-top: 2px;
 }
 .vault-home-stat-empty {
-  color: #777;
+  color: var(--text-dim);
   font-style: italic;
 }
 .vault-home-list {
@@ -619,7 +744,7 @@ html, body, #app {
   flex-shrink: 0;
 }
 .vault-home-list .empty {
-  color: #777;
+  color: var(--text-dim);
   font-style: italic;
   padding: 6px 8px;
   cursor: default;
@@ -649,7 +774,7 @@ html, body, #app {
 .activity-id {
   /* Slightly dimmer than other meta so the id reads as ambient ref data
      rather than a primary label. */
-  color: #777;
+  color: var(--text-dim);
 }
 .activity-author {
   display: inline-flex;
@@ -738,15 +863,15 @@ html, body, #app {
   padding: 0;
 }
 .vault-home-activity-detail-list > li {
-  border-top: 1px solid #2a2a2a;
+  border-top: 1px solid var(--border-divider);
   padding: 8px 8px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 .vault-home-activity-detail-list > li.recently-rolled-back {
-  background: rgba(255, 200, 80, 0.04);
-  border-left: 2px solid #b88a36;
+  background: var(--warn-fill);
+  border-left: 2px solid var(--warn-strong);
 }
 .vault-home-activity-detail-list .row-line {
   display: flex;
@@ -783,11 +908,11 @@ html, body, #app {
 }
 .vault-home-activity-detail-list .un-rollback-prompt {
   font-size: 11px;
-  color: #d2a866;
+  color: var(--warn-soft-text);
 }
 
 #vault-path {
-  color: #888;
+  color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -801,7 +926,7 @@ html, body, #app {
   padding: 0 8px;
   height: var(--top-bar-height);
   box-sizing: border-box;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
 }
 
 #new-note-btn {
@@ -809,7 +934,7 @@ html, body, #app {
   font: inherit;
   font-size: 12px;
   padding: 4px 8px;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -817,7 +942,7 @@ html, body, #app {
 }
 
 #new-note-btn:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 .icon-btn {
@@ -829,7 +954,7 @@ html, body, #app {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -838,7 +963,7 @@ html, body, #app {
 }
 
 .icon-btn:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 .icon-btn.active {
@@ -910,7 +1035,7 @@ html, body, #app {
 }
 
 #tree li:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 #tree li.active {
@@ -928,7 +1053,7 @@ html, body, #app {
   display: flex;
   align-items: center;
   padding: 6px 8px;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
   gap: 6px;
 }
 
@@ -944,7 +1069,7 @@ html, body, #app {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -954,7 +1079,7 @@ html, body, #app {
 }
 
 .toolbar-btn:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 .toolbar-btn.active {
@@ -975,7 +1100,7 @@ html, body, #app {
 #discovery {
   display: flex;
   flex-direction: column;
-  border-left: 1px solid #8884;
+  border-left: 1px solid var(--border-default);
   min-height: 0;
   /* `position: relative` anchors the chat session-picker popover, which
      positions itself with `left` / `bottom` against this aside's
@@ -989,7 +1114,7 @@ html, body, #app {
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
   /* status: ui-no-sibling-pushout — input shrinks; toggles never push out */
   min-width: 0;
 }
@@ -999,7 +1124,7 @@ html, body, #app {
   min-width: 0;
   padding: 4px 8px;
   font-size: 13px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -1015,8 +1140,8 @@ html, body, #app {
    the hint (set from JS). The disabled visual cue keeps users from
    typing into a no-op field. */
 #search-input:disabled {
-  color: #888;
-  background: #8881;
+  color: var(--text-muted);
+  background: var(--surface-hover-soft);
   cursor: not-allowed;
 }
 
@@ -1030,7 +1155,7 @@ html, body, #app {
 #search-clear-btn {
   flex: 0 0 auto;
   font-size: 11px;
-  color: #888;
+  color: var(--text-muted);
 }
 
 /* status: chat-panel-detached-scroll — sections region scrolls as a
@@ -1055,7 +1180,7 @@ html, body, #app {
   padding: 2px 6px;
   min-height: 24px;
   background: transparent;
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   cursor: row-resize;
   user-select: none;
   position: relative;
@@ -1063,7 +1188,7 @@ html, body, #app {
 
 #chat-resize-handle:hover,
 #chat-resize-handle.dragging {
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 
 .chat-handle-spacer {
@@ -1086,8 +1211,8 @@ html, body, #app {
 }
 
 .chat-handle-btn:hover {
-  background: #8882;
-  border-color: #8884;
+  background: var(--surface-hover);
+  border-color: var(--border-default);
 }
 
 .chat-handle-btn-square {
@@ -1098,8 +1223,8 @@ html, body, #app {
 }
 
 .chat-handle-btn-square.active {
-  background: #8881;
-  border-color: #8884;
+  background: var(--surface-hover-soft);
+  border-color: var(--border-default);
 }
 
 /* status: chat-session-new-button — left-side dropdown trigger.
@@ -1126,11 +1251,11 @@ html, body, #app {
    above the chat input inside the discovery panel. */
 .chat-at-popover {
   z-index: 25;
-  background: var(--cm-background, #fff);
+  background: var(--cm-background, Canvas);
   color: inherit;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
-  box-shadow: 0 4px 12px #0003;
+  box-shadow: 0 4px 12px var(--shadow-soft);
   min-width: 220px;
   max-width: 360px;
   padding: 4px;
@@ -1148,7 +1273,7 @@ html, body, #app {
 }
 
 .chat-at-popover-row.selected {
-  background: #5588dd33;
+  background: var(--accent-soft-fill);
 }
 
 .chat-at-popover-row.disabled {
@@ -1163,7 +1288,7 @@ html, body, #app {
 
 .chat-at-popover-row-hint {
   flex: 1 1 auto;
-  color: #888;
+  color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
@@ -1173,11 +1298,11 @@ html, body, #app {
 /* Popover floats above the handle inside the discovery panel. */
 .chat-session-menu-popover {
   z-index: 20;
-  background: var(--cm-background, #fff);
+  background: var(--cm-background, Canvas);
   color: inherit;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
-  box-shadow: 0 4px 12px #0003;
+  box-shadow: 0 4px 12px var(--shadow-soft);
   min-width: 220px;
   max-width: 360px;
   padding: 4px;
@@ -1201,16 +1326,16 @@ html, body, #app {
 }
 
 .chat-session-menu-row:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 .chat-session-menu-row.active {
-  background: #8881;
+  background: var(--surface-hover-soft);
   font-weight: 600;
 }
 
 .chat-session-menu-row-new {
-  color: #58a;
+  color: var(--accent-link);
   font-weight: 500;
 }
 
@@ -1225,7 +1350,7 @@ html, body, #app {
   flex: 0 0 auto;
   font-family: ui-monospace, monospace;
   font-size: 10px;
-  color: #888;
+  color: var(--text-muted);
 }
 
 .chat-session-menu-row-label {
@@ -1238,7 +1363,7 @@ html, body, #app {
 .chat-session-menu-row-count {
   flex: 0 0 auto;
   font-size: 10px;
-  color: #888;
+  color: var(--text-muted);
 }
 
 /* status: chat-session-trash */
@@ -1253,7 +1378,7 @@ html, body, #app {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 4px;
-  color: #888;
+  color: var(--text-muted);
   cursor: pointer;
   /* Hidden by default; revealed on row hover so the menu reads cleanly
      when the user is just scanning the list. */
@@ -1266,13 +1391,13 @@ html, body, #app {
 }
 
 .chat-session-menu-row-trash:hover {
-  background: #c441;
-  border-color: #c44a;
-  color: #c44;
+  background: var(--danger-fill);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
 }
 
 .chat-session-menu-sep {
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   margin: 4px 0;
 }
 
@@ -1297,7 +1422,7 @@ html, body, #app {
   min-height: 80px;
   display: flex;
   flex-direction: column;
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   min-width: 0;
 }
 
@@ -1330,7 +1455,7 @@ html, body, #app {
 .chat-msg-role {
   font-size: 10px;
   font-weight: 600;
-  color: #888;
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
@@ -1338,7 +1463,7 @@ html, body, #app {
 .chat-msg-user {
   align-self: flex-end;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-on-strong);
   padding: 6px 10px;
   border-radius: 8px 8px 2px 8px;
   max-width: 85%;
@@ -1379,13 +1504,13 @@ html, body, #app {
 }
 
 .chat-tool-call {
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 6px;
   padding: 6px 8px;
   margin: 4px 0;
   font-family: ui-monospace, monospace;
   font-size: 11px;
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 
 .chat-tool-call-head {
@@ -1393,7 +1518,7 @@ html, body, #app {
   gap: 6px;
   align-items: center;
   font-weight: 600;
-  color: #888;
+  color: var(--text-muted);
 }
 
 .chat-tool-call-args,
@@ -1404,11 +1529,11 @@ html, body, #app {
 }
 
 .chat-tool-call-result.ok {
-  color: #4a4;
+  color: var(--success);
 }
 
 .chat-tool-call-result.fail {
-  color: #c44;
+  color: var(--danger-text);
 }
 
 /* status: chat-panel-tool-call-collapsible */
@@ -1427,7 +1552,7 @@ html, body, #app {
 }
 
 .chat-tool-call-args-summary {
-  color: #888;
+  color: var(--text-muted);
   font-weight: 400;
   flex: 0 1 auto;
   overflow: hidden;
@@ -1436,7 +1561,7 @@ html, body, #app {
 }
 
 .chat-tool-call-result-summary {
-  color: #888;
+  color: var(--text-muted);
   font-weight: 400;
   flex: 1 1 auto;
   overflow: hidden;
@@ -1445,17 +1570,17 @@ html, body, #app {
 }
 
 .chat-tool-call-result-summary.ok {
-  color: #4a4;
+  color: var(--success);
 }
 
 .chat-tool-call-result-summary.fail {
-  color: #c44;
+  color: var(--danger-text);
 }
 
 .chat-tool-call-expanded {
   margin-top: 6px;
   padding-top: 6px;
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1471,7 +1596,7 @@ html, body, #app {
 .chat-tool-call-json {
   margin: 0;
   padding: 4px 6px;
-  background: #0001;
+  background: var(--bg-pre);
   border-radius: 4px;
   font-size: 11px;
   white-space: pre-wrap;
@@ -1486,7 +1611,7 @@ html, body, #app {
 
 /* status: chat-panel-note-link-render */
 .chat-note-link {
-  color: #58a;
+  color: var(--accent-link);
   text-decoration: underline dotted;
   cursor: pointer;
 }
@@ -1501,11 +1626,11 @@ html, body, #app {
   align-items: center;
   padding: 6px 8px;
   margin: 4px 0;
-  border: 1px dashed #8886;
+  border: 1px dashed var(--border-strong);
   border-radius: 6px;
   font-size: 12px;
-  color: #888;
-  background: #8881;
+  color: var(--text-muted);
+  background: var(--surface-hover-soft);
 }
 
 .chat-cap-row button {
@@ -1517,15 +1642,15 @@ html, body, #app {
   align-self: stretch;
   text-align: center;
   font-size: 11px;
-  color: #888;
+  color: var(--text-muted);
   padding: 4px 0;
 }
 
 .chat-msg-error {
   align-self: stretch;
   font-size: 12px;
-  color: #c44;
-  background: #c441;
+  color: var(--danger-text);
+  background: var(--danger-fill);
   padding: 6px 8px;
   border-radius: 6px;
 }
@@ -1544,7 +1669,7 @@ html, body, #app {
   padding: 4px 10px;
   font-size: 18px;
   line-height: 1;
-  color: #888;
+  color: var(--text-muted);
 }
 
 .chat-thinking-dot {
@@ -1569,7 +1694,7 @@ html, body, #app {
   display: flex;
   gap: 6px;
   padding: 6px 8px;
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   align-items: end;
   flex: 0 0 auto;
 }
@@ -1580,7 +1705,7 @@ html, body, #app {
   padding: 6px 8px;
   font-size: 13px;
   font-family: inherit;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -1595,15 +1720,15 @@ html, body, #app {
 }
 
 .chat-input:disabled {
-  color: #888;
-  background: #8881;
+  color: var(--text-muted);
+  background: var(--surface-hover-soft);
 }
 
 .chat-send-btn {
   flex: 0 0 auto;
   padding: 4px 8px;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-on-strong);
   border: none;
   border-radius: 4px;
   cursor: pointer;
@@ -1614,15 +1739,14 @@ html, body, #app {
   cursor: not-allowed;
 }
 
-/* status: bug-discovery-sections-overlap-after-toggle-cycles
-   `#discovery-sections` is the single scroll context (per its
+/* `#discovery-sections` is the single scroll context (per its
    `overflow: auto`). Sections take their natural height — no
    `display: flex` / `min-height: 0` here, otherwise the section's
    inner body's `overflow: auto` competes with the container's scroll
    and one panel ends up visually overlapping the next on expand
    transitions. */
 .discovery-section {
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border-default);
 }
 
 .discovery-section:last-child {
@@ -1636,7 +1760,7 @@ html, body, #app {
   padding: 6px 10px;
   font-size: 12px;
   font-weight: 600;
-  color: #888;
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   cursor: pointer;
@@ -1645,7 +1769,7 @@ html, body, #app {
 }
 
 .discovery-section-header:hover {
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 
 .discovery-chevron {
@@ -1674,7 +1798,7 @@ html, body, #app {
 .discovery-section-count {
   flex: 0 0 auto;
   font-weight: 400;
-  color: #888;
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -1682,7 +1806,7 @@ html, body, #app {
 .discovery-section-spinner {
   flex: 0 0 auto;
   font-size: 11px;
-  color: #888;
+  color: var(--text-muted);
 }
 
 .discovery-section-body {
@@ -1710,7 +1834,7 @@ html, body, #app {
 }
 
 .related-item:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 /* status: search-keyboard-nav — visible focus ring on the keyboard-active
@@ -1728,13 +1852,13 @@ html, body, #app {
 
 .related-item-meta {
   font-size: 11px;
-  color: #888;
+  color: var(--text-muted);
   margin-bottom: 4px;
 }
 
 .related-item-snippet {
   font-size: 12px;
-  color: #888;
+  color: var(--text-muted);
   line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 3;
@@ -1743,7 +1867,7 @@ html, body, #app {
 }
 
 .related-empty {
-  color: #888;
+  color: var(--text-muted);
   font-style: italic;
   padding: 12px 10px;
 }
@@ -1752,7 +1876,7 @@ html, body, #app {
    `<mark>` tags are parsed in `appendSnippetWithMarks` and replaced with
    `.search-mark` spans (no raw HTML rendering). */
 .search-mark {
-  background: #ffe06688;
+  background: var(--highlight-mark);
   border-radius: 2px;
   padding: 0 1px;
 }
@@ -1790,9 +1914,9 @@ html, body, #app {
   align-items: center;
   gap: 12px;
   padding: 4px 10px;
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   font-size: 12px;
-  color: #888;
+  color: var(--text-muted);
 }
 
 #status-left, #status-right {
@@ -1816,7 +1940,7 @@ html, body, #app {
 
 .badge {
   padding: 1px 6px;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   font-size: 10px;
   text-transform: uppercase;
@@ -1824,7 +1948,7 @@ html, body, #app {
 
 #tree li.dirty::after {
   content: " ●";
-  color: #e0a040;
+  color: var(--warn);
 }
 
 /* status: tree-row-unsupported-marker / tree-row-skipped-marker / tree-row-queued-marker
@@ -1841,10 +1965,10 @@ html, body, #app {
 }
 #tree li.ix-unsupported > .ix-marker {
   background: transparent;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
 }
 #tree li.ix-skipped > .ix-marker {
-  background: #e0a040;
+  background: var(--warn);
 }
 #tree li.ix-queued > .ix-marker {
   background: var(--accent);
@@ -1863,7 +1987,7 @@ html, body, #app {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: #0008;
+  background: var(--bg-overlay-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1873,9 +1997,9 @@ html, body, #app {
 .modal-dialog {
   background: Canvas;
   color: CanvasText;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
-  box-shadow: 0 8px 32px #0006;
+  box-shadow: 0 8px 32px var(--shadow-strong);
   padding: 20px;
   min-width: 360px;
   max-width: 520px;
@@ -1895,34 +2019,10 @@ html, body, #app {
   flex-wrap: wrap;
 }
 
-/* status: multi-buffer-window-close-guard */
-.modal-dirty-list {
-  list-style: none;
-  margin: 0 0 12px;
-  padding: 0;
-  max-height: 240px;
-  overflow-y: auto;
-  font-size: 12px;
-}
-.modal-dirty-list li {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 4px 0;
-  border-bottom: 1px solid #8882;
-}
-.modal-dirty-path {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .modal-btn {
   font: inherit;
   padding: 6px 14px;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 4px;
   background: transparent;
   color: inherit;
@@ -1930,7 +2030,7 @@ html, body, #app {
 }
 
 .modal-btn:hover {
-  background: #8882;
+  background: var(--surface-hover);
 }
 
 .modal-btn-primary {
@@ -1940,7 +2040,7 @@ html, body, #app {
 }
 
 .modal-btn-primary:hover {
-  background: #3a80d2;
+  background: var(--accent-hover);
 }
 
 .modal-btn:focus-visible {
@@ -1949,13 +2049,13 @@ html, body, #app {
 }
 
 .modal-btn-danger {
-  background: #c0392b;
-  border-color: #c0392b;
+  background: var(--danger);
+  border-color: var(--danger);
   color: white;
 }
 
 .modal-btn-danger:hover {
-  background: #a83224;
+  background: var(--danger-hover);
 }
 
 /* status: tree-context-menu */
@@ -1965,9 +2065,9 @@ html, body, #app {
   min-width: 160px;
   background: Canvas;
   color: CanvasText;
-  border: 1px solid #8886;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
-  box-shadow: 0 6px 20px #0006;
+  box-shadow: 0 6px 20px var(--shadow-strong);
   padding: 4px 0;
   font-size: 13px;
 }
@@ -2011,11 +2111,11 @@ html, body, #app {
 }
 
 .ctx-menu-item.danger {
-  color: #c0392b;
+  color: var(--danger);
 }
 
 .ctx-menu-item.danger:hover {
-  background: #c0392b;
+  background: var(--danger);
   color: white;
 }
 
@@ -2023,12 +2123,12 @@ html, body, #app {
   position: fixed;
   bottom: 24px;
   right: 24px;
-  background: #222;
+  background: var(--bg-toast);
   color: white;
   padding: 10px 16px;
   border-radius: 6px;
   font-size: 13px;
-  box-shadow: 0 4px 16px #0006;
+  box-shadow: 0 4px 16px var(--shadow-strong);
   opacity: 0;
   transform: translateY(8px);
   transition: opacity 0.15s ease, transform 0.15s ease;
@@ -2060,12 +2160,12 @@ html, body, #app {
 }
 
 #toast .toast-action:hover {
-  color: #6aa8f0;
+  color: var(--accent-link-hover);
 }
 
 /* status: tree-trash-bin */
 #trash-bin {
-  border-top: 1px solid #8884;
+  border-top: 1px solid var(--border-default);
   font-size: 12px;
   user-select: none;
   flex: 0 0 auto;
@@ -2085,7 +2185,7 @@ html, body, #app {
 }
 
 #trash-header:hover {
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 
 #trash-bin.collapsed #trash-list {
@@ -2103,7 +2203,7 @@ html, body, #app {
 }
 
 .trash-row:hover {
-  background: #8881;
+  background: var(--surface-hover-soft);
 }
 
 .trash-row.active {
@@ -2214,7 +2314,7 @@ html, body, #app {
   margin-left: auto;
   font-style: italic;
 }
-.queue-toggle-status.error { color: #d75d5d; font-style: normal; }
+.queue-toggle-status.error { color: var(--danger-text-strong); font-style: normal; }
 
 .queue-list {
   list-style: none;
@@ -2226,7 +2326,7 @@ html, body, #app {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
-  border-top: 1px solid #2a2a2a;
+  border-top: 1px solid var(--border-divider);
   font-size: 12px;
 }
 .queue-row:first-child { border-top: none; }
@@ -2236,7 +2336,7 @@ html, body, #app {
 .queue-pri {
   font-size: 10px;
   padding: 1px 6px;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 3px;
   color: var(--text-muted);
   text-transform: uppercase;
@@ -2244,16 +2344,11 @@ html, body, #app {
   min-width: 38px;
   text-align: center;
 }
-/* status: vault-bar-queue-button — promote the high-priority red to a
-   custom property so the failed-task indicator can share it. */
-:root {
-  --queue-pri-high-color: #d68a78;
-  --queue-pri-high-border: #c25a4d66;
-  --queue-active-pulse-color: #5da7e6;
-}
+/* status: vault-bar-queue-button — `--queue-pri-high-color` etc. live
+   in the consolidated :root block at the top. */
 .queue-pri-high   { color: var(--queue-pri-high-color); border-color: var(--queue-pri-high-border); }
 .queue-pri-normal { color: var(--text-muted); }
-.queue-pri-low    { color: #777; }
+.queue-pri-low    { color: var(--text-dim); }
 .queue-kind {
   color: var(--text-strong);
 }
@@ -2271,9 +2366,9 @@ html, body, #app {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.queue-state-ok { color: #6da76d; }
-.queue-state-err { color: #d75d5d; }
-.queue-state-cancelled { color: #777; }
+.queue-state-ok { color: var(--success-strong); }
+.queue-state-err { color: var(--danger-text-strong); }
+.queue-state-cancelled { color: var(--text-dim); }
 .queue-state-leased { color: var(--text-strong); }
 .queue-pulse-dot {
   display: inline-block;
@@ -2326,7 +2421,7 @@ html, body, #app {
 }
 .queue-row-clickable .queue-row-head { cursor: pointer; }
 .queue-row.expanded {
-  background: var(--bg-elevated, rgba(255, 255, 255, 0.03));
+  background: var(--bg-panel-elevated);
   border-radius: 4px;
 }
 .queue-row-details {
@@ -2350,8 +2445,8 @@ html, body, #app {
 .queue-detail-pre {
   margin: 0;
   padding: 6px 8px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--bg-panel-elevated-strong);
+  border: 1px solid var(--border-panel-strong);
   border-radius: 3px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2388,7 +2483,7 @@ html, body, #app {
   font-size: 14px;
   line-height: 1;
 }
-.queue-cancel:hover { color: #d75d5d; }
+.queue-cancel:hover { color: var(--danger-text-strong); }
 
 /* status: queue-detail-shared-row-primitive */
 .queue-source-badge {
@@ -2396,10 +2491,12 @@ html, body, #app {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 0 4px;
-  border: 1px solid #8884;
+  border: 1px solid var(--border-default);
   border-radius: 3px;
   color: var(--text-muted);
   font-weight: 500;
   min-width: 38px;
   text-align: center;
 }
+</content>
+</invoke>

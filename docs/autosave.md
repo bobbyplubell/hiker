@@ -1,6 +1,6 @@
 # Autosave
 
-Crash-recovery snapshots of dirty editor buffers, plus a tab-state restore on vault re-open. Written periodically from the frontend, owned by the backend, surfaced as a recovery modal on next launch when an autosaved buffer has unsaved deltas. Modeled on Notepad++: one snapshot per dirty buffer, overwritten in place each tick, separate from the actual file the user is editing.
+Crash-recovery snapshots of dirty editor buffers, plus a tab-state restore on vault re-open. Written periodically from the frontend, owned by the backend, auto-restored as dirty sticky tabs on next launch when an autosaved buffer has unsaved deltas (no modal — the dirty-marker is the affordance). Modeled on Notepad++: one snapshot per dirty buffer, overwritten in place each tick, separate from the actual file the user is editing.
 
 Distinct from saving. Saving writes the *user's file* — autosave writes a *sidecar shadow copy* the user never sees unless we crash. Distinct from `changes.md`'s changelog — that records committed writes for agent rollback / future sync; autosave records *uncommitted* in-flight content for force-kill recovery. Different lifecycle, different consumers, different invariants; the two stores never share rows.
 
@@ -10,7 +10,7 @@ The headline decisions:
 - **Backend owns storage, GC, and recovery; frontend ticks and pushes.** All filesystem touches are in `core::autosave`. The frontend's role collapses to "fire a 5s timer, push every dirty buffer's current text, prompt on recover hits." Live buffer text only exists in CM6, so the push direction is unavoidable; everything else stays in core. [autosave-backend-module]
 - **Storage lives at `vault/.hiker/autosave/`.** Per-vault. One `<id>.md` per dirty buffer plus an `index.json` carrying the path↔id map, per-entry content hash, and an authoritative tab-state snapshot. [autosave-store-layout]
 - **Recovery surfaces only buffers that genuinely have unsaved deltas.** On vault open, `autosave_recover()` returns entries whose autosaved `content_hash` differs from the live on-disk hash for the same path. Matches drop silently — they're stale snapshots from the last clean session. [autosave-recover-cmd]
-- **Tab state restores silently; buffer recovery prompts.** Reopening tabs is a quality-of-life feature the user expects to "just work." Restoring buffer content is a destructive-feeling decision (your edits vs. what's on disk now) and gets a per-row modal. [autosave-tab-state-silent-restore, autosave-recovery-modal]
+- **Both tab state and buffer recovery restore silently.** Reopening tabs is the quality-of-life baseline; recovered buffers ride the same shape — each one auto-opens as a sticky tab carrying the autosaved content, dirty against disk, so the user sees the unsaved work and decides whether to save or revert via the normal save / discard surfaces. No prompt at vault open. [autosave-tab-state-silent-restore, autosave-recovery-auto-restore]
 - **Not in `changes.db`.** The two stores have different lifecycles (autosave: ephemeral, GC'd on save; changes: durable, retention-bounded), different consumers, and conflating them would inflate changelog row counts by orders of magnitude.
 
 
@@ -120,34 +120,35 @@ Every ~5 seconds while any tab is dirty, the frontend pushes each dirty buffer's
 
 - **Successful save** → `autosave_clear(path)`. The on-disk file now matches what the buffer holds; the autosave sidecar is redundant and would otherwise resurface as a false-positive recovery on next open.
 - **Tab close (any path)** → `autosave_clear(path)`. Whether the user picked Save, Discard, or the tab was clean to begin with, the autosave entry for that buffer is no longer relevant.
-- **Window close, all dirty buffers handled** → after the existing `multi-buffer-window-close-guard` resolves, the frontend clears each handled path and pushes a final tab-state snapshot (which may be empty). The next launch's recovery returns nothing.
+- **Window close** → no dirty-buffer modal. The frontend awaits one final autosave flush (`flushAllAndWait`) and pushes the current tab-state snapshot (`pushTabStateNow`), then destroys the window. Sidecars are *not* cleared — next launch's `autosave-recovery-auto-restore` reopens every recoverable buffer as a dirty tab so the user can save or revert via the existing affordances. Note: autosave does *not* write through to the user's files on exit — exit means "park the work," not "commit to disk." [autosave-close-no-modal]
 - **Force-kill / crash** → no cleanup runs. The next vault open finds the autosave directory populated and `autosave_recover()` does its filtering. This is the load-bearing path the whole feature exists for.
 - **Watcher-driven external rename** → the buffer's path field follows the new name (per `watcher-editor-renamed-followup`); the frontend fires `autosave_clear(oldPath)` and the next tick writes against the new path naturally. [autosave-rename-clear-old]
 - **Watcher-driven external delete while dirty** → buffer stays open per `watcher-editor-deleted-buffer`; the autosave entry persists. Recovery on next open compares against a now-missing on-disk file → `on_disk_hash = None` → entry surfaces as a recoverable buffer.
 
 
-## Recovery modal
+## Recovery (auto-restore)
 
-When `autosave_recover()` returns a non-empty list on vault open, the frontend renders a modal listing each entry. Same widget family as `multi-buffer-window-close-guard`'s save/discard list. [autosave-recovery-modal]
+When `autosave_recover()` returns a non-empty list on vault open, the frontend opens each entry as a sticky tab — no modal, no per-row prompt. [autosave-recovery-auto-restore]
 
-Per-row affordances:
+Per-entry shape:
 
-- **Restore** — load the autosaved content into a buffer for that path, mark dirty, open as a sticky tab. The user can save (writes through to the actual file) or discard from the normal buffer-management surface afterward. Calls `autosave_clear(path)` once the buffer is open, since the autosaved copy is now live in memory.
-- **Discard** — `autosave_discard(path)`. The autosaved sidecar is removed, no buffer is opened, the on-disk file (if it exists) is left alone.
+- **File still on disk.** Open the path normally (`open_for_edit` reads disk content into `loadedText`), then dispatch the autosaved bytes into the editor. The buffer reads dirty (autosaved bytes ≠ on-disk loadedText), so the user sees the unsaved work, the dirty marker on the tab, and can save (writes the autosaved bytes through to the file) or revert via the normal close-dirty / dirty-buffer-diff affordances.
+- **File deleted on disk.** Write the autosaved bytes back to disk first (Restore creates the file fresh), then open normally. The buffer comes up clean — the user's work is preserved on disk; if they don't want it, normal delete works.
 
-Bulk affordances at the modal footer:
+After the open, the autosave sidecar is dropped (`autosave_discard(path)`) since the autosaved copy is now live in memory.
 
-- **Restore all** — sequence per-row Restore for every entry.
-- **Discard all** — sequence per-row Discard for every entry.
+No modal because:
 
-Cancel returns the user to the app with the modal dismissed but the autosave entries still on disk; the next vault open will surface them again. We deliberately don't auto-discard on Cancel — the user may have hit Cancel by accident, and the cost of a re-prompt is much smaller than the cost of silently dropping unsaved work.
+- The dirty-marker on each restored tab is already a clear signal that recovered work is sitting in front of the user; it composes with every other dirty-buffer affordance the editor already has (save, the close-dirty modal, `editor-diff-vs-disk-toggle`).
+- A modal at vault open is friction the user pays *every* recoverable session, even when the right answer is obviously "yes, give me my work back." The dirty-marker shape makes the same decision implicit and reversible.
+- Force-kill recoveries are by definition unsaved work — defaulting to "preserve" matches the user's intent in every case the recovery exists for. If they really want to discard, the close-dirty modal already covers it.
 
-Modal entry rows show: path (clickable preview-style row mirroring the recents-list shape), saved_at relative time (`2m ago`, `yesterday`), and a small `(deleted)` tag when `on_disk_hash` is `None` so the user knows Restore creates the file fresh. No diff preview in the modal itself — restoring opens the buffer, where the existing `editor-diff-vs-disk-toggle` answers "what changed?" if the user wants the comparison.
+Worth pinning: the multi-tab restore order matches `tab_state.open_paths` (the silent tab-state restore runs alongside this auto-restore on vault open); the active tab on next open is `tab_state.active_path` if still resolvable, otherwise the most recent recovered tab.
 
 
 ## Tab state restore
 
-On vault open, after the recovery modal resolves (or if it had nothing to surface), the frontend silently calls `autosave_load_tab_state()` and reopens each path in `open_paths` as a sticky tab in order, then activates `active_path`. If `preview_path` is non-null and that path was *not* in `open_paths`, it opens as the preview slot. [autosave-tab-state-silent-restore]
+On vault open, after the auto-restore loop finishes opening recovered buffers (or immediately if there were none), the frontend silently calls `autosave_load_tab_state()` and reopens each path in `open_paths` as a sticky tab in order, then activates `active_path`. If `preview_path` is non-null and that path was *not* in `open_paths`, it opens as the preview slot. [autosave-tab-state-silent-restore]
 
 Silent because:
 
@@ -160,14 +161,14 @@ Tab state restore lifts the prior posture of `multi-buffer-in-memory-only` — o
 
 ## Vault swap
 
-Closing a vault flushes the in-memory autosave state via the same path that `multi-buffer-window-close-guard` runs through (clear each handled path, push final tab state) and then the new vault's `core::autosave` opens fresh against its own `.hiker/autosave/` directory. No cross-vault leakage; each vault's autosave state is local to that vault, exactly like `changes.db` and `index.db`. [autosave-vault-swap-clears]
+Closing a vault flushes the in-memory autosave state — clearing each handled path and pushing the final tab state — and then the new vault's `core::autosave` opens fresh against its own `.hiker/autosave/` directory. No cross-vault leakage; each vault's autosave state is local to that vault, exactly like `changes.db` and `index.db`. [autosave-vault-swap-clears]
 
 
 ## Backup classification
 
 Per `design.md`'s three-class backup framing:
 
-- The autosave directory's `<id>.md` files are **regenerable from running memory** — if the app is up and a tab is dirty, the next tick re-creates them. Lost only if the app exits cleanly with all buffers saved (in which case there's nothing to recover) or the user discards via the modal. Treat as **regenerable** for backup purposes; not worth syncing.
+- The autosave directory's `<id>.md` files are **regenerable from running memory** — if the app is up and a tab is dirty, the next tick re-creates them. Lost only if the app exits cleanly with all buffers saved (in which case there's nothing to recover) or after the auto-restored buffer is in memory and the sidecar is dropped. Treat as **regenerable** for backup purposes; not worth syncing.
 - The `index.json` is **durable** — it carries the tab-state snapshot, which isn't reconstructible after a clean shutdown. Worth keeping if a backup tool is already including the rest of `.hiker/`. The cost is trivial (one small JSON file per vault).
 
 In practice, the simplest "back up the whole `.hiker/` directory" rule already covers both correctly. [autosave-backup-class]
@@ -184,7 +185,7 @@ Autosave is on by default with a fixed 5s tick. No `[autosave]` config section i
 - **Compression.** Autosave files are markdown at personal-vault scale, written briefly, read once. zstd would save bytes but adds an encode step in the hot tick path for no measured win. `changes.md`'s `changes-content-zstd` lives where compression actually pays off (long retention, many rows).
 - **Cross-device autosave sync.** Autosave is per-machine crash recovery, not a device-handoff feature. The future sync layer in `design.md` syncs *committed* writes (saved files); in-flight uncommitted content stays local. This deliberately matches every other editor's posture.
 - **Per-keystroke continuous flush.** 5s tick + on-blur flush is the right ergonomic floor; flushing every keystroke would bury the disk for negligible recovery improvement.
-- **Recovery diff preview inside the modal.** Restoring opens the buffer, where `editor-diff-vs-disk-toggle` already answers "what changed?" Inlining a second diff renderer in a modal duplicates that affordance.
+- **Recovery prompt / modal at vault open.** Auto-restore as dirty tabs is the design; the dirty-marker, the close-dirty modal, and `editor-diff-vs-disk-toggle` together cover everything a per-row Restore/Discard prompt would.
 - **Untitled / scratch buffers.** Hiker has no untitled-buffer concept today (`create-note-button` mints a path immediately). When and if scratch buffers land, autosave will need a path-less storage shape; not designed here.
 
 

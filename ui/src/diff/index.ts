@@ -9,7 +9,7 @@
 // hosts the diff inline: the same CM6 view toggles between the consumer's
 // primary content and the diff rendering. See docs/diff.md.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Ipc, type DiffResult } from "../ipc";
 import { Compartment, type Extension } from "@codemirror/state";
 import { EditorView, Decoration, type DecorationSet } from "@codemirror/view";
 
@@ -19,32 +19,18 @@ export interface DiffInput {
   after: { label: string; content: string; meta?: Record<string, unknown> };
 }
 
-// Mirrors `core::diff::DiffResult` / `DiffHunk` / `DiffLine`. ts-rs auto-
-// export isn't wired in this codebase yet, so the shape is hand-mirrored;
-// the Rust unit tests pin the wire format and a mismatch would surface as
-// a deserialization error on the very first call.
-type DiffOp = "equal" | "insert" | "delete";
-interface DiffLine {
-  op: DiffOp;
-  line: string;
-  before_line_no: number | null;
-  after_line_no: number | null;
-}
-interface DiffHunk {
-  lines: DiffLine[];
-}
-interface DiffResult {
-  hunks: DiffHunk[];
-}
+// `DiffResult` / `DiffHunk` / `DiffLine` mirror `core::diff::DiffResult`;
+// they live in `../ipc` so every caller of `compute_diff` sees the same
+// shape.
 
 const diffTheme = EditorView.baseTheme({
-  ".cm-diff-add": { backgroundColor: "rgba(60, 180, 100, 0.18)" },
-  ".cm-diff-del": { backgroundColor: "rgba(220, 80, 80, 0.18)" },
+  ".cm-diff-add": { backgroundColor: "var(--diff-add-fill)" },
+  ".cm-diff-del": { backgroundColor: "var(--diff-del-fill)" },
   ".cm-diff-sep": {
-    backgroundColor: "rgba(255, 255, 255, 0.04)",
-    borderTop: "1px solid rgba(255, 255, 255, 0.12)",
-    borderBottom: "1px solid rgba(255, 255, 255, 0.12)",
-    color: "#777",
+    backgroundColor: "var(--bg-panel-elevated-strong)",
+    borderTop: "1px solid var(--diff-sep-border)",
+    borderBottom: "1px solid var(--diff-sep-border)",
+    color: "var(--text-dim)",
     fontStyle: "italic",
   },
 });
@@ -130,7 +116,7 @@ function formatErr(err: unknown): string {
 export async function renderDiff(view: EditorView, input: DiffInput): Promise<void> {
   let result: DiffResult;
   try {
-    result = await invoke<DiffResult>("compute_diff", {
+    result = await Ipc.computeDiff({
       before: input.before.content,
       after: input.after.content,
     });

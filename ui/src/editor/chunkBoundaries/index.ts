@@ -131,19 +131,19 @@ const chunkGutter = gutter({
 
 const chunkTheme = EditorView.baseTheme({
   ".cm-chunk-boundary": {
-    borderTop: "1px solid #d97757",
+    borderTop: "1px solid var(--accent-chunk)",
   },
   ".cm-chunk-gutter": {
     minWidth: "1.4em",
   },
   ".cm-chunk-gutter .cm-gutterElement": {
-    color: "#d97757",
+    color: "var(--accent-chunk)",
     fontSize: "0.75em",
     paddingRight: "4px",
     textAlign: "right",
   },
   ".cm-chunk-gutter-hint": {
-    color: "#999",
+    color: "var(--text-muted)",
     fontStyle: "italic",
     fontSize: "0.7em",
     paddingRight: "4px",
@@ -158,7 +158,6 @@ export function chunkBoundsToState(
   const doc = view.state.doc;
   const entries: ChunkLineEntry[] = [];
   for (const b of bounds) {
-    // status: bug-byte-to-char-conversion-in-ui (fixed)
     // `char_start` is UTF-16 from core; CM6 indexes by code unit too.
     const pos = Math.min(Math.max(b.char_start, 0), doc.length);
     entries.push({

@@ -194,7 +194,6 @@ pub struct ChunkRow {
 /// for the chunk-boundary editor decoration. Omits `text` and `note_id` to
 /// keep the payload small; the UI only needs offsets + heading_path.
 ///
-/// status: bug-byte-to-char-conversion-in-ui (fixed)
 /// `char_start` / `char_end` are UTF-16 code-unit offsets into the source
 /// note, computed in core via `enrich_char_offsets`. The chunker emits
 /// byte offsets natively; the UI used to convert them via `TextEncoder`,
@@ -220,8 +219,6 @@ pub struct ChunkBounds {
 /// build a fresh sorted index of unique byte positions and binary-search
 /// each into that table. For the typical ~hundreds-of-chunks-per-note
 /// shape this stays cheap.
-///
-/// status: bug-byte-to-char-conversion-in-ui (fixed)
 pub fn enrich_char_offsets(text: &str, bounds: &mut [ChunkBounds]) {
     if bounds.is_empty() {
         return;

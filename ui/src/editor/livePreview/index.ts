@@ -245,15 +245,15 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-inline-code": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: "0.9em",
-    backgroundColor: "rgba(127, 127, 127, 0.15)",
+    backgroundColor: "var(--lp-code-bg)",
     borderRadius: "3px",
     padding: "0 2px",
   },
   ".cm-lp-link": {
-    color: "#3b82f6",
+    color: "var(--accent-link-bright)",
     textDecoration: "underline",
   },
-  "&dark .cm-lp-link": { color: "#60a5fa" },
+  "&dark .cm-lp-link": { color: "var(--accent-link-bright-hover)" },
   ".cm-lp-h": { fontWeight: "bold", lineHeight: "1.25" },
   ".cm-lp-h1": { fontSize: "1.6em" },
   ".cm-lp-h2": { fontSize: "1.4em" },
@@ -264,7 +264,7 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-fence-line": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: "0.9em",
-    backgroundColor: "rgba(127, 127, 127, 0.08)",
+    backgroundColor: "var(--lp-fence-bg)",
   },
   ".cm-lp-frontmatter": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",

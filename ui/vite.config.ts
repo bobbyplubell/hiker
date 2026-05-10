@@ -5,6 +5,14 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    host: "0.0.0.0",
+    hmr: {
+      host: "localhost",
+      clientPort: 1420,
+    },
+    watch: {
+      usePolling: false,
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

@@ -18,11 +18,15 @@
 // status: chat-panel-note-link-render
 // status: chat-panel-thinking-indicator
 // status: chat-panel-tool-call-collapsible
+// status: chat-panel-stop-button
 
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Ipc, type SessionListItem } from "./ipc";
 import { mountChatMarkdown, type ChatMarkdownView } from "./chatMarkdownView";
 import { mountAtMentions, type AtMentionsApi, type ParsedAtToken } from "./atMentions";
+import { resolveAtNote } from "./notes/resolver";
+import type { BufferApi } from "./app/state";
+import { Icons } from "./icons";
 
 type AgentEvent =
   | { kind: "turn_started"; turn_id: string; user_message_summary: string }
@@ -90,15 +94,6 @@ interface ActiveSessionDto {
   turns: ResumedTurn[];
 }
 
-interface SessionListItem {
-  sessionId: string;
-  relPath: string;
-  mtimeUnix: number;
-  firstUserPreview: string;
-  turnCount: number;
-  isActive: boolean;
-}
-
 interface ChatPanel {
   setEnabled(enabled: boolean): void;
   setHeight(fraction: number): void;
@@ -140,20 +135,14 @@ export interface ChatPanelOptions {
   /// `file-switch-guard-dirty`).
   /// status: chat-panel-note-link-render
   onOpenNoteLink: (rel: string) => void;
-  /// Returns the currently-open note's vault-relative path + buffer
-  /// text, or `null` if there's no eligible buffer (preview modes
-  /// excluded). Called once per `chat_send` so the active note rides
-  /// as turn-scoped context.
+  /// Cross-module read surface for the active editable buffer +
+  /// selection. Replaces the prior `getActiveNote` / `getActiveSelection`
+  /// closures over main.ts internals (`bug-chat-couples-to-main-buffer-globals`).
+  /// Chat polls `bufferApi.getActive()` at submit time; subscriptions
+  /// aren't wired since chat has no reactive surface today.
   /// status: chat-active-note-context-injection
-  getActiveNote: () => { relPath: string; bufferText: string } | null;
-  /// Returns the active editor's current selection (text + source
-  /// rel-path + 1-based inclusive line range), or `null` if no editor
-  /// is open or the selection is empty. Called at submit time when an
-  /// `@selection` token is in the input.
   /// status: chat-input-at-selection
-  getActiveSelection: () =>
-    | { relPath: string; text: string; lineRange: string }
-    | null;
+  bufferApi: BufferApi;
   /// Surface a transient toast (e.g. for failed `@<rel-path>` resolution
   /// at submit time). The host wires this to its existing toast helper.
   /// status: chat-input-at-mentions
@@ -208,8 +197,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     sendBtnEl,
     onResizePersist,
     onOpenNoteLink,
-    getActiveNote,
-    getActiveSelection,
+    bufferApi,
     toast,
   } = opts;
 
@@ -218,7 +206,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   const atMentions: AtMentionsApi = mountAtMentions({
     inputEl,
     anchorEl: panelEl,
-    hasEditorSelection: () => getActiveSelection() !== null,
+    hasEditorSelection: () => (bufferApi.getActive()?.selection ?? null) !== null,
   });
 
   let activeSessionId: string | null = null;
@@ -240,9 +228,34 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     return `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  // status: chat-panel-stop-button
+  // While a turn is in flight the send affordance flips to a Stop
+  // button. Click invokes `chat_stop` (same Tauri command the cap-hit
+  // row's Stop already calls); the button reverts to Send on the next
+  // `TurnFinished`. Cap-hit rows aren't "in flight" — `setBusy(false)`
+  // fires when the cap row appears, so the button reverts to Send and
+  // the row's own Stop handles that path.
+  let busyState = false;
   function setBusy(busy: boolean): void {
-    sendBtnEl.disabled = busy || inputEl.value.trim().length === 0;
+    busyState = busy;
+    if (busy) {
+      sendBtnEl.disabled = false;
+      sendBtnEl.innerHTML = Icons.stop();
+      sendBtnEl.title = "Stop";
+      sendBtnEl.setAttribute("aria-label", "Stop");
+    } else {
+      sendBtnEl.disabled = inputEl.value.trim().length === 0;
+      sendBtnEl.innerHTML = Icons.send();
+      sendBtnEl.title = "Send";
+      sendBtnEl.setAttribute("aria-label", "Send");
+    }
     inputEl.disabled = busy;
+  }
+
+  function stopActiveTurn(): void {
+    if (!activeTurnId) return;
+    const turnId = activeTurnId;
+    void Ipc.chatStop({ sessionId: activeSessionId, turnId });
   }
 
   async function send(): Promise<void> {
@@ -274,7 +287,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     showThinking();
     setBusy(true);
     try {
-      const returnedSessionId = await invoke<string>("chat_send", {
+      const returnedSessionId = await Ipc.chatSend({
         sessionId: activeSessionId,
         turnId: activeTurnId,
         message,
@@ -300,26 +313,27 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     const blocks: ChatContextBlock[] = [];
     const seenRelPaths = new Set<string>();
 
-    const note = getActiveNote();
-    if (note) {
+    // One snapshot per send — the buffer / selection can't change mid-compose.
+    const active = bufferApi.getActive();
+    if (active) {
       blocks.push({
         kind: "activeNote",
-        relPath: note.relPath,
-        content: note.bufferText,
+        relPath: active.relPath,
+        content: active.bufferText,
       });
-      seenRelPaths.add(note.relPath);
+      seenRelPaths.add(active.relPath);
     }
 
     for (const tok of tokens) {
       if (tok.kind === "selection") {
-        const sel = getActiveSelection();
-        if (!sel) {
+        const sel = active?.selection ?? null;
+        if (!active || !sel) {
           throw new Error("@selection has no selected text");
         }
         // Selection blocks are never de-duped — the slice is the point.
         blocks.push({
           kind: "selection",
-          relPath: sel.relPath,
+          relPath: active.relPath,
           content: sel.text,
           lineRange: sel.lineRange,
         });
@@ -328,10 +342,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
         // probes .md / .markdown / .txt and returns the actual rel-path
         // (with extension) + body. Throws "note not found: <rel>" when
         // the path no longer resolves.
-        const resolved = await invoke<{ relPath: string; content: string }>(
-          "chat_resolve_at_note",
-          { relNoExt: tok.relPathNoExt },
-        );
+        const resolved = await resolveAtNote(tok.relPathNoExt);
         if (seenRelPaths.has(resolved.relPath)) continue;
         seenRelPaths.add(resolved.relPath);
         blocks.push({
@@ -346,17 +357,26 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
 
   formEl.addEventListener("submit", (ev) => {
     ev.preventDefault();
+    if (busyState) {
+      stopActiveTurn();
+      return;
+    }
     void send();
   });
 
   inputEl.addEventListener("input", () => {
-    sendBtnEl.disabled = inputEl.value.trim().length === 0 || inputEl.disabled;
+    if (busyState) return;
+    sendBtnEl.disabled = inputEl.value.trim().length === 0;
     autoSizeInput();
   });
 
   inputEl.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
+      if (busyState) {
+        stopActiveTurn();
+        return;
+      }
       void send();
     }
   });
@@ -382,7 +402,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     }
     let items: SessionListItem[] = [];
     try {
-      items = await invoke<SessionListItem[]>("chat_session_list");
+      items = await Ipc.chatSessionList();
     } catch (e) {
       appendError(`Failed to list sessions: ${describeErr(e)}`);
       return;
@@ -441,7 +461,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       trashBtn.className = "chat-session-menu-row-trash";
       trashBtn.title = "Move session to trash";
       trashBtn.setAttribute("aria-label", "Move session to trash");
-      trashBtn.innerHTML = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M3 4.5h10"/><path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5"/><path d="M4.5 4.5l.6 8.2a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8.2"/></svg>`;
+      trashBtn.innerHTML = Icons.trash();
       trashBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         void doDeleteSession(item.sessionId, item.isActive);
@@ -505,7 +525,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
 
   async function doNewSession(): Promise<void> {
     try {
-      const sid = await invoke<string>("chat_session_new");
+      const sid = await Ipc.chatSessionNew();
       activeSessionId = sid;
       activeTurnId = null;
       pausedAtCap = false;
@@ -524,7 +544,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   // status: chat-session-trash
   async function doDeleteSession(id: string, wasActive: boolean): Promise<void> {
     try {
-      await invoke("chat_session_delete", { sessionId: id });
+      await Ipc.chatSessionDelete({ sessionId: id });
     } catch (e) {
       appendError(`Failed to delete session: ${describeErr(e)}`);
       return;
@@ -550,9 +570,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
 
   async function doOpenSession(id: string): Promise<void> {
     try {
-      const active = await invoke<ActiveSessionDto | null>("chat_session_open", {
-        sessionId: id,
-      });
+      const active = await Ipc.chatSessionOpen({ sessionId: id });
       if (!active) return;
       hydrateInternal(active);
     } catch (e) {
@@ -770,7 +788,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     cont.addEventListener("click", () => {
       row.remove();
       pausedAtCap = false;
-      void invoke("chat_continue", {
+      void Ipc.chatContinue({
         sessionId: activeSessionId,
         turnId,
       });
@@ -781,7 +799,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     stop.addEventListener("click", () => {
       row.remove();
       pausedAtCap = false;
-      void invoke("chat_stop", {
+      void Ipc.chatStop({
         sessionId: activeSessionId,
         turnId,
       });

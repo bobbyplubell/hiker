@@ -43,7 +43,7 @@ If a slug is ambiguous, ask before coding. One clarifying question saves a wrong
 - **After landing a feature**, update its `status.md` row: status (`done` or `partial` with the gap named), evidence column (file:line of the new anchor), notes (anything non-obvious about the implementation).
 - **After landing a bug fix**, move its row in `bug_tracking.md` from `Open` to `Resolved` with a one-line summary of the fix.
 - **Tests.** Match the surrounding code's culture. Core has unit tests; UI is mostly type-checked. If the spec calls out specific edge cases, add tests for them. Don't demand tests where the codebase doesn't have them.
-- **Verify locally.** Run `cargo test -p hiker-core --lib`, `cargo check -p hiker-ui`, and `npx tsc --noEmit` (in `ui/`) before reporting done. Run each command **once**. If it exits 0 with no output, it passed — don't re-run it under different working directories or with extra flags to "double-check." If the change is UI-visible, say in the report that the user still needs to reload the dev server to see it — you can't verify UI yourself.
+- **Verify locally.** Run `cargo test -p hiker-core --lib`, `cargo check -p hiker-ui`, and `docker compose run --rm ui ./node_modules/.bin/tsc --noEmit` (from `ui/`) before reporting done. **Do not use `npx`, and do not run `npm` / `node` / `tsc` / `vite` on the host.** The npm supply chain is not trusted — every JS toolchain invocation must go through the Docker container defined in `ui/compose.yaml`, which isolates install scripts from the user's home directory. Host invocation of `npx` is doubly bad: it will silently fetch from the registry if the local copy is missing or the package name is typo'd. The pattern is always `docker compose run --rm ui <command>` for one-shot tasks (typecheck, install, etc.), and `docker compose up ui` for the long-running dev server (which Tauri starts automatically via `beforeDevCommand`). If a Dockerfile or compose tweak is needed, do it — don't fall back to host npm. Run each command **once**. If it exits 0 with no output, it passed — don't re-run it under different working directories or with extra flags to "double-check." If the change is UI-visible, say in the report that the user still needs to reload the dev server to see it — you can't verify UI yourself.
 
 ## What the report looks like
 
@@ -71,7 +71,7 @@ Keep it short. The user has already read the specs; they don't need them re-expl
 ## Verification
 - cargo test -p hiker-core --lib: <pass/fail/N tests>
 - cargo check -p hiker-ui: <ok / errors>
-- npx tsc --noEmit: <ok / errors>
+- docker compose run --rm ui ./node_modules/.bin/tsc --noEmit: <ok / errors>
 - UI verification: <"reload dev server to see X" if applicable, else "n/a">
 ```
 
@@ -94,3 +94,4 @@ A 200–400 word report is the sweet spot. The diff is the source of truth for w
 - **Tagging bug fixes in code.** Per `bug_tracking.md`, this clutters source. Git history is enough for short-lived references.
 - **Forgetting to update `status.md` / `bug_tracking.md`.** The registry-first convention is load-bearing for `hiker-pm` and the user's mental model. Skipping it costs more than the 30 seconds it saves.
 - **Reporting "done" when tests fail.** Trust collapses fast.
+- **Running `npm`/`npx`/`node`/`tsc`/`vite` on the host.** The npm supply chain is treated as untrusted; every JS toolchain call goes through `docker compose run --rm ui …` (one-shot) or `docker compose up ui` (dev server). Host invocation defeats the isolation and reintroduces the `npx` registry-fetch footgun.

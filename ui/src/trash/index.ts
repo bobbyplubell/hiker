@@ -11,10 +11,11 @@
 // buffer. The preview reuses the buffer-mode union's `{kind: "trash"}`
 // variant so save / dirty / file-switch guards take the read-only path.
 
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { EditorView } from "@codemirror/view";
-import type { Compartment, Extension } from "@codemirror/state";
+import { Ipc } from "../ipc";
+import { Logger } from "../logger";
+import type { SettingsManager } from "../settings/manager";
+import type { EditorHost } from "../app/editor";
 
 import {
   openContextMenu,
@@ -22,16 +23,10 @@ import {
 } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { confirm3, confirmDanger } from "../widgets/confirm";
-
-interface TrashEntry {
-  id: string;
-  original_path: string;
-  trashed_name: string;
-  original_mtime: number;
-  deleted_at: number;
-  kind: "file" | "folder";
-  members?: string[] | null;
-}
+import {
+  createPanelController,
+  type PanelController,
+} from "../panels/controller";
 
 export interface TrashListItem {
   id: string | null;
@@ -43,15 +38,13 @@ export interface TrashListItem {
   orphaned: boolean;
 }
 
-interface FileWithHash {
-  contents: string;
-  hash: string;
-}
-
 interface BufferLike {
   path: string;
   loadedText: string;
-  loadedHash: string;
+  /// Trash previews are read-only (no commits), so the token slot is
+  /// always `null`. Kept here so the host's `Buffer` interface and
+  /// this module's `BufferLike` shape stay structurally compatible.
+  token: unknown | null;
   mode: { kind: string } & Record<string, unknown>;
 }
 
@@ -61,25 +54,14 @@ export interface TrashDeps {
   listEl: HTMLElement;
   chevronEl: HTMLElement;
   labelEl: HTMLElement;
-  view: EditorView;
-  language: Compartment;
-  livePreviewCompartment: Compartment;
-  languageExtensionForPath: (rel: string) => Extension;
-  livePreviewExtensionForPath: (rel: string) => Extension;
+  editor: EditorHost;
   getBuffer: () => BufferLike | null;
   setBuffer: (b: BufferLike | null) => void;
-  setReadOnly: (ro: boolean, mode?: "trash" | "snapshot" | null) => void;
-  updateStatus: () => void;
-  refreshChunkBoundaries: () => void;
-  isDirty: () => boolean;
-  save: () => Promise<boolean>;
   cssEscape: (s: string) => string;
   isVaultIsOpen: () => boolean;
-  persistSetting: (
-    scope: "user" | "vault",
-    key: string,
-    value: unknown,
-  ) => Promise<void>;
+  // Routes the `vault.trash_expanded` write through the host's
+  // `SettingsManager` instead of a bespoke `persistSetting` closure.
+  settings: SettingsManager;
   isVaultHomeVisible: () => boolean;
   setVaultHomeVisible: (on: boolean) => void;
   refreshTree: () => Promise<void>;
@@ -95,6 +77,16 @@ export interface TrashApi {
   items(): TrashListItem[];
 }
 
+// Trash is the proof-of-shape migration onto the new
+// `PanelController<Api>` shape. The controller's `isVisible` /
+// `setVisible` map onto the bin's expanded/collapsed state — clicking the
+// header (handled inside the module) and the host-driven flip both route
+// through the same toggle so the persisted `vault.trash_expanded` setting
+// stays in sync. The other four panels (`tree`, `vaultHome`, `discovery`,
+// `queueDetail`) keep their bespoke factory APIs for now and migrate one
+// at a time per the bug row's "narrow enough to review" guidance.
+export type TrashController = PanelController<TrashApi>;
+
 function relativeTime(unixSecs: number): string {
   const now = Math.floor(Date.now() / 1000);
   const d = now - unixSecs;
@@ -107,15 +99,15 @@ function relativeTime(unixSecs: number): string {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-export function mountTrash(deps: TrashDeps): TrashApi {
+export function mountTrash(deps: TrashDeps): TrashController {
   let trashItems: TrashListItem[] = [];
 
   async function refresh(): Promise<void> {
     if (!deps.isVaultIsOpen()) return;
     try {
-      trashItems = await invoke<TrashListItem[]>("list_trash");
+      trashItems = await Ipc.listTrash();
     } catch (err) {
-      console.error("list_trash failed:", err);
+      Logger.error("ui::trash", "list_trash failed", { err });
       trashItems = [];
     }
     render();
@@ -173,13 +165,11 @@ export function mountTrash(deps: TrashDeps): TrashApi {
         label: "Restore",
         run: async () => {
           try {
-            const restored = await invoke<TrashEntry>("restore_trash_entry", {
-              id: item.id,
-            });
+            const restored = await Ipc.restoreTrashEntry({ id: item.id });
             showToast(`Restored ${restored.original_path}`);
             await deps.refreshTree();
           } catch (err) {
-            console.error("restore_trash_entry failed:", err);
+            Logger.error("ui::trash", "restore_trash_entry failed", { err });
             alert(`restore failed: ${deps.formatError(err)}`);
           }
         },
@@ -201,11 +191,13 @@ export function mountTrash(deps: TrashDeps): TrashApi {
         );
         if (!ok) return;
         try {
-          await invoke("permanent_delete_trash_entry", {
+          await Ipc.permanentDeleteTrashEntry({
             trashedName: item.trashed_name,
           });
         } catch (err) {
-          console.error("permanent_delete_trash_entry failed:", err);
+          Logger.error("ui::trash", "permanent_delete_trash_entry failed", {
+            err,
+          });
           alert(`delete failed: ${deps.formatError(err)}`);
         }
       },
@@ -215,7 +207,7 @@ export function mountTrash(deps: TrashDeps): TrashApi {
 
   async function openPreview(item: TrashListItem): Promise<void> {
     const buffer = deps.getBuffer();
-    if (buffer && deps.isDirty()) {
+    if (buffer && deps.editor.isDirty()) {
       const choice = await confirm3(
         `${buffer.path} has unsaved changes.`,
         "Save & switch",
@@ -224,28 +216,30 @@ export function mountTrash(deps: TrashDeps): TrashApi {
       );
       if (choice === "cancel") return;
       if (choice === "a") {
-        const ok = await deps.save();
+        const ok = await deps.editor.save();
         if (!ok) return;
       }
     }
     const trashRel = `.hiker/trash/${item.trashed_name}`;
     try {
-      const file = await invoke<FileWithHash>("read_file_with_hash", {
-        rel: trashRel,
-      });
+      // Trash entries are read-only previews. We just need the bytes;
+      // the file lives at a fixed `.hiker/trash/...` path, so a plain
+      // read suffices and no token is minted (the buffer's token is
+      // always `null` for non-file buffer modes).
+      const contents = await Ipc.readFile({ rel: trashRel });
       deps.setBuffer(null);
-      deps.view.dispatch({
+      deps.editor.dispatch({
         changes: {
           from: 0,
-          to: deps.view.state.doc.length,
-          insert: file.contents,
+          to: deps.editor.getDocLength(),
+          insert: contents,
         },
         effects: [
-          deps.language.reconfigure(
-            deps.languageExtensionForPath(item.original_path ?? item.trashed_name),
+          deps.editor.language.reconfigure(
+            deps.editor.languageExtensionForPath(item.original_path ?? item.trashed_name),
           ),
-          deps.livePreviewCompartment.reconfigure(
-            deps.livePreviewExtensionForPath(
+          deps.editor.livePreviewCompartment.reconfigure(
+            deps.editor.livePreviewExtensionForPath(
               item.original_path ?? item.trashed_name,
             ),
           ),
@@ -254,14 +248,14 @@ export function mountTrash(deps: TrashDeps): TrashApi {
       if (deps.isVaultHomeVisible()) deps.setVaultHomeVisible(false);
       deps.setBuffer({
         path: trashRel,
-        loadedText: deps.view.state.doc.toString(),
-        loadedHash: file.hash,
+        loadedText: deps.editor.getActiveText(),
+        token: null,
         mode: {
           kind: "trash",
           displayPath: item.original_path ?? item.trashed_name,
         },
       });
-      deps.setReadOnly(true, "trash");
+      deps.editor.setReadOnly(true);
       document
         .querySelectorAll("#tree li.active")
         .forEach((el) => el.classList.remove("active"));
@@ -272,10 +266,10 @@ export function mountTrash(deps: TrashDeps): TrashApi {
         `.trash-row[data-trashed-name="${deps.cssEscape(item.trashed_name)}"]`,
       );
       row?.classList.add("active");
-      deps.updateStatus();
-      deps.refreshChunkBoundaries();
+      deps.editor.updateStatus();
+      deps.editor.refreshChunkBoundaries();
     } catch (err) {
-      console.error("openTrashPreview failed:", err);
+      Logger.error("ui::trash", "openTrashPreview failed", { err });
       alert(`preview failed: ${deps.formatError(err)}`);
     }
   }
@@ -284,24 +278,23 @@ export function mountTrash(deps: TrashDeps): TrashApi {
     const buffer = deps.getBuffer();
     if (buffer?.mode.kind !== "trash") return;
     deps.setBuffer(null);
-    deps.view.dispatch({
-      changes: { from: 0, to: deps.view.state.doc.length, insert: "" },
+    deps.editor.dispatch({
+      changes: { from: 0, to: deps.editor.getDocLength(), insert: "" },
     });
-    deps.setReadOnly(false);
+    deps.editor.setReadOnly(false);
     document
       .querySelectorAll(".trash-row.active")
       .forEach((el) => el.classList.remove("active"));
-    deps.updateStatus();
+    deps.editor.updateStatus();
   }
 
-  // Header click → toggle collapsed; persist new state.
+  // Header click → flip the controller's visibility, which owns the
+  // `.collapsed` toggle + chevron + persisted `vault.trash_expanded`
+  // write through the shared setter below. One toggle path for both the
+  // user click and any future host-driven flip (e.g. a "show trash" verb
+  // restoring previous state on vault open).
   deps.headerEl.addEventListener("click", () => {
-    deps.binEl.classList.toggle("collapsed");
-    const expanded = !deps.binEl.classList.contains("collapsed");
-    deps.chevronEl.textContent = expanded ? "▾" : "▸";
-    if (deps.isVaultIsOpen()) {
-      void deps.persistSetting("vault", "vault.trash_expanded", expanded);
-    }
+    controller.setVisible(!controller.isVisible());
   });
 
   // Header right-click → Empty trash.
@@ -321,9 +314,9 @@ export function mountTrash(deps: TrashDeps): TrashApi {
           );
           if (!ok) return;
           try {
-            await invoke("empty_trash");
+            await Ipc.emptyTrash();
           } catch (err) {
-            console.error("empty_trash failed:", err);
+            Logger.error("ui::trash", "empty_trash failed", { err });
             alert(`empty failed: ${deps.formatError(err)}`);
           }
         },
@@ -342,19 +335,40 @@ export function mountTrash(deps: TrashDeps): TrashApi {
       );
       if (!stillThere) {
         deps.setBuffer(null);
-        deps.view.dispatch({
-          changes: { from: 0, to: deps.view.state.doc.length, insert: "" },
+        deps.editor.dispatch({
+          changes: { from: 0, to: deps.editor.getDocLength(), insert: "" },
         });
-        deps.setReadOnly(false);
-        deps.updateStatus();
+        deps.editor.setReadOnly(false);
+        deps.editor.updateStatus();
       }
     }
   });
 
-  return {
+  const api: TrashApi = {
     refresh,
     openPreview,
     closePreview,
     items: () => trashItems,
   };
+
+  // Visibility = "trash bin row expanded" (vs collapsed). The controller's
+  // `setVisible` owns the DOM class flip + chevron + persisted setting so
+  // both header-click and any host-driven flip share one path.
+  const controller = createPanelController<TrashApi>(api, {
+    initialVisible: !deps.binEl.classList.contains("collapsed"),
+    // DOM already reflects `initialVisible` (host's startup pass set
+    // `.collapsed` from the persisted `vault.trash_expanded` value), and
+    // the persist write below should fire only on real user toggles —
+    // not on mount.
+    applyOnMount: false,
+    onSetVisible: (on) => {
+      deps.binEl.classList.toggle("collapsed", !on);
+      deps.chevronEl.textContent = on ? "▾" : "▸";
+      if (deps.isVaultIsOpen()) {
+        void deps.settings.setVaultSetting("vault.trash_expanded", on);
+      }
+    },
+  });
+
+  return controller;
 }

@@ -653,6 +653,14 @@ pub struct VaultConfig {
     /// status: chat-panel-default-height
     #[serde(default = "default_chat_height")]
     pub chat_height: f32,
+    /// Sidebar column width in CSS pixels.
+    /// status: side-panel-resize
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u32,
+    /// Discovery (right) column width in CSS pixels.
+    /// status: side-panel-resize
+    #[serde(default = "default_discovery_width")]
+    pub discovery_width: u32,
     /// Surface `.hiker/sessions/` as a virtual top-level "Sessions" group
     /// in the tree. Default off — sessions stay hidden alongside other
     /// `.hiker/` sidecars. Search and related-notes always include
@@ -673,6 +681,8 @@ impl Default for VaultConfig {
             related_open: false,
             trash_expanded: false,
             chat_height: default_chat_height(),
+            sidebar_width: default_sidebar_width(),
+            discovery_width: default_discovery_width(),
             show_sessions_in_tree: false,
             tree: TreeConfig::default(),
         }
@@ -681,6 +691,14 @@ impl Default for VaultConfig {
 
 fn default_chat_height() -> f32 {
     0.30
+}
+
+fn default_sidebar_width() -> u32 {
+    280
+}
+
+fn default_discovery_width() -> u32 {
+    320
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1069,6 +1087,8 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
     EligibleKey { path: "vault.chat_height",             ty: ValueType::UnitFraction },
+    EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
+    EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },
     EligibleKey { path: "search.modes.semantic",         ty: ValueType::Bool },

@@ -4,8 +4,14 @@
   "version": "0.0.0",
   "identifier": "dev.hiker.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": {
+      "cwd": "../",
+      "script": "docker compose up ui"
+    },
+    "beforeBuildCommand": {
+      "cwd": "../",
+      "script": "docker compose run --rm ui sh -c './node_modules/.bin/tsc && ./node_modules/.bin/vite build'"
+    },
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
