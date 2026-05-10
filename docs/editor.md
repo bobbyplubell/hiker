@@ -128,20 +128,21 @@ Four regions: top strip across the window, then three columns below it (sidebar 
 
   The sidebar's content is mode-switchable. Three modes:
 
-  - **Files** (default) — file tree as described in this section. The `+ New note` / `…` actions row + the trash bin pinned at the bottom are filetree-specific chrome.
-  - **Cluster trees** — switches the sidebar body to the cluster editor (per `cluster-editor.md`); filetree chrome hides; the cluster editor brings its own header (tree-name selector, "Suggest reorganization" action, mode-specific `…` menu).
+  - **Files** (default) — file tree as described in this section. The `+ New note` / `…` actions row is filetree-specific chrome; the Trash bin pinned at the bottom is shared across modes (trash is multimodal — may hold notes, trails, cluster trees).
+  - **Cluster trees** — switches the sidebar body to the cluster editor (per `cluster-editor.md`); filetree chrome hides; the cluster editor brings its own header (tree-name selector, "Suggest reorganization" action, mode-specific `…` menu). The Trash bin stays pinned regardless of mode.
   - **Trails** — reserved slot, greyed in v1; lands when trails do.
 
-  The switcher itself is a **side-by-side icon-only button row** at the top of the sidebar — three icons in a single horizontal row, no labels, pressed-state on the active mode. Sits at the very top of the sidebar (the position where the four vault-level icon buttons used to live before they moved to the top strip). Clicking switches the body in place; the editor pane on the right is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing (eligible-key set grows by one). [sidebar-mode-switcher]
+  The top of the sidebar is a single uniform icon-only row, persistent across all three modes: three mode buttons on the left (Files / Cluster trees / Trails — pressed-state on the active mode), then a divider, then a `+` (new note) and a `⋯` (actions menu) on the right. No labels anywhere. Clicking a mode icon switches the sidebar body in place; the editor pane is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing (eligible-key set grows by one). [sidebar-mode-switcher]
 
   The sidebar's collapse toggle (`sidebar-toggle-icon`) keeps its existing behavior — it hides the whole sidebar regardless of mode. Modes share one collapse state. [sidebar-mode-shared-collapse]
 
-  The Trash bin is filetree-specific and only appears in Files mode; future modes that want a pinned-bottom region bring their own. [sidebar-trash-files-mode-only]
+  The `+` and `⋯` buttons sit in the same top row regardless of mode, so the row layout never shifts when the user switches modes. Their *behavior* is mode-aware:
 
-  Tree toolbar at the top of the Files-mode sidebar (below the mode switcher): a wide **+ New note** button and a small **`…`** actions menu next to it. The asymmetry is the point — new-note is a frequent action; the menu is the bucket for everything else. The toolbar hides in non-Files modes; each mode brings its own header chrome. [tree-toolbar-actions-menu]
+  - **`+` is the new-item button.** Left-click creates the active mode's primary item: a note in Files mode, a cluster tree in Cluster trees mode, a trail in Trails mode. Right-click opens a popover that lets the user pick any item type regardless of current mode (New note / New cluster tree / New trail), so creating a trail while browsing files doesn't require a mode switch. [sidebar-new-item-button]
+  - **`⋯` menu's contents swap per mode**: filetree actions in Files mode (Refresh tree / Reindex all / Reindex this file / Sort by); the `cluster-editor-mode-menu` entries in Cluster trees mode; trail-scoped entries in Trails mode when trails land. [sidebar-toolbar-actions-menu]
 
-  - **New note** creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [create-note-button]
-  - **`…` menu** opens a small popover with the v1 entries below. Adding new entries is intentionally low-friction — the menu is the catch-all for low-frequency tree-scoped actions, so future verbs slot in here rather than growing the toolbar.
+  - **New note** (Files-mode `+` left-click): creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [sidebar-new-item-button]
+  - **`⋯` menu** (Files mode) opens a small popover with the v1 entries below. Adding new entries is intentionally low-friction — the menu is the catch-all for low-frequency filetree actions, so future verbs slot in here rather than growing the top row. (For Cluster trees mode the menu hosts `cluster-editor-mode-menu` entries; for Trails mode, trail-scoped entries when trails land.)
     - **Refresh tree** — re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; refresh stays even after that lands. [tree-refresh-manual, tree-refresh-watcher]
     - **Reindex all** — full-vault reindex via `reindex-all-action` (see `index.md`). No confirm modal: re-embedding identical content is non-destructive, and the user opted in by clicking.
     - **Reindex this file** — single-file reindex via `reindex-current-file-action`; greyed when no file is active.
@@ -183,7 +184,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
     - **Open** — opens the note in the editor (same as a single click; included for discoverability and to give right-click a non-destructive default).
     - **Rename** — enters inline-rename mode (same as double-click).
     - **Delete** — calls `delete_note` after a confirm modal. Delete is *not* permanent: the file is moved into the vault's trash (see "Delete semantics" below). Modal text reflects this: "Move `<path>` to trash?" for files; "Move `<path>` and N notes inside it to trash?" for folders. Two buttons: Cancel (default focus) and Move to trash (red-ish, but not as alarming as a true delete). No "don't ask again" bypass — keep the friction since most people deleting a note from a tree mean to. [tree-context-delete]
-    - **Properties** — deferred. Stubbed in the menu (greyed out) until frontmatter editing exists; the entry will eventually open a small panel showing the note's `hiker:` frontmatter, content_hash, indexed_at, etc. Tracked as `tree-context-properties`. [tree-context-properties]
+    - **Properties** — opens a `properties`-kind tab for the note (per `tab-kinds` and the "Note properties tab" section below). Read-only inspector of every piece of data hiker stores about the note across `index.db` and `changes.db`. [tree-context-properties]
 
     Right-click on **empty space below the tree** opens a smaller menu with one entry — **New note here** — which is equivalent to clicking the toolbar's + New note while no folder is selected.
 
@@ -248,7 +249,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
   - Auto-empty policies (`trash.retention_days`, `trash.max_size_mb`) — same as the existing `vault-trash-empty` deferral.
   - Drag-out-of-trash to a specific tree location (would need a target-picker UX too; restore-to-original covers the common case).
   - Bulk select + restore/delete (multi-row selection isn't a v1 tree feature anywhere else).
-  - Frontmatter-editing-aware preview (the preview is read-only; richer trash inspection waits for `tree-context-properties`).
+  - Frontmatter-editing-aware preview (the preview is read-only; richer trash inspection waits for the properties tab landing on trash entries — see `note-properties-tab`).
 
   ### Tree-row index-state markers
 
@@ -349,12 +350,10 @@ The editor pane's top toolbar is converging on icon-only affordances; each menu 
 | --------------------------- | -------------------------------------- | --------------------- | -------- |
 | Sidebar toggle              | safe-dial / ship-wheel (rounded-square frame, circle with spokes) | `sidebar-toggle-icon` | landed   |
 | Discovery toggle            | magnifying glass                       | `discovery-toggle-icon` | landed |
-| View menu                   | eye                                    | `view-menu-icon`      | planned  |
-| Mutations menu              | wand                                   | `mutations-menu-icon` | reserved (lands with `note-mutations-menu`) |
-| Trails menu                 | squiggly trail (matches the file-tree trail-row icon seedling in `design.md`) | `trails-menu-icon`    | reserved (lands with the future trails UI) |
-| Auto-tree-org (RAPTOR)      | tree                                   | `tree-org-menu-icon`  | reserved (lands with the auto-tree-org affordance from `clustering.md` / `suggestions.md`) |
+| View menu                   | eye                                    | `view-menu-icon`      | landed   |
+| Mutations menu              | wand                                   | `mutations-menu-icon` | landed (live via `note-mutations-menu`; mutation roster grows under that slug) |
 
-The mutations/trails/tree-org rows are *icon reservations*, not full feature slugs — the parent UI surfaces (the menus themselves) are deferred to their respective feature specs. Pinning the glyph now keeps the visual language coherent so future spec writers don't have to relitigate the palette.
+Sidebar-scoped icons (Files / Cluster trees / Trails switcher, `+` new note, `⋯` actions menu) live in the sidebar's top row, not the editor toolbar — see the Sidebar mode switcher section above.
 
 Each entry is a checkable item — checkmark when active, click flips it, menu closes on click. State is in-memory only for v1. Persistence (per-vault, per-user, or both) is a `settings.md` concern when that surface lands; users will expect toggle state to survive a relaunch, so this menu is one of the first hooks the settings work picks up.
 
@@ -444,7 +443,7 @@ The new column rides a small slug of its own since the tracking is independent i
 
 Refresh shape: the home page subscribes to `hiker:reindex-progress` for live stat updates and to `hiker:file-changed` for recent-modified updates. The recently-accessed list updates on each open without watcher involvement (the writer is hiker itself).
 
-UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same Tauri call as the tree's existing `create-note-button`.
+UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same Tauri call as the sidebar's `sidebar-new-item-button`.
 
 Out of scope for v1 of the home page: pinned/landmark notes, active-trail display, search shortcuts, discovery hints from clustering, recent-searches list, vocabulary stats, sync status. All slot in as additional widgets as their backing features land.
 
@@ -556,6 +555,78 @@ Browser-style multi-buffer tabs. Each tab represents one open buffer; click swit
 - **Navigation history stays unified** across all tabs (one stack per vault). Back/forward navigates between content surfaces regardless of which tab they were in; the corresponding tab activates as part of the back/forward action.
 
 
+### Tab kinds
+
+A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the payload identifies *which one*.
+
+- `buffer` — payload is a vault-relative file path; renders the existing CodeMirror editor for that file. All current tab semantics (preview slot, dirty marker, close guard, autosave participation, tree-click activation, search-result-click activation, navigation-history entries) describe this kind.
+- `agent` — payload is a chat session id; renders the chat surface as the tab's content (per `chat-panel-expand-to-editor`). The discovery-panel's bottom-docked chat region collapses while an agent tab is open since the surface lives in the tab; closing the agent tab restores the docked region.
+- `graph` — payload is the graph view's state (filter set, selection); renders a graph-view canvas (per `design.md`'s graph-view future bullet).
+- `home` — vault home overview (per `vault-home-screen`); renders the home page as the tab's content.
+- `home-detail` — payload is the detail-view kind (`stats` | `recent-activity` | `recent-modified` | `recent-accessed`); renders the home page's drill-in view.
+- `queue` — task queue + indexer detail view (per `task-queue-home-detail-view`).
+- `settings` — settings pane (per `settings-pane-mode`).
+- `properties` — payload is a vault-relative note path; renders the read-only properties inspector for that note (per `note-properties-tab`). One properties tab per note path; opening Properties on a path that already has a tab open switches to it rather than spawning a duplicate.
+
+Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (file glyph for `buffer`, chat glyph for `agent`, graph glyph for `graph`, house glyph for `home`/`home-detail`, list-with-pulse for `queue`, gear for `settings`); the label is whatever the kind chooses (basename for `buffer`, session preview for `agent`, "Graph" or filter summary for `graph`, "Home" / "Recent activity" / "Queue" / "Settings" / etc. for the page kinds).
+
+**Page-kind tabs default-land in the preview slot.** Clicking the Home / Queue / Settings buttons in the top strip's leading cluster opens the corresponding tab as a *preview*: it occupies the preview slot, replacing whatever preview was previously there (same one-preview-at-a-time rule as `editor-preview-tab`). The user can promote a page-kind preview to sticky via the same affordances as buffer previews (right-click "Keep open", or any user interaction on the tab body that signals "I'm staying" — per-kind decision: home-detail clicks within the page count as promotion; settings flips do not, since the user is just toggling and leaving). This keeps the common case ("glance at home, then go back to my work") clutter-free while letting power users keep pages around.
+
+**Buffer-scoped chrome hides when the active tab is non-buffer.** The editor toolbar's buffer-scoped controls (View menu, Save button, Diff button, Mutations menu, the mode-controls slot) and the bottom status bar (line:col, index-state label, file-path) are buffer-only — they hide entirely when the active tab is `agent`, `graph`, `home`, `home-detail`, `queue`, or `settings`. The sidebar / discovery toggle icons stay visible regardless because they control the side panels independently of the center pane. Each non-buffer kind brings its own chrome (or none) inside the tab body — settings has its scope toggle and refresh button in its own header, home has its overview/detail toggle, etc.
+
+**Kind-aware predicates.** Existing tab semantics that assume "every tab is a file buffer" gate on kind:
+
+- **Preview slot** (`editor-preview-tab`) — buffer-only on the *contents-tracking* side (paths replace each other in the slot). Page-kind tabs use the same one-slot-per-strip rule; opening a page-kind tab evicts whatever was previewed before (buffer or page).
+- **Dirty marker** (`editor-tab-dirty-marker`) is `buffer`-only — non-buffer tabs have no dirty concept.
+- **Close guard** (`file-switch-guard-dirty`) only fires when closing a `buffer` tab whose buffer is dirty.
+- **Autosave tab-state** (`autosave-tab-state-store`) records `(kind, payload)` per open tab; restore reopens each kind through its own mount path.
+- **Mode controls slot** (`editor-toolbar-mode-controls`) is buffer-only chrome and is hidden along with the rest of the editor toolbar on non-buffer tabs.
+- **Reveal in tree** (`editor-tab-context-menu`) only applies to `buffer` tabs.
+
+[tab-kinds]
+
+
+### Note properties tab
+
+Right-click → Properties on a tree row opens a `properties`-kind tab for that note. The tab is a read-only inspector of every piece of state hiker tracks for the note across `index.db` and `changes.db` — the answer to "what does hiker actually know about this file." Useful for debugging skip reasons, sanity-checking embedder version drift, auditing the change log without opening recent activity, and confirming trail / cluster membership. Frontmatter editing is **not** part of this tab; the in-place frontmatter editor (`tree-context-properties-frontmatter-editing`) is a separate future surface that will eventually layer in as a section once a frontmatter-editing primitive exists.
+
+The headline decisions:
+
+- **One properties tab per note path.** Opening Properties on a path that already has a properties tab open switches to it instead of spawning a duplicate — same shape as the file-tree click rule for buffer tabs. [note-properties-tab]
+- **Read-only data view, no editor chrome.** The tab is non-buffer per `tab-kinds`, so the editor toolbar and bottom status bar hide on activation. The tab body owns its own header (note basename + relative path). No save button, no dirty marker, no preview-slot promotion path — clicking Properties from the tree always opens sticky (it's a directed action, like restore-from-trash). [note-properties-tab-no-editor-chrome]
+- **Page-kind preview-slot rule still applies on open.** Properties tabs default-land in the preview slot — same rule as `home` / `queue` / `settings` (per `tab-kinds`). Clicking Properties on a second note replaces the preview; promotion paths are the standard ones (right-click "Keep open", drag, etc.). [note-properties-tab-preview-slot]
+- **Live-refreshing.** The tab subscribes to the same event surfaces the rest of the UI rides — `hiker:reindex-progress` (notes-row / chunks data refreshes when a re-ingest finishes), `hiker:changes-appended` (changes-section refreshes on every new change row for this path), `hiker:file-changed` (mtime / size refresh on external edits). No manual refresh button; the data is always current. [note-properties-tab-live-refresh]
+
+#### Sections rendered
+
+Each section is a labeled block stacked vertically; sections render in order regardless of whether they have content (a missing row shows an empty-state line). [note-properties-tab-content]
+
+- **Identity.** Vault-relative path, note ULID (from `notes.id`), and the `path_ids` row's id. Calls out a mismatch between `notes.id` and `path_ids[path]` if it exists (shouldn't, but if it does the user should see it).
+- **File state.** `mtime`, `size`, `content_hash` (full blake3 hex, copyable), filesystem extension, and whether the path is currently inside the open buffer set / open in another tab.
+- **Index state.** `indexed_at`, `embedder_version`, `skipped` flag, `skip_reason` (if any), and the indexer's runtime classification (`Indexed` / `Skipped` / `Queued` / `Unsupported`) — same surface that drives `tree-row-unsupported-marker` / `tree-row-skipped-marker` / `tree-row-queued-marker` / `status-bar-active-file-index-state`.
+- **Chunks.** Total count plus a compact list: `chunk_index`, byte range, `heading_path` (or `—`), and the first ~80 chars of the chunk text as a snippet. Long lists virtualize; the surface is a debugging aid, not a search UI.
+- **Access tracking.** `last_accessed_at` from the notes row (per `note-access-tracking`), formatted as a relative time with absolute on hover.
+- **Changes.** Total count of `changes` rows for this path, breakdown by `author_class` (user / agent / sync / import / other), and a chronological list of the most recent N rows (timestamp, op, author, metadata summary). Each row click opens the change-row detail in `snapshot-preview-mode` — same affordance the home page's recent-activity detail uses (`vault-home-recent-activity-detail`), so the inspector shares a code path rather than re-implementing snapshot preview.
+- **Trail / cluster membership.** Trails containing this note (resolved via `core::trails::trails_containing_note_with_paths`, same query that powers `chat-tool-call-opens-touched-note` and the trails verbs) and clusters this note belongs to (when clustering data is available — placeholder otherwise).
+
+#### Behavior details
+
+- **Open paths.** Right-click → Properties (this slug, `tree-context-properties`) is the canonical entry; an editor-tab-strip right-click verb on `buffer` tabs (`Show properties` in the tab context menu, per `editor-tab-context-menu`) and a "Properties" entry on the buffer's right-click context menu in the future are the only other entries. Programmatic `openProperties(rel)` skips the preview slot per the directed-action rule.
+- **Path doesn't resolve.** If the path no longer exists on disk by the time the tab activates (file deleted, moved by another process), the tab renders a "Note not found at `<path>`" empty state but still shows whatever the index and changes db know about the path — exactly the case the inspector exists to surface.
+- **Trash entries.** Right-clicking a trash row → Properties opens the same tab kind for the trashed note (path is the trash-relative path). The "Index state" section shows `Skipped` (trash entries aren't indexed) and the "Changes" section shows the row recorded at delete time — useful for "what was this file's state when I deleted it." [note-properties-tab-trash]
+- **Autosave tab-state.** Properties tabs participate in `autosave-tab-state-store` like every other kind — a properties tab open at quit reopens at the same path on next launch. Stable enough to ride the standard machinery; nothing tab-kind-specific to do.
+- **Reveal in tree.** Tab right-click → Reveal in tree highlights the note in the file tree, same shape as the buffer-tab verb.
+- **No write affordances in v1.** Editing frontmatter, force-reindexing this note, restoring a change row — all candidates for follow-up but the v1 surface is strictly read-only. Force-reindex of a single note is the most likely first write addition (slug-reserved as `note-properties-force-reindex` below).
+
+#### Out of scope (deferred)
+
+- **In-place frontmatter editing.** Tracked under `tree-context-properties-frontmatter-editing`; lands when a frontmatter-editing primitive exists.
+- **Force-reindex this note.** A button that submits a single-note `IndexJob::Reindex`. Useful when debugging skip reasons or embedder drift; deferred until the surface has a real user. [note-properties-force-reindex]
+- **Restore-from-this-row inline.** The changes section already opens each row in `snapshot-preview-mode` which carries Restore — duplicating the Restore button on every row in the inspector would be redundant.
+- **Properties for non-note paths** (folders, trash entries other than `.md` / `.txt`). Folder properties are a different surface (recursive note count, total bytes); revisit when there's an ask. [note-properties-tab-folder-deferred]
+- **Comparison view across two notes.** "Why does the indexer skip A but not B" is occasionally useful; defer until someone wants it.
+
+
 ### Preview tabs
 
 VSCode-style "preview" tab. Single-clicking a note from any browse-y entry point (tree, search results, related notes, recents, wikilink, chat note-link, `@`-mention click) opens it in a single shared preview slot rather than spawning a new tab; clicking the next note replaces the preview's contents in place. The user can browse through ten search hits without ending up with ten tabs. The preview tab promotes to a regular sticky tab the moment the user signals intent — by editing, by double-clicking the tab, by dragging it, or by picking "Keep open" from the tab context menu.
@@ -597,6 +668,7 @@ The headline decisions:
 - **Back and forward buttons live in the top strip's leading cluster** (leftmost, before Home / Queue / Settings / Open). Icon-only, disabled when no history exists in that direction. Browser-leading-left placement keeps all vault-level navigation controls together; per-buffer navigation lives separately in the tab strip. [top-strip-back-button, top-strip-forward-button]
 - **Two-finger horizontal trackpad swipe** triggers back/forward. Same UX as macOS Safari / Chrome / Firefox. Detection via wheel events with sustained `deltaX` past a threshold; right-swipe = back, left-swipe = forward (matches browser convention). [navigation-trackpad-swipe]
 - **Keybind registry entries** reserve `navigation.back` and `navigation.forward` with platform-conventional chords: Cmd/Ctrl-[ for back, Cmd/Ctrl-] for forward; Alt-Left/Right as additional bindings on Linux/Windows for browser-keyboard parity. [navigation-keybind]
+- **Mouse side buttons** (mouse-button-3 / mouse-button-4 — the thumb buttons on standard mice with a back/forward pair) trigger back/forward by default, matching every browser. Detection via window-level `mousedown` (or `auxclick`) listening for `event.button === 3` (back) and `event.button === 4` (forward); calls into the same `navigation.back` / `navigation.forward` action handlers as the keybind and trackpad-swipe paths so all three trigger surfaces converge. Default-on; rebinding deferred until the keybind registry grows mouse-button support (today's registry is keyboard-chord-only). [navigation-mouse-buttons]
 - **Dirty-buffer protection** is moot for back/forward navigation under multi-buffer — navigating to a different tab leaves the prior tab dirty in memory rather than closing it. The save/discard/cancel modal only fires on explicit tab close (per `multi-buffer-no-switch-guard`); window close has no modal (`autosave-close-no-modal`).
 
 

@@ -18,15 +18,12 @@ The headline decisions:
 The left sidebar's top region grows a mode switcher row, sitting between the vault bar (Open vault / Home / Settings — at the top of the app, per `editor.md`) and the existing `+ New note` row. Three modes (initially):
 
 - **Files** (default) — current sidebar content: `+ New note` / `…` actions row at top, file tree, Trash bin pinned at bottom. Unchanged.
-- **Cluster trees** — switcher swaps sidebar body to the cluster editor. The `+ New note` / `…` row + Trash bin hide; the cluster editor brings its own header (tree-name selector, "New tree from current vault" action, mode-specific `…` menu).
+- **Cluster trees** — switcher swaps sidebar body to the cluster editor. The `+ New note` / `…` row hides; the cluster editor brings its own header (tree-name selector, "New tree from current vault" action, mode-specific `…` menu). The Trash bin stays pinned at the bottom — trash is multimodal (may contain notes, trails, cluster trees) so it's shared across modes.
 - **Trails** — reserved slot, not implemented in v1. The switcher offers it as a greyed entry once trails land.
 
-The switcher itself is a compact row of icon-buttons (file-tree glyph / cluster-tree glyph / trail glyph), pressed-state on the active mode. Switching modes is purely a sidebar-content swap — the editor pane on the right is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing. [sidebar-mode-switcher, sidebar-mode-persistence]
+The switcher lives in the sidebar's top row alongside the persistent `+` (new note) and `⋯` (mode-aware actions) buttons — see `editor.md` for the full row layout. Three icon-buttons on the left (file-tree glyph / cluster-tree glyph / trail glyph), pressed-state on the active mode. Switching modes is purely a sidebar-content swap — the editor pane on the right is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing. [sidebar-mode-switcher, sidebar-mode-persistence]
 
 A small detail: the sidebar's collapse toggle (`sidebar-toggle-icon`) keeps its existing behavior — it hides the whole sidebar regardless of mode. Modes don't have their own collapse states; they share the sidebar's one.
-
-The Trash bin is filetree-specific and only appears in Files mode. If a future mode (e.g. Trails) wants its own pinned-bottom region, it brings its own. [sidebar-trash-files-mode-only]
-
 
 ## Cluster trees mode (sidebar)
 

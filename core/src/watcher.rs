@@ -269,6 +269,13 @@ pub fn is_ignored(rel: &str) -> bool {
     if rel.starts_with(".hiker/sessions/") {
         return false;
     }
+    // status: trail-watcher-carve-out
+    // `.hiker/trails/` is similarly carved out: trail-docs and waypoint-
+    // notes ride the indexer so they're searchable like any other note.
+    // Same shape as the sessions carve-out above.
+    if rel.starts_with(".hiker/trails/") {
+        return false;
+    }
     if rel.starts_with(".hiker/") || rel == ".hiker" {
         return true;
     }
@@ -331,6 +338,9 @@ mod tests {
         assert!(!is_ignored("note.md"));
         assert!(!is_ignored("project/notes.md"));
         assert!(!is_ignored("inbox/today.md"));
+        // Carve-outs: sessions and trails ride through the watcher.
+        assert!(!is_ignored(".hiker/sessions/2026-05-01-abc.md"));
+        assert!(!is_ignored(".hiker/trails/01HRX/waypoints/0001--note.md"));
         // Hidden-dir contents are NOT ignored unless under .hiker/ or .git/.
         // That's intentional: a user vault might have legitimate dotted
         // subdirs we shouldn't silently skip beyond the documented two.

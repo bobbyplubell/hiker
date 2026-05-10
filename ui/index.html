@@ -69,18 +69,50 @@
       <aside id="sidebar">
         <!-- status: side-panel-resize -->
         <div id="sidebar-resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize sidebar"></div>
-        <!-- status: sidebar-mode-switcher (planned)
-             Empty slot at the top of the sidebar — reserves the space
-             where the four vault-level icon buttons used to live before
-             they moved out to #top-strip. The Files/Cluster/Trails mode
-             switcher will land here. -->
-        <div id="sidebar-mode-switcher" hidden></div>
-        <header id="tree-toolbar">
-          <button id="new-note-btn" title="New note">+ New note</button>
-          <button id="tree-actions-btn" class="icon-btn" title="Tree actions">…</button>
+        <!-- status: sidebar-mode-switcher, sidebar-toolbar-actions-menu, create-note-button
+             Single uniform icon-only top row across all three modes:
+             three mode buttons on the left (Files / Cluster trees /
+             Trails — pressed-state on the active mode), a divider,
+             then `+` (new note) and `⋯` (actions menu) on the right.
+             Layout never shifts on mode switch; `+` and `⋯` are
+             behaviorally mode-aware. Trails is greyed in v1. -->
+        <header id="sidebar-mode-switcher" role="tablist" aria-label="Sidebar mode">
+          <button id="sidebar-mode-files" class="sidebar-mode-btn active" type="button" role="tab" aria-selected="true" title="Files" aria-label="Files">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M2.5 4a1 1 0 0 1 1-1h3l1.5 1.5H12.5a1 1 0 0 1 1 1V12.5a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V4z"/><line x1="5" y1="7.5" x2="11" y2="7.5"/><line x1="5" y1="9.8" x2="11" y2="9.8"/><line x1="5" y1="12.1" x2="9" y2="12.1"/></svg>
+          </button>
+          <button id="sidebar-mode-clusters" class="sidebar-mode-btn" type="button" role="tab" aria-selected="false" title="Cluster trees" aria-label="Cluster trees">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="3.25" r="1.5"/><circle cx="3.5" cy="12.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M8 4.75v2.5"/><path d="M8 7.25H3.5v3.75"/><path d="M8 7.25h4.5v3.75"/></svg>
+          </button>
+          <button id="sidebar-mode-trails" class="sidebar-mode-btn" type="button" role="tab" aria-selected="false" title="Trails" aria-label="Trails">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-linecap="round" overflow="visible" aria-hidden="true"><path stroke-width="2.8" d="M8 15 C 20 12.5, -4 9, 8 7"/><path stroke-width="1.3" d="M8 7 C 13 5.5, 4 3.5, 8 2"/><path stroke-width="0.7" d="M8 2 C 8.8 1.4, 7.5 1, 8 0.5"/></svg>
+          </button>
+          <span class="sidebar-toolbar-spacer"></span>
+          <span class="sidebar-toolbar-divider" aria-hidden="true"></span>
+          <button id="new-note-btn" class="sidebar-mode-btn" type="button" title="New note" aria-label="New note">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="3" x2="8" y2="13"/><line x1="3" y1="8" x2="13" y2="8"/></svg>
+          </button>
+          <button id="sidebar-actions-btn" class="sidebar-mode-btn" type="button" title="Sidebar actions" aria-label="Sidebar actions">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3.5" cy="8" r="1.2"/><circle cx="8" cy="8" r="1.2"/><circle cx="12.5" cy="8" r="1.2"/></svg>
+          </button>
         </header>
         <div id="sidebar-scroll">
           <div id="tree"></div>
+          <!-- status: sidebar-mode-switcher
+               Placeholder for the cluster-trees mode body. The full
+               cluster editor (per `cluster-editor.md`) is `planned` and
+               its sidebar surface lands under `cluster-editor-sidebar-mode`;
+               this stub exists so the mode switcher has somewhere to
+               swap to in the meantime. -->
+          <div id="sidebar-clusters-body" class="sidebar-mode-placeholder" hidden>
+            <p>Cluster trees</p>
+            <p class="sidebar-mode-placeholder-hint">Coming soon — the cluster editor lands with <code>cluster-editor-sidebar-mode</code>.</p>
+          </div>
+          <!-- status: trails-mode-body
+               Body container for the Trails sidebar mode. Header
+               (active-trail dropdown + trail-head icon + expand-all)
+               and waypoint cards (or empty state) are rendered by
+               `ui/src/trails`. -->
+          <div id="sidebar-trails-body" class="sidebar-trails-body" hidden></div>
           <div id="trash-bin" class="collapsed">
             <div id="trash-header"><span id="trash-chevron">▸</span> <svg class="trash-icon" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M3 4.5h10"/><path d="M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5"/><path d="M4.5 4.5l.6 8.2a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8.2"/><line x1="7" y1="7.2" x2="7" y2="11.8" stroke-width="1"/><line x1="9" y1="7.2" x2="9" y2="11.8" stroke-width="1"/></svg> <span id="trash-label">Trash</span></div>
             <div id="trash-list"></div>
@@ -98,6 +130,12 @@
                buffer is a trash / snapshot preview, or when the diff view
                is up. Empty in normal editing. Centered between the two
                flex spacers. -->
+          <!-- status: trail-add-to-active-from-editor-verb
+               Editor toolbar pill: "Add to trail: <name>". Visibility
+               and label are runtime-driven by `./trails/addToTrailPill`;
+               hidden by default so the toolbar layout stays stable
+               before the buffer + active-trail seam is wired. -->
+          <button id="add-to-trail-pill" class="toolbar-btn add-to-trail-pill" type="button" hidden></button>
           <span id="mode-controls"></span>
           <span class="toolbar-spacer"></span>
           <button id="save-btn" class="toolbar-btn" title="Save" aria-label="Save" disabled>
@@ -111,12 +149,6 @@
           </button>
           <button id="mutations-menu-btn" class="toolbar-btn" title="Note mutations" aria-label="Note mutations">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><g transform="rotate(-45 8 8)"><rect x="2" y="7.8" width="12" height="2.4" rx="1.2" stroke-width="0.9"/><rect x="2.4" y="8.2" width="7.2" height="1.6" rx="0.8" fill="currentColor" stroke="none"/></g></svg>
-          </button>
-          <button id="tree-org-menu-btn" class="toolbar-btn" title="Auto-organize tree" aria-label="Auto-organize tree">
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="3.25" r="1.5"/><circle cx="3.5" cy="12.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M8 4.75v2.5"/><path d="M8 7.25H3.5v3.75"/><path d="M8 7.25h4.5v3.75"/></svg>
-          </button>
-          <button id="trails-menu-btn" class="toolbar-btn" title="Trails" aria-label="Trails">
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-linecap="round" overflow="visible" aria-hidden="true"><path stroke-width="2.8" d="M8 15 C 20 12.5, -4 9, 8 7"/><path stroke-width="1.3" d="M8 7 C 13 5.5, 4 3.5, 8 2"/><path stroke-width="0.7" d="M8 2 C 8.8 1.4, 7.5 1, 8 0.5"/></svg>
           </button>
           <button id="toggle-related" class="toolbar-btn" title="Toggle discovery panel" aria-label="Toggle discovery panel">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.25"/><line x1="10.2" y1="10.2" x2="14" y2="14"/></svg>

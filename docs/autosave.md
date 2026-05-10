@@ -186,7 +186,7 @@ Autosave is on by default with a fixed 5s tick. No `[autosave]` config section i
 - **Cross-device autosave sync.** Autosave is per-machine crash recovery, not a device-handoff feature. The future sync layer in `design.md` syncs *committed* writes (saved files); in-flight uncommitted content stays local. This deliberately matches every other editor's posture.
 - **Per-keystroke continuous flush.** 5s tick + on-blur flush is the right ergonomic floor; flushing every keystroke would bury the disk for negligible recovery improvement.
 - **Recovery prompt / modal at vault open.** Auto-restore as dirty tabs is the design; the dirty-marker, the close-dirty modal, and `editor-diff-vs-disk-toggle` together cover everything a per-row Restore/Discard prompt would.
-- **Untitled / scratch buffers.** Hiker has no untitled-buffer concept today (`create-note-button` mints a path immediately). When and if scratch buffers land, autosave will need a path-less storage shape; not designed here.
+- **Untitled / scratch buffers.** Hiker has no untitled-buffer concept today (`sidebar-new-item-button` mints a path immediately). When and if scratch buffers land, autosave will need a path-less storage shape; not designed here.
 
 
 ## Forward refs

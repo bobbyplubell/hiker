@@ -37,6 +37,7 @@ export type UiTarget =
   | "ui::mutations"
   | "ui::snapshot-preview"
   | "ui::trash"
+  | "ui::trails"
   | "ui::mode-controls"
   | "ui::app";
 

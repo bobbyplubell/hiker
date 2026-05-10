@@ -49,7 +49,7 @@ export interface DomRefs {
   tree: {
     treeEl: HTMLElement;
     newNoteBtn: HTMLButtonElement;
-    treeActionsBtn: HTMLButtonElement;
+    sidebarActionsBtn: HTMLButtonElement;
   };
   trash: {
     binEl: HTMLElement;
@@ -164,7 +164,7 @@ export function captureDomRefs(): DomRefs {
     tree: {
       treeEl: byId("tree"),
       newNoteBtn: byId<HTMLButtonElement>("new-note-btn"),
-      treeActionsBtn: byId<HTMLButtonElement>("tree-actions-btn"),
+      sidebarActionsBtn: byId<HTMLButtonElement>("sidebar-actions-btn"),
     },
     trash: {
       binEl: byId("trash-bin"),

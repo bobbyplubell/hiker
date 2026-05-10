@@ -55,11 +55,29 @@ export interface SettingsConfig {
     sidebar_width: number;
     discovery_width: number;
     show_sessions_in_tree: boolean;
+    sidebar_mode: "files" | "clusters" | "trails";
+    /// status: active-trail-state
+    /// Vault-relative path of the active trail-doc, or `null` when none
+    /// is active. Persisted via `set_setting` / `trail_set_active` (the
+    /// latter is the canonical writer because it also stamps
+    /// `hiker.last_activated_at` on the trail-doc).
+    active_trail: string | null;
     tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
   };
   search: {
     modes: { semantic: boolean; lexical: boolean };
     sections: { results_expanded: boolean; related_expanded: boolean };
+    lexical: {
+      case_sensitive: boolean;
+      diacritic_sensitive: boolean;
+      prefix_match: boolean;
+      phrase_mode: boolean;
+    };
+    semantic: {
+      min_similarity: number;
+      top_k: number;
+      recency_bias: "off" | "mild" | "strong";
+    };
   };
   // Loosely shaped — the pane only inspects keys via dotted-path lookup,
   // and the deferred sections (llm, mcp) don't have rendered rows yet.
@@ -104,11 +122,24 @@ const DEFAULTS = {
     sidebar_width: 280,
     discovery_width: 320,
     show_sessions_in_tree: false,
+    sidebar_mode: "files" as const,
+    active_trail: null as string | null,
     tree: { sort_by: "name_asc" as const },
   },
   search: {
     modes: { semantic: true, lexical: true },
     sections: { results_expanded: true, related_expanded: true },
+    lexical: {
+      case_sensitive: false,
+      diacritic_sensitive: false,
+      prefix_match: false,
+      phrase_mode: false,
+    },
+    semantic: {
+      min_similarity: 0.0,
+      top_k: 25,
+      recency_bias: "off" as const,
+    },
   },
   // Mirror of `LlmConfig::default()` (and its sub-tables) in
   // core/src/config.rs. The settings pane's reset affordance reads

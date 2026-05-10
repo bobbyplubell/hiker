@@ -9,6 +9,9 @@
 // status: search-section-counts
 // status: search-result-click-opens-chunk
 // status: search-section-collapsible
+// status: search-mode-options-menu
+// status: search-lexical-options
+// status: search-semantic-options
 //
 // Discovery panel: search input + mode toggles + lexical/semantic results +
 // related-notes panel + collapsible sections + roving-tabindex keyboard nav.
@@ -26,6 +29,33 @@ import {
   type PanelDeps,
 } from "../panels/controller";
 import { Classes, Selectors } from "../style/classes";
+import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+
+export interface LexicalSearchOpts {
+  case_sensitive: boolean;
+  diacritic_sensitive: boolean;
+  prefix_match: boolean;
+  phrase_mode: boolean;
+}
+
+export interface SemanticSearchOpts {
+  min_similarity: number;
+  top_k: number;
+  recency_bias: "off" | "mild" | "strong";
+}
+
+const DEFAULT_LEXICAL_OPTS: LexicalSearchOpts = {
+  case_sensitive: false,
+  diacritic_sensitive: false,
+  prefix_match: false,
+  phrase_mode: false,
+};
+
+const DEFAULT_SEMANTIC_OPTS: SemanticSearchOpts = {
+  min_similarity: 0.0,
+  top_k: 25,
+  recency_bias: "off",
+};
 
 export interface DiscoveryDeps extends PanelDeps {
   appEl: HTMLElement;
@@ -54,6 +84,8 @@ export interface DiscoveryApi {
   refreshRelated(rel: string | null): Promise<void>;
   scheduleRelatedRefresh(rel: string | null, delayMs: number): void;
   setMode(mode: "semantic" | "lexical", on: boolean, persist: boolean): void;
+  setLexicalOpts(opts: LexicalSearchOpts): void;
+  setSemanticOpts(opts: SemanticSearchOpts): void;
   setSectionExpanded(
     section: "results" | "related",
     expanded: boolean,
@@ -79,6 +111,8 @@ export type DiscoveryController = PanelController<DiscoveryApi>;
 export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
   let searchModeSemantic = true;
   let searchModeLexical = true;
+  let lexicalOpts: LexicalSearchOpts = { ...DEFAULT_LEXICAL_OPTS };
+  let semanticOpts: SemanticSearchOpts = { ...DEFAULT_SEMANTIC_OPTS };
   let searchEpoch = 0;
   let searchDebounceTimer: number | null = null;
   let searchSectionExpanded = true;
@@ -228,6 +262,8 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
         query,
         modes: { semantic: searchModeSemantic, lexical: searchModeLexical },
         epoch,
+        lexicalOpts,
+        semanticOpts,
       });
       if (resp.epoch !== searchEpoch) return;
       deps.searchSpinnerEl.hidden = true;
@@ -489,12 +525,127 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
     }, delayMs);
   }
 
+  function setLexicalOpts(opts: LexicalSearchOpts): void {
+    lexicalOpts = { ...opts };
+  }
+  function setSemanticOpts(opts: SemanticSearchOpts): void {
+    semanticOpts = { ...opts };
+  }
+
+  function persistLexical<K extends keyof LexicalSearchOpts>(
+    key: K,
+    value: LexicalSearchOpts[K],
+  ): void {
+    lexicalOpts = { ...lexicalOpts, [key]: value };
+    void deps.settings.setVaultSetting(`search.lexical.${key}`, value);
+    maybeRerunSearchAfterModeChange();
+  }
+  function persistSemantic<K extends keyof SemanticSearchOpts>(
+    key: K,
+    value: SemanticSearchOpts[K],
+  ): void {
+    semanticOpts = { ...semanticOpts, [key]: value };
+    void deps.settings.setVaultSetting(`search.semantic.${key}`, value);
+    maybeRerunSearchAfterModeChange();
+  }
+
+  // status: search-mode-options-menu
+  //
+  // Right-click on either toggle pops a `openContextMenu` popover
+  // anchored under the button with mode-specific options. Left-click
+  // still flips on/off — opening the menu does *not* toggle enabled
+  // state per the spec ("no behavioral overload of the primary
+  // affordance").
+  function openLexicalOptionsMenu(anchor: HTMLElement): void {
+    const rect = anchor.getBoundingClientRect();
+    const items: CtxMenuItem[] = [
+      {
+        label: "Case sensitive",
+        checked: lexicalOpts.case_sensitive,
+        run: () => persistLexical("case_sensitive", !lexicalOpts.case_sensitive),
+      },
+      {
+        label: "Match diacritics",
+        checked: lexicalOpts.diacritic_sensitive,
+        run: () =>
+          persistLexical(
+            "diacritic_sensitive",
+            !lexicalOpts.diacritic_sensitive,
+          ),
+      },
+      {
+        label: "Prefix match",
+        checked: lexicalOpts.prefix_match,
+        tooltip: lexicalOpts.phrase_mode
+          ? "Phrase mode is on — FTS5 ignores prefix * inside a quoted phrase."
+          : undefined,
+        run: () => persistLexical("prefix_match", !lexicalOpts.prefix_match),
+      },
+      {
+        label: "Phrase mode",
+        checked: lexicalOpts.phrase_mode,
+        run: () => persistLexical("phrase_mode", !lexicalOpts.phrase_mode),
+      },
+    ];
+    openContextMenu(rect.left, rect.bottom, items);
+  }
+
+  function openSemanticOptionsMenu(anchor: HTMLElement): void {
+    const rect = anchor.getBoundingClientRect();
+    const items: CtxMenuItem[] = [
+      {
+        kind: "slider",
+        label: "Minimum similarity",
+        min: 0,
+        max: 0.95,
+        step: 0.05,
+        value: semanticOpts.min_similarity,
+        format: (v) => v.toFixed(2),
+        onChange: (v) => persistSemantic("min_similarity", v),
+      },
+      {
+        kind: "number",
+        label: "Top-k override",
+        min: 5,
+        max: 100,
+        step: 1,
+        value: semanticOpts.top_k,
+        onCommit: (v) => persistSemantic("top_k", v),
+      },
+      {
+        kind: "radio",
+        label: "Recency bias",
+        value: semanticOpts.recency_bias,
+        options: [
+          { label: "Off", value: "off" },
+          { label: "Mild", value: "mild" },
+          { label: "Strong", value: "strong" },
+        ],
+        onChange: (v) =>
+          persistSemantic(
+            "recency_bias",
+            v as SemanticSearchOpts["recency_bias"],
+          ),
+      },
+    ];
+    openContextMenu(rect.left, rect.bottom, items);
+  }
+
   // ---------- DOM listeners ----------
   deps.toggleSemanticBtn.addEventListener("click", () => {
     setMode("semantic", !searchModeSemantic, true);
   });
   deps.toggleLexicalBtn.addEventListener("click", () => {
     setMode("lexical", !searchModeLexical, true);
+  });
+  // status: search-mode-options-menu
+  deps.toggleSemanticBtn.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openSemanticOptionsMenu(deps.toggleSemanticBtn);
+  });
+  deps.toggleLexicalBtn.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openLexicalOptionsMenu(deps.toggleLexicalBtn);
   });
   // Container-level click delegation; rows are pure DOM with a
   // `data-rel` hook the handler resolves via `closest`.
@@ -546,6 +697,8 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
     refreshRelated,
     scheduleRelatedRefresh,
     setMode,
+    setLexicalOpts,
+    setSemanticOpts,
     setSectionExpanded,
     syncToggleButtons,
     clear,

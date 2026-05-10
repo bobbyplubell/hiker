@@ -263,7 +263,7 @@ Indexer logic: when ingest decides to skip a file, write the `notes` row with `s
 
 ## Reindex verbs
 
-`tauri-cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the tree toolbar's `…` menu (see `editor.md`'s `tree-toolbar-actions-menu`):
+`tauri-cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
 
 - **Reindex all** — `index(IndexScope::All)`. No confirm modal; re-embedding identical content is non-destructive and the click is the opt-in. [reindex-all-action]
 - **Reindex this file** — `index(IndexScope::Path(currentPath))`. Greyed when no file is active. [reindex-current-file-action]

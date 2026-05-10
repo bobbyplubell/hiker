@@ -125,6 +125,16 @@ export function mountTabs(deps: TabsDeps): TabsApi {
       if (out) out.savedState = ed.getState();
     }
     ed.resetDiffDecorations();
+    // Clear the outgoing buffer reference *before* the doc dispatch so
+    // CM6's synchronous update listeners (notably `statusUpdater` →
+    // `updateStatus()` → `isDirty()`) don't compare the incoming doc
+    // against the outgoing buffer's `loadedText`. Without this, the
+    // mid-switch dirty-check sees a doc/loadedText mismatch (the doc
+    // already swapped, the buffer pointer hasn't yet) and fires
+    // `promotePreviewIfActive()` against the outgoing preview tab —
+    // demoting it to sticky on every tab switch, contradicting the
+    // promotion-paths rule in `editor-preview-tab-promotion`.
+    deps.setBufferState({ buffer: null });
     // Build the per-tab compartment effect list once via the host's
     // `tabSwitchEffects`. setState restores compartments to whatever the
     // target's saved state had; we re-apply path-dependent + global

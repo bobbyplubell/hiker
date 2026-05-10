@@ -19,6 +19,7 @@ Both jobs start by reading the code and specs honestly. They differ only in what
 3. **Read `bug_tracking.md`.** Active bugs may outrank new features.
 4. **Audit the code.** For each `partial` slug in `status.md`, read the cited file:line and verify the claim. Status rows drift; reality on disk wins. Surface drift to the user as part of the report.
 5. **Look at recent git history.** `git log --oneline -30` and the diff of unmerged work tells you what's actively in flight — don't recommend something the user is already doing.
+6. **Skim `scratch/`.** Files there hold in-flight design context — ideas the user has been pooling in chat but haven't been ironed out enough to land in `docs/` yet (currently trails). A feature with substantial scratch notes is *being designed*, not ready for impl recommendation; surface it as "in design" rather than "ready to build." Same rule for `docs/design.md`'s "Future / deferred" section: items there are named but not specced — don't recommend them as next-up impl work.
 
 ## How to prioritize
 

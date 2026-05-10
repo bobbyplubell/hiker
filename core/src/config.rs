@@ -76,6 +76,8 @@ pub struct Config {
     pub llm: LlmConfig,
     #[serde(default)]
     pub tasks: TasksConfig,
+    #[serde(default)]
+    pub trails: TrailsConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -93,8 +95,35 @@ impl Default for Config {
             mcp: McpConfig::default(),
             llm: LlmConfig::default(),
             tasks: TasksConfig::default(),
+            trails: TrailsConfig::default(),
         }
     }
+}
+
+/// `[trails]` section. Configures trail-doc placement and other vault-wide
+/// trail policy. See `docs/trails.md`.
+///
+/// status: trails-default-location
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrailsConfig {
+    /// Default directory for newly-created trail-docs. Vault-relative.
+    /// Empty string places trails at vault root. Auto-created on first
+    /// trail. Vault-scope eligible per `settings-write-back`.
+    #[serde(default = "default_new_trail_dir")]
+    pub new_trail_dir: String,
+}
+
+impl Default for TrailsConfig {
+    fn default() -> Self {
+        Self {
+            new_trail_dir: default_new_trail_dir(),
+        }
+    }
+}
+
+fn default_new_trail_dir() -> String {
+    "trails/".to_string()
 }
 
 /// `[tasks]` section. Configures the unified work queue (`core::tasks`).
@@ -527,6 +556,103 @@ pub struct SearchConfig {
     pub modes: SearchModesConfig,
     #[serde(default)]
     pub sections: SearchSectionsConfig,
+    #[serde(default)]
+    pub lexical: SearchLexicalConfig,
+    #[serde(default)]
+    pub semantic: SearchSemanticConfig,
+}
+
+/// `[search.lexical]` — per-mode option flags surfaced via the right-click
+/// options menu on the Lexical (`Aa`) toggle. Defaults preserve current
+/// behavior (everything off) so existing users see no change until they
+/// reach into the menu.
+///
+/// status: search-lexical-options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchLexicalConfig {
+    #[serde(default = "no")]
+    pub case_sensitive: bool,
+    #[serde(default = "no")]
+    pub diacritic_sensitive: bool,
+    #[serde(default = "no")]
+    pub prefix_match: bool,
+    #[serde(default = "no")]
+    pub phrase_mode: bool,
+}
+
+impl Default for SearchLexicalConfig {
+    fn default() -> Self {
+        Self {
+            case_sensitive: false,
+            diacritic_sensitive: false,
+            prefix_match: false,
+            phrase_mode: false,
+        }
+    }
+}
+
+/// `[search.semantic]` — per-mode option flags surfaced via the right-click
+/// options menu on the Semantic (brain) toggle.
+///
+/// status: search-semantic-options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSemanticConfig {
+    /// Cosine-similarity floor; hits below this are dropped before fusion.
+    /// Range 0.00–0.95 in 0.05 steps; default 0.00 (no filter).
+    /// status: search-semantic-min-similarity
+    #[serde(default = "default_min_similarity")]
+    pub min_similarity: f32,
+    /// Override of `PER_BACKEND_TOP_K` for the semantic side only. Range
+    /// 5–100; default 25 (matches the lexical side).
+    /// status: search-semantic-top-k-override
+    #[serde(default = "default_semantic_top_k")]
+    pub top_k: u32,
+    /// RRF blend of `notes.mtime` rank into the semantic score; off/mild/strong.
+    /// status: search-semantic-recency-bias
+    #[serde(default)]
+    pub recency_bias: RecencyBias,
+}
+
+impl Default for SearchSemanticConfig {
+    fn default() -> Self {
+        Self {
+            min_similarity: default_min_similarity(),
+            top_k: default_semantic_top_k(),
+            recency_bias: RecencyBias::default(),
+        }
+    }
+}
+
+fn default_min_similarity() -> f32 { 0.0 }
+fn default_semantic_top_k() -> u32 { 25 }
+
+/// Recency-bias weighting for the semantic engine. `Off` = no recency
+/// blend (default); `Mild` / `Strong` mix mtime rank into the score via
+/// the same RRF k=60 shape as cross-mode fusion (weights 0.5 / 1.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecencyBias {
+    Off,
+    Mild,
+    Strong,
+}
+
+impl Default for RecencyBias {
+    fn default() -> Self {
+        RecencyBias::Off
+    }
+}
+
+impl RecencyBias {
+    pub fn weight(self) -> f32 {
+        match self {
+            RecencyBias::Off => 0.0,
+            RecencyBias::Mild => 0.5,
+            RecencyBias::Strong => 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -604,6 +730,15 @@ pub struct IndexingConfig {
     pub batch_size: u16,
     #[serde(default)]
     pub ignored_paths: Vec<String>,
+    /// Controls when notes get their `hiker.id` stamped into frontmatter.
+    /// `lazy` (default) stamps only when a note becomes a reference target
+    /// (e.g. trail waypoint, future wikilink). `all` stamps every note on
+    /// first ingest. Both modes share the invariant that any *referenced*
+    /// note is stamped.
+    ///
+    /// status: note-id-stamping
+    #[serde(default)]
+    pub id_stamping: IdStampingMode,
 }
 
 impl Default for IndexingConfig {
@@ -612,7 +747,26 @@ impl Default for IndexingConfig {
             model: default_model(),
             batch_size: default_batch_size(),
             ignored_paths: Vec::new(),
+            id_stamping: IdStampingMode::default(),
         }
+    }
+}
+
+/// Note-id stamping policy. See `docs/trails.md` §"Note ID stamping policy".
+///
+/// status: note-id-stamping
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdStampingMode {
+    /// Stamp every note on first ingest (lazy backfill via reindex).
+    All,
+    /// Stamp only when a note becomes a reference target. Default.
+    Lazy,
+}
+
+impl Default for IdStampingMode {
+    fn default() -> Self {
+        IdStampingMode::Lazy
     }
 }
 
@@ -668,6 +822,17 @@ pub struct VaultConfig {
     /// status: chat-session-show-in-tree-toggle
     #[serde(default = "no")]
     pub show_sessions_in_tree: bool,
+    /// Active sidebar mode (Files / Cluster trees / Trails).
+    /// status: sidebar-mode-switcher
+    #[serde(default)]
+    pub sidebar_mode: SidebarMode,
+    /// Vault-relative path of the currently active trail-doc, or `None`
+    /// if no trail is active. At most one active trail per vault. Persisted
+    /// via `set_setting` so it survives restarts.
+    ///
+    /// status: active-trail-state
+    #[serde(default)]
+    pub active_trail: Option<String>,
     #[serde(default)]
     pub tree: TreeConfig,
 }
@@ -684,6 +849,8 @@ impl Default for VaultConfig {
             sidebar_width: default_sidebar_width(),
             discovery_width: default_discovery_width(),
             show_sessions_in_tree: false,
+            sidebar_mode: SidebarMode::default(),
+            active_trail: None,
             tree: TreeConfig::default(),
         }
     }
@@ -728,6 +895,22 @@ pub enum TreeSortBy {
 impl Default for TreeSortBy {
     fn default() -> Self {
         TreeSortBy::NameAsc
+    }
+}
+
+/// Active sidebar mode. Persisted per-vault under `vault.sidebar_mode`.
+/// status: sidebar-mode-switcher
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarMode {
+    Files,
+    Clusters,
+    Trails,
+}
+
+impl Default for SidebarMode {
+    fn default() -> Self {
+        SidebarMode::Files
     }
 }
 
@@ -1063,6 +1246,8 @@ enum ValueType {
     StringArray,
     /// `name_asc | name_desc | mtime_desc | mtime_asc`.
     TreeSortBy,
+    /// `files | clusters | trails`.
+    SidebarMode,
     /// Floating-point fraction in `[0.0, 1.0]`.
     UnitFraction,
     /// Positive integer (fits in u32). Used for the LLM/agent knobs
@@ -1073,6 +1258,14 @@ enum ValueType {
     /// `0..=65535` — used for `[mcp] port`. Distinct from `PositiveInt`
     /// because port `0` means "ephemeral / OS-assigned" and is valid.
     Port,
+    /// Floating-point in `[0.0, 0.95]` — `[search.semantic] min_similarity`.
+    SemanticMinSim,
+    /// `5..=100` — `[search.semantic] top_k`.
+    SemanticTopK,
+    /// `off | mild | strong` for `[search.semantic] recency_bias`.
+    RecencyBias,
+    /// `all | lazy` for `[indexing] id_stamping`.
+    IdStamping,
 }
 
 const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -1090,11 +1283,26 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
+    EligibleKey { path: "vault.sidebar_mode",            ty: ValueType::SidebarMode },
+    // status: active-trail-state
+    EligibleKey { path: "vault.active_trail",            ty: ValueType::String },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },
+    // status: trails-default-location
+    EligibleKey { path: "trails.new_trail_dir",          ty: ValueType::String },
+    // status: note-id-stamping
+    EligibleKey { path: "indexing.id_stamping",          ty: ValueType::IdStamping },
     EligibleKey { path: "search.modes.semantic",         ty: ValueType::Bool },
     EligibleKey { path: "search.modes.lexical",          ty: ValueType::Bool },
     EligibleKey { path: "search.sections.results_expanded", ty: ValueType::Bool },
     EligibleKey { path: "search.sections.related_expanded", ty: ValueType::Bool },
+    // status: search-lexical-options, search-semantic-options
+    EligibleKey { path: "search.lexical.case_sensitive",     ty: ValueType::Bool },
+    EligibleKey { path: "search.lexical.diacritic_sensitive",ty: ValueType::Bool },
+    EligibleKey { path: "search.lexical.prefix_match",       ty: ValueType::Bool },
+    EligibleKey { path: "search.lexical.phrase_mode",        ty: ValueType::Bool },
+    EligibleKey { path: "search.semantic.min_similarity",    ty: ValueType::SemanticMinSim },
+    EligibleKey { path: "search.semantic.top_k",             ty: ValueType::SemanticTopK },
+    EligibleKey { path: "search.semantic.recency_bias",      ty: ValueType::RecencyBias },
     // LLM section. Per-vault override (provider key / model / cap can
     // be tuned per workspace) shares the same eligibility set as user
     // scope so the per-section [User]/[Vault] toggle in the settings
@@ -1222,6 +1430,9 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
             s.as_str(),
             "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc"
         ),
+        (ValueType::SidebarMode, J::String(s)) => {
+            matches!(s.as_str(), "files" | "clusters" | "trails")
+        }
         (ValueType::UnitFraction, J::Number(n)) => n
             .as_f64()
             .map(|f| (0.0..=1.0).contains(&f))
@@ -1241,6 +1452,20 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
             .as_u64()
             .map(|u| u <= u16::MAX as u64)
             .unwrap_or(false),
+        (ValueType::SemanticMinSim, J::Number(n)) => n
+            .as_f64()
+            .map(|f| (0.0..=0.95).contains(&f))
+            .unwrap_or(false),
+        (ValueType::SemanticTopK, J::Number(n)) => n
+            .as_u64()
+            .map(|u| (5..=100).contains(&u))
+            .unwrap_or(false),
+        (ValueType::RecencyBias, J::String(s)) => {
+            matches!(s.as_str(), "off" | "mild" | "strong")
+        }
+        (ValueType::IdStamping, J::String(s)) => {
+            matches!(s.as_str(), "all" | "lazy")
+        }
         _ => false,
     };
     if !ok {

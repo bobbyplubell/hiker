@@ -69,6 +69,16 @@ For every new feature slug introduced in a spec:
 
 For specs that include slugs deferred to "we may do this later" (e.g. `obs-perf-flamegraph`), add them as `planned` rows too — being deferred isn't a different status, it's just one of the planned items.
 
+## Where ideas live
+
+Three homes, picked by maturity:
+
+- **`docs/<feature>.md`** — concrete enough for a spec doc with slug taxonomy and registered status rows. Default destination once an idea is well-formed.
+- **`docs/design.md`'s "Future / deferred" section** — for cross-doc future ideas that have a name and a sketch but aren't ready for their own spec doc yet. Captures the idea in canonical project docs without inflating it into premature commitment.
+- **`scratch/<topic>.md`** — for context discussed in chat that *isn't yet ironed out enough* to land in `docs/`. Decisions are still evolving; contradictions and open questions are expected. Currently used for trails (until `trails.md` exists). Pool conversation context here, then promote to `design.md` (as deferred) or to its own `docs/<feature>.md` when the design firms up.
+
+When in doubt, prefer `design.md` over `scratch/` — design.md is the canonical doc, scratch is a holding pen. Only park in `scratch/` if the idea is genuinely too unstable for `design.md`'s deferred section.
+
 ## When the user asks for a new spec
 
 1. Read all of `docs/` in full, plus `status.md`.

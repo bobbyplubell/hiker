@@ -30,6 +30,12 @@ import {
 } from "./dirtyBufferDiff";
 import { mountTabStrip, type TabStripApi } from "./tabStrip";
 import { mountDiscovery, type DiscoveryController } from "./discovery";
+import { mountTrailsPanel, type TrailsController } from "./trails";
+import { mountAddToTrailPill } from "./trails/addToTrailPill";
+import {
+  installMembershipWatchers,
+  refreshActiveTrailWaypointPaths,
+} from "./trails/membership";
 import {
   mountNavigation,
   installNavigationSwipe,
@@ -52,6 +58,7 @@ import {
   tabStore,
   viewSettingsStore,
   inFlightMutationsStore,
+  activeTrailStore,
   type Buffer,
   type BufferApi,
   type ActiveBufferSnapshot,
@@ -145,9 +152,12 @@ function applySettingsToUi(s: Settings): void {
     setChatHeight: (h) => chatPanel.setHeight(h),
     setSidebarWidth: (px) => setSidebarWidthVar(px),
     setDiscoveryWidth: (px) => setDiscoveryWidthVar(px),
+    setSidebarMode: (mode) => setSidebarMode(mode, false),
     setSearchMode: (mode, on) => discovery.api.setMode(mode, on, false),
     setSearchSection: (section, expanded) =>
       discovery.api.setSectionExpanded(section, expanded, false),
+    setLexicalOpts: (opts) => discovery.api.setLexicalOpts(opts),
+    setSemanticOpts: (opts) => discovery.api.setSemanticOpts(opts),
     syncToggleButtons,
   });
 }
@@ -159,7 +169,7 @@ const dom = captureDomRefs();
 const { appEl, editorEl, editorPaneEl, saveBtn, diffBtn, modeControlsEl } = dom.editor;
 const { statusPathEl, statusCursorEl, statusWordsEl, statusIndexEl } = dom.statusBar;
 const { pickBtn, vaultPathEl, homeBtn, settingsBtn } = dom.vaultBar;
-const { treeEl, newNoteBtn, treeActionsBtn } = dom.tree;
+const { treeEl, newNoteBtn, sidebarActionsBtn } = dom.tree;
 const {
   binEl: trashBinEl,
   headerEl: trashHeaderEl,
@@ -721,7 +731,7 @@ const panelToast: (msg: string, opts?: { actionLabel?: string; onAction?: () => 
 const tree: TreeController = mountTree({
   treeEl,
   newNoteBtn,
-  treeActionsBtn,
+  sidebarActionsBtn,
   cssEscape,
   // PanelDeps cross-panel uniforms (toast / formatErr / settings /
   // openNote / focusEditor). The tree uses `formatErr` (alert copy on
@@ -771,6 +781,16 @@ const tree: TreeController = mountTree({
   },
   refreshTrashBin,
   renderIndexStatus: () => indexStatusView.render(),
+  // status: trail-add-to-active-from-tree-verb — explicit panel +
+  // membership refresh after the verb's `trailAppendWaypoint`
+  // succeeds. Watcher is suppressed for the trail-doc + waypoint-note
+  // paths during the append, so the `hiker:file-changed` refresh
+  // path can't fire here. See
+  // `bug-add-to-trail-verbs-dont-refresh-panel`.
+  onWaypointAppended: () => {
+    void trailsPanel?.api.refresh();
+    void refreshActiveTrailWaypointPaths();
+  },
 });
 
 // status: status-bar-index-label, status-bar-active-file-index-state
@@ -863,8 +883,15 @@ async function applyOpenedVault(path: string): Promise<void> {
   // surface in the new vault. status: search-discovery-panel
   discovery.api.clear();
   startBackgroundIntervals();
+  // status: trail-row-icon — seed the trail-doc set so the first
+  // tree paint can decorate trail-doc rows. Awaited before
+  // `refreshTree` so the initial paint already includes the icon.
+  await tree.api.refreshTrailDocSet();
   await refreshTree();
   await refreshTrashBin();
+  // status: trails-mode-body — re-fetch trails-list + active trail
+  // detail after the settings snapshot has seeded `activeTrailStore`.
+  trailsPanel?.api.onActiveTrailMaybeChanged();
   // status: navigation-history-stack — history is per-vault, so swapping
   // vaults drops the stack along with `openBuffers`. Cleared *before*
   // `vaultHome.setVisible(true)` below so the home page becomes the
@@ -1626,6 +1653,107 @@ toggleRelatedBtn.addEventListener("click", () => {
 appEl.classList.add("related-collapsed");
 syncToggleButtons();
 
+// status: sidebar-mode-switcher
+// Files / Cluster trees / Trails switcher at the top of the sidebar.
+// Files-mode body is the existing tree + toolbar; Clusters-mode swaps in a
+// placeholder until the cluster editor surface (`cluster-editor-sidebar-mode`)
+// lands; Trails is greyed in v1 until trails do. The trash bin
+// (`#trash-bin`) is shared across modes per spec. Mode persists per-vault
+// under `vault.sidebar_mode`.
+type SidebarMode = "files" | "clusters" | "trails";
+const sidebarEl = document.getElementById("sidebar");
+const sidebarModeFilesBtn = document.getElementById("sidebar-mode-files");
+const sidebarModeClustersBtn = document.getElementById("sidebar-mode-clusters");
+const sidebarModeTrailsBtn = document.getElementById("sidebar-mode-trails");
+let sidebarMode: SidebarMode = "files";
+function paintSidebarMode(): void {
+  if (!sidebarEl) return;
+  sidebarEl.classList.toggle("mode-files", sidebarMode === "files");
+  sidebarEl.classList.toggle("mode-clusters", sidebarMode === "clusters");
+  sidebarEl.classList.toggle("mode-trails", sidebarMode === "trails");
+  for (const [btn, mode] of [
+    [sidebarModeFilesBtn, "files"],
+    [sidebarModeClustersBtn, "clusters"],
+    [sidebarModeTrailsBtn, "trails"],
+  ] as const) {
+    if (!btn) continue;
+    const active = sidebarMode === mode;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  }
+}
+function setSidebarMode(mode: SidebarMode, persist: boolean): void {
+  if (mode === sidebarMode) return;
+  sidebarMode = mode;
+  paintSidebarMode();
+  if (persist && vaultIsOpen()) {
+    void persistSetting("vault", "vault.sidebar_mode", mode);
+  }
+}
+paintSidebarMode();
+sidebarModeFilesBtn?.addEventListener("click", () =>
+  setSidebarMode("files", true),
+);
+sidebarModeClustersBtn?.addEventListener("click", () =>
+  setSidebarMode("clusters", true),
+);
+sidebarModeTrailsBtn?.addEventListener("click", () => {
+  setSidebarMode("trails", true);
+});
+
+// status: trails-default-location
+// status: sidebar-new-item-button (Trails-mode left-click branch)
+// `+` button is mode-aware. Files mode keeps the existing tree-owned
+// create-note path. Trails mode creates a new trail at the configured
+// `[trails] new_trail_dir` (suffix-counted by `core::trails::create_trail`),
+// auto-activates it, opens the trail-doc, and triggers inline rename
+// so the user can name it before submitting. Clusters is a v1 no-op
+// until the cluster editor lands. Capture-phase + `stopImmediatePropagation`
+// preempts the tree module's own listener for the trails branch only;
+// Files mode falls through unchanged.
+newNoteBtn.addEventListener(
+  "click",
+  (e) => {
+    if (sidebarMode === "files") return;
+    e.stopImmediatePropagation();
+    if (sidebarMode !== "trails") return;
+    void (async () => {
+      let created: { trail_doc_rel: string; trail_id: string };
+      try {
+        created = await Ipc.trailCreate({ name: "new-trail" });
+      } catch (err) {
+        Logger.error("ui::trails", "trail_create failed", { err });
+        showToast(`Couldn't create trail: ${formatError(err)}`);
+        return;
+      }
+      try {
+        await Ipc.trailSetActive({ trailDocRel: created.trail_doc_rel });
+        activeTrailStore.set({ rel: created.trail_doc_rel });
+      } catch (err) {
+        Logger.error("ui::trails", "trail_set_active failed", { err });
+      }
+      // Open the trail-doc, refresh the tree so the new row exists,
+      // then begin inline rename. The tree refresh is also driven by
+      // the watcher event for the create, but we don't want to race
+      // — refresh explicitly so `beginInlineRenameByPath` has a row
+      // to attach to.
+      try {
+        await openFile(created.trail_doc_rel, { preview: false });
+      } catch (err) {
+        Logger.error("ui::trails", "open new trail-doc failed", { err });
+      }
+      await tree.api.refreshTrailDocSet();
+      await tree.api.refresh();
+      await tree.api.revealPath(created.trail_doc_rel);
+      await tree.api.beginInlineRenameByPath(created.trail_doc_rel);
+      // Kick the trails panel so the new trail surfaces in the
+      // dropdown / body without waiting for the watcher debounce.
+      void trailsPanel?.api.refresh();
+    })();
+  },
+  true, // capture phase — runs before the tree module's bubbled listener
+);
+
 // status: side-panel-resize
 // Drag handles on the inner edge of the sidebar / discovery columns.
 // Per the spec: 4px handles, `col-resize` cursor, min/max clamped, persisted
@@ -1777,6 +1905,34 @@ const discovery: DiscoveryController = mountDiscovery({
     return wasCollapsed;
   },
 });
+
+// status: trails-mode-body
+// Trails sidebar mode body. Module owns trails-list cache, active-trail
+// detail cache, expanded-card state, and refresh epoch; host wires the
+// `openNote` callback + the `#sidebar-trails-body` root.
+const sidebarTrailsBodyEl = document.getElementById("sidebar-trails-body");
+const trailsPanel: TrailsController | null = sidebarTrailsBodyEl
+  ? mountTrailsPanel({
+      toast: panelToast,
+      formatErr: formatError,
+      settings,
+      openNote: (rel, opts) => openFile(rel, opts ?? {}).then(() => undefined),
+      focusEditor: () => editor.focus(),
+      rootEl: sidebarTrailsBodyEl,
+    })
+  : null;
+// Refresh on external active-trail mutations — `applySettingsToUi`
+// re-seeds `activeTrailStore` after every `set_setting` round-trip,
+// and other surfaces (e.g. `set as active` tree verb, slice U3 +
+// button) write through it too.
+{
+  let lastActiveRel = activeTrailStore.get().rel;
+  activeTrailStore.subscribe((s) => {
+    if (s.rel === lastActiveRel) return;
+    lastActiveRel = s.rel;
+    trailsPanel?.api.onActiveTrailMaybeChanged();
+  });
+}
 
 // Window-level keybinding handlers (settings.open global half,
 // search-keybind-ctrl-space global half, tab keybinds, navigation
@@ -1998,6 +2154,30 @@ const modeControls: ModeControlsApi = mountModeControls({
   getActiveMode: () => buffer?.mode.kind ?? null,
 });
 
+// status: trail-add-to-active-from-editor-verb
+// Editor toolbar pill: "Add to trail: <name>". Inserted as the
+// previous sibling of `#mode-controls` so it sits on the left of the
+// centered mode-controls slot, leaving the right-side button cluster
+// (Save / Diff / View / Mutations / Discovery) untouched. The
+// membership cache (installed below) drives the idempotency state;
+// the pill subscribes to `activeTrailStore` / `bufferStore` /
+// membership-cache changes for re-renders.
+const addToTrailPill = mountAddToTrailPill({
+  hostBeforeEl: modeControlsEl,
+  // status: trail-add-to-active-from-editor-verb — explicit panel +
+  // membership refresh after the pill's `trailAppendWaypoint`
+  // succeeds. Watcher is suppressed for the trail-doc + waypoint-note
+  // paths during the append, so the `hiker:file-changed` refresh
+  // path can't fire here. See
+  // `bug-add-to-trail-verbs-dont-refresh-panel`.
+  onAppended: () => {
+    void trailsPanel?.api.refresh();
+    void refreshActiveTrailWaypointPaths();
+  },
+});
+addToTrailPill.setTrailDocPredicate((rel) => tree.api.isTrailDoc(rel));
+installMembershipWatchers();
+
 // status: editor-tab-strip
 const tabStrip: TabStripApi = mountTabStrip({
   hostEl: dom.editor.tabStripEl,
@@ -2155,6 +2335,61 @@ let watcherConflictPromptOpen = false;
 
 void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
   const ev = event.payload;
+  // status: trails-mode-body — refresh the trails panel when a trail
+  // doc or any `.hiker/trails/<id>/waypoints/` path is touched. Cheap
+  // path-prefix check; the panel's internal epoch counter drops stale
+  // fetches if the user is mid-refresh. Also refresh on any `.md`
+  // change outside `.hiker/` — a non-active trail-doc could have been
+  // created/renamed/deleted (acquiring or losing `hiker.kind: trail`
+  // frontmatter), and the trails-list cache must reflect that or the
+  // dropdown lists stale entries (and activating a deleted trail
+  // errors). Mirrors the conservative posture used by the
+  // `trail-row-icon` block below; trails-list is a small per-vault
+  // query so the extra calls are acceptable.
+  {
+    const paths =
+      ev.kind === "renamed" ? [ev.from, ev.to] : [ev.path];
+    const activeTrailRel = activeTrailStore.get().rel;
+    const looksLikeWaypoint = paths.some((p) =>
+      p.startsWith(".hiker/trails/"),
+    );
+    const matchesActiveTrail =
+      activeTrailRel !== null && paths.includes(activeTrailRel);
+    const isMdOutsideHikerForTrails = paths.some(
+      (p) => p.endsWith(".md") && !p.startsWith(".hiker/"),
+    );
+    if (looksLikeWaypoint || matchesActiveTrail || isMdOutsideHikerForTrails) {
+      void trailsPanel?.api.refresh();
+    }
+    // status: trail-add-to-active-from-editor-verb — keep the
+    // membership cache fresh so the editor pill and the tree verb
+    // flip to "Already in this trail" without a manual refresh
+    // when a new waypoint of the active trail lands (or the active
+    // trail-doc itself changes shape via a frontmatter edit).
+    // Conservative: any `.hiker/trails/` event refreshes (we don't
+    // pre-narrow to the active trail's id since the cost is one
+    // `trail_get` call); active-trail-doc edits also refresh.
+    if (
+      activeTrailRel !== null
+      && (matchesActiveTrail || looksLikeWaypoint)
+    ) {
+      void refreshActiveTrailWaypointPaths();
+    }
+    // status: trail-row-icon — any `.md` change outside `.hiker/` may
+    // have added or removed `hiker.kind: trail` frontmatter, so the
+    // tree's cached trail-doc set is potentially stale. Conservative
+    // refresh; cheap (single `trails_list` call) and only triggers a
+    // tree repaint if the set actually changed.
+    {
+      const isMdOutsideHiker = paths.some(
+        (p) => p.endsWith(".md") && !p.startsWith(".hiker/"),
+      );
+      const isTrailDoc = paths.some((p) => p.startsWith(".hiker/trails/"));
+      if (isMdOutsideHiker || isTrailDoc) {
+        void tree.api.refreshTrailDocSet();
+      }
+    }
+  }
   // Tree shape changes don't depend on which buffer (if any) is active.
   // Schedule before buffer mutations so the rebuild reads the post-update
   // `buffer.path` (matters for the renamed branch's silent path follow).

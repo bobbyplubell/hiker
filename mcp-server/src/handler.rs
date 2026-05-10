@@ -629,6 +629,8 @@ impl HikerHandler {
             effective,
             Some(&p.query),
             embedding.as_deref(),
+            search::LexicalOpts::default(),
+            search::SemanticOpts::default(),
         )
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         if (resp.fused.len() as u32) > requested {

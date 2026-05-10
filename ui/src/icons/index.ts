@@ -105,6 +105,14 @@ export const Icons = {
     return svgWrapper(`<path d="M2 8L14 2L9 14L7 9L2 8z"/>`, opts);
   },
 
+  /// Squiggly-trail glyph used by the Trails sidebar mode-switcher
+  /// button and the trails-mode header trail-head icon. Path commands
+  /// mirror the inline SVG at `#sidebar-mode-trails` in `index.html`.
+  trail(opts: SvgWrapperOptions = { size: 14 }): string {
+    const size = opts.size ?? DEFAULT_SIZE;
+    return `<svg viewBox="0 0 16 16" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-linecap="round" overflow="visible" aria-hidden="true"><path stroke-width="2.8" d="M8 15 C 20 12.5, -4 9, 8 7"/><path stroke-width="1.3" d="M8 7 C 13 5.5, 4 3.5, 8 2"/><path stroke-width="0.7" d="M8 2 C 8.8 1.4, 7.5 1, 8 0.5"/></svg>`;
+  },
+
   stop(opts: SvgWrapperOptions = { size: 14 }): string {
     const size = opts.size ?? DEFAULT_SIZE;
     return `<svg viewBox="0 0 16 16" width="${size}" height="${size}" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor"/></svg>`;

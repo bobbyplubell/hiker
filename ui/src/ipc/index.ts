@@ -264,6 +264,80 @@ export async function invokeWithLogging<T>(
   }
 }
 
+// ----- trails DTOs (active-trail-state seam) -----
+// Hand-mirror of `hiker_core::trails::{TrailListItem, TrailDetail,
+// ResolvedWaypoint, DoubleLinkRef, ResolutionOutcome,
+// CreateTrailOutcome, AppendWaypointOutcome}`. Trails are low-volume UI
+// verbs so the cast is the seam (per `bug-ipc-responses-untyped`).
+export interface TrailCreated {
+  trail_doc_rel: string;
+  trail_id: string;
+}
+export interface WaypointAppended {
+  waypoint_rel: string;
+  waypoint_id: string;
+  trail_id: string;
+}
+export interface WaypointRemoved {
+  removed_count: number;
+}
+export interface TrailListItem {
+  rel_path: string;
+  trail_id: string;
+  title: string;
+  waypoint_count: number;
+  last_activated_at: string | null;
+}
+/// Mirror of `core::trails::TrailsContainingNoteHit`. Drives the
+/// per-trail idempotency check used by the "Add to active trail"
+/// verbs (tree row + editor pill) per `trail-add-to-active-from-editor-verb`.
+export interface TrailsContainingNoteHit {
+  trail_id: string;
+  trail_doc_rel: string;
+}
+export interface DoubleLinkRef {
+  id: string;
+  path: string;
+}
+/// Mirrors `core::trails::ResolutionOutcome` (`#[serde(tag = "kind",
+/// rename_all = "snake_case")]`).
+export type ResolutionOutcome =
+  | { kind: "resolved"; rel_path: string; id: string }
+  | {
+      kind: "self_heal";
+      canonical_path: string;
+      id: string;
+      prior_path: string;
+    }
+  | {
+      kind: "path_conflict";
+      recorded_id: string;
+      current_path_id: string;
+      path: string;
+    }
+  | { kind: "orphan" };
+export interface ResolvedWaypoint {
+  waypoint_rel: string;
+  waypoint_id: string;
+  annotation_body: string;
+  source_ref: DoubleLinkRef;
+  in_trail: DoubleLinkRef;
+  resolution: ResolutionOutcome;
+  children: ResolvedWaypoint[];
+  tree_path: string;
+}
+export interface TrailDetail {
+  rel_path: string;
+  trail_id: string;
+  last_activated_at: string | null;
+  body: string;
+  waypoints: ResolvedWaypoint[];
+  /// Append cursor — waypoint-id under which the next unparented
+  /// append lands; `null` = root-tail. Drives the little-person
+  /// "you are here" glyph (trail-append-cursor-indicator).
+  append_under: string | null;
+}
+
 // ---------------- typed surface ----------------
 
 export const Ipc = {
@@ -423,6 +497,17 @@ export const Ipc = {
     query: string;
     modes: { semantic: boolean; lexical: boolean };
     epoch: number;
+    lexicalOpts?: {
+      case_sensitive: boolean;
+      diacritic_sensitive: boolean;
+      prefix_match: boolean;
+      phrase_mode: boolean;
+    };
+    semanticOpts?: {
+      min_similarity: number;
+      top_k: number;
+      recency_bias: "off" | "mild" | "strong";
+    };
   }): Promise<SearchResponse> {
     return invokeWithLogging<SearchResponse>(
       "search_vault",
@@ -568,6 +653,69 @@ export const Ipc = {
   },
   autosaveDiscard(args: { path: string }): Promise<void> {
     return invokeWithLogging<void>("autosave_discard", args);
+  },
+
+  // ----- trails (active-trail-state seam) -----
+  // Hand-typed mirrors of `hiker_core::trails::*` DTOs returned by the
+  // Tauri commands. Per `bug-ipc-responses-untyped`, only high-blast-
+  // radius commands get runtime validators; the trails surface is
+  // low-volume UI verbs so the cast is the seam.
+  trailCreate(args: { name: string }): Promise<TrailCreated> {
+    return invokeWithLogging<TrailCreated>("trail_create", args);
+  },
+  trailAppendWaypoint(args: {
+    trailDocRel: string;
+    sourceRel: string;
+    parentWaypointId?: string | null;
+    annotation?: string | null;
+  }): Promise<WaypointAppended> {
+    return invokeWithLogging<WaypointAppended>("trail_append_waypoint", {
+      trailDocRel: args.trailDocRel,
+      sourceRel: args.sourceRel,
+      parentWaypointId: args.parentWaypointId ?? null,
+      annotation: args.annotation ?? null,
+    });
+  },
+  trailRemoveWaypoint(args: {
+    trailDocRel: string;
+    waypointId: string;
+  }): Promise<WaypointRemoved> {
+    return invokeWithLogging<WaypointRemoved>("trail_remove_waypoint", args);
+  },
+  trailDescendantCount(args: {
+    trailDocRel: string;
+    waypointId: string;
+  }): Promise<number> {
+    return invokeWithLogging<number>("trail_descendant_count", args);
+  },
+  trailDelete(args: { trailDocRel: string }): Promise<void> {
+    return invokeWithLogging<void>("trail_delete", args);
+  },
+  trailsList(): Promise<TrailListItem[]> {
+    return invokeWithLogging<TrailListItem[]>("trails_list");
+  },
+  trailGet(args: { trailDocRel: string }): Promise<TrailDetail> {
+    return invokeWithLogging<TrailDetail>("trail_get", args);
+  },
+  trailsContainingNote(args: {
+    sourceRel: string;
+  }): Promise<TrailsContainingNoteHit[]> {
+    return invokeWithLogging<TrailsContainingNoteHit[]>(
+      "trails_containing_note",
+      args,
+    );
+  },
+  trailSetAppendCursor(args: {
+    trailDocRel: string;
+    waypointId: string | null;
+  }): Promise<void> {
+    return invokeWithLogging<void>("trail_set_append_cursor", {
+      trailDocRel: args.trailDocRel,
+      waypointId: args.waypointId,
+    });
+  },
+  trailSetActive(args: { trailDocRel: string | null }): Promise<void> {
+    return invokeWithLogging<void>("trail_set_active", args);
   },
 
   // ----- frontend logging bridge (obs-frontend-bridge) -----

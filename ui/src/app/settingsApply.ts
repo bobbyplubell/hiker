@@ -9,7 +9,7 @@
 /// no DOM lookups, no IPC. The host wires the per-surface mutators in via
 /// `deps` so the same set of "this is how a setting becomes a UI change"
 /// statements live in one place.
-import { viewSettingsStore } from "./state";
+import { activeTrailStore, viewSettingsStore } from "./state";
 import { sortOrderFromSettings } from "../tree";
 
 // Mirror of `core::config::Config` for the frontend. Returned by
@@ -42,11 +42,25 @@ export interface Settings {
     sidebar_width: number;
     discovery_width: number;
     show_sessions_in_tree: boolean;
+    sidebar_mode: "files" | "clusters" | "trails";
+    /// status: active-trail-state
+    active_trail: string | null;
     tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
   };
   search: {
     modes: { semantic: boolean; lexical: boolean };
     sections: { results_expanded: boolean; related_expanded: boolean };
+    lexical: {
+      case_sensitive: boolean;
+      diacritic_sensitive: boolean;
+      prefix_match: boolean;
+      phrase_mode: boolean;
+    };
+    semantic: {
+      min_similarity: number;
+      top_k: number;
+      recency_bias: "off" | "mild" | "strong";
+    };
   };
   llm: {
     enabled: boolean;
@@ -73,11 +87,14 @@ export interface SettingsApplyDeps {
   setChatHeight: (h: number) => void;
   setSidebarWidth: (px: number) => void;
   setDiscoveryWidth: (px: number) => void;
+  setSidebarMode: (mode: Settings["vault"]["sidebar_mode"]) => void;
   setSearchMode: (mode: "semantic" | "lexical", on: boolean) => void;
   setSearchSection: (
     section: "results" | "related",
     expanded: boolean,
   ) => void;
+  setLexicalOpts: (opts: Settings["search"]["lexical"]) => void;
+  setSemanticOpts: (opts: Settings["search"]["semantic"]) => void;
   syncToggleButtons: () => void;
 }
 
@@ -109,11 +126,30 @@ export function applySettingsToUi(s: Settings, deps: SettingsApplyDeps): void {
   if (typeof s.vault.discovery_width === "number") {
     deps.setDiscoveryWidth(s.vault.discovery_width);
   }
+  // status: sidebar-mode-switcher
+  if (
+    s.vault.sidebar_mode === "files" ||
+    s.vault.sidebar_mode === "clusters" ||
+    s.vault.sidebar_mode === "trails"
+  ) {
+    deps.setSidebarMode(s.vault.sidebar_mode);
+  }
+  // status: active-trail-state
+  // Seed the active-trail store from the merged settings snapshot so
+  // any panel can read it via `getActiveTrailRel()`. v1 has no panel
+  // surfacing this yet — slice U2 (Trails-mode dropdown) is the first
+  // consumer.
+  activeTrailStore.set({
+    rel: typeof s.vault.active_trail === "string" ? s.vault.active_trail : null,
+  });
   // status: search-mode-state-persisted, search-section-collapsible
   deps.setSearchMode("semantic", s.search.modes.semantic);
   deps.setSearchMode("lexical", s.search.modes.lexical);
   deps.setSearchSection("results", s.search.sections.results_expanded);
   deps.setSearchSection("related", s.search.sections.related_expanded);
+  // status: search-lexical-options, search-semantic-options
+  deps.setLexicalOpts(s.search.lexical);
+  deps.setSemanticOpts(s.search.semantic);
   deps.syncToggleButtons();
 }
 

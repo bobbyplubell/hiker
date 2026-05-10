@@ -29,7 +29,19 @@ use crate::error::HikerError;
 /// v4 added `notes.last_accessed_at` (NULL until first user-open) so the
 /// vault-home recents widget can sort by user-open time. Tracked
 /// independently of `mtime` since the user may open without modifying.
-pub const SCHEMA_VERSION: i32 = 4;
+///
+/// v5 added the `trail_waypoints` derived index table (one row per
+/// waypoint-note) for fast `trails_containing(note_id)` and
+/// `waypoints_of(trail_id)` lookups. See `docs/trails.md`
+/// §"Indexer integration" — `trail-waypoints-derived-table`.
+///
+/// v6 reshaped `trail_waypoints` to support side trails
+/// (`trail-side-trail-shape`): the `seq` column is dropped in favor of
+/// `parent_waypoint_id` (NULL for root) + `tree_path` (materialized
+/// depth-first dotted-1-based path, e.g. `"1"`, `"1.2"`, `"1.2.1"`).
+/// Lexical ordering on `tree_path` reproduces reading order without a
+/// recursive query.
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Embedding dimension for the v1 model (bge-small-en-v1.5). Pinned here so
 /// the schema and the embedder agree.
@@ -300,6 +312,43 @@ pub struct RelatedHit {
     pub score: f32,
     pub best_heading_path: Option<String>,
     pub snippet: String,
+}
+
+/// One row in the derived `trail_waypoints` table, surfacing the link
+/// between a waypoint-note and its trail/source. Populated by the indexer
+/// when it ingests waypoint-notes or trail-docs.
+///
+/// status: trail-waypoints-derived-table
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaypointRow {
+    pub waypoint_path: String,
+    pub waypoint_id: String,
+    pub trail_id: String,
+    /// `None` when the source note hasn't been ingested (or had its ULID
+    /// stamped) yet. Filled in on a later indexing pass.
+    pub source_id: Option<String>,
+    pub source_path: String,
+    /// `None` for root-level waypoints; otherwise the ULID of the
+    /// parent waypoint.
+    pub parent_waypoint_id: Option<String>,
+    /// Materialized depth-first 1-based dotted path —
+    /// `"1"`, `"1.2"`, `"1.2.1"`. Empty when the row was written via
+    /// the per-waypoint ingest path before the parent trail-doc has
+    /// been re-ingested (next trail-doc ingest fills the canonical
+    /// value).
+    pub tree_path: String,
+}
+
+/// Hit returned by `Store::trails_containing_note`. Holds enough to point
+/// the UI at both the trail and the specific waypoint inside it.
+///
+/// status: trail-waypoints-derived-table
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrailContainingHit {
+    pub trail_id: String,
+    pub waypoint_path: String,
+    pub waypoint_id: String,
+    pub tree_path: String,
 }
 
 /// Bundle of everything needed to upsert a note in one transaction. Caller
@@ -972,6 +1021,170 @@ impl Store {
             .collect())
     }
 
+    /// Resolve a note id back to its current vault-relative path via the
+    /// `path_ids` table. Returns the most recently inserted path for the
+    /// id (renames write a fresh row + delete the old one, so there's
+    /// at most one live row per id under normal operation).
+    ///
+    /// status: trail-reference-resolution
+    pub fn path_for_id(&self, note_id: &str) -> Result<Option<String>, StoreError> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT path FROM path_ids WHERE id = ?1 LIMIT 1",
+                params![note_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
+    /// Insert or replace one `trail_waypoints` row.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn upsert_trail_waypoint(
+        &mut self,
+        row: &WaypointRow,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO trail_waypoints
+               (waypoint_path, waypoint_id, trail_id, source_id, source_path,
+                parent_waypoint_id, tree_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(waypoint_path) DO UPDATE SET
+               waypoint_id        = excluded.waypoint_id,
+               trail_id           = excluded.trail_id,
+               source_id          = excluded.source_id,
+               source_path        = excluded.source_path,
+               parent_waypoint_id = excluded.parent_waypoint_id,
+               tree_path          = excluded.tree_path",
+            params![
+                row.waypoint_path,
+                row.waypoint_id,
+                row.trail_id,
+                row.source_id,
+                row.source_path,
+                row.parent_waypoint_id,
+                row.tree_path,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every row tied to `trail_id`. Used by the trail-doc walk
+    /// path (clear + re-insert) so the table stays consistent with the
+    /// trail-doc's `hiker.waypoints` array.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn delete_trail_waypoints_by_trail(
+        &mut self,
+        trail_id: &str,
+    ) -> Result<usize, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM trail_waypoints WHERE trail_id = ?1",
+            params![trail_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete a single waypoint row by its waypoint path.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn delete_trail_waypoint_by_path(
+        &mut self,
+        waypoint_path: &str,
+    ) -> Result<usize, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM trail_waypoints WHERE waypoint_path = ?1",
+            params![waypoint_path],
+        )?;
+        Ok(n)
+    }
+
+    /// Trails that contain a given source note. `note_id_or_path` is
+    /// matched against both `source_id` and `source_path` so the caller
+    /// doesn't have to pre-resolve.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn trails_containing_note(
+        &self,
+        note_id_or_path: &str,
+    ) -> Result<Vec<TrailContainingHit>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT trail_id, waypoint_path, waypoint_id, tree_path
+             FROM trail_waypoints
+             WHERE source_id = ?1 OR source_path = ?1
+             ORDER BY trail_id, tree_path",
+        )?;
+        let rows = stmt
+            .query_map(params![note_id_or_path], |row| {
+                Ok(TrailContainingHit {
+                    trail_id: row.get(0)?,
+                    waypoint_path: row.get(1)?,
+                    waypoint_id: row.get(2)?,
+                    tree_path: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// All waypoint rows for a given trail, ordered by `tree_path` so
+    /// the natural row order matches reading order.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn waypoints_of(&self, trail_id: &str) -> Result<Vec<WaypointRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT waypoint_path, waypoint_id, trail_id, source_id, source_path,
+                    parent_waypoint_id, tree_path
+             FROM trail_waypoints
+             WHERE trail_id = ?1
+             ORDER BY tree_path",
+        )?;
+        let rows = stmt
+            .query_map(params![trail_id], |row| {
+                Ok(WaypointRow {
+                    waypoint_path: row.get(0)?,
+                    waypoint_id: row.get(1)?,
+                    trail_id: row.get(2)?,
+                    source_id: row.get(3)?,
+                    source_path: row.get(4)?,
+                    parent_waypoint_id: row.get(5)?,
+                    tree_path: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Bulk-rewrite waypoint paths whose `waypoint_path` starts with
+    /// `old_prefix` to start with `new_prefix` instead. Used by the
+    /// auto-update-on-move path (slice 3) when a trail's waypoint dir is
+    /// renamed alongside the trail-doc; landed here so the API surface
+    /// is settled.
+    ///
+    /// status: trail-waypoints-derived-table
+    pub fn rename_trail_waypoint_paths(
+        &mut self,
+        old_prefix: &str,
+        new_prefix: &str,
+    ) -> Result<usize, StoreError> {
+        // Use SQLite substr() to splice the new prefix in. Length-of-prefix
+        // is computed on the server so we don't have to re-bind it.
+        let like_pattern = format!("{}%", old_prefix);
+        let n = self.conn.execute(
+            "UPDATE trail_waypoints
+             SET waypoint_path = ?1 || substr(waypoint_path, ?2)
+             WHERE waypoint_path LIKE ?3",
+            params![
+                new_prefix,
+                (old_prefix.len() as i64) + 1,
+                like_pattern,
+            ],
+        )?;
+        Ok(n)
+    }
+
     /// KNN search. Returns the top-k chunks by similarity to `query`, with
     /// chunks belonging to `exclude_note_id` (if Some) filtered out.
     pub fn knn_chunks(
@@ -1187,6 +1400,25 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.text);
             INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
         END;
+
+        -- status: trail-waypoints-derived-table
+        -- Derived index of trail waypoints. Re-derived from frontmatter on
+        -- every ingest of a trail-doc or waypoint-note; deletes cascade via
+        -- the ops layer. `source_id` is nullable: a waypoint may reference
+        -- a source note that hasn't been ingested (or stamped) yet.
+        CREATE TABLE IF NOT EXISTS trail_waypoints (
+            waypoint_path        TEXT PRIMARY KEY,
+            waypoint_id          TEXT NOT NULL,
+            trail_id             TEXT NOT NULL,
+            source_id            TEXT,
+            source_path          TEXT NOT NULL,
+            parent_waypoint_id   TEXT,
+            tree_path            TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS trail_waypoints_trail_id        ON trail_waypoints(trail_id);
+        CREATE INDEX IF NOT EXISTS trail_waypoints_source_id       ON trail_waypoints(source_id);
+        CREATE INDEX IF NOT EXISTS trail_waypoints_source_path     ON trail_waypoints(source_path);
+        CREATE INDEX IF NOT EXISTS trail_waypoints_parent_waypoint ON trail_waypoints(parent_waypoint_id);
         "#,
         dim = EMBED_DIM,
     ))?;
@@ -1652,6 +1884,126 @@ mod tests {
         // Limit honored.
         let limited = store.at_autocomplete("", 2).unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    // status: trail-waypoints-derived-table
+    #[test]
+    fn trail_waypoints_insert_query_delete() {
+        let (_dir, mut store) = fresh_store();
+        let trail_id = "01HTRAIL";
+        let wp1 = WaypointRow {
+            waypoint_path: ".hiker/trails/01HTRAIL/waypoints/a--AAAAAA.md".into(),
+            waypoint_id: "01HWP1".into(),
+            trail_id: trail_id.into(),
+            source_id: Some("01HSRCA".into()),
+            source_path: "research/a.md".into(),
+            parent_waypoint_id: None,
+            tree_path: "1".into(),
+        };
+        let wp2 = WaypointRow {
+            waypoint_path: ".hiker/trails/01HTRAIL/waypoints/b--BBBBBB.md".into(),
+            waypoint_id: "01HWP2".into(),
+            trail_id: trail_id.into(),
+            source_id: None,
+            source_path: "research/b.md".into(),
+            parent_waypoint_id: Some("01HWP1".into()),
+            tree_path: "1.1".into(),
+        };
+        store.upsert_trail_waypoint(&wp1).unwrap();
+        store.upsert_trail_waypoint(&wp2).unwrap();
+
+        let by_trail = store.waypoints_of(trail_id).unwrap();
+        assert_eq!(by_trail.len(), 2);
+        assert_eq!(by_trail[0].tree_path, "1");
+        assert_eq!(by_trail[1].waypoint_id, "01HWP2");
+        assert_eq!(by_trail[1].parent_waypoint_id.as_deref(), Some("01HWP1"));
+
+        // Lookup by source id matches wp1.
+        let hits_id = store.trails_containing_note("01HSRCA").unwrap();
+        assert_eq!(hits_id.len(), 1);
+        assert_eq!(hits_id[0].waypoint_id, "01HWP1");
+
+        // Lookup by source path matches wp2 (no source_id stamped yet).
+        let hits_path = store.trails_containing_note("research/b.md").unwrap();
+        assert_eq!(hits_path.len(), 1);
+        assert_eq!(hits_path[0].waypoint_id, "01HWP2");
+
+        // Re-upsert with mutated source_id is an update, not a new row.
+        let wp1_v2 = WaypointRow {
+            source_id: Some("01HSRCA-V2".into()),
+            ..wp1.clone()
+        };
+        store.upsert_trail_waypoint(&wp1_v2).unwrap();
+        assert_eq!(store.waypoints_of(trail_id).unwrap().len(), 2);
+        let hits_v2 = store.trails_containing_note("01HSRCA-V2").unwrap();
+        assert_eq!(hits_v2.len(), 1);
+
+        // Single-path delete.
+        let removed = store
+            .delete_trail_waypoint_by_path(&wp2.waypoint_path)
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(store.waypoints_of(trail_id).unwrap().len(), 1);
+
+        // Bulk delete by trail.
+        let removed = store.delete_trail_waypoints_by_trail(trail_id).unwrap();
+        assert_eq!(removed, 1);
+        assert!(store.waypoints_of(trail_id).unwrap().is_empty());
+    }
+
+    // status: trail-waypoints-derived-table
+    #[test]
+    fn rename_trail_waypoint_paths_rewrites_prefix() {
+        let (_dir, mut store) = fresh_store();
+        let row = WaypointRow {
+            waypoint_path: ".hiker/trails/01OLD/waypoints/a--AAAAAA.md".into(),
+            waypoint_id: "01HWP".into(),
+            trail_id: "01OLD".into(),
+            source_id: None,
+            source_path: "src.md".into(),
+            parent_waypoint_id: None,
+            tree_path: "1".into(),
+        };
+        store.upsert_trail_waypoint(&row).unwrap();
+
+        let updated = store
+            .rename_trail_waypoint_paths(
+                ".hiker/trails/01OLD/",
+                ".hiker/trails/01NEW/",
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        // Reading back via PK requires the new path now.
+        let rows = store.waypoints_of("01OLD").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].waypoint_path,
+            ".hiker/trails/01NEW/waypoints/a--AAAAAA.md"
+        );
+    }
+
+    // status: trail-reference-resolution
+    #[test]
+    fn path_for_id_round_trip_through_upsert_and_rename() {
+        let (_dir, mut store) = fresh_store();
+        let id = new_id();
+        store
+            .upsert_note(NoteUpsert {
+                id: &id,
+                path: "alpha.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![],
+            })
+            .unwrap();
+        assert_eq!(store.path_for_id(&id).unwrap().as_deref(), Some("alpha.md"));
+        store.rename_note(&id, "beta.md").unwrap();
+        assert_eq!(store.path_for_id(&id).unwrap().as_deref(), Some("beta.md"));
+        assert!(store.path_for_id("nonexistent").unwrap().is_none());
     }
 
     #[test]

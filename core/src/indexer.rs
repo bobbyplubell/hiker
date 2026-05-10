@@ -145,6 +145,16 @@ pub struct IndexerHandle {
     /// (search returns empty until ready, mirroring the
     /// `embedder-first-run-nonblocking` posture).
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Late-bound watcher reference, used by the trails auto-update path
+    /// (`trail-auto-update-on-note-move`). Filled by the host (Tauri /
+    /// CLI) via `attach_watcher` after both the indexer and the watcher
+    /// have started. CLI / tests that don't run a watcher leave this
+    /// empty — `core::trails::on_note_moved` handles the missing-watcher
+    /// case as a best-effort no-suppress write.
+    watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
+    /// Late-bound changelog reference. Same shape as `watcher_cell` —
+    /// optional so CLI / tests can run without a changelog.
+    changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>>,
 }
 
 /// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
@@ -257,6 +267,27 @@ impl IndexerHandle {
         }
     }
 
+    /// Late-bind the filesystem watcher used by the trails auto-update
+    /// path. The Tauri layer calls this after both the indexer and the
+    /// watcher are running. Idempotent first-write-wins per `OnceCell`
+    /// semantics — subsequent calls log + ignore.
+    ///
+    /// status: trail-auto-update-on-note-move
+    pub fn attach_watcher(&self, watcher: Arc<crate::watcher::Watcher>) {
+        if self.watcher_cell.set(watcher).is_err() {
+            tracing::warn!("indexer: watcher_cell already attached; ignoring");
+        }
+    }
+
+    /// Late-bind the changelog used by the trails auto-update path.
+    ///
+    /// status: trail-auto-update-on-note-move
+    pub fn attach_changes(&self, changes: Arc<crate::changes::Changes>) {
+        if self.changes_cell.set(changes).is_err() {
+            tracing::warn!("indexer: changes_cell already attached; ignoring");
+        }
+    }
+
     /// Stop the indexer task gracefully and wait for it to finish.
     pub async fn shutdown(mut self) {
         // Drop the held sender so the task's `recv()` returns `None`. Any
@@ -304,9 +335,22 @@ where
         ..IndexStatus::default()
     });
 
+    let watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>> = Arc::new(OnceCell::new());
+    let changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>> = Arc::new(OnceCell::new());
+
     let progress_for_task = progress_tx.clone();
     let pending_for_task = pending.clone();
     let embedder_cell_for_task = embedder_cell.clone();
+    // Build a self-targeting IndexJobTx the loop can hand to
+    // `core::trails::on_note_moved` so trail-doc / waypoint-note rewrites
+    // re-enqueue Upserts to refresh the derived `trail_waypoints` rows.
+    // status: trail-auto-update-on-note-move
+    let self_tx = IndexJobTx {
+        tx: tx.clone(),
+        pending: pending.clone(),
+    };
+    let watcher_cell_for_task = watcher_cell.clone();
+    let changes_cell_for_task = changes_cell.clone();
     let join = tokio::spawn(indexer_loop(
         vault,
         vault_root,
@@ -317,6 +361,9 @@ where
         status_tx,
         pending_for_task,
         embedder_cell_for_task,
+        self_tx,
+        watcher_cell_for_task,
+        changes_cell_for_task,
     ));
 
     IndexerHandle {
@@ -326,9 +373,12 @@ where
         join: Some(join),
         pending,
         embedder: embedder_cell,
+        watcher_cell,
+        changes_cell,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn indexer_loop<F>(
     vault: crate::vault::Vault,
     vault_root: PathBuf,
@@ -339,6 +389,9 @@ async fn indexer_loop<F>(
     status: watch::Sender<IndexStatus>,
     pending: Arc<Mutex<HashSet<String>>>,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    self_tx: IndexJobTx,
+    watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
+    changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>>,
 ) where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
@@ -454,6 +507,9 @@ async fn indexer_loop<F>(
                             &progress,
                             &status,
                             &pending,
+                            &self_tx,
+                            &watcher_cell,
+                            &changes_cell,
                             j,
                         )
                         .await;
@@ -478,6 +534,9 @@ async fn indexer_loop<F>(
                     &progress,
                     &status,
                     &pending,
+                    &self_tx,
+                    &watcher_cell,
+                    &changes_cell,
                     other,
                 )
                 .await;
@@ -492,6 +551,7 @@ async fn indexer_loop<F>(
 
 /// Dispatch a single non-FullScan job. Extracted so the FullScan handler can
 /// call it directly on its scan results without re-entering the mpsc.
+#[allow(clippy::too_many_arguments)]
 async fn handle_simple_job(
     vault: &crate::vault::Vault,
     vault_root: &Path,
@@ -500,6 +560,9 @@ async fn handle_simple_job(
     progress: &broadcast::Sender<ProgressEvent>,
     status: &watch::Sender<IndexStatus>,
     pending: &Arc<Mutex<HashSet<String>>>,
+    self_tx: &IndexJobTx,
+    watcher_cell: &Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
+    changes_cell: &Arc<OnceCell<Arc<crate::changes::Changes>>>,
     job: IndexJob,
 ) {
     match job {
@@ -564,6 +627,12 @@ async fn handle_simple_job(
                     from: from.clone(),
                     to: to.clone(),
                 });
+                // status: trail-auto-update-on-note-move
+                // Watcher-driven external rename: run the trails update.
+                run_trails_on_note_moved(
+                    watcher_cell, self_tx, vault, changes_cell, store, &from, &to,
+                )
+                .await;
             }
             Ok(false) => {
                 if let Err(e) = handle_inline_upsert(
@@ -598,10 +667,43 @@ async fn handle_simple_job(
             // need to here. Run vault::move_note on the indexer's owned
             // store so all writes flow through one connection.
             let result = crate::vault::move_note(vault, store, None, &from, &to);
+            // status: trail-auto-update-on-note-move
+            // After the path remap succeeds, sweep trails referencing the
+            // moved note. Errors are swallowed (logged inside the helper)
+            // so a partial trails update never fails the move's reply.
+            if result.is_ok() {
+                run_trails_on_note_moved(
+                    watcher_cell, self_tx, vault, changes_cell, store, &from, &to,
+                )
+                .await;
+            }
             let _ = reply.send(result);
         }
         IndexJob::MoveFolder { from, to, reply } => {
+            // Compute the (old, new) member pairs *before* the rename so
+            // we can call on_note_moved per-pair after the rename. Walk
+            // failures here are non-fatal: the trails sweep just runs over
+            // whatever subset we collected.
+            let pre_members = vault.walk_indexable_files(&from).unwrap_or_default();
+            let from_prefix = format!("{from}/");
+            let pairs: Vec<(String, String)> = pre_members
+                .iter()
+                .map(|m| {
+                    let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
+                    (m.clone(), format!("{to}/{suffix}"))
+                })
+                .collect();
+
             let result = crate::vault::move_folder(vault, store, None, &from, &to);
+            // status: trail-auto-update-on-note-move
+            if result.is_ok() {
+                for (old, new) in &pairs {
+                    run_trails_on_note_moved(
+                        watcher_cell, self_tx, vault, changes_cell, store, old, new,
+                    )
+                    .await;
+                }
+            }
             let _ = reply.send(result);
         }
         IndexJob::DeleteNote { rel, reply } => {
@@ -688,6 +790,42 @@ async fn handle_simple_job(
                 );
             }
         }
+    }
+}
+
+/// Run the trails auto-update sweep after a successful path remap. Reads
+/// `watcher_cell` / `changes_cell` so callers don't need to know whether
+/// the host has wired them — CLI / tests run with neither attached and
+/// the sweep degrades to a write-without-suppress / no-changelog shape.
+/// Errors are swallowed (logged inside `core::trails::on_note_moved`).
+///
+/// status: trail-auto-update-on-note-move
+async fn run_trails_on_note_moved(
+    watcher_cell: &Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
+    self_tx: &IndexJobTx,
+    vault: &crate::vault::Vault,
+    changes_cell: &Arc<OnceCell<Arc<crate::changes::Changes>>>,
+    store: &mut Store,
+    from: &str,
+    to: &str,
+) {
+    let watcher_arc = watcher_cell.get().cloned();
+    let changes_arc = changes_cell.get().cloned();
+    let watcher_ref = watcher_arc.as_deref();
+    let changes_ref = changes_arc.as_ref();
+    if let Err(e) = crate::trails::on_note_moved(
+        watcher_ref,
+        Some(self_tx),
+        vault,
+        changes_ref,
+        store,
+        from,
+        to,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, %from, %to,
+            "indexer: trails on_note_moved sweep failed");
     }
 }
 
@@ -803,9 +941,12 @@ async fn process_upsert(
     if chunks.is_empty() {
         // Empty note: still record the row so deletes/renames work, but no
         // embeddings to insert.
+        // Adopt frontmatter `hiker.id` when present and `path_ids` empty,
+        // same as the chunked branch — see
+        // `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`.
         let id = match store.id_for_path(rel_path)? {
             Some(id) => id,
-            None => new_id(),
+            None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
         };
         let indexed_at = now_secs();
         store.upsert_note(NoteUpsert {
@@ -818,6 +959,11 @@ async fn process_upsert(
             embedder_version: embedder.version(),
             chunks: Vec::new(),
         })?;
+        // status: trail-waypoints-derived-table
+        // Also re-derive on the empty-body branch — waypoint-notes
+        // intentionally have empty bodies (`trail-empty-waypoint-body`),
+        // so the FM-only path is the common case for them.
+        update_trail_waypoints_if_relevant(store, rel_path, &contents);
         return Ok(UpsertOutcome::Indexed);
     }
 
@@ -835,9 +981,15 @@ async fn process_upsert(
         "embedder: batch embedded",
     );
 
+    // bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids:
+    // adopt the source's `hiker.id` from frontmatter when the indexer
+    // has no `path_ids` row yet. Otherwise the case where a user-action
+    // pre-stamped the file (e.g. capture flow that bypasses the indexer
+    // for a moment) would mint a *different* ULID into `path_ids`,
+    // diverging from the value already written into the file.
     let id = match store.id_for_path(rel_path)? {
         Some(id) => id,
-        None => new_id(),
+        None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
     };
     let indexed_at = now_secs();
     let zipped: Vec<_> = chunks.into_iter().zip(embeddings.into_iter()).collect();
@@ -851,10 +1003,179 @@ async fn process_upsert(
         embedder_version: embedder.version(),
         chunks: zipped,
     })?;
+
+    // status: trail-waypoints-derived-table
+    // After the standard notes/chunks upsert, also re-derive the
+    // `trail_waypoints` rows if this file is a trail-doc or waypoint.
+    // Parse failures here are soft errors (the file might be mid-edit) —
+    // warn-and-continue rather than failing the whole ingest.
+    update_trail_waypoints_if_relevant(store, rel_path, &contents);
+
     Ok(UpsertOutcome::Indexed)
 }
 
+/// Soft-error helper that re-derives `trail_waypoints` rows for a file
+/// that may be a trail-doc or a waypoint-note.
+///
+/// Two ingest paths share this function:
+///
+///   - **Trail-doc ingest** is the authoritative re-derive: it walks
+///     the recursive `hiker.waypoints` tree, clears every existing row
+///     for `trail_id`, and re-inserts one row per waypoint with
+///     correct `parent_waypoint_id` + `tree_path` filled in. This is
+///     the canonical population path; tree-shape edits to the
+///     trail-doc reach the table here.
+///   - **Waypoint-note ingest** writes a single row keyed on the
+///     waypoint's own frontmatter (`hiker.in_trail`, `hiker.references`,
+///     `hiker.id`). It cannot know its own `parent_waypoint_id` /
+///     `tree_path` from the waypoint-note alone — that information
+///     lives in the parent trail-doc. So those columns are written as
+///     `(NULL, "")` here; the next trail-doc ingest fills the
+///     canonical values via the depth-first re-derive above. The
+///     append-waypoint op enqueues both upserts (waypoint-note then
+///     trail-doc), so the canonical fill follows immediately.
+fn update_trail_waypoints_if_relevant(
+    store: &mut Store,
+    rel_path: &str,
+    contents: &str,
+) {
+    use crate::trails::{parse_trail_doc_for, parse_waypoint, walk_waypoints_depth_first};
+    use crate::store::WaypointRow;
+
+    // Cheap kind discriminator: only attempt the parse on `.md` files.
+    if !rel_path.ends_with(".md") {
+        return;
+    }
+    let is_under_waypoints =
+        rel_path.starts_with(".hiker/trails/") && rel_path.contains("/waypoints/");
+
+    if is_under_waypoints {
+        match parse_waypoint(contents) {
+            Ok(fm) => {
+                // Source id comes from the index lookup at ingest time;
+                // may be None if the source hasn't been indexed yet.
+                let source_id = match store.id_for_path(&fm.references.path) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %rel_path,
+                            "indexer: source id_for_path lookup failed",
+                        );
+                        None
+                    }
+                };
+                let row = WaypointRow {
+                    waypoint_path: rel_path.to_string(),
+                    waypoint_id: fm.id,
+                    trail_id: fm.in_trail.id,
+                    source_id,
+                    source_path: fm.references.path,
+                    // Tree-position columns are owned by the trail-doc
+                    // ingest path; written as the empty / NULL default
+                    // here. The trail-doc ingest that follows
+                    // `append_waypoint` enqueues both, so the canonical
+                    // values land within the same indexer drain.
+                    parent_waypoint_id: None,
+                    tree_path: String::new(),
+                };
+                if let Err(e) = store.upsert_trail_waypoint(&row) {
+                    tracing::warn!(
+                        error = %e,
+                        path = %rel_path,
+                        "indexer: upsert_trail_waypoint failed",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    path = %rel_path,
+                    "indexer: waypoint parse failed (file may be mid-edit)",
+                );
+            }
+        }
+        return;
+    }
+
+    // Trail-doc ingest: clear + re-insert every row for `trail_id` so
+    // tree-shape changes (re-parent, reorder, remove) propagate to the
+    // derived table. Frontmatter is the source of truth.
+    //
+    // status: trail-waypoints-derived-table
+    // status: trail-side-trail-shape
+    if let Ok(fm) = parse_trail_doc_for(rel_path, contents) {
+        let trail_id = fm.id.clone();
+        // Capture existing rows BEFORE the clear so we can preserve
+        // each row's `source_id` / `source_path` (those columns are
+        // owned by the per-waypoint ingest path and aren't
+        // recoverable from the trail-doc alone).
+        let existing_by_path: std::collections::HashMap<String, (Option<String>, String)> =
+            store
+                .waypoints_of(&trail_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.waypoint_path, (r.source_id, r.source_path)))
+                .collect();
+        if let Err(e) = store.delete_trail_waypoints_by_trail(&trail_id) {
+            tracing::warn!(
+                error = %e,
+                trail_id = %trail_id,
+                "indexer: delete_trail_waypoints_by_trail failed",
+            );
+        }
+        walk_waypoints_depth_first(&fm.waypoints, &mut |parent_id, entry, tree_path| {
+            let (source_id, source_path) = existing_by_path
+                .get(&entry.path)
+                .cloned()
+                .unwrap_or((None, String::new()));
+            let row = WaypointRow {
+                waypoint_path: entry.path.clone(),
+                waypoint_id: entry.id.clone(),
+                trail_id: trail_id.clone(),
+                source_id,
+                source_path,
+                parent_waypoint_id: parent_id.map(str::to_string),
+                tree_path: tree_path.to_string(),
+            };
+            if let Err(e) = store.upsert_trail_waypoint(&row) {
+                tracing::warn!(
+                    error = %e,
+                    path = %entry.path,
+                    "indexer: upsert_trail_waypoint (trail-doc walk) failed",
+                );
+            }
+        });
+    }
+}
+
+/// Read `hiker.id` from a note's frontmatter, returning None if there's
+/// no frontmatter, no `hiker:` block, or no `id:` field. Used by
+/// `process_upsert` to keep `path_ids` in lockstep with whatever id the
+/// file already declares — avoids the "two ULIDs for one note" failure
+/// mode that produced
+/// `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`.
+fn frontmatter_hiker_id(contents: &str) -> Option<String> {
+    let split = crate::frontmatter::split(contents);
+    let fm = split.frontmatter?;
+    let serde_yml::Value::Mapping(map) = fm else { return None };
+    let serde_yml::Value::Mapping(hiker) = map.get("hiker")? else { return None };
+    hiker.get("id")?.as_str().map(|s| s.to_string())
+}
+
 fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, IndexerError> {
+    // status: trail-waypoints-derived-table
+    // Drop any derived waypoint row that referenced this path — both for
+    // a waypoint-note being deleted (waypoint_path match) and for a
+    // source note being deleted (source_path match) so orphaned rows
+    // don't linger.
+    if let Err(e) = store.delete_trail_waypoint_by_path(rel_path) {
+        tracing::warn!(
+            error = %e,
+            path = %rel_path,
+            "indexer: delete_trail_waypoint_by_path failed",
+        );
+    }
     let id = match store.id_for_path(rel_path)? {
         Some(id) => id,
         None => return Ok(false),
@@ -876,6 +1197,12 @@ fn process_rename(store: &mut Store, from: &str, to: &str) -> Result<bool, Index
 /// store in line with the filesystem. Upserts for every `.md` file found,
 /// Deletes for indexed paths whose files have vanished.
 pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Vec<IndexJob>, IndexerError> {
+    // TODO(note-id-stamping): when `[indexing] id_stamping = "all"`, the
+    // startup scan should walk every md note here and lazy-stamp its
+    // `hiker.id` via `core::ops::ensure_note_id_stamped` for any note
+    // missing one. Slice 1 lands the helper + config; slice 2 wires it
+    // here (and at trail/waypoint creation time, which is the lazy-mode
+    // trigger). For now this scan is `lazy`-mode-shaped only.
     tracing::info!(
         vault_root = %vault_root.display(),
         force,
@@ -1354,6 +1681,96 @@ mod tests {
         if let ProgressEvent::Skipped { reason, .. } = ev {
             assert_eq!(reason, "unsupported extension");
         }
+    }
+
+    // status: trail-waypoints-derived-table
+    #[tokio::test]
+    async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
+        let dir = tempdir().unwrap();
+        let trail_id = "01HTRAILTEST";
+        let waypoint_id = "01HWPTEST";
+        let source_id = "01HSRCTEST"; // not used directly; source uses path-based lookup
+        let _ = source_id;
+
+        // Write the source note first so the indexer assigns an id we can
+        // look up on the waypoint's source_id column.
+        std::fs::create_dir_all(dir.path().join("research")).unwrap();
+        std::fs::write(
+            dir.path().join("research/raptor.md"),
+            "# Raptor\n\nbody.\n",
+        )
+        .unwrap();
+
+        // Trail-doc.
+        std::fs::create_dir_all(dir.path().join("trails")).unwrap();
+        let trail_doc = format!(
+            "---\nhiker:\n  kind: trail\n  id: {trail_id}\n  waypoints:\n    - id: {waypoint_id}\n      path: .hiker/trails/{trail_id}/waypoints/0001--raptor.md\n---\nbody\n"
+        );
+        std::fs::write(dir.path().join("trails/my-trail.md"), trail_doc).unwrap();
+
+        // Waypoint-note.
+        let waypoint_dir = dir
+            .path()
+            .join(format!(".hiker/trails/{trail_id}/waypoints"));
+        std::fs::create_dir_all(&waypoint_dir).unwrap();
+        let wp = format!(
+            "---\nhiker:\n  kind: waypoint\n  id: {waypoint_id}\n  references:\n    id: WILLBELOOKEDUP\n    path: research/raptor.md\n  in_trail:\n    id: {trail_id}\n    path: trails/my-trail.md\n---\n"
+        );
+        std::fs::write(waypoint_dir.join("0001--raptor.md"), wp).unwrap();
+
+        let store = Store::open(dir.path()).unwrap();
+        let handle = start_indexer(
+            crate::vault::Vault::open(dir.path()).unwrap(),
+            store,
+            mock_loader(),
+        );
+        let mut prog = handle.subscribe_progress();
+        await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+        // Index source first so its id is available when the waypoint
+        // ingests; then trail-doc; then waypoint-note.
+        handle.index_path("research/raptor.md").await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == "research/raptor.md")
+        })
+        .await;
+
+        handle
+            .index_path(format!(
+                ".hiker/trails/{trail_id}/waypoints/0001--raptor.md"
+            ))
+            .await
+            .unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path }
+                if path.ends_with("0001--raptor.md"))
+        })
+        .await;
+
+        // Trail-doc ingested AFTER the waypoint-note so the depth-first
+        // walk sees the per-row `source_path` and produces canonical
+        // `parent_waypoint_id` + `tree_path` values. Mirrors
+        // `append_waypoint`'s waypoint-then-trail-doc enqueue order.
+        handle.index_path("trails/my-trail.md").await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == "trails/my-trail.md")
+        })
+        .await;
+
+        // Verify derived rows.
+        let store2 = Store::open(dir.path()).unwrap();
+        let waypoints = store2.waypoints_of(trail_id).unwrap();
+        assert_eq!(waypoints.len(), 1);
+        assert_eq!(waypoints[0].waypoint_id, waypoint_id);
+        assert_eq!(waypoints[0].tree_path, "1");
+        assert_eq!(waypoints[0].source_path, "research/raptor.md");
+        assert!(waypoints[0].parent_waypoint_id.is_none());
+        // source_id was looked up via the just-ingested source note.
+        assert!(waypoints[0].source_id.is_some());
+
+        let containing = store2.trails_containing_note("research/raptor.md").unwrap();
+        assert_eq!(containing.len(), 1);
+        assert_eq!(containing[0].trail_id, trail_id);
     }
 
     #[tokio::test]

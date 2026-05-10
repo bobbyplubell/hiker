@@ -18,6 +18,7 @@ pub mod search;
 pub mod sessions;
 pub mod store;
 pub mod tasks;
+pub mod trails;
 pub mod trash;
 pub mod vault;
 pub mod watcher;

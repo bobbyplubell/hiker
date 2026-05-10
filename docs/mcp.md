@@ -60,6 +60,17 @@ All writes route through `core::ops` (or directly through the indexer for finer-
 - **`set_frontmatter(rel_path: string, fields: map<string, json>)`** — merge frontmatter fields into a note. Implementation merges into the existing frontmatter via a small frontmatter-aware writer (`core::ops::set_frontmatter`, new — currently `core::vault::write_file` is body-only). Stamps `hiker.author: agent-authored` automatically. Used for tag application, summary writes, status changes. [mcp-tool-set-frontmatter]
 - **`apply_tag(rel_path: string, tag: string)`** / **`remove_tag(rel_path: string, tag: string)`** — convenience wrappers over `set_frontmatter` for the most common case. [mcp-tool-apply-tag]
 
+### Trail tools
+
+Trails (per `trails.md`) get a six-tool surface — three read, three write — so agents can both consume curated context and transcribe their investigations as draft trails. Write tools route through `core::ops::agent_*` like every other MCP write and pass through staging when `agent-write-review-mode` is on.
+
+- **`trails_list(filters?)`** — enumerate trails with optional filters (containing-note, recently-activated, name-substring); returns id + title + waypoint count + activation timestamp + path. [mcp-tool-trails-list]
+- **`trail_get(id, detail?)`** — full trail-doc body + ordered waypoint list (each waypoint's source-note ref + annotation body); detail levels mirror `mcp-tool-get-note`'s `digest` / `full`. [mcp-tool-trail-get]
+- **`trails_containing_note(rel_path)`** — reverse lookup; returns trails that include the given note as a waypoint. [mcp-tool-trails-containing-note]
+- **`trail_create(name)`** — create a new trail (empty waypoint list, default placement per `[trails] new_trail_dir`); returns id + path. [mcp-tool-trail-create]
+- **`trail_append_waypoint(trail_id, source_rel, annotation?)`** — append a waypoint; creates the waypoint-note under `.hiker/trails/<trail-id>/waypoints/`, links to source, seeds optional starter annotation (omitted → empty body). [mcp-tool-trail-append-waypoint]
+- **`trail_remove_waypoint(trail_id, waypoint_id)`** — symmetric to the sidebar's `trails-mode-remove-waypoint-verb`; routes the waypoint-note delete through `core::ops::delete` so it lands in trash. [mcp-tool-trail-remove-waypoint]
+
 ### Task queue tools
 
 When `core::tasks` lands (per `task-queue.md`), the MCP server gains four more tools so external rmcp clients — Claude Code, Codex, the user's ACP-acting-as-MCP-client — can drain hiker's non-interactive LLM work. The same tools are in-process-dispatched to the basic chat agent's tool set when `[tasks] expose_to_chat_agent = true`, so the queue's checkout/submit surface is one tool registry shared across the chat agent and external clients.
@@ -78,7 +89,7 @@ Cancellation is **not** an MCP tool. External agents learn cancellation via `sta
 Notably absent from v3:
 
 - `move_note`, `delete_note`, `create_folder` — heavier write operations. Agent enrichment use cases don't need them; deferred until a real motivating case appears.
-- `list_trails`, `get_trail`, `list_landmarks`, `list_collections`, `get_collection` — backing features don't exist yet (trails are deferred; landmarks and collections are unbuilt). When they land, the corresponding tools are added; until then they're not advertised at initialize. [mcp-tool-trails-deferred, mcp-tool-landmarks-deferred, mcp-tool-collections-deferred]
+- `list_landmarks`, `list_collections`, `get_collection` — landmarks and collections are unbuilt; the corresponding tools are added when those features land. Until then they're not advertised at initialize. [mcp-tool-landmarks-deferred, mcp-tool-collections-deferred]
 - `expand_chunk`, `get_note_context` — sketched in `design.md` but not load-bearing for v3 use cases. The chunk-id format issue can be settled later. Deferred.
 - Vision OCR helpers — depend on the extractor pipeline being real. Deferred to v4+.
 

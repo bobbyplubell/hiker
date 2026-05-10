@@ -22,6 +22,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config::RecencyBias;
 use crate::store::{knn_chunks_on, Store, StoreError, EMBED_DIM};
 
 /// Per-backend top-k pulled internally before fusion. Spec: 25 per backend
@@ -48,6 +49,48 @@ pub enum SearchError {
     Sqlite(#[from] rusqlite::Error),
     #[error("embed dim mismatch: got {got}, expected {expected}")]
     EmbedDim { got: usize, expected: usize },
+}
+
+/// Per-side option flags surfaced via the right-click options menu on the
+/// Lexical (`Aa`) toggle. See `search.md` §"Lexical options menu". All
+/// fields default to `false` to preserve current FTS5 behavior.
+///
+/// status: search-lexical-options
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LexicalOpts {
+    pub case_sensitive: bool,
+    pub diacritic_sensitive: bool,
+    pub prefix_match: bool,
+    pub phrase_mode: bool,
+}
+
+/// Per-side option flags for the semantic engine, surfaced via the
+/// right-click options menu on the brain toggle.
+///
+/// status: search-semantic-options
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticOpts {
+    /// Cosine-similarity floor; hits below this are dropped before fusion.
+    /// status: search-semantic-min-similarity
+    pub min_similarity: f32,
+    /// Override of `PER_BACKEND_TOP_K` for the semantic side only.
+    /// status: search-semantic-top-k-override
+    pub top_k: u32,
+    /// RRF blend of `notes.mtime` rank into the semantic score.
+    /// status: search-semantic-recency-bias
+    pub recency_bias: RecencyBias,
+}
+
+impl Default for SemanticOpts {
+    fn default() -> Self {
+        Self {
+            min_similarity: 0.0,
+            top_k: PER_BACKEND_TOP_K as u32,
+            recency_bias: RecencyBias::Off,
+        }
+    }
 }
 
 /// Which backends should run for this query. Both true = hybrid via RRF;
@@ -108,7 +151,12 @@ pub struct SearchResponse {
 /// open + sqlite-vec auto-extension is process-once); no `Send + Sync`
 /// bound — engine values don't outlive a single query.
 pub trait LexicalEngine {
-    fn query(&self, q: &str, top_k: usize) -> Result<Vec<NoteHit>, SearchError>;
+    fn query(
+        &self,
+        q: &str,
+        top_k: usize,
+        opts: LexicalOpts,
+    ) -> Result<Vec<NoteHit>, SearchError>;
     fn version(&self) -> &str;
 }
 
@@ -132,17 +180,33 @@ pub struct Fts5LexicalEngine<'a> {
 }
 
 impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
-    fn query(&self, q: &str, top_k: usize) -> Result<Vec<NoteHit>, SearchError> {
+    fn query(
+        &self,
+        q: &str,
+        top_k: usize,
+        opts: LexicalOpts,
+    ) -> Result<Vec<NoteHit>, SearchError> {
         if q.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // status: search-lexical-phrase-mode, search-lexical-prefix-match
+        //
+        // Phrase mode wraps the whole query in double quotes for FTS5
+        // exact-phrase semantics; prefix match rewrites each token to
+        // `token*`. Phrase mode wins when both are set (FTS5 ignores `*`
+        // inside a quoted phrase per the spec hint in `search.md`).
+        let match_string = build_match_string(q, opts);
         // status: search-fts5-bm25-snippet
         // SQLite's bm25() returns a NEGATIVE-going score (more-negative =
         // better match), so ORDER BY bm25 ASC produces best-first.
         // snippet() column index 0 = the `text` column on chunks_fts.
+        // We additionally pull `c.text` so the post-filter pass for
+        // `case_sensitive` / `diacritic_sensitive` can run against the raw
+        // chunk body rather than the highlighted snippet.
         let sql = format!(
             "SELECT c.id AS chunk_id, c.note_id, n.path, c.chunk_index, c.heading_path,
                     snippet(chunks_fts, 0, '<mark>', '</mark>', '…', {win}) AS snip,
+                    c.text AS chunk_text,
                     bm25(chunks_fts) AS score
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
@@ -158,23 +222,49 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
         // returns top_k distinct notes even when one note dominates the
         // raw chunk-level results.
         let candidate_k = top_k.saturating_mul(4).max(top_k + 16) as i64;
-        let rows = stmt.query_map(params![q, candidate_k], |row| {
+        let rows = stmt.query_map(params![match_string, candidate_k], |row| {
             let raw_score: f64 = row.get("score")?;
             // Flip sign so higher = better, matching the semantic side.
             // Magnitude isn't comparable across backends — RRF doesn't
             // care about absolute values, only ranks.
             let score = (-raw_score) as f32;
-            Ok(RawChunkHit {
-                chunk_id: row.get("chunk_id")?,
-                note_id: row.get("note_id")?,
-                path: row.get("path")?,
-                chunk_index: row.get::<_, i64>("chunk_index")? as u32,
-                heading_path: row.get("heading_path")?,
-                snippet: row.get("snip")?,
-                score,
-            })
+            let chunk_text: String = row.get("chunk_text")?;
+            Ok((
+                RawChunkHit {
+                    chunk_id: row.get("chunk_id")?,
+                    note_id: row.get("note_id")?,
+                    path: row.get("path")?,
+                    chunk_index: row.get::<_, i64>("chunk_index")? as u32,
+                    heading_path: row.get("heading_path")?,
+                    snippet: row.get("snip")?,
+                    score,
+                },
+                chunk_text,
+            ))
         })?;
-        let chunk_hits: Vec<RawChunkHit> = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut chunk_hits: Vec<RawChunkHit> = Vec::new();
+        for row in rows {
+            let (hit, chunk_text) = row?;
+            // status: search-lexical-case-sensitive,
+            // search-lexical-diacritic-sensitive
+            //
+            // Post-filter the FTS5 candidate set against the raw chunk
+            // text. FTS5's tokenizer is case-folded + diacritic-stripped at
+            // index time, so a per-query toggle of either knob is honored
+            // by checking whether the (optionally case-folded) chunk body
+            // still contains the user's query verbatim. Diacritic-sensitive
+            // falls out for free: a literal substring of a query without
+            // diacritics will not appear inside a chunk that carries them
+            // (and vice versa) without a normalization pass — so the
+            // narrower setting is enforced by exactly the same byte-level
+            // contains check as case_sensitive.
+            if opts.case_sensitive || opts.diacritic_sensitive {
+                if !chunk_contains(q, &chunk_text, opts) {
+                    continue;
+                }
+            }
+            chunk_hits.push(hit);
+        }
         Ok(group_by_note(chunk_hits, top_k))
     }
 
@@ -335,6 +425,45 @@ fn rrf_fuse(
         .collect()
 }
 
+/// Build the FTS5 `MATCH` string from the user's raw query plus the
+/// lexical option flags. Phrase mode wraps the whole query in double
+/// quotes (FTS5 exact-phrase). Prefix match rewrites each whitespace
+/// token to `token*`. Phrase wins over prefix when both are set —
+/// FTS5 silently ignores `*` inside a quoted phrase.
+fn build_match_string(q: &str, opts: LexicalOpts) -> String {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if opts.phrase_mode {
+        // Escape any embedded double quotes by doubling them per FTS5's
+        // string literal rules.
+        let escaped = trimmed.replace('"', "\"\"");
+        return format!("\"{escaped}\"");
+    }
+    if opts.prefix_match {
+        return trimmed
+            .split_whitespace()
+            .map(|tok| format!("{tok}*"))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    trimmed.to_string()
+}
+
+/// Substring check used by the lexical post-filter pass. When
+/// `case_sensitive` is off, both sides are lowercased before comparison.
+/// Diacritic-sensitivity is handled by the natural byte-level mismatch
+/// between accented and unaccented forms — see the call site for why no
+/// normalization pass runs here.
+fn chunk_contains(query: &str, chunk_text: &str, opts: LexicalOpts) -> bool {
+    if opts.case_sensitive {
+        chunk_text.contains(query)
+    } else {
+        chunk_text.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
 /// Top-level entry. `lexical_query_text` and `query_embedding` are the
 /// caller's responsibility; embedding is done in a `spawn_blocking` hop
 /// outside the store's connection pool per
@@ -346,19 +475,35 @@ pub fn query(
     modes: SearchModes,
     lexical_query_text: Option<&str>,
     query_embedding: Option<&[f32]>,
+    lexical_opts: LexicalOpts,
+    semantic_opts: SemanticOpts,
 ) -> Result<SearchResponse, SearchError> {
     let conn = store.open_reader()?;
 
     let lexical_hits = if modes.lexical {
         let q = lexical_query_text.unwrap_or("");
-        Fts5LexicalEngine { conn: &conn }.query(q, PER_BACKEND_TOP_K)?
+        Fts5LexicalEngine { conn: &conn }.query(q, PER_BACKEND_TOP_K, lexical_opts)?
     } else {
         Vec::new()
     };
 
+    // Clamp top_k override to [5, 100] per spec. A misconfigured value
+    // upstream defaults to PER_BACKEND_TOP_K rather than panicking.
+    let semantic_top_k = (semantic_opts.top_k.clamp(5, 100)) as usize;
     let semantic_hits = if modes.semantic {
         match query_embedding {
-            Some(emb) => VecSemanticEngine { conn: &conn }.query(emb, PER_BACKEND_TOP_K)?,
+            Some(emb) => {
+                let mut hits = VecSemanticEngine { conn: &conn }.query(emb, semantic_top_k)?;
+                // status: search-semantic-min-similarity
+                if semantic_opts.min_similarity > 0.0 {
+                    hits.retain(|h| h.score >= semantic_opts.min_similarity);
+                }
+                // status: search-semantic-recency-bias
+                if semantic_opts.recency_bias != RecencyBias::Off && !hits.is_empty() {
+                    apply_recency_bias(&conn, &mut hits, semantic_opts.recency_bias)?;
+                }
+                hits
+            }
             None => Vec::new(),
         }
     } else {
@@ -406,6 +551,77 @@ pub fn pick_bucket(
     } else {
         Vec::new()
     }
+}
+
+/// Blend an `notes.mtime`-derived rank into each semantic hit's score
+/// using the same RRF k=60 shape as the cross-mode fusion:
+///
+/// ```text
+/// score' = 1/(k + sim_rank) + w · 1/(k + recency_rank)
+/// ```
+///
+/// where `w` is `0.5` (Mild) or `1.0` (Strong) and `recency_rank` is the
+/// note's position when the candidate set is sorted by `notes.mtime
+/// DESC`. The semantic rank used is the input ordering: `hits` arrives
+/// already sorted best-first by cosine similarity. Mtimes for every hit
+/// are pulled in one bulk `IN (...)` query.
+///
+/// status: search-semantic-recency-bias
+fn apply_recency_bias(
+    conn: &Connection,
+    hits: &mut Vec<NoteHit>,
+    bias: RecencyBias,
+) -> Result<(), SearchError> {
+    let weight = bias.weight();
+    if weight == 0.0 {
+        return Ok(());
+    }
+    // Pull each candidate's mtime in one query. `IN (?, ?, ?, ...)`.
+    let mut placeholders = String::new();
+    for i in 0..hits.len() {
+        if i > 0 {
+            placeholders.push(',');
+        }
+        placeholders.push('?');
+    }
+    let sql = format!("SELECT id, mtime FROM notes WHERE id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params_iter: Vec<&dyn rusqlite::ToSql> = hits
+        .iter()
+        .map(|h| &h.note_id as &dyn rusqlite::ToSql)
+        .collect();
+    let mtime_rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
+        let id: String = row.get(0)?;
+        let mtime: i64 = row.get(1)?;
+        Ok((id, mtime))
+    })?;
+    let mut mtimes: HashMap<String, i64> = HashMap::new();
+    for r in mtime_rows {
+        let (id, m) = r?;
+        mtimes.insert(id, m);
+    }
+    // Recency rank: sort note ids by mtime DESC. Notes missing from the
+    // map (shouldn't happen, but guard) tail with mtime=0.
+    let mut by_recency: Vec<(&str, i64)> = hits
+        .iter()
+        .map(|h| (h.note_id.as_str(), *mtimes.get(&h.note_id).unwrap_or(&0)))
+        .collect();
+    by_recency.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut recency_rank: HashMap<String, usize> = HashMap::new();
+    for (i, (id, _)) in by_recency.iter().enumerate() {
+        recency_rank.insert((*id).to_string(), i + 1);
+    }
+    // Apply the RRF blend in place. `sim_rank` is the input order (1-based).
+    let total = hits.len();
+    for (i, hit) in hits.iter_mut().enumerate() {
+        let sim_rank = (i + 1) as f32;
+        let rec_rank = *recency_rank.get(&hit.note_id).unwrap_or(&total) as f32;
+        let blended = 1.0 / (RRF_K + sim_rank) + weight * (1.0 / (RRF_K + rec_rank));
+        hit.score = blended;
+    }
+    // Re-sort by the blended score so the panel sees the recency-aware order.
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(())
 }
 
 fn title_from_path(path: &str) -> String {
@@ -481,7 +697,7 @@ mod tests {
 
         let conn = store.open_reader().unwrap();
         let engine = Fts5LexicalEngine { conn: &conn };
-        let hits = engine.query("fox", 10).unwrap();
+        let hits = engine.query("fox", 10, LexicalOpts::default()).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].note_id, id);
         assert!(hits[0].snippet.contains("<mark>fox</mark>"));
@@ -510,7 +726,7 @@ mod tests {
 
         let conn = store.open_reader().unwrap();
         let engine = Fts5LexicalEngine { conn: &conn };
-        let hits = engine.query("rust", 10).unwrap();
+        let hits = engine.query("rust", 10, LexicalOpts::default()).unwrap();
         assert_eq!(hits.len(), 1, "two chunks of the same note must collapse");
     }
 
@@ -537,7 +753,7 @@ mod tests {
 
         let conn = store.open_reader().unwrap();
         let engine = Fts5LexicalEngine { conn: &conn };
-        let hits = engine.query("hello", 10).unwrap();
+        let hits = engine.query("hello", 10, LexicalOpts::default()).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "ok.md");
     }
@@ -609,6 +825,8 @@ mod tests {
             SearchModes { lexical: false, semantic: false },
             Some("anything"),
             Some(&unit_vec(0.0)),
+            LexicalOpts::default(),
+            SemanticOpts::default(),
         )
         .unwrap();
         assert_eq!(resp.epoch, 7);
@@ -640,6 +858,8 @@ mod tests {
             SearchModes { lexical: true, semantic: false },
             Some("needle"),
             None, // no embedding required when semantic is off
+            LexicalOpts::default(),
+            SemanticOpts::default(),
         )
         .unwrap();
         assert_eq!(resp.epoch, 42);

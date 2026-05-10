@@ -4,12 +4,16 @@
 // status: tree-double-click-rename
 // status: tree-context-menu
 // status: tree-context-delete
-// status: tree-toolbar-actions-menu
+// status: sidebar-toolbar-actions-menu
 // status: tree-sort-options
 // status: tree-row-unsupported-marker
 // status: tree-row-skipped-marker
 // status: tree-row-queued-marker
 // status: create-note-button
+// status: trail-row-icon
+// status: trail-row-dropdown-chevron
+// status: trail-set-as-active-context-verb
+// status: trail-add-to-active-from-tree-verb
 //
 // Sidebar tree panel — rendering, dnd, inline rename, context menu, sort
 // menu, watcher reconciliation, index-state markers. The module owns its
@@ -28,6 +32,10 @@ import { Classes, IX_STATE_CLASSES } from "../style/classes";
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { confirmDanger } from "../widgets/confirm";
+import { Icons } from "../icons";
+import type { ResolvedWaypoint } from "../ipc";
+import { getActiveTrailRel } from "../app/state";
+import { getActiveTrailWaypointPaths } from "../trails/membership";
 
 export type EntryKind = "dir" | "file";
 export interface DirEntry {
@@ -90,7 +98,7 @@ type BufferLike = { path: string; mode: { kind: string } };
 export interface TreeDeps extends PanelDeps {
   treeEl: HTMLElement;
   newNoteBtn: HTMLButtonElement;
-  treeActionsBtn: HTMLButtonElement;
+  sidebarActionsBtn: HTMLButtonElement;
   cssEscape: (s: string) => string;
   getBuffer: () => BufferLike | null;
   /// True when buffer is a read-only preview (snapshot/trash). Used by the
@@ -107,6 +115,16 @@ export interface TreeDeps extends PanelDeps {
   /// Re-render the status-bar index label when the active buffer's index
   /// state resolves lazily.
   renderIndexStatus: () => void;
+  /// status: trail-add-to-active-from-tree-verb — fired after a
+  /// successful `trailAppendWaypoint` from the tree-row "Add to active
+  /// trail" verb. Host uses this to explicitly refresh the trails
+  /// panel + membership cache; needed because
+  /// `core::trails::append_waypoint` suppresses the watcher for the
+  /// trail-doc + waypoint-note paths (to avoid indexer feedback
+  /// loops), so the `hiker:file-changed`-driven refresh path can't
+  /// fire for these writes. See
+  /// `bug-add-to-trail-verbs-dont-refresh-panel`.
+  onWaypointAppended?: () => void;
 }
 
 export interface TreeApi {
@@ -121,6 +139,25 @@ export interface TreeApi {
   deleteIndexState(rel: string): void;
   clearCaches(): void;
   fetchIndexState(rel: string): Promise<IndexState>;
+  /// Begin inline-rename on the row currently rendered for `rel`. Used
+  /// by the sidebar `+`-button create flows (notes, trails) so the new
+  /// item lands in rename mode for naming. Awaits the next tree
+  /// refresh before resolving the row, so the caller can `await
+  /// refresh()` first or rely on `revealPath`. Resolves silently when
+  /// no row matches (e.g. the create call failed and the row never
+  /// landed).
+  beginInlineRenameByPath(rel: string): Promise<void>;
+  /// status: trail-row-icon — refresh the cached set of trail-doc rel
+  /// paths so the file tree can decorate trail-doc rows with the
+  /// squiggly icon. Cheap; called from the host's watcher hook on any
+  /// `.md` change outside `.hiker/`.
+  refreshTrailDocSet(): Promise<void>;
+  /// status: trail-add-to-active-from-editor-verb — synchronous "is
+  /// this rel-path a trail-doc?" predicate over the tree's internal
+  /// `trailDocPaths` cache. Used by the editor toolbar pill to hide
+  /// itself when the open buffer is a trail-doc (a trail can't be a
+  /// waypoint of itself).
+  isTrailDoc(rel: string): boolean;
 }
 
 export type TreeController = PanelController<TreeApi>;
@@ -138,6 +175,56 @@ export function mountTree(deps: TreeDeps): TreeController {
   // Persists folder expansion state across `refreshTree` calls so a delete /
   // rename / refresh doesn't collapse every open folder.
   const expandedFolders = new Set<string>();
+
+  // status: trail-row-icon
+  // Cached set of vault-relative trail-doc paths. Populated by
+  // `Ipc.trailsList()` and refreshed lazily on any `.md` watcher event
+  // outside `.hiker/` (a non-trail-doc could acquire `hiker.kind:
+  // trail` frontmatter at any time, and a trail-doc could lose it).
+  // Used by `renderTreeRowLabel` to prepend the squiggly-trail icon
+  // and by `attachContextMenu` to show the "Set as active trail"
+  // verb. Empty until first refresh resolves.
+  const trailDocPaths = new Set<string>();
+
+  // status: trail-row-dropdown-chevron
+  // Per-trail expansion state in the file tree. NOT persisted —
+  // resets on vault open per spec. Each entry is a trail-doc rel path
+  // currently expanded inline; the children are waypoint rows
+  // rendered after the trail-doc row in `renderDir`. Detail is
+  // fetched lazily via `Ipc.trailGet` on first expand and cached in
+  // `trailDetailCache`.
+  const expandedTrails = new Set<string>();
+  const trailDetailCache = new Map<string, ResolvedWaypoint[]>();
+
+  // status: trails-mode-side-trail-render — render side-trail
+  // children recursively under their parent. Each level is wrapped
+  // in its own `<ul>`, so the global `#tree ul ul` rules + the
+  // `.tree-trail-children` indent step compound naturally per
+  // depth.
+  function appendWaypointChildren(
+    parentUl: HTMLElement,
+    waypoints: ResolvedWaypoint[],
+  ): void {
+    for (const w of waypoints) {
+      const childLi = document.createElement("li");
+      const sourcePath = w.source_ref?.path ?? w.waypoint_rel;
+      childLi.dataset.path = sourcePath;
+      childLi.dataset.kind = "file";
+      childLi.classList.add("tree-trail-waypoint");
+      const name = sourcePath.split("/").pop() ?? sourcePath;
+      childLi.append(document.createTextNode(name));
+      parentUl.appendChild(childLi);
+      const kids = w.children ?? [];
+      if (kids.length > 0) {
+        const nestedContainer = document.createElement("div");
+        nestedContainer.className = "tree-trail-children";
+        const nestedUl = document.createElement("ul");
+        appendWaypointChildren(nestedUl, kids);
+        nestedContainer.appendChild(nestedUl);
+        childLi.after(nestedContainer);
+      }
+    }
+  }
 
   let treeSortOrder: TreeSortOrder = "name-asc";
 
@@ -198,6 +285,34 @@ export function mountTree(deps: TreeDeps): TreeController {
     if (entry.kind === "dir") {
       li.append(document.createTextNode((expanded ? "▾ " : "▸ ") + entry.name));
       return;
+    }
+    // status: trail-row-icon — squiggly-trail glyph prefix on trail-doc
+    // file rows. Driven by the cached `trailDocPaths` set; non-trail
+    // file rows render unchanged.
+    const isTrail = trailDocPaths.has(entry.rel_path);
+    if (isTrail) {
+      const icon = document.createElement("span");
+      icon.className = "tree-trail-icon";
+      icon.innerHTML = Icons.trail({ size: 11 });
+      li.append(icon);
+      // status: trail-row-dropdown-chevron — chevron next to a
+      // trail-doc row when the trail has at least one waypoint.
+      // Fetches detail lazily on first click; expansion state lives
+      // in `expandedTrails` and resets on vault open.
+      const cachedWps = trailDetailCache.get(entry.rel_path);
+      const wpCount = cachedWps?.length ?? null;
+      // Only render chevron when we already know the count is > 0
+      // OR we haven't fetched yet (optimistic — toggle on first click
+      // hides itself if the trail has zero waypoints). The watcher
+      // refresh path repaints the tree on any `.hiker/trails/` event
+      // so the chevron appears after the first waypoint capture.
+      if (wpCount === null || wpCount > 0) {
+        const chev = document.createElement("span");
+        chev.className = "tree-trail-chevron";
+        chev.dataset.action = "toggle-trail";
+        chev.textContent = expandedTrails.has(entry.rel_path) ? "▾" : "▸";
+        li.append(chev);
+      }
     }
     li.append(document.createTextNode(entry.name));
 
@@ -351,6 +466,28 @@ export function mountTree(deps: TreeDeps): TreeController {
         void beginInlineRename(li, entry.rel_path, entry.kind);
       });
       ul.appendChild(li);
+      // status: trail-row-dropdown-chevron — render waypoint children
+      // for expanded trail-doc rows, mirroring the folder-expansion
+      // shape. Detail comes from `trailDetailCache`; first-paint will
+      // be empty if the click handler hasn't fetched yet. Must run
+      // AFTER `ul.appendChild(li)` — otherwise `li.after(...)` is a
+      // no-op (Element.after needs a parent) and the waypoints never
+      // appear in the DOM (fix for bug-filetree-trail-expand-shows-no-waypoints).
+      if (
+        entry.kind === "file"
+        && trailDocPaths.has(entry.rel_path)
+        && expandedTrails.has(entry.rel_path)
+      ) {
+        const wps = trailDetailCache.get(entry.rel_path) ?? [];
+        if (wps.length > 0) {
+          const childContainer = document.createElement("div");
+          childContainer.className = "tree-trail-children";
+          const childUl = document.createElement("ul");
+          appendWaypointChildren(childUl, wps);
+          childContainer.appendChild(childUl);
+          li.after(childContainer);
+        }
+      }
     }
     container.appendChild(ul);
     await Promise.all(pendingChildren);
@@ -365,6 +502,22 @@ export function mountTree(deps: TreeDeps): TreeController {
     if (e.detail >= 2) return;
     const target = e.target as HTMLElement | null;
     if (!target) return;
+    // status: trail-row-dropdown-chevron — chevron click toggles
+    // inline expansion of the trail's waypoints. Resolved before the
+    // generic row click so opening a trail-doc still works (clicking
+    // the basename, not the chevron).
+    const chevTarget = target.closest<HTMLElement>(
+      "[data-action='toggle-trail']",
+    );
+    if (chevTarget && deps.treeEl.contains(chevTarget)) {
+      const li = chevTarget.closest<HTMLLIElement>("li[data-path]");
+      if (li) {
+        e.stopPropagation();
+        const trailRel = li.dataset.path ?? "";
+        await toggleTrailExpansion(trailRel);
+      }
+      return;
+    }
     const li = target.closest<HTMLLIElement>("li[data-path]");
     if (!li || !deps.treeEl.contains(li)) return;
     e.stopPropagation();
@@ -406,6 +559,71 @@ export function mountTree(deps: TreeDeps): TreeController {
   deps.treeEl.addEventListener("click", (e) => {
     void onTreeClick(e);
   });
+
+  async function refreshTrailDocSet(): Promise<void> {
+    // status: trail-row-icon — reload trail-doc paths so the tree
+    // can decorate rows. Failures are logged and leave the set
+    // unchanged; the worst-case is a stale icon until the next
+    // successful refresh.
+    try {
+      const list = await Ipc.trailsList();
+      const fresh = new Set<string>();
+      for (const t of list) fresh.add(t.rel_path);
+      // Only mutate if anything changed — avoids redundant refreshes
+      // when the watcher fires for non-trail md edits.
+      let changed = fresh.size !== trailDocPaths.size;
+      if (!changed) {
+        for (const p of fresh) {
+          if (!trailDocPaths.has(p)) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        trailDocPaths.clear();
+        for (const p of fresh) trailDocPaths.add(p);
+        // Drop expanded state + cached detail for trails that no
+        // longer exist.
+        for (const k of [...expandedTrails]) {
+          if (!trailDocPaths.has(k)) expandedTrails.delete(k);
+        }
+        for (const k of [...trailDetailCache.keys()]) {
+          if (!trailDocPaths.has(k)) trailDetailCache.delete(k);
+        }
+      }
+    } catch (err) {
+      Logger.error("ui::tree", "trails_list (decoration) failed", { err });
+    }
+  }
+
+  async function toggleTrailExpansion(trailRel: string): Promise<void> {
+    if (expandedTrails.has(trailRel)) {
+      expandedTrails.delete(trailRel);
+      await refresh();
+      return;
+    }
+    // First-time expand — fetch detail lazily. Cached for subsequent
+    // toggles; the watcher hook invalidates the cache on `.hiker/
+    // trails/` events so reopening picks up new waypoints.
+    try {
+      const detail = await Ipc.trailGet({ trailDocRel: trailRel });
+      trailDetailCache.set(trailRel, detail.waypoints);
+      // Hide the chevron post-fetch when the trail is empty (the
+      // optimistic render above shows it before we know the count).
+      if (detail.waypoints.length === 0) {
+        await refresh();
+        return;
+      }
+      expandedTrails.add(trailRel);
+      await refresh();
+    } catch (err) {
+      Logger.error("ui::tree", "trail_get (tree expand) failed", {
+        err,
+        trailRel,
+      });
+    }
+  }
 
   async function refresh(): Promise<void> {
     deps.treeEl.innerHTML = "";
@@ -536,7 +754,100 @@ export function mountTree(deps: TreeDeps): TreeController {
       e.stopPropagation();
       const items: CtxMenuItem[] = [];
       if (entry.kind === "file") {
+        // status: trail-set-as-active-context-verb — only on trail-doc rows.
+        if (trailDocPaths.has(entry.rel_path)) {
+          items.push({
+            label: "Set as active trail",
+            run: async () => {
+              try {
+                await Ipc.trailSetActive({ trailDocRel: entry.rel_path });
+                const name = entry.rel_path.split("/").pop() ?? entry.rel_path;
+                showToast(`Activated ${name.replace(/\.md$/i, "")}`);
+              } catch (err) {
+                Logger.error("ui::tree", "trail_set_active failed", {
+                  err,
+                  rel: entry.rel_path,
+                });
+                alert(`activate failed: ${deps.formatErr(err)}`);
+              }
+            },
+          });
+        }
         items.push({ label: "Open", run: () => deps.openNote(entry.rel_path) });
+        // status: trail-add-to-active-from-tree-verb — append the row's
+        // note as a waypoint of the currently-active trail. Calls
+        // `Ipc.trailAppendWaypoint` directly rather than going through
+        // the shared `captureToActiveTrail` helper: the helper swallows
+        // errors by contract (capture entry points must not hard-fail
+        // when trail routing fails), but this tree verb is a direct
+        // user action and the user needs to see when the append fails.
+        // Hidden on trail-docs (already a trail), waypoint-notes under
+        // `.hiker/trails/`, and unsupported file types (per the cached
+        // `IndexState`). Disabled with a tooltip when no active trail
+        // is set so the affordance teaches itself.
+        const isTrailDoc = trailDocPaths.has(entry.rel_path);
+        const isWaypointNote = entry.rel_path.startsWith(".hiker/trails/");
+        const ixState = indexStateCache.get(entry.rel_path);
+        const isUnsupported = ixState?.kind === "unsupported";
+        if (!isTrailDoc && !isWaypointNote && !isUnsupported) {
+          const active = getActiveTrailRel();
+          const activeBasename = active
+            ? (active.split("/").pop() ?? active).replace(/\.md$/i, "")
+            : null;
+          const label = activeBasename
+            ? `Add to active trail (${activeBasename})`
+            : "Add to active trail";
+          // Per `trails.md` "Building a trail while reading":
+          // idempotency check is per-trail, not per-vault. The
+          // synchronous membership cache is populated by
+          // `./trails/membership` and refreshed on active-trail and
+          // waypoint-set changes; reading from it inside the
+          // contextmenu builder keeps the menu sync-safe (no async
+          // before show).
+          const alreadyMember =
+            active !== null
+            && getActiveTrailWaypointPaths().has(entry.rel_path);
+          const disabled = active === null || alreadyMember;
+          let tooltip: string | undefined;
+          if (active === null) {
+            tooltip = "No active trail — pick one in Trails mode";
+          } else if (alreadyMember) {
+            tooltip = "Already in this trail";
+          }
+          items.push({
+            label,
+            disabled,
+            tooltip,
+            run: async () => {
+              const target = getActiveTrailRel();
+              if (!target) return;
+              const targetBasename =
+                (target.split("/").pop() ?? target).replace(/\.md$/i, "");
+              try {
+                await Ipc.trailAppendWaypoint({
+                  trailDocRel: target,
+                  sourceRel: entry.rel_path,
+                  annotation: null,
+                });
+                showToast(`Added to ${targetBasename}`);
+                // Watcher is suppressed for the trail-doc +
+                // waypoint-note paths during the append (indexer
+                // feedback-loop prevention), so the `hiker:file-changed`
+                // refresh path can't fire here. Explicitly notify the
+                // host to refresh the trails panel + membership cache.
+                // See `bug-add-to-trail-verbs-dont-refresh-panel`.
+                deps.onWaypointAppended?.();
+              } catch (err) {
+                Logger.error("ui::tree", "trail append from tree verb failed", {
+                  error: String(err),
+                  rel: entry.rel_path,
+                  trail: target,
+                });
+                showToast("Failed to add waypoint");
+              }
+            },
+          });
+        }
       }
       items.push({
         label: "Rename",
@@ -692,10 +1003,10 @@ export function mountTree(deps: TreeDeps): TreeController {
     }
   });
 
-  // status: tree-toolbar-actions-menu — `…` actions menu.
-  deps.treeActionsBtn.addEventListener("click", (e) => {
+  // status: sidebar-toolbar-actions-menu — `…` actions menu.
+  deps.sidebarActionsBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    const rect = deps.treeActionsBtn.getBoundingClientRect();
+    const rect = deps.sidebarActionsBtn.getBoundingClientRect();
     const buffer = deps.getBuffer();
     const activePath =
       buffer && !deps.isReadOnlyBuffer(buffer) ? buffer.path : null;
@@ -759,8 +1070,23 @@ export function mountTree(deps: TreeDeps): TreeController {
     clearCaches: () => {
       indexStateCache.clear();
       inflightStateFetches.clear();
+      // status: trail-row-dropdown-chevron — expansion resets on vault
+      // open per spec. status: trail-row-icon — drop the cached
+      // trail-doc set so the new vault re-fetches.
+      expandedTrails.clear();
+      trailDetailCache.clear();
+      trailDocPaths.clear();
     },
     fetchIndexState,
+    beginInlineRenameByPath: async (rel: string) => {
+      const li = document.querySelector(
+        `#tree li[data-path="${deps.cssEscape(rel)}"]`,
+      ) as HTMLLIElement | null;
+      if (!li) return;
+      await beginInlineRename(li, rel, "file");
+    },
+    refreshTrailDocSet,
+    isTrailDoc: (rel: string) => trailDocPaths.has(rel),
   };
 
   return createPanelController<TreeApi>(api, {

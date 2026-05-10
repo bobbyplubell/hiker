@@ -121,6 +121,28 @@ export const viewSettingsStore: Store<ViewSettings> = createStore<ViewSettings>(
   renderTxtAsMarkdown: true,
 });
 
+/// Active trail (vault-relative path of the trail-doc), mirrored from
+/// `vault.active_trail` in the merged settings snapshot. `null` when no
+/// trail is active. Slice U1 lands the read side only — Trails-mode
+/// dropdown writes (slice U2) will go through `Ipc.trailSetActive` and
+/// re-seed this store via the post-write `applySettingsToUi` pass.
+///
+/// status: active-trail-state
+export interface ActiveTrailState {
+  rel: string | null;
+}
+
+export const activeTrailStore: Store<ActiveTrailState> =
+  createStore<ActiveTrailState>({ rel: null });
+
+/// Read the active trail's vault-relative trail-doc path. Returns `null`
+/// when no trail is active. Pure read — writes go through
+/// `Ipc.trailSetActive` (which also stamps `hiker.last_activated_at` on
+/// the trail-doc).
+export function getActiveTrailRel(): string | null {
+  return activeTrailStore.get().rel;
+}
+
 /// Source paths with an active or leased `NoteMutation` task. Populated
 /// by `mountMutationsMenu`'s `onInFlightChanged` hook driven off
 /// `hiker:queue-event`. The active buffer is set RO while its path is
