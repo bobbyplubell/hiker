@@ -63,20 +63,32 @@ export type CtxMenuItem =
   | CtxMenuRadio;
 
 let openMenuEl: HTMLElement | null = null;
+let openMenuTrigger: HTMLElement | null = null;
 
 export function closeContextMenu(): void {
   if (openMenuEl) {
     openMenuEl.remove();
     openMenuEl = null;
   }
+  openMenuTrigger = null;
 }
 
 export function openContextMenu(
   x: number,
   y: number,
   items: CtxMenuItem[],
+  triggerEl?: HTMLElement,
 ): void {
+  // Clicking the same trigger while its menu is open closes instead of
+  // re-opening (toggle behavior). Without this guard the outside-click
+  // handler fires first (mousedown capture), removes the menu, then
+  // the button's own click handler immediately re-opens it.
+  if (triggerEl && openMenuEl && openMenuTrigger === triggerEl) {
+    closeContextMenu();
+    return;
+  }
   closeContextMenu();
+  openMenuTrigger = triggerEl ?? null;
   const menu = document.createElement("div");
   menu.className = "ctx-menu";
   menu.setAttribute("role", "menu");

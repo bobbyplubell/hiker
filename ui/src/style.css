@@ -2084,6 +2084,26 @@ html, body, #app {
   background: var(--surface-hover-soft);
 }
 
+.chat-input-resize-handle {
+  flex: 0 0 auto;
+  height: 6px;
+  background: transparent;
+  cursor: row-resize;
+  user-select: none;
+  border-top: 1px solid transparent;
+  transition: background 80ms, border-color 80ms;
+}
+
+.chat-input-resize-handle:hover {
+  background: var(--surface-hover-soft);
+  border-top-color: var(--border-default);
+}
+
+.chat-input-resize-handle.dragging {
+  background: var(--accent-fill-soft);
+  border-top-color: var(--accent);
+}
+
 .chat-send-btn {
   flex: 0 0 auto;
   padding: 4px 8px;

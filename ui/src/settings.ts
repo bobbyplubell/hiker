@@ -52,6 +52,7 @@ export interface SettingsConfig {
     related_open: boolean;
     trash_expanded: boolean;
     chat_height: number;
+    chat_input_height: number;
     sidebar_width: number;
     discovery_width: number;
     show_sessions_in_tree: boolean;
@@ -119,6 +120,7 @@ const DEFAULTS = {
     related_open: false,
     trash_expanded: false,
     chat_height: 0.30,
+    chat_input_height: 0,
     sidebar_width: 280,
     discovery_width: 320,
     show_sessions_in_tree: false,

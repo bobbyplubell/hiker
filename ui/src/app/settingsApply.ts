@@ -39,6 +39,7 @@ export interface Settings {
     related_open: boolean;
     trash_expanded: boolean;
     chat_height: number;
+    chat_input_height: number;
     sidebar_width: number;
     discovery_width: number;
     show_sessions_in_tree: boolean;
@@ -85,6 +86,7 @@ export interface SettingsApplyDeps {
   trashChevronEl: HTMLElement;
   setChatEnabled: (on: boolean) => void;
   setChatHeight: (h: number) => void;
+  setChatInputHeight: (px: number) => void;
   setSidebarWidth: (px: number) => void;
   setDiscoveryWidth: (px: number) => void;
   setSidebarMode: (mode: Settings["vault"]["sidebar_mode"]) => void;
@@ -118,6 +120,9 @@ export function applySettingsToUi(s: Settings, deps: SettingsApplyDeps): void {
   deps.setChatEnabled(s.llm.enabled);
   if (typeof s.vault.chat_height === "number") {
     deps.setChatHeight(s.vault.chat_height);
+  }
+  if (typeof s.vault.chat_input_height === "number" && s.vault.chat_input_height > 0) {
+    deps.setChatInputHeight(s.vault.chat_input_height);
   }
   // status: side-panel-resize
   if (typeof s.vault.sidebar_width === "number") {

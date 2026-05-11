@@ -97,6 +97,8 @@ interface ActiveSessionDto {
 interface ChatPanel {
   setEnabled(enabled: boolean): void;
   setHeight(fraction: number): void;
+  /// Apply a persisted chat input height (pixels). 0 means auto-grow.
+  setInputHeight(px: number): void;
   reset(): void;
   /// Start a fresh session — backed by `chat_session_new`. Clears the
   /// transcript and pins the new id as active.
@@ -132,6 +134,11 @@ export interface ChatPanelOptions {
   /// Called when the user finishes a drag, so the host can persist the
   /// new fraction via `set_setting("vault.chat_height", ...)`.
   onResizePersist: (fraction: number) => void;
+  /// Called when the user finishes dragging the input-area resize handle,
+  /// so the host can persist the new height via
+  /// `set_setting("vault.chat_input_height", ...)`. Passes 0 when the
+  /// user drags to the auto-grow floor (unsets the override).
+  onInputHeightPersist: (heightPx: number) => void;
   /// Called by the chat panel when an `hiker://note/<rel>` (or bare
   /// vault-relative) link in an agent message is clicked. The host runs
   /// the existing `openFile` machinery (which handles
@@ -199,6 +206,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     inputEl,
     sendBtnEl,
     onResizePersist,
+    onInputHeightPersist,
     onOpenNoteLink,
     bufferApi,
     toast,
@@ -224,6 +232,9 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     assistantBubble: null,
     toolCards: new Map(),
   };
+
+  // User-set input height in px. 0 = auto-grow mode (no manual override).
+  let userInputHeight = 0;
 
   // ---------- send / continue / stop ----------
 
@@ -582,6 +593,12 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   }
 
   function autoSizeInput(): void {
+    if (userInputHeight > 0) return;
+    // Clear inline height when empty — let CSS min-height carry the row.
+    if (!inputEl.value) {
+      inputEl.style.height = "";
+      return;
+    }
     inputEl.style.height = "auto";
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, 120)}px`;
   }
@@ -969,6 +986,63 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     onResizePersist(currentFraction());
   });
 
+  // ---------- input resize ----------
+
+  // Create a resize handle just above the chat input form. Mirrors the
+  // shape of `#chat-resize-handle` one level up: a thin horizontal grab
+  // bar that the user drags to grow/shrink the input area.
+  const inputResizeEl = document.createElement("div");
+  inputResizeEl.className = "chat-input-resize-handle";
+  inputResizeEl.setAttribute("role", "separator");
+  inputResizeEl.setAttribute("aria-orientation", "horizontal");
+  inputResizeEl.setAttribute("aria-label", "Resize chat input");
+  formEl.before(inputResizeEl);
+
+  let inputDragStartY = 0;
+  let inputDragStartHeight = 0;
+
+  inputResizeEl.addEventListener("pointerdown", (ev) => {
+    if (appEl.classList.contains("chat-collapsed")) return;
+    ev.preventDefault();
+    inputResizeEl.classList.add("dragging");
+    inputResizeEl.setPointerCapture(ev.pointerId);
+    inputDragStartY = ev.clientY;
+    inputDragStartHeight = inputEl.getBoundingClientRect().height;
+  });
+
+  inputResizeEl.addEventListener("pointermove", (ev) => {
+    if (!inputResizeEl.classList.contains("dragging")) return;
+    const dy = ev.clientY - inputDragStartY;
+    // Dragging up (negative dy) grows the input; dragging down shrinks it.
+    const next = clamp(inputDragStartHeight - dy, MIN_INPUT_HEIGHT, maxInputHeight());
+    setInputHeightPx(next);
+  });
+
+  inputResizeEl.addEventListener("pointerup", (ev) => {
+    if (!inputResizeEl.classList.contains("dragging")) return;
+    inputResizeEl.classList.remove("dragging");
+    inputResizeEl.releasePointerCapture(ev.pointerId);
+    const h = userInputHeight;
+    // Persist 0 when user drags to the auto-grow floor, so the next
+    // vault open starts in auto-grow mode.
+    const flush = h <= MIN_INPUT_HEIGHT + 4 ? 0 : Math.round(h);
+    onInputHeightPersist(flush);
+  });
+
+  const MIN_INPUT_HEIGHT = 28;
+
+  function maxInputHeight(): number {
+    // Chat region height minus room for the handle + form padding +
+    // at least a couple transcript lines (~60px).
+    const regionH = regionEl.clientHeight || 0;
+    return Math.max(MIN_INPUT_HEIGHT, regionH - 68);
+  }
+
+  function setInputHeightPx(px: number): void {
+    userInputHeight = px;
+    inputEl.style.height = `${px}px`;
+  }
+
   // ---------- collapse ----------
 
   collapseBtnEl.addEventListener("click", (ev) => {
@@ -1012,6 +1086,14 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     setHeight(fraction) {
       setFraction(fraction);
     },
+    setInputHeight(px) {
+      if (px > 0) {
+        setInputHeightPx(px);
+      } else {
+        userInputHeight = 0;
+        inputEl.style.height = "";
+      }
+    },
     reset() {
       activeSessionId = null;
       activeTurnId = null;
@@ -1053,6 +1135,11 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     const firstUser = active.turns[0]?.user ?? "";
     setSessionLabel(firstUser ? shortLabel(firstUser, 28) : "Session");
   }
+
+  // Defer the initial auto-size pass until after the first layout so
+  // `scrollHeight` reads the laid-out element rather than a zero-width
+  // / display-pending state.
+  requestAnimationFrame(() => autoSizeInput());
 }
 
 function shortLabel(s: string, max: number): string {

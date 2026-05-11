@@ -2,6 +2,9 @@ mod chat;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
+
+use notify::{Event as NotifyEvent, EventKind as NotifyEventKind, Watcher as NotifyWatcher, RecursiveMode};
 
 use hiker_core::autosave::{Autosave, RecoveredEntry, TabState};
 use hiker_core::changes::{ChangeOp, ChangeRow, Changes};
@@ -99,6 +102,9 @@ pub(crate) struct VaultSession {
     /// CancellationToken used to wind down the direct worker + queue
     /// maintenance task on vault swap. Dropped with the session.
     pub(crate) tasks_cancel: tokio_util::sync::CancellationToken,
+    /// CancellationToken that stops the config-file watcher task on vault
+    /// swap. Dropped with the session; the watcher task selects on this.
+    pub(crate) config_watcher_cancel: tokio_util::sync::CancellationToken,
     /// status: mcp-tool-toggles
     /// Shared `[mcp.tools]` config — also held by the MCP handler so
     /// per-tool toggles apply live. Mutated by `set_setting` /
@@ -112,11 +118,17 @@ impl Drop for VaultSession {
         // Safe to call multiple times — `CancellationToken::cancel` is
         // idempotent.
         self.tasks_cancel.cancel();
+        // Stop the config-file watcher task.
+        self.config_watcher_cancel.cancel();
     }
 }
 
 pub(crate) struct AppState {
     pub(crate) session: Mutex<Option<VaultSession>>,
+    /// Suppression timestamp for the config-file watcher so
+    /// `set_setting` writes don't round-trip back through the file
+    /// watcher and re-fire `hiker:config-reloaded`.
+    pub(crate) config_last_write: Mutex<Option<Instant>>,
 }
 
 fn with_vault<R>(
@@ -461,6 +473,14 @@ async fn set_setting_inner(
         (session.root.clone(), cfg.mcp.clone())
     };
     let updated = Config::set(scope, &key, value, &root)?;
+    // Suppress the config-file watcher for a short window after this write
+    // so the resulting fs event doesn't round-trip back through
+    // `Config::load` -> `hiker:config-reloaded`.
+    {
+        if let Ok(mut guard) = state.config_last_write.lock() {
+            *guard = Some(Instant::now());
+        }
+    }
     // Apply the live in-memory updates (config swap, queue cfg,
     // mcp tool gates).
     {
@@ -1087,6 +1107,18 @@ async fn open_vault_at_inner(
         tracing::warn!(error = %e, "sessions: resume_latest_at_open failed");
     }
 
+    // Start the config-file watcher so external edits to either TOML are
+    // picked up live and the UI re-applies settings without a restart.
+    let config_watcher_cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let app_for_cw = app.clone();
+        let root_for_cw = root.clone();
+        let cancel = config_watcher_cancel.clone();
+        tokio::spawn(async move {
+            start_config_watcher(app_for_cw, root_for_cw, cancel).await;
+        });
+    }
+
     let session = VaultSession {
         vault,
         root,
@@ -1102,6 +1134,7 @@ async fn open_vault_at_inner(
         audit,
         tasks,
         tasks_cancel,
+        config_watcher_cancel,
         mcp_tools,
     };
 
@@ -3223,11 +3256,143 @@ async fn trail_set_append_cursor_inner(
     .await
 }
 
+/// Background task: watches both config TOML files for external edits,
+/// reloads the merged Config, swaps the in-memory copy, and emits
+/// `hiker:config-reloaded` so the frontend re-applies settings.
+///
+/// Debounced at ~500 ms. Suppressed for 2 s after a `set_setting` write
+/// (same `SUPPRESS_TTL` shape as the vault watcher) so UI-driven flips
+/// don't round-trip back through the file watcher.
+async fn start_config_watcher(
+    app: tauri::AppHandle,
+    vault_root: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use std::collections::HashSet;
+    let paths = hiker_core::config::ConfigPaths::resolve(&vault_root);
+
+    // Watch parent directories (notify works more reliably on dirs than
+    // non-existent files, and some backends require dirs). Collect unique
+    // parents; filter events by exact file path below.
+    let mut parent_dirs: HashSet<PathBuf> = HashSet::new();
+    parent_dirs.insert(
+        paths
+            .vault
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| paths.vault.clone()),
+    );
+    if let Some(ref user) = paths.user {
+        parent_dirs.insert(
+            user.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| user.clone()),
+        );
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<NotifyEvent>>(16);
+
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        let _ = tx.blocking_send(res);
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "config watcher: failed to start");
+            return;
+        }
+    };
+
+    for dir in &parent_dirs {
+        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            tracing::warn!(error = %e, dir = %dir.display(), "config watcher: failed to watch");
+        }
+    }
+
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+    const SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_reload = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            ev = rx.recv() => {
+                match ev {
+                    Some(Ok(event)) => {
+                        // Only care about Modify / Create events on our config files.
+                        let relevant = matches!(
+                            event.kind,
+                            NotifyEventKind::Modify(_) | NotifyEventKind::Create(_)
+                        );
+                        if !relevant {
+                            continue;
+                        }
+                        let hits_config = event.paths.iter().any(|p| {
+                            p == &paths.vault
+                                || paths.user.as_ref().map_or(false, |u| p == u)
+                        });
+                        if !hits_config {
+                            continue;
+                        }
+
+                        // Debounce: skip rapid bursts from a single save.
+                        if last_reload.elapsed() < DEBOUNCE {
+                            continue;
+                        }
+
+                        // Suppress: skip if `set_setting` wrote recently.
+                        {
+                            let suppressed = app.state::<AppState>()
+                                .config_last_write
+                                .lock()
+                                .map_or(false, |g| g.map_or(false, |t| t.elapsed() < SUPPRESS_WINDOW));
+                            if suppressed {
+                                continue;
+                            }
+                        }
+
+                        last_reload = Instant::now();
+
+                        match hiker_core::config::Config::load(&vault_root) {
+                            Ok(config) => {
+                                // Swap in-memory copy + live mirrors.
+                                let state = app.state::<AppState>();
+                                if let Ok(guard) = state.session.lock() {
+                                    if let Some(session) = guard.as_ref() {
+                                        if let Ok(mut w) = session.config.write() {
+                                            *w = config.clone();
+                                        }
+                                        session.tasks.set_cfg(config.tasks.clone());
+                                        if let Ok(mut tools) = session.mcp_tools.write() {
+                                            *tools = config.mcp.tools.clone();
+                                        }
+                                    }
+                                }
+                                let _ = app.emit("hiker:config-reloaded", &config);
+                                tracing::debug!("config watcher: reloaded, emitted hiker:config-reloaded");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "config watcher: Config::load failed");
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "config watcher: notify error");
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             session: Mutex::new(None),
+            config_last_write: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             list_dir,

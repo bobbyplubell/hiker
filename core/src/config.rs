@@ -833,6 +833,9 @@ pub struct VaultConfig {
     /// status: active-trail-state
     #[serde(default)]
     pub active_trail: Option<String>,
+    /// User-set chat input height in CSS pixels, or 0 for auto-grow mode.
+    #[serde(default)]
+    pub chat_input_height: u32,
     #[serde(default)]
     pub tree: TreeConfig,
 }
@@ -851,6 +854,7 @@ impl Default for VaultConfig {
             show_sessions_in_tree: false,
             sidebar_mode: SidebarMode::default(),
             active_trail: None,
+            chat_input_height: 0,
             tree: TreeConfig::default(),
         }
     }
@@ -1253,6 +1257,9 @@ enum ValueType {
     /// Positive integer (fits in u32). Used for the LLM/agent knobs
     /// (`max_tokens`, `iteration_cap`, etc.) where 0 is meaningless.
     PositiveInt,
+    /// Non-negative integer (fits in u32). 0 is meaningful — used for
+    /// `vault.chat_input_height` (0 = auto-grow, >0 = user-set px).
+    NonNegativeInt,
     /// `auto | internal | external` for `[tasks] worker_preference`.
     WorkerPreference,
     /// `0..=65535` — used for `[mcp] port`. Distinct from `PositiveInt`
@@ -1280,6 +1287,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
     EligibleKey { path: "vault.chat_height",             ty: ValueType::UnitFraction },
+    EligibleKey { path: "vault.chat_input_height",       ty: ValueType::NonNegativeInt },
     EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
@@ -1444,6 +1452,10 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
         (ValueType::PositiveInt, J::Number(n)) => n
             .as_u64()
             .map(|u| u >= 1 && u <= u32::MAX as u64)
+            .unwrap_or(false),
+        (ValueType::NonNegativeInt, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= u32::MAX as u64)
             .unwrap_or(false),
         (ValueType::WorkerPreference, J::String(s)) => {
             matches!(s.as_str(), "auto" | "internal" | "external")

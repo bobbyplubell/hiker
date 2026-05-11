@@ -21,3 +21,4 @@ hiker-mcp-server = { path = "../../mcp-server" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+notify.workspace = true
