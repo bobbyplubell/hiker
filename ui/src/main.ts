@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { EditorView } from "@codemirror/view";
 import { register, validate, toCMKeymap } from "./editor/keybinds";
-import { mountEditor, type EditorHost } from "./app/editor";
+import { mountEditorPane, type EditorPaneApi } from "./editorPane";
 import { mountTabs, type TabsApi } from "./app/tabs";
 import { mountChatPanel } from "./chat";
 import { mountSettingsPane, type SettingsPaneApi } from "./settings";
@@ -18,16 +18,10 @@ import {
   type TreeController,
   sortOrderFromSettings,
 } from "./tree";
-import { openContextMenu, type CtxMenuItem } from "./widgets/contextMenu";
 import { showToast } from "./widgets/toast";
 import { confirm3 } from "./widgets/confirm";
 import { mountVaultHome, type VaultHomeController } from "./vaultHome";
 import { mountQueueDetail, type QueueDetailController } from "./queueDetail";
-import { mountMutationsMenu, type MutationsMenuApi } from "./mutations";
-import {
-  mountDirtyBufferDiff,
-  type DirtyBufferDiffApi,
-} from "./dirtyBufferDiff";
 import { mountTabStrip, type TabStripApi } from "./tabStrip";
 import { mountDiscovery, type DiscoveryController } from "./discovery";
 import { mountTrailsPanel, type TrailsController } from "./trails";
@@ -42,12 +36,9 @@ import {
   type NavApi,
   type NavState,
 } from "./navigation";
-import {
-  mountModeControls,
-  type ModeControlsApi,
-  iconButton,
-} from "./modeControls";
+import { iconButton } from "./modeControls";
 import { Icons } from "./icons";
+import { mountPropertiesPane, type PropertiesPaneApi } from "./propertiesPane";
 // Stores hoist main.ts's globals into a single source of truth + subscribe
 // surface. Local `let` bindings below stay as derived caches kept in sync
 // via `*Store.subscribe(...)`; every write rides through `*Store.set` /
@@ -62,6 +53,7 @@ import {
   type Buffer,
   type BufferApi,
   type ActiveBufferSnapshot,
+  type TabKind,
 } from "./app/state";
 import { applySettingsToUi as applySettingsToUiImpl, type Settings } from "./app/settingsApply";
 import { mountVaultLifecycle } from "./app/vaultLifecycle";
@@ -69,11 +61,9 @@ import { mountIndexStatusBus } from "./app/indexStatusBus";
 import { installWindowKeybindings } from "./app/keybindings";
 import { mountOpenFile } from "./app/openFile";
 import { mountAutosave, type AutosaveApi } from "./app/autosave";
-import { mountViewMenu, type ViewMenuApi } from "./app/viewMenu";
 import { mountIndexStatusView, type IndexStatusViewApi } from "./app/indexStatusView";
 import { mountAgentChanges } from "./app/agentChanges";
 import { captureDomRefs } from "./app/domRefs";
-import { mountStatusBar } from "./app/statusBar";
 import { createSettingsManager } from "./settings/manager";
 import { emit as emitBusEvent } from "./events/bus";
 
@@ -340,11 +330,14 @@ function checkpointNav(): void {
   nav.checkpoint();
 }
 
-/// True for any read-only preview buffer (trash / snapshot). Most code paths
-/// share the "no save, no dirty state, switch without prompt" behavior;
-/// trash-specific or snapshot-specific UI narrows on `mode.kind` directly.
+/// True for any read-only preview buffer (trash / snapshot) or any
+/// non-buffer-kind tab (home, queue, settings, agent, graph, properties).
+/// Most code paths share the "no save, no dirty state, switch without
+/// prompt" behavior. // status: tab-kinds
 function isReadOnlyBuffer(b: Buffer | null): boolean {
-  return !!(b && b.mode.kind !== "file");
+  if (!b) return true;
+  if (b.kind !== "buffer") return true;
+  return b.mode.kind !== "file";
 }
 
 // CM6 view + the six per-feature compartments + the path-extension /
@@ -413,42 +406,115 @@ function scheduleChunkBoundariesRefresh(delayMs: number): void {
   editor.scheduleChunkBoundariesRefresh(delayMs);
 }
 
+// status: tab-kinds
+/// Returns the `kind` discriminator of the active buffer (or the
+/// pending page-kind tab key prefix), or `null` when no tab is active.
+function activeKind(): TabKind | null {
+  if (!buffer) return null;
+  return buffer.kind;
+}
+
+// status: tab-kinds
+/// Stable synthetic key for a page-kind tab. Buffer tabs use the
+/// vault-relative path as their key; page-kind tabs use a prefixed
+/// sentinel so they live alongside buffer entries in `openBuffers`
+/// without colliding with real paths.
+function pageTabKey(kind: string, view?: string): string {
+  return view ? `__hiker:${kind}:${view}` : `__hiker:${kind}`;
+}
+
+// status: tab-kinds
+/// Re-evaluates editor chrome + page-kind surface visibility based on
+/// the active tab's kind discriminator. Called on every status pulse.
+function renderActiveTab(): void {
+  const kind = activeKind();
+  const isBuffer = kind === "buffer";
+  dom.editor.editorEl.hidden = !isBuffer;
+  // Buffer-only toolbar buttons
+  saveBtn.hidden = !isBuffer;
+  diffBtn.hidden = !isBuffer;
+  dom.editor.viewMenuBtn.hidden = !isBuffer;
+  dom.editor.mutationsMenuBtn.hidden = !isBuffer;
+  modeControlsEl.hidden = !isBuffer;
+  const trailPill = document.getElementById("add-to-trail-pill");
+  if (trailPill) trailPill.hidden = !isBuffer;
+  const statusBarEl = document.getElementById("status-bar");
+  if (statusBarEl) statusBarEl.hidden = !isBuffer;
+  // Page-kind surfaces
+  const isHome = kind === "home";
+  const isHomeDetail = kind === "home-detail";
+  const isQueue = kind === "queue";
+  const isSettings = kind === "settings";
+  const isProperties = kind === "properties";
+  dom.vaultHome.rootEl.hidden = !(isHome || isHomeDetail || isQueue);
+  dom.settingsPane.paneEl.hidden = !isSettings;
+  dom.propertiesPane.paneEl.hidden = !isProperties;
+  dom.vaultHome.overviewEl.hidden = !isHome;
+  dom.vaultHome.detailEl.hidden = !isHomeDetail;
+  dom.vaultHome.queueDetailEl.hidden = !isQueue;
+  if (isHome) void vaultHome.api.refresh();
+  if (isHomeDetail) {
+    const key = activePath;
+    let view = "recent-activity";
+    if (key && key.startsWith("__hiker:home-detail:")) {
+      view = key.slice("__hiker:home-detail:".length);
+    }
+    if (view === "recent-activity") vaultHome.api.showDetail(view);
+  }
+  if (isQueue) {
+    queueDetail.setVisible(true);
+    queueDetail.api.setFilter("tasks");
+  }
+  if (isSettings) {
+    void settingsPane.refresh();
+  } else {
+    if (settingsPane.isVisible()) void settingsPane.setVisible(false);
+  }
+  if (isProperties) {
+    const key = activePath;
+    if (key && key.startsWith("__hiker:properties:")) {
+      const rel = key.slice("__hiker:properties:".length);
+      void propertiesPane.update(rel);
+    }
+  }
+  // Active state for home/settings buttons
+  dom.vaultBar.homeBtn.classList.toggle("active", isHome || isHomeDetail);
+  dom.vaultBar.settingsBtn.classList.toggle("active", isSettings);
+  // Collapse docked chat while any agent tab is open
+  const hasAgentTab = [...openBuffers.values()].some(e => e.buffer.kind === "agent");
+  appEl.classList.toggle("agent-tab-open", hasAgentTab);
+}
+
 /// Coordinator for every paint that used to live in the monolithic
 /// `updateStatus()`. The pure status-bar paint moved to
-/// `./app/statusBar` (title, path, cursor, words, save/diff-btn,
-/// dirty-tree-dot). The secondary fan-outs below are *peer concerns*
-/// that just happened to share the same trigger; they stay here as
-/// imperative calls from a single coordinator rather than each
-/// becoming its own subscriber, since they form a small ordered
-/// sequence with one cross-coupling (clean-buffer drops a stuck diff
-/// toggle before mode-controls re-renders).
+/// `./editorPane`; the secondary fan-outs below are *peer concerns*
+/// that just happened to share the same trigger. Now also re-evaluates
+/// `renderActiveTab()` on every pulse.
 function updateStatus(): void {
   const dirty = isDirty();
   // status: editor-preview-tab-promotion
-  // Preview tabs are never dirty by construction. Any path that
-  // produces dirty state promotes the preview to sticky so downstream
-  // invariants (file-switch-guard-dirty, window-close guard, etc.)
-  // don't have to know.
   if (dirty) promotePreviewIfActive();
-  statusBar.repaint();
+  editorPane.repaintStatusBar();
   // Center status label mirrors the active buffer's index state.
   indexStatusView.render();
   // Wand button enable depends on active buffer's path / mode /
   // extension / dirtiness — re-evaluate on every status pulse.
-  mutationsMenu.refreshButtonState();
+  editorPane.mutationsMenu.refreshButtonState();
   // status: editor-diff-vs-disk-toggle — clean buffer + diff active is
   // unreachable user state; force the toggle off before the
   // mode-controls renderer reads it.
   if (
     !dirty
     && buffer?.mode.kind === "file"
-    && dirtyBufferDiff.isActive()
+    && editorPane.dirtyBufferDiff.isActive()
   ) {
-    dirtyBufferDiff.forceOff();
+    editorPane.dirtyBufferDiff.forceOff();
   }
-  modeControls.render();
-  // status: editor-tab-dirty-marker — per-tab dirty state.
+  editorPane.modeControls.render();
   tabStrip.render();
+  // status: tab-kinds — re-evaluate editor chrome visibility after
+  // every kind transition.
+  renderActiveTab();
 }
 
 register({
@@ -567,70 +633,74 @@ register({
 });
 validate();
 
-// Editor host (CM6 view + compartments + extracted helpers) lives in
-// `./app/editor`. `applyCommit` / `handleDriftDetected` / `handleSaveError`
-// route through `openFileApi` (declared as a `const` further down in
-// bootstrap); the host reads it lazily via the closures below, so the
-// late binding is fine as long as no save / drift actually fires before
-// `openFileApi` is mounted.
-const editor: EditorHost = mountEditor({
-  parent: editorEl,
+// status: tab-kinds
+// Buffer-kind tab renderer. Owns CM6 view construction, the EditorHost,
+// buffer-scoped toolbar wiring (Save / Diff / View / Mutations), the
+// bottom status bar, the mode-controls slot, and the save/drift/dirty
+// pipeline. This is the peer of the other kind modules (vaultHome,
+// queueDetail, settings, chat, properties).
+const cssEscape = (s: string): string => CSS.escape(s);
+const editorPane: EditorPaneApi = mountEditorPane({
+  parentEl: editorEl,
+  saveBtn,
+  diffBtn,
+  modeControlsEl,
+  viewMenuBtn: dom.editor.viewMenuBtn,
+  mutationsMenuBtn: dom.editor.mutationsMenuBtn,
+  statusPathEl,
+  statusCursorEl,
+  statusWordsEl,
+  treeEl,
   getBuffer: () => buffer,
-  applyCommit: ({ loadedText, token, pendingChangesMetadata }) => {
-    if (!buffer) return;
-    buffer.loadedText = loadedText;
-    buffer.token = token;
-    buffer.pendingChangesMetadata = pendingChangesMetadata;
-  },
+  setBufferState,
   handleDriftDetected: (rel, newText, extraMetadata) => {
     return openFileApi.handleDriftDetected(rel, newText, extraMetadata);
   },
   handleSaveError: (err) => openFileApi.handleSaveError(err),
-  isReadOnlyBuffer: (b) => isReadOnlyBuffer(b),
-  onAfterStatus: () => updateStatus(),
+  isReadOnlyBuffer: (b) => isReadOnlyBuffer(b as Buffer | null),
   keymap: toCMKeymap(),
+  onAfterSave: (savedPath, ok) => {
+    if (ok) {
+      discovery.api.scheduleRelatedRefresh(savedPath, 500);
+      scheduleChunkBoundariesRefresh(500);
+      if (savedPath) autosave.clearPath(savedPath);
+    }
+  },
+  onStatusPulse: () => {
+    // Host fan-out after every internal status-bar paint: preview-
+    // promotion, tab-strip render, and renderActiveTab.
+    if (isDirty()) promotePreviewIfActive();
+    tabStrip.render();
+    renderActiveTab();
+  },
+  inFlightMutationPaths,
+  settings,
+  syncToggleButtons,
+  cssEscape,
+  formatError,
+  onMutationInFlightChanged: (path, inFlight) => {
+    if (inFlight) {
+      addInFlightMutationPath(path);
+      promotePreviewByPath(path);
+    } else {
+      removeInFlightMutationPath(path);
+    }
+    if (buffer && buffer.mode.kind === "file" && buffer.path === path) {
+      setReadOnly(inFlight);
+    }
+    editorPane.modeControls.render();
+  },
 });
+
+// Backwards-compat shim so existing code referencing `editor.*` (CM6
+// dispatch, getState, etc.) keeps working. The `editorPane.host` is the
+// canonical EditorHost; this re-export avoids touching hundreds of
+// call sites.
+const editor = editorPane.host;
 
 async function save(): Promise<boolean> {
-  return editor.save();
+  return editorPane.save();
 }
-
-saveBtn.addEventListener("click", async () => {
-  const savedPath = buffer?.path ?? null;
-  const ok = await save();
-  if (ok) {
-    discovery.api.scheduleRelatedRefresh(buffer?.path ?? null, 500);
-    scheduleChunkBoundariesRefresh(500);
-    // status: autosave-write-tick — successful save makes the autosave
-    // sidecar redundant. Drop it so the next vault open doesn't surface
-    // a false-positive recovery.
-    if (savedPath) autosave.clearPath(savedPath);
-  }
-});
-
-// status: editor-diff-vs-disk-toggle
-// Toolbar diff button. Click toggles the only currently-implemented diff
-// target ("on-disk"); right-click opens a target-picker menu so future
-// targets (chunk boundaries, last save, snapshot, …) can slot in here
-// without splitting buttons. Enable / pressed paint lives in
-// `./app/statusBar` (it pairs with the save-button paint there).
-diffBtn.addEventListener("click", () => {
-  if (diffBtn.disabled) return;
-  void dirtyBufferDiff.toggle();
-});
-diffBtn.addEventListener("contextmenu", (ev) => {
-  ev.preventDefault();
-  const available = editor.diffButtonAvailable();
-  const active = dirtyBufferDiff.isActive();
-  const items: CtxMenuItem[] = [
-    {
-      label: active ? "Hide diff" : "Diff against on-disk",
-      disabled: !available && !active,
-      run: () => void dirtyBufferDiff.toggle(),
-    },
-  ];
-  openContextMenu(ev.clientX, ev.clientY, items);
-});
 
 // status: snapshot-preview-mode
 // Mount the snapshot-preview module. Hosted state — `buffer`, the CM6 view,
@@ -644,7 +714,7 @@ const snapshotPreview: SnapshotPreviewApi = mountSnapshotPreview({
     setBufferState({ buffer: b as Buffer | null });
   },
   getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
-  renderModeControls: () => modeControls.render(),
+  renderModeControls: () => editorPane.modeControls.render(),
   // Returning to the activity detail view if it's where the user came from;
   // otherwise fall back to the home overview.
   onClose: () => {
@@ -704,8 +774,6 @@ function promotePreviewIfActive(): void {
 function promotePreviewByPath(rel: string): void {
   tabs.promotePreviewByPath(rel);
 }
-
-const cssEscape = (s: string): string => CSS.escape(s);
 
 // status: tree-* (see ./tree)
 // Sidebar tree owns its own state (expanded folders, sort order, debounce,
@@ -791,6 +859,8 @@ const tree: TreeController = mountTree({
     void trailsPanel?.api.refresh();
     void refreshActiveTrailWaypointPaths();
   },
+  // status: tree-context-properties
+  onOpenProperties: (rel) => openPropertiesTab(rel),
 });
 
 // status: status-bar-index-label, status-bar-active-file-index-state
@@ -898,8 +968,9 @@ async function applyOpenedVault(path: string): Promise<void> {
   // first checkpoint on the new vault rather than landing on a stale tail.
   nav.reset();
   // status: vault-home-screen — default landing surface on vault open
-  // (no auto-resume of last buffer in v1).
-  vaultHome.setVisible(true);
+  // (no auto-resume of last buffer in v1). Opens as a page-kind tab per
+  // tab-kinds so the editor toolbar + status bar hide on activation.
+  void openPageTab("home", {});
 
   // status: autosave-recover-cmd, autosave-recovery-auto-restore,
   // autosave-tab-state-silent-restore
@@ -972,14 +1043,36 @@ async function runAutosaveRecoveryAndRestore(): Promise<void> {
   }
   if (!tabState) return;
   const alreadyOpen = new Set(openBuffers.keys());
+  const kinds = tabState.open_tab_kinds ?? {};
   for (const path of tabState.open_paths) {
     if (alreadyOpen.has(path)) continue;
+    // status: tab-kinds — __hiker:* sentinels are page-kind tabs, not
+    // files. Restore them via openPageTab instead of openFile.
+    if (path.startsWith("__hiker:")) {
+      const kind = kinds[path] || "";
+      if (kind === "home") {
+        void openPageTab("home", {});
+      } else if (kind === "home-detail") {
+        void openPageTab("home-detail", {});
+      } else if (kind === "queue") {
+        void openPageTab("queue", {});
+      } else if (kind === "settings") {
+        void openPageTab("settings", {});
+      } else if (kind === "agent") {
+        const sessionId = path.replace(/^__hiker:agent:?/, "") || undefined;
+        if (sessionId) {
+          void openAgentTab(sessionId);
+        }
+      } else if (kind === "properties") {
+        const rel = path.replace(/^__hiker:properties:/, "");
+        if (rel) openPropertiesTab(rel);
+      }
+      continue;
+    }
     try {
       await openFile(path, { preview: false });
       alreadyOpen.add(path);
     } catch (err) {
-      // Path no longer exists / unreadable / outside vault — drop it
-      // from the restore set silently per the spec.
       Logger.error("ui::app", "autosave tab restore: skipping path", {
         path,
         err,
@@ -1022,6 +1115,18 @@ pickBtn.addEventListener("click", () => void vaultLifecycle.openVault());
 // New-note button, tree-actions menu (Refresh / Reindex / Sort by),
 // inline rename, attachContextMenu, deleteFromTree, countNotesIn,
 // sortOrderLabel, openSortByMenu — all moved to ./tree.
+
+// status: vault-home-screen, vault-home-button
+// Home button in the top strip — opens the vault home as a page-kind tab.
+homeBtn.addEventListener("click", () => {
+  void openPageTab("home", {});
+});
+
+// status: vault-bar-settings-icon
+// Settings button in the top strip — opens the settings as a page-kind tab.
+settingsBtn.addEventListener("click", () => {
+  void openPageTab("settings", {});
+});
 
 const win = getCurrentWindow();
 
@@ -1114,7 +1219,6 @@ void win.onCloseRequested(async (event) => {
 // the same `confirm3` modal `openFile` uses (file-switch-guard-dirty).
 const settingsPane: SettingsPaneApi = mountSettingsPane({
   paneEl: settingsPaneEl,
-  editorPaneEl,
   settingsBtn,
   vaultPathEl,
   guardDirtyBuffer: async () => {
@@ -1156,7 +1260,7 @@ register({
   keys: "Mod-,",
   label: "Open settings",
   run: () => {
-    void settingsPane.toggle();
+    openPageTab("settings", {});
     return true;
   },
 });
@@ -1208,6 +1312,12 @@ const vaultHome: VaultHomeController = mountVaultHome({
       dom.vaultHome.overviewEl.hidden = false;
     }
   },
+  // status: tab-kinds — activity-widget clicks open home-detail tabs.
+  onOpenPage: (kind, payload) => {
+    if (kind === "home-detail") {
+      void openPageTab("home-detail", payload);
+    }
+  },
 });
 
 // status: task-queue-home-detail-view
@@ -1236,27 +1346,34 @@ const queueDetail: QueueDetailController = mountQueueDetail({
 const { navBackBtn, navForwardBtn } = dom.vaultBar;
 
 function inferNavState(): NavState {
-  if (queueDetail.isVisible()) return { kind: "queue-detail" };
-  if (vaultHome.isVisible()) {
-    const d = vaultHome.api.activeDetailView();
-    if (d && d.kind === "recent-activity") {
-      return { kind: "home-detail", view: "recent-activity" };
+  const buf = buffer;
+  // status: tab-kinds — detect all tab kinds via activeKind() first.
+  if (buf && buf.kind !== "buffer") {
+    if (buf.kind === "home") return { kind: "home" };
+    if (buf.kind === "home-detail") {
+      const d = vaultHome.api.activeDetailView();
+      return {
+        kind: "home-detail",
+        view: d?.kind === "recent-activity" ? "recent-activity" : "recent-activity",
+      };
     }
+    if (buf.kind === "queue") return { kind: "queue-detail" };
+    if (buf.kind === "settings") return { kind: "settings" };
+    if (buf.kind === "properties") return { kind: "tab", path: buf.path };
     return { kind: "home" };
   }
-  if (settingsPane.isVisible()) return { kind: "settings" };
-  if (buffer && buffer.mode.kind === "trash") {
-    const trashedName = buffer.path.replace(/^\.hiker\/trash\//, "");
+  if (buf && buf.mode.kind === "trash") {
+    const trashedName = buf.path.replace(/^\.hiker\/trash\//, "");
     return { kind: "trash-preview", trashedName };
   }
-  if (buffer && buffer.mode.kind === "snapshot") {
+  if (buf && buf.mode.kind === "snapshot") {
     return {
       kind: "snapshot-preview",
-      changeId: buffer.mode.changeId,
-      row: buffer.mode.row,
+      changeId: buf.mode.changeId,
+      row: buf.mode.row,
     };
   }
-  if (activePath !== null && buffer && buffer.mode.kind === "file") {
+  if (activePath !== null && buf && buf.mode.kind === "file") {
     return { kind: "tab", path: activePath };
   }
   return { kind: "empty" };
@@ -1266,32 +1383,24 @@ async function applyNavState(s: NavState): Promise<boolean> {
   switch (s.kind) {
     case "tab": {
       if (!openBuffers.has(s.path)) return false;
-      // If a preview / settings / home is currently up, activateTabInner
-      // already drops them via its own setVisible(false) calls.
       activateTabInner(s.path);
       return true;
     }
     case "home": {
-      vaultHome.setVisible(true);
+      openPageTab("home", {});
       return true;
     }
     case "home-detail": {
-      vaultHome.setVisible(true);
-      vaultHome.api.showDetail(s.view);
+      openPageTab("home-detail", { view: s.view });
       return true;
     }
     case "queue-detail": {
-      vaultHome.setVisible(true);
-      dom.vaultHome.overviewEl.hidden = true;
-      queueDetail.setVisible(true);
-      queueDetail.api.setFilter("tasks");
+      openPageTab("queue", {});
       return true;
     }
     case "settings": {
-      const ok = await settingsPane.setVisible(true);
-      // `setVisible` returns false when the dirty-buffer guard cancels
-      // the entry; treat it as "couldn't restore" so navigate() skips on.
-      return ok;
+      openPageTab("settings", {});
+      return true;
     }
     case "trash-preview": {
       const item = trash.api.items().find((i) => i.trashed_name === s.trashedName);
@@ -1304,8 +1413,6 @@ async function applyNavState(s: NavState): Promise<boolean> {
       return true;
     }
     case "empty": {
-      // Nothing to do — closeTab's no-tabs-left branch already routes to
-      // the home view, so the empty state isn't actually re-enterable.
       return false;
     }
   }
@@ -1372,74 +1479,14 @@ installNavigationSwipe({
   obs.observe(dom.vaultHome.queueDetailEl, { attributes: true, attributeFilter: ["hidden"] });
 }
 
-// status: editor-diff-vs-disk-toggle
-// Dirty-buffer Diff toggle: per `diff.md`'s `editor-diff-vs-disk-toggle`,
-// `#mode-controls` shows a single Diff toggle for any dirty editable
-// buffer. Module owns selection/viewport save+restore, in-flight guard,
-// and the markdown-compartment reconfigure (per the "Markdown-rendering
-// coupling" rule in `diff.md`).
-const dirtyBufferDiff: DirtyBufferDiffApi = mountDirtyBufferDiff({
-  editor: editor!,
-  getBuffer: () => buffer,
-  getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
-  renderModeControls: () => modeControls.render(),
-  formatError,
-});
-
-// Pure status-bar paint (title / path / cursor / words / save+diff
-// button enable / dirty-tree-dot / reveal click). Subscribes to
-// `bufferStore` for active-buffer transitions; CM6 doc/selection
-// pulses still flow through `editor.onAfterStatus → updateStatus()`,
-// which delegates to `statusBar.repaint()` plus the secondary
-// fan-outs (mode-controls, tab-strip, mutations-menu, dirty-buffer
-// diff force-off).
-const statusBar = mountStatusBar({
-  statusPathEl,
-  statusCursorEl,
-  statusWordsEl,
-  saveBtn,
-  diffBtn,
-  treeEl,
-  editor,
-  isReadOnlyBuffer: (b) => isReadOnlyBuffer(b as Buffer | null),
-  isDirtyBufferDiffActive: () => dirtyBufferDiff.isActive(),
-  cssEscape,
-});
-
-// status: note-mutations-menu
-const mutationsMenuBtn = dom.editor.mutationsMenuBtn;
-const mutationsMenu: MutationsMenuApi = mountMutationsMenu(
-  {
-    buttonEl: mutationsMenuBtn,
-    getBuffer: () => buffer,
-    getActiveBufferText: () => {
-      if (!buffer || isReadOnlyBuffer(buffer)) return null;
-      return editor.getActiveText();
-    },
-    formatError,
-  },
-  {
-    // status: note-mutation-buffer-ro-while-in-flight
-    onInFlightChanged: (path, inFlight) => {
-      if (inFlight) {
-        addInFlightMutationPath(path);
-        // status: editor-preview-tab-promotion
-        // Pin the source tab on submit so it can't be replaced by a
-        // preview-slot swap mid-flight (the result needs an open
-        // buffer to land on). Idempotent on already-sticky tabs.
-        promotePreviewByPath(path);
-      } else {
-        removeInFlightMutationPath(path);
-      }
-      // If the active buffer is the one whose in-flight state just
-      // changed, mirror it in the editor.
-      if (buffer && buffer.mode.kind === "file" && buffer.path === path) {
-        setReadOnly(inFlight);
-      }
-      modeControls.render();
-    },
-  },
-);
+// status: editor-diff-vs-disk-toggle, note-mutations-menu
+// Dirty-buffer diff, status bar, mutations menu, mode controls, and view
+// menu are all mounted inside `editorPane` (see `./editorPane`). The
+// host accesses them via `editorPane.dirtyBufferDiff`,
+// `editorPane.repaintStatusBar()`, `editorPane.mutationsMenu`,
+// `editorPane.modeControls`, and `editorPane.viewMenu`.
+// The individual mounts that previously lived here were lifted into
+// editorPane per S3 of the tab-kinds refactor.
 
 // status: note-mutation-applies-as-buffer-edit, mcp-ui-refresh-on-agent-write
 // Both `hiker:note-mutation-applied` (apply mutation result into the
@@ -1533,15 +1580,9 @@ const taskQueueTile = (() => {
 
   function openQueueDetail(): void {
     if (!llmEnabled) return;
-    // Vault home owns the overview ↔ detail toggle; show home first
-    // and then swap into the queue detail. The home button stays the
-    // back-out path.
-    vaultHome.setVisible(true);
-    dom.vaultHome.overviewEl.hidden = true;
-    queueDetail.setVisible(true);
-    queueDetail.api.setFilter("tasks");
-    // Visiting the queue clears the "unread failure" indicator. Active
-    // pulse stays — that's a live-state mirror, not a notification.
+    // status: tab-kinds — open the queue as a page-kind tab instead of
+    // swapping the vaultHome sub-mode.
+    void openPageTab("queue", {});
     unreadFailure = false;
     paintIndicator();
   }
@@ -1841,14 +1882,6 @@ if (discoveryResizeHandleEl)
 
 // View ▾ menu — `buildItems` factory + click-handler wiring extracted to
 // `./app/viewMenu`. Reads `viewSettingsStore`; writes via `editor.setX`
-// (which writes through to the store) + `settings.setVaultSetting`.
-const viewMenuBtn = dom.editor.viewMenuBtn;
-const viewMenu: ViewMenuApi = mountViewMenu({
-  editor,
-  settings,
-  syncToggleButtons,
-});
-
 // ---------- discovery panel (search + related) ----------
 // Search input + mode toggles + lexical/semantic results + related-notes
 // panel + collapsible sections + roving-tabindex keyboard nav all live in
@@ -2048,10 +2081,7 @@ const tabs: TabsApi = mountTabs({
   getLivePreviewEnabled: () => livePreviewEnabled,
   getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
   getOpenFileApi: () => openFileApi,
-  isVaultHomeVisible: () => vaultHome.isVisible(),
-  setVaultHomeVisible: (on) => vaultHome.setVisible(on),
-  isSettingsPaneVisible: () => settingsPane.isVisible(),
-  setSettingsPaneVisible: (on) => settingsPane.setVisible(on),
+  onShowHome: () => { openPageTab("home", {}); },
   save: () => save(),
   isDirty: () => isDirty(),
   revealInTree: (rel) => revealInTree(rel),
@@ -2104,6 +2134,99 @@ const openFileApi = mountOpenFile({
   },
 });
 
+// status: tab-kinds
+/// Open or activate a page-kind tab in the preview slot. Evicts other
+/// page-kind previews. Called from Home / Queue / Settings button handlers.
+async function openPageTab(
+  kind: "home" | "home-detail" | "queue" | "settings",
+  payload?: Record<string, string>,
+): Promise<void> {
+  const key = pageTabKey(kind, payload?.view);
+  if (openBuffers.has(key)) {
+    activateTabInner(key);
+    return;
+  }
+  // Evict the current preview tab (any kind) — at most one preview
+  // exists at a time per spec. Sticky tabs (preview: false) survive.
+  if (previewTabPath) {
+    const oldEntry = openBuffers.get(previewTabPath);
+    if (oldEntry && oldEntry.buffer.preview) {
+      openBuffers.delete(previewTabPath);
+      nav.pruneTab(previewTabPath);
+    }
+  }
+  const buf: Buffer = {
+    path: key,
+    loadedText: "",
+    token: null,
+    kind: kind as TabKind,
+    mode: { kind: "file" },
+    pendingChangesMetadata: null,
+    preview: true,
+  };
+  openBuffers.set(key, {
+    buffer: buf,
+    savedState: null,
+    lastActivatedAt: bumpActivationCounter(),
+  });
+  setBufferState({ previewTabPath: key });
+  activateTabInner(key);
+}
+
+// status: note-properties-tab
+/// Open a properties-kind tab for the given relative path. Reuses an
+/// existing properties tab for the same path; otherwise creates a new one.
+function openPropertiesTab(rel: string): void {
+  const key = pageTabKey("properties", rel);
+  if (openBuffers.has(key)) {
+    activateTabInner(key);
+    void propertiesPane.update(rel);
+    return;
+  }
+  const buf: Buffer = {
+    path: key,
+    loadedText: "",
+    token: null,
+    kind: "properties",
+    mode: { kind: "file" },
+    pendingChangesMetadata: null,
+    preview: false,
+  };
+  openBuffers.set(key, {
+    buffer: buf,
+    savedState: null,
+    lastActivatedAt: bumpActivationCounter(),
+  });
+  activateTabInner(key);
+  void propertiesPane.update(rel);
+}
+
+// status: chat-panel-expand-to-editor
+/// Open an agent-kind tab for the given chat session. Creates one
+/// tab per session; reopens the existing one if already open.
+async function openAgentTab(sessionId: string): Promise<void> {
+  const key = pageTabKey("agent", sessionId);
+  if (openBuffers.has(key)) {
+    activateTabInner(key);
+    return;
+  }
+  const buf: Buffer = {
+    path: key,
+    loadedText: "",
+    token: null,
+    kind: "agent",
+    mode: { kind: "file" },
+    pendingChangesMetadata: null,
+    preview: false,
+  };
+  openBuffers.set(key, {
+    buffer: buf,
+    savedState: null,
+    lastActivatedAt: bumpActivationCounter(),
+  });
+  activateTabInner(key);
+}
+
 // status: autosave-write-tick, autosave-tab-state-store, autosave-readonly-skipped
 // Autosave coordinator. Tick + on-blur flush + per-path clear + tab-state
 // debounce. Started inside `applyOpenedVault`; stopped on vault swap and
@@ -2137,22 +2260,8 @@ bufferStore.subscribe(() => {
 /// directly; the parameter persists for legacy call-site clarity.
 function setReadOnly(ro: boolean, _mode: "trash" | "snapshot" | "mutation" | null = null): void {
   editor.setReadOnly(ro);
-  modeControls.render();
+  editorPane.modeControls.render();
 }
-
-// status: editor-toolbar-mode-controls, mode-controls-diff-toggle
-// Mode-specific controls (snapshot / trash labels + action icons) live in
-// `./modeControls`. Each owning module registers its renderer here; the
-// host swaps based on the active buffer's `mode.kind`. The View ▾ menu
-// shares the same toolbar host and its menu items live in
-// `mountViewMenu` (above), which builds the items off the
-// `viewSettingsStore` snapshot.
-const modeControls: ModeControlsApi = mountModeControls({
-  hostEl: modeControlsEl,
-  viewMenuBtn,
-  buildViewMenuItems: viewMenu.buildItems,
-  getActiveMode: () => buffer?.mode.kind ?? null,
-});
 
 // status: trail-add-to-active-from-editor-verb
 // Editor toolbar pill: "Add to trail: <name>". Inserted as the
@@ -2183,7 +2292,7 @@ const tabStrip: TabStripApi = mountTabStrip({
   hostEl: dom.editor.tabStripEl,
   getTabs: () => tabSnapshots(),
   getActivePath: () =>
-    buffer?.mode.kind === "file" ? activePath : null,
+    activePath,
   onActivate: (path) => activateTabInner(path),
   onClose: (path) => void closeTab(path),
   onCloseOthers: (path) => {
@@ -2216,7 +2325,7 @@ const tabStrip: TabStripApi = mountTabStrip({
   onPromote: (path) => promotePreviewByPath(path),
 });
 
-modeControls.register("snapshot", (host) => {
+editorPane.modeControls.register("snapshot", (host) => {
   if (buffer?.mode.kind !== "snapshot") return;
   const row = buffer.mode.row;
   const diffActive = buffer.mode.diffActive;
@@ -2263,7 +2372,7 @@ modeControls.register("snapshot", (host) => {
 // flight on the active path (so the user knows why the buffer is RO).
 // The dirty-buffer Diff toggle moved to the editor toolbar
 // (`editor-diff-vs-disk-toggle`) so it's always visible alongside Save.
-modeControls.register("file", (host) => {
+editorPane.modeControls.register("file", (host) => {
   if (!buffer || buffer.mode.kind !== "file") return;
   const path = buffer.path;
   if (inFlightMutationPaths.has(path)) {
@@ -2275,7 +2384,7 @@ modeControls.register("file", (host) => {
   }
 });
 
-modeControls.register("trash", (host) => {
+editorPane.modeControls.register("trash", (host) => {
   const label = document.createElement("span");
   label.className = "mode-label";
   label.textContent = "Trash preview";
@@ -2486,7 +2595,19 @@ void listen<FileChangedEvent>("hiker:file-changed", async (event) => {
   }
 });
 
-// `handleWatcherConflictDirty` lives in `./app/openFile`.
+// status: note-properties-tab
+// Read-only note inspector mounted into the `#properties-pane` div.
+const propertiesPane: PropertiesPaneApi = mountPropertiesPane({
+  containerEl: dom.propertiesPane.paneEl,
+});
+
+// status: chat-panel-expand-to-editor
+// Expand button in the chat handle area — opens the active chat session
+// as an agent-kind tab in the editor pane.
+dom.chat.expandBtnEl.addEventListener("click", () => {
+  const sid = chatPanel.getActiveSessionId!();
+  if (sid) void openAgentTab(sid);
+});
 
 // Initial paint — every mount above is now in scope as a const, so
 // `updateStatus()` reaches `mutationsMenu` / `dirtyBufferDiff` /

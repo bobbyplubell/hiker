@@ -137,6 +137,27 @@ export interface RecentNote {
   last_accessed_at: number | null;
 }
 
+// status: note-properties-tab-content
+/// DTO returned by the `note_properties` Tauri command. Mirrors
+/// `core::store::NoteProperties` + the changes count from
+/// `core::changes::count_for_path`.
+export interface NoteProperties {
+  path: string;
+  noteId: string | null;
+  pathIdsId: string | null;
+  mtime: number | null;
+  size: number | null;
+  contentHash: string | null;
+  extension: string | null;
+  indexedAt: number | null;
+  embedderVersion: string | null;
+  skipped: boolean | null;
+  skipReason: string | null;
+  chunkCount: number | null;
+  lastAccessedAt: number | null;
+  changeCount: number | null;
+}
+
 export interface RollbackOutcome {
   prior_change_id: number;
   path: string;
@@ -190,6 +211,9 @@ export interface AutosaveTabState {
   active_path: string | null;
   preview_path: string | null;
   saved_at_ms: number;
+  // status: tab-kinds — per-tab kind discriminator so the restore path
+  // knows whether to re-open as a buffer tab or a page-kind tab.
+  open_tab_kinds: Record<string, string>;
 }
 
 export interface AutosaveRecoveredEntry {
@@ -551,6 +575,14 @@ export const Ipc = {
   },
   recentNotesAccessed(args: { limit: number }): Promise<RecentNote[]> {
     return invokeWithLogging<RecentNote[]>("recent_notes_accessed", args);
+  },
+
+  // status: note-properties-tab-content
+  /// Read-only snapshot of everything hiker knows about a note across
+  /// `index.db` and `changes.db`. Returns `{noteId: null, ...}` for
+  /// unindexed paths (the command errors on non-notes).
+  noteProperties(args: { rel: string }): Promise<NoteProperties> {
+    return invokeWithLogging<NoteProperties>("note_properties", args);
   },
 
   // ----- chat -----

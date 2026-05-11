@@ -122,6 +122,7 @@ export function mountOpenFile(deps: OpenFileDeps): OpenFileApi {
       path: newRel,
       loadedText: deps.editor.getActiveText(),
       token: file.token,
+      kind: "buffer",
       mode: { kind: "file" },
       pendingChangesMetadata: null,
       preview: true,
@@ -204,15 +205,28 @@ export function mountOpenFile(deps: OpenFileDeps): OpenFileApi {
     // persists (after a path remap) so the slot reads as the same tab
     // to the user. No dirty guard: preview tabs are never dirty by
     // construction.
+    // status: tab-kinds — page-kind previews are evicted directly since
+    // they don't have CM6 state to preserve.
     const previewTabPath = deps.getPreviewTabPath();
     if (wantPreview && previewTabPath !== null && previewTabPath !== rel) {
-      try {
-        await replacePreviewWith(rel);
-      } catch (err) {
-        Logger.error("ui::app", "openFile (preview replace) failed", { rel, err });
-        alert(`open failed: ${err}`);
+      const oldPreview = deps.openBuffers.get(previewTabPath);
+      if (oldPreview && oldPreview.buffer.kind !== "buffer") {
+        deps.openBuffers.delete(previewTabPath);
+      } else {
+        try {
+          await replacePreviewWith(rel);
+        } catch (err) {
+          Logger.error("ui::app", "openFile (preview replace) failed", { rel, err });
+          alert(`open failed: ${err}`);
+        }
       }
-      return;
+      if (!deps.openBuffers.has(rel)) {
+        // Fall through to normal open — the eviction above removed the
+        // page-kind preview but didn't create the replacement.
+        // Continue below.
+      } else {
+        return;
+      }
     }
     // status: multi-buffer-no-switch-guard — no dirty-modal on tab
     // open. Switching tabs leaves the prior buffer dirty in memory.
@@ -247,6 +261,7 @@ export function mountOpenFile(deps: OpenFileDeps): OpenFileApi {
         path: rel,
         loadedText: deps.editor.getActiveText(),
         token: file.token,
+        kind: "buffer",
         mode: { kind: "file" },
         pendingChangesMetadata: null,
         preview: wantPreview,

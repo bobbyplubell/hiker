@@ -107,6 +107,9 @@ interface ChatPanel {
   /// `null` clears the panel without affecting the backend registry.
   /// status: chat-session-resume-latest
   hydrate(active: ActiveSessionDto | null): void;
+  /// Returns the active session id, or null when no session is active.
+  /// status: chat-panel-expand-to-editor
+  getActiveSessionId?(): string | null;
 }
 
 export interface ChatPanelOptions {
@@ -1023,6 +1026,9 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     },
     newSession: doNewSession,
     hydrate: hydrateInternal,
+    // status: chat-panel-expand-to-editor
+    /// Returns the active session id, or null when no session is active.
+    getActiveSessionId: () => activeSessionId,
   };
 
   function hydrateInternal(active: ActiveSessionDto | null): void {

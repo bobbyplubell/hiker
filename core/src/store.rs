@@ -189,6 +189,28 @@ pub struct VaultStats {
     pub skipped: u32,
 }
 
+// status: note-properties-tab-content
+/// Read-only snapshot of everything hiker knows about a note across
+/// `index.db` and `changes.db`. Consumed by the `properties`-kind tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteProperties {
+    pub path: String,
+    pub note_id: Option<String>,
+    pub path_ids_id: Option<String>,
+    pub mtime: Option<i64>,
+    pub size: Option<i64>,
+    pub content_hash: Option<String>,
+    pub extension: Option<String>,
+    pub indexed_at: Option<i64>,
+    pub embedder_version: Option<String>,
+    pub skipped: Option<bool>,
+    pub skip_reason: Option<String>,
+    pub chunk_count: Option<i64>,
+    pub last_accessed_at: Option<i64>,
+    pub change_count: Option<i64>,
+}
+
 /// Stored chunk metadata (without the embedding — fetch via knn_chunks for
 /// scored retrieval).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +550,79 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // status: note-properties-tab-content
+    /// Read-only snapshot of everything the store knows about one note.
+    /// Returns `Ok(None)` when the path has never been indexed (no
+    /// `notes` row exists). Chunk count is computed separately — cheap
+    /// per-note. Callers should also pull `changes.count_for_path` to
+    /// fill the `change_count` field.
+    pub fn note_properties(
+        &self,
+        rel_path: &str,
+    ) -> Result<Option<NoteProperties>, StoreError> {
+        let row = self.conn.query_row(
+            "SELECT n.id, n.content_hash, n.mtime, n.size, n.indexed_at,
+                    n.embedder_version, n.skipped, n.skip_reason,
+                    n.last_accessed_at
+             FROM notes n
+             WHERE n.path = ?1",
+            params![rel_path],
+            |row| {
+                let extension = std::path::Path::new(rel_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_string());
+                let note_id: Option<String> = row.get(0)?;
+                let content_hash: Option<String> = row.get(1)?;
+                let mtime: Option<i64> = row.get(2)?;
+                let size: Option<i64> = row.get(3)?;
+                let indexed_at: Option<i64> = row.get(4)?;
+                let embedder_version: Option<String> = row.get(5)?;
+                let skipped: Option<bool> = row.get(6)?;
+                let skip_reason: Option<String> = row.get(7)?;
+                let last_accessed_at: Option<i64> = row.get(8)?;
+                Ok(NoteProperties {
+                    path: rel_path.to_string(),
+                    note_id,
+                    path_ids_id: None,
+                    mtime,
+                    size,
+                    content_hash,
+                    extension,
+                    indexed_at,
+                    embedder_version,
+                    skipped,
+                    skip_reason,
+                    chunk_count: None,
+                    last_accessed_at,
+                    change_count: None,
+                })
+            },
+        );
+        match row {
+            Ok(props) => {
+                // Pull the path_ids id in a separate query — cheap, and
+                // keeps the main query simple.
+                let path_ids_id: Option<String> = self.conn.query_row(
+                    "SELECT id FROM path_ids WHERE path = ?1",
+                    params![rel_path],
+                    |row| row.get(0),
+                ).optional()?;
+                let chunk_count: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE note_id = ?1",
+                    params![props.note_id],
+                    |row| row.get(0),
+                )?;
+                let mut p = props;
+                p.path_ids_id = path_ids_id;
+                p.chunk_count = Some(chunk_count);
+                Ok(Some(p))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Notes whose basename (filename minus extension) loosely matches the

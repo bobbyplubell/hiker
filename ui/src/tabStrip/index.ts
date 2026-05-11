@@ -28,6 +28,11 @@ export interface TabSnapshot {
   /// status: editor-preview-tab
   /// True for the single preview tab; rendered with italic title.
   preview: boolean;
+  // status: tab-kinds
+  /// Tab kind discriminator — renders a `tab--kind-<kind>` CSS class
+  /// on the tab element and gates buffer-only affordances (folder hints,
+  /// reveal-in-tree) on `kind === "buffer"`.
+  kind: string;
 }
 
 export interface TabStripDeps {
@@ -71,7 +76,8 @@ export function mountTabStrip(deps: TabStripDeps): TabStripApi {
       el.className =
         "tab" +
         (t.path === active ? " tab--active" : "") +
-        (t.preview ? " tab--preview" : "");
+        (t.preview ? " tab--preview" : "") +
+        ` tab--kind-${t.kind}`;
       el.dataset.path = t.path;
       el.title = t.path;
       el.setAttribute("role", "tab");
@@ -82,7 +88,7 @@ export function mountTabStrip(deps: TabStripDeps): TabStripApi {
       label.textContent = t.basename;
       el.appendChild(label);
 
-      if ((basenameCounts.get(t.basename) ?? 0) > 1) {
+      if (t.kind === "buffer" && (basenameCounts.get(t.basename) ?? 0) > 1) {
         const hint = document.createElement("span");
         hint.className = "tab-folder-hint";
         hint.textContent = `(${t.folder ? t.folder + "/" : "/"})`;
