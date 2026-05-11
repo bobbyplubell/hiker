@@ -42,6 +42,13 @@ export type BufferMode =
       changeId: number;
       /// status: snapshot-preview-diff-toggle
       diffActive: boolean;
+    }
+  // status: staging-review-activity-detail-filter
+  | {
+      kind: "staging";
+      proposal_id: string;
+      targetPath: string;
+      diffActive: boolean;
     };
 
 export interface Buffer {

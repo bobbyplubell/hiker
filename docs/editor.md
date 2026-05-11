@@ -416,7 +416,7 @@ When only one mutation entry is enabled (the v1 case), the popover still opens â
 
 ### Batch mutations
 
-Single-note in-buffer is the right shape when the user is watching one note land. **Batch mutations** (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks; the user can't watch N buffers at once. Batch results route through the **staging surface** (per `settings.md`'s staging-preview-mode) â€” the same surface used for agent writes the user wasn't there for. Apply / Reject per file, or use the bulk Apply / Reject actions on the home-page "Pending changes" widget.
+Single-note in-buffer is the right shape when the user is watching one note land. **Batch mutations** (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks; the user can't watch N buffers at once. Batch results route through the **staging surface** (per `settings.md`'s staging review section). Results appear on the activity detail page's Pending filter with per-row [Accept] [Reject] and [Accept all], plus on the editor toolbar pill when the affected file is open.
 
 Batch entry points are deferred to v2; they slot into:
 

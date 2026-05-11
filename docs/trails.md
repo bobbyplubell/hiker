@@ -339,13 +339,32 @@ Draft trail-docs live at `<vault>/.hiker/trails/drafts/<trail-id>.md` (parallel 
 
 ### Review surface
 
-Draft trails surface in the home-page **"Pending changes"** widget alongside other staged proposals (per `staging-review-queue`). Clicking a draft entry opens the trail-doc in the editor in `staging-preview-mode` — the same shape used for agent-write review and batch-mutation review. The mode-controls slot offers:
+Draft trails are reviewed inline from two surfaces: the trails panel itself, and the activity detail page (per `settings.md`'s staging review section). [trail-draft-review-surface]
 
-- **Accept** — strips `hiker.draft: true`, moves the trail-doc from `.hiker/trails/drafts/` to the configured `[trails] new_trail_dir` (default `trails/`), keeps the waypoints in place, appends a `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "trail-draft"`. The trail joins the dropdown as a normal trail.
-- **Edit and re-stage** — open the draft trail-doc and the waypoint-notes in the editor for normal editing, then re-save with the draft flag intact. The user's edits stick on the next Accept.
-- **Reject** — deletes the trail-doc and the entire `.hiker/trails/<trail-id>/` directory (waypoint-notes included). No trash, no `core::changes` row — drafts are pre-acceptance, so rejection is hard-delete.
+**Trails panel.** When the active trail is a draft, a muted banner row appears below the header (same visual weight as the append-cursor hint):
 
-Drafts also appear in the Trails sidebar dropdown when the user explicitly toggles "Show drafts" — useful for working on a draft over multiple sessions before deciding to accept. Toggle state is per-vault, off by default. [trail-draft-review-surface]
+```
+ⓘ Draft — proposed by agent
+[Accept trail]  [Reject]
+```
+
+When the active trail has pending waypoint additions proposed by an agent, minimal collapsed rows appear at the end of the waypoint list:
+
+```
+── Proposed ─────────────────────────────
++  research/raptor.md   [Accept] [Reject]
++  notes/whisper.md     [Accept] [Reject]
+```
+
+Each row is the source basename plus two muted action links. No full waypoint card — the source path is enough context.
+
+**Activity detail page.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill that lists all pending proposals, including draft trails and waypoint additions. Each row carries [Accept] [Reject]; [Accept all (N)] batch-approves.
+
+**Accept** — strips `hiker.draft: true`, moves the trail-doc from `.hiker/trails/drafts/` to the configured `[trails] new_trail_dir` (default `trails/`), keeps the waypoints in place, appends a `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "trail-draft"`. The trail joins the dropdown as a normal trail.
+
+**Reject** — deletes the trail-doc and the entire `.hiker/trails/<trail-id>/` directory (waypoint-notes included). No trash, no `core::changes` row — drafts are pre-acceptance, so rejection is hard-delete.
+
+Drafts also appear in the Trails sidebar dropdown when the user explicitly toggles "Show drafts" — useful for working on a draft over multiple sessions before deciding to accept. Toggle state is per-vault, off by default.
 
 
 ## Out of scope (v1)

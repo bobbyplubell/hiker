@@ -60,6 +60,7 @@ type AgentEvent =
       call_id: string;
       ok: boolean;
       summary: string;
+      output?: string;
     }
   | {
       kind: "step_finished";
@@ -786,7 +787,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     return out.length > 80 ? out.slice(0, 79) + "…" : out;
   }
 
-  function appendToolResult(callId: string, ok: boolean, summary: string): void {
+  function appendToolResult(callId: string, ok: boolean, summary: string, output?: string): void {
     const c = renderState.toolCards.get(callId);
     if (!c) return;
     c.result = { ok, summary };
@@ -794,6 +795,44 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     c.resultSummaryEl.textContent = ` — ${summary}`;
     c.resultSummaryEl.classList.toggle("ok", ok);
     c.resultSummaryEl.classList.toggle("fail", !ok);
+    // Clear any prior accept/reject links before (re-)checking staging.
+    const prevAction = c.headEl.querySelector(".chat-tool-call-action");
+    if (prevAction) prevAction.remove();
+    // status: staging-accept-reject-from-chat-card
+    if (ok && output) {
+      try {
+        const parsed = JSON.parse(output);
+        if (parsed.staging_id && parsed.status === "staged") {
+          const actionEl = document.createElement("span");
+          actionEl.className = "chat-tool-call-action";
+          const acceptBtn = document.createElement("button");
+          acceptBtn.className = "chat-tool-call-action-accept";
+          acceptBtn.textContent = "Accept";
+          acceptBtn.addEventListener("click", async () => {
+            await Ipc.stagingAccept({ proposalId: parsed.staging_id });
+            actionEl.remove();
+            c.resultSummaryEl.textContent = " — ✓ Applied";
+            c.resultSummaryEl.classList.add("ok");
+            c.resultSummaryEl.classList.remove("fail");
+          });
+          const rejectBtn = document.createElement("button");
+          rejectBtn.className = "chat-tool-call-action-reject";
+          rejectBtn.textContent = "Reject";
+          rejectBtn.addEventListener("click", async () => {
+            await Ipc.stagingReject({ proposalId: parsed.staging_id });
+            actionEl.remove();
+            c.resultSummaryEl.textContent = " — ✗ Rejected";
+            c.glyphEl.textContent = "✗";
+            c.resultSummaryEl.classList.add("fail");
+            c.resultSummaryEl.classList.remove("ok");
+          });
+          actionEl.append(acceptBtn, rejectBtn);
+          c.headEl.appendChild(actionEl);
+        }
+      } catch {
+        /* ignore parse errors — output is an opaque best-effort channel */
+      }
+    }
     if (c.expanded) renderExpanded(c);
     scrollToBottom();
   }
@@ -912,7 +951,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
         appendToolCallComplete(ev.call_id, ev.args);
         break;
       case "tool_result":
-        appendToolResult(ev.call_id, ev.ok, ev.summary);
+        appendToolResult(ev.call_id, ev.ok, ev.summary, ev.output);
         // Tool returned → model goes quiet again until the next step's
         // first TextDelta / ToolCallStart. Show the indicator so the
         // pause is visible rather than implied.

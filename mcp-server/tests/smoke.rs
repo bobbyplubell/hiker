@@ -14,6 +14,7 @@ use hiker_core::chunker::Chunk;
 use hiker_core::config::{McpAuditConfig, McpConfig, McpToolsConfig};
 use hiker_core::embed::{EmbedError, Embedder};
 use hiker_core::indexer::{start_indexer, IndexerHandle};
+use hiker_core::staging::Staging;
 use hiker_core::store::{new_id, NoteUpsert, Store};
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
@@ -60,6 +61,7 @@ async fn boot(config: McpConfig) -> Booted {
         hiker_core::config::TasksConfig::default(),
     ));
     let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
+    let staging = std::sync::Arc::new(Staging::open(td.path()).unwrap());
     let deps = McpDeps {
         vault,
         vault_root: td.path().to_path_buf(),
@@ -70,6 +72,7 @@ async fn boot(config: McpConfig) -> Booted {
         embedder_provider: idx.embedder_provider(),
         config,
         tools: mcp_tools,
+        staging,
         audit,
         tasks,
         tasks_config: hiker_core::config::TasksConfig::default(),

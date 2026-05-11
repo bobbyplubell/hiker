@@ -248,6 +248,37 @@ export interface TaskSnapshotRow {
   [key: string]: unknown;
 }
 
+// ----- staging DTOs (staging-review-activity-detail-filter) -----
+// status: staging-review-activity-detail-filter
+// status: staging-bulk-apply-reject
+/// Mirrors `hiker_core::staging::Proposal` (has `Serialize + Deserialize`).
+/// Field names match the Rust struct (snake_case on the wire from serde).
+export interface Proposal {
+  id: string;
+  surface: string;
+  action: string;
+  target_path: string;
+  trail_id?: string | null;
+  content_hash?: string | null;
+  created_at_ms: number;
+  metadata?: Record<string, unknown> | null;
+}
+
+/// Mirrors `hiker_core::staging::StagingFilter` (snake_case fields).
+export interface StagingFilter {
+  path?: string | null;
+  trail_id?: string | null;
+  surface?: string | null;
+  session_id?: string | null;
+}
+
+/// Mirrors `hiker_core::staging::AcceptOutcome` (has `Serialize`).
+export interface AcceptOutcome {
+  proposal_id: string;
+  target_path: string;
+  new_hash: string;
+}
+
 // ---------------- the wrapper ----------------
 
 /// Single seam every IPC call funnels through. On rejection, route a
@@ -761,5 +792,33 @@ export const Ipc = {
     fields: Record<string, unknown>;
   }): Promise<void> {
     return invokeWithLogging<void>("log_from_frontend", args);
+  },
+
+  // ----- staging (staging-review-activity-detail-filter) -----
+  // status: staging-review-activity-detail-filter
+  // status: staging-bulk-apply-reject
+  stagingList(filter?: StagingFilter): Promise<Proposal[]> {
+    return invokeWithLogging<Proposal[]>("staging_list", filter as Record<string, unknown>);
+  },
+  stagingCount(): Promise<number> {
+    return invokeWithLogging<number>("staging_count");
+  },
+  stagingAccept(args: { proposalId: string }): Promise<AcceptOutcome> {
+    return invokeWithLogging<AcceptOutcome>("staging_accept", {
+      proposalId: args.proposalId,
+    });
+  },
+  stagingReject(args: { proposalId: string }): Promise<void> {
+    return invokeWithLogging<void>("staging_reject", {
+      proposalId: args.proposalId,
+    });
+  },
+  stagingAcceptAll(): Promise<AcceptOutcome[]> {
+    return invokeWithLogging<AcceptOutcome[]>("staging_accept_all");
+  },
+  stagingContent(args: { proposalId: string }): Promise<string> {
+    return invokeWithLogging<string>("staging_content", {
+      proposalId: args.proposalId,
+    });
   },
 };

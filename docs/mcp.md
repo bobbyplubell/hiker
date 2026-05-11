@@ -255,7 +255,8 @@ The settings pane (`settings-pane-section-list`) gets a dedicated `mcp` section 
 - **Max top-k** — positive integer.
 - **Per-tool toggles** — one bool row per advertised tool, plus the legacy `writes_enabled` master gate. Live-applied.
 - **Allow redacted lookup** — bool. Live-applied.
-- **Log full input** — bool, mirrors `llm.audit.log_full_prompt`.
+- **Review required** — bool, default `false`. When on, every MCP tool-write routes through `core::staging::propose()` instead of writing directly. Live-applied. `[mcp.tools].review_required` per `agent-write-review-mode`; surfaced alongside the per-tool toggles so the user sees the staging gate right where they configure which write tools are on.
+- **Log full input** — bool, mirrors `llm.audit.log_full_prompt`. 
 
 Defaults to `vault` scope (matches the `[tasks]` section) — MCP config is per-vault by nature (the discovery file lives in the vault). User scope still works for users who want a global default; eligibility list mirrors the toml shape.
 

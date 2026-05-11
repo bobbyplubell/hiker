@@ -1452,6 +1452,54 @@ html, body, #app {
   color: inherit;
 }
 
+/* status: staging-accept-reject-from-editor
+   Editor toolbar pill: "Proposed change — [Accept] [Reject]".
+   Rendered between mode-controls and the right-side button cluster.
+   Same visual weight as the "Add to trail" pill. The label is muted
+   text; the buttons use the row-action text-link weight. Accept is
+   accent-colored, Reject is danger-colored per the spec. */
+#staging-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+#staging-pill .pill-label {
+  color: var(--text-muted);
+}
+#staging-pill button.row-action {
+  border: 1px solid var(--text-muted);
+  background: transparent;
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1.3;
+}
+#staging-pill button.row-action:hover {
+  background: var(--surface-hover);
+}
+#staging-pill button.pill-accept {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+#staging-pill button.pill-accept:hover {
+  background: var(--accent-fill);
+}
+#staging-pill button.pill-reject {
+  color: var(--danger-text);
+  border-color: var(--danger-text);
+}
+#staging-pill button.pill-reject:hover {
+  background: var(--danger-fill);
+}
+
 /* status: search-discovery-panel
    The right column is the Discovery panel: a fixed input/toggles bar at
    the top, and a column of collapsible sections below. v2 ships with two
@@ -1935,6 +1983,38 @@ html, body, #app {
 
 .chat-tool-call-result-summary.fail {
   color: var(--danger-text);
+}
+
+/* status: staging-accept-reject-from-chat-card
+   Inline [Accept] [Reject] text links appended to tool-call cards
+   when the agent proposes a write in review mode. */
+.chat-tool-call-action {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: 8px;
+  font-weight: 400;
+}
+.chat-tool-call-action-accept {
+  color: var(--accent);
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 0;
+}
+.chat-tool-call-action-reject {
+  color: var(--danger-text);
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 0;
+}
+.chat-tool-call-action-accept:hover,
+.chat-tool-call-action-reject:hover {
+  text-decoration: underline;
 }
 
 .chat-tool-call-expanded {
@@ -2880,18 +2960,25 @@ html, body, #app {
   50% { opacity: 1; }
 }
 
-/* status: vault-bar-queue-button
-   Status indicator overlaid on the new vault-bar queue button. Pulsing
-   blue when something is active; dim red (HIGH-priority pill color) for
-   unread failures. Both share one DOM node — the JS toggles a class. */
+/* status: staging-review-top-bar-badge
+   Numeric badge over the vault-bar queue button. Shows combined count
+   (active tasks + pending reviews). Blue pulsing when active tasks exist,
+   static accent when only pending reviews. Dim red dot (no text) for
+   unread failures. */
 .queue-btn-indicator {
   position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+  top: 0px;
+  right: 0px;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  padding: 0 4px;
   pointer-events: none;
+  color: #fff;
 }
 .queue-btn-indicator.queue-indicator-active {
   background: var(--queue-active-pulse-color);

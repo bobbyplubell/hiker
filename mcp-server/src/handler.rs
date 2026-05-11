@@ -8,9 +8,11 @@ use hiker_core::changes::Changes;
 use hiker_core::config::McpConfig;
 use hiker_core::embed::Embedder;
 use hiker_core::error::HikerError;
+use hiker_core::frontmatter;
 use hiker_core::indexer::IndexJobTx;
 use hiker_core::ops;
 use hiker_core::search::{self, SearchModes};
+use hiker_core::staging::{ProposalInput, Staging};
 use hiker_core::store::Store;
 use hiker_core::tasks::{
     McpClientVia, Priority as TaskPriority, Queue as TaskQueue, QueueError,
@@ -26,6 +28,7 @@ use rmcp::model::{
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_yml;
 
 use crate::audit::AuditLog;
 
@@ -51,6 +54,13 @@ pub struct HikerState {
     /// `set_setting` command swaps the contents in place so flips in
     /// the settings UI apply without a vault restart.
     pub tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    /// Shared staging instance for proposal-based writes (see
+    /// docs/settings.md "## Staging review"). When `[mcp.tools]
+    /// .review_required` is true, write tools route through
+    /// `staging.propose()`.
+    ///
+    /// status: staging-review-pending-response
+    pub staging: Arc<Staging>,
     pub audit: Arc<AuditLog>,
     /// Shared task queue. When `[mcp] enabled`, the `task_*` tools are
     /// advertised; the queue itself lives in the UI layer and is plumbed
@@ -217,10 +227,44 @@ pub struct TaskCheckoutParams {
     pub lease_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize)]
 pub struct TaskSubmitParams {
     pub task_id: String,
     pub value: serde_json::Value,
+}
+
+impl JsonSchema for TaskSubmitParams {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskSubmitParams".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut schema = schemars::Schema::default();
+        let obj = schema.ensure_object();
+        obj.insert("type".into(), "object".into());
+        obj.insert(
+            "description".into(),
+            "Submit a result for a leased task. `value` can be any JSON.".into(),
+        );
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "task_id".to_string(),
+            generator.subschema_for::<String>().into(),
+        );
+        // Use an empty schema object (not boolean true) so MCP clients
+        // see a valid object schema for the value field.
+        properties.insert("value".to_string(), schemars::Schema::default().into());
+        obj.insert("properties".into(), serde_json::Value::Object(properties));
+        obj.insert(
+            "required".into(),
+            serde_json::Value::Array(vec!["task_id".into(), "value".into()]),
+        );
+        schema
+    }
+    fn _schemars_private_non_optional_json_schema(
+        generator: &mut schemars::SchemaGenerator,
+    ) -> schemars::Schema {
+        Self::json_schema(generator)
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -295,6 +339,14 @@ struct GetNoteFull {
 struct WriteOutcome {
     rel_path: String,
     content_hash: String,
+    /// When `review_required` is on, `"staged"` with the proposal id in
+    /// `staging_id`. When off, absent (the default is `"written"`).
+    ///
+    /// status: staging-review-pending-response
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging_id: Option<String>,
 }
 
 // ---------- tool router ----------
@@ -767,26 +819,67 @@ impl HikerHandler {
 
     async fn write_note_inner(&self, p: &WriteNoteParams) -> Result<CallToolResult, ErrorData> {
         self.guard_tool("write_note")?;
-        let new_hash = ops::agent_write_note(
-            &self.state.watcher,
-            &self.state.jobs,
-            &self.state.vault,
-            Some(&self.state.changes),
-            CLIENT_ID,
-            "write_note",
-            &p.rel_path,
-            &p.content,
-            p.expected_hash.as_deref(),
-        )
-        .await
-        .map_err(translate_hiker_err)?;
-        Ok(structured(
-            serde_json::to_value(WriteOutcome {
-                rel_path: p.rel_path.clone(),
-                content_hash: new_hash,
-            })
-            .unwrap_or(serde_json::Value::Null),
-        ))
+
+        // status: staging-review-pending-response
+        let review_required = self
+            .state
+            .tools
+            .read()
+            .map(|cfg| cfg.review_required)
+            .unwrap_or(false);
+
+        if review_required {
+            let staging_id = self
+                .state
+                .staging
+                .propose(ProposalInput {
+                    surface: "mcp-tool-call".into(),
+                    action: "write_note".into(),
+                    target_path: p.rel_path.clone(),
+                    trail_id: None,
+                    content: Some(p.content.clone()),
+                    metadata: Some(serde_json::json!({
+                        "tool": "write_note",
+                        "session_id": CLIENT_ID,
+                    })),
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %e, "staging: propose failed");
+                    ErrorData::internal_error(e.to_string(), None)
+                })?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: String::new(),
+                    status: Some("staged".into()),
+                    staging_id: Some(staging_id),
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
+        } else {
+            let new_hash = ops::agent_write_note(
+                &self.state.watcher,
+                &self.state.jobs,
+                &self.state.vault,
+                Some(&self.state.changes),
+                CLIENT_ID,
+                "write_note",
+                &p.rel_path,
+                &p.content,
+                p.expected_hash.as_deref(),
+            )
+            .await
+            .map_err(translate_hiker_err)?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: new_hash,
+                    status: None,
+                    staging_id: None,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
+        }
     }
 
     async fn set_frontmatter_inner(
@@ -794,25 +887,76 @@ impl HikerHandler {
         p: &SetFrontmatterParams,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_tool("set_frontmatter")?;
-        let new_hash = ops::agent_set_frontmatter(
-            &self.state.watcher,
-            &self.state.jobs,
-            &self.state.vault,
-            Some(&self.state.changes),
-            CLIENT_ID,
-            "set_frontmatter",
-            &p.rel_path,
-            serde_json::Value::Object(p.fields.clone()),
-        )
-        .await
-        .map_err(translate_hiker_err)?;
-        Ok(structured(
-            serde_json::to_value(WriteOutcome {
-                rel_path: p.rel_path.clone(),
-                content_hash: new_hash,
-            })
-            .unwrap_or(serde_json::Value::Null),
-        ))
+
+        // status: staging-review-pending-response
+        let review_required = self
+            .state
+            .tools
+            .read()
+            .map(|cfg| cfg.review_required)
+            .unwrap_or(false);
+
+        if review_required {
+            let existing = self
+                .state
+                .vault
+                .read_file(&p.rel_path)
+                .map_err(translate_hiker_err)?;
+            let merged = frontmatter::merge_agent_patch(
+                &existing,
+                serde_json::Value::Object(p.fields.clone()),
+            )
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            let staging_id = self
+                .state
+                .staging
+                .propose(ProposalInput {
+                    surface: "mcp-tool-call".into(),
+                    action: "set_frontmatter".into(),
+                    target_path: p.rel_path.clone(),
+                    trail_id: None,
+                    content: Some(merged),
+                    metadata: Some(serde_json::json!({
+                        "tool": "set_frontmatter",
+                        "session_id": CLIENT_ID,
+                    })),
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %e, "staging: propose failed");
+                    ErrorData::internal_error(e.to_string(), None)
+                })?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: String::new(),
+                    status: Some("staged".into()),
+                    staging_id: Some(staging_id),
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
+        } else {
+            let new_hash = ops::agent_set_frontmatter(
+                &self.state.watcher,
+                &self.state.jobs,
+                &self.state.vault,
+                Some(&self.state.changes),
+                CLIENT_ID,
+                "set_frontmatter",
+                &p.rel_path,
+                serde_json::Value::Object(p.fields.clone()),
+            )
+            .await
+            .map_err(translate_hiker_err)?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: new_hash,
+                    status: None,
+                    staging_id: None,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
+        }
     }
 
     async fn apply_tag_inner(
@@ -822,39 +966,112 @@ impl HikerHandler {
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = if add { "apply_tag" } else { "remove_tag" };
         self.guard_tool(tool_name)?;
-        let result = if add {
-            ops::agent_apply_tag(
-                &self.state.watcher,
-                &self.state.jobs,
-                &self.state.vault,
-                Some(&self.state.changes),
-                CLIENT_ID,
-                tool_name,
-                &p.rel_path,
-                &p.tag,
+
+        // status: staging-review-pending-response
+        let review_required = self
+            .state
+            .tools
+            .read()
+            .map(|cfg| cfg.review_required)
+            .unwrap_or(false);
+
+        if review_required {
+            let existing = self
+                .state
+                .vault
+                .read_file(&p.rel_path)
+                .map_err(translate_hiker_err)?;
+            // Read existing tags from the source so staging captures the
+            // full resolved content (same merge-into-write shape as the
+            // direct path, but routed through staging).
+            let split = frontmatter::split(&existing);
+            let existing_tags: Vec<String> = match split.frontmatter {
+                Some(serde_yml::Value::Mapping(ref m)) => match m.get("tags") {
+                    Some(serde_yml::Value::Sequence(seq)) => seq
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let mut tags = existing_tags;
+            if add {
+                if !tags.iter().any(|t| t == &p.tag) {
+                    tags.push(p.tag.clone());
+                }
+            } else {
+                tags.retain(|t| t != &p.tag);
+            }
+            let merged = frontmatter::merge_agent_patch(
+                &existing,
+                serde_json::json!({"tags": tags}),
             )
-            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            let staging_id = self
+                .state
+                .staging
+                .propose(ProposalInput {
+                    surface: "mcp-tool-call".into(),
+                    action: tool_name.into(),
+                    target_path: p.rel_path.clone(),
+                    trail_id: None,
+                    content: Some(merged),
+                    metadata: Some(serde_json::json!({
+                        "tool": tool_name,
+                        "session_id": CLIENT_ID,
+                    })),
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %e, "staging: propose failed");
+                    ErrorData::internal_error(e.to_string(), None)
+                })?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: String::new(),
+                    status: Some("staged".into()),
+                    staging_id: Some(staging_id),
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
         } else {
-            ops::agent_remove_tag(
-                &self.state.watcher,
-                &self.state.jobs,
-                &self.state.vault,
-                Some(&self.state.changes),
-                CLIENT_ID,
-                tool_name,
-                &p.rel_path,
-                &p.tag,
-            )
-            .await
-        };
-        let new_hash = result.map_err(translate_hiker_err)?;
-        Ok(structured(
-            serde_json::to_value(WriteOutcome {
-                rel_path: p.rel_path.clone(),
-                content_hash: new_hash,
-            })
-            .unwrap_or(serde_json::Value::Null),
-        ))
+            let result = if add {
+                ops::agent_apply_tag(
+                    &self.state.watcher,
+                    &self.state.jobs,
+                    &self.state.vault,
+                    Some(&self.state.changes),
+                    CLIENT_ID,
+                    tool_name,
+                    &p.rel_path,
+                    &p.tag,
+                )
+                .await
+            } else {
+                ops::agent_remove_tag(
+                    &self.state.watcher,
+                    &self.state.jobs,
+                    &self.state.vault,
+                    Some(&self.state.changes),
+                    CLIENT_ID,
+                    tool_name,
+                    &p.rel_path,
+                    &p.tag,
+                )
+                .await
+            };
+            let new_hash = result.map_err(translate_hiker_err)?;
+            Ok(structured(
+                serde_json::to_value(WriteOutcome {
+                    rel_path: p.rel_path.clone(),
+                    content_hash: new_hash,
+                    status: None,
+                    staging_id: None,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ))
+        }
     }
 
     fn guard_tasks(&self) -> Result<(), ErrorData> {

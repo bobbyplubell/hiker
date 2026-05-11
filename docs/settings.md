@@ -142,59 +142,203 @@ Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables rou
 
 ## Staging review
 
-Some writes shouldn't land directly: the user didn't author the bytes (agent writes), or the user can't watch them all happen at once (batch mutations). Hiker stages these in `vault/.hiker/staging/<rel-path>` and exposes a unified review surface — diff viewer + Apply/Reject — so the user reviews in their own time.
+Some writes shouldn't land directly: the user didn't author the bytes (agent writes), or the user can't watch them all happen at once (batch mutations). Hiker stages these in `vault/.hiker/staging/` and exposes accept/reject inline on every surface that cares — the chat card where the proposal originated, the trails panel for draft-trail proposals, the file tree for per-file proposals, the editor toolbar when the open file has a pending proposal, and the activity detail page as the central review surface. No dedicated staging editor sub-mode — accept/reject lives alongside the content it affects.
 
-Two flows feed the staging surface:
+Two flows feed staging:
 
-- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on routes the writes to staging instead of applying directly.
+- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on routes the writes to staging instead of applying directly. [agent-write-review-mode]
 - **Batch mutations (always staged)** — multi-note mutation actions (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks per `task-queue.md`; the user can't watch N buffers, so each result lands in staging unconditionally. Single-note user-initiated mutations stay in-buffer per `editor.md`'s Note-mutations menu — staging is for the multi-note case.
 
 The headline decisions:
 
 - **Agent-write review is off by default; opt-in per write surface.** Existing behavior — agent writes apply directly + append a `core::changes` row — stays the default. Users who want a checkpoint in the loop flip the flag per surface (MCP / background features). [agent-write-review-mode]
-- **Proposed writes land in `vault/.hiker/staging/<rel-path>`** alongside a `<staging-path>.meta.json` sidecar. Source on disk is unchanged until Apply. Watcher's `.hiker/` ignore covers the dir for free. [staging-dir]
-- **Review surface is `staging-preview-mode`** — editor's CM6 view + the centered `#mode-controls` slot in the editor toolbar populated with label "Staging review" plus icons for Diff toggle, Apply, Reject, Close. Default view shows the staged proposal; the Diff toggle flips to the line diff against the current source (per `diff.md`). **Apply** drift-checked-writes to source via `vault.write_file_checked`, appends a `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "<surface>"`, deletes the staging file + sidecar. **Reject** deletes both files, no activity row. [staging-preview-mode, staging-review-via-diff]
-- **Queue surface in vault home.** A "Pending changes (N)" widget appears on the home page when the staging dir is non-empty; click → list of proposals; click a row → diff viewer for that proposal. Hidden when N == 0. Subscribes to `hiker:staging-changed` so the widget reflects new proposals live. Bulk Apply / Reject affordances on the list cover the batch-mutation case where the user wants to accept-or-reject a fan-out worth of related proposals in one go. [staging-review-queue, staging-bulk-apply-reject]
-- **MCP write responses are honest about staging.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "staged"` plus the staging path so the agent can describe the outcome accurately ("I staged a change to `note.md`; user review is pending"). [staging-review-pending-response]
+- **Proposed writes land in `vault/.hiker/staging/`** — a `pending.json` index file plus one `<id>.md` per proposal (the proposed content). Source on disk is unchanged until Accept. Watcher's `.hiker/` ignore covers the dir for free. [staging-dir]
+- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** There is no `staging-preview-mode` editor sub-mode. Instead, each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the editor toolbar, and the activity detail page as the central review surface. Clicking a proposal opens it as a read-only buffer with the existing diff toggle (reuses `snapshot-preview-mode`'s pattern) — but accept/reject stays on the owning surface's row, not in the editor toolbar.
+- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the existing author-class pills) that shows all pending proposals across all sources. Each row carries [Accept] [Reject]. An [Accept all (N)] button at the top batch-approves. [staging-review-activity-detail-filter]
+- **Proposals are queryable by surface-specific filters.** `core::staging::list()` accepts an optional filter (`by_path`, `by_trail_id`, `by_surface`, `by_session_id`) so each surface pulls only its relevant proposals. [staging-review-filtering]
+- **MCP write responses are honest about staging.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "staged"` plus the staging id so the agent can describe the outcome accurately. [staging-review-pending-response]
 
-### Where the config keys live
+### Review surfaces
 
-The keys themselves live in their owning sections (so each surface can describe its own knob in its own doc), with a single review-mode slug spanning the agent-write flags:
+Five surfaces plus the central activity-detail page. One proposal may appear on multiple surfaces (e.g., an agent write appears on the chat card that produced it AND on the activity detail page AND on the file tree row for the affected file). Accept from any surface removes it from all.
 
-- **`[mcp.tools].review_required`** (bool, default `false`) — extends `mcp-config-section`. When true, every successful tool-write (`mcp-tool-write-note`, `mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) routes through the staging dir instead of writing directly. The audit log row carries `surface = "mcp-tool-call"` and `outcome = "staged"`.
-- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section per `llm.md`. When true, debounced background features (auto-tag-on-save, summary-on-save, cluster summarization) write to staging instead of mutating frontmatter directly. The save burst still coalesces to one prompt per `llm-feature-debounce`; the change just doesn't land until the user accepts.
+#### Surface 1: Chat panel tool-call cards
 
-Batch mutations don't have a `review_required` flag — they always stage, because the user explicitly chose batch.
+When an agent proposes a write in review mode, the tool-call card appends two small text links inline:
 
-Two flags rather than one for agent writes because the threat models differ: an interactive agent writing through MCP is a different opt-in decision than silent background automation. A user might trust their own agent enough to skip review on tool calls while still wanting eyes on every auto-tag. The flags are independent.
+```
+▸ write_note(research/paper.md) ✓ Proposed  [Accept] [Reject]
+```
+
+Accept → drift-checked write → card updates to `✓ Applied`. Reject → discard → card updates to `✗ Rejected`. Same proposal also appears on the activity detail page and the file tree; accepting from the chat card removes it everywhere. [staging-accept-reject-from-chat-card]
+
+#### Surface 2: Trails panel
+
+Two cases:
+
+**Whole trail is a draft** (agent or clustering proposed a new trail). Below the trails panel header, a muted banner row (same visual weight as the existing append-cursor hint):
+
+```
+┌─ Trails ──────────────────────────────────┐
+│ [my-trail ▾]  [↗]                         │
+│ ⓘ Draft — proposed by agent               │
+│ [Accept trail]  [Reject]                   │
+```
+
+The waypoint cards render normally below so the user can inspect before deciding. Accept → moves trail-doc to `[trails] new_trail_dir`, strips `hiker.draft` flag, appends `core::changes` row. Reject → confirm then hard-deletes trail-doc + waypoint dir (no trash — this was never user data). [staging-accept-reject-from-trails]
+
+**Active trail has pending waypoint additions.** Minimal collapsed rows at the end of the waypoint list:
+
+```
+┌─ Trails ──────────────────────────────────┐
+│ 2  notes/ideas.md                         │
+│ ── Proposed ───────────────────────────── │
+│ +  research/raptor.md   [Accept] [Reject] │
+│ +  notes/whisper.md     [Accept] [Reject] │
+```
+
+Each row is the source basename plus two muted action links. No full waypoint card — the source path is enough context for "do I want this in my trail?" The proposal also appears on the activity detail page with the same Accept/Reject. [staging-accept-reject-from-trails]
+
+#### Surface 3: File tree
+
+Files with pending proposals show the **same dirty indicator** (the suffix dot) already used for dirty buffers. The dot is the universal "this file has something unresolved" signal — dirty buffer, pending proposal, same visual.
+
+Right-click context menu on the row grows a "Pending change" submenu:
+
+```
+  Open
+  Rename
+  Delete
+  Properties
+  ———————
+  Pending change ▸
+    Review pending change
+    Accept change
+    Reject change
+```
+
+"Review pending change" opens the file as a read-only buffer with the diff toggle (reuses `snapshot-preview-mode`'s existing diff pattern). Accept and Reject work from the menu without opening the file. [staging-accept-reject-from-tree]
+
+#### Surface 4: Editor toolbar
+
+When the open buffer has a pending proposal, a small pill appears in the editor toolbar between the `#mode-controls` slot and the right-side cluster (same placement and visual weight as the existing "Add to trail" pill):
+
+```
+Proposed change — [Accept] [Reject]
+```
+
+Hidden when there's no proposal for the active file. Accept drift-checked-writes and removes the proposal from all surfaces. Reject discards. The pill does not open a separate preview — the user is already looking at the file on disk. [staging-accept-reject-from-editor]
+
+#### Surface 5: Activity detail page (central review surface)
+
+The existing `vault-home-recent-activity-detail` page (`vault-home-recent-activity-detail`) gains a "Pending" filter pill alongside the existing author-class pills (user/robot icons). When active:
+
+```
+┌─ Activity ───────────────────────────────┐
+│ [●] [○] [Pending]                        │  ← filter pills
+│                                           │
+│ [Accept all (3)]                          │
+│                                           │
+│ ◈ Write — research/paper.md              │
+│   agent:claude · 2m ago     [Accept] [✕] │
+│                                           │
+│ ◈ Trail draft — "Embedding Survey"       │
+│   clustering · 5m ago       [Accept] [✕] │
+│                                           │
+│ ◈ Waypoint add to active trail           │
+│   research/raptor.md · 8m ago [Accept] [✕]│
+│ ───────────────────────────────────────── │
+│ ◈ Modified — research/paper.md  · 1h ago │  ← committed changes below
+│ ◈ Modified — notes/ideas.md    · 2h ago  │
+└───────────────────────────────────────────┘
+```
+
+Click a pending row → opens as read-only buffer with the existing diff toggle (reuses `snapshot-preview-diff-toggle`). Accept/Reject stay on the row — the editor toolbar doesn't gain accept/reject buttons for staging. [Accept all (N)] at the top runs a confirm-then-batch-apply. [staging-review-activity-detail-filter]
+
+#### Surface 6: Queue button (combined badge)
+
+The existing queue button in the top strip shows a combined badge: tasks + pending reviews. Click opens the queue detail page (unchanged). The review count is folded into the badge — users who want the full list go to the activity detail page. [staging-review-top-bar-badge]
+
+### Button styling
+
+No green/red. All Accept/Reject use the existing muted token system and the same text-link weight as the `[Restore this version]` link in the activity detail:
+
+- **Accept** — `var(--accent)` muted outline, same color family as active states elsewhere. Low-opacity fill on hover.
+- **Reject** — `var(--danger-text)` muted outline. Keeps the danger semantic but doesn't scream.
+- **Accept all** — same accent outline with "all" label.
+
+### Storage
+
+```
+.hiker/staging/
+  pending.json    # [{ id, surface, action, target_path, trail_id, content_hash,
+                  #    created_at, metadata }]
+  <id>.md         # proposed content (empty for waypoint-adds — metadata IS the proposal)
+```
+
+One JSON index, one `.md` per proposal. Accept reads the content, drift-checks against source, writes, appends `core::changes` row, removes both files. Reject removes both files, no changelog row. GC on vault open: proposals older than 14 days discarded. [staging-retention]
 
 ### Lifecycle of a staged proposal
 
-1. The producer writes to staging:
-    - **Agent path** — `mcp-tool-write-note` (or a background feature) sees `review_required = true` and routes the write to `<vault>/.hiker/staging/<rel-path>` instead of `<vault>/<rel-path>`. Staging directories are auto-created.
-    - **Batch mutation path** — each fanned-out task in `core::tasks` writes its result to the same staging path on completion.
-2. The staging file's content is the proposed bytes. A sidecar `<staging-path>.meta.json` records the source's `loadedHash` at proposal time (for drift-detection on apply), the originating surface (`mcp-tool-call` / `background-llm` / `batch-mutation`), the author class, and the prompt slug if applicable.
-3. `hiker:staging-changed` fires; the home-page queue widget refreshes.
-4. User opens the proposal in `staging-preview-mode`. **Apply** → `vault.write_file_checked` against the meta sidecar's recorded hash. Drift mismatch surfaces via `drift-conflict-modal` (keep-source / take-staging / cancel). On success: `core::changes` row + staging file + sidecar deleted. **Reject** → both files deleted, no changelog row.
-5. Stale proposals (older than 14 days by default; configurable under the same review-mode keys) GC on vault open. Same shape as `changes-retention`. [staging-retention]
+1. The producer writes to `core::staging::propose()`:
+    - **Agent path** — `mcp-tool-write-note` (or a background feature) sees `review_required = true` and calls `core::staging::propose(action, target_path, content, metadata)` instead of writing directly.
+    - **Batch mutation path** — each fanned-out task in `core::tasks` calls `core::staging::propose()` on completion.
+2. Content is written to `.hiker/staging/<id>.md`; metadata to `pending.json`.
+3. `hiker:staging-changed` fires. All active surfaces (chat cards, trails panel, tree row indicators, editor toolbar pill, activity detail page) refresh.
+4. User accepts from any surface → `core::staging::accept(id)` drift-checked writes to source, appends `core::changes` row with `metadata.staging_proposal_id` + `metadata.action`, removes staging files. Reject → `core::staging::reject(id)` removes staging files, no changelog row.
+5. Stale proposals (older than 14 days; configurable) GC on vault open.
 
 The staging dir does *not* count as part of `core::changes` history — proposals that never apply leave no trace beyond the GC log line. Only accepted writes hit the changelog.
 
+### `core::staging` module
+
+```rust
+Staging::open(vault_root) -> Staging
+
+Staging::propose(input: ProposalInput) -> ProposalId
+// ProposalInput { surface, action, target_path, trail_id, content, metadata }
+
+Staging::accept(id, vault, changes) -> AcceptOutcome
+// drift-checked write + core::changes row + cleanup
+
+Staging::reject(id)
+// delete staging files, no changelog row
+
+Staging::accept_all(filter, vault, changes) -> Vec<AcceptOutcome>
+
+Staging::list(filter) -> Vec<Proposal>
+// filter: StagingFilter { path, trail_id, surface, session_id }
+
+Staging::count(filter) -> u32
+Staging::gc(max_age_days)
+```
+
+Events: `hiker:staging-changed` broadcast on propose/accept/reject so all surfaces stay in sync.
+
+### Where the config keys live
+
+The keys themselves live in their owning sections:
+
+- **`[mcp.tools].review_required`** (bool, default `false`) — extends `mcp-config-section`. When true, every successful tool-write routes through staging instead of writing directly. Exposed as a bool toggle in the MCP settings UI section alongside the per-tool toggles.
+- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section. When true, debounced background features write to staging instead of mutating frontmatter directly. Exposed as a bool toggle in the LLM settings UI section's background subsection.
+
+Batch mutations don't have a `review_required` flag — they always stage.
+
 ### Module placement
 
-- `core::ops::agent_write_note` (and the frontmatter / tag wrappers) branch on the loaded `Config`'s review flag and route to `core::staging` when set. Batch-mutation tasks call `core::staging::stage` directly. `core::staging::stage(rel, content, meta)` writes the staging file + sidecar atomically.
-- `core::staging::list / accept / reject` — read the staging dir, accept-with-drift-check, reject-and-delete.
-- UI: home-page "Pending changes" widget; row click → diff viewer with the staging-aware actions wired in. Bulk Apply / Reject buttons on the list header.
-- MCP server response shapes extend per `staging-review-pending-response` so the agent surface accurately reflects staging.
+- `core::staging` — `Staging` struct, `Staging::propose/accept/reject/list/count/gc`. Pure, no Tauri imports. All `.hiker/staging/` filesystem touches confined here.
+- `core::ops::agent_write_note` (and frontmatter / tag wrappers) branch on the loaded `Config`'s review flag and route to `core::staging::propose` when set.
+- UI: activity detail page filter + inline accept/reject, chat tool-call card buttons, trails panel banner + proposed rows, tree context menu + dot indicator, editor toolbar pill. Each surface calls `core::staging::list(filter)` with its relevant filter.
+- MCP server response shapes extend per `staging-review-pending-response`.
 
 ### Forward refs
 
-- `diff.md` defines the diff renderer (`diff-renderer`) hosted by `staging-preview-mode` via the standard Diff toggle in `#mode-controls` (`mode-controls-diff-toggle`); this section's Apply / Reject are concrete instances of the per-mode action-icon shape (`editor-toolbar-mode-controls`).
-- `mcp.md` `mcp-config-section` gets the actual `tools.review_required` row when this lands; `mcp-tool-write-note` and the frontmatter/tag wrappers gain the staging branch.
-- `llm.md` `[llm.background]` config gets `review_required` when background features land.
-- `task-queue.md` describes the fan-out task submission shape that batch-mutation entry points use.
-- `editor.md` Note-mutations menu describes the batch entry points (`note-mutation-batch-from-folder`, `note-mutation-batch-from-search`) that produce batch-mutation staging proposals.
-- `core::changes` is unchanged — it sees only accepted writes; rejected proposals don't appear.
+- `diff.md` — the diff toggle already works in snapshot preview mode; staging reuses it. No new diff surface needed.
+- `mcp.md` `mcp-config-section` gets the `tools.review_required` row.
+- `llm.md` `[llm.background]` config gets `review_required`.
+- `task-queue.md` — batch mutation fan-out producers call `core::staging::propose` on completion.
+- `trails.md` — draft trail review hooks into the staging surfaces described here.
+- `core::changes` — sees only accepted writes; `metadata` column carries `staging_proposal_id` for traceability.
 
 
 ## Settings UI shell
@@ -314,6 +458,8 @@ Selected in-app UI changes persist by writing back to the appropriate TOML file.
 - `[editor].render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `show_chunk_boundaries` — written on View menu flip. Vault-scope.
 - `[vault].sidebar_open`, `related_open`, `trash_expanded`, `tree.sort_by` — written on the corresponding UI action. Vault-scope.
 - `[vault].recent` — written by the Open Vault flow (push-to-front, dedupe, cap at ~10 entries). User-scope.
+- `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. Vault-scope (per-surface gate that makes sense per vault). Live-applied.
+- `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features write to staging. Vault-scope. Live-applied.
 
 Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
 

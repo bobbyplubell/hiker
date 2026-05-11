@@ -69,6 +69,12 @@ pub enum AgentEvent {
         call_id: String,
         ok: bool,
         summary: String,
+        /// Full tool output (JSON string). Present when the tool
+        /// successfully returned structured data; absent for errors.
+        /// Chat panel uses this to extract staging_ids for accept/reject
+        /// per `staging-accept-reject-from-chat-card`.
+        #[serde(default)]
+        output: Option<String>,
     },
     StepFinished { turn_id: TurnId, step_id: u32, finish_reason: FinishReason },
     IterationCapHit { turn_id: TurnId, completed_iterations: u32 },
@@ -432,6 +438,7 @@ pub async fn run_turn(
                 Ok(s) => (true, s.clone(), summarize(&s, 120)),
                 Err(reason) => (false, reason.clone(), reason.clone()),
             };
+            let output_for_ui = if ok { Some(output.clone()) } else { None };
             let _ = events_tx
                 .send(AgentEvent::ToolResult {
                     turn_id: turn_id.clone(),
@@ -439,6 +446,7 @@ pub async fn run_turn(
                     call_id: c.id.clone(),
                     ok,
                     summary,
+                    output: output_for_ui,
                 })
                 .await;
             results.push(ToolResult {

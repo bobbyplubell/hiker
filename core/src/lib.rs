@@ -17,6 +17,7 @@ pub mod prompts;
 pub mod ops;
 pub mod search;
 pub mod sessions;
+pub mod staging;
 pub mod store;
 pub mod tasks;
 pub mod trails;

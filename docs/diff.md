@@ -88,11 +88,9 @@ Whenever the active buffer is `isDirty()` and not in any other read-only preview
 
 This is the review surface for in-buffer mutations (per `editor.md` Note-mutations menu) — the user reads the post-mutation buffer, optionally toggles to compare against on-disk, then either Saves (accept) or Ctrl-Zs (revert). It's also a generally useful affordance for hand-edits before saving.
 
-### Staging review preview
+### Staging review (forward ref)
 
-When the user opens a staging proposal from the home-page "Pending changes" queue (`staging-review-queue`), the pane enters `staging-preview-mode` — same mode-controls shape, with the slot showing label "Staging review" plus icons for: Diff toggle, Apply, Reject, Close. Default view: the staged proposal. Toggle: diff against current source. **Apply** does a drift-checked write + activity row; **Reject** deletes the proposal. [staging-preview-mode]
-
-This surface is shared by every flow that produces a staged proposal: agent writes (when `agent-write-review-mode` is on), batch mutations (always staged because the user can't watch N buffers), future similar flows.
+Staging proposals open for preview as a read-only buffer with the existing diff toggle — the same pattern `snapshot-preview-mode` already uses. Accept/reject lives on the calling surface's row (activity detail page, chat card, trails panel, tree context menu, editor toolbar pill), not in the editor toolbar mode-controls slot. See `settings.md`'s "Staging review" section for the full surface.
 
 ### Drift-conflict resolution (forward ref)
 
@@ -142,4 +140,4 @@ Slugs registered as `planned`:
 - `diff-viewer-ignore-whitespace` — toggle when a consumer needs it.
 - `diff-viewer-export-patch` — "copy as patch" affordance.
 - `activity-detail-diff-between-versions` — multi-select two snapshot rows + "Diff selected".
-- `staging-preview-mode` — preview-pane shape for staging review queue items (agent writes, batch mutations).
+- `staging-review-activity-detail-filter` — "Pending" filter pill on activity detail page; diff toggle reuses `snapshot-preview-diff-toggle` per `settings.md`.

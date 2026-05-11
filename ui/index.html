@@ -137,6 +137,16 @@
                before the buffer + active-trail seam is wired. -->
           <button id="add-to-trail-pill" class="toolbar-btn add-to-trail-pill" type="button" hidden></button>
           <span id="mode-controls"></span>
+          <!-- status: staging-accept-reject-from-editor
+               Editor toolbar pill: "Proposed change — [Accept] [Reject]".
+               Shown between mode-controls and the right-side button cluster
+               when the open file has a pending staging proposal. Hidden by
+               default; visibility is runtime-driven by ./editor/stagingPill. -->
+          <div id="staging-pill" class="editor-pill" style="display:none">
+            <span class="pill-label">Proposed change — </span>
+            <button class="row-action pill-accept" type="button">Accept</button>
+            <button class="row-action pill-reject" type="button">Reject</button>
+          </div>
           <span class="toolbar-spacer"></span>
           <button id="save-btn" class="toolbar-btn" title="Save" aria-label="Save" disabled>
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M2.5 2.5h8.5l3 3v8a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z"/><path d="M4.5 2.5h6v3.5h-6z"/><rect x="4" y="9" width="8" height="5"/></svg>

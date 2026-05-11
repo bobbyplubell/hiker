@@ -297,6 +297,7 @@ async fn translate_update(
                             call_id: tcu.tool_call_id.to_string(),
                             ok: true,
                             summary: "completed".into(),
+                            output: None,
                         })
                         .await;
                 }
@@ -308,6 +309,7 @@ async fn translate_update(
                             call_id: tcu.tool_call_id.to_string(),
                             ok: false,
                             summary: "failed".into(),
+                            output: None,
                         })
                         .await;
                 }

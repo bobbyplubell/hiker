@@ -290,6 +290,8 @@ pub struct LlmConfig {
     pub agent: LlmAgentConfig,
     #[serde(default)]
     pub audit: LlmAuditConfig,
+    #[serde(default)]
+    pub background: LlmBackgroundConfig,
 }
 
 impl Default for LlmConfig {
@@ -300,8 +302,24 @@ impl Default for LlmConfig {
             limits: LlmLimitsConfig::default(),
             agent: LlmAgentConfig::default(),
             audit: LlmAuditConfig::default(),
+            background: LlmBackgroundConfig::default(),
         }
     }
+}
+
+/// `[llm.background]` — config for debounced background LLM features
+/// (auto-tagging, summarization, etc.). Stub in v3 — `review_required`
+/// is the only field that ships now; the rest land when their backing
+/// features do.
+///
+/// status: agent-write-review-mode
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmBackgroundConfig {
+    /// When true, debounced background LLM features write to staging
+    /// instead of mutating frontmatter directly. Default false (off).
+    #[serde(default = "no")]
+    pub review_required: bool,
 }
 
 /// `[llm.provider]` — backend selection and connection-shaped knobs. API
@@ -485,6 +503,13 @@ pub struct McpToolsConfig {
     /// Conservative default (false) per spec.
     #[serde(default = "no")]
     pub allow_redacted_lookup: bool,
+    // status: agent-write-review-mode
+    /// When true, MCP write tools (`write_note`, `set_frontmatter`,
+    /// `apply_tag`, `remove_tag`) route through `core::staging::propose()`
+    /// instead of applying directly. Default false — agents write directly
+    /// + append a changelog row (existing behavior).
+    #[serde(default = "no")]
+    pub review_required: bool,
     // Per-tool toggles (status: mcp-tool-toggles). Default true.
     // Reads:
     #[serde(default = "yes")] pub search_notes_enabled: bool,
@@ -538,6 +563,7 @@ impl Default for McpToolsConfig {
         Self {
             writes_enabled: true,
             allow_redacted_lookup: false,
+            review_required: false,
             search_notes_enabled: true,
             get_note_enabled: true,
             related_notes_enabled: true,
@@ -1044,7 +1070,7 @@ impl Config {
             None => None,
         };
 
-        let vault_doc = read_or_create(&paths.vault, &Self::default())?;
+        let vault_doc = read_or_create_minimal(&paths.vault)?;
 
         // Deep-merge user under vault (vault wins per-key). Tables recurse;
         // arrays and scalars replace.
@@ -1141,10 +1167,14 @@ impl Config {
             SettingsScope::Vault => paths.vault.clone(),
         };
 
-        // Read-or-create-defaults so write-back works on a vault that's
-        // never had its TOML touched. Use toml_edit so user comments and
-        // key ordering survive the patch.
-        let mut doc = read_or_create_doc(&target, &Self::default())?;
+        // Read-or-create the target file. For user-scope writes we seed
+        // full defaults so the user can see available keys; for vault-scope
+        // writes we seed only schema_version to avoid auto-created defaults
+        // silently overriding user settings (e.g. LLM provider backend).
+        let mut doc = match scope {
+            SettingsScope::User => read_or_create_doc(&target, &Self::default())?,
+            SettingsScope::Vault => read_or_create_minimal_doc(&target)?,
+        };
         apply_patch(&mut doc, key, &value);
         atomic_write(&target, doc.to_string().as_bytes())?;
 
@@ -1208,6 +1238,44 @@ fn read_or_create(path: &Path, defaults: &Config) -> Result<toml::Value, HikerEr
     }
 }
 
+/// Like `read_or_create` but seeds only `schema_version` in the
+/// auto-created file. Used for the vault TOML so auto-created vault
+/// defaults don't silently override user-scope settings (e.g. LLM
+/// provider backend). If the file already exists, reads it normally.
+fn read_or_create_minimal(path: &Path) -> Result<toml::Value, HikerError> {
+    if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|e| {
+            tracing::error!(file = %path.display(), error = %e, "settings read failed");
+            HikerError::Config(format!("read {}: {e}", path.display()))
+        })?;
+        toml::from_str(&raw).map_err(|e: toml::de::Error| {
+            tracing::error!(
+                file = %path.display(),
+                error = %e,
+                "settings parse failed",
+            );
+            HikerError::Config(format!("parse {}: {e}", path.display()))
+        })
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                HikerError::Config(format!("mkdir {}: {e}", parent.display()))
+            })?;
+        }
+        let header = format!(
+            "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
+             # This file was auto-generated. Add per-vault overrides here;\n\
+             # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
+        );
+        let body = format!("schema_version = {SCHEMA_VERSION}\n");
+        let bytes = format!("{header}{body}");
+        atomic_write(path, bytes.as_bytes())?;
+        let mut map = toml::map::Map::new();
+        map.insert("schema_version".into(), toml::Value::Integer(SCHEMA_VERSION as i64));
+        Ok(toml::Value::Table(map))
+    }
+}
+
 /// Same as `read_or_create` but returns a `toml_edit::DocumentMut` for
 /// in-place patching.
 fn read_or_create_doc(
@@ -1216,6 +1284,32 @@ fn read_or_create_doc(
 ) -> Result<toml_edit::DocumentMut, HikerError> {
     if !path.exists() {
         write_defaults(path, defaults)?;
+    }
+    let raw = fs::read_to_string(path).map_err(|e| {
+        HikerError::Config(format!("read {}: {e}", path.display()))
+    })?;
+    raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        HikerError::Config(format!("parse {}: {e}", path.display()))
+    })
+}
+
+/// Same as `read_or_create_doc` but seeds only `schema_version`.
+/// Used for vault-scope write-back to avoid auto-created defaults
+/// overriding user settings.
+fn read_or_create_minimal_doc(path: &Path) -> Result<toml_edit::DocumentMut, HikerError> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                HikerError::Config(format!("mkdir {}: {e}", parent.display()))
+            })?;
+        }
+        let header = format!(
+            "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
+             # This file was auto-generated. Add per-vault overrides here;\n\
+             # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
+        );
+        let body = format!("schema_version = {SCHEMA_VERSION}\n");
+        atomic_write(path, format!("{header}{body}").as_bytes())?;
     }
     let raw = fs::read_to_string(path).map_err(|e| {
         HikerError::Config(format!("read {}: {e}", path.display()))
@@ -1389,7 +1483,10 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.review_required",        ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // status: agent-write-review-mode
+    EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
     // ACP section. The agent can be overridden per vault.
     // Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
@@ -1440,7 +1537,10 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.review_required",        ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // status: agent-write-review-mode
+    EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
     // ACP section. Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
 ];

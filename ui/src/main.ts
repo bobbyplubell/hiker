@@ -26,6 +26,7 @@ import { mountTabStrip, type TabStripApi } from "./tabStrip";
 import { mountDiscovery, type DiscoveryController } from "./discovery";
 import { mountTrailsPanel, type TrailsController } from "./trails";
 import { mountAddToTrailPill } from "./trails/addToTrailPill";
+import { mountStagingPill, type StagingPillApi } from "./editor/stagingPill";
 import {
   installMembershipWatchers,
   refreshActiveTrailWaypointPaths,
@@ -38,6 +39,7 @@ import {
 } from "./navigation";
 import { iconButton } from "./modeControls";
 import { Icons } from "./icons";
+import { hideFrontmatter } from "./editor/hideFrontmatter";
 import { mountPropertiesPane, type PropertiesPaneApi } from "./propertiesPane";
 // Stores hoist main.ts's globals into a single source of truth + subscribe
 // surface. Local `let` bindings below stay as derived caches kept in sync
@@ -54,6 +56,7 @@ import {
   type BufferApi,
   type ActiveBufferSnapshot,
   type TabKind,
+  type BufferMode,
 } from "./app/state";
 import { applySettingsToUi as applySettingsToUiImpl, type Settings } from "./app/settingsApply";
 import { mountVaultLifecycle } from "./app/vaultLifecycle";
@@ -724,6 +727,140 @@ const snapshotPreview: SnapshotPreviewApi = mountSnapshotPreview({
   formatError,
 });
 
+// status: staging-review-activity-detail-filter
+// Staging proposal preview: open a proposal's .md content as a read-only
+// buffer with a diff toggle against the current file on disk. Reuses the
+// same pattern as snapshot-preview-mode: set buffer mode to "staging",
+// lock the editor to read-only, and render per-mode controls in the
+// toolbar's #mode-controls slot. Accept/Reject actions stay on the
+// activity-detail row per the spec.
+let stagingDiffActive = false;
+
+async function openStagingPreview(proposal: { id: string; target_path: string }): Promise<void> {
+  const curBuf = buffer;
+  if (curBuf && editor.isDirty()) {
+    const choice = await confirm3(
+      `${curBuf.path} has unsaved changes.`,
+      "Save & switch",
+      "Discard & switch",
+      "Cancel",
+    );
+    if (choice === "cancel") return;
+    if (choice === "a" && !(await editor.save())) return;
+  }
+  let contents: string;
+  try {
+    contents = await Ipc.stagingContent({ proposalId: proposal.id });
+  } catch (err) {
+    alert(`Failed to load staging proposal: ${formatError(err)}`);
+    return;
+  }
+  if (!contents) {
+    alert("This proposal has no content to preview.");
+    return;
+  }
+  stagingDiffActive = false;
+  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
+  editor.dispatch({
+    changes: { from: 0, to: editor.getDocLength(), insert: contents },
+    effects: [
+      editor.language.reconfigure(editor.languageExtensionForPath(proposal.target_path)),
+      editor.livePreviewCompartment.reconfigure(
+        editor.livePreviewExtensionForPath(proposal.target_path),
+      ),
+    ],
+  });
+  if (vaultHome.isVisible()) vaultHome.setVisible(false);
+  setBufferState({
+    buffer: {
+      path: proposal.target_path,
+      loadedText: editor.getActiveText(),
+      token: null,
+      kind: "buffer",
+      mode: { kind: "staging", proposal_id: proposal.id, targetPath: proposal.target_path, diffActive: false },
+      pendingChangesMetadata: null,
+      preview: false,
+    },
+    activePath: proposal.target_path,
+    previewTabPath: null,
+  });
+  editor.setReadOnly(true);
+  editorPane.modeControls.render();
+  editorPane.repaintStatusBar();
+  editorPane.refreshChunkBoundaries();
+  checkpointNav();
+}
+
+function closeStagingPreview(): void {
+  if (buffer?.mode.kind !== "staging") return;
+  editor.resetDiffDecorations();
+  stagingDiffActive = false;
+  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
+  editor.dispatch({
+    changes: { from: 0, to: editor.getDocLength(), insert: "" },
+  });
+  editor.setReadOnly(false);
+  // Return to the activity detail page.
+  vaultHome.setVisible(true);
+  if (vaultHome.api.activeDetailView()?.kind !== "recent-activity") {
+    vaultHome.api.showDetail("recent-activity");
+  }
+  editorPane.modeControls.render();
+  editorPane.repaintStatusBar();
+  checkpointNav();
+}
+
+async function toggleStagingDiff(): Promise<void> {
+  if (buffer?.mode.kind !== "staging") return;
+  if (stagingDiffActive) {
+    editor.clearDiff(buffer.loadedText);
+    editor.dispatch({
+      effects: [
+        editor.livePreviewCompartment.reconfigure(
+          editor.livePreviewExtensionForPath(buffer.mode.targetPath),
+        ),
+        editor.hideFrontmatterCompartment.reconfigure(
+          hideFrontmatterEnabled ? hideFrontmatter() : [],
+        ),
+      ],
+    });
+    stagingDiffActive = false;
+    buffer.mode.diffActive = false;
+    editorPane.modeControls.render();
+    editorPane.refreshChunkBoundaries();
+    return;
+  }
+  let currentContent: string;
+  try {
+    currentContent = await Ipc.readFile({ rel: buffer.mode.targetPath });
+  } catch (err) {
+    alert(`Could not load current ${buffer.mode.targetPath}: ${formatError(err)}`);
+    return;
+  }
+  if (buffer?.mode.kind !== "staging") return;
+  editor.dispatch({
+    effects: [
+      editor.livePreviewCompartment.reconfigure([]),
+      editor.hideFrontmatterCompartment.reconfigure([]),
+    ],
+  });
+  await editor.renderDiff({
+    before: {
+      label: `${buffer.mode.targetPath} · proposed`,
+      content: buffer.loadedText,
+      meta: { staging: true },
+    },
+    after: {
+      label: `${buffer.mode.targetPath} · current`,
+      content: currentContent,
+    },
+  });
+  stagingDiffActive = true;
+  buffer.mode.diffActive = true;
+  editorPane.modeControls.render();
+  editorPane.refreshChunkBoundaries();
+}
+
 // `save` is owned by the EditorHost; main.ts calls `editor.save()`. The
 // drift / save-error handlers live in `./app/openFile`.
 
@@ -1313,6 +1450,14 @@ const vaultHome: VaultHomeController = mountVaultHome({
       void openPageTab("home-detail", payload);
     }
   },
+  // status: staging-review-activity-detail-filter
+  onOpenStagingProposal: (proposal) => openStagingPreview(proposal),
+  onAcceptStaging: async (proposal) => {
+    await Ipc.stagingAccept({ proposalId: proposal.id });
+  },
+  onRejectStaging: async (proposal) => {
+    await Ipc.stagingReject({ proposalId: proposal.id });
+  },
 });
 
 // status: task-queue-home-detail-view
@@ -1524,6 +1669,7 @@ const taskQueueTile = (() => {
   let failedCount = 0;
   let unreadFailure = false;
   let llmEnabled = true;
+  let pendingReviewCount = 0;
 
   const SUMMARY_DOT = " · ";
   function paintSummary(): void {
@@ -1552,15 +1698,24 @@ const taskQueueTile = (() => {
       return;
     }
     queueBtnEl.hidden = false;
-    if (activeCount > 0) {
+
+    const total = activeCount + pendingReviewCount;
+
+    if (total > 0) {
       queueIndicatorEl.hidden = false;
-      queueIndicatorEl.classList.add("queue-indicator-active");
-      queueIndicatorEl.classList.toggle("queue-indicator-failed", false);
+      queueIndicatorEl.textContent = String(total);
+      if (activeCount > 0) {
+        queueIndicatorEl.classList.add("queue-indicator-active");
+      } else {
+        queueIndicatorEl.classList.remove("queue-indicator-active");
+      }
       return;
     }
+
     queueIndicatorEl.classList.remove("queue-indicator-active");
     if (unreadFailure) {
       queueIndicatorEl.hidden = false;
+      queueIndicatorEl.textContent = "";
       queueIndicatorEl.classList.add("queue-indicator-failed");
       return;
     }
@@ -1572,6 +1727,33 @@ const taskQueueTile = (() => {
     paintSummary();
     paintIndicator();
   }
+
+  // status: staging-review-top-bar-badge
+  async function refreshStaging(): Promise<void> {
+    try {
+      pendingReviewCount = await Ipc.stagingCount();
+    } catch {
+      pendingReviewCount = 0;
+    }
+    repaint();
+  }
+
+  let stagingInterval: ReturnType<typeof setInterval> | undefined;
+
+  function startStagingPolling(): void {
+    stopStagingPolling();
+    stagingInterval = setInterval(() => { void refreshStaging(); }, 30_000);
+  }
+
+  function stopStagingPolling(): void {
+    if (stagingInterval) { clearInterval(stagingInterval); stagingInterval = undefined; }
+  }
+
+  // Listen for staging changes so the badge updates immediately after
+  // an accept/reject/accept_all, without waiting for the next poll tick.
+  void listen("hiker:staging-changed", () => {
+    void refreshStaging();
+  });
 
   function openQueueDetail(): void {
     if (!llmEnabled) return;
@@ -1638,10 +1820,12 @@ const taskQueueTile = (() => {
       unreadFailure = false;
     }
     repaint();
+    void refreshStaging();
+    startStagingPolling();
   }
   repaint();
   void refresh();
-  return { refresh };
+  return { refresh, stopStagingPolling };
 })();
 
 // Snapshot-preview lifecycle: callers go through the `snapshotPreview`
@@ -2290,6 +2474,65 @@ const addToTrailPill = mountAddToTrailPill({
 addToTrailPill.setTrailDocPredicate((rel) => tree.api.isTrailDoc(rel));
 installMembershipWatchers();
 
+// status: staging-accept-reject-from-editor
+// Editor toolbar pill: "Proposed change — [Accept] [Reject]". The
+// pill element is rendered in index.html between #mode-controls and
+// the right-side button cluster. Visibility and click handlers are
+// driven by this module; it subscribes to bufferStore for active-path
+// changes and exposes `refresh()` for the `hiker:staging-changed`
+// event listener below.
+const stagingPillEl = document.getElementById(
+  "staging-pill",
+) as HTMLDivElement | null;
+if (!stagingPillEl) {
+  throw new Error("stagingPill: element #staging-pill not found");
+}
+const stagingPill: StagingPillApi = mountStagingPill({
+  pillEl: stagingPillEl,
+  onAcceptAfter: (acceptedContent, _targetPath) => {
+    // The accepted content was just written to disk. If it differs
+    // from what's currently in the editor, replace the editor content
+    // so the user sees the version that was just committed.
+    const currentText = editor.getActiveText();
+    if (acceptedContent !== currentText) {
+      // Replace the editor content while preserving the buffer token
+      // (the disk hash was already updated by core::staging::accept).
+      editor.dispatch({
+        changes: {
+          from: 0,
+          to: editor.getDocLength(),
+          insert: acceptedContent,
+        },
+      });
+      const buf = buffer;
+      if (buf) {
+        // Update loadedText so the dirty state reflects post-accept
+        // reality. The token was rotated server-side so we leave it
+        // as-is — a subsequent save will go through the normal drift
+        // check path with the new on-disk hash.
+        setBufferState({
+          buffer: {
+            ...buf,
+            loadedText: acceptedContent,
+          },
+        });
+      }
+    }
+  },
+  onAfterAction: () => {
+    closeStagingPreview();
+  },
+});
+
+// status: staging-accept-reject-from-editor
+// Listen for staging changes from any surface (activity detail,
+// trails, tree, chat cards). When a proposal is accepted or rejected
+// elsewhere, the pill must refresh so it hides (or updates to the
+// next proposal) immediately.
+void listen("hiker:staging-changed", () => {
+  void stagingPill.refresh();
+});
+
 // status: editor-tab-strip
 const tabStrip: TabStripApi = mountTabStrip({
   hostEl: dom.editor.tabStripEl,
@@ -2402,6 +2645,72 @@ editorPane.modeControls.register("trash", (host) => {
       title: "Close preview",
       svg: Icons.close(),
       onClick: () => trash.api.closePreview(),
+    }),
+  );
+});
+
+// status: staging-review-activity-detail-filter
+editorPane.modeControls.register("staging", (host) => {
+  if (!buffer || buffer.mode.kind !== "staging") return;
+  const mode = buffer.mode as Extract<BufferMode, { kind: "staging" }>;
+  const diffActive = mode.diffActive;
+  const label = document.createElement("span");
+  label.className = "mode-label";
+  label.textContent = diffActive ? "Diff · proposed ↔ current" : "Staging preview";
+  label.title = `${mode.targetPath} — proposed change`;
+  host.appendChild(label);
+  host.appendChild(
+    iconButton({
+      title: diffActive ? "Hide diff" : "Show diff vs current",
+      pressed: diffActive,
+      svg: Icons.diff(),
+      onClick: () => toggleStagingDiff(),
+    }),
+  );
+  const acceptBtn = document.createElement("button");
+  acceptBtn.type = "button";
+  acceptBtn.textContent = "Accept";
+  acceptBtn.style.cssText =
+    "padding: 2px 8px; border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; background: transparent; cursor: pointer; font-size: 12px;";
+  acceptBtn.addEventListener("click", async () => {
+    acceptBtn.disabled = true;
+    rejectBtn.disabled = true;
+    try {
+      await Ipc.stagingAccept({ proposalId: mode.proposal_id });
+      showToast("Accepted");
+      closeStagingPreview();
+    } catch (err) {
+      alert("Accept failed: " + formatError(err));
+      acceptBtn.disabled = false;
+      rejectBtn.disabled = false;
+    }
+  });
+  host.appendChild(acceptBtn);
+  const rejectBtn = document.createElement("button");
+  rejectBtn.type = "button";
+  rejectBtn.textContent = "Reject";
+  rejectBtn.style.cssText =
+    "padding: 2px 8px; border: 1px solid var(--danger-border); color: var(--danger-text); border-radius: 4px; background: transparent; cursor: pointer; font-size: 12px;";
+  rejectBtn.addEventListener("click", async () => {
+    if (!confirm("Reject this proposed change?")) return;
+    acceptBtn.disabled = true;
+    rejectBtn.disabled = true;
+    try {
+      await Ipc.stagingReject({ proposalId: mode.proposal_id });
+      showToast("Rejected");
+      closeStagingPreview();
+    } catch (err) {
+      alert("Reject failed: " + formatError(err));
+      acceptBtn.disabled = false;
+      rejectBtn.disabled = false;
+    }
+  });
+  host.appendChild(rejectBtn);
+  host.appendChild(
+    iconButton({
+      title: "Close preview",
+      svg: Icons.close(),
+      onClick: () => closeStagingPreview(),
     }),
   );
 });

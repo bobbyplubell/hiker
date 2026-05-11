@@ -5,6 +5,8 @@
 // status: vault-home-recent-activity-detail
 // status: vault-home-recent-activity-author-filter
 // status: vault-home-recent-activity-unrollback
+// status: staging-review-activity-detail-filter
+// status: staging-bulk-apply-reject
 //
 // Vault home view: stats / recently modified / recently accessed widgets +
 // recent-activity tile that expands into a filtered detail pane. Owns the
@@ -13,7 +15,7 @@
 // the host via callbacks so this module never touches the editor.
 
 import type { ChangeRow, ChangeOp } from "../snapshotPreview";
-import { Ipc, type VaultHomeStats, type RecentNote } from "../ipc";
+import { Ipc, type VaultHomeStats, type RecentNote, type Proposal } from "../ipc";
 import { Logger } from "../logger";
 import { Icons } from "../icons";
 import {
@@ -23,6 +25,20 @@ import {
 } from "../panels/controller";
 
 type DetailView = null | { kind: "recent-activity" };
+
+type TimelineRow =
+  | { kind: "change"; row: ChangeRow }
+  | { kind: "proposal"; row: Proposal };
+
+function timelineAuthorClass(t: TimelineRow): string {
+  if (t.kind === "change") return t.row.author_class;
+  const cls = t.row.metadata?.author_class;
+  return typeof cls === "string" ? cls : "agent";
+}
+
+function timelineTimestampMs(t: TimelineRow): number {
+  return t.kind === "change" ? t.row.timestamp_ms : t.row.created_at_ms;
+}
 
 export interface VaultHomeDeps extends PanelDeps {
   editorPaneEl: HTMLElement;
@@ -53,6 +69,14 @@ export interface VaultHomeDeps extends PanelDeps {
   // status: tab-kinds
   /// Open a page-kind tab (e.g. home-detail for activity-widget clicks).
   onOpenPage?: (kind: string, payload?: Record<string, string>) => void;
+  // status: staging-review-activity-detail-filter
+  /// Open a staging proposal as a read-only preview buffer (reuses the
+  /// snapshot-preview diff-toggle pattern).
+  onOpenStagingProposal: (proposal: Proposal) => void | Promise<void>;
+  /// Accept a proposal — calls `Ipc.stagingAccept` + refreshes.
+  onAcceptStaging: (proposal: Proposal) => Promise<void>;
+  /// Reject a proposal — calls `Ipc.stagingReject` + refreshes.
+  onRejectStaging: (proposal: Proposal) => Promise<void>;
 }
 
 export interface VaultHomeApi {
@@ -116,6 +140,7 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   let allFiltersOnce = false;
   let recentlyRestoredFromId: number | null = null;
   let activityRows: ChangeRow[] = [];
+  let proposals: Proposal[] = [];
   let statsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   function isVisible(): boolean {
@@ -369,12 +394,22 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
       Logger.error("ui::vault-home", "recent_changes failed", { err });
       activityRows = [];
     }
+    try {
+      proposals = await Ipc.stagingList();
+    } catch (err) {
+      Logger.error("ui::vault-home", "staging_list failed", { err });
+      proposals = [];
+    }
     renderActivityDetail();
   }
 
   function renderActivityDetail(): void {
     const presentClasses = new Set<string>();
     for (const r of activityRows) presentClasses.add(r.author_class);
+    for (const p of proposals) {
+      const cls = typeof p.metadata?.author_class === "string" ? p.metadata.author_class : "agent";
+      presentClasses.add(cls);
+    }
 
     const ALWAYS_SHOW: readonly string[] = ["user", "agent"];
     const allClasses = new Set<string>([...ALWAYS_SHOW, ...presentClasses]);
@@ -386,6 +421,8 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     }
 
     deps.detailFiltersEl.replaceChildren();
+
+    // Render author-class filter pills.
     const sortedClasses = [...allClasses].sort();
     for (const cls of sortedClasses) {
       const pill = document.createElement("button");
@@ -411,14 +448,144 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
       deps.detailFiltersEl.appendChild(pill);
     }
 
-    const visible = activityRows.filter((r) =>
-      activeAuthorFilters.has(r.author_class),
-    );
-    deps.detailCountEl.textContent = `${visible.length} of ${activityRows.length}`;
+    // Build unified timeline
+    const timelineRows: TimelineRow[] = [
+      ...activityRows.map((r): TimelineRow => ({ kind: "change", row: r })),
+      ...proposals.map((p): TimelineRow => ({ kind: "proposal", row: p })),
+    ];
+    timelineRows.sort((a, b) => timelineTimestampMs(b) - timelineTimestampMs(a));
 
-    deps.detailListEl.replaceChildren(
-      ...visible.map((r) => buildActivityDetailRow(r)),
-    );
+    const visible = timelineRows.filter((t) => {
+      if (activeAuthorFilters.size === 0) return true;
+      return activeAuthorFilters.has(timelineAuthorClass(t));
+    });
+
+    if (proposals.length > 0) {
+      deps.detailCountEl.textContent = `${proposals.length} pending · ${visible.length} total events`;
+    } else {
+      deps.detailCountEl.textContent = `${visible.length} items`;
+    }
+
+    const listChildren: HTMLElement[] = [];
+
+    if (proposals.length > 0) {
+      const acceptAllRow = document.createElement("li");
+      acceptAllRow.style.cssText = "padding:4px 8px;display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--border-divider)";
+      const acceptAllBtn = document.createElement("button");
+      acceptAllBtn.className = "row-action";
+      acceptAllBtn.textContent = `Accept all (${proposals.length})`;
+      acceptAllBtn.title = "Confirm then batch-apply every pending proposal.";
+      acceptAllBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Accept all ${proposals.length} pending proposals?\n\nEach proposal will be drift-checked against its target file before writing.`)) return;
+        try {
+          await Ipc.stagingAcceptAll();
+        } catch (err) {
+          alert(`Accept all failed: ${deps.formatErr(err)}`);
+          return;
+        }
+        await refreshActivityDetail();
+      });
+      acceptAllRow.appendChild(acceptAllBtn);
+      listChildren.push(acceptAllRow);
+    }
+
+    listChildren.push(...visible.map((t) => buildTimelineRow(t)));
+    deps.detailListEl.replaceChildren(...listChildren);
+  }
+
+  function buildTimelineRow(t: TimelineRow): HTMLElement {
+    if (t.kind === "change") {
+      return buildActivityDetailRow(t.row);
+    }
+    return buildProposalRow(t.row);
+  }
+
+  // status: staging-review-activity-detail-filter
+  function buildProposalRow(p: Proposal): HTMLElement {
+    const li = document.createElement("li");
+    li.classList.add("clickable");
+    li.style.cursor = "pointer";
+    li.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      void deps.onOpenStagingProposal(p);
+    });
+
+    const line = document.createElement("div");
+    line.className = "row-line";
+
+    // Proposal type indicator.
+    const op = document.createElement("span");
+    op.className = "activity-op";
+    const surfaceLabel = p.surface === "mcp-tool-call" ? "Write" :
+      p.surface === "trails" ? (p.action.includes("trail") ? "Trail draft" : "Waypoint") :
+      p.surface === "batch-mutation" ? "Batch" : p.action;
+    op.textContent = surfaceLabel;
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = p.target_path;
+    if (p.trail_id) name.title = `Trail: ${p.trail_id}`;
+
+    const right = document.createElement("span");
+    right.className = "row-right";
+
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = relativeTime(Math.floor(p.created_at_ms / 1000));
+    when.title = new Date(p.created_at_ms).toLocaleString();
+
+    const surface = document.createElement("span");
+    surface.className = "activity-author";
+    surface.textContent = p.surface;
+    surface.title = `Source: ${p.surface}`;
+
+    right.append(when, surface);
+    line.append(op, name, right);
+    li.appendChild(line);
+
+    // Accept / Reject action buttons.
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+
+    const acceptBtn = document.createElement("button");
+    acceptBtn.className = "row-action";
+    acceptBtn.style.color = "var(--accent)";
+    acceptBtn.style.borderColor = "var(--accent)";
+    acceptBtn.textContent = "Accept";
+    acceptBtn.title = "Drift-check the proposed write against the current file and apply.";
+    acceptBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await deps.onAcceptStaging(p);
+      } catch (err) {
+        alert(`Accept failed: ${deps.formatErr(err)}`);
+        return;
+      }
+      await refreshActivityDetail();
+    });
+    actions.appendChild(acceptBtn);
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "row-action";
+    rejectBtn.style.color = "var(--danger-text)";
+    rejectBtn.style.borderColor = "var(--danger-text)";
+    rejectBtn.textContent = "Reject";
+    rejectBtn.title = "Discard the proposal without writing. No changelog row.";
+    rejectBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await deps.onRejectStaging(p);
+      } catch (err) {
+        alert(`Reject failed: ${deps.formatErr(err)}`);
+        return;
+      }
+      await refreshActivityDetail();
+    });
+    actions.appendChild(rejectBtn);
+
+    li.appendChild(actions);
+    return li;
   }
 
   function buildActivityDetailRow(r: ChangeRow): HTMLElement {

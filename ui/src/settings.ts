@@ -336,6 +336,9 @@ const SECTIONS: SectionSpec[] = [
         writeScope: "user", control: { kind: "number", min: 1, max: 3600, step: 1 } },
       { key: "llm.audit.log_full_prompt", label: "Log full prompt/response",
         writeScope: "user", control: { kind: "bool" } },
+      { key: "llm.background.review_required", label: "Review required (background)",
+        desc: "When on, background LLM features write to staging instead of mutating notes directly.",
+        writeScope: "vault", control: { kind: "bool" } },
     ],
   },
   {
@@ -368,6 +371,7 @@ const SECTIONS: SectionSpec[] = [
     ],
   },
   {
+    // status: agent-write-review-settings-toggles
     // status: mcp-settings-ui-section
     id: "mcp",
     title: "MCP server",
@@ -396,6 +400,9 @@ const SECTIONS: SectionSpec[] = [
         writeScope: "vault", control: { kind: "bool" } },
       { key: "mcp.tools.allow_redacted_lookup", label: "Allow redacted-body lookup",
         desc: "When on, agents passing scope can fetch redacted bodies. Default off.",
+        writeScope: "vault", control: { kind: "bool" } },
+      { key: "mcp.tools.review_required", label: "Review required",
+        desc: "When on, MCP write tools route through staging (manual review) instead of writing directly.",
         writeScope: "vault", control: { kind: "bool" } },
       // Per-tool toggles (status: mcp-tool-toggles). Live-applied.
       { key: "mcp.tools.search_notes_enabled",   label: "Tool: search_notes",

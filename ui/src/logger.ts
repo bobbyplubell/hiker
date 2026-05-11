@@ -34,6 +34,7 @@ export type UiTarget =
   | "ui::vault-home"
   | "ui::queue-detail"
   | "ui::chat"
+  | "ui::editor"
   | "ui::mutations"
   | "ui::snapshot-preview"
   | "ui::trash"

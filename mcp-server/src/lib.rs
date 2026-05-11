@@ -33,6 +33,7 @@ use hiker_core::changes::Changes;
 use hiker_core::config::{McpConfig, TasksConfig};
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
+use hiker_core::staging::Staging;
 use hiker_core::store::Store;
 use hiker_core::tasks::Queue as TaskQueue;
 use hiker_core::vault::Vault;
@@ -82,6 +83,13 @@ pub struct McpDeps {
     /// `1004 disabled` rather than letting external agents check work
     /// out that no one will drain.
     pub llm_enabled: bool,
+    /// Shared staging instance for proposal-based writes. When
+    /// `[mcp.tools].review_required` is true, MCP write tools route
+    /// through `staging.propose()`. Created by the Tauri layer at
+    /// vault open and shared with the MCP handler.
+    ///
+    /// status: agent-write-review-mode
+    pub staging: Arc<Staging>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +220,7 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         embedder_provider: deps.embedder_provider,
         config: deps.config.clone(),
         tools: deps.tools.clone(),
+        staging: deps.staging.clone(),
         audit,
         tasks: deps.tasks,
         default_lease_secs: deps.tasks_config.lease.default_secs,

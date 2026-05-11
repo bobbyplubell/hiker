@@ -13,6 +13,7 @@ use hiker_core::indexer::{
     route_watcher_events, start_indexer, IndexJob, IndexStatus, IndexerHandle, ProgressEvent,
 };
 use hiker_core::search::{self, LexicalOpts, SearchModes, SearchResponse, SemanticOpts};
+use hiker_core::staging::{Staging, AcceptOutcome, Proposal, StagingFilter};
 use hiker_core::store::{ChunkBounds, RecentNote, RelatedHit, Store, VaultStats};
 use hiker_core::trash::{Trash, TrashEntry, TrashListItem};
 use hiker_core::watcher::{FileEvent, Watcher};
@@ -39,6 +40,13 @@ pub(crate) struct VaultSession {
     /// Subscribed by a tokio task that re-emits each append as
     /// `hiker:changes-appended` for the home-page activity widget.
     changes: Arc<Changes>,
+    /// Staging area for proposed writes (see docs/settings.md "## Staging
+    /// review"). Created at vault open, passed to the MCP server so write
+    /// tools can route proposals through it when `[mcp.tools].review_required`
+    /// is true.
+    ///
+    /// status: agent-write-review-mode
+    pub(crate) staging: Arc<Staging>,
     /// status: autosave-backend-module
     /// Owns all `<vault>/.hiker/autosave/` writes and recovery. Same
     /// module-discipline shape as `core::store` / `core::changes` —
@@ -553,6 +561,7 @@ async fn restart_mcp_server(state: &State<'_, AppState>, updated: &Config) {
             session.audit.clone(),
             session.tasks.clone(),
             session.mcp_tools.clone(),
+            session.staging.clone(),
         );
         drop(old);
         inputs
@@ -560,7 +569,7 @@ async fn restart_mcp_server(state: &State<'_, AppState>, updated: &Config) {
     if !updated.mcp.enabled {
         return;
     }
-    let (vault, root, jobs, embedder_provider, read_store, watcher, changes, audit, tasks, mcp_tools) =
+    let (vault, root, jobs, embedder_provider, read_store, watcher, changes, audit, tasks, mcp_tools, staging) =
         restart_inputs;
     let deps = hiker_mcp::McpDeps {
         vault,
@@ -576,6 +585,7 @@ async fn restart_mcp_server(state: &State<'_, AppState>, updated: &Config) {
         tasks,
         tasks_config: updated.tasks.clone(),
         llm_enabled: updated.llm.enabled,
+        staging,
     };
     match hiker_mcp::start(deps).await {
         Ok(handle) => {
@@ -812,6 +822,16 @@ async fn open_vault_at_inner(
         Changes::open(&root).map_err(|e| HikerError::Io(format!("changes db: {e}")))?,
     );
 
+    // Open the staging area for proposed writes. Created at vault open,
+    // lives for the duration of the session. The MCP server references
+    // this instance to route write tools through propose() when
+    // `[mcp.tools].review_required` is true.
+    //
+    // status: agent-write-review-mode
+    let staging = Arc::new(
+        Staging::open(&root).map_err(|e| HikerError::Io(format!("staging: {e}")))?,
+    );
+
     // status: autosave-backend-module, autosave-store-layout
     // Open the per-vault autosave store. Failure is fatal at vault open
     // (a future tick would just keep failing silently otherwise).
@@ -1020,7 +1040,7 @@ async fn open_vault_at_inner(
     // status: mcp-server-crate
     // Start the in-process MCP server. Failure to bind logs and continues —
     // the user's vault is more important than MCP availability.
-    let mcp = match start_mcp(&vault, &root, &indexer, &watcher, &changes, &read_store, &config, &audit, &tasks, &mcp_tools).await {
+    let mcp = match start_mcp(&vault, &root, &indexer, &watcher, &changes, &read_store, &config, &audit, &tasks, &mcp_tools, &staging).await {
         Ok(handle) => Some(handle),
         Err(hiker_mcp::StartError::Disabled) => None,
         Err(e) => {
@@ -1125,6 +1145,7 @@ async fn open_vault_at_inner(
         indexer,
         watcher,
         changes,
+        staging,
         autosave,
         config: RwLock::new(config),
         read_store,
@@ -2666,6 +2687,7 @@ async fn start_mcp(
     audit: &Arc<hiker_core::audit::AgentLog>,
     tasks: &Arc<hiker_core::tasks::Queue>,
     mcp_tools: &Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    staging: &Arc<Staging>,
 ) -> Result<hiker_mcp::McpServerHandle, hiker_mcp::StartError> {
     let deps = hiker_mcp::McpDeps {
         vault: vault.clone(),
@@ -2681,6 +2703,7 @@ async fn start_mcp(
         tasks: tasks.clone(),
         tasks_config: config.tasks.clone(),
         llm_enabled: config.llm.enabled,
+        staging: staging.clone(),
     };
     hiker_mcp::start(deps).await
 }
@@ -3387,6 +3410,152 @@ async fn start_config_watcher(
     }
 }
 
+// status: staging-review-activity-detail-filter
+// status: staging-bulk-apply-reject
+// Tauri command surface for core::staging. Each command is the standard
+// shape: parse args → snapshot session deps → call core → translate errors
+// → return DTO.
+
+#[derive(Debug, Default, Deserialize)]
+struct StagingFilterArg {
+    path: Option<String>,
+    trail_id: Option<String>,
+    surface: Option<String>,
+    session_id: Option<String>,
+}
+
+impl From<StagingFilterArg> for StagingFilter {
+    fn from(a: StagingFilterArg) -> Self {
+        StagingFilter {
+            path: a.path,
+            trail_id: a.trail_id,
+            surface: a.surface,
+            session_id: a.session_id,
+        }
+    }
+}
+
+#[tauri::command]
+fn staging_list(
+    state: State<'_, AppState>,
+    filter: Option<StagingFilterArg>,
+) -> Result<Vec<Proposal>, String> {
+    let result = (|| -> Result<Vec<Proposal>, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let f: StagingFilter = filter.unwrap_or_default().into();
+        session.staging.list(&f).map_err(|e| e.to_string())
+    })();
+    log_cmd_result("staging_list", result)
+}
+
+#[tauri::command]
+fn staging_count(state: State<'_, AppState>) -> Result<u32, String> {
+    let result = (|| -> Result<u32, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session
+            .staging
+            .count(&StagingFilter::default())
+            .map_err(|e| e.to_string())
+    })();
+    log_cmd_result("staging_count", result)
+}
+
+#[tauri::command]
+fn staging_accept(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> Result<AcceptOutcome, String> {
+    let result = (|| -> Result<AcceptOutcome, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let outcome = session
+            .staging
+            .accept(&proposal_id, &session.vault, Some(&session.changes))
+            .map_err(|e| e.to_string())?;
+        Ok(outcome)
+    })();
+    let r = log_cmd_result("staging_accept", result);
+    // status: staging-review-activity-detail-filter
+    // Emit so every active surface (activity detail, tree, trails, etc.)
+    // can refresh after a proposal is accepted.
+    if r.is_ok() {
+        let _ = app.emit("hiker:staging-changed", ());
+    }
+    r
+}
+
+#[tauri::command]
+fn staging_reject(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> Result<(), String> {
+    let result = (|| -> Result<(), String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session
+            .staging
+            .reject(&proposal_id)
+            .map_err(|e| e.to_string())
+    })();
+    let r = log_cmd_result("staging_reject", result);
+    if r.is_ok() {
+        let _ = app.emit("hiker:staging-changed", ());
+    }
+    r
+}
+
+#[tauri::command]
+fn staging_accept_all(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<AcceptOutcome>, String> {
+    let result = (|| -> Result<Vec<AcceptOutcome>, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session
+            .staging
+            .accept_all(
+                &StagingFilter::default(),
+                &session.vault,
+                Some(&session.changes),
+            )
+            .map_err(|e| e.to_string())
+    })();
+    let r = log_cmd_result("staging_accept_all", result);
+    if r.is_ok() {
+        let _ = app.emit("hiker:staging-changed", ());
+    }
+    r
+}
+
+/// Read the proposed `.md` content for a staging proposal so the frontend
+/// can open it as a read-only preview buffer with the snapshot-preview diff
+/// toggle pattern.
+///
+/// status: staging-review-activity-detail-filter
+#[tauri::command]
+fn staging_content(
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> Result<String, String> {
+    let result = (|| -> Result<String, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        session
+            .staging
+            .content(&proposal_id)
+            .map_err(|e| e.to_string())
+    })();
+    log_cmd_result("staging_content", result)
+}
+
+// status: staging-review-activity-detail-filter
+// status: staging-bulk-apply-reject
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -3469,6 +3638,12 @@ pub fn run() {
             trails_containing_note,
             trail_set_active,
             trail_set_append_cursor,
+            staging_list,
+            staging_count,
+            staging_accept,
+            staging_reject,
+            staging_accept_all,
+            staging_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
