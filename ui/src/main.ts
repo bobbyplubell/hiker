@@ -1247,10 +1247,6 @@ const settingsPane: SettingsPaneApi = mountSettingsPane({
   },
 });
 
-settingsBtn.addEventListener("click", () => {
-  void settingsPane.toggle();
-});
-
 // status: settings-pane-keybind
 // `settings.open` chord: `Mod-,` (Cmd-, on macOS, Ctrl-, elsewhere). Same
 // dual-half shape as `search-keybind-ctrl-space` — registered in CM6 so it
