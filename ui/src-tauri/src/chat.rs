@@ -30,8 +30,9 @@ use hiker_core::indexer::{IndexJob, IndexJobTx};
 use hiker_core::llm::{GraniteLlmClient, LlmClient, Message, ToolDef};
 use hiker_core::prompts::Prompts;
 use hiker_core::sessions::{self, SessionId, SessionMeta};
+use hiker_core::ChatContextBlock;
 use hiker_mcp::McpAgentDispatcher;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
@@ -140,32 +141,6 @@ impl Drop for TurnGuard {
     }
 }
 
-/// One context block the frontend pre-resolves and rides on the outgoing
-/// turn. The list is the *composed* list per the spec: auto-injected
-/// active note first (if any), then the explicit `@`-mentions in the
-/// order they appear in the user message — already de-duplicated by
-/// rel-path on the frontend (per `chat-input-at-mentions-dedup`).
-///
-/// `kind` is one of `"activeNote"`, `"selection"`, `"note"`. Only the
-/// `activeNote` kind participates in the consecutive-turn "still
-/// viewing" collapse (per `chat-active-note-context-injection`); the
-/// explicit `@`-mentions are always re-sent in full because the user
-/// asked for them on this turn.
-///
-/// status: chat-input-at-mentions
-/// status: chat-active-note-context-injection
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatContextBlock {
-    pub kind: String,
-    pub rel_path: String,
-    pub content: String,
-    /// Selection blocks carry a 1-based inclusive line range like
-    /// `"L42-L58"` for the framing line; absent for whole-note blocks.
-    #[serde(default)]
-    pub line_range: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ResumedTurnDto {
     pub user: String,
@@ -196,14 +171,27 @@ pub async fn chat_send(
     let turn_id = TurnId::from(turn_id);
     let prep = prepare_for_turn(&state)?;
     let sid = resolve_or_create_session(&state, &prep, session_id)?;
-    spawn_turn_task(
-        app,
-        prep,
-        sid.clone(),
-        turn_id,
-        Some(message),
-        context_blocks.unwrap_or_default(),
-    )?;
+
+    // status: llm-acp-client-optional
+    if !prep.acp_command.is_empty() {
+        spawn_acp_turn(
+            app,
+            prep,
+            sid.clone(),
+            turn_id,
+            message,
+            context_blocks.unwrap_or_default(),
+        )?;
+    } else {
+        spawn_turn_task(
+            app,
+            prep,
+            sid.clone(),
+            turn_id,
+            Some(message),
+            context_blocks.unwrap_or_default(),
+        )?;
+    }
     Ok(sid.0)
 }
 
@@ -221,7 +209,13 @@ pub async fn chat_continue(
     let turn_id = TurnId::from(turn_id);
     let sid = SessionId(session_id);
     let prep = prepare_for_turn(&state)?;
-    spawn_turn_task(app, prep, sid, turn_id, None, Vec::new()).map(|_| ())
+
+    // status: llm-acp-client-optional
+    if !prep.acp_command.is_empty() {
+        spawn_acp_turn(app, prep, sid, turn_id, String::new(), Vec::new()).map(|_| ())
+    } else {
+        spawn_turn_task(app, prep, sid, turn_id, None, Vec::new()).map(|_| ())
+    }
 }
 
 /// Tauri command: user-halt. Fires the `user_halt` arm of the stop
@@ -305,6 +299,12 @@ pub fn chat_session_list(state: State<'_, AppState>) -> Result<Vec<SessionListIt
 /// Tauri command: switch the active session to an existing on-disk one
 /// and return the resumed transcript. Backs the session-picker
 /// dropdown's "open this session" path.
+///
+/// status: llm-acp-client-optional
+/// ACP limitation: when an external agent is active, the session file
+/// is loaded only for display. Agent history is NOT seeded into the ACP
+/// session — the external agent always starts fresh each turn.
+/// ACP's `session/load` is not yet supported.
 #[tauri::command]
 pub fn chat_session_open(
     state: State<'_, AppState>,
@@ -528,6 +528,9 @@ struct TurnPreparation {
     model: String,
     provider: String,
     jobs: IndexJobTx,
+    // status: llm-acp-client-optional
+    acp_command: String,
+    mcp_port: Option<u16>,
 }
 
 /// Resolve the session id (passed in or implicit-active) or lazily
@@ -879,6 +882,10 @@ fn prepare_for_turn(state: &State<'_, AppState>) -> Result<TurnPreparation, Stri
         .render("chat_system", [("vault_name", vault_name.as_str())])
         .map_err(|e| e.to_string())?;
 
+    // status: llm-acp-client-optional
+    let mcp_port = mcp.addr().port();
+    let acp_command = cfg.acp.command.clone();
+
     Ok(TurnPreparation {
         client,
         dispatcher,
@@ -891,6 +898,8 @@ fn prepare_for_turn(state: &State<'_, AppState>) -> Result<TurnPreparation, Stri
         model: llm_cfg.provider.model.clone(),
         provider: llm_cfg.provider.backend.clone(),
         jobs: session.indexer.job_sender(),
+        acp_command,
+        mcp_port: Some(mcp_port),
     })
 }
 
@@ -898,4 +907,159 @@ fn registry_from_state(state: &State<'_, AppState>) -> Result<Arc<ChatRegistry>,
     let guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
     Ok(session.chat.clone())
+}
+
+/// Shared task spawn for `chat_send` and `chat_continue` via the ACP
+/// backend. Parallel to `spawn_turn_task` but calls
+/// `core::acp::run_acp_turn` instead of `core::agent::run_turn`.
+///
+/// status: llm-acp-client-optional
+fn spawn_acp_turn(
+    app: AppHandle,
+    prep: TurnPreparation,
+    session_id: SessionId,
+    turn_id: TurnId,
+    message: String,
+    context_blocks: Vec<ChatContextBlock>,
+) -> Result<(), String> {
+    let TurnPreparation {
+        acp_command,
+        mcp_port,
+        system_prompt,
+        registry,
+        audit,
+        vault_root,
+        jobs,
+        ..
+    } = prep;
+
+    let entry = registry
+        .entry(&session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+
+    let mcp_port = mcp_port.ok_or_else(|| "mcp server not running".to_string())?;
+    let command_line = acp_command.trim().to_string();
+    if command_line.is_empty() {
+        return Err("ACP command not configured".to_string());
+    }
+
+    let stop = StopSignal::new();
+    let (file_path, rel_path) = {
+        let mut guard = entry.lock().map_err(|e| e.to_string())?;
+        if guard.in_flight {
+            return Err("turn already in flight".to_string());
+        }
+        guard.in_flight = true;
+        guard.stop = stop.clone();
+        guard.system_prompt = system_prompt.clone();
+
+        // Inject context blocks as synthetic history for persistence.
+        let mut active_note_path: Option<String> = None;
+        for block in &context_blocks {
+            if block.rel_path.is_empty() {
+                continue;
+            }
+            let body = match block.kind.as_str() {
+                "activeNote" => {
+                    let same = guard.last_active_note.as_deref()
+                        == Some(block.rel_path.as_str());
+                    active_note_path = Some(block.rel_path.clone());
+                    if same {
+                        format!(
+                            "[hiker context] user is still viewing `{}`",
+                            block.rel_path
+                        )
+                    } else {
+                        format!(
+                            "[hiker context] user is currently viewing `{}` — its current buffer contents:\n\n{}",
+                            block.rel_path, block.content
+                        )
+                    }
+                }
+                "selection" => {
+                    let where_at = block
+                        .line_range
+                        .as_deref()
+                        .map(|r| format!("`{}` ({})", block.rel_path, r))
+                        .unwrap_or_else(|| format!("`{}`", block.rel_path));
+                    format!(
+                        "[hiker context] user attached the selection from {where_at}:\n\n{}",
+                        block.content
+                    )
+                }
+                _ => format!(
+                    "[hiker context] user attached `{}`:\n\n{}",
+                    block.rel_path, block.content
+                ),
+            };
+            guard.history.push(Message::user(body));
+        }
+        guard.last_active_note = active_note_path;
+
+        (guard.file_path.clone(), guard.rel_path.clone())
+    };
+
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+    let app_for_events = app.clone();
+    let event_pump = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let _ = app_for_events.emit("hiker:chat-event", &ev);
+        }
+    });
+
+    let entry_for_task = entry.clone();
+    let user_message_for_persist = message.clone();
+    tokio::spawn(async move {
+        let _guard = TurnGuard {
+            entry: entry_for_task.clone(),
+        };
+
+        let agent_audit = AgentAudit {
+            log: audit,
+            feature: "chat_system",
+        };
+        let outcome = hiker_core::acp::run_acp_turn(
+            &command_line,
+            &vault_root,
+            mcp_port,
+            &message,
+            &context_blocks,
+            &turn_id.0,
+            &tx,
+            stop,
+            Some(agent_audit),
+        )
+        .await;
+
+        match outcome {
+            Ok(out) => {
+                if !user_message_for_persist.is_empty() {
+                    let history = vec![
+                        Message::user(&user_message_for_persist),
+                        Message::assistant(&out.agent_text),
+                    ];
+                    persist_turn(
+                        &file_path,
+                        &rel_path,
+                        &user_message_for_persist,
+                        &history,
+                        &jobs,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id.0,
+                    turn_id = %turn_id.0,
+                    "acp turn errored",
+                );
+            }
+        }
+        drop(tx);
+        let _ = event_pump.await;
+    });
+
+    Ok(())
 }

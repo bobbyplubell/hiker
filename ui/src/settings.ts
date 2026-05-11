@@ -98,6 +98,9 @@ export interface SettingsConfig {
     audit: { log_full_prompt: boolean };
   };
   mcp: unknown;
+  acp: {
+    command: string;
+  };
 }
 
 // Mirror of `Config::default()` from `core::config`. Used by the per-row
@@ -166,6 +169,10 @@ const DEFAULTS = {
     direct_worker: { enabled: true, parallelism: 1 },
     expose_to_chat_agent: true,
     lease: { default_secs: 60, max_secs: 600 },
+  },
+  // Mirror of `AcpConfig::default()` in core/src/config.rs.
+  acp: {
+    command: "",
   },
 } as const;
 
@@ -431,11 +438,15 @@ const SECTIONS: SectionSpec[] = [
     rows: [],
   },
   {
+    // status: llm-acp-client-optional
     id: "acp",
     title: "ACP",
     defaultScope: "vault",
-    deferred: "External-agent picker lands when core::acp ships (see llm-acp-client-optional).",
-    rows: [],
+    rows: [
+      { key: "acp.command", label: "Agent command",
+        desc: "Full command line to launch the ACP agent. Empty = ACP disabled (uses built-in agent loop). The agent must be installed separately. Examples: \"auggie --acp\", \"gemini --acp\", \"cursor --acp\".",
+        writeScope: "vault", control: { kind: "string" } },
+    ],
   },
 ];
 

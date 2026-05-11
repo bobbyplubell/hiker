@@ -78,6 +78,8 @@ pub struct Config {
     pub tasks: TasksConfig,
     #[serde(default)]
     pub trails: TrailsConfig,
+    #[serde(default)]
+    pub acp: AcpConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -96,6 +98,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             tasks: TasksConfig::default(),
             trails: TrailsConfig::default(),
+            acp: AcpConfig::default(),
         }
     }
 }
@@ -124,6 +127,32 @@ impl Default for TrailsConfig {
 
 fn default_new_trail_dir() -> String {
     "trails/".to_string()
+}
+
+/// `[acp]` section. Configures the optional Agent Client Protocol backend
+/// for the chat panel. When `command` is non-empty, the chat panel routes
+/// through an external ACP agent instead of the built-in basic agent loop.
+/// The `command` value is the full command line to launch the agent (e.g.
+/// `"auggie --acp"`, `"gemini --acp"`, `"cursor --acp"`). The first
+/// whitespace-delimited word is the binary; the rest are arguments.
+/// The agent binary must be installed and on PATH independently.
+/// See `docs/acp.md`.
+///
+/// status: llm-acp-client-optional
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpConfig {
+    /// Full command line to launch the ACP agent. Empty string means
+    /// ACP is disabled. Split on whitespace; first token = binary,
+    /// remainder = args.
+    #[serde(default)]
+    pub command: String,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self { command: String::new() }
+    }
 }
 
 /// `[tasks]` section. Configures the unified work queue (`core::tasks`).
@@ -1361,6 +1390,9 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // ACP section. The agent can be overridden per vault.
+    // Also eligible at user scope for a global default.
+    EligibleKey { path: "acp.command",                      ty: ValueType::String },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[
@@ -1409,6 +1441,8 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // ACP section. Also eligible at user scope for a global default.
+    EligibleKey { path: "acp.command",                      ty: ValueType::String },
 ];
 
 fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {

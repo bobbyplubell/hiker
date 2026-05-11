@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod agent;
 pub mod audit;
 pub mod autosave;
@@ -26,3 +27,19 @@ pub mod watcher;
 pub use error::HikerError;
 pub use hash::hash_str;
 pub use vault::{DirEntryDto, EntryKind, Vault};
+
+/// Context block the frontend pre-resolves and sends alongside a chat
+/// turn. Shared between the HTTP/ACP adapter and the basic agent loop.
+/// Mirrors the frontend's `ChatContextBlock` interface from `chat.ts`.
+///
+/// status: chat-input-at-mentions
+/// status: chat-active-note-context-injection
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextBlock {
+    pub kind: String,
+    pub rel_path: String,
+    pub content: String,
+    #[serde(default)]
+    pub line_range: Option<String>,
+}
