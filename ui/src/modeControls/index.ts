@@ -77,7 +77,7 @@ export function mountModeControls(deps: ModeControlsDeps): ModeControlsApi {
     e.preventDefault();
     e.stopPropagation();
     const rect = deps.viewMenuBtn.getBoundingClientRect();
-    openContextMenu(rect.left, rect.bottom + 2, deps.buildViewMenuItems());
+    openContextMenu(rect.left, rect.bottom + 2, deps.buildViewMenuItems(), deps.viewMenuBtn);
   });
 
   return { register, render };

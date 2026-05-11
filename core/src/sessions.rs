@@ -403,7 +403,11 @@ mod tests {
         let p1 = create_session_file(dir.path(), &m1).unwrap();
         let p2 = create_session_file(dir.path(), &m2).unwrap();
         // Touch p2 last so its mtime is newer regardless of birth order.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Sleep ensures the file system registers a distinct timestamp;
+        // some CoW / overlay filesystems have coarse (1s) mtime granularity.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let _ = fs::write(&p2, "");  // truncation forces a visible mtime bump
+        std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(&p2, fs::read(&p2).unwrap()).unwrap();
         let _ = p1;
         let list = list_sessions(dir.path()).unwrap();

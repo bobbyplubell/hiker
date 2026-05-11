@@ -78,6 +78,8 @@ pub struct Config {
     pub tasks: TasksConfig,
     #[serde(default)]
     pub trails: TrailsConfig,
+    #[serde(default)]
+    pub acp: AcpConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -96,6 +98,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             tasks: TasksConfig::default(),
             trails: TrailsConfig::default(),
+            acp: AcpConfig::default(),
         }
     }
 }
@@ -124,6 +127,32 @@ impl Default for TrailsConfig {
 
 fn default_new_trail_dir() -> String {
     "trails/".to_string()
+}
+
+/// `[acp]` section. Configures the optional Agent Client Protocol backend
+/// for the chat panel. When `command` is non-empty, the chat panel routes
+/// through an external ACP agent instead of the built-in basic agent loop.
+/// The `command` value is the full command line to launch the agent (e.g.
+/// `"auggie --acp"`, `"gemini --acp"`, `"cursor --acp"`). The first
+/// whitespace-delimited word is the binary; the rest are arguments.
+/// The agent binary must be installed and on PATH independently.
+/// See `docs/acp.md`.
+///
+/// status: llm-acp-client-optional
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpConfig {
+    /// Full command line to launch the ACP agent. Empty string means
+    /// ACP is disabled. Split on whitespace; first token = binary,
+    /// remainder = args.
+    #[serde(default)]
+    pub command: String,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self { command: String::new() }
+    }
 }
 
 /// `[tasks]` section. Configures the unified work queue (`core::tasks`).
@@ -833,6 +862,9 @@ pub struct VaultConfig {
     /// status: active-trail-state
     #[serde(default)]
     pub active_trail: Option<String>,
+    /// User-set chat input height in CSS pixels, or 0 for auto-grow mode.
+    #[serde(default)]
+    pub chat_input_height: u32,
     #[serde(default)]
     pub tree: TreeConfig,
 }
@@ -851,6 +883,7 @@ impl Default for VaultConfig {
             show_sessions_in_tree: false,
             sidebar_mode: SidebarMode::default(),
             active_trail: None,
+            chat_input_height: 0,
             tree: TreeConfig::default(),
         }
     }
@@ -1253,6 +1286,9 @@ enum ValueType {
     /// Positive integer (fits in u32). Used for the LLM/agent knobs
     /// (`max_tokens`, `iteration_cap`, etc.) where 0 is meaningless.
     PositiveInt,
+    /// Non-negative integer (fits in u32). 0 is meaningful — used for
+    /// `vault.chat_input_height` (0 = auto-grow, >0 = user-set px).
+    NonNegativeInt,
     /// `auto | internal | external` for `[tasks] worker_preference`.
     WorkerPreference,
     /// `0..=65535` — used for `[mcp] port`. Distinct from `PositiveInt`
@@ -1280,6 +1316,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
     EligibleKey { path: "vault.chat_height",             ty: ValueType::UnitFraction },
+    EligibleKey { path: "vault.chat_input_height",       ty: ValueType::NonNegativeInt },
     EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
@@ -1353,6 +1390,9 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // ACP section. The agent can be overridden per vault.
+    // Also eligible at user scope for a global default.
+    EligibleKey { path: "acp.command",                      ty: ValueType::String },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[
@@ -1401,6 +1441,8 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.task_heartbeat_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_list_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
+    // ACP section. Also eligible at user scope for a global default.
+    EligibleKey { path: "acp.command",                      ty: ValueType::String },
 ];
 
 fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {
@@ -1444,6 +1486,10 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
         (ValueType::PositiveInt, J::Number(n)) => n
             .as_u64()
             .map(|u| u >= 1 && u <= u32::MAX as u64)
+            .unwrap_or(false),
+        (ValueType::NonNegativeInt, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= u32::MAX as u64)
             .unwrap_or(false),
         (ValueType::WorkerPreference, J::String(s)) => {
             matches!(s.as_str(), "auto" | "internal" | "external")

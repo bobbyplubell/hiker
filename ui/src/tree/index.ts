@@ -1057,7 +1057,7 @@ export function mountTree(deps: TreeDeps): TreeController {
         label: `Sort by  ▸  ${sortOrderLabel(treeSortOrder)}`,
         run: () => openSortByMenu(rect.right, rect.bottom),
       },
-    ]);
+    ], deps.sidebarActionsBtn);
   });
 
   const api: TreeApi = {

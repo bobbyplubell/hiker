@@ -52,6 +52,7 @@ export interface SettingsConfig {
     related_open: boolean;
     trash_expanded: boolean;
     chat_height: number;
+    chat_input_height: number;
     sidebar_width: number;
     discovery_width: number;
     show_sessions_in_tree: boolean;
@@ -97,6 +98,9 @@ export interface SettingsConfig {
     audit: { log_full_prompt: boolean };
   };
   mcp: unknown;
+  acp: {
+    command: string;
+  };
 }
 
 // Mirror of `Config::default()` from `core::config`. Used by the per-row
@@ -119,6 +123,7 @@ const DEFAULTS = {
     related_open: false,
     trash_expanded: false,
     chat_height: 0.30,
+    chat_input_height: 0,
     sidebar_width: 280,
     discovery_width: 320,
     show_sessions_in_tree: false,
@@ -164,6 +169,10 @@ const DEFAULTS = {
     direct_worker: { enabled: true, parallelism: 1 },
     expose_to_chat_agent: true,
     lease: { default_secs: 60, max_secs: 600 },
+  },
+  // Mirror of `AcpConfig::default()` in core/src/config.rs.
+  acp: {
+    command: "",
   },
 } as const;
 
@@ -429,11 +438,15 @@ const SECTIONS: SectionSpec[] = [
     rows: [],
   },
   {
+    // status: llm-acp-client-optional
     id: "acp",
     title: "ACP",
     defaultScope: "vault",
-    deferred: "External-agent picker lands when core::acp ships (see llm-acp-client-optional).",
-    rows: [],
+    rows: [
+      { key: "acp.command", label: "Agent command",
+        desc: "Full command line to launch the ACP agent. Empty = ACP disabled (uses built-in agent loop). The agent must be installed separately. Examples: \"auggie --acp\", \"gemini --acp\", \"cursor --acp\".",
+        writeScope: "vault", control: { kind: "string" } },
+    ],
   },
 ];
 

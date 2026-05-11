@@ -86,16 +86,6 @@ type SettingsScope = "user" | "vault";
 // write failed; the in-memory change still took effect for the session.
 const settings = createSettingsManager({ logTarget: "ui::app" });
 
-// `SettingsManager` is the canonical emitter for `settings-changed` on
-// the cross-module event bus. Subscribers (current + future panels) can
-// react to settings flips via the bus without holding a direct reference
-// to the manager. The `Settings`/`SettingsConfig` payload shape matches
-// what `set_setting` returned; per `applySettingsToUi`, that's the
-// merged `Config`.
-settings.onSettingsChanged((cfg) => {
-  emitBusEvent("settings-changed", cfg as unknown as Settings);
-});
-
 // Backwards-compat shim for the handful of host-side call sites below
 // (View menu, sidebar/related toggles, chat-panel resize) that read like
 // `persistSetting("vault", key, value)`. The panels themselves have moved
@@ -140,6 +130,7 @@ function applySettingsToUi(s: Settings): void {
     trashChevronEl,
     setChatEnabled: (on) => chatPanel.setEnabled(on),
     setChatHeight: (h) => chatPanel.setHeight(h),
+    setChatInputHeight: (px) => chatPanel.setInputHeight(px),
     setSidebarWidth: (px) => setSidebarWidthVar(px),
     setDiscoveryWidth: (px) => setDiscoveryWidthVar(px),
     setSidebarMode: (mode) => setSidebarMode(mode, false),
@@ -244,6 +235,10 @@ const chatPanel = mountChatPanel({
   onResizePersist: (fraction) => {
     if (!vaultIsOpen()) return;
     void persistSetting("vault", "vault.chat_height", fraction);
+  },
+  onInputHeightPersist: (heightPx) => {
+    if (!vaultIsOpen()) return;
+    void persistSetting("vault", "vault.chat_input_height", heightPx);
   },
   // status: chat-panel-note-link-render
   // status: editor-preview-tab-from-open-callsites
@@ -913,6 +908,10 @@ async function applyOpenedVault(path: string): Promise<void> {
   // status: task-queue-home-widget
   // Tile mounts pre-vault-open; re-fetch settings + snapshot now.
   void taskQueueTile.refresh();
+  // Re-seed the queue-detail worker toggles from the now-vault-bound
+  // config — the initial seed at module-load may have errored or
+  // resolved against a not-yet-vault-bound config.
+  void queueDetail.api.refreshFromSettings();
 
   // status: settings-load-once-at-startup
   // Seed View menu / tree / panel state from the merged settings. Failures
@@ -1948,6 +1947,14 @@ const trailsPanel: TrailsController | null = sidebarTrailsBodyEl
       openNote: (rel, opts) => openFile(rel, opts ?? {}).then(() => undefined),
       focusEditor: () => editor.focus(),
       rootEl: sidebarTrailsBodyEl,
+      // `core::trails::remove_waypoint` cascades through `core::ops::delete`
+      // which suppresses the watcher for deleted paths, so the
+      // `hiker:file-changed`-driven refresh can't fire. Refresh the trash
+      // panel + vault-home activity surface explicitly instead.
+      onWaypointRemoved: () => {
+        void trash.api.refresh();
+        vaultHome.api.notifyChangesAppended();
+      },
     })
   : null;
 // Refresh on external active-trail mutations — `applySettingsToUi`
@@ -2417,6 +2424,14 @@ interface LlmWarningPayload {
 // chat. Longer TTL than the default toast so the message is readable.
 void listen<LlmWarningPayload>("hiker:llm-warning", (event) => {
   showToast(event.payload.message, undefined, 8000);
+});
+
+// External edits to either config.toml fire this event. Reload through
+// the same applySettingsToUi path as vault open + set_setting writes so
+// every surface that reflects a setting (View menu, tree sort, panels,
+// chat) repaints from the live Config.
+void listen<Settings>("hiker:config-reloaded", (event) => {
+  applySettingsToUi(event.payload);
 });
 
 // ---------- watcher → editor integration ----------

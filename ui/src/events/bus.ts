@@ -1,8 +1,8 @@
 // Tiny typed event bus for cross-module UI events. Emitters publish a
 // named event with a typed payload; subscribers register a callback for
 // the events they care about. The bus is the seam that decouples the
-// "something happened" producer (a sidebar toggle handler, a settings
-// write, a vault swap) from the N panels that want to react.
+// "something happened" producer (a sidebar toggle handler, a vault swap)
+// from the N panels that want to react.
 //
 // Pure: no DOM, no Tauri, no IPC. Listeners run synchronously on the
 // emitter's thread; a throwing listener is logged and the remaining
@@ -12,14 +12,11 @@
 // here plus call sites. The compiler then enforces matching payload
 // shapes on every `emit` / `on` pair.
 //
-// Pairs with `bug-persist-setting-duplicated-per-module`: `SettingsManager`
-// is the canonical emitter for `settings-changed` — the host wires its
-// `onSettingsChanged` callback to `emit("settings-changed", cfg)` so any
-// panel can subscribe via the bus rather than holding a direct reference
-// to the manager.
+// The real-time settings sync path is `hiker:config-reloaded` (a Tauri
+// event backed by the config-file watcher). The frontend listener calls
+// `applySettingsToUi` directly — no bus indirection needed.
 
 import { Logger } from "../logger";
-import type { Settings } from "../app/settingsApply";
 
 /// Typed event surface. Add a row here, then `emit` / `on` are typed for
 /// it everywhere.
@@ -33,10 +30,6 @@ export interface EventMap {
   /// Fires when the active vault is being closed (no current consumer in
   /// v1; declared so future close paths have a typed seam).
   "vault-closed": Record<string, never>;
-  /// Fires after a successful `set_setting` write, carrying the merged
-  /// `Settings` snapshot returned by core. Wired from
-  /// `SettingsManager.onSettingsChanged` in the host.
-  "settings-changed": Settings;
 }
 
 export type EventName = keyof EventMap;

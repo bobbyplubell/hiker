@@ -463,6 +463,7 @@ mod tests {
             open_paths: vec!["a.md".into(), "b.md".into()],
             active_path: Some("b.md".into()),
             preview_path: Some("c.md".into()),
+            open_tab_kinds: HashMap::new(),
             saved_at_ms: 0,
         };
         a.save_tab_state(s.clone()).unwrap();

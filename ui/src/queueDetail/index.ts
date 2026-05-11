@@ -26,6 +26,7 @@ import {
 } from "../panels/controller";
 import { Classes, Selectors } from "../style/classes";
 import { Icons } from "../icons";
+import { on } from "../events/bus";
 
 type Priority = "low" | "normal" | "high";
 type TaskShape = "direct" | "agent";
@@ -123,6 +124,12 @@ export interface QueueDetailDeps extends PanelDeps {
 export interface QueueDetailApi {
   // `isVisible` / `setVisible` live on the `PanelController` wrapper.
   setFilter(f: FilterPill): void;
+  /// Re-fetch settings and re-seed the worker toggles. Called by the
+  /// host after a vault opens and by the bus `vault-opened` subscriber,
+  /// because `mountQueueDetail` runs at module-load before any vault is
+  /// open so the initial `getSettings` can resolve against a
+  /// not-yet-vault-bound config.
+  refreshFromSettings(): Promise<void>;
   /// Tear down event subscriptions. Currently never called (the page
   /// stays mounted for the lifetime of the app).
   destroy(): Promise<void>;
@@ -261,17 +268,30 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
     direct_worker: { enabled: boolean };
     expose_to_chat_agent: boolean;
   }
-  void Ipc.getSettings<{ tasks: TasksConfigShape }>()
-    .then((cfg) => {
+
+  async function refreshFromSettings(): Promise<void> {
+    try {
+      const cfg = await Ipc.getSettings<{ tasks: TasksConfigShape }>();
       if (directToggle) directToggle.checked = cfg.tasks.direct_worker.enabled;
       if (exposeToggle) exposeToggle.checked = cfg.tasks.expose_to_chat_agent;
       if (prefSelect) prefSelect.value = cfg.tasks.worker_preference;
-    })
-    .catch((err) => {
+    } catch (err) {
       Logger.error("ui::queue-detail", "get_settings (tasks pane) failed", {
         err,
       });
-    });
+    }
+  }
+
+  // Initial seed — may resolve against a not-yet-vault-bound config;
+  // `refreshFromSettings` is called again from `applyOpenedVault` and
+  // the `vault-opened` bus event to fix that.
+  void refreshFromSettings();
+
+  // Re-seed whenever a vault opens (belt-and-suspenders with the host's
+  // `applyOpenedVault` call — covers future open paths).
+  on("vault-opened", () => {
+    void refreshFromSettings();
+  });
 
   function paintPills(): void {
     for (const btn of Array.from(root.querySelectorAll<HTMLButtonElement>(Selectors.QUEUE_PILLS))) {
@@ -280,8 +300,15 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
     }
     // Worker toggles ride with the LLM-tasks filter — hide when that
     // pill is off (no LLM rows visible → toggles aren't relevant).
+    // Re-seed toggles from settings when they become visible so a user
+    // who opens the page mid-session doesn't see stale state (the
+    // initial seed runs before any vault is open).
     const togglesEl = root.querySelector<HTMLElement>('[data-section="toggles"]');
-    if (togglesEl) togglesEl.hidden = !activeFilters.has("tasks");
+    if (togglesEl) {
+      const wasHidden = togglesEl.hidden;
+      togglesEl.hidden = !activeFilters.has("tasks");
+      if (wasHidden && !togglesEl.hidden) void refreshFromSettings();
+    }
   }
 
   function togglePill(f: FilterPill): void {
@@ -780,6 +807,7 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
 
   const api: QueueDetailApi = {
     setFilter,
+    refreshFromSettings,
     destroy: async () => {
       if (unlistenQueue) {
         unlistenQueue();

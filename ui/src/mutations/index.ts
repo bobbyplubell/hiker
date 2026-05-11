@@ -169,7 +169,7 @@ export function mountMutationsMenu(
     e.preventDefault();
     e.stopPropagation();
     const rect = deps.buttonEl.getBoundingClientRect();
-    openContextMenu(rect.left, rect.bottom + 2, buildItems());
+    openContextMenu(rect.left, rect.bottom + 2, buildItems(), deps.buttonEl);
   });
 
   void (async () => {

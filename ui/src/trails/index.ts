@@ -53,6 +53,13 @@ import { activeTrailStore } from "../app/state";
 
 export interface TrailsDeps extends PanelDeps {
   rootEl: HTMLElement;
+  /// Fired after a successful `removeWaypoint` → `refresh()`. The host
+  /// uses this to refresh the trash panel + vault-home activity surface,
+  /// because `core::trails::remove_waypoint` cascades through
+  /// `core::ops::delete` which suppresses the watcher for deleted paths,
+  /// so the `hiker:file-changed`-driven refresh path can't fire for
+  /// these writes. Mirrors `onWaypointAppended` on `TreeDeps`.
+  onWaypointRemoved?: () => void;
 }
 
 export interface TrailsApi {
@@ -189,7 +196,7 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
       disabled: trails.length === 0,
       run: () => openAllTrailsPicker(rect.left, rect.bottom),
     });
-    openContextMenu(rect.left, rect.bottom, items);
+    openContextMenu(rect.left, rect.bottom, items, anchor);
   }
 
   function openAllTrailsPicker(x: number, y: number): void {
@@ -618,6 +625,11 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
         waypointId: w.waypoint_id,
       });
       await refresh();
+      // Notify the host so the trash panel + vault-home activity
+      // surface pick up the cascaded deletes. `core::ops::delete`
+      // suppresses the watcher for deleted paths, so the
+      // `hiker:file-changed`-driven refresh path can't fire here.
+      deps.onWaypointRemoved?.();
       const removed = outcome.removed_count;
       if (removed > 1) {
         const sides = removed - 1;
