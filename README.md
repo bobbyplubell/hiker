@@ -18,7 +18,7 @@ Multimodal means non-markdown sources (PDFs, images, audio, web captures) are in
 The same vault is navigable by a human in the desktop UI and by agents over MCP, with identical search, related-notes, and trail semantics on both sides.
 
 <p align="center">
-  <img src="images/screenshot_1.png" alt="Hiker editor with sidebar tree, live-preview markdown, and discovery panel" width="900">
+  <img src="images/screenshot_2.png" alt="Hiker editor with sidebar tree, live-preview markdown, and discovery panel" width="900">
 </p>
 
 
