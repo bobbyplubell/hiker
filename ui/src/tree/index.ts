@@ -125,6 +125,11 @@ export interface TreeDeps extends PanelDeps {
   /// fire for these writes. See
   /// `bug-add-to-trail-verbs-dont-refresh-panel`.
   onWaypointAppended?: () => void;
+  // status: tree-context-properties
+  /// Open the note-properties inspector for a note. Wired by the host
+  /// to `openPropertiesTab(rel)`; fires from the Properties context-menu
+  /// entry on tree rows.
+  onOpenProperties?: (rel: string) => void;
 }
 
 export interface TreeApi {
@@ -858,7 +863,11 @@ export function mountTree(deps: TreeDeps): TreeController {
         danger: true,
         run: () => deleteFromTree(entry),
       });
-      items.push({ label: "Properties", disabled: true });
+      // status: tree-context-properties
+      items.push({
+        label: "Properties",
+        run: () => deps.onOpenProperties?.(entry.rel_path),
+      });
       openContextMenu(e.clientX, e.clientY, items);
     });
   }

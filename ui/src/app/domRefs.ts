@@ -84,6 +84,8 @@ export interface DomRefs {
     sendBtnEl: HTMLButtonElement;
     sessionMenuBtnEl: HTMLButtonElement;
     sessionMenuLabelEl: HTMLElement;
+    // status: chat-panel-expand-to-editor
+    expandBtnEl: HTMLButtonElement;
   };
   settingsPane: {
     paneEl: HTMLElement;
@@ -108,6 +110,10 @@ export interface DomRefs {
     tasksSection: HTMLElement | null;
     tasksHeader: HTMLElement | null;
     tasksSummary: HTMLElement | null;
+  };
+  // status: note-properties-tab
+  propertiesPane: {
+    paneEl: HTMLElement;
   };
 }
 
@@ -199,6 +205,8 @@ export function captureDomRefs(): DomRefs {
       sendBtnEl: byId<HTMLButtonElement>("chat-send-btn"),
       sessionMenuBtnEl: byId<HTMLButtonElement>("chat-session-menu-btn"),
       sessionMenuLabelEl: byId("chat-session-menu-label"),
+      // status: chat-panel-expand-to-editor
+      expandBtnEl: byId<HTMLButtonElement>("chat-expand-btn"),
     },
     settingsPane: {
       paneEl: byId("settings-pane"),
@@ -223,6 +231,10 @@ export function captureDomRefs(): DomRefs {
       tasksSection: maybeId("vault-home-tasks"),
       tasksHeader: maybeId("vault-home-tasks-header"),
       tasksSummary: maybeId("vault-home-tasks-summary"),
+    },
+    // status: note-properties-tab
+    propertiesPane: {
+      paneEl: byId("properties-pane"),
     },
   };
 }

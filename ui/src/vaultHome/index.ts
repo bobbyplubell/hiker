@@ -50,6 +50,9 @@ export interface VaultHomeDeps extends PanelDeps {
   /// Hook fired before the home view becomes visible. Host uses it to drop
   /// the settings pane (mutually exclusive sub-modes).
   onBeforeShow?: () => void;
+  // status: tab-kinds
+  /// Open a page-kind tab (e.g. home-detail for activity-widget clicks).
+  onOpenPage?: (kind: string, payload?: Record<string, string>) => void;
 }
 
 export interface VaultHomeApi {
@@ -116,7 +119,9 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   let statsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   function isVisible(): boolean {
-    return deps.editorPaneEl.classList.contains("home-view");
+    // status: tab-kinds — visibility is driven by the `hidden` attribute
+    // set/cleared by renderActiveTab() in main.ts.
+    return !deps.vaultHomeEl.hidden;
   }
 
   async function refresh(): Promise<void> {
@@ -590,10 +595,11 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     initialVisible: isVisible(),
     applyOnMount: false,
     onSetVisible: (on) => {
+      // status: tab-kinds — visibility is driven by the `hidden` attribute,
+      // set/cleared by renderActiveTab() in main.ts. The controller's
+      // setVisible still runs the refresh on show for legacy callers.
       if (on) deps.onBeforeShow?.();
-      deps.editorPaneEl.classList.toggle("home-view", on);
       deps.vaultHomeEl.hidden = !on;
-      deps.homeBtn.classList.toggle("active", on);
       if (on) void refresh();
     },
   });

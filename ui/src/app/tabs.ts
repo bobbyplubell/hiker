@@ -26,6 +26,8 @@ export interface TabSnapshot {
   folder: string;
   dirty: boolean;
   preview: boolean;
+  // status: tab-kinds
+  kind: string;
 }
 
 export interface TabsDeps {
@@ -61,12 +63,10 @@ export interface TabsDeps {
   /// at call time rather than in deps.
   getOpenFileApi: () => OpenFileApi | null;
 
-  /// True when read-only preview surfaces (vault home, settings)
-  /// should hide on activation.
-  isVaultHomeVisible: () => boolean;
-  setVaultHomeVisible: (on: boolean) => void;
-  isSettingsPaneVisible: () => boolean;
-  setSettingsPaneVisible: (on: boolean) => Promise<unknown> | unknown;
+  /// Host callback: open or activate a `home`-kind tab. Called when
+  /// the last buffer tab is closed or a `home-detail` tab is closed
+  /// with no home-overview tab open.
+  onShowHome?: () => void;
 
   /// Save the active buffer (used by the close-dirty modal).
   save: () => Promise<boolean>;
@@ -125,58 +125,67 @@ export function mountTabs(deps: TabsDeps): TabsApi {
       if (out) out.savedState = ed.getState();
     }
     ed.resetDiffDecorations();
-    // Clear the outgoing buffer reference *before* the doc dispatch so
-    // CM6's synchronous update listeners (notably `statusUpdater` →
-    // `updateStatus()` → `isDirty()`) don't compare the incoming doc
-    // against the outgoing buffer's `loadedText`. Without this, the
-    // mid-switch dirty-check sees a doc/loadedText mismatch (the doc
-    // already swapped, the buffer pointer hasn't yet) and fires
-    // `promotePreviewIfActive()` against the outgoing preview tab —
-    // demoting it to sticky on every tab switch, contradicting the
-    // promotion-paths rule in `editor-preview-tab-promotion`.
-    deps.setBufferState({ buffer: null });
-    // Build the per-tab compartment effect list once via the host's
-    // `tabSwitchEffects`. setState restores compartments to whatever the
-    // target's saved state had; we re-apply path-dependent + global
-    // compartments so toggles (live preview, hide-frontmatter, word wrap,
-    // etc.) reflect the user's *current* preferences rather than the
-    // snapshotted ones.
-    const tabEffects = ed.tabSwitchEffects({
-      rel: target.buffer.path,
-      livePreviewEnabled: deps.getLivePreviewEnabled(),
-      hideFrontmatterEnabled: deps.getHideFrontmatterEnabled(),
-      readOnly: deps.inFlightMutationPaths.has(target.buffer.path),
-    });
-    if (target.savedState) {
-      // CM6's `view.setState` is the only path that restores undo history /
-      // selection / scroll; `applySavedState` wraps it + the follow-up
-      // compartment-reapply dispatch.
-      ed.applySavedState(target.savedState, tabEffects);
-    } else {
-      // First activation — dispatch loadedText into the existing state.
-      ed.dispatch({
-        changes: { from: 0, to: ed.getDocLength(), insert: target.buffer.loadedText },
-        effects: tabEffects,
+    // status: tab-kinds — only buffer-kind tabs carry CM6 state (save /
+    // restore / dispatch). Non-buffer tabs (home, queue, settings, agent,
+    // graph, properties) skip the CM6 dance entirely — their renderers
+    // manage their own DOM independently.
+    if (target.buffer.kind === "buffer") {
+      // Clear the outgoing buffer reference *before* the doc dispatch so
+      // CM6's synchronous update listeners (notably `statusUpdater` →
+      // `updateStatus()` → `isDirty()`) don't compare the incoming doc
+      // against the outgoing buffer's `loadedText`. Without this, the
+      // mid-switch dirty-check sees a doc/loadedText mismatch (the doc
+      // already swapped, the buffer pointer hasn't yet) and fires
+      // `promotePreviewIfActive()` against the outgoing preview tab —
+      // demoting it to sticky on every tab switch, contradicting the
+      // promotion-paths rule in `editor-preview-tab-promotion`.
+      deps.setBufferState({ buffer: null });
+      // Build the per-tab compartment effect list once via the host's
+      // `tabSwitchEffects`. setState restores compartments to whatever the
+      // target's saved state had; we re-apply path-dependent + global
+      // compartments so toggles (live preview, hide-frontmatter, word wrap,
+      // etc.) reflect the user's *current* preferences rather than the
+      // snapshotted ones.
+      const tabEffects = ed.tabSwitchEffects({
+        rel: target.buffer.path,
+        livePreviewEnabled: deps.getLivePreviewEnabled(),
+        hideFrontmatterEnabled: deps.getHideFrontmatterEnabled(),
+        readOnly: deps.inFlightMutationPaths.has(target.buffer.path),
       });
-      // The dispatch normalized loadedText through CM's doc — re-read so
-      // isDirty() doesn't immediately flag the buffer dirty after open.
-      target.buffer.loadedText = ed.getActiveText();
+      if (target.savedState) {
+        // CM6's `view.setState` is the only path that restores undo history /
+        // selection / scroll; `applySavedState` wraps it + the follow-up
+        // compartment-reapply dispatch.
+        ed.applySavedState(target.savedState, tabEffects);
+      } else {
+        // First activation — dispatch loadedText into the existing state.
+        ed.dispatch({
+          changes: { from: 0, to: ed.getDocLength(), insert: target.buffer.loadedText },
+          effects: tabEffects,
+        });
+        // The dispatch normalized loadedText through CM's doc — re-read so
+        // isDirty() doesn't immediately flag the buffer dirty after open.
+        target.buffer.loadedText = ed.getActiveText();
+      }
     }
     deps.setBufferState({ buffer: target.buffer, activePath: rel });
     target.lastActivatedAt = deps.bumpActivationCounter();
-    if (deps.isVaultHomeVisible()) deps.setVaultHomeVisible(false);
-    if (deps.isSettingsPaneVisible()) void deps.setSettingsPaneVisible(false);
     document.querySelectorAll("#tree li.active").forEach((el) => el.classList.remove("active"));
     document.querySelectorAll(".trash-row.active").forEach((el) => el.classList.remove("active"));
-    void deps.revealInTree(rel);
+    // status: tab-kinds — chunkBoundaries refresh and reveal-in-tree
+    // are buffer-only concepts. Non-buffer tabs have no CM6 view, no
+    // tree path, and no note-access tracking.
+    if (target.buffer.kind === "buffer") {
+      void deps.revealInTree(rel);
+      deps.refreshChunkBoundaries();
+      // status: note-access-tracking
+      Ipc.noteAccessed({ rel }).catch((err) => {
+        Logger.error("ui::app", "note_accessed failed", { err });
+      });
+    }
     deps.updateStatus();
-    deps.refreshChunkBoundaries();
     deps.renderTabStrip();
     deps.checkpointNav();
-    // status: note-access-tracking
-    Ipc.noteAccessed({ rel }).catch((err) => {
-      Logger.error("ui::app", "note_accessed failed", { err });
-    });
   }
 
   // status: editor-tab-strip
@@ -189,10 +198,14 @@ export function mountTabs(deps: TabsDeps): TabsApi {
     const entry = deps.openBuffers.get(rel);
     if (!entry) return;
     const isActive = deps.getActivePath() === rel;
-    const dirty = isActive
-      ? deps.isDirty()
-      : entry.buffer.loadedText !==
-        (entry.savedState?.doc.toString() ?? entry.buffer.loadedText);
+    // status: tab-kinds — only buffer-kind tabs carry a dirty guard.
+    // Non-buffer tabs close without prompting.
+    const isBufferKind = entry.buffer.kind === "buffer";
+    const dirty = isBufferKind &&
+      (isActive
+        ? deps.isDirty()
+        : entry.buffer.loadedText !==
+          (entry.savedState?.doc.toString() ?? entry.buffer.loadedText));
     if (dirty) {
       // We need the dirty buffer's edits visible in the modal context —
       // the user wants to see what they're saving/discarding. If it's
@@ -214,6 +227,13 @@ export function mountTabs(deps: TabsDeps): TabsApi {
     deps.openBuffers.delete(rel);
     // status: editor-preview-tab — clear the slot if we just closed it.
     if (deps.getPreviewTabPath() === rel) deps.setBufferState({ previewTabPath: null });
+    // status: tab-kinds — when closing a home-detail tab, return to
+    // the home overview (same as browser "back from detail to overview").
+    if (entry.buffer.kind === "home-detail") {
+      if (!deps.openBuffers.has("__hiker:home")) {
+        deps.onShowHome?.();
+      }
+    }
     // status: navigation-history-stack — drop history entries pointing at
     // the closed tab so back/forward never tries to revive a vanished buffer.
     deps.pruneNavTab(rel);
@@ -230,15 +250,8 @@ export function mountTabs(deps: TabsDeps): TabsApi {
       if (next) {
         activateTab(next);
       } else {
-        // No tabs left — clear the editor. Mirror what the existing
-        // delete-from-tree path does.
-        deps.setBufferState({ buffer: null, activePath: null });
-        deps.editor.dispatch({
-          changes: { from: 0, to: deps.editor.getDocLength(), insert: "" },
-        });
-        deps.setReadOnly(false);
-        deps.setVaultHomeVisible(true);
-        deps.updateStatus();
+        // No tabs left — open the home page.
+        deps.onShowHome?.();
       }
     }
     deps.renderTabStrip();
@@ -274,15 +287,44 @@ export function mountTabs(deps: TabsDeps): TabsApi {
     const activePath = deps.getActivePath();
     for (const [path, entry] of deps.openBuffers) {
       const slash = path.lastIndexOf("/");
-      const basename = slash >= 0 ? path.slice(slash + 1) : path;
+      let basename = slash >= 0 ? path.slice(slash + 1) : path;
+      // status: tab-kinds — produce human-readable labels for page-kind
+      // tabs so the strip says "Home" / "Queue" / etc. instead of the
+      // internal `__hiker:*` sentinel key.
+      if (path.startsWith("__hiker:home") && !path.includes("detail")) {
+        basename = "Home";
+      } else if (path.startsWith("__hiker:home-detail")) {
+        basename = "Recent activity";
+      } else if (path.startsWith("__hiker:queue")) {
+        basename = "Queue";
+      } else if (path.startsWith("__hiker:settings")) {
+        basename = "Settings";
+      } else if (path.startsWith("__hiker:agent")) {
+        basename = "Chat";
+      } else if (path.startsWith("__hiker:properties")) {
+        basename = path.replace(/^__hiker:properties:/, "");
+        basename = basename.slice(basename.lastIndexOf("/") + 1);
+      }
       const folder = slash >= 0 ? path.slice(0, slash) : "";
       const isActive = path === activePath && buffer?.mode.kind === "file";
-      const dirty = isActive
-        ? deps.isDirty()
-        : entry.savedState !== null
-          ? entry.savedState.doc.toString() !== entry.buffer.loadedText
-          : false;
-      out.push({ path, basename, folder, dirty, preview: entry.buffer.preview });
+      // status: tab-kinds — only buffer-kind tabs carry a dirty marker;
+      // non-buffer tabs (home, queue, settings, agent, graph, properties)
+      // have no dirty concept.
+      const isBufferKind = entry.buffer.kind === "buffer";
+      const dirty = isBufferKind &&
+        (isActive
+          ? deps.isDirty()
+          : entry.savedState !== null
+            ? entry.savedState.doc.toString() !== entry.buffer.loadedText
+            : false);
+      out.push({
+        path,
+        basename,
+        folder,
+        dirty,
+        preview: entry.buffer.preview,
+        kind: entry.buffer.kind,
+      });
     }
     return out;
   }

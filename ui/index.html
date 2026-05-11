@@ -203,6 +203,8 @@
         </div>
         <!-- status: settings-pane-mode, settings-pane-section-list -->
         <div id="settings-pane" hidden></div>
+        <!-- status: note-properties-tab -->
+        <div id="properties-pane" hidden></div>
         <footer id="status-bar">
           <div id="status-left">
             <span id="status-path"></span>
@@ -272,6 +274,10 @@
             <span class="chat-session-menu-chevron">▾</span>
           </button>
           <span class="chat-handle-spacer"></span>
+          <!-- status: chat-panel-expand-to-editor -->
+          <button id="chat-expand-btn" class="chat-handle-btn chat-handle-btn-square" title="Expand chat to editor pane" aria-label="Expand chat to editor pane" type="button" hidden>
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="4 8 1 12 4 12"/><polyline points="12 8 15 12 12 12"/></svg>
+          </button>
           <!-- Right: collapse toggle, small square button. -->
           <button id="chat-collapse-btn" class="chat-handle-btn chat-handle-btn-square active" title="Toggle chat" aria-label="Toggle chat" type="button">
             <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="8" cy="3" r="0.6" fill="currentColor"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/><line x1="6" y1="11.5" x2="10" y2="11.5"/></svg>

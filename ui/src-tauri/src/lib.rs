@@ -1805,6 +1805,70 @@ async fn note_accessed(state: State<'_, AppState>, rel: String) -> Result<(), St
     log_cmd_result("note_accessed", send_result)
 }
 
+// status: note-properties-tab-content
+/// DTO returned by `note_properties`. Mirrors `core::store::NoteProperties`
+/// plus the changes count from `core::changes`. The struct uses the same
+/// `#[serde(rename_all = "camelCase")]` as the core type.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotePropertiesDto {
+    pub path: String,
+    pub note_id: Option<String>,
+    pub path_ids_id: Option<String>,
+    pub mtime: Option<i64>,
+    pub size: Option<i64>,
+    pub content_hash: Option<String>,
+    pub extension: Option<String>,
+    pub indexed_at: Option<i64>,
+    pub embedder_version: Option<String>,
+    pub skipped: Option<bool>,
+    pub skip_reason: Option<String>,
+    pub chunk_count: Option<i64>,
+    pub last_accessed_at: Option<i64>,
+    pub change_count: Option<i64>,
+}
+
+#[tauri::command]
+fn note_properties(
+    state: State<AppState>,
+    rel: String,
+) -> Result<NotePropertiesDto, String> {
+    let result = (|| {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let read_store = session
+            .read_store
+            .lock()
+            .map_err(|_| "read_store mutex poisoned".to_string())?;
+        let mut props = read_store
+            .note_properties(&rel)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("note not indexed: {rel}"))?;
+        let change_count = session
+            .changes
+            .count_for_path(&rel)
+            .map_err(|e| e.to_string())?;
+        props.change_count = Some(change_count);
+        Ok(NotePropertiesDto {
+            path: props.path,
+            note_id: props.note_id,
+            path_ids_id: props.path_ids_id,
+            mtime: props.mtime,
+            size: props.size,
+            content_hash: props.content_hash,
+            extension: props.extension,
+            indexed_at: props.indexed_at,
+            embedder_version: props.embedder_version,
+            skipped: props.skipped,
+            skip_reason: props.skip_reason,
+            chunk_count: props.chunk_count,
+            last_accessed_at: props.last_accessed_at,
+            change_count: props.change_count,
+        })
+    })();
+    log_cmd_result("note_properties", result)
+}
+
 /// Resolve a chat `@<rel-path-without-extension>` token to a concrete
 /// vault path + file body. Probes `.md`, `.markdown`, `.txt` in order.
 /// Errors with "note not found: <rel>" if no extension resolves — the
@@ -3202,6 +3266,7 @@ pub fn run() {
             recent_notes_modified,
             recent_notes_accessed,
             note_accessed,
+            note_properties,
             recent_changes,
             changes_count,
             change_content,

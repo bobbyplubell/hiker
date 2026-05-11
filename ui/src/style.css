@@ -397,25 +397,16 @@ html, body, #app {
   white-space: nowrap;
 }
 
-/* status: vault-home-button — placeholder pane occupies the editor row
-   when home view is active. Actual content widgets land with
-   vault-home-screen. */
-#editor-pane.home-view #editor {
-  display: none;
-}
-#editor-pane:not(.home-view) #vault-home {
-  display: none;
-}
+/* status: tab-kinds — renderActiveTab() in main.ts manages visibility of all
+   center-pane content (CM6 editor, toolbar, status bar, vault home, settings,
+   queue, properties) based on activeKind(). The prior .home-view / .settings-view
+   CSS class-based visibility rules are replaced by hidden-attribute toggles. */
 
-/* status: settings-pane-mode — sub-mode of editor-pane state. The CM6
-   editor and vault-home are both hidden; the settings pane occupies the
-   editor row. Same shape as `home-view` to keep one mental model. */
-#editor-pane.settings-view #editor,
-#editor-pane.settings-view #vault-home {
-  display: none;
+#editor-pane #editor {
+  /* shown/hidden by renderActiveTab() */
 }
-#editor-pane:not(.settings-view) #settings-pane {
-  display: none;
+#vault-home {
+  /* shown/hidden by renderActiveTab() */
 }
 #settings-pane {
   overflow: auto;
@@ -796,9 +787,11 @@ html, body, #app {
   flex-shrink: 0;
 }
 
-/* status: vault-home-detail-views */
-#editor-pane.home-view #vault-home-overview[hidden] { display: none; }
-#editor-pane.home-view #vault-home-detail[hidden] { display: none; }
+/* status: vault-home-detail-views — overview/detail hidden toggles ride
+   the `hidden` attribute; renderActiveTab() manages the show/hide of the
+   pane root. */
+#vault-home-overview[hidden] { display: none; }
+#vault-home-detail[hidden] { display: none; }
 .vault-home-detail-count {
   color: var(--text-muted);
   font-size: 11px;
@@ -2980,6 +2973,55 @@ html, body, #app {
   font-weight: 500;
   min-width: 38px;
   text-align: center;
+}
+
+/* status: note-properties-tab */
+#properties-pane {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.props-section {
+  margin-bottom: 28px;
+}
+.props-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-divider);
+}
+.props-dl {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+.props-dl dt {
+  color: var(--text-muted);
+  text-align: right;
+}
+.props-dl dd {
+  color: var(--text-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.props-empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* status: chat-panel-expand-to-editor */
+#app.agent-tab-open #chat-region,
+#app.agent-tab-open #chat-resize-handle {
+  display: none;
+}
+#chat-expand-btn {
+  /* icon-only, styled by the chat-panel handle area */
 }
 </content>
 </invoke>

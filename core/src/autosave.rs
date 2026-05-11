@@ -16,7 +16,7 @@
 // status: autosave-no-watcher-suppression
 // status: autosave-backup-class
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,8 @@ pub enum AutosaveError {
 /// reopens on next vault open; `active_path` is the tab that gets
 /// activated; `preview_path` is the at-most-one preview slot's path
 /// (or `None` when no preview tab existed at flush time).
+/// `open_tab_kinds` records the `kind` discriminator per tab so the
+/// restore path knows whether to restore as buffer or page-kind.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TabState {
     #[serde(default)]
@@ -54,6 +56,9 @@ pub struct TabState {
     pub preview_path: Option<String>,
     #[serde(default)]
     pub saved_at_ms: i64,
+    // status: tab-kinds
+    #[serde(default)]
+    pub open_tab_kinds: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

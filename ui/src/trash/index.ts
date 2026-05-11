@@ -46,6 +46,7 @@ interface BufferLike {
   /// this module's `BufferLike` shape stay structurally compatible.
   token: unknown | null;
   mode: { kind: string } & Record<string, unknown>;
+  kind?: string;
 }
 
 export interface TrashDeps {
@@ -250,6 +251,7 @@ export function mountTrash(deps: TrashDeps): TrashController {
         path: trashRel,
         loadedText: deps.editor.getActiveText(),
         token: null,
+        kind: "buffer",
         mode: {
           kind: "trash",
           displayPath: item.original_path ?? item.trashed_name,

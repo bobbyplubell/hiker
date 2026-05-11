@@ -82,14 +82,11 @@ export function mountAutosave(deps: AutosaveDeps): AutosaveApi {
   const lastWritten: Map<string, string> = new Map();
 
   function isAutosavablePath(path: string): boolean {
-    // status: autosave-readonly-skipped — trash / snapshot previews
-    // have no own tab in `openBuffers`; the only way an entry sits in
-    // the map is via the `file` mode buffer flow. The check is here
-    // for the active-buffer branch below where the user might be
-    // looking at a read-only preview while a file buffer is also open.
+    // status: tab-kinds — only buffer-kind tabs participate in per-buffer
+    // content autosave (snapshot / trash previews produce no sidecar).
     const entry = deps.openBuffers.get(path);
     if (!entry) return false;
-    return entry.buffer.mode.kind === "file";
+    return entry.buffer.kind === "buffer" && entry.buffer.mode.kind === "file";
   }
 
   function activeBufferTextFor(path: string): string | null {
@@ -193,21 +190,25 @@ export function mountAutosave(deps: AutosaveDeps): AutosaveApi {
   }
 
   function buildTabState(): AutosaveTabState {
+    // status: tab-kinds — include ALL open tabs regardless of kind so
+    // the next vault open restores page-kind tabs alongside buffer tabs.
     const open_paths: string[] = [];
+    const open_tab_kinds: Record<string, string> = {};
     for (const [path, entry] of deps.openBuffers) {
-      if (entry.buffer.mode.kind !== "file") continue;
       open_paths.push(path);
+      open_tab_kinds[path] = entry.buffer.kind;
     }
     const activePath = deps.getActivePath();
     const buf = deps.getBuffer();
     const active_path =
-      buf && buf.mode.kind === "file" && activePath ? activePath : null;
+      buf && activePath ? activePath : null;
     const preview_path = deps.getPreviewTabPath();
     return {
       open_paths,
       active_path,
       preview_path,
       saved_at_ms: 0,
+      open_tab_kinds,
     };
   }
 

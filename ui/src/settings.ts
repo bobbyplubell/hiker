@@ -439,12 +439,10 @@ const SECTIONS: SectionSpec[] = [
 
 export interface SettingsPaneDeps {
   paneEl: HTMLElement;
-  editorPaneEl: HTMLElement;
   settingsBtn: HTMLButtonElement;
   vaultPathEl: HTMLElement;
   // Returns true if it's safe to swap the buffer (clean, or user picked
-  // Save / Discard); false on Cancel. Mirrors the editor's existing
-  // file-switch-guard-dirty modal.
+  // Save / Discard); false on Cancel.
   guardDirtyBuffer: () => Promise<boolean>;
   // Called when entering settings to ensure home view is hidden, and on
   // exit so the caller can decide what to swap back to. The pane itself
@@ -464,10 +462,13 @@ export interface SettingsPaneApi {
   setVisible(on: boolean): Promise<boolean>;
   /// Toggle. Same return shape as setVisible.
   toggle(): Promise<boolean>;
+  /// Refresh the pane content in place (e.g. after an external config
+  /// edit). // status: tab-kinds
+  refresh(): Promise<void>;
 }
 
 export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
-  const { paneEl, editorPaneEl, settingsBtn, vaultPathEl } = deps;
+  const { paneEl, vaultPathEl } = deps;
 
   // Per-section scope state (in-memory, per-session, not persisted —
   // settings.md "the choice is per-section and per-session, not persisted").
@@ -479,7 +480,9 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   for (const s of SECTIONS) sectionCollapsed.set(s.id, !!s.deferred);
 
   function isVisible(): boolean {
-    return editorPaneEl.classList.contains("settings-view");
+    // status: tab-kinds — visibility driven by the `hidden` attribute
+    // set/cleared by renderActiveTab() in main.ts.
+    return !paneEl.hidden;
   }
 
   async function setVisible(on: boolean): Promise<boolean> {
@@ -488,14 +491,10 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
       const ok = await deps.guardDirtyBuffer();
       if (!ok) return false;
       deps.onEnter();
-      editorPaneEl.classList.add("settings-view");
       paneEl.hidden = false;
-      settingsBtn.classList.add("active");
       await render();
     } else {
-      editorPaneEl.classList.remove("settings-view");
       paneEl.hidden = true;
-      settingsBtn.classList.remove("active");
     }
     return true;
   }
@@ -878,7 +877,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     return f;
   }
 
-  return { isVisible, setVisible, toggle };
+  return { isVisible, setVisible, toggle, refresh: render };
 }
 
 // Walk a dotted path through a record and return the leaf value, or

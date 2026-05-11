@@ -362,6 +362,19 @@ impl Changes {
         Ok(rows)
     }
 
+    // status: note-properties-tab-content
+    /// Count of changes rows for a single path. Used by the
+    /// `hiker_core::store::note_properties` response (changes section).
+    pub fn count_for_path(&self, path: &str) -> Result<i64, ChangesError> {
+        let conn = self.conn.lock().expect("changes mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM changes WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Pull the content blob for a given change row. Returns `None` for
     /// `op='deleted'` rows (which carry no content) and for unknown ids.
     /// status: changes-content-zstd — decodes the stored zstd frame

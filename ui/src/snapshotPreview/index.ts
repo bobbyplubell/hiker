@@ -53,6 +53,7 @@ interface BufferLike {
   /// Tauri command).
   token: unknown | null;
   mode: { kind: string } & Record<string, unknown>;
+  kind?: string;
 }
 
 export interface SnapshotPreviewDeps {
@@ -133,6 +134,7 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
       path: row.path,
       loadedText: deps.editor.getActiveText(),
       token: null,
+      kind: "buffer",
       mode: { kind: "snapshot", row, changeId: row.id, diffActive: false },
     });
     deps.editor.setReadOnly(true);

@@ -17,6 +17,17 @@ import type { ChangeRow } from "../snapshotPreview";
 import type { BufferToken } from "../ipc";
 import { createStore, type Store, type Unsubscribe } from "../store/createStore";
 
+// status: tab-kinds
+export type TabKind =
+  | "buffer"
+  | "home"
+  | "home-detail"
+  | "queue"
+  | "settings"
+  | "agent"
+  | "graph"
+  | "properties";
+
 /// Discriminated union of buffer modes. `file` is the normal editable
 /// buffer; the other two are read-only previews. Bundling per-mode state
 /// onto the variant makes invalid combinations (e.g. a trash buffer with
@@ -35,6 +46,10 @@ export type BufferMode =
 
 export interface Buffer {
   path: string;
+  /// tab-kinds — distinguishes buffer tabs from page-kind / agent / graph /
+  /// properties tabs so every cross-cutting concern (dirty marker, close
+  /// guard, autosave, mode-controls, reveal-in-tree) gates on kind.
+  kind: TabKind;
   loadedText: string;
   /// Opaque buffer-identity token issued by `core::ops::open_for_edit`
   /// and rotated by every successful `commit_buffer` /
@@ -74,7 +89,9 @@ export const bufferStore: Store<BufferState> = createStore<BufferState>({
 /// captured on tab switch so undo history / selection / scroll persist.
 ///
 /// Snapshot / trash buffers are *transient previews* on top of the
-/// active tab — they don't get their own tab entry.
+/// active tab — they don't get their own tab entry. Non-file entries
+/// (home, queue, settings, agent, graph, properties) are stored here
+/// alongside file-mode buffers; the kind determines rendering.
 export interface OpenBufferEntry {
   buffer: Buffer;
   /// CM6 state captured at last tab-deactivate. `null` until the user
@@ -88,6 +105,9 @@ export interface OpenBufferEntry {
 /// by `set`/`delete` calls in main.ts); `tabStore.set(map)` on every
 /// mutation re-fires the listeners with the same Map reference.
 /// `activationCounter` is a monotonic tick for last-activated ordering.
+/// Non-file entries (home, queue, settings, etc.) are stored here
+/// alongside file-mode buffers — the kind on the buffer entry
+/// distinguishes rendering.
 export interface TabState {
   openBuffers: Map<string, OpenBufferEntry>;
   activationCounter: number;
