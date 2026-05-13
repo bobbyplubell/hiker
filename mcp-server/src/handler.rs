@@ -12,7 +12,9 @@ use hiker_core::frontmatter;
 use hiker_core::indexer::IndexJobTx;
 use hiker_core::ops;
 use hiker_core::search::{self, SearchModes};
-use hiker_core::staging::{ProposalInput, Staging};
+use hiker_core::staging::{
+    apply_edit, find_all_matches, EditPayload, EditProposalInput, ProposalInput, Staging,
+};
 use hiker_core::store::Store;
 use hiker_core::tasks::{
     McpClientVia, Priority as TaskPriority, Queue as TaskQueue, QueueError,
@@ -161,6 +163,25 @@ pub struct WriteNoteParams {
     /// on-disk hash differs.
     #[serde(default)]
     pub expected_hash: Option<String>,
+}
+
+/// One span-anchored edit in an `edit_note` call. `replace_all = true`
+/// allows the anchor to match N times (all replaced); the default requires
+/// exactly one match.
+///
+/// status: mcp-tool-edit-note
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EditSpec {
+    pub old_str: String,
+    pub new_str: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditNoteParams {
+    pub rel_path: String,
+    pub edits: Vec<EditSpec>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -335,6 +356,25 @@ struct GetNoteFull {
     content_hash: String,
 }
 
+/// Response shape for `edit_note`. Either `status: "staged"` with the per-edit
+/// `staging_ids` (review mode) or `status: "written"` with the final
+/// `content_hash` (direct mode). `edit_count` is the number of edits in the
+/// originating call.
+///
+/// status: mcp-tool-edit-note
+#[derive(Debug, Serialize, JsonSchema)]
+struct EditOutcome {
+    rel_path: String,
+    status: &'static str,
+    edit_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    staging_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct WriteOutcome {
     rel_path: String,
@@ -427,7 +467,11 @@ impl HikerHandler {
     /// `expected_hash` is provided.
     #[tool(
         name = "write_note",
-        description = "Create or replace a note's body. Returns the new content hash."
+        description = "Create or replace a note's body. Returns the new content hash on a direct write. \
+                       NOTE: when the server is in review-required mode, the write is STAGED as a pending proposal \
+                       instead of hitting disk — the response is `{ status: \"staged\", staging_id }` and the file \
+                       will NOT be visible via `get_note` (which returns 1002 not_found) until the user accepts the \
+                       proposal. Use `list_pending_proposals` to confirm a staged write landed."
     )]
     pub async fn write_note(
         &self,
@@ -444,11 +488,44 @@ impl HikerHandler {
         outcome
     }
 
+    /// Apply one or more span-anchored patches to an existing note.
+    /// Validates anchors at receive time; on any failure the whole call
+    /// rejects and nothing stages.
+    ///
+    /// status: mcp-tool-edit-note
+    /// status: mcp-edit-note-validation
+    #[tool(
+        name = "edit_note",
+        description = "Apply one or more span-anchored patches to an existing note. Each `old_str` must match \
+                       exactly once unless `replace_all: true`. Refuses non-existent paths (use write_note to create). \
+                       Validation (path exists, per-edit anchor uniqueness, no textual overlap, anchors resolve against \
+                       the pre-application file) runs atomically — on any failure the whole call rejects. \
+                       NOTE: in review-required mode each edit STAGES as its own pending proposal (sharing a batch_id); \
+                       response carries `status: \"staged\"` + `staging_ids` and disk is unchanged until accepts."
+    )]
+    pub async fn edit_note(
+        &self,
+        params: Parameters<EditNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.edit_note_inner(&p).await;
+        self.state.audit.record(
+            "edit_note",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
     /// Merge fields into a note's YAML frontmatter. Deep-merge for nested
     /// maps; auto-stamps `hiker.author: agent-authored`.
     #[tool(
         name = "set_frontmatter",
-        description = "Deep-merge fields into a note's YAML frontmatter (auto-stamps hiker.author=agent-authored)."
+        description = "Deep-merge fields into a note's YAML frontmatter (auto-stamps hiker.author=agent-authored). \
+                       NOTE: in review-required mode the merged result is STAGED as a pending proposal — the file on \
+                       disk is unchanged until the user accepts. Response carries `status: \"staged\"` + `staging_id` \
+                       in that case. Use `list_pending_proposals` to confirm."
     )]
     pub async fn set_frontmatter(
         &self,
@@ -468,7 +545,9 @@ impl HikerHandler {
     /// Append a tag to a note's `tags` frontmatter list. Idempotent.
     #[tool(
         name = "apply_tag",
-        description = "Append a tag to a note's tags frontmatter list (idempotent)."
+        description = "Append a tag to a note's tags frontmatter list (idempotent). \
+                       NOTE: in review-required mode the tagged result is STAGED as a pending proposal — disk is \
+                       unchanged until the user accepts. Response carries `status: \"staged\"` + `staging_id` in that case."
     )]
     pub async fn apply_tag(
         &self,
@@ -488,7 +567,9 @@ impl HikerHandler {
     /// Remove a tag from a note's `tags` frontmatter list. No-op if absent.
     #[tool(
         name = "remove_tag",
-        description = "Remove a tag from a note's tags frontmatter list (no-op if absent)."
+        description = "Remove a tag from a note's tags frontmatter list (no-op if absent). \
+                       NOTE: in review-required mode the result is STAGED as a pending proposal — disk is unchanged \
+                       until the user accepts. Response carries `status: \"staged\"` + `staging_id` in that case."
     )]
     pub async fn remove_tag(
         &self,
@@ -829,6 +910,15 @@ impl HikerHandler {
             .unwrap_or(false);
 
         if review_required {
+            // status: staging-proposal-state — capture propose-time disk hash
+            // so eager recheck can detect drift before accept. `None` here is
+            // the create-shaped case (target path doesn't yet exist).
+            let source_hash = self
+                .state
+                .vault
+                .read_file_with_hash(&p.rel_path)
+                .ok()
+                .map(|(_, h)| h);
             let staging_id = self
                 .state
                 .staging
@@ -842,6 +932,7 @@ impl HikerHandler {
                         "tool": "write_note",
                         "session_id": CLIENT_ID,
                     })),
+                    source_hash,
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
@@ -882,6 +973,186 @@ impl HikerHandler {
         }
     }
 
+    /// status: mcp-tool-edit-note
+    /// status: mcp-edit-note-validation
+    async fn edit_note_inner(
+        &self,
+        p: &EditNoteParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_tool("edit_note")?;
+        if p.edits.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "edits: must contain at least one edit",
+                None,
+            ));
+        }
+
+        // Rule 1: path must exist. Creates flow through `write_note`.
+        let abs = self
+            .state
+            .vault
+            .abs_path(&p.rel_path)
+            .map_err(translate_hiker_err)?;
+        if !abs.exists() {
+            return Err(hiker_err(
+                ErrorCode(1002),
+                format!("note not found (use write_note to create): {}", p.rel_path),
+            ));
+        }
+
+        // Read the pre-application file once; every anchor resolves against
+        // this content (rule 4).
+        let (pre_content, pre_hash) = self
+            .state
+            .vault
+            .read_file_with_hash(&p.rel_path)
+            .map_err(translate_hiker_err)?;
+
+        // Rule 2 + 3: per-edit anchor uniqueness, then cross-edit overlap.
+        // Collect ranges in input order so error messages name the offending
+        // edit by its source index.
+        let mut per_edit_ranges: Vec<Vec<(usize, usize)>> = Vec::with_capacity(p.edits.len());
+        for (idx, e) in p.edits.iter().enumerate() {
+            if e.old_str.is_empty() {
+                return Err(ErrorData::invalid_params(
+                    format!("edit[{idx}]: old_str must not be empty"),
+                    None,
+                ));
+            }
+            let matches = find_all_matches(&pre_content, &e.old_str);
+            if matches.is_empty() {
+                return Err(hiker_err(
+                    ErrorCode(1003),
+                    format!("drift: edit[{idx}].old_str not found in {}", p.rel_path),
+                ));
+            }
+            if matches.len() > 1 && !e.replace_all {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "edit[{idx}].old_str matches {} ranges; pass replace_all=true to replace all",
+                        matches.len(),
+                    ),
+                    None,
+                ));
+            }
+            per_edit_ranges.push(matches);
+        }
+
+        // No-overlap check across edits. Flatten (range, edit_idx) and
+        // sort by start; consecutive overlapping ranges expose the pair.
+        let mut flat: Vec<(usize, usize, usize)> = Vec::new();
+        for (idx, ranges) in per_edit_ranges.iter().enumerate() {
+            for (s, e) in ranges {
+                flat.push((*s, *e, idx));
+            }
+        }
+        flat.sort_by_key(|r| r.0);
+        for w in flat.windows(2) {
+            let (_, a_end, a_idx) = w[0];
+            let (b_start, _, b_idx) = w[1];
+            if b_start < a_end {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "edits[{}] and edits[{}] resolve to overlapping byte ranges; merge them into one edit with a wider span",
+                        a_idx, b_idx,
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        // status: staging-review-pending-response
+        let review_required = self
+            .state
+            .tools
+            .read()
+            .map(|cfg| cfg.review_required)
+            .unwrap_or(false);
+
+        if review_required {
+            // Split into N staging proposals, one per edit, sharing a batch_id.
+            // `.md` sidecar stores `new_str` (the post-edit span content) for
+            // UI preview; accept re-resolves the anchor against current disk.
+            let mut inputs = Vec::with_capacity(p.edits.len());
+            for e in &p.edits {
+                let edit_payload = EditPayload {
+                    old_str: e.old_str.clone(),
+                    new_str: e.new_str.clone(),
+                    replace_all: e.replace_all,
+                };
+                inputs.push(EditProposalInput {
+                    surface: "mcp-tool-call".into(),
+                    action: "edit_note".into(),
+                    target_path: p.rel_path.clone(),
+                    content: Some(e.new_str.clone()),
+                    metadata: Some(serde_json::json!({
+                        "tool": "edit_note",
+                        "session_id": CLIENT_ID,
+                        "pre_content_hash": pre_hash,
+                    })),
+                    edit: edit_payload,
+                    // status: staging-proposal-state
+                    source_hash: Some(pre_hash.clone()),
+                });
+            }
+            let batch = self.state.staging.propose_batch(inputs).map_err(|e| {
+                tracing::error!(error = %e, "staging: propose_batch failed");
+                ErrorData::internal_error(e.to_string(), None)
+            })?;
+            return Ok(structured(
+                serde_json::to_value(EditOutcome {
+                    rel_path: p.rel_path.clone(),
+                    status: "staged",
+                    edit_count: p.edits.len() as u32,
+                    content_hash: None,
+                    staging_ids: batch.ids,
+                    batch_id: Some(batch.batch_id),
+                })
+                .unwrap_or(serde_json::Value::Null),
+            ));
+        }
+
+        // Direct mode: apply all edits transactionally and write once.
+        let mut current = pre_content.clone();
+        for e in &p.edits {
+            let payload = EditPayload {
+                old_str: e.old_str.clone(),
+                new_str: e.new_str.clone(),
+                replace_all: e.replace_all,
+            };
+            current = apply_edit(&current, &payload).map_err(|err| {
+                // Validation above means this should be unreachable; if a
+                // race occurred between validation and apply, surface it as
+                // 1003 drift rather than internal-error.
+                hiker_err(ErrorCode(1003), format!("drift: {err}"))
+            })?;
+        }
+        let new_hash = ops::agent_write_note(
+            &self.state.watcher,
+            &self.state.jobs,
+            &self.state.vault,
+            Some(&self.state.changes),
+            CLIENT_ID,
+            "edit_note",
+            &p.rel_path,
+            &current,
+            Some(&pre_hash),
+        )
+        .await
+        .map_err(translate_hiker_err)?;
+        Ok(structured(
+            serde_json::to_value(EditOutcome {
+                rel_path: p.rel_path.clone(),
+                status: "written",
+                edit_count: p.edits.len() as u32,
+                content_hash: Some(new_hash),
+                staging_ids: Vec::new(),
+                batch_id: None,
+            })
+            .unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
     async fn set_frontmatter_inner(
         &self,
         p: &SetFrontmatterParams,
@@ -897,10 +1168,12 @@ impl HikerHandler {
             .unwrap_or(false);
 
         if review_required {
-            let existing = self
+            // status: staging-proposal-state — capture propose-time disk hash
+            // alongside the read used for the frontmatter merge.
+            let (existing, source_hash) = self
                 .state
                 .vault
-                .read_file(&p.rel_path)
+                .read_file_with_hash(&p.rel_path)
                 .map_err(translate_hiker_err)?;
             let merged = frontmatter::merge_agent_patch(
                 &existing,
@@ -920,6 +1193,7 @@ impl HikerHandler {
                         "tool": "set_frontmatter",
                         "session_id": CLIENT_ID,
                     })),
+                    source_hash: Some(source_hash),
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
@@ -976,10 +1250,12 @@ impl HikerHandler {
             .unwrap_or(false);
 
         if review_required {
-            let existing = self
+            // status: staging-proposal-state — propose-time disk hash for eager
+            // drift recheck.
+            let (existing, source_hash) = self
                 .state
                 .vault
-                .read_file(&p.rel_path)
+                .read_file_with_hash(&p.rel_path)
                 .map_err(translate_hiker_err)?;
             // Read existing tags from the source so staging captures the
             // full resolved content (same merge-into-write shape as the
@@ -1021,6 +1297,7 @@ impl HikerHandler {
                         "tool": tool_name,
                         "session_id": CLIENT_ID,
                     })),
+                    source_hash: Some(source_hash),
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
@@ -1347,6 +1624,18 @@ impl HikerHandler {
                 );
                 r
             }
+            "edit_note" => {
+                let p: EditNoteParams = serde_json::from_value(raw_value.clone())
+                    .map_err(|e| format!("invalid edit_note args: {e}"))?;
+                let r = self.edit_note_inner(&p).await;
+                self.state.audit.record(
+                    "edit_note",
+                    &raw_value,
+                    audit_status(&r),
+                    audit_err(&r),
+                );
+                r
+            }
             "set_frontmatter" => {
                 let p: SetFrontmatterParams = serde_json::from_value(raw_value.clone())
                     .map_err(|e| format!("invalid set_frontmatter args: {e}"))?;
@@ -1461,7 +1750,12 @@ impl ServerHandler for HikerHandler {
             .with_server_info(Implementation::new("hiker", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Hiker MCP server. Read: search_notes, get_note, related_notes. \
-                 Write: write_note, set_frontmatter, apply_tag, remove_tag.",
+                 Write: write_note, edit_note, set_frontmatter, apply_tag, remove_tag. \
+                 Review mode: when the server is configured with review_required = true, write tools STAGE a \
+                 proposal instead of writing to disk — the response carries `status: \"staged\"` and a \
+                 `staging_id`, and the affected file will NOT be readable via get_note until the user accepts \
+                 the proposal in the hiker UI. If a write returns staged and a follow-up get_note returns \
+                 1002 not_found, that is expected; the write is pending human review, not lost.",
             )
     }
 }
@@ -1691,6 +1985,25 @@ impl Serialize for TaskListParams {
         let mut m = s.serialize_struct("TaskListParams", 2)?;
         m.serialize_field("states", &self.states)?;
         m.serialize_field("types", &self.types)?;
+        m.end()
+    }
+}
+impl Serialize for EditSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("EditSpec", 3)?;
+        m.serialize_field("old_str", &self.old_str)?;
+        m.serialize_field("new_str", &self.new_str)?;
+        m.serialize_field("replace_all", &self.replace_all)?;
+        m.end()
+    }
+}
+impl Serialize for EditNoteParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("EditNoteParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("edits", &self.edits)?;
         m.end()
     }
 }

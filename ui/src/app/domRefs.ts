@@ -19,10 +19,16 @@ export interface DomRefs {
     editorPaneEl: HTMLElement;
     saveBtn: HTMLButtonElement;
     diffBtn: HTMLButtonElement;
+    /// status: patch-review-agent-diff-toggle
+    agentDiffBtn: HTMLButtonElement;
     modeControlsEl: HTMLElement;
     viewMenuBtn: HTMLButtonElement;
     mutationsMenuBtn: HTMLButtonElement;
     tabStripEl: HTMLElement;
+    /// status: write-note-pending-banner
+    writeNotePendingBannerEl: HTMLElement;
+    writeNotePendingBannerLabelEl: HTMLElement;
+    writeNotePendingBannerBtn: HTMLButtonElement;
   };
   statusBar: {
     statusPathEl: HTMLElement;
@@ -140,10 +146,18 @@ export function captureDomRefs(): DomRefs {
       editorPaneEl: byId("editor-pane"),
       saveBtn: byId<HTMLButtonElement>("save-btn"),
       diffBtn: byId<HTMLButtonElement>("diff-btn"),
+      agentDiffBtn: byId<HTMLButtonElement>("agent-diff-btn"),
       modeControlsEl: byId("mode-controls"),
       viewMenuBtn: byId<HTMLButtonElement>("view-menu-btn"),
       mutationsMenuBtn: byId<HTMLButtonElement>("mutations-menu-btn"),
       tabStripEl: byId("tab-strip"),
+      writeNotePendingBannerEl: byId("write-note-pending-banner"),
+      writeNotePendingBannerLabelEl: byId<HTMLElement>(
+        "write-note-pending-banner",
+      ).querySelector<HTMLElement>(".write-note-pending-banner-label")!,
+      writeNotePendingBannerBtn: byId<HTMLElement>(
+        "write-note-pending-banner",
+      ).querySelector<HTMLButtonElement>(".write-note-pending-banner-btn")!,
     },
     statusBar: {
       statusPathEl: byId("status-path"),

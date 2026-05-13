@@ -80,6 +80,8 @@ pub struct Config {
     pub trails: TrailsConfig,
     #[serde(default)]
     pub acp: AcpConfig,
+    #[serde(default)]
+    pub staging: StagingConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -99,8 +101,41 @@ impl Default for Config {
             tasks: TasksConfig::default(),
             trails: TrailsConfig::default(),
             acp: AcpConfig::default(),
+            staging: StagingConfig::default(),
         }
     }
+}
+
+/// `[staging]` section. Behavior that applies regardless of which producer
+/// staged a proposal. See `docs/settings.md` §`[staging]` config section.
+///
+/// status: staging-config-section
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagingConfig {
+    /// When `true`, the `applyable → conflicted` state transition
+    /// immediately invokes `reject(id)`. Live-applied. Default false.
+    ///
+    /// status: staging-auto-reject-on-conflict
+    #[serde(default = "no")]
+    pub auto_reject_on_conflict: bool,
+    /// GC age threshold consumed by `Staging::gc` on vault open. Lifts the
+    /// previously-hardcoded 14-day value.
+    #[serde(default = "default_staging_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self {
+            auto_reject_on_conflict: false,
+            retention_days: default_staging_retention_days(),
+        }
+    }
+}
+
+fn default_staging_retention_days() -> u32 {
+    14
 }
 
 /// `[trails]` section. Configures trail-doc placement and other vault-wide
@@ -517,6 +552,7 @@ pub struct McpToolsConfig {
     #[serde(default = "yes")] pub related_notes_enabled: bool,
     // Writes (also gated by `writes_enabled` master flag):
     #[serde(default = "yes")] pub write_note_enabled: bool,
+    #[serde(default = "yes")] pub edit_note_enabled: bool,
     #[serde(default = "yes")] pub set_frontmatter_enabled: bool,
     #[serde(default = "yes")] pub apply_tag_enabled: bool,
     #[serde(default = "yes")] pub remove_tag_enabled: bool,
@@ -535,7 +571,7 @@ impl McpToolsConfig {
     pub fn tool_allowed(&self, name: &str) -> bool {
         let is_write = matches!(
             name,
-            "write_note" | "set_frontmatter" | "apply_tag" | "remove_tag"
+            "write_note" | "edit_note" | "set_frontmatter" | "apply_tag" | "remove_tag"
         );
         if is_write && !self.writes_enabled {
             return false;
@@ -545,6 +581,7 @@ impl McpToolsConfig {
             "get_note" => self.get_note_enabled,
             "related_notes" => self.related_notes_enabled,
             "write_note" => self.write_note_enabled,
+            "edit_note" => self.edit_note_enabled,
             "set_frontmatter" => self.set_frontmatter_enabled,
             "apply_tag" => self.apply_tag_enabled,
             "remove_tag" => self.remove_tag_enabled,
@@ -568,6 +605,7 @@ impl Default for McpToolsConfig {
             get_note_enabled: true,
             related_notes_enabled: true,
             write_note_enabled: true,
+            edit_note_enabled: true,
             set_frontmatter_enabled: true,
             apply_tag_enabled: true,
             remove_tag_enabled: true,
@@ -757,6 +795,9 @@ pub struct EditorConfig {
     pub show_chunk_boundaries: bool,
     #[serde(default = "no")]
     pub hide_frontmatter: bool,
+    // status: view-intraline-diff-toggle
+    #[serde(default = "no")]
+    pub intraline_diff: bool,
     #[serde(default = "default_tab_size")]
     pub tab_size: u8,
 }
@@ -771,6 +812,7 @@ impl Default for EditorConfig {
             show_whitespace: false,
             show_chunk_boundaries: false,
             hide_frontmatter: false,
+            intraline_diff: false,
             tab_size: 2,
         }
     }
@@ -1406,6 +1448,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.show_whitespace",        ty: ValueType::Bool },
     EligibleKey { path: "editor.show_chunk_boundaries",  ty: ValueType::Bool },
     EligibleKey { path: "editor.hide_frontmatter",       ty: ValueType::Bool },
+    EligibleKey { path: "editor.intraline_diff",         ty: ValueType::Bool },
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
@@ -1475,6 +1518,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.get_note_enabled",       ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.related_notes_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.write_note_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.edit_note_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
@@ -1490,6 +1534,9 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // ACP section. The agent can be overridden per vault.
     // Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
+    // status: staging-config-section
+    EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
+    EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[
@@ -1529,6 +1576,7 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.get_note_enabled",       ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.related_notes_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.write_note_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.edit_note_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
@@ -1543,6 +1591,9 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
     // ACP section. Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
+    // status: staging-config-section
+    EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
+    EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
 ];
 
 fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {

@@ -146,6 +146,14 @@ export interface ChatPanelOptions {
   /// `file-switch-guard-dirty`).
   /// status: chat-panel-note-link-render
   onOpenNoteLink: (rel: string) => void;
+  /// Open a staged proposal for review — same seam the activity widget
+  /// uses (`vaultHome` / `tree`). Used by the tool-call card's header
+  /// click when the result carries `status: "staged"`, so we don't call
+  /// `openFile` against a path that has no on-disk content yet
+  /// (`bug-chat-tool-card-no-link-for-staged-writes`). Host routes
+  /// through `openProposalReview`, which dispatches to patch-review or
+  /// write-note review via `note-open-routes-to-pending-review`.
+  onOpenStagingProposal: (proposal: { id: string; target_path: string }) => void;
   /// Cross-module read surface for the active editable buffer +
   /// selection. Replaces the prior `getActiveNote` / `getActiveSelection`
   /// closures over main.ts internals (`bug-chat-couples-to-main-buffer-globals`).
@@ -191,6 +199,24 @@ interface ToolCardEls {
   finalArgs: string | null;
   result: { ok: boolean; summary: string } | null;
   expanded: boolean;
+  /// Touched-note routing payload extracted from the tool result for
+  /// note-touching tools (`write_note` / `edit_note` / `set_frontmatter`
+  /// / `apply_tag` / `remove_tag`). When set, the head-click opens the
+  /// note (or its staged proposal); chevron-click still toggles.
+  /// `bug-chat-tool-card-no-link-for-staged-writes`.
+  touched: TouchedNoteRouting | null;
+}
+
+/// Resolved routing info for a note-touching tool call. `stagingIds`
+/// carries any pending proposal ids the result returned (singular
+/// `staging_id` for `write_note` / `set_frontmatter` / `apply_tag`,
+/// plural `staging_ids` for `edit_note`). When `stagingIds` is non-empty
+/// AND any of those ids is still in the live staging set, the head-click
+/// routes through `onOpenStagingProposal`; otherwise it falls back to
+/// opening the note directly.
+interface TouchedNoteRouting {
+  targetPath: string;
+  stagingIds: string[];
 }
 
 export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
@@ -209,6 +235,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     onResizePersist,
     onInputHeightPersist,
     onOpenNoteLink,
+    onOpenStagingProposal,
     bufferApi,
     toast,
   } = opts;
@@ -233,6 +260,34 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     assistantBubble: null,
     toolCards: new Map(),
   };
+
+  // status: staging-accept-reject-from-chat-card
+  // `bug-chat-tool-card-stale-after-cross-surface-accept` /
+  // `bug-chat-tool-card-no-link-for-staged-writes`.
+  //
+  // Local mirror of pending staging proposal ids, refreshed from
+  // `Ipc.stagingList()` on every `hiker:staging-changed` event. Used to
+  // (a) re-render the Accept/Reject buttons on tool cards so a
+  // cross-surface accept/reject (e.g. from the activity-detail page)
+  // clears them in the chat session too, and (b) decide whether the
+  // header-click on a touched-note tool card routes to the staging
+  // preview or directly to the on-disk note.
+  let pendingStagingIds: Set<string> = new Set();
+  async function refreshPendingStagingIds(): Promise<void> {
+    try {
+      const list = await Ipc.stagingList();
+      pendingStagingIds = new Set(list.map((p) => p.id));
+    } catch {
+      pendingStagingIds = new Set();
+    }
+    for (const c of renderState.toolCards.values()) {
+      renderActionButtons(c);
+    }
+  }
+  void refreshPendingStagingIds();
+  void listen("hiker:staging-changed", () => {
+    void refreshPendingStagingIds();
+  });
 
   // User-set input height in px. 0 = auto-grow mode (no manual override).
   let userInputHeight = 0;
@@ -688,18 +743,65 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       finalArgs: null,
       result: null,
       expanded: false,
+      touched: null,
     };
-    head.addEventListener("click", () => toggleCard(els));
+    // Chevron click expands; clicks elsewhere on the head route through
+    // `handleHeadClick`, which opens the touched note (or its staged
+    // proposal) for note-touching tool calls and falls back to toggling
+    // for everything else. The Accept/Reject button cluster, when
+    // present, lives inside the head and stops propagation itself.
+    // Pairs with `chat-tool-call-opens-touched-note` (still planned;
+    // this lands the routing seam plus the staged-write prong from
+    // `bug-chat-tool-card-no-link-for-staged-writes`).
+    chevron.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleCard(els);
+    });
+    head.addEventListener("click", () => handleHeadClick(els));
     head.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
-        toggleCard(els);
+        handleHeadClick(els);
       }
     });
 
     renderState.toolCards.set(callId, els);
     scrollToBottom();
     renderState.assistantBubble = null;
+  }
+
+  // Tools whose successful result identifies a single touched note.
+  // `chat-tool-call-opens-touched-note` resolution-rule tool list;
+  // `edit_note` is included per
+  // `bug-chat-tool-card-no-link-for-staged-writes`.
+  const TOUCHED_NOTE_TOOLS = new Set<string>([
+    "get_note",
+    "write_note",
+    "edit_note",
+    "set_frontmatter",
+    "apply_tag",
+    "remove_tag",
+  ]);
+
+  function handleHeadClick(c: ToolCardEls): void {
+    if (!c.touched) {
+      toggleCard(c);
+      return;
+    }
+    const stagedId = c.touched.stagingIds.find((id) => pendingStagingIds.has(id));
+    if (stagedId) {
+      // Staged: route through the staging-preview seam so the host
+      // lands the user in the appropriate review surface
+      // (`note-open-routes-to-pending-review`). Single seam for both
+      // `write_note` (singular `staging_id`) and `edit_note` (N
+      // `staging_ids` sharing a `batch_id`) — `openProposalReview` walks
+      // through `openFile`, which auto-routes by action.
+      onOpenStagingProposal({ id: stagedId, target_path: c.touched.targetPath });
+      return;
+    }
+    // Not staged (or staging proposal already resolved): the file
+    // exists on disk; open it directly.
+    onOpenNoteLink(c.touched.targetPath);
   }
 
   function toggleCard(c: ToolCardEls): void {
@@ -795,46 +897,166 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     c.resultSummaryEl.textContent = ` — ${summary}`;
     c.resultSummaryEl.classList.toggle("ok", ok);
     c.resultSummaryEl.classList.toggle("fail", !ok);
-    // Clear any prior accept/reject links before (re-)checking staging.
-    const prevAction = c.headEl.querySelector(".chat-tool-call-action");
-    if (prevAction) prevAction.remove();
-    // status: staging-accept-reject-from-chat-card
-    if (ok && output) {
-      try {
-        const parsed = JSON.parse(output);
-        if (parsed.staging_id && parsed.status === "staged") {
-          const actionEl = document.createElement("span");
-          actionEl.className = "chat-tool-call-action";
-          const acceptBtn = document.createElement("button");
-          acceptBtn.className = "chat-tool-call-action-accept";
-          acceptBtn.textContent = "Accept";
-          acceptBtn.addEventListener("click", async () => {
-            await Ipc.stagingAccept({ proposalId: parsed.staging_id });
-            actionEl.remove();
-            c.resultSummaryEl.textContent = " — ✓ Applied";
-            c.resultSummaryEl.classList.add("ok");
-            c.resultSummaryEl.classList.remove("fail");
-          });
-          const rejectBtn = document.createElement("button");
-          rejectBtn.className = "chat-tool-call-action-reject";
-          rejectBtn.textContent = "Reject";
-          rejectBtn.addEventListener("click", async () => {
-            await Ipc.stagingReject({ proposalId: parsed.staging_id });
-            actionEl.remove();
-            c.resultSummaryEl.textContent = " — ✗ Rejected";
-            c.glyphEl.textContent = "✗";
-            c.resultSummaryEl.classList.add("fail");
-            c.resultSummaryEl.classList.remove("ok");
-          });
-          actionEl.append(acceptBtn, rejectBtn);
-          c.headEl.appendChild(actionEl);
-        }
-      } catch {
-        /* ignore parse errors — output is an opaque best-effort channel */
-      }
-    }
+    // Resolve touched-note routing for note-touching tool calls so the
+    // head-click opens the right surface
+    // (`chat-tool-call-opens-touched-note`).
+    c.touched = resolveTouchedNote(c, output);
+    c.headEl.classList.toggle("has-touched", c.touched !== null);
+    renderActionButtons(c);
     if (c.expanded) renderExpanded(c);
     scrollToBottom();
+  }
+
+  /// Parse the tool result's JSON output and extract touched-note
+  /// routing info for note-touching tools. Resolution rule per
+  /// `chat-tool-call-opens-touched-note`: prefer the result's
+  /// `rel_path` / `path` field; fall back to the call's args. Carries
+  /// `staging_id` (write_note / set_frontmatter / apply_tag) and/or
+  /// `staging_ids` (edit_note) when the result is staged.
+  function resolveTouchedNote(c: ToolCardEls, output?: string): TouchedNoteRouting | null {
+    if (!c.result?.ok) return null;
+    if (!TOUCHED_NOTE_TOOLS.has(c.toolName)) return null;
+
+    let parsed: Record<string, unknown> | null = null;
+    if (output) {
+      try {
+        const v = JSON.parse(output);
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          parsed = v as Record<string, unknown>;
+        }
+      } catch {
+        /* fall through to args fallback */
+      }
+    }
+
+    const targetPath =
+      pickRelPath(parsed) ?? pickRelPathFromArgs(c.finalArgs ?? c.argsBuf);
+    if (!targetPath) return null;
+
+    const stagingIds: string[] = [];
+    if (parsed) {
+      const sid = parsed.staging_id;
+      if (typeof sid === "string" && sid) stagingIds.push(sid);
+      const sids = parsed.staging_ids;
+      if (Array.isArray(sids)) {
+        for (const v of sids) if (typeof v === "string" && v) stagingIds.push(v);
+      }
+    }
+    return { targetPath, stagingIds };
+  }
+
+  function pickRelPath(obj: Record<string, unknown> | null): string | null {
+    if (!obj) return null;
+    for (const k of ["rel_path", "path"]) {
+      const v = obj[k];
+      if (typeof v === "string" && v) return v;
+    }
+    return null;
+  }
+
+  function pickRelPathFromArgs(argsJson: string): string | null {
+    if (!argsJson.trim()) return null;
+    try {
+      const v = JSON.parse(argsJson);
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        return pickRelPath(v as Record<string, unknown>);
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  /// (Re-)render the Accept/Reject button cluster on the card head from
+  /// the current pending-staging set. Called from `appendToolResult` and
+  /// from the `hiker:staging-changed` listener so a cross-surface
+  /// accept/reject in another surface clears the buttons live
+  /// (`bug-chat-tool-card-stale-after-cross-surface-accept`).
+  function renderActionButtons(c: ToolCardEls): void {
+    const prevAction = c.headEl.querySelector(".chat-tool-call-action");
+    if (prevAction) prevAction.remove();
+    if (!c.touched) return;
+    const liveStagedIds = c.touched.stagingIds.filter((id) =>
+      pendingStagingIds.has(id),
+    );
+    if (liveStagedIds.length === 0) return;
+
+    // status: staging-accept-reject-from-chat-card
+    const actionEl = document.createElement("span");
+    actionEl.className = "chat-tool-call-action";
+    // Stop click propagation so the head's open-note routing doesn't
+    // fire when the user clicks Accept / Reject (the buttons live
+    // inside the head element).
+    actionEl.addEventListener("click", (ev) => ev.stopPropagation());
+
+    // `bug-write-note-review-accept-stale-proposal-id`: the captured
+    // `staging_id` can go stale when a write_note proposal is replayed
+    // / reissued through staging churn. For whole-file proposals
+    // (single captured id), refresh by `(target_path, action)` and
+    // pick the newest. For batch (`edit_note`) shapes the captured
+    // ids are still the source of truth — they're authoritative until
+    // accepted/rejected (staged once per `propose_batch`).
+    const resolveLiveProposalIds = async (): Promise<string[]> => {
+      if (!c.touched) return liveStagedIds;
+      if (liveStagedIds.length !== 1) return liveStagedIds;
+      const captured = liveStagedIds[0];
+      const targetPath = c.touched.targetPath;
+      try {
+        const live = await Ipc.stagingList({ path: targetPath });
+        const matches = live.filter(
+          (p) => p.action === c.toolName && p.target_path === targetPath,
+        );
+        if (matches.length === 0) return [captured];
+        if (matches.some((p) => p.id === captured)) return [captured];
+        matches.sort((a, b) => b.created_at_ms - a.created_at_ms);
+        return [matches[0].id];
+      } catch {
+        return [captured];
+      }
+    };
+
+    const acceptBtn = document.createElement("button");
+    acceptBtn.className = "chat-tool-call-action-accept";
+    acceptBtn.textContent = "Accept";
+    acceptBtn.addEventListener("click", async () => {
+      try {
+        const ids = await resolveLiveProposalIds();
+        let target = c.touched?.targetPath ?? null;
+        for (const id of ids) {
+          const outcome = await Ipc.stagingAccept({ proposalId: id });
+          target = outcome.target_path;
+        }
+        if (target) onOpenNoteLink(target);
+      } catch {
+        /* host listener will surface failure via toast on the IPC layer */
+      }
+      // Optimistic UX update; the `hiker:staging-changed` listener
+      // re-renders us authoritatively right after.
+      c.resultSummaryEl.textContent = " — ✓ Applied";
+      c.resultSummaryEl.classList.add("ok");
+      c.resultSummaryEl.classList.remove("fail");
+    });
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "chat-tool-call-action-reject";
+    rejectBtn.textContent = "Reject";
+    rejectBtn.addEventListener("click", async () => {
+      try {
+        const ids = await resolveLiveProposalIds();
+        for (const id of ids) {
+          await Ipc.stagingReject({ proposalId: id });
+        }
+      } catch {
+        /* host listener will surface failure via toast on the IPC layer */
+      }
+      c.resultSummaryEl.textContent = " — ✗ Rejected";
+      c.glyphEl.textContent = "✗";
+      c.resultSummaryEl.classList.add("fail");
+      c.resultSummaryEl.classList.remove("ok");
+    });
+
+    actionEl.append(acceptBtn, rejectBtn);
+    c.headEl.appendChild(actionEl);
   }
 
   function appendCapRow(turnId: string, completed: number): void {

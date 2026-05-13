@@ -22,8 +22,10 @@ export type NavState =
   | { kind: "home-detail"; view: "recent-activity" }
   | { kind: "queue-detail" }
   | { kind: "settings" }
+  | { kind: "properties"; path: string }
   | { kind: "trash-preview"; trashedName: string }
   | { kind: "snapshot-preview"; changeId: number; row: ChangeRow }
+  | { kind: "staging-preview"; proposalId: string; targetPath: string }
   | { kind: "empty" };
 
 export interface NavDeps {
@@ -66,6 +68,10 @@ function sameState(a: NavState | null, b: NavState): boolean {
       return a.trashedName === (b as { trashedName: string }).trashedName;
     case "snapshot-preview":
       return a.changeId === (b as { changeId: number }).changeId;
+    case "staging-preview":
+      return a.proposalId === (b as { proposalId: string }).proposalId;
+    case "properties":
+      return a.path === (b as { path: string }).path;
     default:
       return true;
   }
@@ -93,6 +99,15 @@ export function mountNavigation(deps: NavDeps): NavApi {
     while (src.length > 0) {
       const target = src.pop()!;
       if (sameState(current, target)) continue;
+      // Capture the prior surface *before* apply runs — apply may
+      // evict the active preview tab (app-page tab replacement,
+      // preview-slot replacement) and call back into `pruneTab`,
+      // which nullifies `current` when it matches the closed path.
+      // Without this snapshot the opposite-direction push below
+      // would silently drop the entry we just navigated away from
+      // (the "nav stack skips entries" failure mode of
+      // bug-nav-history-broken-for-app-page-tabs).
+      const prev = current;
       restoring = true;
       let ok: boolean;
       try {
@@ -101,7 +116,7 @@ export function mountNavigation(deps: NavDeps): NavApi {
         restoring = false;
       }
       if (ok) {
-        if (current !== null) dst.push(current);
+        if (prev !== null && !sameState(prev, target)) dst.push(prev);
         current = target;
         deps.onChange();
         return true;
@@ -113,7 +128,19 @@ export function mountNavigation(deps: NavDeps): NavApi {
   }
 
   function pruneTab(path: string): void {
-    const filter = (s: NavState) => !(s.kind === "tab" && s.path === path);
+    // Strip the `__hiker:properties:` sentinel prefix so we can match
+    // properties NavState entries (which carry the vault-relative path
+    // directly, not the synthetic tab key).
+    const propertiesPath = path.startsWith("__hiker:properties:")
+      ? path.slice("__hiker:properties:".length)
+      : null;
+    const filter = (s: NavState) => {
+      if (s.kind === "tab" && s.path === path) return false;
+      if (s.kind === "properties" && propertiesPath !== null && s.path === propertiesPath) {
+        return false;
+      }
+      return true;
+    };
     {
       const kept = back.filter(filter);
       back.length = 0;
@@ -124,9 +151,18 @@ export function mountNavigation(deps: NavDeps): NavApi {
       forward.length = 0;
       forward.push(...kept);
     }
-    if (current !== null && current.kind === "tab" && current.path === path) {
+    const currentMatches =
+      current !== null &&
+      ((current.kind === "tab" && current.path === path) ||
+        (current.kind === "properties" &&
+          propertiesPath !== null &&
+          current.path === propertiesPath));
+    if (currentMatches) {
       // Caller will checkpoint to whatever surface replaced the closed tab;
       // mark current invalid so the next checkpoint pushes nothing for it.
+      // Note: back/forward navigation captures `prev` before calling apply
+      // (see `navigate`), so a mid-apply pruneTab that nulls current here
+      // doesn't lose the opposite-direction stack push.
       current = null;
     }
     deps.onChange();

@@ -15,7 +15,13 @@
 // the host via callbacks so this module never touches the editor.
 
 import type { ChangeRow, ChangeOp } from "../snapshotPreview";
-import { Ipc, type VaultHomeStats, type RecentNote, type Proposal } from "../ipc";
+import {
+  Ipc,
+  type VaultHomeStats,
+  type RecentNote,
+  type Proposal,
+  type ActivityItem,
+} from "../ipc";
 import { Logger } from "../logger";
 import { Icons } from "../icons";
 import {
@@ -67,7 +73,7 @@ export interface VaultHomeDeps extends PanelDeps {
   /// the settings pane (mutually exclusive sub-modes).
   onBeforeShow?: () => void;
   // status: tab-kinds
-  /// Open a page-kind tab (e.g. home-detail for activity-widget clicks).
+  /// Open a app-page tab (e.g. home-detail for activity-widget clicks).
   onOpenPage?: (kind: string, payload?: Record<string, string>) => void;
   // status: staging-review-activity-detail-filter
   /// Open a staging proposal as a read-only preview buffer (reuses the
@@ -88,6 +94,10 @@ export interface VaultHomeApi {
   /// Fired on every `hiker:changes-appended` event. No-op when home isn't
   /// visible — the next refresh on show will pick the new rows up.
   notifyChangesAppended(): void;
+  /// Fired on every `hiker:staging-changed` event so the recent-activity
+  /// widget's pending rows appear/disappear live. No-op when home isn't
+  /// visible — the on-show refresh picks the new state up.
+  notifyStagingChanged(): void;
   /// Fired by the watcher when an external mtime change might shift the
   /// recently-modified list.
   notifyRecentModified(): void;
@@ -118,6 +128,29 @@ function authorPillIcon(cls: string): string {
   if (cls === "user") return Icons.user();
   if (cls === "agent") return Icons.robot({ size: 12, strokeWidth: 1.4 });
   return Icons.dot();
+}
+
+/// status: patch-review-per-hunk-accept
+/// Activity-row Accept / Reject icon button. Rounded rectangle, no fill,
+/// accent (green) or danger (red) tint on hover only — matches the
+/// existing toolbar-btn type ramp.
+function makeIconButton(
+  kind: "accept" | "reject",
+  label: string,
+  title: string,
+  onClick: (e: MouseEvent) => void | Promise<void>,
+): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `row-action row-action-icon row-action-${kind}`;
+  btn.title = title;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML =
+    kind === "accept"
+      ? `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="3,8 7,12 13,4"/></svg>`
+      : `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>`;
+  btn.addEventListener("click", (e) => void onClick(e));
+  return btn;
 }
 
 function opLabel(op: ChangeOp): string {
@@ -312,14 +345,39 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     }
   }
 
+  // status: vault-home-detail-views, tab-kinds
+  // Drill-in entry points (header click on the recent-activity widget, row
+  // click on a preview row) route through the host's `onOpenPage` callback
+  // so the detail view opens as its own `home-detail` app-page tab — same
+  // shape as queue / settings. That's what lets the nav stack record the
+  // transition from `home` → `home-detail` so Back from the detail view
+  // lands on home (rather than skipping past it to the previously-open
+  // note). Falls back to a direct `showDetail` call when no host wiring is
+  // present (defensive; main.ts always wires `onOpenPage` in v1).
+  function requestRecentActivityDetail(): void {
+    if (deps.onOpenPage) {
+      deps.onOpenPage("home-detail", { view: "recent-activity" });
+    } else {
+      showDetail("recent-activity");
+    }
+  }
+
+  // status: vault-home-recent-activity-widget
+  // Consumes the unified `core::activity` feed so pending staging
+  // proposals appear alongside committed change rows — same merged DTO
+  // the editor status-bar version dropdown
+  // (`status-bar-version-dropdown-uses-unified-feed`) and the activity
+  // detail page (`activity-feed-activity-detail-consumer`) drive off.
+  // Pending rows render with inline Accept/Reject affordances per
+  // `staging-accept-reject-from-activity-detail`.
   async function refreshActivityWidget(): Promise<void> {
     if (!deps.getVaultIsOpen()) return;
     if (!isVisible()) return;
     let count = 0;
     try {
-      count = await Ipc.changesCount();
+      count = await Ipc.activityCount({ source: "merged" });
     } catch (err) {
-      Logger.error("ui::vault-home", "changes_count failed", { err });
+      Logger.error("ui::vault-home", "activity_count failed", { err });
     }
     if (count <= 0) {
       deps.activitySectionEl.hidden = true;
@@ -327,17 +385,127 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     }
     deps.activitySectionEl.hidden = false;
     deps.activityHeaderEl.textContent = `Recent activity (${count})`;
-    let rows: ChangeRow[] = [];
+    let items: ActivityItem[] = [];
     try {
-      rows = await Ipc.recentChanges({ limit: 5 });
+      items = await Ipc.activityList({ source: "merged", limit: 5 });
     } catch (err) {
-      Logger.error("ui::vault-home", "recent_changes failed", { err });
+      Logger.error("ui::vault-home", "activity_list failed", { err });
     }
     deps.activityListEl.replaceChildren(
-      ...rows.map((r) => buildActivityPreviewRow(r)),
+      ...items.map((it) => buildActivityPreviewItem(it)),
     );
     deps.activityHeaderEl.style.cursor = "pointer";
-    deps.activityHeaderEl.onclick = () => showDetail("recent-activity");
+    deps.activityHeaderEl.onclick = () => requestRecentActivityDetail();
+  }
+
+  function proposalFromStagingPayload(
+    s: Extract<ActivityItem["payload"], { kind: "staging" }>,
+  ): Proposal {
+    const meta =
+      s.metadata && typeof s.metadata === "object" && !Array.isArray(s.metadata)
+        ? (s.metadata as Record<string, unknown>)
+        : null;
+    return {
+      id: s.id,
+      surface: s.surface,
+      action: s.action,
+      target_path: s.target_path,
+      trail_id: s.trail_id,
+      content_hash: s.content_hash,
+      created_at_ms: s.created_at_ms,
+      metadata: meta,
+    };
+  }
+
+  function buildActivityPreviewItem(it: ActivityItem): HTMLElement {
+    if (it.payload.kind === "staging") {
+      const proposal = proposalFromStagingPayload(it.payload);
+      return buildPendingPreviewRow(proposal);
+    }
+    const { kind: _k, ...row } = it.payload;
+    return buildActivityPreviewRow(row as ChangeRow);
+  }
+
+  // Compact pending-proposal preview row for the home widget tile.
+  // Shape mirrors `buildActivityPreviewRow` (change-row preview) so the
+  // two row kinds align visually in the same list, with inline
+  // Accept/Reject affordances per
+  // `staging-accept-reject-from-activity-detail`.
+  function buildPendingPreviewRow(p: Proposal): HTMLElement {
+    const li = document.createElement("li");
+    li.classList.add("clickable");
+    li.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      void deps.onOpenStagingProposal(p);
+    });
+
+    const op = document.createElement("span");
+    op.className = "activity-op";
+    op.textContent = "pending";
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = p.target_path.split("/").pop() ?? p.target_path;
+    if (p.trail_id) name.title = `Trail: ${p.trail_id}`;
+
+    const rel = document.createElement("span");
+    rel.className = "rel";
+    rel.textContent = p.target_path.includes("/")
+      ? p.target_path.slice(0, p.target_path.lastIndexOf("/"))
+      : "";
+
+    const right = document.createElement("span");
+    right.className = "row-right";
+
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = relativeTime(Math.floor(p.created_at_ms / 1000));
+    when.title = new Date(p.created_at_ms).toLocaleString();
+
+    const author = document.createElement("span");
+    author.className = "activity-author";
+    const authorClass =
+      typeof p.metadata?.author_class === "string"
+        ? p.metadata.author_class
+        : "agent";
+    author.innerHTML = authorPillIcon(authorClass);
+    author.title = `Pending (${p.surface})`;
+
+    const acceptBtn = makeIconButton(
+      "accept",
+      "Accept",
+      "Drift-check the proposed write against the current file and apply.",
+      async (e) => {
+        e.stopPropagation();
+        try {
+          await deps.onAcceptStaging(p);
+        } catch (err) {
+          alert(`Accept failed: ${deps.formatErr(err)}`);
+          return;
+        }
+        await refreshActivityWidget();
+      },
+    );
+
+    const rejectBtn = makeIconButton(
+      "reject",
+      "Reject",
+      "Discard the proposal without writing. No changelog row.",
+      async (e) => {
+        e.stopPropagation();
+        try {
+          await deps.onRejectStaging(p);
+        } catch (err) {
+          alert(`Reject failed: ${deps.formatErr(err)}`);
+          return;
+        }
+        await refreshActivityWidget();
+      },
+    );
+
+    right.append(when, author, acceptBtn, rejectBtn);
+    li.append(op, name, rel, right);
+    return li;
   }
 
   function buildActivityPreviewRow(r: ChangeRow): HTMLElement {
@@ -383,22 +551,46 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
       li.appendChild(badge);
     }
     li.append(rel, right);
-    li.addEventListener("click", () => showDetail("recent-activity"));
+    li.addEventListener("click", () => requestRecentActivityDetail());
     return li;
   }
 
+  // status: activity-feed-activity-detail-consumer
+  // status: activity-feed-merged
+  // Single backend-merged feed call replaces the prior two-fetch +
+  // client-side reconcile. The unified `ActivityItem[]` is split back into
+  // `activityRows` / `proposals` for the existing renderers; the merge,
+  // ordering, and tiebreak now live in `core::activity`.
   async function refreshActivityDetail(): Promise<void> {
+    let items: ActivityItem[] = [];
     try {
-      activityRows = await Ipc.recentChanges({ limit: 200 });
+      items = await Ipc.activityList({ source: "merged", limit: 200 });
     } catch (err) {
-      Logger.error("ui::vault-home", "recent_changes failed", { err });
-      activityRows = [];
+      Logger.error("ui::vault-home", "activity_list failed", { err });
+      items = [];
     }
-    try {
-      proposals = await Ipc.stagingList();
-    } catch (err) {
-      Logger.error("ui::vault-home", "staging_list failed", { err });
-      proposals = [];
+    activityRows = [];
+    proposals = [];
+    for (const it of items) {
+      if (it.payload.kind === "change") {
+        const { kind: _k, ...row } = it.payload;
+        activityRows.push(row as ChangeRow);
+      } else {
+        const s = it.payload;
+        const meta = s.metadata && typeof s.metadata === "object" && !Array.isArray(s.metadata)
+          ? (s.metadata as Record<string, unknown>)
+          : null;
+        proposals.push({
+          id: s.id,
+          surface: s.surface,
+          action: s.action,
+          target_path: s.target_path,
+          trail_id: s.trail_id,
+          content_hash: s.content_hash,
+          created_at_ms: s.created_at_ms,
+          metadata: meta,
+        });
+      }
     }
     renderActivityDetail();
   }
@@ -548,40 +740,38 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     const actions = document.createElement("div");
     actions.className = "row-actions";
 
-    const acceptBtn = document.createElement("button");
-    acceptBtn.className = "row-action";
-    acceptBtn.style.color = "var(--accent)";
-    acceptBtn.style.borderColor = "var(--accent)";
-    acceptBtn.textContent = "Accept";
-    acceptBtn.title = "Drift-check the proposed write against the current file and apply.";
-    acceptBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try {
-        await deps.onAcceptStaging(p);
-      } catch (err) {
-        alert(`Accept failed: ${deps.formatErr(err)}`);
-        return;
-      }
-      await refreshActivityDetail();
-    });
+    const acceptBtn = makeIconButton(
+      "accept",
+      "Accept",
+      "Drift-check the proposed write against the current file and apply.",
+      async (e) => {
+        e.stopPropagation();
+        try {
+          await deps.onAcceptStaging(p);
+        } catch (err) {
+          alert(`Accept failed: ${deps.formatErr(err)}`);
+          return;
+        }
+        await refreshActivityDetail();
+      },
+    );
     actions.appendChild(acceptBtn);
 
-    const rejectBtn = document.createElement("button");
-    rejectBtn.className = "row-action";
-    rejectBtn.style.color = "var(--danger-text)";
-    rejectBtn.style.borderColor = "var(--danger-text)";
-    rejectBtn.textContent = "Reject";
-    rejectBtn.title = "Discard the proposal without writing. No changelog row.";
-    rejectBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try {
-        await deps.onRejectStaging(p);
-      } catch (err) {
-        alert(`Reject failed: ${deps.formatErr(err)}`);
-        return;
-      }
-      await refreshActivityDetail();
-    });
+    const rejectBtn = makeIconButton(
+      "reject",
+      "Reject",
+      "Discard the proposal without writing. No changelog row.",
+      async (e) => {
+        e.stopPropagation();
+        try {
+          await deps.onRejectStaging(p);
+        } catch (err) {
+          alert(`Reject failed: ${deps.formatErr(err)}`);
+          return;
+        }
+        await refreshActivityDetail();
+      },
+    );
     actions.appendChild(rejectBtn);
 
     li.appendChild(actions);
@@ -730,6 +920,14 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     void refreshRecentModified();
   }
 
+  function notifyStagingChanged(): void {
+    if (!isVisible()) return;
+    void refreshActivityWidget();
+    if (activeDetailView?.kind === "recent-activity") {
+      void refreshActivityDetail();
+    }
+  }
+
   // Wire the home button + new-note button.
   deps.homeBtn.addEventListener("click", () => {
     controller.setVisible(!controller.isVisible());
@@ -748,6 +946,7 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     refresh,
     showDetail,
     notifyChangesAppended,
+    notifyStagingChanged,
     notifyRecentModified,
     scheduleStatsRefresh,
     doRestoreSnapshot,

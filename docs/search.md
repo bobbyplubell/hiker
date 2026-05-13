@@ -29,49 +29,49 @@ The right-hand panel is one column with a fixed input row at the top and a stack
 
 Behavior:
 
-- **Empty query** — search-results section isn't rendered. Related-notes takes the whole panel; identical to current v1 behavior, no regression. [search-empty-collapses-results]
-- **Non-empty query** — both sections visible, both expanded by default. User can collapse either with the chevron; collapse state persists per-vault via `settings-write-back` (`settings-section-vault`). [search-section-collapsible]
-- **Section headers carry live counts.** "Search results (8)" updates as the type-ahead returns; "Related notes (5)" updates when the active file changes. A subtle in-section spinner shows while a query is in flight. [search-section-counts, search-loading-shimmer]
-- **Related stays bound to the active editor file** even when search is active. Conceptually: searching is exploration, editing is anchored. Rebinding Related to the top search hit was considered and rejected — it muddies "what is this section about" and steals an affordance the user already relies on. [search-related-stays-bound]
+- **Empty query** — search-results section not rendered; Related-notes takes the whole panel (identical to v1). [search-empty-collapses-results]
+- **Non-empty query** — both sections visible, both expanded by default. Chevron collapses either; state persists per-vault via `settings-write-back` (`settings-section-vault`). [search-section-collapsible]
+- **Section headers carry live counts.** "Search results (8)" updates as type-ahead returns; "Related notes (5)" updates on active-file change. Subtle in-section spinner while a query is in flight. [search-section-counts, search-loading-shimmer]
+- **Related stays bound to the active editor file** even when search is active. Searching is exploration, editing is anchored. Rebinding Related to the top search hit was considered and rejected — it muddies "what is this section about" and steals an affordance the user already relies on. [search-related-stays-bound]
 
 The toggle button on the editor toolbar still flips the panel open/closed (existing `panel-toggle-buttons`); only the panel's contents change.
 
 
 ## The search input + mode toggles
 
-A single text input pinned at the top of the panel. To its right, two compact icon-only toggle buttons matching the editor toolbar's icon-only treatment (sidebar wheel, discovery magnifying glass, view eye): [search-bar-input, search-mode-toggles]
+Text input pinned at panel top. To its right, two icon-only toggle buttons matching the editor toolbar's treatment (sidebar wheel, discovery magnifying glass, view eye): [search-bar-input, search-mode-toggles]
 
 - **Semantic toggle** — brain glyph. Tooltip "Semantic search."
 - **Lexical toggle** — `Aa` glyph (typographic, signaling "match these letters"). Tooltip "Lexical search."
 
-Pressed/unpressed states show which modes are active; both pressed = hybrid via RRF, one pressed = single-source, neither pressed = disabled input + "pick a mode" hint per `search-modes-both-off-disabled`.
+Pressed states show which modes are active.
 
 Mode rules:
 
-- **Both on (default).** Lexical and semantic both run. Results fused via reciprocal rank fusion (k=60) and grouped by note. [search-rrf-fusion]
-- **One on.** Only that backend runs. Results come straight from its native ranking (BM25 for lexical, cosine similarity for semantic). No fusion step, no second backend warmed up.
-- **Both off.** Input is visually disabled (greyed out, no focus ring) with a tooltip hint "Enable Semantic or Lexical to search." Pressing Ctrl-Space in this state still focuses the input — the hint is then visible. [search-modes-both-off-disabled]
+- **Both on (default).** Both backends run. Results fused via reciprocal rank fusion (k=60), grouped by note. [search-rrf-fusion]
+- **One on.** Only that backend runs, native ranking (BM25 for lexical, cosine for semantic). No fusion, no second backend warmed up.
+- **Both off.** Input visually disabled (greyed out, no focus ring) with tooltip "Enable Semantic or Lexical to search." Ctrl-Space still focuses the input so the hint is visible. [search-modes-both-off-disabled]
 
-State persists via `settings-write-back` to a new `search.modes` config section (`search.modes.semantic = true`, `search.modes.lexical = true`). Default both-on; the eligible-key set in `core::config::ELIGIBLE_*` grows two entries. [search-mode-state-persisted]
+State persists via `settings-write-back` to a new `search.modes` config section (`semantic`, `lexical`, both default true). Eligible-key set in `core::config::ELIGIBLE_*` grows two entries. [search-mode-state-persisted]
 
 
 ## Mode option menus
 
-Each mode toggle has a deeper config surface than on/off. **Right-click** (or long-press / two-finger tap on macOS) on either the Semantic or Lexical toggle opens a small popover anchored under the button with mode-specific options. Left-click still flips on/off — no behavioral overload of the primary affordance. [search-mode-options-menu]
+**Right-click** (long-press / two-finger tap on macOS) on either toggle opens a popover anchored under the button with mode-specific options. Left-click still flips on/off. [search-mode-options-menu]
 
-Implementation: a `contextmenu` event handler on each toggle button reuses the existing `openContextMenu` popover helper (same one View menu / tree-actions menu / sort menu use). Rows are checkable booleans, sliders for numeric ranges, and small numeric inputs where appropriate. Opening the menu does *not* flip the mode — left-click is the only path that toggles enabled state. The menu closes on outside-click and on Esc, identical to the View menu.
+Implementation: `contextmenu` handler reuses the existing `openContextMenu` helper (View menu / tree-actions menu / sort menu). Rows are checkable booleans, sliders, or numeric inputs. Closes on outside-click and Esc.
 
-Both menus persist every flip immediately via `settings-write-back` to `search.lexical.*` / `search.semantic.*`. Eligible-key set grows accordingly. Defaults preserve current behavior so existing users see no change until they reach into the menu.
+Both menus persist immediately via `settings-write-back` to `search.lexical.*` / `search.semantic.*`. Eligible-key set grows accordingly. Defaults preserve current behavior.
 
 
 ### Lexical options menu
 
 Anchored under the `Aa` toggle. Rows: [search-lexical-options]
 
-- **Case sensitive** — when on, results are post-filtered to those whose chunk text contains the query as a case-sensitive substring. FTS5's `unicode61` tokenizer is case-folded at index time and can't be reconfigured per-query; doing the case check in Rust as a post-filter on the top-25 hits is cheap (a few KB of text) and avoids a second FTS5 table. Default off. [search-lexical-case-sensitive]
-- **Match diacritics** — same shape as case sensitivity. The current tokenizer config `remove_diacritics 2` strips them at index time, so a per-query flip is implemented as a post-filter pass (Unicode NFD-aware substring match against the raw chunk text). Default off — diacritic-blind matching is the common case for English-leaning users and matches today's behavior. [search-lexical-diacritic-sensitive]
-- **Prefix match** — when on, each whitespace-separated query token is rewritten to `token*` before being passed to FTS5's `MATCH` (so `auto` matches `automation`, `automatic`). FTS5 supports the prefix operator natively, so this is a query-string transform, no schema change. Default off — current FTS5 behavior is exact-token matching and we keep it as the default to avoid silently changing precision. [search-lexical-prefix-match]
-- **Phrase mode** — when on, the entire query is wrapped in double quotes before being passed to FTS5, forcing exact-phrase matching. When off (default), FTS5's standard implicit-AND token semantics apply. Mutually exclusive with prefix match in practice (FTS5 ignores `*` inside a quoted phrase); the menu doesn't enforce that — checking both just means the user gets phrase semantics, and we surface a subtle hint in the prefix-match row tooltip. [search-lexical-phrase-mode]
+- **Case sensitive** (default off) — post-filter top-25 hits in Rust for case-sensitive substring match. FTS5's `unicode61` tokenizer is case-folded at index time and can't be reconfigured per-query; the post-filter is cheap (few KB of text) and avoids a second FTS5 table. [search-lexical-case-sensitive]
+- **Match diacritics** (default off) — same shape as case sensitivity; tokenizer config `remove_diacritics 2` strips at index time, so a per-query flip is a post-filter pass (Unicode NFD-aware substring match against raw chunk text). Default off matches today's behavior and the common case for English-leaning users. [search-lexical-diacritic-sensitive]
+- **Prefix match** (default off) — rewrite each whitespace-separated query token to `token*` before FTS5's `MATCH` (so `auto` matches `automation`). FTS5 supports the prefix operator natively, so it's a query-string transform, no schema change. Default off keeps current exact-token matching to avoid silently changing precision. [search-lexical-prefix-match]
+- **Phrase mode** (default off) — wrap the entire query in double quotes before FTS5, forcing exact-phrase matching. When off, FTS5's standard implicit-AND token semantics apply. Mutually exclusive with prefix match in practice (FTS5 ignores `*` inside a quoted phrase); the menu doesn't enforce that — checking both just yields phrase semantics, with a subtle hint in the prefix-match row tooltip. [search-lexical-phrase-mode]
 
 Rejected for v2: a "stemming on/off" toggle. FTS5's tokenizer is configured at table-creation time; offering it as a per-query toggle would require a second FTS5 table with porter-stemmer tokenization, doubling write cost and on-disk size. If users actually want stemming, it's a one-line tokenizer change at schema bump, not a runtime knob.
 
@@ -80,9 +80,9 @@ Rejected for v2: a "stemming on/off" toggle. FTS5's tokenizer is configured at t
 
 Anchored under the brain toggle. Rows: [search-semantic-options]
 
-- **Minimum similarity** — slider from `0.00` to `0.95` in 0.05 steps. Hits with cosine similarity below the threshold are dropped before fusion (or before render in single-mode). Default `0.00` — no filter, current behavior. Useful when the embedder returns weak global matches that crowd out genuinely relevant results; raising the floor turns "always 20 results, some weak" into "fewer-but-stronger, sometimes empty." Empty results when the threshold filters everything out show a hint row "No results above threshold X.XX — lower the threshold or refine your query." [search-semantic-min-similarity]
-- **Top-k override** — small numeric input, range 5–100, default 25 (matches `PER_BACKEND_TOP_K`). Override only affects the semantic side; lexical stays at 25. Enables the "I want a wider semantic net" workflow without touching the global budget. Larger values cost more sqlite-vec scan but the index is small; capped at 100 to keep the panel responsive. [search-semantic-top-k-override]
-- **Recency bias** — three-way radio: `Off` / `Mild` / `Strong`. When on, fuses an mtime-rank into the semantic score using the same RRF shape as cross-mode fusion: `score = 1/(k + sim_rank) + w · 1/(k + recency_rank)`, where `w` is `0.0` / `0.5` / `1.0` for Off/Mild/Strong and `recency_rank` is the note's position when the result set is sorted by `notes.mtime DESC`. Default Off — hiker doesn't otherwise privilege recent files in retrieval, and a recency boost should be a deliberate user choice, not a silent default. [search-semantic-recency-bias]
+- **Minimum similarity** (slider `0.00`–`0.95`, 0.05 steps, default `0.00`) — hits below threshold dropped before fusion (or before render in single-mode). Default `0.00` = no filter, current behavior. Useful when the embedder returns weak global matches; raising the floor trades "always 20, some weak" for "fewer-but-stronger, sometimes empty." Empty-after-filter shows a hint row "No results above threshold X.XX — lower the threshold or refine your query." [search-semantic-min-similarity]
+- **Top-k override** (numeric input, 5–100, default 25, matches `PER_BACKEND_TOP_K`) — affects only the semantic side; lexical stays at 25. Enables a wider semantic net without touching the global budget. Capped at 100 to keep the panel responsive (sqlite-vec scan cost). [search-semantic-top-k-override]
+- **Recency bias** (radio `Off` / `Mild` / `Strong`, default Off) — fuses mtime-rank into the semantic score via the same RRF shape as cross-mode fusion: `score = 1/(k + sim_rank) + w · 1/(k + recency_rank)`, where `w` is `0.0` / `0.5` / `1.0` and `recency_rank` is the note's position sorted by `notes.mtime DESC`. Default Off — hiker doesn't otherwise privilege recent files in retrieval; recency boost should be a deliberate choice, not a silent default. [search-semantic-recency-bias]
 
 Rejected for v2: an embedder/model picker in this menu. Choosing an embedder is a vault-level decision tied to the existing embedding index — switching mid-session would invalidate every cached vector. That belongs in `embedder-config-section` (a config-file restart, with the existing reindex flow), not a per-query toggle.
 
@@ -91,9 +91,9 @@ Rejected for v2: an embedder/model picker in this menu. Choosing an embedder is 
 
 Search runs as the user types. Mechanic:
 
-- **Debounce 250ms.** A keystroke schedules a query 250ms in the future; subsequent keystrokes within that window cancel and reschedule. Empty query collapses results immediately, no debounce. [search-typeahead-debounce]
-- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch. The Tauri command runs both backends in parallel; results that come back tagged with an epoch lower than the current input's epoch get dropped on the frontend before render. Mirrors the cancel pattern already used for related-notes refresh on file-switch.
-- **Lexical returns near-instantly** (sqlite query). **Semantic requires embedding the query string** — runs on the existing `spawn_blocking` pool (per `embedder-spawn-blocking`), tens of ms with the bge-small embedder warm. Both run in parallel; the panel renders each section as it arrives, so lexical may paint a beat before semantic. Acceptable — the section spinners cover the gap. [search-query-embed-spawn-blocking]
+- **Debounce 250ms.** Keystroke schedules a query 250ms out; subsequent keystrokes cancel and reschedule. Empty query collapses results immediately, no debounce. [search-typeahead-debounce]
+- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch. Tauri command runs both backends in parallel; stale-epoch results dropped on the frontend before render. Mirrors the related-notes file-switch cancel pattern.
+- **Lexical returns near-instantly** (sqlite). **Semantic embeds the query string** on the existing `spawn_blocking` pool (`embedder-spawn-blocking`), tens of ms with bge-small warm. Both run in parallel; panel renders each section as it arrives — lexical may paint a beat before semantic, covered by section spinners. [search-query-embed-spawn-blocking]
 
 
 ## Result rendering
@@ -107,14 +107,14 @@ Row anatomy:
 - **Snippet.** ~2–3 lines from the matched chunk. Lexical hits use FTS5's `snippet()` for highlighting; semantic-only hits show plain context. [search-result-row]
 - **Score.** Small, muted, right-aligned. Debug-friendly; users tend to ignore it but it's useful when ranking feels wrong.
 
-**Click → open + scroll-to-chunk.** Clicking a row opens the file in the editor and scrolls so the matched chunk is visible. Uses the chunk's stored line range (already stable per `tauri-cmd-chunks-for-path`). [search-result-click-opens-chunk]
+**Click → open + scroll-to-chunk.** Opens the file and scrolls to the matched chunk via its stored line range (`tauri-cmd-chunks-for-path`). [search-result-click-opens-chunk]
 
-**Result budget.** Each backend returns its top 25 hits internally; the fused list shows 20. Rationale: RRF benefits from a tail of below-the-fold candidates from each side. Fixed for v2; configurability waits until MCP needs different budgets. [search-result-budget]
+**Result budget.** Each backend returns top 25 internally; fused list shows 20. RRF benefits from a tail of below-the-fold candidates per side. Fixed for v2; configurability waits until MCP needs different budgets. [search-result-budget]
 
 
 ## Keyboard model
 
-- **Ctrl-Space** — focuses the search input. Opens the discovery panel if it's collapsed. Same on macOS; we deliberately don't take Cmd-Space. The keybind registers at the document level (matching the `keybind-registry` pattern), with high enough precedence to win over CM6's default `Ctrl-Space → startCompletion` binding inside the editor. Hiker doesn't lean on autocomplete in v2; we can revisit if a wikilinks-completion feature ever needs the binding back. [search-keybind-ctrl-space]
+- **Ctrl-Space** — focuses the search input; opens the discovery panel if collapsed. Same on macOS — we deliberately don't take Cmd-Space (Spotlight). Registers at document level (`keybind-registry` pattern) with precedence to win over CM6's default `Ctrl-Space → startCompletion` inside the editor. Hiker doesn't lean on autocomplete in v2; revisit if a wikilinks-completion feature ever needs the binding back. [search-keybind-ctrl-space]
 - **↑ / ↓** — moves the active result within whichever section has focus. ↑ at the top of Related jumps to the bottom of Search results; ↓ at the bottom of Search results jumps to the top of Related. Stops at the panel boundaries.
 - **Enter** — opens the focused result.
 - **Tab** — moves focus from input → search results → related → out of panel.
@@ -202,13 +202,11 @@ Group-by-note happens *before* fusion: lexical hits are first reduced to one-row
 
 ## Scope
 
-v2 searches the whole vault. No folder scope, no tag scope, no lifecycle filters (`archive` / `redact` / `retire` from `design.md` aren't yet implemented anyway). [search-vault-scope-only]
+v2 searches the whole vault. No folder scope, tag scope, or lifecycle filters (`archive` / `redact` / `retire` from `design.md` aren't implemented yet). [search-vault-scope-only]
 
-Skipped notes (`tauri-cmd-file-index-state`'s "Skipped" — too-large, not-utf-8) aren't indexed and therefore aren't searchable. Their tree-row Skipped marker is the user-facing signal.
-
-`.hiker/` paths and ignored paths (`watcher-ignore-hardcoded`) are already excluded from indexing, so they're naturally excluded from search.
-
-Trash entries are stored under `.hiker/trash/` and therefore not indexed; they don't appear in search results. The trash bin's row list (`tree-trash-flat-by-deleted`) is the dedicated surface for finding trashed notes — by design, search results show your live vault.
+- **Skipped notes** (`tauri-cmd-file-index-state` — too-large, not-utf-8) aren't indexed, so aren't searchable. The tree-row Skipped marker is the user-facing signal.
+- **`.hiker/` and ignored paths** (`watcher-ignore-hardcoded`) are already excluded from indexing, naturally excluded from search.
+- **Trash entries** under `.hiker/trash/` aren't indexed, don't appear in results. The trash bin's row list (`tree-trash-flat-by-deleted`) is the dedicated surface — by design, search shows your live vault.
 
 
 ## Tauri command surface
@@ -227,13 +225,13 @@ async fn search_vault(
 ) -> Result<SearchResponse, HikerError>;
 ```
 
-`SearchResponse { epoch, lexical_hits: Vec<NoteHit>, semantic_hits: Vec<NoteHit>, fused: Vec<NoteHit> }`. The frontend renders `fused` when both modes are on, otherwise the relevant single list.
+`SearchResponse { epoch, lexical_hits: Vec<NoteHit>, semantic_hits: Vec<NoteHit>, fused: Vec<NoteHit> }`. Frontend renders `fused` when both modes are on, else the relevant single list.
 
-Both option structs have `#[serde(default)]` on every field, so older frontend payloads (or the empty-options shape) decode to the documented defaults — the loader-level `settings-strict-load` discipline doesn't apply at the Tauri boundary, only at config load.
+Both option structs use `#[serde(default)]` on every field, so older payloads decode to documented defaults — `settings-strict-load` discipline applies at config load only, not at the Tauri boundary.
 
-Returning all three buckets (rather than the frontend-relevant one) is deliberate: it keeps the Tauri command flat and lets us add UI affordances later (e.g. "show me what each backend found separately") without a new command. The frontend ignores the buckets it doesn't need. [search-tauri-cmd]
+Returning all three buckets is deliberate: keeps the command flat and lets us add UI affordances later (e.g. "show me what each backend found separately") without a new command. Frontend ignores the buckets it doesn't need. [search-tauri-cmd]
 
-Wires through `core::search::query()`, which composes the two engine traits. Tauri command is a thin wrapper over the core call (~10 lines) per the layer-split rules in `design.md`.
+Wires through `core::search::query()`, which composes the two engine traits. Tauri command is a thin wrapper (~10 lines) per the layer-split rules in `design.md`.
 
 
 ## Module discipline

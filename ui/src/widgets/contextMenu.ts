@@ -113,7 +113,15 @@ export function openContextMenu(
   openMenuEl = menu;
 
   const onDocDown = (ev: MouseEvent) => {
-    if (!menu.contains(ev.target as Node)) closeContextMenu();
+    if (menu.contains(ev.target as Node)) return;
+    // If the mousedown lands on the trigger that opened this menu, leave
+    // dismissal to the trigger's own click handler — otherwise the
+    // mousedown-capture close fires first and the click handler then
+    // re-opens (the toggle guard in openContextMenu can't help because
+    // openMenuEl is already null). Skipping here lets the click handler's
+    // openContextMenu call hit the same-trigger short-circuit and close.
+    if (openMenuTrigger && (openMenuTrigger === ev.target || openMenuTrigger.contains(ev.target as Node))) return;
+    closeContextMenu();
   };
   const onKey = (ev: KeyboardEvent) => {
     if (ev.key === "Escape") {

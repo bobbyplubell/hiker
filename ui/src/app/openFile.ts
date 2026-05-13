@@ -205,7 +205,7 @@ export function mountOpenFile(deps: OpenFileDeps): OpenFileApi {
     // persists (after a path remap) so the slot reads as the same tab
     // to the user. No dirty guard: preview tabs are never dirty by
     // construction.
-    // status: tab-kinds — page-kind previews are evicted directly since
+    // status: tab-kinds — app-page previews are evicted directly since
     // they don't have CM6 state to preserve.
     const previewTabPath = deps.getPreviewTabPath();
     if (wantPreview && previewTabPath !== null && previewTabPath !== rel) {
@@ -222,7 +222,7 @@ export function mountOpenFile(deps: OpenFileDeps): OpenFileApi {
       }
       if (!deps.openBuffers.has(rel)) {
         // Fall through to normal open — the eviction above removed the
-        // page-kind preview but didn't create the replacement.
+        // app-page preview but didn't create the replacement.
         // Continue below.
       } else {
         return;

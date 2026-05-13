@@ -130,29 +130,43 @@
                buffer is a trash / snapshot preview, or when the diff view
                is up. Empty in normal editing. Centered between the two
                flex spacers. -->
+          <span id="mode-controls"></span>
+          <span class="toolbar-spacer"></span>
           <!-- status: trail-add-to-active-from-editor-verb
-               Editor toolbar pill: "Add to trail: <name>". Visibility
+               Editor toolbar pill: "Add to trail: <name>". Lives in the
+               right-side toolbar cluster, just left of Save. Visibility
                and label are runtime-driven by `./trails/addToTrailPill`;
                hidden by default so the toolbar layout stays stable
                before the buffer + active-trail seam is wired. -->
-          <button id="add-to-trail-pill" class="toolbar-btn add-to-trail-pill" type="button" hidden></button>
-          <span id="mode-controls"></span>
-          <!-- status: staging-accept-reject-from-editor
-               Editor toolbar pill: "Proposed change — [Accept] [Reject]".
-               Shown between mode-controls and the right-side button cluster
-               when the open file has a pending staging proposal. Hidden by
-               default; visibility is runtime-driven by ./editor/stagingPill. -->
-          <div id="staging-pill" class="editor-pill" style="display:none">
-            <span class="pill-label">Proposed change — </span>
-            <button class="row-action pill-accept" type="button">Accept</button>
-            <button class="row-action pill-reject" type="button">Reject</button>
-          </div>
-          <span class="toolbar-spacer"></span>
+          <button id="add-to-trail-pill" class="toolbar-btn add-to-trail-pill" type="button" hidden title="" aria-label="">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-linecap="round" overflow="visible" aria-hidden="true">
+              <path stroke-width="2.2" d="M6.5 14 C 17 11.5, -4 8.5, 6.5 6.5"/>
+              <path stroke-width="1.2" d="M6.5 6.5 C 11 5, 3 3.5, 6.5 2"/>
+              <path stroke-width="0.7" d="M6.5 2 C 7.2 1.5, 6.1 1.2, 6.5 0.8"/>
+              <line x1="11.5" y1="2.5" x2="11.5" y2="5.5" stroke-width="1.4"/>
+              <line x1="10" y1="4" x2="13" y2="4" stroke-width="1.4"/>
+            </svg>
+          </button>
           <button id="save-btn" class="toolbar-btn" title="Save" aria-label="Save" disabled>
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M2.5 2.5h8.5l3 3v8a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z"/><path d="M4.5 2.5h6v3.5h-6z"/><rect x="4" y="9" width="8" height="5"/></svg>
           </button>
           <button id="diff-btn" class="toolbar-btn" title="Diff vs on-disk" aria-label="Diff vs on-disk" disabled>
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="8" x2="13" y2="8"/><polyline points="5,5 2,8 5,11"/><polyline points="11,5 14,8 11,11"/></svg>
+            <!-- status: editor-diff-vs-disk-toggle; user badge per patch-review-toolbar-buttons -->
+            <span class="diff-btn-stack">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="8" x2="13" y2="8"/><polyline points="5,5 2,8 5,11"/><polyline points="11,5 14,8 11,11"/></svg>
+              <span class="diff-btn-badge" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><circle cx="8" cy="5.5" r="2.4"/><path d="M3.5 13.5c0-2.4 2-4 4.5-4s4.5 1.6 4.5 4"/></svg>
+              </span>
+            </span>
+          </button>
+          <!-- status: patch-review-agent-diff-toggle, patch-review-toolbar-buttons -->
+          <button id="agent-diff-btn" class="toolbar-btn" title="Review agent edits" aria-label="Review agent edits" disabled>
+            <span class="diff-btn-stack">
+              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="8" x2="13" y2="8"/><polyline points="5,5 2,8 5,11"/><polyline points="11,5 14,8 11,11"/></svg>
+              <span class="diff-btn-badge" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"><rect x="3" y="6" width="10" height="7" rx="1.5"/><line x1="8" y1="3.5" x2="8" y2="6"/><circle cx="6" cy="9.2" r="0.7" fill="currentColor"/><circle cx="10" cy="9.2" r="0.7" fill="currentColor"/></svg>
+              </span>
+            </span>
           </button>
           <button id="view-menu-btn" class="toolbar-btn" title="View options" aria-label="View options">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></svg>
@@ -164,6 +178,17 @@
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.25"/><line x1="10.2" y1="10.2" x2="14" y2="14"/></svg>
           </button>
         </header>
+        <!-- status: write-note-pending-banner
+             Thin strip below the toolbar in plain editing mode when the
+             active buffer's path has a pending write-shaped staging
+             proposal (`write_note` / `set_frontmatter` / `apply_tag`).
+             Single Review button routes to the existing write-note
+             review surface. Hidden by default — visibility is
+             runtime-driven from `main.ts::refreshWriteNotePendingBanner`. -->
+        <div id="write-note-pending-banner" class="write-note-pending-banner" hidden>
+          <span class="write-note-pending-banner-label"></span>
+          <button class="write-note-pending-banner-btn" type="button">Review</button>
+        </div>
         <div id="editor"></div>
         <!-- status: vault-home-screen -->
         <div id="vault-home" hidden>

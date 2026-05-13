@@ -90,7 +90,7 @@ pub fn agent_tool_defs_filtered(
     tools_cfg: Option<&hiker_core::config::McpToolsConfig>,
 ) -> Vec<ToolDef> {
     use crate::handler::{
-        ApplyTagParams, GetNoteParams, RelatedNotesParams, SearchNotesParams,
+        ApplyTagParams, EditNoteParams, GetNoteParams, RelatedNotesParams, SearchNotesParams,
         SetFrontmatterParams, TaskCheckoutParams, TaskFailParams, TaskHeartbeatParams,
         TaskListParams, TaskSubmitParams, WriteNoteParams,
     };
@@ -137,6 +137,13 @@ pub fn agent_tool_defs_filtered(
                 "Create or replace a note's body. Returns the new content hash.{writes_gate_note}"
             ),
             parameters: schema::<WriteNoteParams>(),
+        },
+        ToolDef {
+            name: "edit_note".into(),
+            description: format!(
+                "Apply one or more span-anchored patches to an existing note. Each old_str must match exactly once unless replace_all=true.{writes_gate_note}"
+            ),
+            parameters: schema::<EditNoteParams>(),
         },
         ToolDef {
             name: "set_frontmatter".into(),
@@ -212,6 +219,7 @@ mod tests {
                 "get_note",
                 "related_notes",
                 "write_note",
+                "edit_note",
                 "set_frontmatter",
                 "apply_tag",
                 "remove_tag",

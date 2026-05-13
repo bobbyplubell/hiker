@@ -109,11 +109,19 @@ export interface SearchResponse {
 }
 
 export type DiffOp = "equal" | "insert" | "delete";
+export interface IntralineSpan {
+  op: DiffOp;
+  byte_start_before: number;
+  byte_end_before: number;
+  byte_start_after: number;
+  byte_end_after: number;
+}
 export interface DiffLine {
   op: DiffOp;
   line: string;
   before_line_no: number | null;
   after_line_no: number | null;
+  intraline_spans?: IntralineSpan[] | null;
 }
 export interface DiffHunk {
   lines: DiffLine[];
@@ -212,7 +220,7 @@ export interface AutosaveTabState {
   preview_path: string | null;
   saved_at_ms: number;
   // status: tab-kinds — per-tab kind discriminator so the restore path
-  // knows whether to re-open as a buffer tab or a page-kind tab.
+  // knows whether to re-open as a buffer tab or a app-page tab.
   open_tab_kinds: Record<string, string>;
 }
 
@@ -251,6 +259,22 @@ export interface TaskSnapshotRow {
 // ----- staging DTOs (staging-review-activity-detail-filter) -----
 // status: staging-review-activity-detail-filter
 // status: staging-bulk-apply-reject
+// status: staging-per-edit-proposals
+// status: staging-proposal-state
+/// Span-anchored edit payload — present on `edit_note`-derived rows.
+export interface EditPayload {
+  old_str: string;
+  new_str: string;
+  replace_all?: boolean;
+}
+
+export type ProposalState = "applyable" | "conflicted";
+export type ConflictReason =
+  | "anchor_missing"
+  | "anchor_not_unique"
+  | "target_missing"
+  | "hash_changed";
+
 /// Mirrors `hiker_core::staging::Proposal` (has `Serialize + Deserialize`).
 /// Field names match the Rust struct (snake_case on the wire from serde).
 export interface Proposal {
@@ -261,7 +285,16 @@ export interface Proposal {
   trail_id?: string | null;
   content_hash?: string | null;
   created_at_ms: number;
+  /// Shared id for all proposals that came from one originating `edit_note`
+  /// tool call. Absent for whole-file proposals.
+  batch_id?: string | null;
+  /// Span-anchored edit payload. Present on `edit_note` rows; absent on
+  /// `write_note` / `set_frontmatter` / `apply_tag` rows.
+  edit?: EditPayload | null;
   metadata?: Record<string, unknown> | null;
+  state?: ProposalState;
+  conflict_reason?: ConflictReason | null;
+  source_hash?: string | null;
 }
 
 /// Mirrors `hiker_core::staging::StagingFilter` (snake_case fields).
@@ -270,6 +303,7 @@ export interface StagingFilter {
   trail_id?: string | null;
   surface?: string | null;
   session_id?: string | null;
+  state?: ProposalState | null;
 }
 
 /// Mirrors `hiker_core::staging::AcceptOutcome` (has `Serialize`).
@@ -277,6 +311,55 @@ export interface AcceptOutcome {
   proposal_id: string;
   target_path: string;
   new_hash: string;
+}
+
+// ----- activity feed DTOs (activity-feed-*) -----
+// status: activity-feed-unified-item
+// status: activity-feed-staging-metadata
+
+export type ActivitySource = "changes_only" | "staging_only" | "merged";
+
+export interface ActivityFilter {
+  source?: ActivitySource;
+  limit?: number;
+  author_pattern?: string | null;
+  since_ms?: number | null;
+}
+
+/// Projection of `core::staging` proposal data into the unified feed.
+/// `core::activity::StagingItem` — distinct from the bare `Proposal` DTO
+/// because the merge layer normalizes `session_id` out of `metadata`.
+export interface ActivityStagingItem {
+  id: string;
+  surface: string;
+  action: string;
+  target_path: string;
+  trail_id: string | null;
+  session_id: string | null;
+  content_hash: string | null;
+  created_at_ms: number;
+  metadata: Record<string, unknown> | unknown[] | string | number | boolean | null;
+}
+
+/// Short label material — the frontend formats display strings off this.
+export type ActivitySummary =
+  | { kind: "change"; op: ChangeRow["op"] }
+  | { kind: "staging"; surface: string; action: string };
+
+/// Per-kind payload — tagged enum (`kind`) so consumers can switch.
+/// Wire shape: serde internal-tag with newtype variants flattens the
+/// inner struct's fields next to the `kind` discriminator.
+export type ActivityPayload =
+  | ({ kind: "change" } & ChangeRow)
+  | ({ kind: "staging" } & ActivityStagingItem);
+
+/// Mirrors `hiker_core::activity::ActivityItem`.
+export interface ActivityItem {
+  timestamp_ms: number;
+  path: string;
+  author: string;
+  summary: ActivitySummary;
+  payload: ActivityPayload;
 }
 
 // ---------------- the wrapper ----------------
@@ -575,7 +658,11 @@ export const Ipc = {
   },
 
   // ----- diff -----
-  computeDiff(args: { before: string; after: string }): Promise<DiffResult> {
+  computeDiff(args: {
+    before: string;
+    after: string;
+    intraline?: boolean;
+  }): Promise<DiffResult> {
     return invokeWithLogging<DiffResult>("compute_diff", args);
   },
 
@@ -797,6 +884,32 @@ export const Ipc = {
   // ----- staging (staging-review-activity-detail-filter) -----
   // status: staging-review-activity-detail-filter
   // status: staging-bulk-apply-reject
+  // ----- activity (merged changes + staging) -----
+  // status: activity-feed-merged-query
+  activityList(filter?: ActivityFilter): Promise<ActivityItem[]> {
+    return invokeWithLogging<ActivityItem[]>(
+      "activity_list",
+      filter ? { filter } : undefined,
+    );
+  },
+  // status: activity-feed-merged-query
+  // status: status-bar-version-dropdown-uses-unified-feed
+  activityListForPath(
+    path: string,
+    filter?: ActivityFilter,
+  ): Promise<ActivityItem[]> {
+    return invokeWithLogging<ActivityItem[]>(
+      "activity_list_for_path",
+      filter ? { path, filter } : { path },
+    );
+  },
+  activityCount(filter?: ActivityFilter): Promise<number> {
+    return invokeWithLogging<number>(
+      "activity_count",
+      filter ? { filter } : undefined,
+    );
+  },
+
   stagingList(filter?: StagingFilter): Promise<Proposal[]> {
     return invokeWithLogging<Proposal[]>("staging_list", filter as Record<string, unknown>);
   },

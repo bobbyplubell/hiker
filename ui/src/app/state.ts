@@ -43,17 +43,34 @@ export type BufferMode =
       /// status: snapshot-preview-diff-toggle
       diffActive: boolean;
     }
-  // status: staging-review-activity-detail-filter
+  // status: patch-review-mode
+  // status: patch-review-as-mode-not-pane
+  // Patch-review mode renders pending `edit_note` proposal hunks inline
+  // over the live on-disk file. CM6 is read-only while active; hunks are
+  // accepted or rejected per-hunk via gutter buttons, and the whole mode
+  // shares Accept-all / Reject-all / Exit verbs in the mode-controls slot.
   | {
-      kind: "staging";
+      kind: "patch-review";
+      targetPath: string;
+    }
+  // status: write-note-review-surface
+  // Whole-file proposal review (write_note / set_frontmatter / apply_tag).
+  // Read-only buffer of the proposed content; accept blocks if the user
+  // has a dirty buffer for the same path.
+  | {
+      kind: "write-note-review";
       proposal_id: string;
       targetPath: string;
       diffActive: boolean;
+      /// True when the target path doesn't exist on disk (a create-shaped
+      /// `write_note`). Drives the "Review new note" vs "Review rewrite"
+      /// label in `#mode-controls`.
+      isCreate: boolean;
     };
 
 export interface Buffer {
   path: string;
-  /// tab-kinds — distinguishes buffer tabs from page-kind / agent / graph /
+  /// tab-kinds — distinguishes buffer tabs from app-page / agent / graph /
   /// properties tabs so every cross-cutting concern (dirty marker, close
   /// guard, autosave, mode-controls, reveal-in-tree) gates on kind.
   kind: TabKind;
@@ -136,6 +153,8 @@ export interface ViewSettings {
   lineNumbersVisible: boolean;
   wordWrapEnabled: boolean;
   renderTxtAsMarkdown: boolean;
+  /// status: view-intraline-diff-toggle
+  intralineDiffEnabled: boolean;
 }
 
 export const viewSettingsStore: Store<ViewSettings> = createStore<ViewSettings>({
@@ -146,6 +165,7 @@ export const viewSettingsStore: Store<ViewSettings> = createStore<ViewSettings>(
   lineNumbersVisible: true,
   wordWrapEnabled: true,
   renderTxtAsMarkdown: true,
+  intralineDiffEnabled: false,
 });
 
 /// Active trail (vault-relative path of the trail-doc), mirrored from

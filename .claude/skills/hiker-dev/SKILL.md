@@ -1,6 +1,6 @@
 ---
 name: hiker-dev
-description: Use when the user asks for implementation work on the hiker repo — landing one or more named slugs from `status.md` (features) or `bug_tracking.md` (bugs). Reads every spec under `docs/` end-to-end first so the implementation respects cross-doc constraints, then implements only what's asked, and ends with a concise report of what was done. Pairs with `hiker-pm` (chooses what to do next) and `hiker-spec-writer` (drafts new specs).
+description: Use when the user asks for implementation work on the hiker repo — landing one or more named slugs from `status.md` (features) or `bug_tracking.md` (bugs). Reads the relevant specs under `docs/` (the ones owning the slug, plus anything they cross-reference) so the implementation respects cross-doc constraints, then implements only what's asked, and ends with a concise report of what was done. Pairs with `hiker-pm` (chooses what to do next) and `hiker-spec-writer` (drafts new specs).
 ---
 
 # hiker dev
@@ -9,11 +9,18 @@ Lands implementation work for slugs the user has already chosen. Doesn't decide 
 
 ## Before writing any code
 
-1. **Read every spec in `docs/` in full.** Specs cross-reference each other; an implementation that ignores a constraint stated in another doc is the most common failure mode here. No skimming.
-2. **Read `status.md` end-to-end.** Confirm the slugs the user named exist there, note their current status (`planned`/`partial`/`done`), and read any neighboring rows that look like dependencies.
-3. **Read `bug_tracking.md`.** Catches active bugs that overlap with the area you're about to touch — the fix may already be specified.
+The docs collection has grown too large to read end-to-end. Read what's relevant; don't skim everything.
+
+1. **Always read in full:**
+   - `docs/index.md` and `docs/design.md` — the foundational rules (module discipline, layer split, store conventions). Every implementation has to respect these.
+   - `status.md` — the registry. Confirm the slugs the user named exist there, note their current status (`planned`/`partial`/`done`), and check neighboring rows for stated dependencies.
+   - `bug_tracking.md` — catches active bugs that overlap with the area you're about to touch.
+2. **Read the spec doc(s) that own the named slugs in full.** `status.md` rows are grouped under `## <Topic> (<file>.md)` headings — that names the owning doc. Don't skim; the spec is the contract for the slug.
+3. **Follow cross-references.** If the owning spec cites another slug as a prerequisite (e.g. `requires watcher-suppress-self-writes`) or references another doc, open that doc and read the relevant section. Repeat until the citation graph is exhausted for the work at hand.
 4. **Read the code at every cited file:line in the relevant rows.** Status evidence drifts; verify the claim before building on top of it. If you find drift (status says `done` but code disagrees, or vice versa), surface it in the report — don't silently fix it.
 5. **Look at recent git history** for the touched files (`git log --oneline -20 -- <path>`). Tells you what's actively in flight and whether the user is mid-edit.
+
+Specs not on the citation graph for this slice can stay unread. If something later in implementation makes you suspect a constraint lives in an unread doc (e.g. you're about to emit a frontend event and haven't read `observability.md`), open it then.
 
 ## What the user has asked for
 
@@ -106,7 +113,8 @@ A 200–400 word report is the sweet spot. The diff is the source of truth for w
 
 ## Common pitfalls
 
-- **Skimming the specs.** This is the failure mode that produces "the implementation looks reasonable but ignores a constraint stated three docs over." Read everything.
+- **Skimming the specs you do read.** The selection-by-relevance rule above is not permission to skim — every doc you open should be read in full. The failure mode is "the implementation looks reasonable but ignores a constraint stated in the very spec that owns the slug."
+- **Stopping at the owning spec.** Cross-references are not optional. If `move-note-core-cmd` cites `watcher-suppress-self-writes`, the watcher doc is now in scope. Don't pretend the citation isn't there.
 - **Putting orchestration in `ui/src-tauri/lib.rs` because that's where the existing command lives.** Tauri commands are seams; if you're writing more than the 5–15 line wrapper shape (parse args → call core → translate errors → return DTO), the logic belongs in `core` (usually `core::ops`). This mistake previously compounded across five mutating ops before being cleaned up — don't re-introduce it.
 - **Duplicating a backend list / constant on the frontend with a "keep in sync" comment.** It will drift. Surface it via a Tauri command at vault open instead.
 - **Implementing more than asked.** Adjacent features have their own slugs; let the user invoke this skill again when they want them.

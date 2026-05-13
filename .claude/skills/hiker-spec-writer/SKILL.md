@@ -1,29 +1,34 @@
 ---
 name: hiker-spec-writer
-description: Use when writing or substantially editing a spec doc for the hiker project (anything in /home/bobby/projects/notes/docs/). Triggers on phrases like "spec out X", "draft a spec for X", "add to <doc>.md", or "write docs/<name>.md". Enforces the project's spec conventions: read all existing docs first, match the established voice, assign kebab-case slugs for each feature, and register them in status.md.
+description: Use when writing or substantially editing a spec doc for the hiker project (anything in /home/bobby/projects/notes/docs/). Triggers on phrases like "spec out X", "draft a spec for X", "add to <doc>.md", or "write docs/<name>.md". Enforces the project's spec conventions: read the relevant existing docs first (foundations + anything the new spec touches), assign kebab-case slugs for each feature, and register them in status.md.
 ---
 
 # hiker spec writer
 
-The hiker project keeps its design decisions in `docs/` as opinionated, decisive spec documents. New specs must fit that house style and plug into the slug registry in `status.md`. This skill is the checklist for doing that correctly.
+The hiker project keeps its design decisions in `docs/` as spec documents. New specs must plug into the slug registry in `status.md`. This skill is the checklist for doing that correctly.
 
 ## Before writing anything
 
-1. **List `docs/` and read every spec that already exists, in full.** No skimming — the specs are short and they cross-reference each other heavily (e.g. anything touching the filesystem references `watcher.md`'s `watcher-suppress-self-writes`; anything touching persisted format references `index.md`'s `store-version-fail-loud`). Missing those links is the #1 way new specs come out wrong.
-2. **Read `status.md` end-to-end.** It is the registry of every feature slug. New slugs must not collide; existing slugs are the right reference for any feature that already has one. Note the "How to use this file" section at the top — that's authoritative for slug behavior.
-3. **Decide if the doc is feature spec or process doc.** Feature specs (`editor.md`, `index.md`, `clustering.md`, `observability.md`, etc.) describe things that get implemented in code → they get slugs. Process docs (`release.md`, hypothetical `contributing.md`) describe how we *work* → they do *not* get slugs. Slugs exist for grep-ability between spec, registry, and code; process docs have no code anchor.
+The docs collection has grown too large to read end-to-end every time. Read the foundations plus whatever the new/edited spec actually touches; don't open everything.
 
-## Voice and structure
+1. **Always read in full:**
+   - `status.md` — the slug registry. New slugs must not collide; existing slugs are the right reference for any feature that already has one. Note the "How to use this file" section at the top — that's authoritative for slug behavior. `status.md` also doubles as the index of which docs exist and what they cover.
+   - `docs/index.md` and `docs/design.md` — foundational rules (module discipline, layer split, "Future / deferred" list). Every new spec has to fit these.
+   - If editing an existing doc, **that doc in full.**
+2. **Pick the relevant neighbors and read them in full.** Use `status.md` plus a quick `ls docs/` and `grep` over `docs/` for keywords from the new feature to decide. Anything the new spec touches the seam of — filesystem → `watcher.md`, persisted format → `index.md`, frontend events / logging → `observability.md`, etc. — gets opened. Specs you cite must be read; don't cite from memory.
+3. **Follow cross-references.** If a doc you opened cites another spec for a constraint relevant to your new work, open that one too.
+4. **Decide if the doc is feature spec or process doc.** Feature specs (`editor.md`, `index.md`, `clustering.md`, `observability.md`, etc.) describe things that get implemented in code → they get slugs. Process docs (`release.md`, hypothetical `contributing.md`) describe how we *work* → they do *not* get slugs. Slugs exist for grep-ability between spec, registry, and code; process docs have no code anchor.
 
-Match the existing docs. Concretely:
+Specs that aren't on the citation graph for the new work can stay unread. The bar is: would a constraint in this doc plausibly affect what I'm specifying? If no, skip it. If unsure, open it.
+
+## Structure
 
 - **Open with a 1–2 sentence framing** of what the doc covers and the goal.
 - **"The headline decisions:" block as a bulleted list.** 3–6 bullets, each a decisive statement of a design choice with an inline `[slug]` marker. This is the TL;DR.
 - **Then sections drilling in.** H2 per major topic. Use H3 for sub-features inside a section. Each feature definition gets an inline `[slug]` marker either in the heading or at the end of the bullet/sentence that defines it.
 - **Tradeoffs are stated, not hidden.** When a decision rejects an alternative, say what was rejected and why in one or two sentences.
 - **End with "Deferred" and/or "Out of scope".** Deferred = considered, postponed, may revisit. Out of scope = explicitly not this doc's problem. Both sections frequently include slugs for things we *might* do later.
-
-Tone: opinionated, precise, conversational where it helps, no corporate hedging. Read `clustering.md`, `observability.md`, and `txt-ingest.md` as examples — these are recent and embody the current style.
+- **Be concise.** State each decision once. No restating the bullet list in prose underneath, no scope-previewing intros, no "it's worth noting" / "essentially" / "in general" hedging. Prefer tables or nested bullets over paragraphs when the content is parallel (triggers, options, tiers). If a paragraph runs past ~6 lines, it probably wants to be a list. The reader is the implementing agent — optimize for fast scan, not narrative flow.
 
 **Specs describe the present desired state, not the history of how we got there.** This is load-bearing — the user has been explicit that the docs are not a running change log. The git log, PRs, and squash-merge messages cover history; the spec is what we want the project *to be*.
 
@@ -81,16 +86,16 @@ When in doubt, prefer `design.md` over `scratch/` — design.md is the canonical
 
 ## When the user asks for a new spec
 
-1. Read all of `docs/` in full, plus `status.md`.
+1. Read the foundations and the docs relevant to the new spec (see "Before writing anything" above). Don't read every doc.
 2. Confirm which file the spec lives in. Usually a new spec → new file. If it's small or tightly coupled to an existing one, fold into that doc rather than creating a new one.
-3. Draft the doc following the voice + structure above.
+3. Draft the doc following the structure above.
 4. Assign slugs as you go; verify against `status.md` for collisions.
 5. Update `status.md`: add a `## <Topic> (<file>.md)` section if new, plus a row per slug.
 6. Report back to the user with: what file changed, what slugs were added, and any cross-doc links worth flagging.
 
 ## When editing an existing spec
 
-1. Read the doc plus `status.md` plus any spec it references.
+1. Read the doc in full, plus `status.md`, plus any spec it references that's relevant to the edit.
 2. If the edit adds new features, treat each as a new slug and follow the registry rules.
 3. If the edit reshapes an existing feature, decide: still the same slug, or genuinely a new feature? When in doubt, keep the slug and update its row in `status.md`.
 4. Never silently drop a slug — if a feature is removed, mark its row in `status.md` removed (or delete the row and note in the squash-merge commit message).
@@ -109,6 +114,7 @@ The exceptions are `status.md` and `bug_tracking.md` — both reflect *current c
 ## Common pitfalls
 
 - **Writing the spec without reading `status.md`.** Leads to slug collisions, missed reuse, and contradictions with already-decided rules.
+- **Reading only `status.md` and the new file.** The foundations (`index.md`, `design.md`) and any neighboring spec the new feature touches are mandatory — selective reading isn't permission to skip the citation graph.
 - **Slugs that encode location.** `editor-section-status-bar-3` will rot the moment `editor.md` reorganizes. Name the feature.
 - **Inline slugs only in headings, missing on bullet-level features.** Every distinct feature gets an inline marker at the closest definition point, not just at the section heading.
 - **Process docs gaining slugs.** `release.md` deliberately has none. If the doc describes how the team works rather than what the code does, no slugs.

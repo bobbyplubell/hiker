@@ -33,7 +33,7 @@ import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { confirmDanger } from "../widgets/confirm";
 import { Icons } from "../icons";
-import type { ResolvedWaypoint } from "../ipc";
+import type { Proposal, ResolvedWaypoint } from "../ipc";
 import { getActiveTrailRel } from "../app/state";
 import { getActiveTrailWaypointPaths } from "../trails/membership";
 
@@ -130,6 +130,13 @@ export interface TreeDeps extends PanelDeps {
   /// to `openPropertiesTab(rel)`; fires from the Properties context-menu
   /// entry on tree rows.
   onOpenProperties?: (rel: string) => void;
+  // status: staging-accept-reject-from-tree
+  /// Open a staging proposal as a read-only preview buffer.
+  onOpenStagingProposal?: (proposal: Proposal) => void | Promise<void>;
+  /// Accept a staging proposal.
+  onAcceptStaging?: (proposal: Proposal) => Promise<void>;
+  /// Reject a staging proposal.
+  onRejectStaging?: (proposal: Proposal) => Promise<void>;
 }
 
 export interface TreeApi {
@@ -163,6 +170,9 @@ export interface TreeApi {
   /// itself when the open buffer is a trail-doc (a trail can't be a
   /// waypoint of itself).
   isTrailDoc(rel: string): boolean;
+  /// status: staging-accept-reject-from-tree — fetch pending proposals
+  /// and refresh the tree so synthetic rows appear.
+  refreshStagingProposals(): Promise<void>;
 }
 
 export type TreeController = PanelController<TreeApi>;
@@ -200,6 +210,47 @@ export function mountTree(deps: TreeDeps): TreeController {
   // `trailDetailCache`.
   const expandedTrails = new Set<string>();
   const trailDetailCache = new Map<string, ResolvedWaypoint[]>();
+
+  // status: staging-accept-reject-from-tree
+  // Cached pending staging proposals. Fetched on vault open and on
+  // `hiker:staging-changed`. Used by `renderDir` to inject synthetic
+  // rows for new files and dirty markers for existing files.
+  let pendingProposals: Proposal[] = [];
+
+  async function refreshStagingProposals(): Promise<void> {
+    try {
+      pendingProposals = await Ipc.stagingList();
+    } catch (err) {
+      Logger.error("ui::tree", "staging_list failed", { err });
+      pendingProposals = [];
+    }
+  }
+
+  /// Given a directory rel path, return a map of direct child names
+  /// to the proposals that target that child (or deeper inside it).
+  function childProposalsForDir(rel: string): Map<string, Proposal[]> {
+    const map = new Map<string, Proposal[]>();
+    for (const p of pendingProposals) {
+      if (rel === "") {
+        // Direct children have no slash (file at root) or the first
+        // segment before any slash.
+        const slashIdx = p.target_path.indexOf("/");
+        const childName = slashIdx >= 0 ? p.target_path.slice(0, slashIdx) : p.target_path;
+        const arr = map.get(childName) ?? [];
+        arr.push(p);
+        map.set(childName, arr);
+      } else if (p.target_path === rel || p.target_path.startsWith(rel + "/")) {
+        const rest = p.target_path === rel ? "" : p.target_path.slice(rel.length + 1);
+        const slashIdx = rest.indexOf("/");
+        const childName = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+        if (!childName) continue;
+        const arr = map.get(childName) ?? [];
+        arr.push(p);
+        map.set(childName, arr);
+      }
+    }
+    return map;
+  }
 
   // status: trails-mode-side-trail-render — render side-trail
   // children recursively under their parent. Each level is wrapped
@@ -239,8 +290,12 @@ export function mountTree(deps: TreeDeps): TreeController {
 
   async function fetchIndexState(rel: string): Promise<IndexState> {
     const state = await Ipc.indexStateFor({ rel });
-    indexStateCache.set(rel, state);
-    return state;
+    // Don't overwrite a fresher value that arrived via hiker:reindex-progress
+    // while this IPC was in flight — events are the live source of truth.
+    if (!indexStateCache.has(rel)) {
+      indexStateCache.set(rel, state);
+    }
+    return indexStateCache.get(rel)!;
   }
 
   function applyIndexMarker(li: HTMLElement, state: IndexState | null): void {
@@ -441,17 +496,74 @@ export function mountTree(deps: TreeDeps): TreeController {
     return li;
   }
 
-  async function renderDir(rel: string, container: HTMLElement): Promise<void> {
-    const entries = await Ipc.listDir({
-      rel,
-      sort: sortOrderToSettings(treeSortOrder),
+  function sortTreeEntries(
+    entries: DirEntry[],
+    order: TreeSortOrder,
+  ): DirEntry[] {
+    return entries.slice().sort((a, b) => {
+      const aDir = a.kind === "dir";
+      const bDir = b.kind === "dir";
+      if (aDir && !bDir) return -1;
+      if (!aDir && bDir) return 1;
+      switch (order) {
+        case "name-asc":
+          return a.name.localeCompare(b.name);
+        case "name-desc":
+          return b.name.localeCompare(a.name);
+        case "mtime-newest":
+          return b.mtime - a.mtime;
+        case "mtime-oldest":
+          return a.mtime - b.mtime;
+      }
     });
+  }
+
+  async function renderDir(rel: string, container: HTMLElement): Promise<void> {
+    let entries: DirEntry[];
+    try {
+      entries = await Ipc.listDir({
+        rel,
+        sort: sortOrderToSettings(treeSortOrder),
+      });
+    } catch {
+      // Directory doesn't exist on disk — typical for synthetic staging
+      // directories that haven't been accepted yet.
+      entries = [];
+    }
+
+    // status: staging-accept-reject-from-tree — merge pending proposals.
+    const childMap = childProposalsForDir(rel);
+    const realNames = new Set(entries.map((e) => e.name));
+    for (const [childName, proposals] of childMap) {
+      if (realNames.has(childName)) continue;
+      const exactPath = rel ? `${rel}/${childName}` : childName;
+      const hasExactFile = proposals.some((p) => p.target_path === exactPath);
+      entries.push({
+        kind: hasExactFile ? "file" : "dir",
+        name: childName,
+        rel_path: exactPath,
+        mtime: 0,
+      });
+    }
+    entries = sortTreeEntries(entries, treeSortOrder);
+
     const ul = document.createElement("ul");
     const pendingChildren: Promise<void>[] = [];
     for (const entry of entries) {
+      const proposals = childMap.get(entry.name) ?? [];
+      const hasStaging = proposals.length > 0;
+      const isSynthetic = !realNames.has(entry.name);
       const expanded = entry.kind === "dir" && expandedFolders.has(entry.rel_path);
       const li = domForTreeRow(entry, expanded);
-      attachDnd(li, entry);
+      if (isSynthetic) {
+        li.draggable = false;
+      }
+      if (hasStaging) {
+        li.classList.add(isSynthetic ? "staging-new" : "staging-dirty");
+      }
+      if (!isSynthetic) {
+        attachDnd(li, entry);
+      }
       attachContextMenu(li, entry);
       if (entry.kind === "dir" && expanded) {
         const path = entry.rel_path;
@@ -465,11 +577,13 @@ export function mountTree(deps: TreeDeps): TreeController {
           }),
         );
       }
-      li.addEventListener("dblclick", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        void beginInlineRename(li, entry.rel_path, entry.kind);
-      });
+      if (!isSynthetic) {
+        li.addEventListener("dblclick", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          void beginInlineRename(li, entry.rel_path, entry.kind);
+        });
+      }
       ul.appendChild(li);
       // status: trail-row-dropdown-chevron — render waypoint children
       // for expanded trail-doc rows, mirroring the folder-expansion
@@ -480,6 +594,7 @@ export function mountTree(deps: TreeDeps): TreeController {
       // appear in the DOM (fix for bug-filetree-trail-expand-shows-no-waypoints).
       if (
         entry.kind === "file"
+        && !isSynthetic
         && trailDocPaths.has(entry.rel_path)
         && expandedTrails.has(entry.rel_path)
       ) {
@@ -557,8 +672,17 @@ export function mountTree(deps: TreeDeps): TreeController {
       }
     } else {
       selectedFolder = parentOf(rel);
-      const sticky = e.metaKey || e.ctrlKey;
-      void deps.openNote(rel, { preview: !sticky });
+      // status: staging-accept-reject-from-tree — synthetic staging rows
+      // open the staging preview instead of the on-disk file.
+      if (li.classList.contains("staging-new")) {
+        const proposal = pendingProposals.find((p) => p.target_path === rel);
+        if (proposal && deps.onOpenStagingProposal) {
+          void deps.onOpenStagingProposal(proposal);
+        }
+      } else {
+        const sticky = e.metaKey || e.ctrlKey;
+        void deps.openNote(rel, { preview: !sticky });
+      }
     }
   }
   deps.treeEl.addEventListener("click", (e) => {
@@ -868,6 +992,44 @@ export function mountTree(deps: TreeDeps): TreeController {
         label: "Properties",
         run: () => deps.onOpenProperties?.(entry.rel_path),
       });
+      // status: staging-accept-reject-from-tree
+      const stagingProposals = pendingProposals.filter(
+        (p) =>
+          p.target_path === entry.rel_path ||
+          p.target_path.startsWith(entry.rel_path + "/"),
+      );
+      if (stagingProposals.length > 0) {
+        const first = stagingProposals[0];
+        items.push({
+          label: "Review pending change",
+          run: () => deps.onOpenStagingProposal?.(first),
+        });
+        items.push({
+          label: "Accept change",
+          run: async () => {
+            try {
+              await deps.onAcceptStaging?.(first);
+              await refreshStagingProposals();
+              await refresh();
+            } catch (err) {
+              Logger.error("ui::tree", "staging accept failed", { err });
+            }
+          },
+        });
+        items.push({
+          label: "Reject change",
+          danger: true,
+          run: async () => {
+            try {
+              await deps.onRejectStaging?.(first);
+              await refreshStagingProposals();
+              await refresh();
+            } catch (err) {
+              Logger.error("ui::tree", "staging reject failed", { err });
+            }
+          },
+        });
+      }
       openContextMenu(e.clientX, e.clientY, items);
     });
   }
@@ -1085,6 +1247,8 @@ export function mountTree(deps: TreeDeps): TreeController {
       expandedTrails.clear();
       trailDetailCache.clear();
       trailDocPaths.clear();
+      // status: staging-accept-reject-from-tree
+      pendingProposals = [];
     },
     fetchIndexState,
     beginInlineRenameByPath: async (rel: string) => {
@@ -1094,9 +1258,10 @@ export function mountTree(deps: TreeDeps): TreeController {
       if (!li) return;
       await beginInlineRename(li, rel, "file");
     },
-    refreshTrailDocSet,
-    isTrailDoc: (rel: string) => trailDocPaths.has(rel),
-  };
+  refreshTrailDocSet,
+  isTrailDoc: (rel: string) => trailDocPaths.has(rel),
+  refreshStagingProposals,
+};
 
   return createPanelController<TreeApi>(api, {
     initialVisible: true,

@@ -41,6 +41,7 @@ import {
   resetDiffDecorations,
   renderDiff as renderDiffImpl,
   clearDiff as clearDiffImpl,
+  rerenderActiveDiff as rerenderActiveDiffImpl,
   type DiffInput,
 } from "../diff";
 import { viewSettingsStore, type Buffer } from "./state";
@@ -97,6 +98,11 @@ export interface EditorHost {
   /// Force live-preview-on flag (View menu's toggle). Current buffer's
   /// md-ness still gates whether the extension actually applies.
   setLivePreviewEnabled(on: boolean): void;
+  /// View-menu intraline-diff toggle. Updates `viewSettingsStore` and, if
+  /// a diff is currently rendered in this view, re-runs `renderDiff` with
+  /// the new flag so the active diff updates without leaving preview mode.
+  // status: view-intraline-diff-toggle
+  setIntralineDiffEnabled(on: boolean): Promise<void>;
 
   /// Path-extension helpers — exposed because tab-management code
   /// in `app/tabs.ts` and the file-load path in `app/openFile.ts` need
@@ -161,6 +167,10 @@ export interface EditorHost {
   renderDiff(input: DiffInput): Promise<void>;
   clearDiff(plainText: string): void;
   resetDiffDecorations(): void;
+  /// Re-run the last `renderDiff` against the current view (no-op when
+  /// no diff is active). Reads `intralineDiffEnabled` from
+  /// `viewSettingsStore` so the View toggle flip drives the recompute.
+  rerenderActiveDiff(): Promise<void>;
 
   /// Tab-activation escape hatch. Restores a previously-captured CM6
   /// `EditorState` (selection / scroll / undo history) via
@@ -247,6 +257,22 @@ export function mountEditor(deps: EditorHostDeps): EditorHost {
       doc: "",
       extensions: [
         basicSetup,
+        EditorView.domEventHandlers({
+          mousedown: (e) => {
+            if (e.button === 1) {
+              e.preventDefault();
+              return true;
+            }
+            return false;
+          },
+          auxclick: (e) => {
+            if (e.button === 1) {
+              e.preventDefault();
+              return true;
+            }
+            return false;
+          },
+        }),
         wordWrapCompartment.of(EditorView.lineWrapping),
         language.of(markdown()),
         livePreviewCompartment.of(livePreview()),
@@ -455,6 +481,16 @@ export function mountEditor(deps: EditorHostDeps): EditorHost {
     });
   }
 
+  async function setIntralineDiffEnabled(on: boolean): Promise<void> {
+    viewSettingsStore.update((s) => ({ ...s, intralineDiffEnabled: on }));
+    // status: view-intraline-diff-toggle — drive a class on the editor
+    // root so patch-review's CSS can swap its hunk rendering (inline strike-
+    // through widget when on, stacked block when off) without rebuilding
+    // its decorations.
+    view.dom.classList.toggle("hiker-intraline-active", on);
+    await rerenderActiveDiffImpl(view, { intraline: on });
+  }
+
   return {
     getActiveText: () => view.state.doc.toString(),
     getDocLength: () => view.state.doc.length,
@@ -477,6 +513,7 @@ export function mountEditor(deps: EditorHostDeps): EditorHost {
     setLineNumbersVisible,
     setRenderTxtAsMarkdown,
     setLivePreviewEnabled,
+    setIntralineDiffEnabled,
     languageExtensionForPath,
     livePreviewExtensionForPath,
     isMarkdownPath,
@@ -492,9 +529,16 @@ export function mountEditor(deps: EditorHostDeps): EditorHost {
     diffButtonAvailable,
     refreshChunkBoundaries,
     scheduleChunkBoundariesRefresh,
-    renderDiff: (input) => renderDiffImpl(view, input),
+    renderDiff: (input) =>
+      renderDiffImpl(view, input, {
+        intraline: viewSettingsStore.get().intralineDiffEnabled,
+      }),
     clearDiff: (plainText) => clearDiffImpl(view, plainText),
     resetDiffDecorations: () => resetDiffDecorations(view),
+    rerenderActiveDiff: () =>
+      rerenderActiveDiffImpl(view, {
+        intraline: viewSettingsStore.get().intralineDiffEnabled,
+      }),
     applySavedState: (state, effects) => {
       view.setState(state);
       view.dispatch({ effects });

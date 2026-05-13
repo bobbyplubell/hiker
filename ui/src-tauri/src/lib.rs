@@ -7,6 +7,7 @@ use std::time::Instant;
 use notify::{Event as NotifyEvent, EventKind as NotifyEventKind, Watcher as NotifyWatcher, RecursiveMode};
 
 use hiker_core::autosave::{Autosave, RecoveredEntry, TabState};
+use hiker_core::activity::{Activity, ActivityFilter, ActivityItem, ActivitySource};
 use hiker_core::changes::{ChangeOp, ChangeRow, Changes};
 use hiker_core::config::{Config, SettingsScope, TreeSortBy};
 use hiker_core::indexer::{
@@ -47,6 +48,11 @@ pub(crate) struct VaultSession {
     ///
     /// status: agent-write-review-mode
     pub(crate) staging: Arc<Staging>,
+    /// status: activity-feed-module
+    /// Pure projection over `changes` + `staging`. Constructed at vault
+    /// open; no on-disk state of its own. Backs `activity_list` /
+    /// `activity_list_for_path` / `activity_count`.
+    pub(crate) activity: Arc<Activity>,
     /// status: autosave-backend-module
     /// Owns all `<vault>/.hiker/autosave/` writes and recovery. Same
     /// module-discipline shape as `core::store` / `core::changes` —
@@ -118,6 +124,13 @@ pub(crate) struct VaultSession {
     /// per-tool toggles apply live. Mutated by `set_setting` /
     /// `reload_config`.
     pub(crate) mcp_tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    /// status: staging-config-section
+    /// Shared `[staging]` config. Read live by the staging recheck task
+    /// (so `auto_reject_on_conflict` applies without a restart) and by
+    /// the vault-open GC pass via the in-memory copy. Mutated alongside
+    /// `mcp_tools` by `set_setting` / `reload_config` / the config-file
+    /// watcher.
+    pub(crate) staging_config: Arc<std::sync::RwLock<hiker_core::config::StagingConfig>>,
 }
 
 impl Drop for VaultSession {
@@ -510,6 +523,10 @@ async fn set_setting_inner(
             Ok(mut tools) => *tools = updated.mcp.tools.clone(),
             Err(_) => {} // poisoned — best-effort
         };
+        match session.staging_config.write() {
+            Ok(mut s) => *s = updated.staging.clone(),
+            Err(_) => {} // poisoned — best-effort
+        };
     }
     // status: mcp-bind-host-configurable
     // Bind-affecting change → tear the MCP server down and start it
@@ -665,6 +682,9 @@ fn reload_config(state: State<AppState>) -> Result<Config, HikerError> {
         if let Ok(mut tools) = session.mcp_tools.write() {
             *tools = updated.mcp.tools.clone();
         }
+        if let Ok(mut s) = session.staging_config.write() {
+            *s = updated.staging.clone();
+        }
         Ok(updated)
     })();
     log_cmd_result("reload_config", result)
@@ -737,6 +757,118 @@ fn get_default_vault() -> Result<Option<String>, String> {
 /// the bootstrap path can react with a toast + fall-through to picker
 /// rather than auto-clearing the setting.
 ///
+/// status: staging-drift-eager-recheck
+/// Spawn a tokio task that consumes watcher + changes broadcasts and
+/// re-checks every pending staging proposal whose `target_path` matches.
+/// `Staging::recheck` persists transitions and broadcasts
+/// `hiker:staging-changed` via the existing staging forwarder, so this
+/// helper is fire-and-forget — it owns no event channel of its own.
+fn spawn_staging_recheck(
+    staging: Arc<Staging>,
+    vault: Vault,
+    staging_config: Arc<std::sync::RwLock<hiker_core::config::StagingConfig>>,
+    mut file_rx: tokio::sync::broadcast::Receiver<FileEvent>,
+    mut changes_rx: tokio::sync::broadcast::Receiver<ChangeRow>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                ev = file_rx.recv() => match ev {
+                    Ok(FileEvent::Created { path })
+                    | Ok(FileEvent::Modified { path })
+                    | Ok(FileEvent::Deleted { path }) => {
+                        recheck_path(&staging, &vault, &staging_config, &path);
+                    }
+                    Ok(FileEvent::Renamed { from, to }) => {
+                        recheck_path(&staging, &vault, &staging_config, &from);
+                        recheck_path(&staging, &vault, &staging_config, &to);
+                    }
+                    Ok(FileEvent::Overflow) => {
+                        // After overflow, our knowledge of the filesystem is
+                        // stale. Recheck every pending proposal against
+                        // current disk so conflicted state catches up.
+                        if let Ok(all) = staging.list(&StagingFilter::default()) {
+                            let mut seen = std::collections::HashSet::new();
+                            for p in &all {
+                                if seen.insert(p.target_path.clone()) {
+                                    recheck_path(&staging, &vault, &staging_config, &p.target_path);
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                },
+                ev = changes_rx.recv() => match ev {
+                    Ok(row) => {
+                        recheck_path(&staging, &vault, &staging_config, &row.path);
+                        if let Some(ref from) = row.rename_from {
+                            recheck_path(&staging, &vault, &staging_config, from);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                },
+            }
+        }
+    });
+}
+
+/// status: staging-auto-reject-on-conflict
+fn recheck_path(
+    staging: &Staging,
+    vault: &Vault,
+    staging_config: &std::sync::RwLock<hiker_core::config::StagingConfig>,
+    rel_path: &str,
+) {
+    let proposals = match staging.list(&StagingFilter {
+        path: Some(rel_path.to_string()),
+        ..Default::default()
+    }) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let disk = vault.read_file(rel_path).ok();
+    for p in &proposals {
+        match staging.recheck(&p.id, disk.as_deref()) {
+            Ok(outcome) => {
+                use hiker_core::staging::ProposalState;
+                let transitioned_to_conflict = outcome.prior_state == ProposalState::Applyable
+                    && outcome.new_state == ProposalState::Conflicted;
+                if !transitioned_to_conflict {
+                    continue;
+                }
+                let auto_reject = staging_config
+                    .read()
+                    .map(|c| c.auto_reject_on_conflict)
+                    .unwrap_or(false);
+                if !auto_reject {
+                    continue;
+                }
+                let reason = outcome
+                    .new_reason
+                    .map(|r| r.as_str())
+                    .unwrap_or("unknown");
+                tracing::info!(
+                    proposal_id = %p.id,
+                    reason = %reason,
+                    "staging: auto-rejecting proposal on conflict transition",
+                );
+                if let Err(e) = staging.reject(&p.id) {
+                    tracing::warn!(
+                        proposal_id = %p.id,
+                        error = %e,
+                        "staging: auto-reject failed",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(proposal_id = %p.id, error = %e, "staging: recheck failed");
+            }
+        }
+    }
+}
+
 /// status: settings-default-vault-autoopen
 #[tauri::command]
 async fn open_vault_at(
@@ -832,6 +964,9 @@ async fn open_vault_at_inner(
         Staging::open(&root).map_err(|e| HikerError::Io(format!("staging: {e}")))?,
     );
 
+    // status: activity-feed-module
+    let activity = Arc::new(Activity::new(changes.clone(), staging.clone()));
+
     // status: autosave-backend-module, autosave-store-layout
     // Open the per-vault autosave store. Failure is fatal at vault open
     // (a future tick would just keep failing silently otherwise).
@@ -847,6 +982,13 @@ async fn open_vault_at_inner(
         tracing::warn!(error = %e, "changes: gc on open failed");
     }
 
+    // status: staging-config-section
+    // Staging GC on vault open; retention threshold from `[staging]`
+    // config (default 14 days). Lifts the previously-hardcoded value.
+    if let Err(e) = staging.gc(config.staging.retention_days) {
+        tracing::warn!(error = %e, "staging: gc on open failed");
+    }
+
     // Forward each append to the frontend as `hiker:changes-appended`.
     // Lagging is fine — the home page widget re-fetches `recent` on each
     // notification so a missed event just means one less repaint.
@@ -857,6 +999,23 @@ async fn open_vault_at_inner(
             match changes_rx.recv().await {
                 Ok(row) => {
                     let _ = app_for_changes.emit("hiker:changes-appended", &row);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+
+    // Forward staging mutations to the frontend as `hiker:staging-changed`.
+    // This catches proposals from the MCP surface (which lacks an AppHandle)
+    // as well as the Tauri accept/reject commands.
+    let app_for_staging = app.clone();
+    let mut staging_rx = staging.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match staging_rx.recv().await {
+                Ok(()) => {
+                    let _ = app_for_staging.emit("hiker:staging-changed", ());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -914,6 +1073,25 @@ async fn open_vault_at_inner(
             }
         }
     });
+
+    // status: staging-config-section
+    // Shared `[staging]` config — read live by the staging recheck task so
+    // `auto_reject_on_conflict` applies without a restart.
+    let staging_config: Arc<std::sync::RwLock<hiker_core::config::StagingConfig>> =
+        Arc::new(std::sync::RwLock::new(config.staging.clone()));
+
+    // status: staging-drift-eager-recheck
+    // Every watcher FileEvent and every appended `core::changes` row gets
+    // routed through `Staging::recheck` for proposals whose `target_path`
+    // matches. State transitions persist + broadcast `hiker:staging-changed`
+    // via the staging forwarder above; this task is purely the trigger.
+    spawn_staging_recheck(
+        staging.clone(),
+        vault.clone(),
+        staging_config.clone(),
+        watcher.subscribe(),
+        changes.subscribe(),
+    );
 
     // Forward indexer progress events to the frontend.
     let app_for_progress = app.clone();
@@ -1146,6 +1324,7 @@ async fn open_vault_at_inner(
         watcher,
         changes,
         staging,
+        activity,
         autosave,
         config: RwLock::new(config),
         read_store,
@@ -1157,6 +1336,7 @@ async fn open_vault_at_inner(
         tasks_cancel,
         config_watcher_cancel,
         mcp_tools,
+        staging_config,
     };
 
     let state = app.state::<AppState>();
@@ -1262,8 +1442,12 @@ fn count_notes_in(state: State<AppState>, rel: String) -> Result<u32, String> {
 /// buffer text, snapshot blob via `change_content`, derived file via
 /// `read_file`, etc.) and renders the returned `DiffResult`.
 #[tauri::command]
-fn compute_diff(before: String, after: String) -> hiker_core::diff::DiffResult {
-    hiker_core::diff::compute(&before, &after)
+fn compute_diff(
+    before: String,
+    after: String,
+    intraline: Option<bool>,
+) -> hiker_core::diff::DiffResult {
+    hiker_core::diff::compute_with_intraline(&before, &after, intraline.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -3390,6 +3574,9 @@ async fn start_config_watcher(
                                         if let Ok(mut tools) = session.mcp_tools.write() {
                                             *tools = config.mcp.tools.clone();
                                         }
+                                        if let Ok(mut s) = session.staging_config.write() {
+                                            *s = config.staging.clone();
+                                        }
                                     }
                                 }
                                 let _ = app.emit("hiker:config-reloaded", &config);
@@ -3431,6 +3618,7 @@ impl From<StagingFilterArg> for StagingFilter {
             trail_id: a.trail_id,
             surface: a.surface,
             session_id: a.session_id,
+            state: None,
         }
     }
 }
@@ -3464,7 +3652,6 @@ fn staging_count(state: State<'_, AppState>) -> Result<u32, String> {
 
 #[tauri::command]
 fn staging_accept(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
     proposal_id: String,
 ) -> Result<AcceptOutcome, String> {
@@ -3477,19 +3664,11 @@ fn staging_accept(
             .map_err(|e| e.to_string())?;
         Ok(outcome)
     })();
-    let r = log_cmd_result("staging_accept", result);
-    // status: staging-review-activity-detail-filter
-    // Emit so every active surface (activity detail, tree, trails, etc.)
-    // can refresh after a proposal is accepted.
-    if r.is_ok() {
-        let _ = app.emit("hiker:staging-changed", ());
-    }
-    r
+    log_cmd_result("staging_accept", result)
 }
 
 #[tauri::command]
 fn staging_reject(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
     proposal_id: String,
 ) -> Result<(), String> {
@@ -3501,16 +3680,11 @@ fn staging_reject(
             .reject(&proposal_id)
             .map_err(|e| e.to_string())
     })();
-    let r = log_cmd_result("staging_reject", result);
-    if r.is_ok() {
-        let _ = app.emit("hiker:staging-changed", ());
-    }
-    r
+    log_cmd_result("staging_reject", result)
 }
 
 #[tauri::command]
 fn staging_accept_all(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<AcceptOutcome>, String> {
     let result = (|| -> Result<Vec<AcceptOutcome>, String> {
@@ -3525,11 +3699,7 @@ fn staging_accept_all(
             )
             .map_err(|e| e.to_string())
     })();
-    let r = log_cmd_result("staging_accept_all", result);
-    if r.is_ok() {
-        let _ = app.emit("hiker:staging-changed", ());
-    }
-    r
+    log_cmd_result("staging_accept_all", result)
 }
 
 /// Read the proposed `.md` content for a staging proposal so the frontend
@@ -3555,6 +3725,88 @@ fn staging_content(
 
 // status: staging-review-activity-detail-filter
 // status: staging-bulk-apply-reject
+
+// ---------- unified activity feed (changes + staging) ----------
+
+/// Argument shape for `activity_list*` commands. Mirrors
+/// `hiker_core::activity::ActivityFilter` but kept independent so the
+/// snake_case JSON wire stays stable if the core struct gains fields.
+#[derive(Debug, Deserialize)]
+struct ActivityFilterArg {
+    #[serde(default)]
+    source: ActivitySource,
+    #[serde(default = "default_activity_limit")]
+    limit: usize,
+    #[serde(default)]
+    author_pattern: Option<String>,
+    #[serde(default)]
+    since_ms: Option<i64>,
+}
+
+fn default_activity_limit() -> usize {
+    200
+}
+
+impl From<ActivityFilterArg> for ActivityFilter {
+    fn from(a: ActivityFilterArg) -> Self {
+        ActivityFilter {
+            source: a.source,
+            limit: a.limit,
+            author_pattern: a.author_pattern,
+            since_ms: a.since_ms,
+        }
+    }
+}
+
+// status: activity-feed-merged-query
+#[tauri::command]
+fn activity_list(
+    state: State<'_, AppState>,
+    filter: Option<ActivityFilterArg>,
+) -> Result<Vec<ActivityItem>, String> {
+    let result = (|| -> Result<Vec<ActivityItem>, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
+        session.activity.list(f).map_err(|e| e.to_string())
+    })();
+    log_cmd_result("activity_list", result)
+}
+
+// status: activity-feed-merged-query
+// status: status-bar-version-dropdown-uses-unified-feed
+#[tauri::command]
+fn activity_list_for_path(
+    state: State<'_, AppState>,
+    path: String,
+    filter: Option<ActivityFilterArg>,
+) -> Result<Vec<ActivityItem>, String> {
+    let result = (|| -> Result<Vec<ActivityItem>, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
+        session
+            .activity
+            .list_for_path(&path, f)
+            .map_err(|e| e.to_string())
+    })();
+    log_cmd_result("activity_list_for_path", result)
+}
+
+// status: activity-feed-merged-query
+#[tauri::command]
+fn activity_count(
+    state: State<'_, AppState>,
+    filter: Option<ActivityFilterArg>,
+) -> Result<u32, String> {
+    let result = (|| -> Result<u32, String> {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+        let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
+        session.activity.count(f).map_err(|e| e.to_string())
+    })();
+    log_cmd_result("activity_count", result)
+}
 
 pub fn run() {
     tauri::Builder::default()
@@ -3644,6 +3896,9 @@ pub fn run() {
             staging_reject,
             staging_accept_all,
             staging_content,
+            activity_list,
+            activity_list_for_path,
+            activity_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

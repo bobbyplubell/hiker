@@ -167,17 +167,27 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
     diffToggleInFlight = true;
     try {
       if (mode.diffActive) {
-        deps.editor.clearDiff(buffer.loadedText);
-        deps.editor.dispatch({
-          effects: [
-            deps.editor.livePreviewCompartment.reconfigure(
-              deps.editor.livePreviewExtensionForPath(row.path),
-            ),
-            deps.editor.hideFrontmatterCompartment.reconfigure(
-              deps.getHideFrontmatterEnabled() ? hideFrontmatter() : [],
-            ),
-          ],
-        });
+        // Snapshot preview keeps the editor read-only (set in `open`), but
+        // `clearDiff` issues a `changes:` dispatch that the RO compartment
+        // would silently drop. Drop RO around the doc-replacing dispatches
+        // and restore it after, mirroring `dirtyBufferDiff`'s shape where
+        // `setReadOnly(true)` runs *after* `renderDiff`.
+        deps.editor.setReadOnly(false);
+        try {
+          deps.editor.clearDiff(buffer.loadedText);
+          deps.editor.dispatch({
+            effects: [
+              deps.editor.livePreviewCompartment.reconfigure(
+                deps.editor.livePreviewExtensionForPath(row.path),
+              ),
+              deps.editor.hideFrontmatterCompartment.reconfigure(
+                deps.getHideFrontmatterEnabled() ? hideFrontmatter() : [],
+              ),
+            ],
+          });
+        } finally {
+          deps.editor.setReadOnly(true);
+        }
         mode.diffActive = false;
         deps.renderModeControls();
         deps.editor.refreshChunkBoundaries();
@@ -200,23 +210,37 @@ export function mountSnapshotPreview(deps: SnapshotPreviewDeps): SnapshotPreview
         return;
       }
       const when = new Date(row.timestamp_ms).toLocaleString();
-      deps.editor.dispatch({
-        effects: [
-          deps.editor.livePreviewCompartment.reconfigure([]),
-          deps.editor.hideFrontmatterCompartment.reconfigure([]),
-        ],
-      });
-      await deps.editor.renderDiff({
-        before: {
-          label: `${row.path} · snapshot ${when}`,
-          content: buffer.loadedText,
-          meta: { changeId: row.id },
-        },
-        after: {
-          label: `${row.path} · current`,
-          content: currentContent,
-        },
-      });
+      // Lift RO around `renderDiff` — it dispatches a doc-replacing
+      // `changes:` transaction internally; the RO compartment from `open`
+      // would otherwise drop it on the floor and the toggle would no-op.
+      // Fold the live-preview / hide-frontmatter compartment reconfigures
+      // into a single dispatch *after* `renderDiff` — issuing them
+      // beforehand was causing an intermediate `statusUpdater` ViewUpdate
+      // (via `updateStatus` → `modeControls.render`) to rebuild the
+      // toolbar button mid-toggle, which manifested as a double-click
+      // requirement on first engage.
+      deps.editor.setReadOnly(false);
+      try {
+        await deps.editor.renderDiff({
+          before: {
+            label: `${row.path} · snapshot ${when}`,
+            content: buffer.loadedText,
+            meta: { changeId: row.id },
+          },
+          after: {
+            label: `${row.path} · current`,
+            content: currentContent,
+          },
+        });
+        deps.editor.dispatch({
+          effects: [
+            deps.editor.livePreviewCompartment.reconfigure([]),
+            deps.editor.hideFrontmatterCompartment.reconfigure([]),
+          ],
+        });
+      } finally {
+        deps.editor.setReadOnly(true);
+      }
       (after.mode as unknown as SnapshotBufferMode).diffActive = true;
       deps.renderModeControls();
       deps.editor.refreshChunkBoundaries();

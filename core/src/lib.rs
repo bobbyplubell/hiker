@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod activity;
 pub mod agent;
 pub mod audit;
 pub mod autosave;

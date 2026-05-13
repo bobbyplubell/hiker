@@ -26,7 +26,6 @@ import { mountTabStrip, type TabStripApi } from "./tabStrip";
 import { mountDiscovery, type DiscoveryController } from "./discovery";
 import { mountTrailsPanel, type TrailsController } from "./trails";
 import { mountAddToTrailPill } from "./trails/addToTrailPill";
-import { mountStagingPill, type StagingPillApi } from "./editor/stagingPill";
 import {
   installMembershipWatchers,
   refreshActiveTrailWaypointPaths,
@@ -40,6 +39,8 @@ import {
 import { iconButton } from "./modeControls";
 import { Icons } from "./icons";
 import { hideFrontmatter } from "./editor/hideFrontmatter";
+import { applyEditPure } from "./patchReview";
+import type { Proposal } from "./ipc";
 import { mountPropertiesPane, type PropertiesPaneApi } from "./propertiesPane";
 // Stores hoist main.ts's globals into a single source of truth + subscribe
 // surface. Local `let` bindings below stay as derived caches kept in sync
@@ -56,7 +57,6 @@ import {
   type BufferApi,
   type ActiveBufferSnapshot,
   type TabKind,
-  type BufferMode,
 } from "./app/state";
 import { applySettingsToUi as applySettingsToUiImpl, type Settings } from "./app/settingsApply";
 import { mountVaultLifecycle } from "./app/vaultLifecycle";
@@ -125,6 +125,7 @@ function applySettingsToUi(s: Settings): void {
     setWhitespaceEnabled,
     setChunkBoundariesEnabled,
     setHideFrontmatterEnabled,
+    setIntralineDiffEnabled,
     setTreeSortFromSettings: (sortBy) => {
       void tree.api.setSortOrder(sortOrderFromSettings(sortBy), false);
     },
@@ -150,7 +151,18 @@ function applySettingsToUi(s: Settings): void {
 // domain so the bag stays grep-able as a unit; bootstrap then passes
 // slices into each mount.
 const dom = captureDomRefs();
-const { appEl, editorEl, editorPaneEl, saveBtn, diffBtn, modeControlsEl } = dom.editor;
+const {
+  appEl,
+  editorEl,
+  editorPaneEl,
+  saveBtn,
+  diffBtn,
+  agentDiffBtn,
+  modeControlsEl,
+  writeNotePendingBannerEl,
+  writeNotePendingBannerLabelEl,
+  writeNotePendingBannerBtn,
+} = dom.editor;
 const { statusPathEl, statusCursorEl, statusWordsEl, statusIndexEl } = dom.statusBar;
 const { pickBtn, vaultPathEl, homeBtn, settingsBtn } = dom.vaultBar;
 const { treeEl, newNoteBtn, sidebarActionsBtn } = dom.tree;
@@ -247,6 +259,13 @@ const chatPanel = mountChatPanel({
   // status: editor-preview-tab-from-open-callsites
   onOpenNoteLink: (rel) => {
     void openFile(rel, { preview: true });
+  },
+  // Routes the chat tool-card's header-click for staged write/edit
+  // proposals through the same staging-preview seam the activity
+  // widget uses, so we don't `openFile` against a path that's only
+  // staged. Fixes `bug-chat-tool-card-no-link-for-staged-writes`.
+  onOpenStagingProposal: (proposal) => {
+    void openProposalReview(proposal);
   },
   // status: chat-active-note-context-injection
   // status: chat-input-at-selection
@@ -393,6 +412,9 @@ function setWordWrapEnabled(on: boolean): void {
 function setLivePreviewEnabled(on: boolean): void {
   editor.setLivePreviewEnabled(on);
 }
+function setIntralineDiffEnabled(on: boolean): void {
+  void editor.setIntralineDiffEnabled(on);
+}
 
 function isDirty(): boolean {
   return editor.isDirty();
@@ -406,23 +428,23 @@ function scheduleChunkBoundariesRefresh(delayMs: number): void {
 
 // status: tab-kinds
 /// Returns the `kind` discriminator of the active buffer (or the
-/// pending page-kind tab key prefix), or `null` when no tab is active.
+/// pending app-page tab key prefix), or `null` when no tab is active.
 function activeKind(): TabKind | null {
   if (!buffer) return null;
   return buffer.kind;
 }
 
 // status: tab-kinds
-/// Stable synthetic key for a page-kind tab. Buffer tabs use the
-/// vault-relative path as their key; page-kind tabs use a prefixed
+/// Stable synthetic key for a app-page tab. Buffer tabs use the
+/// vault-relative path as their key; app-page tabs use a prefixed
 /// sentinel so they live alongside buffer entries in `openBuffers`
 /// without colliding with real paths.
-function pageTabKey(kind: string, view?: string): string {
+function appPageTabKey(kind: string, view?: string): string {
   return view ? `__hiker:${kind}:${view}` : `__hiker:${kind}`;
 }
 
 // status: tab-kinds
-/// Re-evaluates editor chrome + page-kind surface visibility based on
+/// Re-evaluates editor chrome + app-page surface visibility based on
 /// the active tab's kind discriminator. Called on every status pulse.
 function renderActiveTab(): void {
   const kind = activeKind();
@@ -434,6 +456,11 @@ function renderActiveTab(): void {
   dom.editor.viewMenuBtn.hidden = !isBuffer;
   dom.editor.mutationsMenuBtn.hidden = !isBuffer;
   modeControlsEl.hidden = !isBuffer;
+  // status: write-note-pending-banner — buffer-scoped chrome.
+  // `refreshWriteNotePendingBanner` already enforces this on its own
+  // path; force-hide here so non-buffer tabs never leak a stale banner
+  // from a previously active buffer.
+  if (!isBuffer) writeNotePendingBannerEl.hidden = true;
   const trailPill = document.getElementById("add-to-trail-pill");
   if (trailPill) trailPill.hidden = !isBuffer;
   const statusBarEl = document.getElementById("status-bar");
@@ -509,6 +536,10 @@ function updateStatus(): void {
     editorPane.dirtyBufferDiff.forceOff();
   }
   editorPane.modeControls.render();
+  // status: patch-review-agent-diff-toggle
+  refreshAgentDiffBtn();
+  // status: write-note-pending-banner
+  refreshWriteNotePendingBanner();
   tabStrip.render();
   // status: tab-kinds — re-evaluate editor chrome visibility after
   // every kind transition.
@@ -688,6 +719,20 @@ const editorPane: EditorPaneApi = mountEditorPane({
     }
     editorPane.modeControls.render();
   },
+  // status: status-bar-path-reveal
+  onRevealInFileManager: (rel) => Ipc.revealInFileManager({ rel }),
+  // status: status-bar-version-dropdown-selection
+  onSelectCurrentVersion: (path) => {
+    // Re-open the live file. The normal open path handles exiting
+    // snapshot / staging preview modes; opens non-preview, sticky.
+    void openFile(path, { preview: false });
+  },
+  onSelectSnapshotVersion: (row) => snapshotPreview.open(row),
+  onSelectStagingVersion: (proposal) => openProposalReview(proposal),
+  // status: patch-review-per-hunk-accept
+  onPatchReviewAcceptHunk: (p) => acceptPatchReviewHunk(p),
+  onPatchReviewRejectHunk: (p) => rejectPatchReviewHunk(p),
+  onExitPatchReview: () => exitPatchReviewMode(),
 });
 
 // Backwards-compat shim so existing code referencing `editor.*` (CM6
@@ -698,6 +743,272 @@ const editor = editorPane.host;
 
 async function save(): Promise<boolean> {
   return editorPane.save();
+}
+
+// status: patch-review-mode
+// status: patch-review-agent-diff-toggle
+// status: patch-review-readonly-while-active
+// Enter / exit patch-review mode against the active buffer's file. The
+// buffer mode flips to `"patch-review"`, CM6 goes read-only, and the
+// active proposal snapshot is pushed into the hunk renderer.
+async function enterPatchReviewMode(rel: string): Promise<void> {
+  const buf = buffer;
+  if (!buf || buf.kind !== "buffer") return;
+  if (buf.path !== rel) return;
+  await refreshPendingProposalsCache();
+  const proposals = pendingEditProposalsForPath(rel);
+  if (proposals.length === 0) return;
+  // Force the user-diff toggle off before entering patch-review per
+  // `patch-review-toggles-mutually-exclusive`.
+  if (editorPane.dirtyBufferDiff.isActive()) {
+    editorPane.dirtyBufferDiff.forceOff();
+  }
+  buf.mode = { kind: "patch-review", targetPath: rel };
+  editorPane.patchReview.setProposals(proposals);
+  editor.setReadOnly(true);
+  refreshAgentDiffBtn();
+  updateStatus();
+}
+
+function exitPatchReviewMode(): void {
+  const buf = buffer;
+  if (!buf || buf.mode.kind !== "patch-review") return;
+  buf.mode = { kind: "file" };
+  editorPane.patchReview.setProposals([]);
+  editor.setReadOnly(false);
+  refreshAgentDiffBtn();
+  updateStatus();
+}
+
+// Repaint the agent-diff toolbar button's enable / pressed state. Greys
+// when the active buffer has no pending `edit_note` proposals, pressed
+// when patch-review mode is active.
+function refreshAgentDiffBtn(): void {
+  const buf = buffer;
+  const inReview = buf?.mode.kind === "patch-review";
+  let hasPending = false;
+  if (buf && buf.kind === "buffer") {
+    hasPending = pendingEditProposalsForPath(buf.path).length > 0;
+  }
+  agentDiffBtn.disabled = !inReview && !hasPending;
+  agentDiffBtn.classList.toggle("active", inReview);
+  // `bug-patch-review-gutter-not-restored-on-exit`: the gutter's
+  // visibility is a derived state of the toggle, not an imperative
+  // side-effect of enter/exit. Reapplying on every status pulse keeps
+  // the class in sync even when CM6 internal re-renders or focus
+  // events would otherwise lose an imperatively-added class.
+  editor.dom.classList.toggle("hiker-patch-review-active", inReview);
+  if (inReview) {
+    agentDiffBtn.title = "Exit agent-edit review";
+  } else if (!hasPending) {
+    agentDiffBtn.title = "No pending agent edits";
+  } else {
+    agentDiffBtn.title = "Review agent edits";
+  }
+}
+
+agentDiffBtn.addEventListener("click", () => {
+  if (agentDiffBtn.disabled) return;
+  const buf = buffer;
+  if (!buf) return;
+  if (buf.mode.kind === "patch-review") {
+    exitPatchReviewMode();
+  } else if (buf.mode.kind === "file") {
+    void enterPatchReviewMode(buf.path);
+  }
+});
+
+// status: write-note-pending-banner
+// Cache of path → "does this exist on disk" probes so the banner's label
+// can distinguish "Pending rewrite for this note" from "Pending new-note
+// proposal" without re-issuing readFile every paint. Populated lazily on
+// first sighting of a path; invalidated on staging-changed (cheap to
+// re-probe; rare event).
+const writeNoteTargetExistsCache = new Map<string, boolean>();
+let writeNoteBannerLatestProposalId: string | null = null;
+
+function refreshWriteNotePendingBanner(): void {
+  const buf = buffer;
+  // Visible iff the active buffer is in plain editing mode AND has at
+  // least one pending write-shaped proposal targeting its path.
+  if (!buf || buf.kind !== "buffer" || buf.mode.kind !== "file") {
+    writeNotePendingBannerEl.hidden = true;
+    writeNoteBannerLatestProposalId = null;
+    return;
+  }
+  const writeProposals = pendingWriteProposalsForPath(buf.path);
+  if (writeProposals.length === 0) {
+    writeNotePendingBannerEl.hidden = true;
+    writeNoteBannerLatestProposalId = null;
+    return;
+  }
+  // Newest proposal wins (matches `note-open-routes-to-pending-review`).
+  const sorted = writeProposals
+    .slice()
+    .sort((a, b) => b.created_at_ms - a.created_at_ms);
+  const latest = sorted[0];
+  writeNoteBannerLatestProposalId = latest.id;
+  const path = buf.path;
+  const cached = writeNoteTargetExistsCache.get(path);
+  // Origin suffix mirrors `write-note-review-mode-label` so the user
+  // sees the same provenance framing in both surfaces. Unknown surfaces
+  // render no suffix rather than leaking an internal token.
+  let origin = "";
+  if (latest.surface === "chat") origin = " · chat";
+  else if (latest.surface === "trails") origin = " · trail";
+  else if (latest.surface === "batch-mutation") origin = " · batch";
+  const paint = (exists: boolean): void => {
+    const base = exists
+      ? "Pending rewrite for this note"
+      : "Pending new-note proposal";
+    writeNotePendingBannerLabelEl.textContent = base + origin;
+  };
+  if (cached !== undefined) {
+    paint(cached);
+  } else {
+    // Default to the existing-file framing while the probe resolves —
+    // it's the common case. Update once readFile returns.
+    paint(true);
+    void Ipc.readFile({ rel: path })
+      .then(() => writeNoteTargetExistsCache.set(path, true))
+      .catch(() => writeNoteTargetExistsCache.set(path, false))
+      .finally(() => {
+        // Guard: buffer may have switched away during the probe.
+        const cur = buffer;
+        if (
+          cur
+          && cur.kind === "buffer"
+          && cur.mode.kind === "file"
+          && cur.path === path
+        ) {
+          const known = writeNoteTargetExistsCache.get(path);
+          if (known !== undefined) paint(known);
+        }
+      });
+  }
+  writeNotePendingBannerEl.hidden = false;
+}
+
+writeNotePendingBannerBtn.addEventListener("click", () => {
+  const id = writeNoteBannerLatestProposalId;
+  if (!id) return;
+  const proposal = pendingProposalsCache.find((p) => p.id === id);
+  if (!proposal) return;
+  void openWriteNoteReview(proposal);
+});
+
+// status: patch-review-mode
+// Local cache of pending staging proposals — pulled at vault open + on
+// every `hiker:staging-changed` event. The cache backs the patch-review
+// hunk decoration set, the agent-diff toggle's grey-when-empty state,
+// and the openFile auto-routing rule.
+let pendingProposalsCache: Proposal[] = [];
+function pendingEditProposalsForPath(path: string): Proposal[] {
+  return pendingProposalsCache.filter(
+    (p) => p.target_path === path && p.action === "edit_note" && p.edit,
+  );
+}
+function pendingWriteProposalsForPath(path: string): Proposal[] {
+  return pendingProposalsCache.filter(
+    (p) => p.target_path === path && p.action !== "edit_note",
+  );
+}
+async function refreshPendingProposalsCache(): Promise<void> {
+  try {
+    pendingProposalsCache = await Ipc.stagingList();
+  } catch {
+    pendingProposalsCache = [];
+  }
+}
+
+// status: patch-review-per-hunk-accept
+// status: patch-review-dirty-buffer-transactional-accept
+// Per-hunk accept handler. Routes:
+// 1. If the active buffer is the same path AND dirty, pre-check that the
+//    edit can apply to the in-memory text — refuse with a toast when the
+//    user's edits clobber the anchor.
+// 2. Call `staging.accept(id)`. Rust re-anchors against current disk and
+//    writes via `write_file_checked`. Anchor / drift failures surface as
+//    errors; we surface them as a toast.
+// 3. On success, dispatch the new buffer text (computed by applying the
+//    same edit to the in-memory buffer) + refresh loadedText / token via
+//    a fresh `open_for_edit` so subsequent commits ride a valid token.
+async function acceptPatchReviewHunk(proposal: Proposal): Promise<void> {
+  const edit = proposal.edit;
+  if (!edit) return;
+  const buf = buffer;
+  const isActiveTarget =
+    buf !== null
+    && buf.path === proposal.target_path
+    && (buf.mode.kind === "file" || buf.mode.kind === "patch-review");
+  let bufferAppliedText: string | null = null;
+  if (isActiveTarget && buf && buf.mode.kind === "file") {
+    const currentBuffer = editor.getActiveText();
+    bufferAppliedText = applyEditPure(currentBuffer, edit);
+    if (bufferAppliedText === null) {
+      showToast(
+        "Your edits conflict with this proposal — save or revert first to accept.",
+      );
+      return;
+    }
+  }
+  try {
+    await Ipc.stagingAccept({ proposalId: proposal.id });
+  } catch (err) {
+    showToast("Accept failed: " + formatError(err));
+    return;
+  }
+  // Re-sync local cache before re-rendering decorations.
+  await refreshPendingProposalsCache();
+  if (isActiveTarget && buf) {
+    try {
+      const fresh = await Ipc.openForEdit({ rel: proposal.target_path });
+      // For patch-review buffers (read-only by mode), just reset
+      // loadedText + token. For file buffers with user edits, dispatch
+      // `bufferAppliedText` (the edit applied to the user's text) so the
+      // user's edits + agent's edit both land.
+      const dispatchText =
+        buf.mode.kind === "file" && bufferAppliedText !== null
+          ? bufferAppliedText
+          : fresh.contents;
+      editor.dispatch({
+        changes: { from: 0, to: editor.getDocLength(), insert: dispatchText },
+      });
+      buf.loadedText = fresh.contents;
+      buf.token = fresh.token;
+    } catch (err) {
+      Logger.error("ui::app", "patch-review accept reload failed", { err });
+    }
+  }
+  // Re-paint decorations against the new doc/proposals snapshot.
+  editorPane.patchReview.setProposals(
+    pendingEditProposalsForPath(proposal.target_path),
+  );
+  updateStatus();
+  if (buf?.mode.kind === "patch-review") {
+    // If the user accepted the last applyable hunk, automatically exit
+    // patch-review mode back to plain editing.
+    const remaining = pendingEditProposalsForPath(proposal.target_path);
+    if (remaining.length === 0) exitPatchReviewMode();
+  }
+}
+
+async function rejectPatchReviewHunk(proposal: Proposal): Promise<void> {
+  try {
+    await Ipc.stagingReject({ proposalId: proposal.id });
+  } catch (err) {
+    showToast("Reject failed: " + formatError(err));
+    return;
+  }
+  await refreshPendingProposalsCache();
+  editorPane.patchReview.setProposals(
+    pendingEditProposalsForPath(proposal.target_path),
+  );
+  updateStatus();
+  if (buffer?.mode.kind === "patch-review") {
+    const remaining = pendingEditProposalsForPath(proposal.target_path);
+    if (remaining.length === 0) exitPatchReviewMode();
+  }
 }
 
 // status: snapshot-preview-mode
@@ -727,138 +1038,29 @@ const snapshotPreview: SnapshotPreviewApi = mountSnapshotPreview({
   formatError,
 });
 
-// status: staging-review-activity-detail-filter
-// Staging proposal preview: open a proposal's .md content as a read-only
-// buffer with a diff toggle against the current file on disk. Reuses the
-// same pattern as snapshot-preview-mode: set buffer mode to "staging",
-// lock the editor to read-only, and render per-mode controls in the
-// toolbar's #mode-controls slot. Accept/Reject actions stay on the
-// activity-detail row per the spec.
-let stagingDiffActive = false;
-
-async function openStagingPreview(proposal: { id: string; target_path: string }): Promise<void> {
-  const curBuf = buffer;
-  if (curBuf && editor.isDirty()) {
-    const choice = await confirm3(
-      `${curBuf.path} has unsaved changes.`,
-      "Save & switch",
-      "Discard & switch",
-      "Cancel",
-    );
-    if (choice === "cancel") return;
-    if (choice === "a" && !(await editor.save())) return;
-  }
-  let contents: string;
-  try {
-    contents = await Ipc.stagingContent({ proposalId: proposal.id });
-  } catch (err) {
-    alert(`Failed to load staging proposal: ${formatError(err)}`);
+// Whole-file staging proposals (`write_note` / `set_frontmatter` /
+// `apply_tag`) open in the spec-conformant `write-note-review` mode
+// below (`openWriteNoteReview`). The older `staging` buffer mode was
+// removed; this dispatcher routes the three legacy entry points
+// (status-bar version dropdown, tree click, vault-home activity click)
+// to the right surface based on the proposal's action.
+async function openProposalReview(proposal: { id: string; target_path: string }): Promise<void> {
+  const full = pendingProposalsCache.find((p) => p.id === proposal.id);
+  if (!full) {
+    // Proposal vanished (accepted/rejected concurrently). Surface the
+    // live file instead.
+    void openFile(proposal.target_path, { preview: true });
     return;
   }
-  if (!contents) {
-    alert("This proposal has no content to preview.");
-    return;
-  }
-  stagingDiffActive = false;
-  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
-  editor.dispatch({
-    changes: { from: 0, to: editor.getDocLength(), insert: contents },
-    effects: [
-      editor.language.reconfigure(editor.languageExtensionForPath(proposal.target_path)),
-      editor.livePreviewCompartment.reconfigure(
-        editor.livePreviewExtensionForPath(proposal.target_path),
-      ),
-    ],
-  });
-  if (vaultHome.isVisible()) vaultHome.setVisible(false);
-  setBufferState({
-    buffer: {
-      path: proposal.target_path,
-      loadedText: editor.getActiveText(),
-      token: null,
-      kind: "buffer",
-      mode: { kind: "staging", proposal_id: proposal.id, targetPath: proposal.target_path, diffActive: false },
-      pendingChangesMetadata: null,
-      preview: false,
-    },
-    activePath: proposal.target_path,
-    previewTabPath: null,
-  });
-  editor.setReadOnly(true);
-  editorPane.modeControls.render();
-  editorPane.repaintStatusBar();
-  editorPane.refreshChunkBoundaries();
-  checkpointNav();
-}
-
-function closeStagingPreview(): void {
-  if (buffer?.mode.kind !== "staging") return;
-  editor.resetDiffDecorations();
-  stagingDiffActive = false;
-  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
-  editor.dispatch({
-    changes: { from: 0, to: editor.getDocLength(), insert: "" },
-  });
-  editor.setReadOnly(false);
-  // Return to the activity detail page.
-  vaultHome.setVisible(true);
-  if (vaultHome.api.activeDetailView()?.kind !== "recent-activity") {
-    vaultHome.api.showDetail("recent-activity");
-  }
-  editorPane.modeControls.render();
-  editorPane.repaintStatusBar();
-  checkpointNav();
-}
-
-async function toggleStagingDiff(): Promise<void> {
-  if (buffer?.mode.kind !== "staging") return;
-  if (stagingDiffActive) {
-    editor.clearDiff(buffer.loadedText);
-    editor.dispatch({
-      effects: [
-        editor.livePreviewCompartment.reconfigure(
-          editor.livePreviewExtensionForPath(buffer.mode.targetPath),
-        ),
-        editor.hideFrontmatterCompartment.reconfigure(
-          hideFrontmatterEnabled ? hideFrontmatter() : [],
-        ),
-      ],
-    });
-    stagingDiffActive = false;
-    buffer.mode.diffActive = false;
-    editorPane.modeControls.render();
-    editorPane.refreshChunkBoundaries();
-    return;
-  }
-  let currentContent: string;
-  try {
-    currentContent = await Ipc.readFile({ rel: buffer.mode.targetPath });
-  } catch (err) {
-    alert(`Could not load current ${buffer.mode.targetPath}: ${formatError(err)}`);
-    return;
-  }
-  if (buffer?.mode.kind !== "staging") return;
-  editor.dispatch({
-    effects: [
-      editor.livePreviewCompartment.reconfigure([]),
-      editor.hideFrontmatterCompartment.reconfigure([]),
-    ],
-  });
-  await editor.renderDiff({
-    before: {
-      label: `${buffer.mode.targetPath} · proposed`,
-      content: buffer.loadedText,
-      meta: { staging: true },
-    },
-    after: {
-      label: `${buffer.mode.targetPath} · current`,
-      content: currentContent,
-    },
-  });
-  stagingDiffActive = true;
-  buffer.mode.diffActive = true;
-  editorPane.modeControls.render();
-  editorPane.refreshChunkBoundaries();
+  // Route through the `openFile` wrapper so the
+  // `note-open-routes-to-pending-review` auto-routing rule consults
+  // `pendingEditProposalsForPath` / `pendingWriteProposalsForPath` and
+  // lands the user in patch-review (for `edit_note`) or write-note
+  // review (for whole-file proposals). Keeps every staging-row entry
+  // point on one path so the contract holds regardless of which
+  // surface triggered the open. Fixes
+  // `bug-activity-pending-row-skips-patch-review-mode`.
+  await openFile(proposal.target_path, { preview: true });
 }
 
 // `save` is owned by the EditorHost; main.ts calls `editor.save()`. The
@@ -871,11 +1073,35 @@ async function toggleStagingDiff(): Promise<void> {
 // `tabs` / `openFileApi` lexically; they're invoked lazily (event
 // listeners, deps callbacks) so the forward references resolve fine
 // once the consts initialize.
-function openFile(
+// status: note-open-routes-to-pending-review
+async function openFile(
   rel: string,
   opts?: { preview?: boolean },
 ): Promise<void> {
-  return openFileApi.openFile(rel, opts);
+  // Auto-routing per `note-open-routes-to-pending-review`:
+  // - whole-file proposals (`write_note` / `set_frontmatter` /
+  //   `apply_tag`) land in write-note review mode (the buffer-side has
+  //   no edit shape to compose against);
+  // - paths with pending `edit_note` proposals open as the live file
+  //   and enter patch-review mode so the user sees the agent's hunks
+  //   inline instead of plain editing.
+  // The agent-diff toolbar toggle (`patch-review-agent-diff-toggle`)
+  // is still the explicit exit/re-enter affordance once the user
+  // chooses to leave review.
+  const editProposals = pendingEditProposalsForPath(rel);
+  if (editProposals.length === 0) {
+    const writeProposals = pendingWriteProposalsForPath(rel);
+    if (writeProposals.length > 0) {
+      writeProposals.sort((a, b) => b.created_at_ms - a.created_at_ms);
+      await openWriteNoteReview(writeProposals[0]);
+      return;
+    }
+    return openFileApi.openFile(rel, opts);
+  }
+  await openFileApi.openFile(rel, opts);
+  if (buffer && buffer.path === rel && buffer.mode.kind === "file") {
+    await enterPatchReviewMode(rel);
+  }
 }
 function activateTabInner(rel: string): void {
   tabs.activateTab(rel);
@@ -993,6 +1219,34 @@ const tree: TreeController = mountTree({
   },
   // status: tree-context-properties
   onOpenProperties: (rel) => openPropertiesTab(rel),
+  // status: staging-accept-reject-from-tree
+  onOpenStagingProposal: (proposal) => openProposalReview(proposal),
+  onAcceptStaging: async (proposal) => {
+    const outcome = await Ipc.stagingAccept({ proposalId: proposal.id });
+    const alreadyOpen = openBuffers.has(outcome.target_path);
+    await openFile(outcome.target_path, { preview: true });
+    if (alreadyOpen && buffer?.path === outcome.target_path && buffer.mode.kind === "file") {
+      if (isDirty()) {
+        showToast(`${outcome.target_path} was updated by accept; save to keep your changes.`);
+      } else {
+        try {
+          const fresh = await Ipc.openForEdit({ rel: outcome.target_path });
+          editor.dispatch({
+            changes: { from: 0, to: editor.getDocLength(), insert: fresh.contents },
+          });
+          buffer.loadedText = editor.getActiveText();
+          buffer.token = fresh.token;
+          updateStatus();
+          scheduleChunkBoundariesRefresh(500);
+        } catch (err) {
+          Logger.error("ui::app", "staging accept reload failed", { err });
+        }
+      }
+    }
+  },
+  onRejectStaging: async (proposal) => {
+    await Ipc.stagingReject({ proposalId: proposal.id });
+  },
 });
 
 // status: status-bar-index-label, status-bar-active-file-index-state
@@ -1093,6 +1347,12 @@ async function applyOpenedVault(path: string): Promise<void> {
   // tree paint can decorate trail-doc rows. Awaited before
   // `refreshTree` so the initial paint already includes the icon.
   await tree.api.refreshTrailDocSet();
+  // status: staging-accept-reject-from-tree — seed pending proposals
+  // so the first tree paint includes synthetic staging rows.
+  await tree.api.refreshStagingProposals();
+  // status: patch-review-mode — seed the local pending-proposals cache
+  // used by the agent-diff toggle + patch-review hunk decorations.
+  await refreshPendingProposalsCache();
   await refreshTree();
   await refreshTrashBin();
   // status: trails-mode-body — re-fetch trails-list + active trail
@@ -1104,9 +1364,9 @@ async function applyOpenedVault(path: string): Promise<void> {
   // first checkpoint on the new vault rather than landing on a stale tail.
   nav.reset();
   // status: vault-home-screen — default landing surface on vault open
-  // (no auto-resume of last buffer in v1). Opens as a page-kind tab per
+  // (no auto-resume of last buffer in v1). Opens as a app-page tab per
   // tab-kinds so the editor toolbar + status bar hide on activation.
-  void openPageTab("home", {});
+  void openAppPageTab("home", {});
 
   // status: autosave-recover-cmd, autosave-recovery-auto-restore,
   // autosave-tab-state-silent-restore
@@ -1182,18 +1442,18 @@ async function runAutosaveRecoveryAndRestore(): Promise<void> {
   const kinds = tabState.open_tab_kinds ?? {};
   for (const path of tabState.open_paths) {
     if (alreadyOpen.has(path)) continue;
-    // status: tab-kinds — __hiker:* sentinels are page-kind tabs, not
-    // files. Restore them via openPageTab instead of openFile.
+    // status: tab-kinds — __hiker:* sentinels are app-page tabs, not
+    // files. Restore them via openAppPageTab instead of openFile.
     if (path.startsWith("__hiker:")) {
       const kind = kinds[path] || "";
       if (kind === "home") {
-        void openPageTab("home", {});
+        void openAppPageTab("home", {});
       } else if (kind === "home-detail") {
-        void openPageTab("home-detail", {});
+        void openAppPageTab("home-detail", {});
       } else if (kind === "queue") {
-        void openPageTab("queue", {});
+        void openAppPageTab("queue", {});
       } else if (kind === "settings") {
-        void openPageTab("settings", {});
+        void openAppPageTab("settings", {});
       } else if (kind === "agent") {
         const sessionId = path.replace(/^__hiker:agent:?/, "") || undefined;
         if (sessionId) {
@@ -1253,15 +1513,15 @@ pickBtn.addEventListener("click", () => void vaultLifecycle.openVault());
 // sortOrderLabel, openSortByMenu — all moved to ./tree.
 
 // status: vault-home-screen, vault-home-button
-// Home button in the top strip — opens the vault home as a page-kind tab.
+// Home button in the top strip — opens the vault home as a app-page tab.
 homeBtn.addEventListener("click", () => {
-  void openPageTab("home", {});
+  void openAppPageTab("home", {});
 });
 
 // status: vault-bar-settings-icon
-// Settings button in the top strip — opens the settings as a page-kind tab.
+// Settings button in the top strip — opens the settings as a app-page tab.
 settingsBtn.addEventListener("click", () => {
-  void openPageTab("settings", {});
+  void openAppPageTab("settings", {});
 });
 
 const win = getCurrentWindow();
@@ -1392,7 +1652,7 @@ register({
   keys: "Mod-,",
   label: "Open settings",
   run: () => {
-    openPageTab("settings", {});
+    openAppPageTab("settings", {});
     return true;
   },
 });
@@ -1447,13 +1707,42 @@ const vaultHome: VaultHomeController = mountVaultHome({
   // status: tab-kinds — activity-widget clicks open home-detail tabs.
   onOpenPage: (kind, payload) => {
     if (kind === "home-detail") {
-      void openPageTab("home-detail", payload);
+      void openAppPageTab("home-detail", payload);
     }
   },
   // status: staging-review-activity-detail-filter
-  onOpenStagingProposal: (proposal) => openStagingPreview(proposal),
+  onOpenStagingProposal: (proposal) => openProposalReview(proposal),
+  // status: staging-accept-navigates-to-preview
+  // Activity-detail surface deliberately *does not* navigate on
+  // accept: the surface is a list of pending items and jumping to
+  // the target file on every click makes bulk-review hostile. The
+  // staging list refreshes in place from `hiker:staging-changed`.
+  // Fixes `bug-staging-accept-navigates-from-activity-detail`.
   onAcceptStaging: async (proposal) => {
     await Ipc.stagingAccept({ proposalId: proposal.id });
+    // If the accepted file is already the active buffer in plain
+    // editing mode, reload its contents from disk so the user sees
+    // the result of the accept without leaving the page (or warn if
+    // their in-flight edits would clobber it).
+    const activePath = buffer?.path;
+    if (activePath === proposal.target_path && buffer?.mode.kind === "file") {
+      if (isDirty()) {
+        showToast(`${proposal.target_path} was updated by accept; save to keep your changes.`);
+      } else {
+        try {
+          const fresh = await Ipc.openForEdit({ rel: proposal.target_path });
+          editor.dispatch({
+            changes: { from: 0, to: editor.getDocLength(), insert: fresh.contents },
+          });
+          buffer.loadedText = editor.getActiveText();
+          buffer.token = fresh.token;
+          updateStatus();
+          scheduleChunkBoundariesRefresh(500);
+        } catch (err) {
+          Logger.error("ui::app", "staging accept reload failed", { err });
+        }
+      }
+    }
   },
   onRejectStaging: async (proposal) => {
     await Ipc.stagingReject({ proposalId: proposal.id });
@@ -1487,20 +1776,37 @@ const { navBackBtn, navForwardBtn } = dom.vaultBar;
 
 function inferNavState(): NavState {
   const buf = buffer;
-  // status: tab-kinds — detect all tab kinds via activeKind() first.
+  // status: tab-kinds — non-buffer ("app-page") tab kinds derive their
+  // NavState from the active tab's `(kind, payload)` rather than from
+  // legacy DOM `hidden` / class flips. The synthetic tab key
+  // `__hiker:<kind>[:<payload>]` carries the payload so we don't have to
+  // probe each app-page module for its own active-view state.
   if (buf && buf.kind !== "buffer") {
     if (buf.kind === "home") return { kind: "home" };
     if (buf.kind === "home-detail") {
-      const d = vaultHome.api.activeDetailView();
-      return {
-        kind: "home-detail",
-        view: d?.kind === "recent-activity" ? "recent-activity" : "recent-activity",
-      };
+      // Parse the view discriminator out of the synthetic key
+      // (`__hiker:home-detail:<view>`); fall back to the only currently
+      // valid view if the prefix is malformed.
+      let view: "recent-activity" = "recent-activity";
+      const prefix = "__hiker:home-detail:";
+      if (buf.path.startsWith(prefix)) {
+        const raw = buf.path.slice(prefix.length);
+        if (raw === "recent-activity") view = raw;
+      }
+      return { kind: "home-detail", view };
     }
     if (buf.kind === "queue") return { kind: "queue-detail" };
     if (buf.kind === "settings") return { kind: "settings" };
-    if (buf.kind === "properties") return { kind: "tab", path: buf.path };
-    return { kind: "home" };
+    if (buf.kind === "properties") {
+      const prefix = "__hiker:properties:";
+      const rel = buf.path.startsWith(prefix) ? buf.path.slice(prefix.length) : buf.path;
+      return { kind: "properties", path: rel };
+    }
+    // `agent` / `graph` (future) — for now treat the synthetic key as a
+    // tab path so applyNavState's `tab` branch handles activation when
+    // the tab still exists. Reopening these kinds after eviction is a
+    // followup once they have their own restore paths.
+    return { kind: "tab", path: buf.path };
   }
   if (buf && buf.mode.kind === "trash") {
     const trashedName = buf.path.replace(/^\.hiker\/trash\//, "");
@@ -1513,7 +1819,18 @@ function inferNavState(): NavState {
       row: buf.mode.row,
     };
   }
-  if (activePath !== null && buf && buf.mode.kind === "file") {
+  if (buf && buf.mode.kind === "write-note-review") {
+    return {
+      kind: "staging-preview",
+      proposalId: buf.mode.proposal_id,
+      targetPath: buf.mode.targetPath,
+    };
+  }
+  if (
+    activePath !== null
+    && buf
+    && (buf.mode.kind === "file" || buf.mode.kind === "patch-review")
+  ) {
     return { kind: "tab", path: activePath };
   }
   return { kind: "empty" };
@@ -1527,19 +1844,23 @@ async function applyNavState(s: NavState): Promise<boolean> {
       return true;
     }
     case "home": {
-      openPageTab("home", {});
+      openAppPageTab("home", {});
       return true;
     }
     case "home-detail": {
-      openPageTab("home-detail", { view: s.view });
+      openAppPageTab("home-detail", { view: s.view });
       return true;
     }
     case "queue-detail": {
-      openPageTab("queue", {});
+      openAppPageTab("queue", {});
       return true;
     }
     case "settings": {
-      openPageTab("settings", {});
+      openAppPageTab("settings", {});
+      return true;
+    }
+    case "properties": {
+      openPropertiesTab(s.path);
       return true;
     }
     case "trash-preview": {
@@ -1550,6 +1871,10 @@ async function applyNavState(s: NavState): Promise<boolean> {
     }
     case "snapshot-preview": {
       await snapshotPreview.open(s.row);
+      return true;
+    }
+    case "staging-preview": {
+      await openProposalReview({ id: s.proposalId, target_path: s.targetPath });
       return true;
     }
     case "empty": {
@@ -1606,18 +1931,15 @@ installNavigationSwipe({
 });
 
 // status: navigation-history-stack
-// Observe DOM-driven content-surface flips (settings ↔ home ↔ queue-detail
-// ↔ home-detail) so the navigation stack records them without each
-// surface module having to call into nav directly. The `restoring` flag
-// inside the navigation module suppresses checkpoints during back/forward
-// apply, so this observer doesn't cause infinite recursion.
-{
-  const obs = new MutationObserver(() => checkpointNav());
-  obs.observe(editorPaneEl, { attributes: true, attributeFilter: ["class"] });
-  obs.observe(dom.vaultHome.overviewEl, { attributes: true, attributeFilter: ["hidden"] });
-  obs.observe(dom.vaultHome.detailEl, { attributes: true, attributeFilter: ["hidden"] });
-  obs.observe(dom.vaultHome.queueDetailEl, { attributes: true, attributeFilter: ["hidden"] });
-}
+// Per `tab-kinds` (editor.md), every content-surface flip — both buffer
+// tabs and app-page tabs (home / home-detail / queue / settings /
+// properties) — goes through `activateTab` in `app/tabs.ts`, which ends
+// with a `checkpointNav()` call. The legacy MutationObserver that
+// watched the editor-pane class flips and per-section `hidden` flips
+// fired again *after* the canonical checkpoint, could read
+// mid-transition DOM state into a wrong NavState, and double-pushed on
+// every kind switch — see `bug-nav-history-broken-for-app-page-tabs`.
+// The activation-time checkpoint is now the sole entry point.
 
 // status: editor-diff-vs-disk-toggle, note-mutations-menu
 // Dirty-buffer diff, status bar, mutations menu, mode controls, and view
@@ -1751,15 +2073,48 @@ const taskQueueTile = (() => {
 
   // Listen for staging changes so the badge updates immediately after
   // an accept/reject/accept_all, without waiting for the next poll tick.
+  // Refresh the cached `pendingProposals` BEFORE re-rendering the tree —
+  // otherwise the render reads stale proposals and leaves the just-accepted
+  // file's row marked `staging-new` / `staging-dirty` (see
+  // `bug-accept-new-note-from-activity-page-leaves-stale-dirty-marker`).
   void listen("hiker:staging-changed", () => {
     void refreshStaging();
+    void (async () => {
+      await tree.api.refreshStagingProposals();
+      await tree.api.refresh();
+    })();
+    // status: patch-review-mode
+    // Re-sync local pending-proposals cache for the agent-diff toggle
+    // grey state and the active patch-review hunk decorations.
+    void (async () => {
+      await refreshPendingProposalsCache();
+      const buf = buffer;
+      if (buf && (buf.mode.kind === "patch-review" || buf.mode.kind === "file")) {
+        const proposals = pendingEditProposalsForPath(buf.path);
+        editorPane.patchReview.setProposals(
+          buf.mode.kind === "patch-review" ? proposals : [],
+        );
+      }
+      refreshAgentDiffBtn();
+      // status: write-note-pending-banner
+      // Staging change may have added or removed a pending write-shape
+      // proposal for the active path. Invalidate the existence cache
+      // (cheap) so the label re-probes if the target's on-disk presence
+      // changed since last paint, then repaint.
+      writeNoteTargetExistsCache.clear();
+      refreshWriteNotePendingBanner();
+    })();
+    // bug-home-recent-activity-missing-pending-agent-review:
+    // home recent-activity widget consumes the unified feed and must
+    // repaint when staging proposals appear/disappear.
+    vaultHome.api.notifyStagingChanged();
   });
 
   function openQueueDetail(): void {
     if (!llmEnabled) return;
-    // status: tab-kinds — open the queue as a page-kind tab instead of
+    // status: tab-kinds — open the queue as a app-page tab instead of
     // swapping the vaultHome sub-mode.
-    void openPageTab("queue", {});
+    void openAppPageTab("queue", {});
     unreadFailure = false;
     paintIndicator();
   }
@@ -2268,7 +2623,7 @@ const tabs: TabsApi = mountTabs({
   getLivePreviewEnabled: () => livePreviewEnabled,
   getHideFrontmatterEnabled: () => hideFrontmatterEnabled,
   getOpenFileApi: () => openFileApi,
-  onShowHome: () => { openPageTab("home", {}); },
+  onShowHome: () => { openAppPageTab("home", {}); },
   save: () => save(),
   isDirty: () => isDirty(),
   revealInTree: (rel) => revealInTree(rel),
@@ -2322,13 +2677,13 @@ const openFileApi = mountOpenFile({
 });
 
 // status: tab-kinds
-/// Open or activate a page-kind tab in the preview slot. Evicts other
-/// page-kind previews. Called from Home / Queue / Settings button handlers.
-async function openPageTab(
+/// Open or activate a app-page tab in the preview slot. Evicts other
+/// app-page previews. Called from Home / Queue / Settings button handlers.
+async function openAppPageTab(
   kind: "home" | "home-detail" | "queue" | "settings",
   payload?: Record<string, string>,
 ): Promise<void> {
-  const key = pageTabKey(kind, payload?.view);
+  const key = appPageTabKey(kind, payload?.view);
   if (openBuffers.has(key)) {
     activateTabInner(key);
     return;
@@ -2364,7 +2719,7 @@ async function openPageTab(
 /// Open a properties-kind tab for the given relative path. Reuses an
 /// existing properties tab for the same path; otherwise creates a new one.
 function openPropertiesTab(rel: string): void {
-  const key = pageTabKey("properties", rel);
+  const key = appPageTabKey("properties", rel);
   if (openBuffers.has(key)) {
     activateTabInner(key);
     void propertiesPane.update(rel);
@@ -2392,7 +2747,7 @@ function openPropertiesTab(rel: string): void {
 /// Open an agent-kind tab for the given chat session. Creates one
 /// tab per session; reopens the existing one if already open.
 async function openAgentTab(sessionId: string): Promise<void> {
-  const key = pageTabKey("agent", sessionId);
+  const key = appPageTabKey("agent", sessionId);
   if (openBuffers.has(key)) {
     activateTabInner(key);
     return;
@@ -2451,15 +2806,12 @@ function setReadOnly(ro: boolean, _mode: "trash" | "snapshot" | "mutation" | nul
 }
 
 // status: trail-add-to-active-from-editor-verb
-// Editor toolbar pill: "Add to trail: <name>". Inserted as the
-// previous sibling of `#mode-controls` so it sits on the left of the
-// centered mode-controls slot, leaving the right-side button cluster
-// (Save / Diff / View / Mutations / Discovery) untouched. The
-// membership cache (installed below) drives the idempotency state;
-// the pill subscribes to `activeTrailStore` / `bufferStore` /
-// membership-cache changes for re-renders.
+// Editor toolbar pill: "Add to trail: <name>". Lives in the right-side
+// toolbar cluster, just left of Save. The membership cache (installed
+// below) drives the idempotency state; the pill subscribes to
+// `activeTrailStore` / `bufferStore` / membership-cache changes for
+// re-renders.
 const addToTrailPill = mountAddToTrailPill({
-  hostBeforeEl: modeControlsEl,
   // status: trail-add-to-active-from-editor-verb — explicit panel +
   // membership refresh after the pill's `trailAppendWaypoint`
   // succeeds. Watcher is suppressed for the trail-doc + waypoint-note
@@ -2473,65 +2825,6 @@ const addToTrailPill = mountAddToTrailPill({
 });
 addToTrailPill.setTrailDocPredicate((rel) => tree.api.isTrailDoc(rel));
 installMembershipWatchers();
-
-// status: staging-accept-reject-from-editor
-// Editor toolbar pill: "Proposed change — [Accept] [Reject]". The
-// pill element is rendered in index.html between #mode-controls and
-// the right-side button cluster. Visibility and click handlers are
-// driven by this module; it subscribes to bufferStore for active-path
-// changes and exposes `refresh()` for the `hiker:staging-changed`
-// event listener below.
-const stagingPillEl = document.getElementById(
-  "staging-pill",
-) as HTMLDivElement | null;
-if (!stagingPillEl) {
-  throw new Error("stagingPill: element #staging-pill not found");
-}
-const stagingPill: StagingPillApi = mountStagingPill({
-  pillEl: stagingPillEl,
-  onAcceptAfter: (acceptedContent, _targetPath) => {
-    // The accepted content was just written to disk. If it differs
-    // from what's currently in the editor, replace the editor content
-    // so the user sees the version that was just committed.
-    const currentText = editor.getActiveText();
-    if (acceptedContent !== currentText) {
-      // Replace the editor content while preserving the buffer token
-      // (the disk hash was already updated by core::staging::accept).
-      editor.dispatch({
-        changes: {
-          from: 0,
-          to: editor.getDocLength(),
-          insert: acceptedContent,
-        },
-      });
-      const buf = buffer;
-      if (buf) {
-        // Update loadedText so the dirty state reflects post-accept
-        // reality. The token was rotated server-side so we leave it
-        // as-is — a subsequent save will go through the normal drift
-        // check path with the new on-disk hash.
-        setBufferState({
-          buffer: {
-            ...buf,
-            loadedText: acceptedContent,
-          },
-        });
-      }
-    }
-  },
-  onAfterAction: () => {
-    closeStagingPreview();
-  },
-});
-
-// status: staging-accept-reject-from-editor
-// Listen for staging changes from any surface (activity detail,
-// trails, tree, chat cards). When a proposal is accepted or rejected
-// elsewhere, the pill must refresh so it hides (or updates to the
-// next proposal) immediately.
-void listen("hiker:staging-changed", () => {
-  void stagingPill.refresh();
-});
 
 // status: editor-tab-strip
 const tabStrip: TabStripApi = mountTabStrip({
@@ -2571,18 +2864,282 @@ const tabStrip: TabStripApi = mountTabStrip({
   onPromote: (path) => promotePreviewByPath(path),
 });
 
+// status: write-note-review-surface
+// Open a write-note-review session for a proposal: replaces the active
+// buffer with a read-only view of the proposed content, with a diff
+// toggle against current disk and Accept/Reject in the mode-controls
+// slot. Accept blocks if any open buffer for the same target is dirty
+// (per `write-note-review-blocks-on-dirty`).
+async function openWriteNoteReview(proposal: Proposal): Promise<void> {
+  // Per `patch-review.md` (Pane integration): "Write-note review entry
+  // never blocks either. The user can be dirty *while reviewing*; accept
+  // is what blocks (per `write-note-review-blocks-on-dirty`)."
+  let contents: string;
+  try {
+    contents = await Ipc.stagingContent({ proposalId: proposal.id });
+  } catch (err) {
+    alert(`Failed to load proposal: ${formatError(err)}`);
+    return;
+  }
+  // Determine whether the target file exists on disk.
+  let isCreate = true;
+  try {
+    await Ipc.readFile({ rel: proposal.target_path });
+    isCreate = false;
+  } catch {
+    isCreate = true;
+  }
+  // Persist the outgoing file-mode buffer's CM6 state before we clobber
+  // the live editor. Otherwise any unsaved edits sitting in the editor
+  // (not yet saved into `openBuffers[path].savedState`) vanish for the
+  // duration of the review and never come back on exit/reject.
+  if (buffer && buffer.mode.kind === "file") {
+    const out = openBuffers.get(buffer.path);
+    if (out) out.savedState = editor.getState();
+  }
+  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
+  editor.dispatch({
+    changes: { from: 0, to: editor.getDocLength(), insert: contents },
+    effects: [
+      editor.language.reconfigure(editor.languageExtensionForPath(proposal.target_path)),
+      editor.livePreviewCompartment.reconfigure(
+        editor.livePreviewExtensionForPath(proposal.target_path),
+      ),
+    ],
+  });
+  if (vaultHome.isVisible()) vaultHome.setVisible(false);
+  setBufferState({
+    buffer: {
+      path: proposal.target_path,
+      loadedText: editor.getActiveText(),
+      token: null,
+      kind: "buffer",
+      mode: {
+        kind: "write-note-review",
+        proposal_id: proposal.id,
+        targetPath: proposal.target_path,
+        diffActive: false,
+        isCreate,
+      },
+      pendingChangesMetadata: null,
+      preview: false,
+    },
+    activePath: proposal.target_path,
+    previewTabPath: null,
+  });
+  editor.setReadOnly(true);
+  updateStatus();
+  checkpointNav();
+}
+
+function exitWriteNoteReview(): void {
+  if (buffer?.mode.kind !== "write-note-review") return;
+  const targetPath = buffer.mode.targetPath;
+  editor.resetDiffDecorations();
+  editor.setReadOnly(false);
+  // If the user was looking at the target file (possibly with unsaved
+  // edits) before entering review, restore that tab — `activateTab`
+  // re-applies the saved CM6 state we stashed on entry.
+  const priorEntry = openBuffers.get(targetPath);
+  if (priorEntry && priorEntry.buffer.mode.kind === "file") {
+    tabs.activateTab(targetPath);
+    return;
+  }
+  setBufferState({ buffer: null, activePath: null, previewTabPath: null });
+  editor.dispatch({
+    changes: { from: 0, to: editor.getDocLength(), insert: "" },
+  });
+  updateStatus();
+  checkpointNav();
+}
+
+async function toggleWriteNoteReviewDiff(): Promise<void> {
+  const buf = buffer;
+  if (!buf || buf.mode.kind !== "write-note-review") return;
+  const mode = buf.mode;
+  if (mode.diffActive) {
+    editor.clearDiff(buf.loadedText);
+    editor.dispatch({
+      effects: [
+        editor.livePreviewCompartment.reconfigure(
+          editor.livePreviewExtensionForPath(mode.targetPath),
+        ),
+        editor.hideFrontmatterCompartment.reconfigure(
+          hideFrontmatterEnabled ? hideFrontmatter() : [],
+        ),
+      ],
+    });
+    mode.diffActive = false;
+    editorPane.modeControls.render();
+    return;
+  }
+  let currentContent = "";
+  try {
+    currentContent = await Ipc.readFile({ rel: mode.targetPath });
+  } catch {
+    currentContent = ""; // new-note case
+  }
+  if (buf.mode.kind !== "write-note-review") return;
+  editor.dispatch({
+    effects: [
+      editor.livePreviewCompartment.reconfigure([]),
+      editor.hideFrontmatterCompartment.reconfigure([]),
+    ],
+  });
+  await editor.renderDiff({
+    before: { label: `${mode.targetPath} · current`, content: currentContent },
+    after: { label: `${mode.targetPath} · proposed`, content: buf.loadedText },
+  });
+  mode.diffActive = true;
+  editorPane.modeControls.render();
+}
+
+// status: write-note-review-surface
+// status: write-note-review-mode-label
+// status: write-note-review-blocks-on-dirty
+editorPane.modeControls.register("write-note-review", (host) => {
+  if (!buffer || buffer.mode.kind !== "write-note-review") return;
+  const mode = buffer.mode;
+  const proposal = pendingProposalsCache.find((p) => p.id === mode.proposal_id);
+  const labelEl = document.createElement("span");
+  labelEl.style.cssText = "margin-right:8px;font-size:12px;color:var(--fg-muted);";
+  const base = mode.isCreate ? "Review new note" : "Review rewrite";
+  // status: write-note-review-mode-label — surface origin suffix
+  let origin = "";
+  const surface = proposal?.surface ?? "";
+  if (surface === "chat") origin = " · chat";
+  else if (surface === "trails") origin = " · trail";
+  else if (surface === "batch-mutation") origin = " · batch";
+  const conflicted = proposal?.state === "conflicted";
+  const conflictSuffix = conflicted
+    ? ` · conflicted (${proposal?.conflict_reason ?? "unknown"})`
+    : "";
+  labelEl.textContent = base + origin + conflictSuffix;
+  host.appendChild(labelEl);
+  host.appendChild(
+    iconButton({
+      title: mode.diffActive ? "Hide diff" : "Show diff vs current",
+      pressed: mode.diffActive,
+      svg: Icons.diff(),
+      onClick: () => toggleWriteNoteReviewDiff(),
+    }),
+  );
+  const acceptBtn = iconButton({
+    title: conflicted
+      ? `Cannot accept: ${proposal?.conflict_reason ?? "conflicted"}`
+      : "Accept",
+    svg: Icons.check(),
+    onClick: async () => {
+      if (acceptBtn.disabled) return;
+      await acceptHandler();
+    },
+  });
+  acceptBtn.classList.add("mode-controls-accept");
+  if (conflicted) acceptBtn.disabled = true;
+  async function acceptHandler(): Promise<void> {
+    // write-note-review-blocks-on-dirty: refuse if any open buffer for
+    // the same target path is dirty — active or background.
+    const targetPath = mode.targetPath;
+    for (const [, entry] of openBuffers) {
+      if (
+        entry.buffer.path !== targetPath
+        || entry.buffer.mode.kind !== "file"
+      ) {
+        continue;
+      }
+      const isActive = entry.buffer === buffer;
+      const dirty = isActive
+        ? editor.isDirty()
+        : entry.savedState
+          ? entry.buffer.loadedText !== entry.savedState.doc.toString()
+          : false;
+      if (dirty) {
+        alert("Your buffer has unsaved changes. Save or revert before accepting this rewrite.");
+        return;
+      }
+    }
+    try {
+      await Ipc.stagingAccept({ proposalId: mode.proposal_id });
+      // No "Accepted" toast: per `patch-review.md`, the buffer reload
+      // is the user-visible confirmation; a transient toast would be
+      // redundant chrome. (`bug-write-note-review-redundant-exit-x`)
+      await refreshPendingProposalsCache();
+      exitWriteNoteReview();
+      void openFile(targetPath, { preview: true });
+    } catch (err) {
+      alert("Accept failed: " + formatError(err));
+    }
+  }
+  host.appendChild(acceptBtn);
+  const rejectBtn = iconButton({
+    title: "Reject",
+    svg: Icons.cross(),
+    onClick: async () => {
+      if (!confirm("Reject this proposed change?")) return;
+      try {
+        await Ipc.stagingReject({ proposalId: mode.proposal_id });
+        showToast("Rejected");
+        await refreshPendingProposalsCache();
+        exitWriteNoteReview();
+      } catch (err) {
+        alert("Reject failed: " + formatError(err));
+      }
+    },
+  });
+  rejectBtn.classList.add("mode-controls-reject");
+  host.appendChild(rejectBtn);
+  // No separate Exit verb in the slot: the agent-diff toolbar toggle
+  // already serves as the exit affordance (per `patch-review.md:52`).
+  // A second exit `X` next to the Reject `X` was redundant chrome.
+  // (`bug-write-note-review-redundant-exit-x`)
+});
+
+// status: patch-review-mode-controls
+editorPane.modeControls.register("patch-review", (host) => {
+  if (buffer?.mode.kind !== "patch-review") return;
+  const target = buffer.mode.targetPath;
+  const proposals = pendingEditProposalsForPath(target);
+  const applyable = proposals.filter((p) => p.state !== "conflicted");
+  const conflicted = proposals.length - applyable.length;
+  const labelEl = document.createElement("span");
+  labelEl.style.cssText = "margin-right:8px;font-size:12px;color:var(--fg-muted);";
+  const conflictSuffix = conflicted > 0 ? ` (${conflicted} conflicted)` : "";
+  labelEl.textContent = `Review agent edits · ${applyable.length} hunks${conflictSuffix}`;
+  host.appendChild(labelEl);
+  const acceptAll = iconButton({
+    title: `Accept all ${applyable.length} applyable hunks`,
+    svg: Icons.check(),
+    onClick: async () => {
+      if (applyable.length === 0) return;
+      if (applyable.length > 5 && !confirm(`Accept ${applyable.length} hunks?`)) return;
+      for (const p of applyable) {
+        await acceptPatchReviewHunk(p);
+      }
+    },
+  });
+  acceptAll.disabled = applyable.length === 0;
+  acceptAll.classList.add("mode-controls-accept");
+  host.appendChild(acceptAll);
+  const rejectAll = iconButton({
+    title: `Reject all ${proposals.length} hunks`,
+    svg: Icons.cross(),
+    onClick: async () => {
+      if (proposals.length === 0) return;
+      if (!confirm(`Reject ${proposals.length} hunks? Agent work will be discarded.`)) return;
+      for (const p of proposals) {
+        await rejectPatchReviewHunk(p);
+      }
+    },
+  });
+  rejectAll.disabled = proposals.length === 0;
+  rejectAll.classList.add("mode-controls-reject");
+  host.appendChild(rejectAll);
+});
+
 editorPane.modeControls.register("snapshot", (host) => {
   if (buffer?.mode.kind !== "snapshot") return;
   const row = buffer.mode.row;
   const diffActive = buffer.mode.diffActive;
-  const label = document.createElement("span");
-  label.className = "mode-label";
-  label.textContent = diffActive ? "Diff · snapshot ↔ current" : "Snapshot preview";
-  if (row) {
-    const when = new Date(row.timestamp_ms).toLocaleString();
-    label.title = `${row.path} · ${when} · ${row.author} · #${row.id}`;
-  }
-  host.appendChild(label);
   // status: mode-controls-diff-toggle
   // Hidden for `op = "deleted"` rows — there's no `before` blob to diff
   // against, so the toggle's affordance lies. Other rows always offer it.
@@ -2614,103 +3171,19 @@ editorPane.modeControls.register("snapshot", (host) => {
 
 // status: note-mutation-buffer-ro-while-in-flight
 // `#mode-controls` renderer for the regular `file` buffer state.
-// Surfaces the "Reformatting…" pill while a `NoteMutation` task is in
-// flight on the active path (so the user knows why the buffer is RO).
-// The dirty-buffer Diff toggle moved to the editor toolbar
-// (`editor-diff-vs-disk-toggle`) so it's always visible alongside Save.
-editorPane.modeControls.register("file", (host) => {
-  if (!buffer || buffer.mode.kind !== "file") return;
-  const path = buffer.path;
-  if (inFlightMutationPaths.has(path)) {
-    const pill = document.createElement("span");
-    pill.className = "mode-label mode-label-pending";
-    pill.textContent = "Reformatting…";
-    pill.title = `${path} — note-mutation in progress`;
-    host.appendChild(pill);
-  }
+// The "Reformatting…" pill moved to the status-bar left region; the
+// toolbar slot now holds only action buttons.
+editorPane.modeControls.register("file", (_host) => {
+  // Empty — file-mode chrome (Save / Diff / View / Mutations) lives
+  // outside the centered mode-controls slot.
 });
 
 editorPane.modeControls.register("trash", (host) => {
-  const label = document.createElement("span");
-  label.className = "mode-label";
-  label.textContent = "Trash preview";
-  const displayPath =
-    buffer?.mode.kind === "trash"
-      ? buffer.mode.displayPath
-      : (buffer?.path ?? "");
-  label.title = `${displayPath} — restore via the trash bin's right-click menu`;
-  host.appendChild(label);
   host.appendChild(
     iconButton({
       title: "Close preview",
       svg: Icons.close(),
       onClick: () => trash.api.closePreview(),
-    }),
-  );
-});
-
-// status: staging-review-activity-detail-filter
-editorPane.modeControls.register("staging", (host) => {
-  if (!buffer || buffer.mode.kind !== "staging") return;
-  const mode = buffer.mode as Extract<BufferMode, { kind: "staging" }>;
-  const diffActive = mode.diffActive;
-  const label = document.createElement("span");
-  label.className = "mode-label";
-  label.textContent = diffActive ? "Diff · proposed ↔ current" : "Staging preview";
-  label.title = `${mode.targetPath} — proposed change`;
-  host.appendChild(label);
-  host.appendChild(
-    iconButton({
-      title: diffActive ? "Hide diff" : "Show diff vs current",
-      pressed: diffActive,
-      svg: Icons.diff(),
-      onClick: () => toggleStagingDiff(),
-    }),
-  );
-  const acceptBtn = document.createElement("button");
-  acceptBtn.type = "button";
-  acceptBtn.textContent = "Accept";
-  acceptBtn.style.cssText =
-    "padding: 2px 8px; border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; background: transparent; cursor: pointer; font-size: 12px;";
-  acceptBtn.addEventListener("click", async () => {
-    acceptBtn.disabled = true;
-    rejectBtn.disabled = true;
-    try {
-      await Ipc.stagingAccept({ proposalId: mode.proposal_id });
-      showToast("Accepted");
-      closeStagingPreview();
-    } catch (err) {
-      alert("Accept failed: " + formatError(err));
-      acceptBtn.disabled = false;
-      rejectBtn.disabled = false;
-    }
-  });
-  host.appendChild(acceptBtn);
-  const rejectBtn = document.createElement("button");
-  rejectBtn.type = "button";
-  rejectBtn.textContent = "Reject";
-  rejectBtn.style.cssText =
-    "padding: 2px 8px; border: 1px solid var(--danger-border); color: var(--danger-text); border-radius: 4px; background: transparent; cursor: pointer; font-size: 12px;";
-  rejectBtn.addEventListener("click", async () => {
-    if (!confirm("Reject this proposed change?")) return;
-    acceptBtn.disabled = true;
-    rejectBtn.disabled = true;
-    try {
-      await Ipc.stagingReject({ proposalId: mode.proposal_id });
-      showToast("Rejected");
-      closeStagingPreview();
-    } catch (err) {
-      alert("Reject failed: " + formatError(err));
-      acceptBtn.disabled = false;
-      rejectBtn.disabled = false;
-    }
-  });
-  host.appendChild(rejectBtn);
-  host.appendChild(
-    iconButton({
-      title: "Close preview",
-      svg: Icons.close(),
-      onClick: () => closeStagingPreview(),
     }),
   );
 });

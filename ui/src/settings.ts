@@ -38,6 +38,7 @@ export interface SettingsConfig {
     show_whitespace: boolean;
     show_chunk_boundaries: boolean;
     hide_frontmatter: boolean;
+    intraline_diff: boolean;
     tab_size: number;
   };
   indexing: {
@@ -116,6 +117,7 @@ const DEFAULTS = {
     show_whitespace: false,
     show_chunk_boundaries: false,
     hide_frontmatter: false,
+    intraline_diff: false,
     tab_size: 2,
   },
   vault: {
@@ -173,6 +175,12 @@ const DEFAULTS = {
   // Mirror of `AcpConfig::default()` in core/src/config.rs.
   acp: {
     command: "",
+  },
+  // Mirror of `StagingConfig::default()` in core/src/config.rs.
+  // status: staging-config-section
+  staging: {
+    auto_reject_on_conflict: false,
+    retention_days: 14,
   },
 } as const;
 
@@ -413,6 +421,8 @@ const SECTIONS: SectionSpec[] = [
         writeScope: "vault", control: { kind: "bool" } },
       { key: "mcp.tools.write_note_enabled",     label: "Tool: write_note",
         writeScope: "vault", control: { kind: "bool" } },
+      { key: "mcp.tools.edit_note_enabled",      label: "Tool: edit_note",
+        writeScope: "vault", control: { kind: "bool" } },
       { key: "mcp.tools.set_frontmatter_enabled",label: "Tool: set_frontmatter",
         writeScope: "vault", control: { kind: "bool" } },
       { key: "mcp.tools.apply_tag_enabled",      label: "Tool: apply_tag",
@@ -443,6 +453,20 @@ const SECTIONS: SectionSpec[] = [
     defaultScope: "vault",
     deferred: "Per-provider config lands when the cloud / Ollama embedder option ships (see embedder-config-section).",
     rows: [],
+  },
+  {
+    // status: staging-config-section
+    id: "staging",
+    title: "Staging",
+    defaultScope: "vault",
+    rows: [
+      { key: "staging.auto_reject_on_conflict", label: "Auto-reject on conflict",
+        desc: "When on, proposals that transition from applyable to conflicted are immediately rejected and disappear from every surface. Live-applied.",
+        writeScope: "vault", control: { kind: "bool" } },
+      { key: "staging.retention_days", label: "Retention (days)",
+        desc: "GC age threshold applied at vault open. Older pending proposals are discarded.",
+        writeScope: "vault", control: { kind: "number", min: 1, max: 365, step: 1 } },
+    ],
   },
   {
     // status: llm-acp-client-optional

@@ -11,12 +11,13 @@
 // The EditorHost module (`ui/src/app/editor.ts`) is constructed here;
 // status bar, mode controls, View menu, dirty-buffer diff, and mutations
 // menu mounts all live inside this module. What stays in main.ts is tab
-// coordination, page-kind rendering, vault lifecycle, navigation history,
+// coordination, app-page rendering, vault lifecycle, navigation history,
 // sidebar/discovery wiring, autosave coordination, window-level keybinds,
 // and event listeners.
 
 import { mountEditor, type EditorHost } from "../app/editor";
 import { mountStatusBar, type StatusBarApi } from "../app/statusBar";
+import type { ChangeRow } from "../snapshotPreview";
 import {
   mountModeControls,
   type ModeControlsApi,
@@ -26,6 +27,11 @@ import {
   mountDirtyBufferDiff,
   type DirtyBufferDiffApi,
 } from "../dirtyBufferDiff";
+import {
+  mountPatchReview,
+  type PatchReviewApi,
+} from "../patchReview";
+import type { Proposal } from "../ipc";
 import {
   mountMutationsMenu,
   type MutationsMenuApi,
@@ -110,6 +116,30 @@ export interface EditorPaneDeps {
   /// Mutations-menu host hook — fired when a path enters / leaves the
   /// in-flight mutation set. Host wires RO toggling + preview promotion.
   onMutationInFlightChanged?: (path: string, inFlight: boolean) => void;
+
+  /// status: status-bar-path-reveal — host wires the reveal-in-file-manager IPC.
+  onRevealInFileManager: (rel: string) => Promise<void>;
+  /// status: status-bar-version-dropdown-selection
+  /// Selecting "Current" in the version dropdown re-opens the live editable
+  /// file, exiting any snapshot / staging preview the buffer is in.
+  onSelectCurrentVersion: (path: string) => void | Promise<void>;
+  /// Selecting a snapshot row opens it read-only in the editor.
+  onSelectSnapshotVersion: (row: ChangeRow) => void | Promise<void>;
+  /// Selecting a staging proposal opens it as a read-only preview.
+  onSelectStagingVersion: (proposal: { id: string; target_path: string }) => void | Promise<void>;
+
+  /// status: patch-review-per-hunk-accept
+  /// Per-hunk accept handler — host owns the transactional disk + buffer
+  /// apply (per `patch-review-dirty-buffer-transactional-accept`).
+  onPatchReviewAcceptHunk: (proposal: Proposal) => Promise<void>;
+  /// status: patch-review-per-hunk-accept
+  /// Per-hunk reject handler — host owns the staging-reject IPC.
+  onPatchReviewRejectHunk: (proposal: Proposal) => Promise<void>;
+
+  /// status: patch-review-toggles-mutually-exclusive
+  /// Called by the user-diff toggle on activation so the host can exit
+  /// patch-review mode first.
+  onExitPatchReview?: () => void;
 }
 
 export interface EditorPaneApi {
@@ -147,6 +177,12 @@ export interface EditorPaneApi {
   /// status-bar diff-button paint.
   dirtyBufferDiff: DirtyBufferDiffApi;
 
+  /// status: patch-review-mode
+  /// Patch-review hunk decoration controller. Host calls `setProposals`
+  /// to push the current `edit_note` proposal snapshot for the active
+  /// file; empty list clears decorations.
+  patchReview: PatchReviewApi;
+
   /// View menu item builder.
   viewMenu: ViewMenuApi;
 
@@ -173,12 +209,18 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     keymap,
     onAfterSave,
     onStatusPulse,
-    inFlightMutationPaths,
     settings,
     syncToggleButtons,
     cssEscape,
     formatError,
     onMutationInFlightChanged,
+    onRevealInFileManager,
+    onSelectCurrentVersion,
+    onSelectSnapshotVersion,
+    onSelectStagingVersion,
+    onPatchReviewAcceptHunk,
+    onPatchReviewRejectHunk,
+    onExitPatchReview,
   } = deps;
 
   // ---- Editor host (CM6 view + compartments + save/dirty/drift) ----
@@ -221,6 +263,10 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     isReadOnlyBuffer,
     isDirtyBufferDiffActive: () => dirtyBufferDiff.isActive(),
     cssEscape,
+    onRevealInFileManager,
+    onSelectCurrent: onSelectCurrentVersion,
+    onSelectSnapshot: onSelectSnapshotVersion,
+    onSelectStaging: onSelectStagingVersion,
   });
 
   // ---- View menu ----
@@ -262,6 +308,14 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     formatError,
   });
 
+  // ---- Patch-review hunk decorations ----
+  // status: patch-review-mode
+  const patchReview: PatchReviewApi = mountPatchReview({
+    dispatch: editor.dispatch,
+    acceptHunk: onPatchReviewAcceptHunk,
+    rejectHunk: onPatchReviewRejectHunk,
+  });
+
   // ---- Mutations menu (wand button) ----
 
   const mutationsMenu: MutationsMenuApi = mountMutationsMenu(
@@ -297,6 +351,13 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
 
   diffBtn.addEventListener("click", () => {
     if (diffBtn.disabled) return;
+    // status: patch-review-toggles-mutually-exclusive
+    // Exit patch-review mode before activating the user-diff toggle —
+    // both decorating the same buffer would conflict.
+    const buf = getBuffer();
+    if (buf?.mode.kind === "patch-review") {
+      onExitPatchReview?.();
+    }
     void dirtyBufferDiff.toggle();
   });
   diffBtn.addEventListener("contextmenu", (ev) => {
@@ -313,19 +374,15 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     openContextMenu(ev.clientX, ev.clientY, items);
   });
 
-  // ---- File-mode controls ("Reformatting…" pill while mutation in flight) ----
-
-  modeControls.register("file", (host) => {
-    const buf = getBuffer();
-    if (!buf || buf.mode.kind !== "file") return;
-    const path = buf.path;
-    if (inFlightMutationPaths.has(path)) {
-      const pill = document.createElement("span");
-      pill.className = "mode-label mode-label-pending";
-      pill.textContent = "Reformatting…";
-      pill.title = `${path} — note-mutation in progress`;
-      host.appendChild(pill);
-    }
+  // ---- File-mode controls ----
+  //
+  // The "Reformatting…" pill that previously lived here moved to the
+  // status-bar left region (see `status-bar-path-basename-tooltip` in
+  // `statusBar.ts`). The mode-controls toolbar slot now holds only
+  // action buttons so the toolbar stays compact.
+  modeControls.register("file", (_host) => {
+    // Empty — all file-mode chrome (Save, Diff, View, Mutations) lives
+    // outside the centered mode-controls slot.
   });
 
   // ---- Read-only wrapper that also re-renders mode controls ----
@@ -349,6 +406,7 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
       editor.scheduleChunkBoundariesRefresh(delayMs),
     modeControls,
     dirtyBufferDiff,
+    patchReview,
     viewMenu,
     mutationsMenu,
   };

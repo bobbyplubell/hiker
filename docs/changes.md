@@ -239,6 +239,89 @@ Bumping the schema means a real migration path (or accepting data loss for casua
 - **Frontmatter "history" embedded in note files.** All changelog data lives in `.hiker/changes.db`, never in source notes. Notes stay clean.
 
 
+## Unified activity feed
+
+The activity detail page, the editor status-bar version dropdown, and the queue-bar pending count all need a single chronological feed that interleaves committed `core::changes` rows with pending `core::staging` proposals. To keep the frontend honest, the merge happens in the backend and is exposed as one DTO; consumers don't reconcile two lists. [activity-feed-merged]
+
+The headline decisions:
+
+- **`core::activity` is the merge module.** Thin wrapper that owns the union DTO and the merged query. Depends on `core::changes` and `core::staging`; neither depends on it. No new on-disk state — `core::activity` is pure projection over the two existing stores. [activity-feed-module]
+- **One DTO (`ActivityItem`) covers both kinds.** A tagged enum (`kind: "change" | "staging"`) with a flat shared envelope (id, timestamp, path, author, summary) plus a per-kind payload. The frontend renders rows from this DTO with no further reconciliation. [activity-feed-unified-item]
+- **Source filter is a first-class arg.** Every query takes a `source` of `changes_only` | `staging_only` | `merged`. `changes_only` and `staging_only` return only their respective rows (existing surfaces keep working unchanged); `merged` returns the interleaved feed. The merged variant is the new third option; the two single-source variants are preserved so per-surface filtering stays cheap. [activity-feed-source-filter]
+- **Staging items carry metadata projected from `pending.json`.** The staging payload on `ActivityItem` exposes the proposal's `surface`, `action`, `target_path`, `trail_id`, `session_id`, `content_hash`, `created_at`, and the free-form `metadata` blob — all sourced from the staging index entry, not re-read from the `.md` file. Content blobs are still fetched on demand via the existing `staging_content` command. [activity-feed-staging-metadata]
+- **Ordering is single-key.** Items sort by `timestamp_ms` desc with `id` as the deterministic tiebreaker (staging ids are string-sortable timestamps; changes ids are monotonic ints — the merge keys off the timestamp and only consults id when timestamps collide). [activity-feed-merge-ordering]
+
+### DTO
+
+```rust
+pub enum ActivitySource { ChangesOnly, StagingOnly, Merged }
+
+pub struct ActivityItem {
+    pub timestamp_ms: i64,
+    pub path: String,                  // target_path for staging, path for changes
+    pub author: String,                // 'pending' for staging items; ChangeRow.author otherwise
+    pub summary: ActivitySummary,      // short label material; UI formats display strings
+    pub payload: ActivityPayload,
+}
+
+pub enum ActivityPayload {
+    Change(ChangeRow),                 // existing DTO from core::changes
+    Staging(StagingItem),              // see below
+}
+
+pub struct StagingItem {
+    pub id: String,                    // proposal id
+    pub surface: String,               // chat | trail | tree | editor | activity | ...
+    pub action: String,                // write_note | apply_tag | set_frontmatter | trail_create | ...
+    pub target_path: String,
+    pub trail_id: Option<String>,
+    pub session_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub created_at_ms: i64,
+    pub metadata: serde_json::Value,   // the rest of pending.json's metadata blob, unparsed
+}
+```
+
+The `StagingItem` fields mirror the columns the `pending.json` index already carries (per `settings.md` `## Storage`), with the `metadata` blob preserved verbatim so consumers that already know how to read MCP-specific or trail-specific fields keep working without a schema bump here. [activity-feed-staging-metadata]
+
+### Query surface
+
+```rust
+impl Activity {
+    pub fn list(&self, filter: ActivityFilter) -> Result<Vec<ActivityItem>>;
+    pub fn list_for_path(&self, path: &str, filter: ActivityFilter) -> Result<Vec<ActivityItem>>;
+    pub fn count(&self, filter: ActivityFilter) -> Result<u32>;
+}
+
+pub struct ActivityFilter {
+    pub source: ActivitySource,        // ChangesOnly | StagingOnly | Merged
+    pub limit: usize,
+    pub author_pattern: Option<String>,// e.g. 'agent:%'; staging items match the synthetic 'pending'
+    pub since_ms: Option<i64>,         // exclude items older than this
+}
+```
+
+`ActivitySource::Merged` runs both underlying queries with the same effective limit, then merges by timestamp and truncates. The two source-only variants short-circuit to the existing `Changes::recent` / `Staging::list` paths and wrap each row in the unified envelope — no behavior change for surfaces that ask for a single source. [activity-feed-merged-query]
+
+Tauri surface: a single `activity_list` command takes `ActivityFilter`; `activity_list_for_path` is the per-buffer variant the status-bar dropdown consumes. The pre-existing `recent_changes` / `staging_list` Tauri commands stay (they're cheaper and used by surfaces that genuinely want only one side), but the activity detail page migrates to `activity_list` so its merge-and-render code shrinks to a flat map.
+
+### Consumers
+
+- **Activity detail page** (`vault-home-recent-activity-detail`) — calls `activity_list({ source: Merged })`. The three filter pills (per `vault-home-recent-activity-filter-pills`) compose into the query: the show-staging toggle flips `source` between `Merged` (on) and `ChangesOnly` (off); the user / agent pills set `author_pattern` for the changes side. With show-staging off + agent off + user on, the page is "my own activity only" — the common audit case. Rows render off `ActivityItem`; no client-side merge. [activity-feed-activity-detail-consumer]
+- **Editor status-bar version dropdown** (`status-bar-version-dropdown`) — calls `activity_list_for_path(path, { source: Merged })` to populate snapshot + staging entries in one pass.
+- **Queue-bar combined badge** (`staging-review-top-bar-badge`) — calls `activity_count({ source: StagingOnly })` for the pending portion of the combined count. No behavior change.
+
+### Module placement
+
+- `core::activity` — `Activity` struct, the DTOs above, `list` / `list_for_path` / `count`. Constructed at vault open with `Arc<Changes>` + `Arc<Staging>` handles; lives next to them on the `VaultSession`. Pure projection — no fs or db writes of its own.
+
+### What this doesn't change
+
+- **`core::changes` and `core::staging` keep their existing APIs.** `Changes::recent` / `recent_by_author` / `history_for_path` and `Staging::list` / `count` stay exactly as today; surfaces that don't want the merge keep calling them directly. The new `Activity` module is additive. [activity-feed-source-filter]
+- **No new on-disk state.** No new tables, no new files, no new GC. The merge is a query-time operation over the two existing stores.
+- **`metadata` semantics stay opaque at the merge layer.** `core::activity` does not parse the staging `metadata` blob; it forwards it. Per-consumer interpretation (e.g. "this is an MCP write" vs. "this is a batch mutation") happens in the consumer or in a thin helper layered above.
+
+
 ## Forward refs
 
 - `mcp.md` (forthcoming) — agent rollback consumes this; write tools stamp `author='agent:*'`.

@@ -2,13 +2,11 @@
 
 Configuration surface for Hiker. v1 ships a TOML loader and the section content needed to unblock the deferred toggles in `editor.md`, `txt-ingest.md`, and `index.md`. No settings UI in v1 — the file is the surface, and a relaunch picks up changes.
 
-The headline decisions:
-
-- **Two TOML files.** Per-user `config.toml` at the platform config dir, per-vault `vault/.hiker/config.toml`. The vault file overrides the user file key-by-key. [settings-user-config-toml, settings-vault-config-toml]
-- **Read once at startup.** No watcher, no hot-reload, no per-access reread. Restart to apply changes. The settings struct is built once and handed around frozen. [settings-load-once-at-startup]
-- **Strict load.** Any unknown key or type mismatch aborts startup with a clear `file:line` error. Same fail-loud discipline as `store-version-fail-loud` in `index.md` — silently dropping a user-set value is a worse failure mode than refusing to start. [settings-strict-load]
-- **Defaults live in Rust, files auto-create on first load.** Every field is `serde(default)`-decorated; the loader treats a missing file as empty *and* writes a full defaults-populated TOML to the expected location so users have a self-documenting file to discover and edit. [settings-defaults-in-code, settings-auto-create-defaults]
-- **In-app toggles write back.** The toggles that already exist in the UI (View menu, tree sort, sidebar/related panel state, trash expansion) persist their flips to the vault TOML so they survive restart. No generalized settings panel in v1 — the TOML is still the canonical surface for everything else. [settings-write-back]
+- **Two TOML files.** Per-user `config.toml` at the platform config dir, per-vault `vault/.hiker/config.toml`. Vault overrides user key-by-key. [settings-user-config-toml, settings-vault-config-toml]
+- **Read once at startup.** No watcher, no hot-reload, no per-access reread. Restart to apply. Struct built once and handed around frozen. [settings-load-once-at-startup]
+- **Strict load.** Unknown key or type mismatch aborts startup with a `file:line` error. Same fail-loud discipline as `store-version-fail-loud` in `index.md` — silently dropping a user-set value is worse than refusing to start. [settings-strict-load]
+- **Defaults live in Rust, files auto-create on first load.** Every field is `serde(default)`; the loader treats a missing file as empty *and* writes a defaults-populated TOML so users have a self-documenting file to edit. [settings-defaults-in-code, settings-auto-create-defaults]
+- **In-app toggles write back.** Existing UI toggles (View menu, tree sort, sidebar/related panel state, trash expansion) persist their flips to the vault TOML so they survive restart. No generalized settings panel in v1 — the TOML is still canonical for everything else. [settings-write-back]
 
 
 ## Storage location
@@ -26,24 +24,23 @@ Either file may be absent; both absent is the same as both empty.
 
 ## Merge & precedence
 
-Conceptually a deep merge of two trees: vault values override user values key-by-key. The user file is the wide default ("my preferences for any vault I open"); the vault file is the local override ("for *this* vault, also do X").
+Deep merge: user is the wide default ("my preferences for any vault"), vault is the local override ("for *this* vault, also do X"), vault wins on key overlap.
 
-- Maps merge recursively. `[editor]` from the user file plus `[editor]` from the vault file produces a single `editor` table where the vault's keys win on overlap.
-- Arrays replace, not concatenate. If the user defines `indexing.ignored_paths = ["foo/"]` and the vault defines `indexing.ignored_paths = ["bar/"]`, the effective value is `["bar/"]`. Concatenation reads as merging but produces surprises (a user can't *remove* an inherited entry). Replace is honest.
-- The schema_version comes from whichever file declares it; if both declare and they disagree, vault wins (same key-overlap rule). The mismatch case below covers what happens when a declared version doesn't match the binary's expected version.
-
-There is no per-key tagging of "this setting is user-only" or "this is vault-only." Any key may appear in either file. The conventions section below names which keys make sense where, but the loader doesn't enforce it — putting `vault.recent_vaults` in a vault TOML works, it's just useless.
+- Maps merge recursively. `[editor]` in both files produces a single table where vault keys win on overlap.
+- Arrays replace, not concatenate. User `indexing.ignored_paths = ["foo/"]` plus vault `["bar/"]` = `["bar/"]`. Concatenation reads as merging but is surprising (a user can't *remove* an inherited entry). Replace is honest.
+- `schema_version` comes from whichever file declares it; if both disagree, vault wins (same overlap rule). Mismatch with the binary's expected version is the strict-load case below.
+- No per-key user-only/vault-only tagging. Any key may appear in either file. The section tables name which keys make sense where, but the loader doesn't enforce it — putting `vault.recent` in a vault TOML works, it's just useless.
 
 
 ## Schema version & strict loading
 
 Top-level `schema_version` integer (default `1`). Mismatch with the binary's expected version is a hard startup failure with a message naming both versions. No silent migration. Same posture as `store-version-fail-loud`. [settings-schema-version]
 
-**Strict load posture.** Unknown keys and type mismatches both abort startup. The error names the file path, the offending key, the line/column from the TOML parser, and (for unknown keys) a suggestion if there's a near match. This is stricter than the typical "warn and continue" pattern; rationale:
+**Strict load posture.** Unknown keys and type mismatches abort startup. The error names file path, offending key, line/column, and (for unknown keys) a near-match suggestion. Rationale:
 
-- A typo'd key that silently does nothing is the worst possible UX — the user thinks they configured something and they didn't. Failing loud surfaces the problem at the moment they made it, not three weeks later when they wonder why the setting "isn't working."
-- The downgrade case (running an older binary against a TOML written by a newer binary that knows new keys) is a real concern — migration policy is to bump `schema_version` whenever keys are added or renamed, so the version check fires before the unknown-key check, and the user gets the *right* error ("schema 2, expected 1") instead of a misleading one ("unknown key `editor.foo`").
-- Migration: same policy as `index.md`'s pre-real-use clause. Until users start putting their actual notes in this app, schema bumps are handled by deleting the offending TOML. Once real-data use begins, every bump ships an additive migration that reads the old shape and writes the new one in place.
+- A typo'd key that silently does nothing is the worst UX — user thinks they configured something and didn't. Failing loud surfaces the problem at the moment they made it, not weeks later.
+- Downgrade case (older binary against TOML written by newer): migration policy bumps `schema_version` whenever keys are added or renamed, so the version check fires before the unknown-key check, giving the *right* error ("schema 2, expected 1") instead of misleading ("unknown key `editor.foo`").
+- Migration: same policy as `index.md`'s pre-real-use clause. Pre-real-use, schema bumps are handled by deleting the offending TOML. Post-real-use, every bump ships an additive migration that reads the old shape and writes the new one in place.
 
 `tracing::error!` events use the `obs-error-context` field discipline: `error!(file = %path.display(), line, col, key = %k, "unknown setting key")`. The user-visible error is a one-line summary plus a "see hiker.log for details" hint.
 
@@ -54,10 +51,10 @@ Top-level `schema_version` integer (default `1`). Mismatch with the binary's exp
 
 Every settable field is declared in Rust with `#[serde(default)]` (and `#[serde(deny_unknown_fields)]` per the strict-load rule). The default for each field lives in a single `Default` impl on its containing struct. [settings-defaults-in-code]
 
-**Auto-create.** On `Config::load`, if either expected file is missing the loader writes a fresh TOML at that path containing the current defaults serialized in full, plus a short header comment naming the binary version. The file is then read back through the normal parse path. Two reasons for writing the *full* defaults rather than an empty file:
+**Auto-create.** On `Config::load`, if either expected file is missing the loader writes a fresh TOML containing the full defaults serialized, plus a header comment naming the binary version. Then read back through the normal parse path. Writing *full* defaults rather than empty:
 
-- **Discoverability.** Users find the file, open it, and see every available key with its current value and (where useful) an inline comment. Documentation that travels with the binary, never out of sync.
-- **No template-drift problem.** The file isn't a template shipped with the binary — it's generated by the running binary, so it always reflects the current schema. When the binary version changes and adds a key, that key is missing from existing files; `serde(default)` fills it in transparently. Users who want to see the new defaults can delete the file and it regenerates.
+- **Discoverability.** Users open the file and see every key with its value and (where useful) an inline comment. Documentation that travels with the binary, never out of sync.
+- **No template drift.** Generated by the running binary, so it always reflects the current schema. When a future binary adds a key, existing files lack it; `serde(default)` fills in transparently. Delete the file to regenerate with new defaults.
 
 Auto-create runs at most once per file per process. If the file is created and then deleted mid-session, the next load (next launch / vault swap) re-creates it. Concurrent first-launches against the same vault from two processes can race, but the loser harmlessly overwrites with identical content; not worth a lock. [settings-auto-create-defaults]
 
@@ -74,12 +71,13 @@ Per-vault toggles for the editor pane and View menu. All optional; each has an i
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
-| `render_txt_as_markdown` | bool | `true` | Backs `txt-render-as-markdown-default` in `txt-ingest.md`. The view-menu entry `view-render-txt-as-markdown-toggle` becomes the in-session override and ungreys with this loader |
+| `render_txt_as_markdown` | bool | `true` | Backs `txt-render-as-markdown-default` in `txt-ingest.md`; `view-render-txt-as-markdown-toggle` is the in-session override and ungreys with this loader |
 | `live_preview` | bool | `true` | Initial state of `view-live-preview-toggle`; matches `live-preview-default-on` |
 | `word_wrap` | bool | `true` | Initial state of `view-word-wrap-toggle`; ungreys this entry |
 | `show_line_numbers` | bool | `true` | Initial state of `view-line-numbers-toggle` |
 | `show_whitespace` | bool | `false` | Initial state of `view-show-whitespace-toggle` |
 | `show_chunk_boundaries` | bool | `false` | Initial state of `view-show-chunk-boundaries`; debugging-grade view, off by default |
+| `intraline_diff` | bool | `false` | Initial state of `view-intraline-diff-toggle`; off keeps the existing line-level rendering. See `diff.md`'s "Diff style" section |
 | `tab_size` | u8 | `2` | CM6 `EditorState.tabSize` |
 
 Theme and font family/size are intentionally excluded from v1 — they need a UI to be discoverable and the TOML-only surface isn't the right home for them. They're listed in "Deferred" below. Crash-recovery autosave (`autosave.md`) is on with a fixed 5s tick and has no config surface in v1; an `[autosave]` section can land later if a workflow asks.
@@ -113,15 +111,15 @@ Per-user vault management plus per-vault UI startup state.
 
 #### Default vault auto-open [settings-default-vault-autoopen]
 
-When `vault.default` is set, the frontend bootstrap auto-opens that path before showing the JS folder dialog. The frontend reads the value via `get_default_vault()` (a small read-only Tauri command) and, if non-empty, calls `open_vault_at(path)` directly. No backend dialog spawning, no "try-and-pick" command — the orchestration lives entirely in the frontend per the rule above.
+When `vault.default` is set, the frontend bootstrap auto-opens that path before showing the JS folder dialog. Reads via `get_default_vault()` (read-only Tauri command); if non-empty, calls `open_vault_at(path)` directly. Orchestration lives entirely in the frontend per the rule above.
 
 Failure modes:
 
-- **`vault.default` is unset / the user TOML doesn't exist yet.** `get_default_vault` returns `Ok(None)`; the bootstrap falls through to the JS dialog. No log noise — this is the empty-state case.
-- **Configured path no longer exists** (deleted, unmounted drive, typo). `open_vault_at` returns `HikerError::NotFound` with the path; the frontend surfaces a non-fatal toast (`"Default vault at <path> not found — pick a vault"`) and falls through to the JS dialog. **Do not auto-clear the setting** — a user with an unplugged USB drive should find the same `vault.default` waiting after they reattach it. The setting is the user's stated intent; the absent path is a transient circumstance.
-- **Path exists but `Vault::open` fails** (permissions, schema mismatch, etc.). Same alert dialog as the manual-open error path — surfaces the real reason rather than masking it as "no default."
+- **Unset / user TOML doesn't exist.** `get_default_vault` returns `Ok(None)`; bootstrap falls through to the JS dialog. No log noise.
+- **Configured path no longer exists** (deleted, unmounted, typo). `open_vault_at` returns `HikerError::NotFound`; non-fatal toast (`"Default vault at <path> not found — pick a vault"`), falls through to the JS dialog. **Do not auto-clear the setting** — a user with an unplugged USB drive should find the same `vault.default` waiting after they reattach it. The setting is stated intent; the absent path is transient.
+- **Path exists but `Vault::open` fails** (permissions, schema mismatch). Same alert dialog as the manual-open error path — surfaces the real reason rather than masking it as "no default."
 
-Setting `vault.default` from inside the app is deferred until a "make this the default vault" UI action lands; until then, hand-edit the user TOML.
+Setting `vault.default` from inside the app is deferred until a "make this the default vault" UI action lands; hand-edit the user TOML until then.
 
 ### [keymap]
 
@@ -152,11 +150,14 @@ Two flows feed staging:
 The headline decisions:
 
 - **Agent-write review is off by default; opt-in per write surface.** Existing behavior — agent writes apply directly + append a `core::changes` row — stays the default. Users who want a checkpoint in the loop flip the flag per surface (MCP / background features). [agent-write-review-mode]
-- **Proposed writes land in `vault/.hiker/staging/`** — a `pending.json` index file plus one `<id>.md` per proposal (the proposed content). Source on disk is unchanged until Accept. Watcher's `.hiker/` ignore covers the dir for free. [staging-dir]
-- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** There is no `staging-preview-mode` editor sub-mode. Instead, each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the editor toolbar, and the activity detail page as the central review surface. Clicking a proposal opens it as a read-only buffer with the existing diff toggle (reuses `snapshot-preview-mode`'s pattern) — but accept/reject stays on the owning surface's row, not in the editor toolbar.
+- **Proposed writes live in `vault/.hiker/staging.db`** — a SQLite database, same module-discipline pattern as `core::changes`'s `changes.db` and `core::store`'s `index.db`. Each pending proposal is one row carrying its metadata + body content as a BLOB column (zstd-compressed, same encoding as `changes-content-zstd`). No per-proposal sidecar files. Source on disk is unchanged until Accept. Watcher's `.hiker/` ignore covers the file for free. [staging-dir, staging-sqlite-store]
+- **`edit_note` proposals split per edit; `write_note` proposals stay whole-file.** Every span in an `edit_note` call lands as its own atomic proposal row, sharing a `batch_id` so consumers can group them visually but accept/reject each independently. `write_note`, `set_frontmatter`, and `apply_tag` produce one proposal per call. [staging-per-edit-proposals]
+- **Pending proposals carry a derived state.** `applyable` (default) or `conflicted`. The state is re-derived on every file change event for the target path; when an anchor is lost or hash drifts past propose-time, the proposal flips to conflicted and `hiker:staging-changed` fires. Conflicted proposals stay visible (Reject still works); Accept is disabled. [staging-proposal-state, staging-drift-eager-recheck]
+- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the editor toolbar, and the activity detail page as the central review surface. The active buffer also exposes an *agent-diff toggle* (per `patch-review.md`) that opens the file in patch-review mode with per-hunk accept/reject for `edit_note`-shaped proposals. `write_note`-shaped proposals open via the existing read-only-buffer-with-diff-toggle pattern, framed as "Review rewrite" / "Review new note" in the mode-controls label (per `write-note-review-surface`).
 - **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the existing author-class pills) that shows all pending proposals across all sources. Each row carries [Accept] [Reject]. An [Accept all (N)] button at the top batch-approves. [staging-review-activity-detail-filter]
 - **Proposals are queryable by surface-specific filters.** `core::staging::list()` accepts an optional filter (`by_path`, `by_trail_id`, `by_surface`, `by_session_id`) so each surface pulls only its relevant proposals. [staging-review-filtering]
 - **MCP write responses are honest about staging.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "staged"` plus the staging id so the agent can describe the outcome accurately. [staging-review-pending-response]
+- **Accept navigates to the target note as a preview tab.** After a successful individual accept (not batch), the UI opens the affected note at its `target_path` in an editor tab with `preview: true`, replacing any existing preview slot. If the file is already open as a sticky tab, the existing tab is activated and its buffer reloaded from disk. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
 
 ### Review surfaces
 
@@ -170,7 +171,7 @@ When an agent proposes a write in review mode, the tool-call card appends two sm
 ▸ write_note(research/paper.md) ✓ Proposed  [Accept] [Reject]
 ```
 
-Accept → drift-checked write → card updates to `✓ Applied`. Reject → discard → card updates to `✗ Rejected`. Same proposal also appears on the activity detail page and the file tree; accepting from the chat card removes it everywhere. [staging-accept-reject-from-chat-card]
+Accept → drift-checked write → navigates to the target note as a preview tab. Card updates to `✓ Applied`. Reject → discard → card updates to `✗ Rejected`. Same proposal also appears on the activity detail page and the file tree; accepting from the chat card removes it everywhere. [staging-accept-reject-from-chat-card]
 
 #### Surface 2: Trails panel
 
@@ -201,9 +202,14 @@ Each row is the source basename plus two muted action links. No full waypoint ca
 
 #### Surface 3: File tree
 
-Files with pending proposals show the **same dirty indicator** (the suffix dot) already used for dirty buffers. The dot is the universal "this file has something unresolved" signal — dirty buffer, pending proposal, same visual.
+Pending proposals are **merged into the file tree at their target path**, not isolated in a separate panel:
 
-Right-click context menu on the row grows a "Pending change" submenu:
+- **New files** (the target path does not yet exist on disk) appear in the tree as synthetic file rows at their destination folder, rendered with a **greyed name** so the user can see where the proposal will land if accepted.
+- **Changes to existing files** show the **same dirty indicator** (the suffix dot) already used for dirty buffers. The dot is the universal "this file has something unresolved" signal — dirty buffer, pending proposal, same visual.
+- **Synthetic directories** are created when a proposal targets a path inside a folder that doesn't exist yet (e.g. `newfolder/file.md`). The folder row appears greyed and can be expanded to reveal the staged children.
+- The tree refreshes automatically on `hiker:staging-changed` so proposals appear and disappear as they are accepted or rejected from any surface.
+
+Right-click context menu on the row grows staging actions:
 
 ```
   Open
@@ -211,23 +217,22 @@ Right-click context menu on the row grows a "Pending change" submenu:
   Delete
   Properties
   ———————
-  Pending change ▸
-    Review pending change
-    Accept change
-    Reject change
+  Review pending change
+  Accept change
+  Reject change
 ```
 
 "Review pending change" opens the file as a read-only buffer with the diff toggle (reuses `snapshot-preview-mode`'s existing diff pattern). Accept and Reject work from the menu without opening the file. [staging-accept-reject-from-tree]
 
 #### Surface 4: Editor toolbar
 
-When the open buffer has a pending proposal, a small pill appears in the editor toolbar between the `#mode-controls` slot and the right-side cluster (same placement and visual weight as the existing "Add to trail" pill):
+When the open buffer has a pending proposal, a small pill appears in the editor toolbar's right-side cluster, just left of Save (same placement and visual weight as the existing "Add to trail" pill):
 
 ```
 Proposed change — [Accept] [Reject]
 ```
 
-Hidden when there's no proposal for the active file. Accept drift-checked-writes and removes the proposal from all surfaces. Reject discards. The pill does not open a separate preview — the user is already looking at the file on disk. [staging-accept-reject-from-editor]
+Hidden when there's no proposal for the active file. Accept drift-checked-writes and removes the proposal from all surfaces. If the active buffer is the target file, the buffer reloads from disk; otherwise navigates to the target as a preview tab. Reject discards. The pill does not open a separate preview — the user is already looking at the file on disk. [staging-accept-reject-from-editor]
 
 #### Surface 5: Activity detail page (central review surface)
 
@@ -253,7 +258,7 @@ The existing `vault-home-recent-activity-detail` page (`vault-home-recent-activi
 └───────────────────────────────────────────┘
 ```
 
-Click a pending row → opens as read-only buffer with the existing diff toggle (reuses `snapshot-preview-diff-toggle`). Accept/Reject stay on the row — the editor toolbar doesn't gain accept/reject buttons for staging. [Accept all (N)] at the top runs a confirm-then-batch-apply. [staging-review-activity-detail-filter]
+Click a pending row → opens as read-only buffer with the existing diff toggle (reuses `snapshot-preview-diff-toggle`). Accept → navigates to the target note as a preview tab. Reject → returns to the activity detail page. [Accept all (N)] at the top runs a confirm-then-batch-apply (stays on current surface). [staging-review-activity-detail-filter]
 
 #### Surface 6: Queue button (combined badge)
 
@@ -270,25 +275,55 @@ No green/red. All Accept/Reject use the existing muted token system and the same
 ### Storage
 
 ```
-.hiker/staging/
-  pending.json    # [{ id, surface, action, target_path, trail_id, content_hash,
-                  #    created_at, metadata }]
-  <id>.md         # proposed content (empty for waypoint-adds — metadata IS the proposal)
+.hiker/staging.db   # SQLite — one table `proposals`, schema below
 ```
 
-One JSON index, one `.md` per proposal. Accept reads the content, drift-checks against source, writes, appends `core::changes` row, removes both files. Reject removes both files, no changelog row. GC on vault open: proposals older than 14 days discarded. [staging-retention]
+Single table `proposals` with these columns (one row per pending proposal):
+
+```
+id                TEXT PRIMARY KEY   -- ULID
+surface           TEXT NOT NULL      -- "mcp-tool-call" | "chat" | "batch-mutation" | "trails" | ...
+action            TEXT NOT NULL      -- "write_note" | "edit_note" | "set_frontmatter" | "apply_tag"
+target_path       TEXT NOT NULL
+trail_id          TEXT
+content_hash      TEXT               -- blake3 of decompressed content; NULL when no body (e.g. waypoint-add metadata-only proposals)
+content           BLOB               -- zstd-compressed body bytes (level 3, same as changes-content-zstd); NULL when content_hash is NULL
+created_at_ms     INTEGER NOT NULL
+batch_id          TEXT               -- groups N rows from one originating tool call (currently only edit_note)
+edit_old_str      TEXT               -- present for edit_note rows
+edit_new_str      TEXT               -- present for edit_note rows
+edit_replace_all  INTEGER            -- 0/1; present for edit_note rows
+state             TEXT NOT NULL      -- "applyable" | "conflicted" (default "applyable")
+conflict_reason   TEXT               -- "anchor_missing" | "anchor_not_unique" | "hash_changed" | "target_missing"
+source_hash       TEXT               -- propose-time disk hash; consumed by recheck
+metadata          TEXT               -- opaque JSON (client_id, session_id, amended_at_ms, amend_count, etc.)
+amended_at_ms     INTEGER            -- last amend timestamp; NULL if never amended (per mcp-tool-amend-pending-proposal)
+amend_count       INTEGER NOT NULL DEFAULT 0
+```
+
+Indexes: `(target_path)`, `(surface)`, `(state)`, `(batch_id)`, `(created_at_ms)` — supporting `StagingFilter` paths without table scans. WAL mode + `synchronous=NORMAL`, mirroring `store-wal-mode` / `changes-store-file`.
+
+Accept reads `content` (decompresses), drift-checks against source (for `edit_note` rows, re-resolves the anchor against current disk per `staging-drift-eager-recheck`), writes the target file, appends a `core::changes` row, deletes the staging row. Reject deletes the row, no changelog row. The accept-write-then-delete sequence is not a single cross-DB transaction (staging.db and changes.db are separate files); the failure mode is the same one the JSON+sidecar shape had — staging row deleted, changes append fails → orphaned changelog entry; staging row deleted, target write fails → user can re-issue from the agent. Worth a one-shot retry on changes append before logging the orphan; out of scope for the storage migration itself. [staging-retention]
+
+`state` defaults to `applyable`; flips to `conflicted` with a populated `conflict_reason` when re-anchoring fails. `batch_id` groups proposals that came from one originating tool call (currently only `edit_note`). The `edit_*` columns carry the patch payload for `edit_note` proposals (NULL for full-file proposals).
+
+GC on vault open: proposals older than `[staging] retention_days` discarded (default 14) via a single `DELETE FROM proposals WHERE created_at_ms < ?`. The retention window is configurable via `staging-config-section`.
+
+Schema version stamped via `pragma user_version` per the established pattern; fail-loud on mismatch per `store-version-fail-loud`. Pre-1.0 policy: no migration code — schema bumps are handled by deleting `.hiker/staging.db`. [staging-sqlite-store]
 
 ### Lifecycle of a staged proposal
 
 1. The producer writes to `core::staging::propose()`:
-    - **Agent path** — `mcp-tool-write-note` (or a background feature) sees `review_required = true` and calls `core::staging::propose(action, target_path, content, metadata)` instead of writing directly.
+    - **Agent path** — `mcp-tool-write-note` / `mcp-tool-edit-note` (or a background feature) sees `review_required = true` and calls `core::staging::propose(action, target_path, payload, metadata)` instead of writing directly. `edit_note` calls split into N proposals via `propose_batch(...)`, one per edit, sharing a generated `batch_id`. Validation (anchor uniqueness, no textual overlap, anchors resolve against pre-application content) happens once at the MCP layer per `mcp-edit-note-validation`; the split-and-stage step trusts the validated input.
     - **Batch mutation path** — each fanned-out task in `core::tasks` calls `core::staging::propose()` on completion.
-2. Content is written to `.hiker/staging/<id>.md`; metadata to `pending.json`.
-3. `hiker:staging-changed` fires. All active surfaces (chat cards, trails panel, tree row indicators, editor toolbar pill, activity detail page) refresh.
-4. User accepts from any surface → `core::staging::accept(id)` drift-checked writes to source, appends `core::changes` row with `metadata.staging_proposal_id` + `metadata.action`, removes staging files. Reject → `core::staging::reject(id)` removes staging files, no changelog row.
-5. Stale proposals (older than 14 days; configurable) GC on vault open.
+2. One `INSERT` into `staging.db`'s `proposals` table carries the metadata, the zstd-compressed body in the `content` column, the propose-time `source_hash`, and (for `edit_note` rows) the `edit_*` patch fields and shared `batch_id`. No sidecar files; everything for the proposal is in the row.
+3. `hiker:staging-changed` fires. All active surfaces (chat cards, trails panel, tree row indicators, editor toolbar pill + patch-review mode, activity detail page) refresh.
+4. While the proposal is pending, every `hiker:file-changed` and `hiker:changes-appended` event for the target path triggers `Staging::recheck(id)`. For `edit_note` rows: re-resolve `edit.old_str` against current disk; if it still matches uniquely, state stays `applyable`. Otherwise flip to `conflicted` with the appropriate `conflict_reason` (`anchor_missing`, `anchor_not_unique`, `target_missing`), broadcast `hiker:staging-changed`. For `write_note` rows: compare `content_hash` against propose-time hash; mismatch flips to `conflicted` with `conflict_reason = "hash_changed"`. [staging-drift-eager-recheck]
+5. User accepts from any surface → `core::staging::accept(id)` re-runs the same anchor / hash check as the source-of-truth safety net, drift-checked writes to source, appends `core::changes` row with `metadata.staging_proposal_id` + `metadata.action` + `metadata.batch_id` (when present), deletes the staging row. Reject → `core::staging::reject(id)` deletes the row, no changelog row. Accept on a `conflicted` proposal returns the conflict reason without modifying disk.
+6. When `[staging] auto_reject_on_conflict = true`, the `applyable → conflicted` transition immediately invokes `reject(id)` with `metadata.auto_rejected_reason = <conflict_reason>`. The proposal disappears from every surface; only future transitions take this path (a flag flip doesn't retroactively reject already-conflicted proposals). [staging-auto-reject-on-conflict]
+7. Stale proposals (older than `[staging] retention_days`) GC on vault open.
 
-The staging dir does *not* count as part of `core::changes` history — proposals that never apply leave no trace beyond the GC log line. Only accepted writes hit the changelog.
+The staging dir does *not* count as part of `core::changes` history — proposals that never apply leave no trace beyond the GC log line and the JSONL agent-log entry. Only accepted writes hit the changelog.
 
 ### `core::staging` module
 
@@ -296,10 +331,15 @@ The staging dir does *not* count as part of `core::changes` history — proposal
 Staging::open(vault_root) -> Staging
 
 Staging::propose(input: ProposalInput) -> ProposalId
-// ProposalInput { surface, action, target_path, trail_id, content, metadata }
+// ProposalInput { surface, action, target_path, trail_id, content, edit?, metadata }
+// edit: Option<EditPayload { old_str, new_str, replace_all }>
+
+Staging::propose_batch(inputs: Vec<ProposalInput>) -> Vec<ProposalId>
+// shared batch_id stamped into each proposal's metadata; used by edit_note
 
 Staging::accept(id, vault, changes) -> AcceptOutcome
-// drift-checked write + core::changes row + cleanup
+// drift-checked write (or re-anchored patch apply for edit_note rows) + core::changes row + cleanup
+// returns AcceptOutcome::Conflicted { reason } when re-check fails at accept time
 
 Staging::reject(id)
 // delete staging files, no changelog row
@@ -307,34 +347,56 @@ Staging::reject(id)
 Staging::accept_all(filter, vault, changes) -> Vec<AcceptOutcome>
 
 Staging::list(filter) -> Vec<Proposal>
-// filter: StagingFilter { path, trail_id, surface, session_id }
+// filter: StagingFilter { path, trail_id, surface, session_id, state? }
 
 Staging::count(filter) -> u32
-Staging::gc(max_age_days)
+
+Staging::recheck(id, current_disk_content?) -> ProposalState
+// re-resolve anchor (edit_note) or hash (write_note) against current disk; persists state + reason
+
+Staging::gc(retention_days)
 ```
 
-Events: `hiker:staging-changed` broadcast on propose/accept/reject so all surfaces stay in sync.
+Events: `hiker:staging-changed` broadcast on propose / accept / reject / state-transition so all surfaces stay in sync.
 
 ### Where the config keys live
 
-The keys themselves live in their owning sections:
+Two kinds of keys: per-surface gates (in their owning sections), and staging-level behavior (in the new `[staging]` section below).
 
 - **`[mcp.tools].review_required`** (bool, default `false`) — extends `mcp-config-section`. When true, every successful tool-write routes through staging instead of writing directly. Exposed as a bool toggle in the MCP settings UI section alongside the per-tool toggles.
 - **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section. When true, debounced background features write to staging instead of mutating frontmatter directly. Exposed as a bool toggle in the LLM settings UI section's background subsection.
 
 Batch mutations don't have a `review_required` flag — they always stage.
 
+### `[staging]` config section [staging-config-section]
+
+Staging-level behavior that applies regardless of which producer staged a proposal. Both keys are eligible for user and vault scope; vault wins per the standard merge rule.
+
+```toml
+[staging]
+auto_reject_on_conflict = false   # default: keep conflicted proposals visible
+retention_days = 14               # GC age threshold
+```
+
+| Key | Type | Default | Scope | Notes |
+| --- | ---- | ------- | ----- | ----- |
+| `auto_reject_on_conflict` | bool | `false` | user + vault | When `true`, the `applyable → conflicted` state transition immediately calls `reject(id)` with `metadata.auto_rejected_reason` set. Live-applied — flipping it on doesn't retroactively reject already-conflicted proposals; flipping it off doesn't resurrect already-rejected proposals. [staging-auto-reject-on-conflict] |
+| `retention_days` | u32 | `14` | user + vault | GC age threshold consumed by `Staging::gc` on vault open. Lifts the previously-hardcoded value. |
+
+The section is added to the strict-load schema (`#[serde(deny_unknown_fields)]` per `settings-strict-load`) and the eligible-key set on both scopes so `set_setting` accepts writes. The settings UI grows a "Staging" section card with bool / int rows for both keys; live-applied (no restart). [staging-config-section]
+
 ### Module placement
 
-- `core::staging` — `Staging` struct, `Staging::propose/accept/reject/list/count/gc`. Pure, no Tauri imports. All `.hiker/staging/` filesystem touches confined here.
+- `core::staging` — `Staging` struct, `Staging::propose / propose_batch / accept / reject / list / count / recheck / gc`. Pure, no Tauri imports. All `.hiker/staging/` filesystem touches confined here.
 - `core::ops::agent_write_note` (and frontmatter / tag wrappers) branch on the loaded `Config`'s review flag and route to `core::staging::propose` when set.
 - UI: activity detail page filter + inline accept/reject, chat tool-call card buttons, trails panel banner + proposed rows, tree context menu + dot indicator, editor toolbar pill. Each surface calls `core::staging::list(filter)` with its relevant filter.
 - MCP server response shapes extend per `staging-review-pending-response`.
 
 ### Forward refs
 
-- `diff.md` — the diff toggle already works in snapshot preview mode; staging reuses it. No new diff surface needed.
-- `mcp.md` `mcp-config-section` gets the `tools.review_required` row.
+- `diff.md` — the diff toggle already works in snapshot preview mode; staging reuses it for `write_note` proposals. `edit_note` proposals open in patch-review mode per `patch-review.md`.
+- `patch-review.md` — owns the inline per-hunk accept/reject surface for `edit_note` proposals plus the agent-diff toolbar toggle.
+- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` is the producer of per-edit proposals.
 - `llm.md` `[llm.background]` config gets `review_required`.
 - `task-queue.md` — batch mutation fan-out producers call `core::staging::propose` on completion.
 - `trails.md` — draft trail review hooks into the staging surfaces described here.
@@ -344,8 +406,6 @@ Batch mutations don't have a `review_required` flag — they always stage.
 ## Settings UI shell
 
 A vault-bar gear button toggles a settings surface that replaces the editor (same shape as the vault home page — a sub-mode of the editor pane state). The TOML files stay canonical; the panel is a UI on top of the existing `set_setting` / `Config::load` infrastructure, not a parallel storage path. [settings-pane-mode]
-
-The headline decisions:
 
 - **Pane mode, not modal.** The settings surface is a sub-mode of the editor pane, alongside the vault home overview and home detail. Clicking the gear swaps `#editor-pane` to a settings layout; clicking any tree row / recents row / search result returns to the editor on that note. Same shape `setVaultHomeVisible` already uses today, with the same dirty-buffer protection (a dirty editor buffer gets the existing `file-switch-guard-dirty` modal before the swap). [settings-pane-mode]
 - **Gear icon in the vault bar between Home and Open-vault.** `vault-bar` order becomes Home / Settings / Open-vault, then the vault path display, then back/forward at the trailing edge. Same icon-only treatment as the existing vault-bar buttons (gear / cog glyph in the established line-weight family). Pressed/unpressed state reflects whether the settings pane is currently visible. Tooltip "Settings." [vault-bar-settings-icon]
@@ -458,8 +518,10 @@ Selected in-app UI changes persist by writing back to the appropriate TOML file.
 - `[editor].render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `show_chunk_boundaries` — written on View menu flip. Vault-scope.
 - `[vault].sidebar_open`, `related_open`, `trash_expanded`, `tree.sort_by` — written on the corresponding UI action. Vault-scope.
 - `[vault].recent` — written by the Open Vault flow (push-to-front, dedupe, cap at ~10 entries). User-scope.
-- `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. Vault-scope (per-surface gate that makes sense per vault). Live-applied.
-- `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features write to staging. Vault-scope. Live-applied.
+- `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. User + vault scope. Live-applied.
+- `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features write to staging. User + vault scope. Live-applied.
+- `[staging].auto_reject_on_conflict` — bool toggle in the Staging settings section. When on, proposals that transition to `conflicted` auto-reject. User + vault scope. Live-applied. [staging-auto-reject-on-conflict]
+- `[staging].retention_days` — int (>0) in the Staging settings section. Sets GC age threshold; lifts the previously-hardcoded 14-day value. User + vault scope. Live-applied (next vault open picks up the new threshold).
 
 Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
 
@@ -483,19 +545,19 @@ Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serd
 
 On app startup, if `vault.default` in the user TOML is set and non-empty, the frontend opens that path directly without showing the vault picker. Empty or absent → show the picker as today. [settings-default-vault-autoopen]
 
-**The picker is a frontend concern.** It's UI; it shouldn't live in Rust. A CLI invocation should never be at risk of spawning a folder dialog. The frontend calls `@tauri-apps/plugin-dialog` from JS when (and only when) it needs the user to pick a folder. The backend exposes one command, `open_vault_at(path)`, that does the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. That command is the same shared helper the CLI / MCP entry points call, with no dialog dependency anywhere in core or in the Tauri command layer.
+**The picker is a frontend concern.** UI doesn't belong in Rust, and a CLI invocation should never risk spawning a folder dialog. The frontend calls `@tauri-apps/plugin-dialog` from JS only when it needs a folder. Backend exposes `open_vault_at(path)` for the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. Same shared helper the CLI / MCP entry points call; no dialog dependency in core or Tauri command layer.
 
-**Frontend bootstrap.** On window init, the frontend:
+**Frontend bootstrap.** On window init:
 
-1. Reads `vault.default` from the user TOML (via a small `get_default_vault()` Tauri command — or whatever read surface exists once it's wired; the point is it's a value lookup, not a side-effecting "try to open" command).
-2. If non-empty, calls `open_vault_at(path)`. On `HikerError::NotFound` (or equivalent — the configured path no longer resolves), logs a `warn!` server-side, surfaces a non-fatal toast on the client (`"Default vault at <path> not found — pick a vault"`), and falls through to step 3. The configured default is **not** auto-cleared (the drive may simply be unplugged — clobbering the setting on a transient failure is the wrong default).
-3. If `vault.default` was empty, or step 2 fell through, opens the JS dialog plugin to let the user pick a folder, then calls `open_vault_at` with the chosen path.
+1. Read `vault.default` from the user TOML via `get_default_vault()` (a value lookup, not a side-effecting "try to open").
+2. If non-empty, call `open_vault_at(path)`. On `HikerError::NotFound`, `warn!` server-side, non-fatal toast (`"Default vault at <path> not found — pick a vault"`), fall through to step 3. **Do not** auto-clear the setting (drive may be unplugged — clobbering on a transient failure is wrong).
+3. If empty or step 2 fell through, open the JS dialog and call `open_vault_at` with the chosen path.
 
-**Today's `pick_vault` command goes away.** Its two responsibilities split: the dialog moves to JS, the open work becomes `open_vault_at`. Existing call sites in `ui/src/main.ts` (the "Open vault" button handler) become "JS dialog → `open_vault_at`."
+**Today's `pick_vault` command goes away.** Dialog moves to JS, open work becomes `open_vault_at`. Call sites in `ui/src/main.ts` become "JS dialog → `open_vault_at`."
 
-**No first-run interaction.** On a brand-new install, `vault.default` is `null` (the user TOML is auto-created with defaults), so the bootstrap falls through to the picker on first launch. The "make this the default vault" UI action that *sets* this value is deferred (see "Deferred"); until it lands, users hand-edit the user TOML to opt in.
+**No first-run interaction.** On a brand-new install `vault.default` is `null`, so the bootstrap falls through to the picker. The "make this the default vault" UI action is deferred (see "Deferred"); until then, hand-edit the user TOML.
 
-**Reading `vault.default`.** Per "Merge & precedence", `vault.default` is documented as user-only but the loader doesn't enforce it. The bootstrap read targets the user TOML directly (it's the only file available before a vault is open — there's no vault to merge against yet). A `vault.default` set inside a vault TOML is silently meaningless, same as today.
+**Reading `vault.default`.** Documented as user-only but not enforced (per "Merge & precedence"). Bootstrap reads the user TOML directly — it's the only file available before a vault is open. `vault.default` in a vault TOML is silently meaningless.
 
 
 ## Module placement

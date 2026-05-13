@@ -60,9 +60,23 @@ export interface TabStripApi {
 }
 
 export function mountTabStrip(deps: TabStripDeps): TabStripApi {
+  // Last rendered signature — short-circuits redundant DOM rebuilds.
+  // Why: render() wipes & rebuilds every tab element via replaceChildren().
+  // updateStatus() fires it on every CM6 ViewUpdate (statusUpdater plugin),
+  // including the focusChanged update produced when the editor blurs on a
+  // tab-strip mousedown. Without this guard the DOM is swapped between
+  // mousedown and mouseup on the same node, the browser suppresses the
+  // resulting `click`, and the user has to click again.
+  let lastSig = "";
   function render(): void {
     const tabs = deps.getTabs();
     const active = deps.getActivePath();
+    const sig = JSON.stringify({
+      a: active,
+      t: tabs.map((t) => [t.path, t.basename, t.folder, t.dirty, t.preview, t.kind]),
+    });
+    if (sig === lastSig && deps.hostEl.childElementCount === tabs.length) return;
+    lastSig = sig;
     // Compute basenames that collide so we can render folder hints
     // (editor-tab-disambiguation).
     const basenameCounts = new Map<string, number>();

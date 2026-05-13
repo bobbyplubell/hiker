@@ -108,6 +108,16 @@ export function mountViewMenu(deps: ViewMenuDeps): ViewMenuApi {
         },
       },
       {
+        // status: view-intraline-diff-toggle
+        label: "Intraline diff highlights",
+        checked: v.intralineDiffEnabled,
+        run: () => {
+          const on = !v.intralineDiffEnabled;
+          void deps.editor.setIntralineDiffEnabled(on);
+          void deps.settings.setVaultSetting("editor.intraline_diff", on);
+        },
+      },
+      {
         // status: view-heading-breadcrumb-toggle
         label: "Show heading breadcrumb",
         checked: false,

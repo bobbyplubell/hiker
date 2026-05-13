@@ -56,15 +56,19 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 ### Editor and vault
 
 - **[implemented]** CodeMirror 6 editor with markdown live preview (cursor-line reveal, fade markers, heading styles, fenced code reveal)
-- **[implemented]** Three-column layout: file tree, editor, discovery panel; collapsible sides
-- **[implemented]** File tree with drag-and-drop move, rename, context menu, sortable, refresh-on-watcher
-- **[implemented]** Soft-delete trash with restore, permanent delete, and empty-trash actions
+- **[implemented]** Three-column layout: file tree, editor, discovery panel; collapsible and resizable sides
+- **[implemented]** Sidebar mode switcher (Files / Clusters / Trails) with persistent per-vault default
+- **[implemented]** File tree with drag-and-drop move, inline rename, context menu, sort options, refresh-on-watcher
+- **[implemented]** Soft-delete trash with restore, permanent delete, empty-trash, and orphan recovery
 - **[implemented]** Pre-write drift check and conflict modal for external edits
 - **[implemented]** Vault home screen with stats, recently-modified, and recently-accessed widgets
-- **[implemented]** Per-buffer view options: live preview, word wrap, whitespace, line numbers, render `.txt` as markdown
+- **[implemented]** Per-buffer view options: live preview, word wrap, whitespace, line numbers, chunk boundaries, render `.txt` as markdown
 - **[implemented]** Plain `.txt` ingest with structure-aware paragraph and sentence packing
-- **[planned]** Frontmatter properties editor, status-bar goto-line, help-panel keybind enumeration
-- **[planned]** Note mutation actions menu (markdown reformat, etc.)
+- **[implemented]** Note mutation actions menu (LLM-driven in-buffer transforms; v1 entry: "Reformat as markdown")
+- **[implemented]** Note properties tab (identity, file state, index state, chunks, access tracking, changes); trail/cluster membership and live-refresh deferred
+- **[implemented]** Autosave: per-buffer crash-recovery sidecars and tab-state snapshots; silent restoration on vault reopen, no close-prompt modal
+- **[implemented]** Status-bar version dropdown spanning the unified activity feed (current buffer + snapshots + pending agent proposals) with live refresh
+- **[planned]** Status-bar goto-line, help-panel keybind enumeration, in-place frontmatter editing inside the properties tab
 
 ### Index, search, and discovery
 
@@ -73,24 +77,30 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[implemented]** Related-notes panel driven by per-chunk KNN
 - **[implemented]** Vault-wide hybrid search (FTS5 lexical + semantic vectors, RRF fusion) in the discovery panel
 - **[implemented]** Type-ahead search with debounce, epoch cancellation, click-to-chunk navigation, full keyboard nav
-- **[in progress]** CLI surface (`hiker reindex`, `hiker query`, trash commands)
+- **[implemented]** Lexical and semantic option menus (case sensitivity, prefix match, min-similarity, recency bias) persisted per vault
+- **[partial]** CLI surface (`hiker reindex`, `hiker query` wired; trash commands and additional verbs still in progress)
 - **[planned]** Pluggable embedder backends (OpenAI, Ollama, Cohere, Mistral, HuggingFace) via the `llm` crate
-- **[planned]** Lexical and semantic option menus (case sensitivity, prefix match, min-similarity, recency bias)
 - **[planned]** Folder, tag, lifecycle, and authorship scoping; multi-vault search; saved-collection results
 - **[planned]** Tantivy lexical engine swap for ranking quality
 
 ### Organization and AI assist
 
+- **[implemented]** Local agent loop with multi-provider LLM core (`core::agent::run_turn`, tool dispatch, cancellation, cap/timeout handling) and chat panel
+- **[implemented]** Optional ACP client for external agents (Claude Code, Goose) — hiker MCP server auto-attached to the spawned session
+- **[implemented]** Per-feature prompt files (two-tier loader: user `~/.config/hiker/prompts/` + vault `.hiker/prompts/`, vault wins); in-app settings-tab editor planned
+- **[implemented]** Unified LLM/agent task queue: priorities, leases, event-streamed progress, direct worker plus external-MCP-client worker support
+- **[implemented]** Changes log: append-only record of every note mutation (user + agent authored), per-path history, rollback primitives for agent edits and snapshot restore
+- **[implemented]** Staging & review: pending agent proposals (`write_note`, `edit_note`, frontmatter, tags) route through `.hiker/staging/` when review-mode is on, surfaced in the unified activity feed and the version dropdown with author/source filtering
+- **[implemented]** Patch review: per-hunk accept/reject for agent `edit_note` proposals, conflicted-state detection, anchor-drift safeguards, batch grouping
+- **[partial]** LLM audit log (JSONL at `.hiker/agent-log/`, daily rotation, shared by core agent + MCP + ACP surfaces) done; cost-transparency status indicator planned
 - **[planned]** Recursive RAPTOR-shaped clustering with HDBSCAN/GMM, LLM cluster naming, saved topic trees
+- **[planned]** Cluster editor surface (interactive tree editing, policies, node operations, triage view)
 - **[planned]** One-shot suggestion proposals (move and tag modes) with markdown audit log and rejection history
 - **[planned]** Confidence-tiered triage: high-confidence auto-apply with undo, medium queued for review
-- **[planned]** Local agent loop on top of a multi-provider LLM core; optional ACP client for external agents (Claude Code, Goose)
-- **[planned]** Per-feature prompt files (user + vault scoped) with settings-tab editor and test affordance
-- **[planned]** LLM audit log and cost-transparency status indicator
 
 ### Spatial navigation
 
-- **[planned]** Trails: ordered, memex-style walks through notes
+- **[implemented]** Trails: ordered, memex-style walks through notes — create, append waypoints, reorder, remove with cascade, side-trail hierarchies, capture-to-active, append-cursor insertion, watcher-driven auto-update on note move
 - **[planned]** Landmarks: pinned anchors with nearest-landmark tagging in embedding space
 - **[planned]** Map: graph visualization of the vault
 
@@ -102,15 +112,25 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[planned]** Audio sidecars via whisper.cpp
 - **[planned]** Web capture and EPUB sources
 
-### Agent surface
+### Agent surface (MCP)
 
-- **[planned]** MCP server (`rmcp`) exposing search, related, trails, and note CRUD with the same semantics as the UI
+- **[implemented]** MCP server (`rmcp` over streamable HTTP) brought up per-vault, with discovery file and per-tool toggles
+- **[implemented]** Read tools: `search_notes`, `get_note`, `related_notes`
+- **[implemented]** Write tools: `write_note`, `set_frontmatter`, `apply_tag`, `remove_tag`; `edit_note` (span-anchored patches, per-edit staging proposals)
+- **[implemented]** Audit log and per-tool review-mode routing through staging
+- **[planned]** Staging introspection (`list_pending_proposals`, `get_pending_proposal` with per-edit anchor-status liveness) and `amend_pending_proposal`
+- **[planned]** Trails, landmarks, collections, and bulk write tools (`move_note`, `delete_note`) — each lands with its backing feature
+
+### Diff viewer
+
+- **[implemented]** Unified diff renderer with line + intraline character-level highlights
+- **[implemented]** Snapshot preview diff, dirty-buffer-vs-disk diff, and pending-proposal-vs-disk diff via toolbar toggle
 
 ### Platform
 
 - **[implemented]** Tauri shell, Rust core with strict module discipline (rusqlite, fastembed, notify each isolated to one module)
 - **[implemented]** Per-vault settings (TOML, user + vault layered, strict load, write-back preserving comments)
-- **[implemented]** Tracing-based observability with daily-rotating file logs
+- **[implemented]** Tracing-based observability with daily-rotating file logs; chunk-boundary editor gutter
 - **[implemented]** Multi-vault open with default-vault auto-open
 - **[deferred]** Tracing spans per pipeline stage, in-app log viewer, frontend log bridge
 - **[deferred]** `.hiker/ignore` config file

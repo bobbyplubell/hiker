@@ -191,7 +191,7 @@ export function mountAutosave(deps: AutosaveDeps): AutosaveApi {
 
   function buildTabState(): AutosaveTabState {
     // status: tab-kinds — include ALL open tabs regardless of kind so
-    // the next vault open restores page-kind tabs alongside buffer tabs.
+    // the next vault open restores app-page tabs alongside buffer tabs.
     const open_paths: string[] = [];
     const open_tab_kinds: Record<string, string> = {};
     for (const [path, entry] of deps.openBuffers) {

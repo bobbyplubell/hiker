@@ -288,7 +288,7 @@ export function mountTabs(deps: TabsDeps): TabsApi {
     for (const [path, entry] of deps.openBuffers) {
       const slash = path.lastIndexOf("/");
       let basename = slash >= 0 ? path.slice(slash + 1) : path;
-      // status: tab-kinds — produce human-readable labels for page-kind
+      // status: tab-kinds — produce human-readable labels for app-page
       // tabs so the strip says "Home" / "Queue" / etc. instead of the
       // internal `__hiker:*` sentinel key.
       if (path.startsWith("__hiker:home") && !path.includes("detail")) {

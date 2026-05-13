@@ -41,7 +41,8 @@ export type UiTarget =
   | "ui::trails"
   | "ui::mode-controls"
   | "ui::app"
-  | "ui::properties-pane";
+  | "ui::properties-pane"
+  | "ui::status-bar";
 
 /// Loose field map. `err` is treated specially below — `Error` instances
 /// (and other non-string values) are stringified before crossing the IPC

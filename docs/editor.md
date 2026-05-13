@@ -1,11 +1,11 @@
 # Editor
 
-CodeMirror 6 inside the Tauri webview. This document specs the editor surface itself — buffer model, save UX, keybinds, status bar, and the extension layout that future features (live preview, wikilinks, autocomplete) will slot into. Live-preview decorations and widget rendering are out of scope here; see design.md.
+CodeMirror 6 inside the Tauri webview. Live-preview decorations and widget rendering are out of scope here; see design.md.
 
 
 ## Buffer model
 
-One open buffer at a time in v0. The buffer is identified by its vault-relative path (`currentPath`). Switching files replaces the buffer's contents via a single `dispatch` that swaps the entire doc.
+One open buffer at a time in v0. Switching files replaces the buffer's contents via a single `dispatch` that swaps the entire doc.
 
 State tracked per buffer:
 
@@ -13,9 +13,9 @@ State tracked per buffer:
 - `loadedHash` — hash (or full string) of the contents most recently read from / written to disk
 - `isDirty` — derived: current doc text !== loadedHash
 
-`isDirty` is the single source of truth for save state. Computed lazily from the editor doc and `loadedHash` — no separate "dirty flag" that can desync. Cleared by re-reads and successful writes; set implicitly by any edit. [buffer-dirty-derived]
+`isDirty` is the single source of truth for save state — computed lazily from the editor doc and `loadedHash`, no separate flag that can desync. Cleared by re-reads and successful writes; set implicitly by any edit. [buffer-dirty-derived]
 
-Multi-buffer / tabs are deferred. The model above keeps single-buffer simple but generalizes — when tabs land, the same per-buffer state moves into a `Buffer[]` keyed by path, with the active buffer driving the editor view.
+Multi-buffer / tabs deferred. When tabs land, the same per-buffer state moves into a `Buffer[]` keyed by path, with the active buffer driving the editor view.
 
 
 ## Save UX
@@ -24,8 +24,10 @@ Save action: writes current doc to `currentPath` via the `write_file` core comma
 
 Triggers (all funnel into the same save function):
 
-- Mod-S keybind [save-keybind-mod-s]
-- Save button in the editor toolbar (floppy-disk icon, just left of the View options button; visible always; disabled when no file is open or when not dirty) [save-button]
+| Trigger | Binding / location |
+| --- | --- |
+| Keybind | Mod-S [save-keybind-mod-s] |
+| Toolbar button | Floppy-disk icon left of View options; always visible; disabled when no file is open or not dirty [save-button] |
 
 Save writes the user's file. Crash-recovery autosave (sidecar shadow copies of dirty buffers, NPP shape) is a separate mechanism — see `autosave.md`. The two paths don't overlap: saving clears the autosave sidecar for that path, autosave never touches the user's file.
 
@@ -37,22 +39,20 @@ Dirty indicator:
 
 File-switch guard fires on **explicit close** of a dirty tab (× / middle-click / `tab.close` keybind) — a confirm dialog with three options: Save & close, Discard & close, Cancel. Cancel keeps the tab open. Switching away from a dirty tab via tab click / file-tree click / search-result click does *not* fire the guard — the buffer stays dirty in memory. Window close has **no** dirty-buffer modal: every dirty buffer flushes through the autosave pipeline and the open-tab snapshot is pushed, so next launch auto-restores the workspace as dirty tabs the user can save or revert via the existing affordances. [file-switch-guard-dirty, autosave-close-no-modal]
 
-External changes: two mechanisms, layered.
+External changes: two mechanisms.
 
-- Pre-write drift check (v0). Every save re-reads the file from disk and compares its hash to `loadedHash` before writing. Three outcomes:
-    - match — write proceeds normally; on success `loadedHash` updates to the new doc text.
+- Pre-write drift check (v0). Every save re-reads the file and compares its hash to `loadedHash` before writing. [pre-write-drift-check, drift-conflict-modal]
+    - match — write proceeds; `loadedHash` updates.
     - file missing — prompt: write anyway (re-creates) / cancel.
-    - hash mismatch — conflict prompt: keep mine (overwrite, lose disk version) / take theirs (discard buffer, reload from disk) / open diff (deferred — falls back to keep/take in v0).
+    - hash mismatch — conflict prompt: keep mine (overwrite) / take theirs (discard buffer, reload) / open diff (deferred — falls back to keep/take in v0).
+    - Catches the "I edited the file in vim while it was open in Hiker" case without a watcher.
 
-    This catches the common "I edited the file in vim while it was open in Hiker" case without needing a watcher. [pre-write-drift-check, drift-conflict-modal]
+- Watcher integration (v1). The notify-based watcher (lands with the indexer) pushes file-change events for the open file.
+    - buffer clean — silently reload; `loadedHash` updates.
+    - buffer dirty — same conflict prompt, but proactive (on event, not at save time).
+    - Reduces the stale-buffer window; pre-write check remains as final guard since watchers miss events (network filesystems, rapid changes, event/save races).
 
-- Watcher integration (v1). When the notify-based watcher lands with the indexer, it pushes file-change events to the frontend for the currently open file. Behavior:
-    - buffer clean — silently reload from disk; `loadedHash` updates.
-    - buffer dirty — same conflict prompt as above, but proactive (fired on the change event, not deferred to save time).
-
-    The watcher reduces the window where the user can edit a stale buffer; the pre-write check remains as a final guard since the watcher can miss events (network filesystems, rapid changes, race between event and save).
-
-The pre-write check and the watcher both reduce to the same conflict-resolution UI; only the trigger differs.
+Both mechanisms reduce to the same conflict-resolution UI; only the trigger differs.
 
 
 ## Keybind registry
@@ -98,18 +98,43 @@ Override mechanism (deferred): a user keybind file (`vault/.hiker/keybinds.toml`
 
 Bottom strip across the editor pane only (not under the tree). Three regions: [status-bar-layout]
 
-- left: current file **basename** (e.g. `note.md`), with the full vault-relative path in a `title=` tooltip on hover. [status-bar-path-basename-tooltip]
+- left: a **version dropdown** for the active buffer's file. Closed-state label is the basename plus a mode qualifier when a non-current version is selected (e.g. `note.md`, `note.md — Snapshot 2m ago`, `note.md — Staging · chat`). The full vault-relative path stays in the `title=` tooltip on hover. See `## Version dropdown` below. [status-bar-version-dropdown]
 - center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later. [status-bar-index-label]
 
   When the *active buffer*'s file is in a non-indexed state (per `tauri-cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
 - right: line:col, word count, file type badge (`md`)
 
-Why basename rather than full path: the file tree already shows location, the window title (`Hiker — <path>`) carries the disambiguation when needed, and full paths overflow the bar on deep vaults. Basename answers "what's open right now"; the tooltip + tree cover "where does it live." Once tabs land the per-tab basename label uses the same rule.
+Why basename rather than full path: the file tree shows location, the window title carries disambiguation, and full paths overflow on deep vaults. Tooltip + tree cover "where does it live."
 
 Click targets:
 
-- file basename → reveal the file in the system file explorer (Finder on macOS, File Explorer on Windows, default file manager on Linux). Implemented via Tauri's shell/opener API. Tracked as `status-bar-path-reveal`. [status-bar-path-reveal]
+- dropdown → opens the version list (see below).
+- right-click on the dropdown's closed-state label → context menu with "Reveal in file manager" (Finder on macOS, File Explorer on Windows, default file manager on Linux; via Tauri's shell/opener API). Suppressed for trash-preview / snapshot / staging buffers so internal `.hiker/` paths don't leak. [status-bar-path-reveal]
 - line:col → opens a goto-line input (deferred; click is a no-op in v0) [status-bar-goto-line]
+
+
+### Version dropdown
+
+The left region of the status bar is a single dropdown that lists every addressable version of the active buffer's file. Selecting an entry switches the editor view to that version (live editor, snapshot preview, or staging preview), without changing tabs or pane state. [status-bar-version-dropdown]
+
+Entries, in fixed group order, newest within each group:
+
+1. **Current** — the live, editable on-disk version. Always present, always the first entry. Selecting it exits any snapshot / staging preview the buffer is in and returns to the editable buffer (same code path as the existing exit-preview transitions).
+2. **Snapshots** — every `core::changes` row for this path within retention (`Changes::history_for_path`), one entry per row. Label: `Snapshot · <relative-time> · <author> · <op>`. Selecting an entry enters `snapshot-preview-mode` against that change-id (same code path as clicking a row on the activity detail page). The current on-disk state already appears as the top "Current" entry, so the most-recent snapshot row is *not* hidden — it represents the saved version, which may diverge from the live buffer if the user has unsaved edits.
+3. **Staging proposals** — every `core::staging` proposal whose `target_path` equals this file (`Staging::list({by_path})`). Label: `Staging · <surface> · <relative-time>`. Selecting an entry opens the proposal's content as a read-only staging preview (same code path as clicking a proposal row on the activity detail page).
+
+The selected entry reflects what's currently in view. Closed-state label mirrors that selection (e.g. `note.md — Snapshot 2m ago · agent:claude`), so the user can tell at a glance which version the editor is showing without opening the dropdown. Mode-specific verbs (Restore, Accept / Reject, Diff toggle) stay in the editor toolbar's `#mode-controls` slot per `editor-toolbar-mode-controls`; the dropdown is purely a version selector. [status-bar-version-dropdown-selection]
+
+The dropdown is buffer-only — it hides for non-buffer tab kinds the same way the rest of the status bar does (`tab-kinds`). For a buffer whose file does not yet exist on disk (newly-created, never saved), only the "Current" entry appears.
+
+Population:
+
+- Snapshots and staging entries come from `core::activity::list_for_path(path, filter)` (see `changes.md` `## Unified activity feed`) so the dropdown shares the merged-feed type with the activity detail page rather than calling two separate APIs and reconciling them in the UI. [status-bar-version-dropdown-uses-unified-feed]
+- The list refreshes on `hiker:changes-appended` and `hiker:staging-changed` for events that touch the active buffer's path; debounced consistent with the activity widget. [status-bar-version-dropdown-live-refresh]
+
+Why a dropdown rather than a static label: the prior label only surfaced *which* preview was active, and only one preview was reachable from outside the editor at a time. A per-buffer version picker makes the status bar the canonical place to ask "what other versions of this file exist?" without leaving the editor. [status-bar-version-dropdown]
+
+Trash entries are out of scope for the dropdown — a trash entry *is* a different file on disk (different path), not a version of the open buffer; surfaced via the existing `tree-trash-preview` path.
 
 
 ### Sibling protection (overflow rule)
@@ -309,14 +334,13 @@ The editor toolbar reserves a centered `#mode-controls` slot between two flex sp
 
 Why a single toolbar slot rather than per-mode banners:
 
-- **Consistent visual language.** The icons match the rest of the editor toolbar palette (sidebar wheel, discovery glass, View eye, etc.) — same line-weight, sizing, hover treatment. Per-mode banners would mean a separate visual family (full-width strips with their own colors) that fights the surrounding chrome.
-- **Less DOM and CSS.** No separate banner elements, no per-mode show/hide logic. The slot is `replaceChildren()`-rebuilt every transition. Idempotent: same inputs → same DOM.
-- **Discoverable once.** Users learn "label + icons in the toolbar center = something special is going on" once and the pattern carries across snapshot / trash / staging / dirty-buffer-diff / future modes.
+- **Consistent visual language.** Icons match the rest of the toolbar palette (line-weight, sizing, hover). Per-mode banners would be a separate visual family that fights the surrounding chrome.
+- **Less DOM and CSS.** No separate banner elements, no per-mode show/hide. Slot is `replaceChildren()`-rebuilt every transition. Idempotent.
+- **Discoverable once.** "Label + icons in toolbar center = something special is going on" carries across snapshot / trash / staging / dirty-buffer-diff / future modes.
 
 What lands in the slot:
 
-- A short text label naming the mode ("Snapshot preview" / "Trash preview" / "Diff · snapshot ↔ current" / "Staging review" / "Diff · buffer ↔ disk"). Title attribute carries metadata (path, timestamp, author, change id, etc.) — hover reveals it without spending toolbar real estate.
-- A row of small icon-only buttons for the mode's verbs: Diff toggle (when applicable, see `diff.md`'s `mode-controls-diff-toggle`), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons.
+- **Icon-only action buttons** for the mode's verbs: Diff toggle (when applicable, see `diff.md`'s `mode-controls-diff-toggle`), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons. The mode qualifier that names which non-current version is in view sits in the status-bar left region's version dropdown closed-state label (see `status-bar-version-dropdown` above) so the toolbar stays compact and the user's eye finds the context in the same place it finds the file name.
 
 `renderModeControls()` reads the current buffer state (`buffer.mode.kind`, `isDirty()`, etc.) and the diff-active flag and rebuilds the slot's children. Called on every transition that affects the slot — buffer swap, mode entry/exit, dirty toggling, diff on/off.
 
@@ -365,6 +389,8 @@ Each entry is a checkable item — checkmark when active, click flips it, menu c
 
 - **Hide frontmatter** — visually collapse the leading `---\n…\n---\n` YAML block into a single placeholder line (`▸ frontmatter (N lines)`) without touching the file. Detection mirrors `core::frontmatter::split` exactly — the block must start at byte 0 with `---\n` and have a closing `---\n` line before any body content; an unterminated or non-leading block is ignored. CodeMirror integration: a `Decoration.replace({block: true})` over the byte range, recomputed off `state.doc` so edits inside or around the block update the placeholder line count immediately. Default off; persistence via `editor.hide_frontmatter` (`settings-section-editor`). Motivated by agent-stamped frontmatter (`mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) accumulating into a tall block that pushes the actual prose off screen — flipping this on lets the user read the body without manually scrolling past metadata that's already visible elsewhere (the activity widget, file detail views). [view-hide-frontmatter-toggle]
 
+- **Intraline diff highlights** — augments the line-level red/green diff with character-level highlights inside paired delete/insert lines. Affects every consumer that calls `editor.renderDiff` (snapshot preview, dirty-buffer diff, write-note review). Default off; persistence via `editor.intraline_diff` (`settings-section-editor`). Flipping the toggle while a diff is currently displayed re-renders the active diff with the new style. Does *not* affect the patch-review agent-diff surface — that renders span-anchored hunks as widgets on the live doc and is governed by its own rules in `patch-review.md`. See `diff.md`'s "Diff style" section for the full rendering contract. [view-intraline-diff-toggle]
+
 ### Reserved entries (greyed in v1, enabled when their backing feature lands)
 
 These appear in the menu now so the surface is predictable, but render greyed-out with a tooltip naming the dependency. Putting the slot up front is also a forcing function for designing each backing feature with the toggle in mind.
@@ -411,6 +437,8 @@ Submits a task with `kind: NoteMutation { mutation: ReformatAsMarkdown, source_p
 - **Enabled** when the active buffer is an editable note (`buffer.mode.kind === "file"`) of an indexable extension (`.md` / `.markdown` / `.txt`) and has at least one byte of content.
 - **Disabled** during read-only preview modes (trash / snapshot / staging review) — mutating from inside a review surface would be confusing. Tooltip explains why.
 - **Disabled with "Mutation in progress…" tooltip** when there is an active or leased task whose `kind: NoteMutation { source_path }` matches the active buffer's path. The buffer is RO during this window for the same reason. Only one in-flight mutation per source path (`note-mutation-one-in-flight-per-path`).
+
+- **Pending-background-mutation indicator.** When the active buffer has at least one pending background mutation job in the queue (any `NoteMutation`-kind task in non-terminal state whose `source_path` matches the buffer), the Mutations menu trigger renders a small pulsing accent-color dot in the corner of its icon. Same `@keyframes` pulse as `tree-row-queued-marker` so the visual vocabulary stays uniform. Distinct from the "Reformatting…" pill in `#mode-controls` (which names the single in-flight in-buffer mutation): the pill belongs to single-note in-buffer flight, the dot is the presence-of-any-pending indicator for the per-note menu and stays lit across multiple queued or batch-flight jobs (`note-mutation-batch-via-staging`). Driven by the same `hiker:queue-event` subscription the menu already maintains. [note-mutations-menu-pending-indicator]
 
 When only one mutation entry is enabled (the v1 case), the popover still opens — clicks-to-action stay one shape so users learn it once. As more mutations land, they slot in alphabetically.
 
@@ -464,7 +492,15 @@ Refresh: subscribes to a new `hiker:changes-appended` event emitted whenever the
 
 Vault home widget tiles support a drill-in pattern. **Click on a widget's tile or header → home view body swaps to a detail view for that widget.** No back button affordance within the home view itself — clicking the Home button in the top strip always returns to the home overview, regardless of whether you're in the overview or a detail view. Clicking a note row in any detail view exits home and opens the editor on that note (same shape as `openFile` already exits home view today). [vault-home-detail-views]
 
-Detail views replace the home overview body, not the editor. Same pane-mode framing: `#editor-pane` has four states — editor, home overview, home detail, and the settings surface (`settings-pane-mode`, see `settings.md` `## Settings UI shell`). The Home button toggles between editor and home overview; widget-tile clicks transition home overview → home detail; the gear (`vault-bar-settings-icon`) toggles editor ↔ settings; back transitions are via Home button (→ overview), note-row click (→ editor), or the gear button (→ editor). Read-only review surfaces (trash preview, snapshot preview, staging review preview) are sub-modes of the editor state — they share the editor's CM6 view, and the editor toolbar's centered `#mode-controls` slot lights up with mode-specific icon buttons + a label (see `## Mode controls slot`). Where applicable, a Diff toggle in that slot flips the view between the consumer's content and the line-level diff (see `diff.md`). The dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) lives in the editor toolbar instead of `#mode-controls` — always visible alongside Save, greyed when no diff target applies.
+Detail views replace the home overview body, not the editor. `#editor-pane` has four states — editor, home overview, home detail, and the settings surface (`settings-pane-mode`, see `settings.md` `## Settings UI shell`).
+
+Transitions:
+- Home button toggles editor ↔ home overview.
+- Widget-tile clicks: home overview → home detail.
+- Gear (`vault-bar-settings-icon`) toggles editor ↔ settings.
+- Back: Home button (→ overview), note-row click (→ editor), gear (→ editor).
+
+Read-only review surfaces (trash, snapshot, staging review previews) are sub-modes of the editor state — they share the CM6 view, and the toolbar's `#mode-controls` slot lights up with mode-specific icon buttons + label (see `## Mode controls slot`). Where applicable, a Diff toggle in that slot flips between the consumer's content and the line-level diff (see `diff.md`). The dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) lives in the editor toolbar instead — always visible alongside Save, greyed when no diff target applies.
 
 Per-widget detail views, in roughly the order they earn their keep:
 
@@ -485,9 +521,10 @@ Per-widget detail views, in roughly the order they earn their keep:
 
     Restore writes the row's `content_at(id)` blob back to disk via `vault.write_file_checked`, then appends a new `'modified'` row stamped `metadata.restored_from = id`. Tauri command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, walks `previous_content_for_path`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same log primitives, see `changes.md` "Rollback".
 
-    - **Author-filter pills** — one pill per present author class. Default: all classes pressed (everything visible). User can flip filters; state persists per-vault. Pills only appear when their class has at least one row in the visible window. [vault-home-recent-activity-author-filter]
-    - **`recent-activity-human-icon`** — human glyph (half-oval body + circle head) for the `user` filter pill. Same icon-only style as the editor toolbar palette. Tooltip "Show user activity." [recent-activity-human-icon]
-    - **`recent-activity-agent-icon`** — simplified retro-robot glyph for the `agent:*` filter pill. Tooltip "Show agent activity." Future author classes (sync, import) get their own glyphs in the same family when they land. [recent-activity-agent-icon]
+    - **Filter pills — three independent toggles.** Default-all-on; state persists per-vault. Each toggle gates a distinct row population, so two-of-three off is a meaningful filter (e.g. "show only pending agent reviews"). The pills replace the earlier "author class + Pending" split — `Pending` is no longer a separate pill, the show-staging toggle owns that visibility. [vault-home-recent-activity-filter-pills]
+        - **Show staging** — pending staging proposals (the rows that route to a review surface on click). Off → backend query switches `source` from `Merged` to `ChangesOnly`. Same icon family as the editor's agent-diff toggle; tooltip "Show pending agent reviews."
+        - **User** — committed change rows with `author_class == "user"`. Tooltip "Show user activity." [recent-activity-human-icon]
+        - **Agent** — committed change rows with `author_class == "agent"` (i.e. agent writes that have *already* landed on disk — staged-and-accepted, or direct-mode). Distinct from the show-staging pill, which covers proposals that haven't landed yet. Tooltip "Show agent activity." Future author classes (sync, import) join as additional pills in the same row. [recent-activity-agent-icon]
     - **Un-rollback affordance** — append-only log + per-row content blob means *every* prior state stays restorable, including states that were themselves the result of a Restore. Mechanically, "un-rollback" is just Restore on a more recent prior version — same primitive, no separate operation. UX: rows tagged `metadata.restored_from` show a `↩ restored` badge; immediately after a Restore action, the row that *was* the current state for that path gets a soft highlight + "← previous state — click Restore to undo" caption. The action is the regular `[Restore this version]` button on that row (no separate primitive); the caption is purely a hint. This is materially better than linear undo stacks where redo state vanishes after a subsequent edit; here, every row within retention is equally accessible as a Restore target. [vault-home-recent-activity-unrollback]
     - **Snapshot read-only preview.** Reuses the trash-preview machinery: `setReadOnly(true, "snapshot")` swaps in the snapshot banner, suppresses the save button + dirty marker, and the dirty-switch guard treats it the same as a trash preview (nothing to discard). The buffer carries `snapshotPreview: true` and `snapshotChangeId` so the banner's Restore action can write back without a re-lookup. Different banner color from trash (amber, not red) — informational, not a recovery surface. [snapshot-preview-mode]
 - **`vault-home-recents-detail`** (lower priority — lands when needed) — full list versions of Recently Modified / Recently Accessed. Less urgent than the stats and agent-activity ones since each preview row already has a click-to-open affordance; the detail view adds filtering / longer history but isn't load-bearing.
@@ -559,6 +596,8 @@ Browser-style multi-buffer tabs. Each tab represents one open buffer; click swit
 
 A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the payload identifies *which one*.
 
+**Umbrella term: "app pages."** Every non-`buffer` kind below (`home`, `home-detail`, `queue`, `settings`, `properties`, `agent`, `graph`) is collectively an *app page* — a tab that renders an in-app surface rather than user-authored content. "App-page tabs" is the form used where the tab-strip aspect matters; "app pages" is the bare noun. The term replaces the earlier inconsistent "page-kind tabs" / "meta pages" wording. The `TabKind` discriminator on the wire stays per-kind (`home`, `queue`, …) — "app page" is umbrella vocabulary, not a runtime category.
+
 - `buffer` — payload is a vault-relative file path; renders the existing CodeMirror editor for that file. All current tab semantics (preview slot, dirty marker, close guard, autosave participation, tree-click activation, search-result-click activation, navigation-history entries) describe this kind.
 - `agent` — payload is a chat session id; renders the chat surface as the tab's content (per `chat-panel-expand-to-editor`). The discovery-panel's bottom-docked chat region collapses while an agent tab is open since the surface lives in the tab; closing the agent tab restores the docked region.
 - `graph` — payload is the graph view's state (filter set, selection); renders a graph-view canvas (per `design.md`'s graph-view future bullet).
@@ -568,15 +607,15 @@ A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the pa
 - `settings` — settings pane (per `settings-pane-mode`).
 - `properties` — payload is a vault-relative note path; renders the read-only properties inspector for that note (per `note-properties-tab`). One properties tab per note path; opening Properties on a path that already has a tab open switches to it rather than spawning a duplicate.
 
-Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (file glyph for `buffer`, chat glyph for `agent`, graph glyph for `graph`, house glyph for `home`/`home-detail`, list-with-pulse for `queue`, gear for `settings`); the label is whatever the kind chooses (basename for `buffer`, session preview for `agent`, "Graph" or filter summary for `graph`, "Home" / "Recent activity" / "Queue" / "Settings" / etc. for the page kinds).
+Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (file glyph for `buffer`, chat glyph for `agent`, graph glyph for `graph`, house glyph for `home`/`home-detail`, list-with-pulse for `queue`, gear for `settings`); the label is whatever the kind chooses (basename for `buffer`, session preview for `agent`, "Graph" or filter summary for `graph`, "Home" / "Recent activity" / "Queue" / "Settings" / etc. for the app pages).
 
-**Page-kind tabs default-land in the preview slot.** Clicking the Home / Queue / Settings buttons in the top strip's leading cluster opens the corresponding tab as a *preview*: it occupies the preview slot, replacing whatever preview was previously there (same one-preview-at-a-time rule as `editor-preview-tab`). The user can promote a page-kind preview to sticky via the same affordances as buffer previews (right-click "Keep open", or any user interaction on the tab body that signals "I'm staying" — per-kind decision: home-detail clicks within the page count as promotion; settings flips do not, since the user is just toggling and leaving). This keeps the common case ("glance at home, then go back to my work") clutter-free while letting power users keep pages around.
+**App-page tabs default-land in the preview slot.** Clicking the Home / Queue / Settings buttons in the top strip's leading cluster opens the corresponding tab as a *preview*: it occupies the preview slot, replacing whatever preview was previously there (same one-preview-at-a-time rule as `editor-preview-tab`). The user can promote an app-page preview to sticky via the same affordances as buffer previews (right-click "Keep open", or any user interaction on the tab body that signals "I'm staying" — per-kind decision: home-detail clicks within the page count as promotion; settings flips do not, since the user is just toggling and leaving). This keeps the common case ("glance at home, then go back to my work") clutter-free while letting power users keep pages around.
 
 **Buffer-scoped chrome hides when the active tab is non-buffer.** The editor toolbar's buffer-scoped controls (View menu, Save button, Diff button, Mutations menu, the mode-controls slot) and the bottom status bar (line:col, index-state label, file-path) are buffer-only — they hide entirely when the active tab is `agent`, `graph`, `home`, `home-detail`, `queue`, or `settings`. The sidebar / discovery toggle icons stay visible regardless because they control the side panels independently of the center pane. Each non-buffer kind brings its own chrome (or none) inside the tab body — settings has its scope toggle and refresh button in its own header, home has its overview/detail toggle, etc.
 
 **Kind-aware predicates.** Existing tab semantics that assume "every tab is a file buffer" gate on kind:
 
-- **Preview slot** (`editor-preview-tab`) — buffer-only on the *contents-tracking* side (paths replace each other in the slot). Page-kind tabs use the same one-slot-per-strip rule; opening a page-kind tab evicts whatever was previewed before (buffer or page).
+- **Preview slot** (`editor-preview-tab`) — buffer-only on the *contents-tracking* side (paths replace each other in the slot). App-page tabs use the same one-slot-per-strip rule; opening an app-page tab evicts whatever was previewed before (buffer or app page).
 - **Dirty marker** (`editor-tab-dirty-marker`) is `buffer`-only — non-buffer tabs have no dirty concept.
 - **Close guard** (`file-switch-guard-dirty`) only fires when closing a `buffer` tab whose buffer is dirty.
 - **Autosave tab-state** (`autosave-tab-state-store`) records `(kind, payload)` per open tab; restore reopens each kind through its own mount path.
@@ -594,7 +633,7 @@ The headline decisions:
 
 - **One properties tab per note path.** Opening Properties on a path that already has a properties tab open switches to it instead of spawning a duplicate — same shape as the file-tree click rule for buffer tabs. [note-properties-tab]
 - **Read-only data view, no editor chrome.** The tab is non-buffer per `tab-kinds`, so the editor toolbar and bottom status bar hide on activation. The tab body owns its own header (note basename + relative path). No save button, no dirty marker, no preview-slot promotion path — clicking Properties from the tree always opens sticky (it's a directed action, like restore-from-trash). [note-properties-tab-no-editor-chrome]
-- **Page-kind preview-slot rule still applies on open.** Properties tabs default-land in the preview slot — same rule as `home` / `queue` / `settings` (per `tab-kinds`). Clicking Properties on a second note replaces the preview; promotion paths are the standard ones (right-click "Keep open", drag, etc.). [note-properties-tab-preview-slot]
+- **App-page preview-slot rule still applies on open.** Properties tabs default-land in the preview slot — same rule as `home` / `queue` / `settings` (per `tab-kinds`). Clicking Properties on a second note replaces the preview; promotion paths are the standard ones (right-click "Keep open", drag, etc.). [note-properties-tab-preview-slot]
 - **Live-refreshing.** The tab subscribes to the same event surfaces the rest of the UI rides — `hiker:reindex-progress` (notes-row / chunks data refreshes when a re-ingest finishes), `hiker:changes-appended` (changes-section refreshes on every new change row for this path), `hiker:file-changed` (mtime / size refresh on external edits). No manual refresh button; the data is always current. [note-properties-tab-live-refresh]
 
 #### Sections rendered
@@ -650,6 +689,7 @@ Behavior details:
 - **No persistence across vault re-open.** Tabs are already in-memory only per `multi-buffer-in-memory-only`; preview state is too. Vault swap clears the preview slot along with everything else.
 - **Tree double-click stays bound to inline rename** per `tree-double-click-rename`. Promoting via double-click on the *tree row* would conflict; the tab double-click covers the canonical VSCode gesture.
 - **Programmatic opens skip preview.** Restore-from-trash, new-note creation, the right-click "Open" tree verb, and any other non-user-click path open sticky — these are directed actions, not browsing. The `openFile` parameter is `{ preview: false }` (or omitted) at those callsites.
+- **Pending agent proposals route the open into review mode.** When `openFile(rel)` resolves a path with one or more pending staging proposals, the buffer lands in patch-review or write-note review per `note-open-routes-to-pending-review` (in `patch-review.md`). The preview-vs-sticky distinction is preserved; the review state rides on `buffer.mode`, not the tab kind.
 
 Out of scope for this feature:
 
@@ -696,7 +736,7 @@ When the user navigates back and then opens a new content surface, the forward s
 
 Browser convention: two-finger horizontal swipe on a trackpad triggers back/forward. macOS surfaces this as `wheel` events with `deltaX` accumulation; the editor pane's wheel handler watches for sustained horizontal scroll past a threshold (e.g. ~120px of accumulated `deltaX` over a short time window) and fires the navigation. Vertical swipes are ignored.
 
-Optional polish (defer for v1 of the feature; nice-to-have): a small "←" or "→" overlay animation that previews the navigation while the swipe is in progress, cancels if the user reverses before the threshold. Not load-bearing.
+**Visual feedback while swiping.** As `deltaX` accumulates past a small floor (~30px) but before the commit threshold, a directional indicator fades in on the swiped-toward edge of the editor pane — a chevron glyph (`‹` for back, `›` for forward) plus a thin progress bar whose fill tracks `|accumulated_deltaX| / threshold`. When the threshold trips, the indicator briefly snaps to fully-filled and fires the navigation; if the user reverses or the 250ms quiet-reset window expires, the indicator fades out without committing. Greyed (indicator visible but desaturated) when there's no history in that direction, so the user gets clear "would commit but nothing to navigate to" feedback rather than a silent no-op. [navigation-swipe-visual-feedback]
 
 Right-swipe = back. Left-swipe = forward. Same as every browser.
 
@@ -718,7 +758,6 @@ Closing the vault while history exists drops the entire stack — no warning, no
 
 - **Persisting history across restarts.** Browser-shaped feature: history is per-session.
 - **Tab-style multi-buffer history.** Hiker is single-buffer in v1; if tabs ever land, each tab gets its own history stack.
-- **Visual swipe overlay animation.** Optional polish, deferred until the basic mechanism is real.
 - **Touchscreen swipe gestures.** Trackpad-only for v1.
 - **Rich history menu (right-click → list of last N pages).** Browser-shaped polish, deferred.
 

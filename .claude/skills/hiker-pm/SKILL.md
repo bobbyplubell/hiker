@@ -14,12 +14,19 @@ Both jobs start by reading the code and specs honestly. They differ only in what
 
 ## Before recommending anything
 
-1. **Read every spec in `docs/` in full.** No skimming. Specs cross-reference each other and a recommendation that ignores a constraint in another doc is worse than no recommendation. Same rule as `hiker-spec-writer`.
-2. **Read `status.md` end-to-end.** It is the registry; every recommendation should cite slugs that exist there.
-3. **Read `bug_tracking.md`.** Active bugs may outrank new features.
-4. **Audit the code.** For each `partial` slug in `status.md`, read the cited file:line and verify the claim. Status rows drift; reality on disk wins. Surface drift to the user as part of the report.
+The docs collection has grown too large to read end-to-end every time. Read what's relevant for the candidate set you're weighing, not everything.
+
+1. **Always read in full:**
+   - `status.md` — the registry; every recommendation should cite slugs that exist there. Use it as the index to decide which spec docs are relevant.
+   - `bug_tracking.md` — active bugs may outrank new features.
+   - `docs/design.md` — anchors the project's foundational rules and the "Future / deferred" list (items named but not specced; don't recommend them as next-up impl work).
+2. **Build a shortlist of candidate slugs first** (active bugs, `partial` slugs, `planned` slugs that look high-leverage). Then read the spec doc(s) that own those slugs in full. `status.md` rows are grouped under `## <Topic> (<file>.md)` headings — that names the owning doc.
+3. **Follow cross-references.** If a candidate spec cites another slug as a prerequisite, open the doc that owns that prerequisite and read the relevant section. Dependency edges drive prioritization, so this step is load-bearing.
+4. **Audit the code for each candidate.** For each `partial` slug in your shortlist, read the cited file:line and verify the claim. Status rows drift; reality on disk wins. Surface drift to the user as part of the report.
 5. **Look at recent git history.** `git log --oneline -30` and the diff of unmerged work tells you what's actively in flight — don't recommend something the user is already doing.
-6. **Skim `scratch/`.** Files there hold in-flight design context — ideas the user has been pooling in chat but haven't been ironed out enough to land in `docs/` yet (currently trails). A feature with substantial scratch notes is *being designed*, not ready for impl recommendation; surface it as "in design" rather than "ready to build." Same rule for `docs/design.md`'s "Future / deferred" section: items there are named but not specced — don't recommend them as next-up impl work.
+6. **Skim `scratch/`.** Files there hold in-flight design context — ideas the user has been pooling in chat but haven't been ironed out enough to land in `docs/` yet. A feature with substantial scratch notes is *being designed*, not ready for impl recommendation; surface it as "in design" rather than "ready to build."
+
+Specs not on the candidate shortlist or its citation graph can stay unread for this turn. If the user pushes back on the recommendation and asks about an area you didn't open, read that spec then.
 
 ## How to prioritize
 
@@ -76,10 +83,14 @@ When the user passes a dev agent's report (or points at a recent commit / branch
 ### What to read before reviewing
 
 1. **The dev agent's report**, in full. Note which slugs it claims to have implemented and any caveats it flagged.
-2. **Every spec slug the work claims to touch.** Read those sections of the relevant docs in full — the spec is the contract, the report is the claim.
-3. **The actual diff.** `git diff <base>..HEAD` or read the changed files. Don't trust the report's description of the diff; read the diff. Agents' summaries describe intent, not always reality.
-4. **`status.md` for each touched slug.** Was the row updated? Did `partial`/`planned` move to `done`?
-5. **Code that links to the touched slug.** `rg "status: <slug>"` should land on the implementation site. Missing tag is a defect of completion, not just hygiene.
+2. **Every spec doc that owns a slug the work claims to touch, in full.** `status.md` tells you which doc owns each slug (rows are grouped under `## <Topic> (<file>.md)`). The spec is the contract, the report is the claim — don't grade against the claim alone.
+3. **Follow cross-references.** If the owning spec cites a prerequisite slug or another doc, open the cited doc and read the relevant section. A correct local implementation that breaks a cross-doc constraint is the most common review miss.
+4. **`docs/design.md`** if the change touches the layer split or module discipline (anything moving logic between `core`, Tauri command layer, and frontend) — that's where the rules live.
+5. **The actual diff.** `git diff <base>..HEAD` or read the changed files. Don't trust the report's description of the diff; read the diff. Agents' summaries describe intent, not always reality.
+6. **`status.md` for each touched slug.** Was the row updated? Did `partial`/`planned` move to `done`?
+7. **Code that links to the touched slug.** `rg "status: <slug>"` should land on the implementation site. Missing tag is a defect of completion, not just hygiene.
+
+Specs unrelated to the touched slugs can stay unread.
 
 ### What to check for
 

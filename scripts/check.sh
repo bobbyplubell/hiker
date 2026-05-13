@@ -14,8 +14,8 @@ cargo test -p hiker-core --lib || fail "cargo test -p hiker-core --lib"
 echo "==> cargo check -p hiker-ui"
 cargo check -p hiker-ui || fail "cargo check -p hiker-ui"
 
-echo "==> tsc --noEmit (from ui/)"
-( cd ui && ./node_modules/.bin/tsc --noEmit ) \
+echo "==> tsc --noEmit (via ui/compose.yaml)"
+( cd ui && docker compose run --rm --no-deps -T ui ./node_modules/.bin/tsc --noEmit ) \
     || fail "tsc --noEmit"
 
 echo "==> all checks passed"

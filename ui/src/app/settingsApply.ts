@@ -25,6 +25,7 @@ export interface Settings {
     show_whitespace: boolean;
     show_chunk_boundaries: boolean;
     hide_frontmatter: boolean;
+    intraline_diff: boolean;
     tab_size: number;
   };
   indexing: {
@@ -80,6 +81,7 @@ export interface SettingsApplyDeps {
   setWhitespaceEnabled: (on: boolean) => void;
   setChunkBoundariesEnabled: (on: boolean) => void;
   setHideFrontmatterEnabled: (on: boolean) => void;
+  setIntralineDiffEnabled: (on: boolean) => void;
   setTreeSortFromSettings: (sortBy: Settings["vault"]["tree"]["sort_by"]) => void;
   appEl: HTMLElement;
   trashBinEl: HTMLElement;
@@ -105,6 +107,7 @@ export function applySettingsToUi(s: Settings, deps: SettingsApplyDeps): void {
     ...v,
     renderTxtAsMarkdown: s.editor.render_txt_as_markdown,
   }));
+  deps.setIntralineDiffEnabled(s.editor.intraline_diff);
   deps.setLivePreviewEnabled(s.editor.live_preview);
   deps.setWordWrapEnabled(s.editor.word_wrap);
   deps.setLineNumbersVisible(s.editor.show_line_numbers);

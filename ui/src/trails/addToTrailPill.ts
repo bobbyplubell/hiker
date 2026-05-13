@@ -50,7 +50,6 @@ export interface AddToTrailPillApi {
 }
 
 export function mountAddToTrailPill(opts: {
-  hostBeforeEl: HTMLElement; // pill is inserted as the previous sibling of this element
   /// Fired after a successful `trailAppendWaypoint` from the pill
   /// click. The host uses this to explicitly refresh the trails
   /// panel + membership cache, because `core::trails::append_waypoint`
@@ -60,25 +59,13 @@ export function mountAddToTrailPill(opts: {
   /// writes. See `bug-add-to-trail-verbs-dont-refresh-panel`.
   onAppended?: () => void;
 }): AddToTrailPillApi {
-  const { hostBeforeEl } = opts;
-  // Prefer the pre-existing `#add-to-trail-pill` button placed in
-  // `index.html` just before `#mode-controls` so the toolbar layout
-  // is stable across reloads. Fall back to creating + inserting if
-  // the HTML doesn't have the slot (defensive).
   const existing = document.getElementById(
     "add-to-trail-pill",
   ) as HTMLButtonElement | null;
-  let btn: HTMLButtonElement;
-  if (existing) {
-    btn = existing;
-  } else {
-    btn = document.createElement("button");
-    btn.id = "add-to-trail-pill";
-    btn.type = "button";
-    btn.className = "toolbar-btn add-to-trail-pill";
-    btn.hidden = true;
-    hostBeforeEl.parentElement?.insertBefore(btn, hostBeforeEl);
+  if (!existing) {
+    throw new Error("#add-to-trail-pill element not found in DOM");
   }
+  const btn = existing;
 
   function isIndexablePath(path: string): boolean {
     const lower = path.toLowerCase();
@@ -143,12 +130,13 @@ export function mountAddToTrailPill(opts: {
       return;
     }
     btn.hidden = false;
-    btn.textContent = s.label;
     btn.disabled = s.disabled;
     if (s.tooltip) {
       btn.title = s.tooltip;
+      btn.setAttribute("aria-label", s.tooltip);
     } else {
-      btn.removeAttribute("title");
+      btn.title = s.label;
+      btn.setAttribute("aria-label", s.label);
     }
   }
 

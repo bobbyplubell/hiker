@@ -157,6 +157,7 @@ async fn server_lists_expected_tools() {
         "get_note",
         "related_notes",
         "write_note",
+        "edit_note",
         "set_frontmatter",
         "apply_tag",
         "remove_tag",
@@ -313,6 +314,125 @@ async fn write_tools_disabled_returns_1004() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     assert!(tools.contains(&"search_notes".to_string()));
+    shutdown(b).await;
+}
+
+// ---------- edit_note: validation + direct + staged ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_direct_applies_all_edits_and_writes_once() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("a.md"), "hello foo world baz").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [
+            {"old_str": "foo", "new_str": "FOO"},
+            {"old_str": "baz", "new_str": "BAZ"},
+        ],
+    })).await;
+    let s = structured(&resp);
+    assert_eq!(s["status"], "written", "resp: {resp}");
+    assert_eq!(s["edit_count"], 2);
+    assert!(s["content_hash"].as_str().unwrap().len() > 0);
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "hello FOO world BAZ");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_missing_path_returns_1002() {
+    let b = boot(McpConfig::default()).await;
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "nope.md",
+        "edits": [{"old_str": "x", "new_str": "y"}],
+    })).await;
+    assert_eq!(resp["error"]["code"], 1002, "resp: {resp}");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_anchor_missing_returns_1003() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("a.md"), "hello world").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [{"old_str": "missing", "new_str": "x"}],
+    })).await;
+    assert_eq!(resp["error"]["code"], 1003, "resp: {resp}");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_non_unique_anchor_returns_invalid_params() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("a.md"), "foo foo").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [{"old_str": "foo", "new_str": "x"}],
+    })).await;
+    assert_eq!(resp["error"]["code"], -32602, "resp: {resp}");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_replace_all_handles_multiple_matches() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("a.md"), "foo foo bar").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [{"old_str": "foo", "new_str": "X", "replace_all": true}],
+    })).await;
+    assert_eq!(structured(&resp)["status"], "written", "resp: {resp}");
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "X X bar");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_overlapping_edits_return_invalid_params() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("a.md"), "abcdef").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [
+            {"old_str": "abcd", "new_str": "X"},
+            {"old_str": "cdef", "new_str": "Y"},
+        ],
+    })).await;
+    assert_eq!(resp["error"]["code"], -32602, "resp: {resp}");
+    // Disk untouched.
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "abcdef");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_note_stages_per_edit_when_review_required() {
+    let cfg = McpConfig {
+        tools: McpToolsConfig {
+            review_required: true,
+            ..McpToolsConfig::default()
+        },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+    std::fs::write(b.td.path().join("a.md"), "hello foo bar baz").unwrap();
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [
+            {"old_str": "foo", "new_str": "FOO"},
+            {"old_str": "baz", "new_str": "BAZ"},
+        ],
+    })).await;
+    let s = structured(&resp);
+    assert_eq!(s["status"], "staged", "resp: {resp}");
+    assert_eq!(s["edit_count"], 2);
+    let ids = s["staging_ids"].as_array().expect("staging_ids array");
+    assert_eq!(ids.len(), 2);
+    assert!(s["batch_id"].is_string());
+    // Disk unchanged until accept.
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "hello foo bar baz");
     shutdown(b).await;
 }
 

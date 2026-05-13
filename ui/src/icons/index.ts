@@ -87,6 +87,21 @@ export const Icons = {
     );
   },
 
+  /// status: patch-review-per-hunk-accept — Accept (✓) icon.
+  check(opts: SvgWrapperOptions = { size: 14, strokeWidth: 2 }): string {
+    return svgWrapper(`<polyline points="3,8 7,12 13,4"/>`, opts);
+  },
+
+  /// status: patch-review-per-hunk-accept — Reject (×) icon. Distinct
+  /// from `close` only in default stroke weight, so the pair reads as
+  /// a balanced accept/reject affordance.
+  cross(opts: SvgWrapperOptions = { size: 14, strokeWidth: 2 }): string {
+    return svgWrapper(
+      `<line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>`,
+      opts,
+    );
+  },
+
   user(opts: SvgWrapperOptions = { size: 12, strokeWidth: 1.4 }): string {
     return svgWrapper(
       `<circle cx="8" cy="5.5" r="2.4"/><path d="M3.5 13.5c0-2.4 2-4 4.5-4s4.5 1.6 4.5 4"/>`,
