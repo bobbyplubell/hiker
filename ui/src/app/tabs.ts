@@ -290,8 +290,12 @@ export function mountTabs(deps: TabsDeps): TabsApi {
       let basename = slash >= 0 ? path.slice(slash + 1) : path;
       // status: tab-kinds — produce human-readable labels for app-page
       // tabs so the strip says "Home" / "Queue" / etc. instead of the
-      // internal `__hiker:*` sentinel key.
-      if (path.startsWith("__hiker:home") && !path.includes("detail")) {
+      // internal `__hiker:*` sentinel key. Buffers with a `displayLabel`
+      // (cluster pane, agent session, etc.) win over the prefix-based
+      // defaults — those carry richer info like the tree name.
+      if (entry.buffer.displayLabel) {
+        basename = entry.buffer.displayLabel;
+      } else if (path.startsWith("__hiker:home") && !path.includes("detail")) {
         basename = "Home";
       } else if (path.startsWith("__hiker:home-detail")) {
         basename = "Recent activity";
@@ -304,6 +308,8 @@ export function mountTabs(deps: TabsDeps): TabsApi {
       } else if (path.startsWith("__hiker:properties")) {
         basename = path.replace(/^__hiker:properties:/, "");
         basename = basename.slice(basename.lastIndexOf("/") + 1);
+      } else if (path.startsWith("__hiker:cluster-pane")) {
+        basename = "Cluster";
       }
       const folder = slash >= 0 ? path.slice(0, slash) : "";
       const isActive = path === activePath && buffer?.mode.kind === "file";

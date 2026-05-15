@@ -22,7 +22,8 @@ CREATE TABLE notes (
   mtime         INTEGER NOT NULL,           -- unix seconds; cheap pre-check before hashing
   size          INTEGER NOT NULL,
   indexed_at    INTEGER NOT NULL,
-  embedder_version TEXT NOT NULL            -- forces re-embed when the model changes
+  embedder_version TEXT NOT NULL,           -- forces re-embed when the model changes
+  note_embedding BLOB                       -- packed f32 mean-pool of chunk embeddings; lazy, per cluster-note-embeddings
 );
 
 -- one row per chunk

@@ -32,7 +32,14 @@ use crate::vault::Vault;
 
 /// Bumped only when the on-disk schema changes. Same fail-loud policy as
 /// `core::store` and `core::changes`.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// v2 added `source_path TEXT` + `proposals_source_path` index so the
+/// `move_note` action (per `staging-action-move-note`) can target a
+/// rename rather than a content write. The column is NULL for write /
+/// edit / tag rows; required for `action = "move_note"`. Pre-1.0
+/// policy: schema bumps are handled by deleting `staging.db` (per
+/// `staging-sqlite-store`); no migration code.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// zstd compression level for the `content` BLOB. Matches `changes-content-zstd`.
 const ZSTD_LEVEL: i32 = 3;
@@ -85,7 +92,7 @@ pub struct EditPayload {
     pub replace_all: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposalInput {
     pub surface: String,
     pub action: String,
@@ -101,6 +108,12 @@ pub struct ProposalInput {
     /// status: staging-proposal-state
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
+    /// For `action = "move_note"`: the file's current vault-relative
+    /// path. `target_path` carries the destination. NULL on every
+    /// non-move action.
+    /// status: staging-action-move-note
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 /// One entry in a `propose_batch` call.
@@ -148,6 +161,14 @@ pub enum ConflictReason {
     AnchorNotUnique,
     TargetMissing,
     HashChanged,
+    /// status: staging-action-move-note
+    /// `move_note` row: source file no longer exists at propose-time
+    /// path.
+    SourceMissing,
+    /// status: staging-action-move-note
+    /// `move_note` row: target path is occupied (another file landed
+    /// there since the proposal was made).
+    TargetOccupied,
 }
 
 impl ConflictReason {
@@ -157,6 +178,8 @@ impl ConflictReason {
             ConflictReason::AnchorNotUnique => "anchor_not_unique",
             ConflictReason::TargetMissing => "target_missing",
             ConflictReason::HashChanged => "hash_changed",
+            ConflictReason::SourceMissing => "source_missing",
+            ConflictReason::TargetOccupied => "target_occupied",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -165,10 +188,19 @@ impl ConflictReason {
             "anchor_not_unique" => ConflictReason::AnchorNotUnique,
             "target_missing" => ConflictReason::TargetMissing,
             "hash_changed" => ConflictReason::HashChanged,
+            "source_missing" => ConflictReason::SourceMissing,
+            "target_occupied" => ConflictReason::TargetOccupied,
             _ => return None,
         })
     }
 }
+
+/// Stable string the producer uses for `Proposal.action` when proposing
+/// a filesystem rename of a note. Centralized here so producers
+/// (triage, cluster-editor multi-select) don't drift on the literal.
+///
+/// status: staging-action-move-note
+pub const ACTION_MOVE_NOTE: &str = "move_note";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
@@ -193,6 +225,10 @@ pub struct Proposal {
     pub conflict_reason: Option<ConflictReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
+    /// status: staging-action-move-note
+    /// Populated only on `action = "move_note"` rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -296,6 +332,7 @@ impl Staging {
                     metadata_str,
                     Option::<i64>::None,            // amended_at_ms
                     0i64,                           // amend_count
+                    input.source_path,
                 ],
             )?;
         }
@@ -347,6 +384,8 @@ impl Staging {
                     metadata_str,
                     Option::<i64>::None,
                     0i64,
+                    // Edit-batch rows are content-shaped, never move_note.
+                    Option::<String>::None,
                 ])?;
                 ids.push(id);
             }
@@ -366,6 +405,17 @@ impl Staging {
         let proposal = self
             .get_full(id)?
             .ok_or_else(|| StagingError::ProposalNotFound(id.to_string()))?;
+
+        // status: staging-action-move-note
+        // Route move_note rows separately from content writes — the
+        // accept path is a filesystem rename, not a buffer write. The
+        // safety-net re-anchor here matches the write-row hash recheck:
+        // we re-verify source/target existence at accept time, since
+        // disk state may have drifted between the eager-recheck and
+        // the user clicking Accept.
+        if proposal.action == ACTION_MOVE_NOTE {
+            return self.accept_move(id, &proposal, vault, changes);
+        }
 
         let proposed_content: Option<String>;
         let new_hash: String;
@@ -552,6 +602,47 @@ impl Staging {
         Ok(removed)
     }
 
+    /// Recheck a `move_note` proposal against the live filesystem.
+    /// Callers (the eager-recheck task, accept-time safety net) pass in
+    /// the current existence of the source and target paths — both
+    /// are vault-relative and resolved through `Vault::abs_path`
+    /// upstream. Returns the same `RecheckOutcome` shape as `recheck`.
+    ///
+    /// status: staging-action-move-note
+    pub fn recheck_move(
+        &self,
+        id: &str,
+        source_exists: bool,
+        target_exists: bool,
+    ) -> Result<RecheckOutcome, StagingError> {
+        let proposal = self
+            .get_full(id)?
+            .ok_or_else(|| StagingError::ProposalNotFound(id.to_string()))?;
+        let (new_state, new_reason) = derive_move_state(source_exists, target_exists);
+        let prior_state = proposal.state;
+        let prior_reason = proposal.conflict_reason;
+        if prior_state == new_state && prior_reason == new_reason {
+            return Ok(RecheckOutcome {
+                prior_state,
+                new_state,
+                new_reason,
+            });
+        }
+        {
+            let conn = self.conn.lock().expect("staging mutex poisoned");
+            conn.execute(
+                "UPDATE proposals SET state = ?1, conflict_reason = ?2 WHERE id = ?3",
+                params![new_state.as_str(), new_reason.map(|r| r.as_str()), id],
+            )?;
+        }
+        let _ = self.changed_tx.send(());
+        Ok(RecheckOutcome {
+            prior_state,
+            new_state,
+            new_reason,
+        })
+    }
+
     /// status: staging-proposal-state
     pub fn recheck(
         &self,
@@ -613,6 +704,118 @@ impl Staging {
 // ── private helpers ────────────────────────────────────────────────
 
 impl Staging {
+    /// Accept a `move_note` proposal: rename the file on disk and
+    /// append a `Renamed` change row. Re-verifies source/target
+    /// existence at call time as the spec's safety net
+    /// (`staging-action-move-note`'s "recheck flips to source_missing /
+    /// target_occupied on drift" — the recheck task runs eagerly, but
+    /// the user can race between an Applyable display and clicking
+    /// Accept).
+    ///
+    /// Indexer integration (store-side path remap) is left to the
+    /// watcher's rename-event handling per `ingest-rename-preserve-id`;
+    /// staging deliberately does not hold an indexer handle. Producers
+    /// that need atomic store-side renames go through
+    /// `core::ops::move_note` directly.
+    ///
+    /// status: staging-action-move-note
+    fn accept_move(
+        &self,
+        id: &str,
+        proposal: &Proposal,
+        vault: &Vault,
+        changes: Option<&Changes>,
+    ) -> Result<AcceptOutcome, StagingError> {
+        let source = proposal
+            .source_path
+            .as_deref()
+            .ok_or_else(|| {
+                StagingError::Vault(
+                    "move_note proposal missing source_path".to_string(),
+                )
+            })?;
+        let target = proposal.target_path.as_str();
+
+        let source_abs = vault.abs_path(source)?;
+        let target_abs = vault.abs_path(target)?;
+
+        // Drift safety net — mirrors the write path's `source_hash`
+        // recheck. Anything the eager-recheck would have caught also
+        // gets caught here, with the same error names.
+        let source_exists = source_abs.exists();
+        let target_exists = target_abs.exists();
+        if !source_exists {
+            return Err(StagingError::Vault(format!(
+                "{}: source not found",
+                ConflictReason::SourceMissing.as_str()
+            )));
+        }
+        if target_exists {
+            return Err(StagingError::Vault(format!(
+                "{}: target {} already exists",
+                ConflictReason::TargetOccupied.as_str(),
+                target,
+            )));
+        }
+        if let Some(parent) = target_abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Read the body now so we can record it on the change row's
+        // post-op content blob (per `core::changes`'s "store post-op
+        // content" rule). Errors here are non-fatal — we still want
+        // the rename to land even if the body's unreadable (binary,
+        // permission edge case); the change row simply omits content.
+        let pre_body = vault.read_file_with_hash(source).ok();
+
+        std::fs::rename(&source_abs, &target_abs)?;
+
+        // Same baseline-on-first-touch discipline as the write path,
+        // so a follow-up rollback of this auto-accepted move has
+        // somewhere to land. Baseline is stamped against the OLD path
+        // since that's the path that previously existed.
+        if let (Some(c), Some((body, hash))) = (changes, &pre_body) {
+            if let Err(e) = c.ensure_baseline(source, "user", body.as_bytes(), hash) {
+                tracing::warn!(error = %e, "changes: ensure_baseline failed (staging accept move)");
+            }
+        }
+
+        let (post_body, new_hash) = match pre_body {
+            Some((body, hash)) => (Some(body), hash),
+            // Body wasn't readable as utf-8 pre-rename; we still
+            // append a Renamed row with NULL content + empty hash.
+            None => (None, String::new()),
+        };
+
+        if let Some(c) = changes {
+            c.append(ChangeAppend {
+                path: target,
+                op: ChangeOp::Renamed,
+                author: "user",
+                content_hash: if new_hash.is_empty() {
+                    None
+                } else {
+                    Some(&new_hash)
+                },
+                content: post_body.as_deref().map(|s| s.as_bytes()),
+                rename_from: Some(source),
+                metadata: serde_json::json!({
+                    "staging_proposal_id": id,
+                    "action": ACTION_MOVE_NOTE,
+                    "reviewed": true,
+                }),
+            })?;
+        }
+
+        self.delete_row(id)?;
+        let _ = self.changed_tx.send(());
+        Ok(AcceptOutcome {
+            proposal_id: id.to_string(),
+            target_path: target.to_string(),
+            new_hash,
+        })
+    }
+
     fn get_full(&self, id: &str) -> Result<Option<Proposal>, StagingError> {
         let conn = self.conn.lock().expect("staging mutex poisoned");
         let mut stmt = conn.prepare(SELECT_FULL_BY_ID)?;
@@ -654,13 +857,13 @@ const INSERT_SQL: &str = "
         content_hash, content, created_at_ms, batch_id,
         edit_old_str, edit_new_str, edit_replace_all,
         state, conflict_reason, source_hash, metadata,
-        amended_at_ms, amend_count
+        amended_at_ms, amend_count, source_path
     ) VALUES (
         ?1, ?2, ?3, ?4, ?5,
         ?6, ?7, ?8, ?9,
         ?10, ?11, ?12,
         ?13, ?14, ?15, ?16,
-        ?17, ?18
+        ?17, ?18, ?19
     )
 ";
 
@@ -668,14 +871,16 @@ const SELECT_COLS: &str = "
     id, surface, action, target_path, trail_id,
     content_hash, created_at_ms, batch_id,
     edit_old_str, edit_new_str, edit_replace_all,
-    state, conflict_reason, source_hash, metadata
+    state, conflict_reason, source_hash, metadata,
+    source_path
 ";
 
 const SELECT_FULL_BY_ID: &str = "
     SELECT id, surface, action, target_path, trail_id,
            content_hash, created_at_ms, batch_id,
            edit_old_str, edit_new_str, edit_replace_all,
-           state, conflict_reason, source_hash, metadata
+           state, conflict_reason, source_hash, metadata,
+           source_path
     FROM proposals
     WHERE id = ?1
 ";
@@ -734,6 +939,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Proposal> {
     let state_str: String = row.get(11)?;
     let conflict_reason_str: Option<String> = row.get(12)?;
     let metadata_str: Option<String> = row.get(14)?;
+    let source_path: Option<String> = row.get(15)?;
     let metadata = metadata_str
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
@@ -752,6 +958,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Proposal> {
         state: ProposalState::parse(&state_str),
         conflict_reason: conflict_reason_str.as_deref().and_then(ConflictReason::parse),
         source_hash: row.get(13)?,
+        source_path,
     })
 }
 
@@ -791,13 +998,19 @@ fn ensure_schema(conn: &mut Connection) -> Result<(), StagingError> {
             source_hash      TEXT,
             metadata         TEXT,
             amended_at_ms    INTEGER,
-            amend_count      INTEGER NOT NULL DEFAULT 0
+            amend_count      INTEGER NOT NULL DEFAULT 0,
+            -- status: staging-action-move-note
+            -- Non-NULL only for `action = "move_note"` rows; carries the
+            -- file's current vault-relative path (target_path stays the
+            -- destination, same as every other row).
+            source_path      TEXT
         );
         CREATE INDEX IF NOT EXISTS proposals_target_path ON proposals(target_path);
         CREATE INDEX IF NOT EXISTS proposals_surface     ON proposals(surface);
         CREATE INDEX IF NOT EXISTS proposals_state       ON proposals(state);
         CREATE INDEX IF NOT EXISTS proposals_batch_id    ON proposals(batch_id);
         CREATE INDEX IF NOT EXISTS proposals_created_at  ON proposals(created_at_ms);
+        CREATE INDEX IF NOT EXISTS proposals_source_path ON proposals(source_path);
         "#,
     )?;
     if user_version == 0 {
@@ -866,6 +1079,14 @@ fn derive_state(
     p: &Proposal,
     current_disk: Option<&str>,
 ) -> (ProposalState, Option<ConflictReason>) {
+    // status: staging-action-move-note
+    // move_note rows are recheckable only via `recheck_move` (which
+    // has access to both source and target presence). Keep this path a
+    // no-op so a stale `recheck(id, None)` against a move row doesn't
+    // spuriously flip it to TargetMissing.
+    if p.action == ACTION_MOVE_NOTE {
+        return (p.state, p.conflict_reason);
+    }
     if let Some(ref edit) = p.edit {
         let Some(disk) = current_disk else {
             return (
@@ -902,6 +1123,26 @@ fn derive_state(
     }
 }
 
+/// Recheck-state derivation for `action = "move_note"` rows. Drift
+/// flips applyability when (a) the source file disappeared since the
+/// proposal was made (`SourceMissing`) or (b) the target path is
+/// already occupied (`TargetOccupied`). Both at once → SourceMissing
+/// is reported first since it's the harder block.
+///
+/// status: staging-action-move-note
+fn derive_move_state(
+    source_exists: bool,
+    target_exists: bool,
+) -> (ProposalState, Option<ConflictReason>) {
+    if !source_exists {
+        (ProposalState::Conflicted, Some(ConflictReason::SourceMissing))
+    } else if target_exists {
+        (ProposalState::Conflicted, Some(ConflictReason::TargetOccupied))
+    } else {
+        (ProposalState::Applyable, None)
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -920,6 +1161,46 @@ mod tests {
         (dir, s)
     }
 
+    /// status: staging-action-move-note
+    #[test]
+    fn propose_move_note_persists_source_path_and_recheck_flips_on_drift() {
+        let (_dir, s) = staged();
+        let id = s
+            .propose(ProposalInput {
+                surface: "triage".into(),
+                action: ACTION_MOVE_NOTE.into(),
+                target_path: "research/embeddings/voyage.md".into(),
+                trail_id: None,
+                content: None,
+                metadata: None,
+                source_hash: None,
+                source_path: Some("inbox/voyage.md".into()),
+            })
+            .unwrap();
+
+        let list = s.list(&StagingFilter::default()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].action, ACTION_MOVE_NOTE);
+        assert_eq!(list[0].source_path.as_deref(), Some("inbox/voyage.md"));
+        assert_eq!(list[0].state, ProposalState::Applyable);
+
+        // source vanished → SourceMissing.
+        let r = s.recheck_move(&id, false, false).unwrap();
+        assert_eq!(r.new_state, ProposalState::Conflicted);
+        assert_eq!(r.new_reason, Some(ConflictReason::SourceMissing));
+
+        // back to both present + target free → applyable again.
+        let r = s.recheck_move(&id, true, false).unwrap();
+        assert_eq!(r.new_state, ProposalState::Applyable);
+        assert_eq!(r.new_reason, None);
+
+        // target occupied → TargetOccupied.
+        let r = s.recheck_move(&id, true, true).unwrap();
+        assert_eq!(r.new_state, ProposalState::Conflicted);
+        assert_eq!(r.new_reason, Some(ConflictReason::TargetOccupied));
+    }
+
     #[test]
     fn propose_returns_id_and_appears_in_list() {
         let (_dir, s) = staged();
@@ -932,6 +1213,7 @@ mod tests {
                 content: Some("# Hello".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         assert!(!id.is_empty());
@@ -953,6 +1235,7 @@ mod tests {
             content: None,
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         let list = s.list(&StagingFilter::default()).unwrap();
@@ -971,6 +1254,7 @@ mod tests {
             content: Some("a".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         s.propose(ProposalInput {
@@ -981,6 +1265,7 @@ mod tests {
             content: Some("b".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
 
@@ -1005,6 +1290,7 @@ mod tests {
             content: Some("a".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         s.propose(ProposalInput {
@@ -1015,6 +1301,7 @@ mod tests {
             content: Some("b".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
 
@@ -1039,6 +1326,7 @@ mod tests {
             content: None,
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         s.propose(ProposalInput {
@@ -1049,6 +1337,7 @@ mod tests {
             content: None,
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
 
@@ -1073,6 +1362,7 @@ mod tests {
             content: Some("a".into()),
             metadata: Some(serde_json::json!({"session_id": "s1"})),
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         s.propose(ProposalInput {
@@ -1083,6 +1373,7 @@ mod tests {
             content: Some("b".into()),
             metadata: Some(serde_json::json!({"session_id": "s2"})),
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
 
@@ -1108,6 +1399,7 @@ mod tests {
                 content: Some("x".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         }
@@ -1145,6 +1437,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
 
@@ -1157,6 +1450,97 @@ mod tests {
         assert_eq!(disk_content, "proposed");
 
         assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    }
+
+    /// status: staging-action-move-note
+    #[test]
+    fn accept_move_note_renames_on_disk_and_records_renamed_change() {
+        let (dir, s) = staged();
+        let vault = Vault::open(dir.path()).unwrap();
+        let changes = Changes::open(dir.path()).unwrap();
+        vault.write_file("inbox/voyage.md", "embedding notes").unwrap();
+        std::fs::create_dir_all(dir.path().join("research/embeddings")).unwrap();
+
+        let id = s
+            .propose(ProposalInput {
+                surface: "triage".into(),
+                action: ACTION_MOVE_NOTE.into(),
+                target_path: "research/embeddings/voyage.md".into(),
+                trail_id: None,
+                content: None,
+                metadata: None,
+                source_hash: None,
+                source_path: Some("inbox/voyage.md".into()),
+            })
+            .unwrap();
+
+        let outcome = s.accept(&id, &vault, Some(&changes)).unwrap();
+        assert_eq!(outcome.proposal_id, id);
+        assert_eq!(outcome.target_path, "research/embeddings/voyage.md");
+
+        // file moved, proposal removed.
+        assert!(!dir.path().join("inbox/voyage.md").exists());
+        assert!(dir
+            .path()
+            .join("research/embeddings/voyage.md")
+            .exists());
+        assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+
+        // changes log captured the move with rename_from set.
+        let rows = changes.history_for_path("research/embeddings/voyage.md", 10).unwrap();
+        let renamed = rows
+            .iter()
+            .find(|r| matches!(r.op, ChangeOp::Renamed))
+            .expect("expected a Renamed row");
+        assert_eq!(renamed.rename_from.as_deref(), Some("inbox/voyage.md"));
+    }
+
+    /// status: staging-action-move-note
+    #[test]
+    fn accept_move_note_errors_when_source_missing() {
+        let (dir, s) = staged();
+        let vault = Vault::open(dir.path()).unwrap();
+        let id = s
+            .propose(ProposalInput {
+                surface: "triage".into(),
+                action: ACTION_MOVE_NOTE.into(),
+                target_path: "research/x.md".into(),
+                trail_id: None,
+                content: None,
+                metadata: None,
+                source_hash: None,
+                source_path: Some("inbox/never-existed.md".into()),
+            })
+            .unwrap();
+        // No file on disk → accept should refuse with the SourceMissing
+        // reason carried in the error message.
+        let err = s.accept(&id, &vault, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source_missing"), "got {msg}");
+    }
+
+    /// status: staging-action-move-note
+    #[test]
+    fn accept_move_note_errors_when_target_occupied() {
+        let (dir, s) = staged();
+        let vault = Vault::open(dir.path()).unwrap();
+        vault.write_file("a.md", "a").unwrap();
+        vault.write_file("b.md", "b").unwrap();
+        let id = s
+            .propose(ProposalInput {
+                surface: "triage".into(),
+                action: ACTION_MOVE_NOTE.into(),
+                target_path: "b.md".into(),
+                trail_id: None,
+                content: None,
+                metadata: None,
+                source_hash: None,
+                source_path: Some("a.md".into()),
+            })
+            .unwrap();
+        let err = s.accept(&id, &vault, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("target_occupied"), "got {msg}");
     }
 
     #[test]
@@ -1172,6 +1556,7 @@ mod tests {
                 content: None,
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
 
@@ -1193,6 +1578,7 @@ mod tests {
                 content: Some("x".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
 
@@ -1234,6 +1620,7 @@ mod tests {
             content: Some("new-a".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         s.propose(ProposalInput {
@@ -1244,6 +1631,7 @@ mod tests {
             content: Some("new-b".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
 
@@ -1266,6 +1654,7 @@ mod tests {
                 content: Some("old".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         // Backdate the row directly so the GC pass picks it up.
@@ -1293,6 +1682,7 @@ mod tests {
             content: Some("recent".into()),
             metadata: None,
             source_hash: None,
+            source_path: None,
         })
         .unwrap();
         let removed = s.gc(30).unwrap();
@@ -1317,6 +1707,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
 
@@ -1361,6 +1752,7 @@ mod tests {
                 content: Some("rewritten-body".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         s.accept(&id, &vault, Some(&changes)).unwrap();
@@ -1441,6 +1833,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         // Simulate corruption: row claims a content_hash but the BLOB has been wiped.
@@ -1474,6 +1867,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         // Swap the BLOB for a different (but valid zstd) frame so the
@@ -1510,6 +1904,7 @@ mod tests {
                 content: Some(proposed.into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
 
@@ -1773,6 +2168,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: Some(source),
+                source_path: None,
             })
             .unwrap();
         let st = s.recheck(&id, Some(propose_time)).unwrap();
@@ -1792,6 +2188,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: Some(source),
+                source_path: None,
             })
             .unwrap();
         let st = s.recheck(&id, Some("drifted")).unwrap();
@@ -1812,6 +2209,7 @@ mod tests {
                 content: Some("# New".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         let st = s.recheck(&id, None).unwrap();
@@ -1833,6 +2231,7 @@ mod tests {
                 content: Some("proposed".into()),
                 metadata: None,
                 source_hash: Some(hash_str("original")),
+                source_path: None,
             })
             .unwrap();
         let _ = rx.try_recv();
@@ -1859,6 +2258,7 @@ mod tests {
                 content: Some("a".into()),
                 metadata: None,
                 source_hash: Some(hash_str("orig")),
+                source_path: None,
             })
             .unwrap();
         let _id_b = s
@@ -1870,6 +2270,7 @@ mod tests {
                 content: Some("b".into()),
                 metadata: None,
                 source_hash: Some(hash_str("orig")),
+                source_path: None,
             })
             .unwrap();
         s.recheck(&id_a, Some("drifted")).unwrap();
@@ -1903,6 +2304,7 @@ mod tests {
                 content: Some(body.clone()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         assert_eq!(s.content(&id).unwrap(), body);

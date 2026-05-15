@@ -75,6 +75,11 @@ pub fn bundled_defaults() -> &'static [PromptDefault] {
             name: "note_mutation_reformat_as_markdown",
             default_body: NOTE_MUTATION_REFORMAT_AS_MARKDOWN_DEFAULT,
         },
+        // status: cluster-summarize-llm
+        PromptDefault {
+            name: "cluster_summarize",
+            default_body: CLUSTER_SUMMARIZE_DEFAULT,
+        },
     ]
 }
 
@@ -86,6 +91,8 @@ const CHAT_SYSTEM_DEFAULT: &str =
     include_str!("../prompts/chat_system.md");
 const NOTE_MUTATION_REFORMAT_AS_MARKDOWN_DEFAULT: &str =
     include_str!("../prompts/note_mutation_reformat_as_markdown.md");
+const CLUSTER_SUMMARIZE_DEFAULT: &str =
+    include_str!("../prompts/cluster_summarize.md");
 
 /// Resolved file paths for a single feature's prompt.
 #[derive(Debug, Clone)]

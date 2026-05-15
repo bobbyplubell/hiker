@@ -39,6 +39,8 @@ export type UiTarget =
   | "ui::snapshot-preview"
   | "ui::trash"
   | "ui::trails"
+  | "ui::clusterEditor"
+  | "ui::clusterReviewTab"
   | "ui::mode-controls"
   | "ui::app"
   | "ui::properties-pane"

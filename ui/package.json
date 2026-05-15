@@ -15,7 +15,10 @@
     "@codemirror/view": "6.41.1",
     "@tauri-apps/api": "2.11.0",
     "@tauri-apps/plugin-dialog": "2.7.1",
-    "codemirror": "6.0.2"
+    "codemirror": "6.0.2",
+    "graphology": "0.26.0",
+    "graphology-types": "0.24.8",
+    "sigma": "3.0.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.0",

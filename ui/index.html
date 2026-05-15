@@ -240,6 +240,10 @@
         <div id="settings-pane" hidden></div>
         <!-- status: note-properties-tab -->
         <div id="properties-pane" hidden></div>
+        <!-- status: cluster-editor-pane-mode, cluster-editor-batch-review-pane-mode -->
+        <div id="cluster-editor-pane" hidden></div>
+        <!-- status: cluster-review-tab-kind -->
+        <div id="cluster-review-pane" hidden></div>
         <footer id="status-bar">
           <div id="status-left">
             <span id="status-path"></span>
@@ -311,7 +315,11 @@
           <span class="chat-handle-spacer"></span>
           <!-- status: chat-panel-expand-to-editor -->
           <button id="chat-expand-btn" class="chat-handle-btn chat-handle-btn-square" title="Expand chat to editor pane" aria-label="Expand chat to editor pane" type="button" hidden>
-            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="4 8 1 12 4 12"/><polyline points="12 8 15 12 12 12"/></svg>
+            <!-- Same shape as `Icons.expand` in `ui/src/icons/index.ts`, rotated 90° so the
+                 diagonal runs NE→SW instead of NW→SE. The pair (cluster tree-expand /
+                 chat-expand) stays visually consistent — rotation distinguishes "expand
+                 this side panel" from "expand this floating panel". -->
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="9 3,13 3,13 7"/><polyline points="7 13,3 13,3 9"/><line x1="13" y1="3" x2="3" y2="13"/></svg>
           </button>
           <!-- Right: collapse toggle, small square button. -->
           <button id="chat-collapse-btn" class="chat-handle-btn chat-handle-btn-square active" title="Toggle chat" aria-label="Toggle chat" type="button">

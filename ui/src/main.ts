@@ -1,4 +1,4 @@
-import { Ipc } from "./ipc";
+import { Ipc, invokeWithLogging } from "./ipc";
 import { Logger } from "./logger";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -25,6 +25,16 @@ import { mountQueueDetail, type QueueDetailController } from "./queueDetail";
 import { mountTabStrip, type TabStripApi } from "./tabStrip";
 import { mountDiscovery, type DiscoveryController } from "./discovery";
 import { mountTrailsPanel, type TrailsController } from "./trails";
+import { mountClusterEditor, type ClusterEditorApi } from "./clusterEditor";
+import {
+  mountClusterReviewTab,
+  type ClusterReviewApi,
+  type Purpose as ClusterReviewPurpose,
+} from "./clusterReviewTab";
+import {
+  mountClusterEditorPane,
+  type ClusterEditorPaneApi,
+} from "./clusterEditorPane";
 import { mountAddToTrailPill } from "./trails/addToTrailPill";
 import {
   installMembershipWatchers,
@@ -471,9 +481,29 @@ function renderActiveTab(): void {
   const isQueue = kind === "queue";
   const isSettings = kind === "settings";
   const isProperties = kind === "properties";
+  // status: cluster-editor-pane-mode
+  const isClusterPane = kind === "cluster-pane";
+  // status: cluster-review-tab-kind
+  const isClusterReview = kind === "cluster-review";
   dom.vaultHome.rootEl.hidden = !(isHome || isHomeDetail || isQueue);
   dom.settingsPane.paneEl.hidden = !isSettings;
   dom.propertiesPane.paneEl.hidden = !isProperties;
+  if (clusterPaneEl) clusterPaneEl.hidden = !isClusterPane;
+  if (!isClusterPane) {
+    clusterEditorPane?.hide();
+  }
+  if (clusterReviewPaneEl) clusterReviewPaneEl.hidden = !isClusterReview;
+  if (isClusterReview && activePath) {
+    clusterReviewTab?.showTab(activePath);
+  } else {
+    clusterReviewTab?.hide();
+  }
+  // Hide the editor toolbar in the cluster-pane / cluster-review tabs —
+  // each has its own toolbar (the cluster-review tab carries Run /
+  // Confirm / Discard) and the editor toolbar's controls (mutations
+  // menu, view options, dirty-diff toggle, etc) don't apply.
+  const editorToolbarEl = document.getElementById("editor-toolbar");
+  if (editorToolbarEl) editorToolbarEl.hidden = isClusterPane || isClusterReview;
   dom.vaultHome.overviewEl.hidden = !isHome;
   dom.vaultHome.detailEl.hidden = !isHomeDetail;
   dom.vaultHome.queueDetailEl.hidden = !isQueue;
@@ -1107,6 +1137,22 @@ function activateTabInner(rel: string): void {
   tabs.activateTab(rel);
 }
 async function closeTab(rel: string): Promise<void> {
+  // status: cluster-review-tab-discard
+  // Close-guard for a cluster-review tab whose in-memory result hasn't
+  // been Confirmed yet. The review module owns the confirm modal so the
+  // copy stays consistent with the Discard button's prompt; once
+  // resolved (confirmed or not), the entry is dropped via `dropTab` and
+  // we fall through to the normal close.
+  if (clusterReviewTab?.hasUnsavedResult(rel)) {
+    const ok = await import("./widgets/confirm").then((m) =>
+      m.confirmDanger(
+        "Discard the clustering result? You'll need to re-run to get it back.",
+        "Discard",
+      ),
+    );
+    if (!ok) return;
+  }
+  clusterReviewTab?.dropTab(rel);
   await tabs.closeTab(rel);
   // status: autosave-write-tick — closing the tab means the autosave
   // entry for that buffer is no longer relevant (whether the user
@@ -1316,6 +1362,10 @@ async function applyOpenedVault(path: string): Promise<void> {
   // Stale per-path state from a prior vault must not leak into the new one
   // (paths can collide across vaults).
   tree.api.clearCaches();
+  // status: cluster-editor-sidebar-mode — re-fetch the open-trees list
+  // against the freshly-opened vault. Failures self-log inside the
+  // module; we don't need to surface them here.
+  void clusterEditor?.refresh();
   // status: multi-buffer-in-memory-only — open buffers don't persist
   // across vault swaps; clear them along with the rest of per-vault state.
   openBuffers.clear();
@@ -1462,6 +1512,40 @@ async function runAutosaveRecoveryAndRestore(): Promise<void> {
       } else if (kind === "properties") {
         const rel = path.replace(/^__hiker:properties:/, "");
         if (rel) openPropertiesTab(rel);
+      } else if (kind === "cluster-review") {
+        // status: cluster-review-tab-no-persistence-until-confirm
+        // Re-derive the purpose from the synthetic path key. The
+        // in-memory structural result is NOT persisted; the user lands
+        // on the configure phase with defaults.
+        const rest = path.replace(/^__hiker:cluster-review:/, "");
+        if (rest === "new-tree") {
+          openClusterReviewTab({ kind: "new-tree" });
+        } else if (rest.startsWith("recluster-subtree:")) {
+          const [_, treeId, nodeId] = rest.split(":");
+          if (treeId && nodeId) {
+            openClusterReviewTab({ kind: "recluster-subtree", treeId, nodeId });
+          }
+        } else if (rest.startsWith("rebuild:")) {
+          const treeId = rest.slice("rebuild:".length);
+          if (treeId) openClusterReviewTab({ kind: "rebuild", treeId });
+        }
+      } else if (kind === "cluster-pane") {
+        // status: cluster-editor-pane-mode
+        // Same shape as the other synthetic tab kinds — re-open the
+        // cluster-editor pane for the tree id encoded in the sentinel
+        // (`__hiker:cluster-pane:<treeId>`). The pane defaults back to
+        // the `cluster-tree` sub-state on restore; the user can re-enter
+        // batch-review via Apply or by clicking a tree state pill that's
+        // already `applied`. Persisting the live sub-state would require
+        // widening the autosave payload — out of scope.
+        //
+        // Tolerate the legacy `cluster-batch-review:` prefix so autosave
+        // state from earlier sessions still restores; can be dropped
+        // after the next vault.
+        const treeId = path
+          .replace(/^__hiker:cluster-pane:/, "")
+          .replace(/^__hiker:cluster-batch-review:/, "");
+        if (treeId) void openClusterTab(treeId);
       }
       continue;
     }
@@ -2291,6 +2375,12 @@ newNoteBtn.addEventListener(
   (e) => {
     if (sidebarMode === "files") return;
     e.stopImmediatePropagation();
+    // status: cluster-editor-new-tree-action — `+` in clusters mode opens
+    // the New-tree modal (the "Suggest reorganization" entry point).
+    if (sidebarMode === "clusters") {
+      clusterEditor?.newTree();
+      return;
+    }
     if (sidebarMode !== "trails") return;
     void (async () => {
       let created: { trail_doc_rel: string; trail_id: string };
@@ -2327,6 +2417,22 @@ newNoteBtn.addEventListener(
     })();
   },
   true, // capture phase — runs before the tree module's bubbled listener
+);
+
+// status: cluster-editor-mode-menu
+// `…` overflow is mode-aware. In clusters mode it routes to the cluster
+// editor's mode menu (New tree / Discard drafts / Refresh) rather than
+// the file-tree's Refresh / Reindex entries. Capture phase + stopImmediate
+// preempts the tree module's bubbled listener, matching the `+` button's
+// pattern above.
+sidebarActionsBtn.addEventListener(
+  "click",
+  (e) => {
+    if (sidebarMode !== "clusters") return;
+    e.stopImmediatePropagation();
+    if (clusterEditor) clusterEditor.openModeMenu(sidebarActionsBtn);
+  },
+  true,
 );
 
 // status: side-panel-resize
@@ -2496,6 +2602,208 @@ const trailsPanel: TrailsController | null = sidebarTrailsBodyEl
       },
     })
   : null;
+// status: cluster-editor-sidebar-mode
+// Cluster-trees sidebar body. Loads the open trees list on mount + on
+// every refresh; opens the New-tree modal on the `+` (new-note) button
+// hijack below for clusters-mode, and on the per-tree action chip.
+const sidebarClustersBodyEl = document.getElementById("sidebar-clusters-body");
+let clusterEditor: ClusterEditorApi | null = null;
+if (sidebarClustersBodyEl) {
+  // Drop the placeholder class so our own CSS layout applies without
+  // fighting the centered "Coming soon" stub copy.
+  sidebarClustersBodyEl.classList.remove("sidebar-mode-placeholder");
+  // The element is `hidden` in the markup so the placeholder stub
+  // doesn't show in modes other than clusters. The mode CSS uses
+  // `display: block` to reveal it; the `hidden` attribute would
+  // override that, so drop it now and let the mode-class do the work.
+  sidebarClustersBodyEl.removeAttribute("hidden");
+  sidebarClustersBodyEl.replaceChildren();
+  clusterEditor = mountClusterEditor({
+    rootEl: sidebarClustersBodyEl,
+    openNote: (rel, opts) => openFile(rel, opts ?? {}).then(() => undefined),
+    openPane: (treeId, treeName) => openClusterTab(treeId, treeName),
+    // status: cluster-review-tab-from-new-tree-action
+    openNewTreeReview: () => openClusterReviewTab({ kind: "new-tree" }),
+    // status: cluster-review-tab-from-recluster-action
+    openReclusterReview: (treeId, nodeId, nodeName) =>
+      openClusterReviewTab({
+        kind: "recluster-subtree",
+        treeId,
+        nodeId,
+        nodeName,
+      }),
+  });
+}
+
+// status: cluster-editor-pane-mode, cluster-editor-batch-review-pane-mode
+const clusterPaneEl = document.getElementById("cluster-editor-pane");
+let clusterEditorPane: ClusterEditorPaneApi | null = null;
+if (clusterPaneEl) {
+  clusterEditorPane = mountClusterEditorPane({
+    rootEl: clusterPaneEl,
+    openNote: (rel, opts) => openFile(rel, opts ?? {}).then(() => undefined),
+    closePane: () => {
+      const key = currentClusterTabKey;
+      if (key) {
+        void closeTab(key);
+      }
+    },
+    // status: cluster-review-tab-from-recluster-action
+    openReclusterReview: (treeId, nodeId, nodeName) =>
+      openClusterReviewTab({
+        kind: "recluster-subtree",
+        treeId,
+        nodeId,
+        nodeName,
+      }),
+  });
+}
+let currentClusterTabKey: string | null = null;
+
+// status: cluster-review-tab-kind
+// status: cluster-review-tab
+//
+// Clustering review tab — mounted into `#cluster-review-pane`. The
+// module owns its own per-tab state (form + in-memory structural
+// result); the host plumbs the surrounding tab lifecycle (open / show /
+// close-guard / transition-to-pane-on-confirm).
+const clusterReviewPaneEl = document.getElementById("cluster-review-pane");
+let clusterReviewTab: ClusterReviewApi | null = null;
+if (clusterReviewPaneEl) {
+  clusterReviewTab = mountClusterReviewTab({
+    rootEl: clusterReviewPaneEl,
+    openNote: (rel, opts) => openFile(rel, opts ?? {}).then(() => undefined),
+    transitionToPane: async (tabKey, treeId, treeName) => {
+      // Tab transitions in place — drop the cluster-review buffer entry,
+      // open a cluster-pane tab in its slot. The cluster-pane mount
+      // (`openClusterTab`) re-uses the existing key shape, so we close
+      // the review tab then open the pane tab; the user's "current tab"
+      // visibly shifts to the new one.
+      openBuffers.delete(tabKey);
+      autosave.scheduleTabStatePush();
+      await openClusterTab(treeId, treeName);
+      // Sidebar's Cluster trees list reads `cluster_trees_list` on mount
+      // and on explicit refresh — kick a refresh so the just-persisted
+      // tree (new-tree case) or the reshaped subtree (recluster case)
+      // shows up without requiring a vault re-open.
+      void clusterEditor?.refresh();
+    },
+    closeTab: (tabKey) => {
+      void closeTab(tabKey);
+    },
+    llmEnabled: async () => {
+      try {
+        const cfg = await Ipc.getSettings<{ llm: { enabled: boolean } }>();
+        return !!cfg.llm?.enabled;
+      } catch {
+        return false;
+      }
+    },
+  });
+}
+
+// status: cluster-review-tab-from-new-tree-action
+// status: cluster-review-tab-from-recluster-action
+// status: cluster-review-tab-rebuild-prefill
+// status: cluster-review-tab-deduplication
+//
+// Open or activate the clustering review tab for `purpose`. Dedup keys:
+// `new-tree` is a singleton; recluster keys on `(treeId, nodeId)`;
+// rebuild keys on `treeId`. Re-opening the same purpose activates the
+// existing tab and preserves the form + result state.
+function openClusterReviewTab(purpose: ClusterReviewPurpose): void {
+  if (!clusterReviewTab) {
+    showToast("Cluster review pane is unavailable in this build");
+    return;
+  }
+  const key = clusterReviewTab.open(purpose);
+  const existing = openBuffers.get(key);
+  let label = "Cluster review";
+  if (purpose.kind === "new-tree") label = "Cluster review: new tree";
+  else if (purpose.kind === "recluster-subtree") {
+    label = `Subcluster: ${purpose.nodeName ?? ""}`.trim();
+  } else if (purpose.kind === "rebuild") label = "Cluster review: rebuild";
+  if (existing) {
+    existing.buffer.displayLabel = label;
+    activateTabInner(key);
+    return;
+  }
+  const buf: Buffer = {
+    path: key,
+    loadedText: "",
+    token: null,
+    kind: "cluster-review",
+    displayLabel: label,
+    mode: { kind: "file" },
+    pendingChangesMetadata: null,
+    preview: false,
+  };
+  openBuffers.set(key, {
+    buffer: buf,
+    savedState: null,
+    lastActivatedAt: bumpActivationCounter(),
+  });
+  activateTabInner(key);
+  autosave.scheduleTabStatePush();
+}
+
+// status: cluster-editor-pane-mode
+/// Open or activate the cluster-editor pane tab for `treeId`. The tab
+/// is sticky (no preview slot) — the pane is heavy enough that a
+/// preview-eviction surprise would be jarring. Re-opening for the same
+/// tree re-paints the tree view without losing batch-review state.
+async function openClusterTab(treeId: string, treeName?: string): Promise<void> {
+  const key = appPageTabKey("cluster-pane", treeId);
+  currentClusterTabKey = key;
+  const existing = openBuffers.get(key);
+  if (existing) {
+    if (treeName) existing.buffer.displayLabel = treeName;
+    activateTabInner(key);
+    await clusterEditorPane?.showTree(treeId);
+    if (!treeName) void hydrateClusterTabLabel(key, treeId);
+    return;
+  }
+  const buf: Buffer = {
+    path: key,
+    loadedText: "",
+    token: null,
+    kind: "cluster-pane",
+    displayLabel: treeName ?? "Cluster",
+    mode: { kind: "cluster-tree", treeId },
+    pendingChangesMetadata: null,
+    preview: false,
+  };
+  openBuffers.set(key, {
+    buffer: buf,
+    savedState: null,
+    lastActivatedAt: bumpActivationCounter(),
+  });
+  activateTabInner(key);
+  await clusterEditorPane?.showTree(treeId);
+  if (!treeName) void hydrateClusterTabLabel(key, treeId);
+}
+
+// Fetch the tree row and copy its `name` onto the open buffer so the
+// tab strip shows it (instead of the `__hiker:cluster-pane:<id>` key).
+// Only relevant when the caller didn't pass a name — the autosave-restore
+// path opens cluster tabs without one.
+async function hydrateClusterTabLabel(key: string, treeId: string): Promise<void> {
+  try {
+    const rows = await invokeWithLogging<Array<{ id: string; name: string }>>(
+      "cluster_trees_list",
+      undefined,
+    );
+    const row = rows.find((r) => r.id === treeId);
+    if (!row) return;
+    const entry = openBuffers.get(key);
+    if (!entry) return;
+    entry.buffer.displayLabel = row.name;
+    tabStrip.render();
+  } catch (err) {
+    Logger.error("ui::clusterEditor", "hydrateClusterTabLabel failed", { err });
+  }
+}
+
 // Refresh on external active-trail mutations — `applySettingsToUi`
 // re-seeds `activeTrailStore` after every `set_setting` round-trip,
 // and other surfaces (e.g. `set as active` tree verb, slice U3 +

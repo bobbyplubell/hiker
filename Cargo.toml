@@ -40,3 +40,11 @@ async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 similar = { version = "2", default-features = false, features = ["text"] }
 agent-client-protocol = "0.11.1"
+# status: cluster-hdbscan-crate-petal
+petal-clustering = "0.13"
+ndarray = "0.17"
+# status: cluster-leiden-crate-single-clustering
+# Pinned exactly: upstream is "under heavy development" per its README,
+# so any minor bump should be a deliberate re-test rather than a passive
+# cargo-update sweep.
+single-clustering = "=0.6.1"

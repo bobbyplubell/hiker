@@ -606,6 +606,7 @@ A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the pa
 - `queue` — task queue + indexer detail view (per `task-queue-home-detail-view`).
 - `settings` — settings pane (per `settings-pane-mode`).
 - `properties` — payload is a vault-relative note path; renders the read-only properties inspector for that note (per `note-properties-tab`). One properties tab per note path; opening Properties on a path that already has a tab open switches to it rather than spawning a duplicate.
+- `cluster-review` — payload is a `ClusterReviewState` (purpose: `new-tree` | `recluster-subtree { tree_id, node_id }` | `rebuild { tree_id }`, plus the in-flight build configuration and any in-memory structural result). Renders the clustering review surface per `cluster-review-tab` in `cluster-editor.md` — configure → run → review → confirm. On Confirm the tab transitions in place to `cluster-batch-review` for the newly-persisted tree.
 
 Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (file glyph for `buffer`, chat glyph for `agent`, graph glyph for `graph`, house glyph for `home`/`home-detail`, list-with-pulse for `queue`, gear for `settings`); the label is whatever the kind chooses (basename for `buffer`, session preview for `agent`, "Graph" or filter summary for `graph`, "Home" / "Recent activity" / "Queue" / "Settings" / etc. for the app pages).
 

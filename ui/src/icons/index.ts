@@ -132,4 +132,69 @@ export const Icons = {
     const size = opts.size ?? DEFAULT_SIZE;
     return `<svg viewBox="0 0 16 16" width="${size}" height="${size}" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor"/></svg>`;
   },
+
+  /// Cluster-tree topology — three nodes connected as a small tree.
+  /// Matches the `#sidebar-mode-clusters` mode-switcher glyph so the
+  /// cluster-editor pane's Tree-view toggle reads as "same concept as
+  /// the sidebar's Clusters mode".
+  clusterTreeShape(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.5 }): string {
+    return svgWrapper(
+      `<circle cx="8" cy="3.25" r="1.5"/><circle cx="3.5" cy="12.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M8 4.75v2.5"/><path d="M8 7.25H3.5v3.75"/><path d="M8 7.25h4.5v3.75"/>`,
+      opts,
+    );
+  },
+
+  /// Network graph — diamond of four nodes around a central hub with
+  /// curved edges. Reads as "interconnected web", distinct from the
+  /// rigid parent→child tree topology in `clusterTreeShape`. Used by
+  /// the cluster-editor pane's Graph-view toggle.
+  graphNodes(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.3 }): string {
+    return svgWrapper(
+      `<path d="M8 3 Q 5.5 6 3.5 8.5"/><path d="M8 3 Q 10.5 6 12.5 8.5"/><path d="M3.5 8.5 Q 5.5 11.5 8 13"/><path d="M12.5 8.5 Q 10.5 11.5 8 13"/><path d="M3.5 8.5 Q 8 7.5 12.5 8.5"/><circle cx="8" cy="3" r="1.5" fill="currentColor" stroke="none"/><circle cx="3.5" cy="8.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12.5" cy="8.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="8" cy="13" r="1.5" fill="currentColor" stroke="none"/>`,
+      opts,
+    );
+  },
+
+  /// Lowercase "md" stylized as a letter glyph — paired with the Aa
+  /// lexical-search button (search-mode toggles). Used by the cluster
+  /// editor pane's Markdown-view toggle so all three view buttons read
+  /// as icon-only square chips.
+  mdLabel(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.3 }): string {
+    return svgWrapper(
+      `<path d="M2 12.5 V 6.5"/><path d="M5.5 12.5 V 6.5"/><path d="M9 12.5 V 6.5"/><path d="M2 6.5 Q 3.75 4.7 5.5 6.5"/><path d="M5.5 6.5 Q 7.25 4.7 9 6.5"/><path d="M14 3 V 12.5"/><path d="M14 8 Q 9.5 8 9.5 10.5 Q 9.5 13 14 12.5"/>`,
+      opts,
+    );
+  },
+
+  /// Triage glyph — large 6-arm star-of-life (three crossing lines).
+  /// Used by the cluster-editor pane's "Save as triage" toolbar button.
+  /// Center (8,8); each arm ~5.5px so the star fills the 16x16 slot.
+  triageStar(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.5 }): string {
+    return svgWrapper(
+      `<line x1="2.5" y1="8" x2="13.5" y2="8"/><line x1="10.75" y1="3.24" x2="5.25" y2="12.76"/><line x1="5.25" y1="3.24" x2="10.75" y2="12.76"/>`,
+      opts,
+    );
+  },
+
+  /// Diagonal "expand to fullscreen" icon — two arrows pointing NW and
+  /// SE, joined by a diagonal. Used by the cluster-editor's tree-expand
+  /// button (replacing the `⤢` unicode glyph). The chat panel's
+  /// expand button uses the same shape rotated 90°.
+  expand(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.4 }): string {
+    return svgWrapper(
+      `<polyline points="7 3,3 3,3 7"/><polyline points="9 13,13 13,13 9"/><line x1="3" y1="3" x2="13" y2="13"/>`,
+      opts,
+    );
+  },
+
+  /// Hammer — sledgehammer-shaped T: wide horizontal head across the
+  /// top, narrow vertical handle dropping from its center. Reads cleanly
+  /// at 16x16 without the prior tilted-handle silhouette (which read as
+  /// a pistol). Used by the cluster-editor pane's "Rebuild" button.
+  hammer(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.4 }): string {
+    return svgWrapper(
+      `<rect x="2" y="2" width="12" height="3.5" rx="0.6"/><rect x="7.2" y="5.5" width="1.6" height="8" rx="0.3"/>`,
+      opts,
+    );
+  },
 };

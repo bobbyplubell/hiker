@@ -357,6 +357,7 @@ mod tests {
                 content: Some("hello".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         let items = act
@@ -396,6 +397,7 @@ mod tests {
                 content: Some("c".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         let only_changes = act
@@ -448,6 +450,7 @@ mod tests {
                     content: Some("c".into()),
                     metadata: None,
                     source_hash: None,
+                    source_path: None,
                 })
                 .unwrap();
         }
@@ -481,6 +484,7 @@ mod tests {
                 content: Some("c".into()),
                 metadata: None,
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         let items = act
@@ -507,6 +511,7 @@ mod tests {
                 content: Some("c".into()),
                 metadata: Some(serde_json::json!({"session_id": "s42"})),
                 source_hash: None,
+                source_path: None,
             })
             .unwrap();
         let items = act

@@ -135,3 +135,9 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[deferred]** Tracing spans per pipeline stage, in-app log viewer, frontend log bridge
 - **[deferred]** `.hiker/ignore` config file
 - **[planned]** QA harness: golden-set evaluation, thumbs feedback, synthetic-corpus benchmark
+
+# Related Research
+```
+RAPTOR https://arxiv.org/html/2401.18059v1
+Possible improvement on clustering https://en.wikipedia.org/wiki/Leiden_algorithm
+```

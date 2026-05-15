@@ -41,7 +41,13 @@ use crate::error::HikerError;
 /// depth-first dotted-1-based path, e.g. `"1"`, `"1.2"`, `"1.2.1"`).
 /// Lexical ordering on `tree_path` reproduces reading order without a
 /// recursive query.
-pub const SCHEMA_VERSION: i32 = 6;
+///
+/// v7 added `notes.note_embedding BLOB` (NULL until computed; lazily
+/// filled by the cluster pipeline as a byte-length-weighted mean-pool
+/// of the note's chunk embeddings — see `cluster-note-embeddings` in
+/// `clustering.md`). Cleared whenever the note's chunks change so it
+/// stays consistent with the live chunk-vecs table.
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Embedding dimension for the v1 model (bge-small-en-v1.5). Pinned here so
 /// the schema and the embedder agree.
@@ -746,6 +752,96 @@ impl Store {
         Ok(rows)
     }
 
+    /// Fetch the cached note-level embedding for a path, if any. NULL until
+    /// the cluster pipeline first computes it; cleared whenever the note's
+    /// chunks change.
+    ///
+    /// status: cluster-note-embeddings
+    pub fn note_embedding_for_path(
+        &self,
+        rel_path: &str,
+    ) -> Result<Option<Vec<f32>>, StoreError> {
+        let blob: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT note_embedding FROM notes WHERE path = ?1",
+                params![rel_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(blob.flatten().map(|b| blob_to_embedding(&b)))
+    }
+
+    /// Compute (or recompute) the note-level embedding for `rel_path` as a
+    /// byte-length-weighted mean-pool of its chunk embeddings, and persist
+    /// it on the `notes` row. Returns the freshly-computed embedding, or
+    /// `None` when the note has no chunks (the column is left NULL).
+    ///
+    /// Lazy: callers (cluster pipeline) call this on first need and on
+    /// chunk-change. The mean is over the indexer's `chunk_vecs` joined
+    /// with `chunks.byte_end - chunks.byte_start` weights so the result
+    /// reflects the chunker's heading-bounded structure.
+    ///
+    /// status: cluster-note-embeddings
+    pub fn compute_and_store_note_embedding(
+        &mut self,
+        rel_path: &str,
+    ) -> Result<Option<Vec<f32>>, StoreError> {
+        let note_id = match self.id_for_path(rel_path)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let weighted = self.collect_weighted_chunk_embeddings(&note_id)?;
+        if weighted.is_empty() {
+            // Empty notes get no embedding (see clustering.md "Level 0
+            // input"). Leave the column NULL so the cluster pass excludes
+            // the note rather than treating a zero-vector as a real point.
+            return Ok(None);
+        }
+        let pooled = byte_weighted_mean_pool(&weighted)?;
+        let blob = embedding_to_blob(&pooled);
+        self.conn.execute(
+            "UPDATE notes SET note_embedding = ?1 WHERE id = ?2",
+            params![blob, note_id],
+        )?;
+        Ok(Some(pooled))
+    }
+
+    /// Drop the cached `note_embedding` for `rel_path`. Called by the
+    /// indexer whenever a note's chunks change so the next cluster pass
+    /// recomputes from current data.
+    ///
+    /// status: cluster-note-embeddings
+    pub fn clear_note_embedding(&mut self, rel_path: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE notes SET note_embedding = NULL WHERE path = ?1",
+            params![rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// Read each chunk's embedding plus byte-length weight, for note-level
+    /// pooling. Private; callers go through `compute_and_store_note_embedding`.
+    fn collect_weighted_chunk_embeddings(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<(Vec<f32>, u64)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT v.embedding, c.byte_end - c.byte_start
+             FROM chunk_vecs v
+             JOIN chunks c ON c.id = v.chunk_id
+             WHERE c.note_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![note_id], |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                let weight: i64 = row.get(1)?;
+                Ok((blob_to_embedding(&blob), weight.max(0) as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Fetch all chunks for a note, ordered by chunk_index.
     pub fn get_note_chunks(&self, note_id: &str) -> Result<Vec<ChunkRow>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -774,8 +870,11 @@ impl Store {
         // Upsert notes row. Successful upsert clears any prior Skipped flag
         // — the file made it through ingest, so it's no longer skipped.
         tx.execute(
-            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL)
+            // Clears `note_embedding` on every upsert — chunks just
+            // changed, so the cached pool is stale until the next cluster
+            // pass recomputes it. status: cluster-note-embeddings
+            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason, note_embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                path = excluded.path,
                content_hash = excluded.content_hash,
@@ -784,7 +883,8 @@ impl Store {
                indexed_at = excluded.indexed_at,
                embedder_version = excluded.embedder_version,
                skipped = 0,
-               skip_reason = NULL",
+               skip_reason = NULL,
+               note_embedding = NULL",
             params![
                 upsert.id,
                 upsert.path,
@@ -1383,6 +1483,58 @@ fn embedding_to_blob(emb: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Inverse of `embedding_to_blob`. Trailing partial-f32 bytes (impossible
+/// on a well-formed blob) are dropped.
+fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blob.len() / 4);
+    for chunk in blob.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact yields 4 bytes");
+        out.push(f32::from_le_bytes(arr));
+    }
+    out
+}
+
+/// Byte-length-weighted mean-pool over a note's chunk embeddings. Empty
+/// input is rejected; zero total weight (every chunk reported zero-length,
+/// which shouldn't happen but is cheap to guard against) falls back to an
+/// unweighted mean. See `cluster-note-embeddings` in `clustering.md`.
+fn byte_weighted_mean_pool(
+    weighted: &[(Vec<f32>, u64)],
+) -> Result<Vec<f32>, StoreError> {
+    debug_assert!(!weighted.is_empty());
+    let dim = weighted[0].0.len();
+    if dim != EMBED_DIM {
+        return Err(StoreError::EmbedDim {
+            got: dim,
+            expected: EMBED_DIM,
+        });
+    }
+    let mut acc = vec![0.0f32; dim];
+    let mut total: u64 = 0;
+    for (vec, w) in weighted {
+        if vec.len() != dim {
+            return Err(StoreError::EmbedDim {
+                got: vec.len(),
+                expected: dim,
+            });
+        }
+        // Treat a zero-length chunk as weight 1 so it still contributes —
+        // dropping it would silently make empty-headed chunks invisible to
+        // the pool.
+        let effective = (*w).max(1);
+        total = total.saturating_add(effective);
+        let wf = effective as f32;
+        for (a, &v) in acc.iter_mut().zip(vec.iter()) {
+            *a += v * wf;
+        }
+    }
+    let denom = (total.max(1)) as f32;
+    for a in acc.iter_mut() {
+        *a /= denom;
+    }
+    Ok(acc)
+}
+
 fn map_note_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
     Ok(NoteRow {
         id: row.get(0)?,
@@ -1447,7 +1599,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             embedder_version TEXT NOT NULL,
             skipped          INTEGER NOT NULL DEFAULT 0,
             skip_reason      TEXT,
-            last_accessed_at INTEGER
+            last_accessed_at INTEGER,
+            -- status: cluster-note-embeddings
+            -- Lazily-computed byte-length-weighted mean-pool of the note's
+            -- chunk embeddings. NULL until the cluster pipeline first asks
+            -- for the note; cleared on any chunk change (see
+            -- `clear_note_embedding`) so the pool stays consistent with
+            -- the live chunk-vecs.
+            note_embedding   BLOB
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -1639,6 +1798,96 @@ mod tests {
         assert_eq!(chunks[1].text, "second chunk");
 
         assert_eq!(store.id_for_path("alpha.md").unwrap().as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn note_embedding_computes_byte_weighted_mean_and_clears_on_upsert() {
+        let (_dir, mut store) = fresh_store();
+        let id = new_id();
+
+        // Two chunks; second chunk is 3× the byte-length so it dominates
+        // the weighted mean.
+        let mut c0 = mk_chunk(0, "");
+        c0.byte_start = 0;
+        c0.byte_end = 10;
+        let mut c1 = mk_chunk(1, "");
+        c1.byte_start = 10;
+        c1.byte_end = 40;
+        // Make every dim of c0's embedding 1.0 and c1's 5.0; weighted
+        // mean = (10*1 + 30*5) / 40 = 4.0.
+        let e0 = vec![1.0f32; EMBED_DIM];
+        let e1 = vec![5.0f32; EMBED_DIM];
+
+        store
+            .upsert_note(NoteUpsert {
+                id: &id,
+                path: "n.md",
+                content_hash: "h1",
+                mtime: 0,
+                size: 40,
+                indexed_at: 0,
+                embedder_version: "test",
+                chunks: vec![(c0, e0), (c1, e1)],
+            })
+            .unwrap();
+
+        // Fresh upsert leaves note_embedding NULL.
+        assert!(store.note_embedding_for_path("n.md").unwrap().is_none());
+
+        let pooled = store
+            .compute_and_store_note_embedding("n.md")
+            .unwrap()
+            .expect("note has chunks");
+        assert_eq!(pooled.len(), EMBED_DIM);
+        for v in &pooled {
+            assert!((v - 4.0).abs() < 1e-4, "expected ~4.0, got {v}");
+        }
+
+        // Subsequent reads see the persisted value.
+        let cached = store
+            .note_embedding_for_path("n.md")
+            .unwrap()
+            .expect("now cached");
+        assert_eq!(cached.len(), EMBED_DIM);
+        assert!((cached[0] - 4.0).abs() < 1e-4);
+
+        // Re-upserting (chunks changed) must clear the pool.
+        store
+            .upsert_note(NoteUpsert {
+                id: &id,
+                path: "n.md",
+                content_hash: "h2",
+                mtime: 1,
+                size: 5,
+                indexed_at: 1,
+                embedder_version: "test",
+                chunks: vec![(mk_chunk(0, "x"), vec![2.0f32; EMBED_DIM])],
+            })
+            .unwrap();
+        assert!(store.note_embedding_for_path("n.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn note_embedding_none_for_empty_note() {
+        let (_dir, mut store) = fresh_store();
+        let id = new_id();
+        store
+            .upsert_note(NoteUpsert {
+                id: &id,
+                path: "empty.md",
+                content_hash: "h",
+                mtime: 0,
+                size: 0,
+                indexed_at: 0,
+                embedder_version: "test",
+                chunks: vec![],
+            })
+            .unwrap();
+        let pooled = store
+            .compute_and_store_note_embedding("empty.md")
+            .unwrap();
+        assert!(pooled.is_none());
+        assert!(store.note_embedding_for_path("empty.md").unwrap().is_none());
     }
 
     #[test]

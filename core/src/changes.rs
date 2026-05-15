@@ -111,6 +111,11 @@ pub enum AuthorClass {
     Agent,
     Sync,
     Import,
+    /// Auto-accepted staging proposal (no user gate at accept time).
+    /// Wire form is `auto:<producer>` — e.g. `auto:triage` for the saved-tree
+    /// triage classifier (per `suggestions.md` `triage-author-class`). The
+    /// `auto:*` prefix is reserved for genuinely-unattended writes.
+    Auto,
     Other,
 }
 
@@ -126,6 +131,7 @@ impl AuthorClass {
             "agent" => AuthorClass::Agent,
             "sync" => AuthorClass::Sync,
             "import" => AuthorClass::Import,
+            "auto" => AuthorClass::Auto,
             _ => AuthorClass::Other,
         }
     }
@@ -828,6 +834,26 @@ mod tests {
         let agents = c.recent_by_author("agent:%", 10).unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].author, "agent:claude-code");
+    }
+
+    #[test]
+    fn author_class_parses_auto_prefix() {
+        assert_eq!(
+            AuthorClass::from_author("auto:triage"),
+            AuthorClass::Auto
+        );
+        assert_eq!(
+            AuthorClass::from_author("auto:cluster-editor"),
+            AuthorClass::Auto
+        );
+        // Bare "auto" with no producer is still the class.
+        assert_eq!(AuthorClass::from_author("auto"), AuthorClass::Auto);
+        // Sanity: existing classes still parse.
+        assert_eq!(AuthorClass::from_author("user"), AuthorClass::User);
+        assert_eq!(
+            AuthorClass::from_author("agent:claude-code"),
+            AuthorClass::Agent
+        );
     }
 
     #[test]

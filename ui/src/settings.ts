@@ -469,6 +469,29 @@ const SECTIONS: SectionSpec[] = [
     ],
   },
   {
+    // status: triage-review-required, triage-staging-proposals
+    id: "suggestions-triage",
+    title: "Triage",
+    defaultScope: "vault",
+    rows: [
+      { key: "suggestions.triage.review_required", label: "Require review on every triage match",
+        desc: "When on, every triage match stays pending in staging until you accept. When off, auto-* policies auto-accept (subject to the per-node require_review flag). Live-applied.",
+        writeScope: "vault", control: { kind: "bool" } },
+      { key: "suggestions.triage.scope", label: "Source-folder scope",
+        desc: "Triage never produces a move_note row whose source path is outside this folder. Also drives the on-save trigger's default folder. Vault-relative; default \"inbox/\".",
+        writeScope: "vault", control: { kind: "string" } },
+      { key: "suggestions.triage.scheduled_rerun", label: "Scheduled rerun (cron)",
+        desc: "Cron-shape; empty disables. e.g. \"0 3 * * *\" (cron-style; not yet supported) or simple duration strings like \"1h\", \"24h\", \"7d\". Per cluster-editor-triage-scheduled-rerun.",
+        writeScope: "vault", control: { kind: "string" } },
+      { key: "suggestions.triage.modified_rerun", label: "Re-triage on meaningful edit",
+        desc: "Opt-in: re-run triage when an already-placed note's embedding shifts beyond the cosine guard. Distinct from the on-save trigger which always fires for notes inside the source-folder scope.",
+        writeScope: "vault", control: { kind: "bool" } },
+      { key: "suggestions.triage.modified_rerun_cosine_guard", label: "Modified-rerun cosine guard",
+        desc: "Cosine-distance threshold (0.0–1.0) the embedding must shift past before a re-triage fires. Typical save noise sits below 0.15; meaningful edits clear it. Default 0.15.",
+        writeScope: "vault", control: { kind: "number", min: 0, max: 1, step: 0.01 } },
+    ],
+  },
+  {
     // status: llm-acp-client-optional
     id: "acp",
     title: "ACP",

@@ -50,6 +50,9 @@ The `author` field is the load-bearing distinguishing feature; queries filter on
 - **`agent:<client-id>`** — write originated from an MCP tool call. The `<client-id>` is the agent's name from the MCP `initialize` handshake (e.g. `agent:claude-code`, `agent:goose`, `agent:custom-script`). Lets the UI filter "edits by Claude Code" vs. "edits by my custom agent."
 - **`sync:<device-id>`** — future. Write came from a sync push from another device. `<device-id>` identifies the originating device.
 - **`import:<source>`** — future. Write came from a bulk import (Apple Notes export, Claude Code transcript, web archival). `<source>` identifies the importer.
+- **`auto:<producer>`** — write came from an auto-accepted staging proposal (no user gate at accept time). `<producer>` identifies the producer pipeline: `auto:triage` for saved-tree triage auto-accepts (per `suggestions.md`), `auto:cluster-editor` reserved for future one-shot auto-accept paths. The accompanying `metadata.staging_proposal_id` + `metadata.auto_accepted = true` carry the full trace; the `auto:*` prefix exists so a single `author LIKE 'auto:%'` filter surfaces "everything organized for me without my touch."
+
+User-accepted staging rows stay `author = "user"` — accept-from-the-activity-detail-page is a user-initiated action even when the producer was triage. The `auto:*` prefix is reserved for genuinely-unattended writes.
 
 The class prefix supports both wildcard (`author LIKE 'agent:%'`) and exact (`author = 'agent:claude-code'`) queries. New classes can be added without schema change.
 

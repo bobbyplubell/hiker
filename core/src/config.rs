@@ -82,6 +82,8 @@ pub struct Config {
     pub acp: AcpConfig,
     #[serde(default)]
     pub staging: StagingConfig,
+    #[serde(default)]
+    pub suggestions: SuggestionsConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -102,8 +104,80 @@ impl Default for Config {
             trails: TrailsConfig::default(),
             acp: AcpConfig::default(),
             staging: StagingConfig::default(),
+            suggestions: SuggestionsConfig::default(),
         }
     }
+}
+
+/// `[suggestions]` + `[suggestions.triage]` config. See
+/// `docs/suggestions.md` §"`[suggestions.triage]` config section". The
+/// outer table currently only carries the triage subsection; the
+/// `tag_field` and other knobs land alongside their feature wiring.
+///
+/// status: triage-review-required
+/// status: triage-staging-proposals
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionsConfig {
+    #[serde(default)]
+    pub triage: TriageConfig,
+}
+
+/// `[suggestions.triage]` subsection. Triage-level behavior — auto-accept
+/// gating, source-folder safety boundary, optional scheduled re-run.
+///
+/// status: triage-review-required
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriageConfig {
+    /// When `true`, every triage match stays pending in `staging.db`
+    /// until the user accepts. When `false`, `auto-*` matches auto-accept
+    /// at insert time. Live-applied.
+    #[serde(default = "no")]
+    pub review_required: bool,
+    /// Source-folder boundary for triage moves. Triage never produces a
+    /// `move_note` row whose `source_path` is outside this folder. Also
+    /// drives the on-save trigger's default folder.
+    #[serde(default = "default_triage_scope")]
+    pub scope: String,
+    /// Duration-string grammar (`30m` / `1h` / `6h` / `24h` / `7d`); empty
+    /// disables. Per `cluster-editor-triage-scheduled-rerun`. NOTE: the spec
+    /// calls for cron-shape values (e.g. `"0 3 * * *"`); the runtime currently
+    /// accepts only the duration grammar above and silently logs + disables
+    /// anything else. Cron-shape support is tracked as
+    /// `cluster-editor-triage-scheduled-rerun-cron-syntax`.
+    #[serde(default)]
+    pub scheduled_rerun: String,
+    /// Opt-in: re-run triage when a note's embedding shifts beyond
+    /// `modified_rerun_cosine_guard` distance from its last triaged
+    /// state. Per `cluster-editor-triage-modified-rerun`. Default off.
+    #[serde(default = "no")]
+    pub modified_rerun: bool,
+    /// Cosine-distance threshold gating the modified-note rerun
+    /// (0.0 = always re-run; 1.0 = never). Default 0.15 — typical save
+    /// noise sits below this; meaningful edits clear it.
+    #[serde(default = "default_modified_rerun_cosine_guard")]
+    pub modified_rerun_cosine_guard: f32,
+}
+
+fn default_modified_rerun_cosine_guard() -> f32 {
+    0.15
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        Self {
+            review_required: false,
+            scope: default_triage_scope(),
+            scheduled_rerun: String::new(),
+            modified_rerun: false,
+            modified_rerun_cosine_guard: default_modified_rerun_cosine_guard(),
+        }
+    }
+}
+
+fn default_triage_scope() -> String {
+    "inbox/".to_string()
 }
 
 /// `[staging]` section. Behavior that applies regardless of which producer
@@ -1537,6 +1611,13 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // status: staging-config-section
     EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
     EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
+    // status: triage-review-required
+    EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
+    EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },
+    EligibleKey { path: "suggestions.triage.scheduled_rerun", ty: ValueType::String },
+    // status: cluster-editor-triage-modified-rerun
+    EligibleKey { path: "suggestions.triage.modified_rerun",  ty: ValueType::Bool },
+    EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
 const ELIGIBLE_USER: &[EligibleKey] = &[
@@ -1594,6 +1675,13 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     // status: staging-config-section
     EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
     EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
+    // status: triage-review-required
+    EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
+    EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },
+    EligibleKey { path: "suggestions.triage.scheduled_rerun", ty: ValueType::String },
+    // status: cluster-editor-triage-modified-rerun
+    EligibleKey { path: "suggestions.triage.modified_rerun",  ty: ValueType::Bool },
+    EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
 fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {

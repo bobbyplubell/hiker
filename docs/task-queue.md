@@ -75,7 +75,8 @@ struct Task {
 
 enum TaskKind {
     NoteMutation { mutation: NoteMutationKind, source_path: VaultRel },
-    RaptorSummarize { cluster_id: ClusterId, level: u8 },
+    RaptorSummarize { tree_id: TreeId, cluster_node_id: NodeId, level: u8 },
+    RaptorTriageMatch { tree_id: TreeId, source_path: VaultRel },
     AutoTag { source_path: VaultRel },
     SummaryOnSave { source_path: VaultRel },
     // ... new kinds added with each feature
@@ -108,6 +109,31 @@ Three named tiers — `High`, `Normal`, `Low`. Strict ordering: High tasks alway
 Why three named tiers rather than an integer: the UI needs a pill per tier, the user reasons in "this is urgent vs. not," and an integer field invites bikeshedding and per-feature drift. Three is enough — `High` for explicit user-initiated foreground work (clicked "rewrite this note"), `Normal` for the default (background save hooks), `Low` for ambient bulk work (RAPTOR's per-cluster summaries during a build).
 
 Producers default to `Normal` and bump up only with a reason. The note-mutation menu submits at `High` because the user is watching; RAPTOR build submits its hundreds of summaries at `Low` so a foreground mutation doesn't queue behind them.
+
+
+## Cluster-tree task types
+
+Two task types are produced by the cluster-editor / triage pipeline (per `clustering.md`, `suggestions.md`, `cluster-editor.md`). Both are `TaskShape::Direct` — they don't need tool calls during execution.
+
+### `RaptorSummarize` [task-queue-raptor-summarize]
+
+Per-cluster LLM call during a tree build pass (one task per cluster per level), or on-demand regeneration triggered from the cluster editor (`cluster-editor-regenerate-via-task-queue`).
+
+- **Payload:** `tree_id`, `cluster_node_id`, `level`, member titles + summaries (read by `core::cluster` at task-construction time and passed inline). Output schema enforces `{ name: string, summary: string, confidence: f32 }`.
+- **Priority:** `Low` during initial build (large fan-outs shouldn't block foreground work). `Normal` for user-triggered regenerations (user is watching).
+- **Retry:** one retry on transient LLM error; mark the cluster as "summarization failed, falling back" and run the tf-idf template path (`cluster-summarize-fallback-tfidf`) on second failure.
+- **Routing:** direct-LLM worker drains by default; any MCP client can also drain.
+- **Sample-and-merge variant.** For clusters with > 30 members (`raptor-summarize-sample-merge-threshold`, configurable), the producer splits into batches and submits them as sibling tasks plus a fan-in merge task that depends on them. The merge task carries the partial summaries as inputs and produces the final cluster summary. Fan-in coordination uses the queue's standard dependency mechanism (per `task-queue-dependencies`). Capped at 300 members per cluster — beyond that, fall back to the template path. [raptor-summarize-sample-merge]
+
+### `RaptorTriageMatch` [task-queue-raptor-triage-match]
+
+Per-note classifier run against a saved Evergreen tree. Triggered on the three triage pathways (`cluster-editor-triage-on-save`, `cluster-editor-triage-scheduled-rerun`, `cluster-editor-triage-modified-rerun`).
+
+- **Payload:** `tree_id`, `source_path`. The worker reads the note's embedding from `index.db` and the saved tree's centroids from `trees.db`, runs the beam-descent classifier (`cluster-place-beam-descent`), produces a `PlacementMatch { leaf_node_id, confidence, margin }`, resolves the matched node's policy, and emits the corresponding `staging.db` row (per `triage-staging-proposals`). No LLM call at all — the entire task is cosine arithmetic + a row insert.
+- **Priority:** `Normal` for on-save matches (user just authored the note; they want the routing to happen now). `Low` for scheduled and modified-note reruns (ambient bulk work).
+- **Retry:** transient errors retry once. Permanent errors (target tree missing — the user deleted the Evergreen tree while a task was queued) drop the task with a warning, no staging row emitted.
+- **Routing:** direct-LLM worker drains (it doesn't actually call the LLM for this task, but the worker is the queue-draining lane). MCP clients also eligible but don't gain anything by draining cosine-only tasks; the in-process worker is faster.
+- **Cancellation:** cancel-by-source-path. If the user deletes the source note before the task runs, the task drops cleanly. If the user accepts/rejects a triage row produced by a *previous* match for the same path before the new task runs, the new task still runs (it's a fresh evaluation against the current note state) and emits a new row.
 
 
 ## Lifecycle

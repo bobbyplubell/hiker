@@ -538,6 +538,19 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
     if (typeof k.cluster_id === "string") {
       return `cluster ${k.cluster_id}`;
     }
+    if (k.type === "cluster_build_tree" && typeof k.name === "string") {
+      return `build ${k.name}`;
+    }
+    if (k.type === "cluster_rebuild_tree" && typeof k.tree_id === "string") {
+      return `rebuild ${k.tree_id}`;
+    }
+    if (
+      k.type === "cluster_recluster_subtree"
+      && typeof k.tree_id === "string"
+      && typeof k.node_id === "string"
+    ) {
+      return `recluster ${k.tree_id}/${k.node_id}`;
+    }
     return k.type;
   }
 

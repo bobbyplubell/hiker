@@ -26,7 +26,18 @@ export type TabKind =
   | "settings"
   | "agent"
   | "graph"
-  | "properties";
+  | "properties"
+  // status: cluster-editor-pane-mode
+  // Tab hosting the expanded cluster editor. Carries two sub-modes keyed
+  // off `BufferMode.kind`: `cluster-tree` (graphical tree view) and
+  // `cluster-batch-review` (the post-Apply rows surface).
+  | "cluster-pane"
+  // status: cluster-review-tab-kind
+  // Clustering review tab — hosts the configure → run structural pass →
+  // review → confirm flow for a new tree, a subtree recluster, or an
+  // Evergreen rebuild. Non-buffer, sticky; on Confirm the tab flips in
+  // place to `cluster-pane` for the newly-persisted tree.
+  | "cluster-review";
 
 /// Discriminated union of buffer modes. `file` is the normal editable
 /// buffer; the other two are read-only previews. Bundling per-mode state
@@ -66,6 +77,23 @@ export type BufferMode =
       /// `write_note`). Drives the "Review new note" vs "Review rewrite"
       /// label in `#mode-controls`.
       isCreate: boolean;
+    }
+  // status: cluster-editor-pane-mode
+  // Expanded cluster-tree editor view in the editor pane. Hosts the
+  // graphical reshape surface + toolbar (Apply / Save-as-triage /
+  // Discard). Flips to `cluster-batch-review` mode on Apply.
+  | {
+      kind: "cluster-tree";
+      treeId: string;
+    }
+  // status: cluster-editor-batch-review-pane-mode
+  // Post-Apply review surface keyed by tree id. Rows are loaded by
+  // filtering `staging.db` for `surface = "cluster-editor"` and
+  // `metadata.tree_id = treeId`. Back-to-tree pops back to
+  // `cluster-tree` mode without closing pending rows.
+  | {
+      kind: "cluster-batch-review";
+      treeId: string;
     };
 
 export interface Buffer {
@@ -74,6 +102,10 @@ export interface Buffer {
   /// properties tabs so every cross-cutting concern (dirty marker, close
   /// guard, autosave, mode-controls, reveal-in-tree) gates on kind.
   kind: TabKind;
+  /// Optional human-readable label for the tab strip. Non-buffer tabs
+  /// (cluster pane, agent, etc.) set this so the strip shows the tree
+  /// name / session title instead of the internal `__hiker:*` key.
+  displayLabel?: string;
   loadedText: string;
   /// Opaque buffer-identity token issued by `core::ops::open_for_edit`
   /// and rotated by every successful `commit_buffer` /

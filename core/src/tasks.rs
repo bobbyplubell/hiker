@@ -86,12 +86,46 @@ pub enum TaskShape {
 pub enum TaskKind {
     /// User-driven note mutation (rewrite-as-markdown, summarize, etc.).
     NoteMutation { mutation: String, source_path: String },
-    /// RAPTOR cluster summarization.
-    RaptorSummarize { cluster_id: String, level: u8 },
+    /// Per-cluster LLM summarize task (RAPTOR build or user-triggered
+    /// regenerate). Payload identifies the tree + node + level so the
+    /// worker can look up members and resolve the output back into
+    /// `trees.db`. status: task-queue-raptor-summarize
+    RaptorSummarize {
+        tree_id: String,
+        cluster_node_id: String,
+        level: u8,
+    },
+    /// Per-note classifier run against a saved Evergreen tree. Pure
+    /// cosine — no LLM call. status: task-queue-raptor-triage-match
+    RaptorTriageMatch {
+        tree_id: String,
+        source_path: String,
+    },
     /// Background auto-tag-on-save.
     AutoTag { source_path: String },
     /// Background summary-on-save.
     SummaryOnSave { source_path: String },
+    /// Initial cluster-tree build from a scope. CPU + LLM-heavy; runs
+    /// through the direct-worker non-LLM side-channel so the IPC thread
+    /// can return immediately and the queue page surfaces progress.
+    ClusterBuildTree {
+        name: String,
+        source: String,
+        scope_json: String,
+        method_json: String,
+    },
+    /// Re-build a saved tree against current vault state.
+    ClusterRebuildTree {
+        tree_id: String,
+        new_name: Option<String>,
+    },
+    /// Recluster the subtree under a selected cluster node.
+    ClusterReclusterSubtree {
+        tree_id: String,
+        node_id: String,
+        cluster_params_json: String,
+        carry_policies_down: bool,
+    },
 }
 
 impl TaskKind {
@@ -100,8 +134,12 @@ impl TaskKind {
         match self {
             TaskKind::NoteMutation { .. } => "note_mutation",
             TaskKind::RaptorSummarize { .. } => "raptor_summarize",
+            TaskKind::RaptorTriageMatch { .. } => "raptor_triage_match",
             TaskKind::AutoTag { .. } => "auto_tag",
             TaskKind::SummaryOnSave { .. } => "summary_on_save",
+            TaskKind::ClusterBuildTree { .. } => "cluster_build_tree",
+            TaskKind::ClusterRebuildTree { .. } => "cluster_rebuild_tree",
+            TaskKind::ClusterReclusterSubtree { .. } => "cluster_recluster_subtree",
         }
     }
 
@@ -109,11 +147,22 @@ impl TaskKind {
     pub fn metadata_oneliner(&self) -> String {
         match self {
             TaskKind::NoteMutation { source_path, .. } => source_path.clone(),
-            TaskKind::RaptorSummarize { cluster_id, level } => {
-                format!("cluster {cluster_id} (level {level})")
-            }
+            TaskKind::RaptorSummarize {
+                tree_id,
+                cluster_node_id,
+                level,
+            } => format!("tree {tree_id} node {cluster_node_id} (L{level})"),
+            TaskKind::RaptorTriageMatch {
+                tree_id,
+                source_path,
+            } => format!("tree {tree_id} ← {source_path}"),
             TaskKind::AutoTag { source_path } => source_path.clone(),
             TaskKind::SummaryOnSave { source_path } => source_path.clone(),
+            TaskKind::ClusterBuildTree { name, .. } => format!("build {name}"),
+            TaskKind::ClusterRebuildTree { tree_id, .. } => format!("rebuild {tree_id}"),
+            TaskKind::ClusterReclusterSubtree { tree_id, node_id, .. } => {
+                format!("recluster {tree_id}/{node_id}")
+            }
         }
     }
 }
@@ -975,17 +1024,37 @@ fn validate_against_schema(
 
 // ---------- direct-LLM worker ----------
 
+/// Pluggable side-channel for `TaskKind` variants that are not just an
+/// LLM prompt. The direct worker checks this before falling back to
+/// `LlmClient::chat`, so producers like `cluster_triage_enqueue` get a
+/// real classifier run on the consumer side rather than handing their
+/// (empty) payload to the LLM.
+///
+/// status: task-queue-raptor-triage-match
+pub trait NonLlmHandlers: Send + Sync {
+    /// Process `task` synchronously without consulting the LLM. Return
+    /// `Ok(None)` to fall through to the default LLM path, `Ok(Some(v))`
+    /// to short-circuit with a successful result, or `Err(s)` to fail
+    /// the task with `s`.
+    fn try_handle(&self, task: &Task) -> Result<Option<serde_json::Value>, String>;
+}
+
 /// Spawn the in-process direct-LLM worker. Drains `Direct`-shape tasks
 /// one at a time per instance; spawn `parallelism` instances if the
 /// config asks for more. Returns when `cancel` fires.
 ///
+/// `handlers` is the optional non-LLM side-channel (see `NonLlmHandlers`).
+/// Pass `None` from contexts that don't need it (e.g. headless CLI / tests).
+///
 /// status: task-queue-direct-worker
 /// status: task-queue-direct-worker-toggle
 /// status: task-queue-structured-output-direct
+/// status: task-queue-raptor-triage-match
 pub async fn run_direct_worker(
     queue: Queue,
     client: Arc<dyn LlmClient>,
     audit: Option<Arc<AgentLog>>,
+    handlers: Option<Arc<dyn NonLlmHandlers>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -1016,7 +1085,7 @@ pub async fn run_direct_worker(
 
         let id = task.id.clone();
         let started = SystemTime::now();
-        let outcome = drive_one_task(client.as_ref(), &task, &stop).await;
+        let outcome = drive_one_task(client.as_ref(), handlers.as_deref(), &task, &stop).await;
         match outcome {
             Ok(value) => {
                 if let Err(e) = queue.submit_result(&id, value).await {
@@ -1075,9 +1144,21 @@ enum WorkerError {
 
 async fn drive_one_task(
     client: &dyn LlmClient,
+    handlers: Option<&dyn NonLlmHandlers>,
     task: &Task,
     stop: &StopSignal,
 ) -> Result<serde_json::Value, WorkerError> {
+    // Non-LLM side-channel (e.g. RaptorTriageMatch). Checked before we
+    // touch the LLM so a triage task with an empty prompt doesn't get
+    // fed to the model — the producer (cluster_triage_enqueue) carries
+    // its inputs on the kind variant, not the prompt.
+    if let Some(h) = handlers {
+        match h.try_handle(task) {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) => {}
+            Err(e) => return Err(WorkerError::Failed(e)),
+        }
+    }
     // Build messages. The producer-supplied prompt is the user message;
     // when an output_schema is set we append a JSON-strict instruction
     // (the v1 fallback for providers without server-side structured

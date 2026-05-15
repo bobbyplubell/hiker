@@ -933,6 +933,7 @@ impl HikerHandler {
                         "session_id": CLIENT_ID,
                     })),
                     source_hash,
+                    source_path: None,
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
@@ -1194,6 +1195,7 @@ impl HikerHandler {
                         "session_id": CLIENT_ID,
                     })),
                     source_hash: Some(source_hash),
+                    source_path: None,
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
@@ -1298,6 +1300,7 @@ impl HikerHandler {
                         "session_id": CLIENT_ID,
                     })),
                     source_hash: Some(source_hash),
+                    source_path: None,
                 })
                 .map_err(|e| {
                     tracing::error!(error = %e, "staging: propose failed");
