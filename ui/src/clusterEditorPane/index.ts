@@ -30,14 +30,24 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Logger } from "../logger";
 import { showToast } from "../widgets/toast";
+import {
+  closeContextMenu,
+  isContextMenuOpen,
+  openContextMenu,
+  type CtxMenuItem,
+} from "../widgets/contextMenu";
 import { Icons } from "../icons";
 import type {
   ClusterNodeRow,
   ClusterTreeRow,
 } from "../clusterEditor";
 import {
+  onDragStateChange,
   renderMultiSelectToolbar,
+  renderPromoteBand,
   renderSiblingsWithOutliers,
+  summarizeOutcomeToast,
+  type SummarizeSweepOutcome,
   type TreeRowDeps,
   type TreeRowSurfaceState,
 } from "../clusterEditor/rowPrimitive";
@@ -178,6 +188,10 @@ export function mountClusterEditorPane(
   let treeViewVariant: "tree" | "graph" | "markdown" = "tree";
   // status: cluster-editor-graph-view-lazy-load
   let graphApi: GraphViewApi | null = null;
+  // Set by `paintTree` so the radio's `onChange` can swap just the body
+  // (no toolbar rebuild). Keeping the toolbar stable across view-mode
+  // switches is what lets the view-options menu refresh in place.
+  let paintBodyHook: (() => void) | null = null;
   // Selection survives the row/graph switch (`cluster-editor-graph-view-toggle`).
   const sharedSelection = new Set<string>();
 
@@ -222,12 +236,19 @@ export function mountClusterEditorPane(
       refresh: async () => {
         try {
           cachedNodes = await Api.get(treeId);
-          paint();
+          // Body-only repaint keeps the toolbar (and the view-menu's
+          // anchor) stable. Falls back to full `paint()` only on the
+          // pre-first-paint path.
+          if (paintBodyHook) paintBodyHook();
+          else paint();
         } catch (err) {
           Logger.error("ui::clusterEditor", "pane refresh failed", { err });
         }
       },
-      repaint: () => paint(),
+      repaint: () => {
+        if (paintBodyHook) paintBodyHook();
+        else paint();
+      },
       openNote: deps.openNote,
       openReclusterReview: deps.openReclusterReview,
     };
@@ -413,6 +434,66 @@ export function mountClusterEditorPane(
     });
     head.appendChild(regenBtn);
 
+    // status: cluster-editor-summarize-stale-action
+    //
+    // "Summarize new / changed (N)" — fan-out Summarize over every
+    // cluster whose name/summary is empty or whose membership churn
+    // counter is non-zero. Predicate mirrors `SummarizeScope::StaleOrUnfilled`
+    // server-side; computed client-side off `cachedNodes` (the pane
+    // already re-fetches on `cluster_nodes` row changes and on queue
+    // completion events, so the count refreshes naturally without a
+    // dedicated subscription).
+    const staleClusterIds = cachedNodes
+      .filter(
+        (n) =>
+          n.kind === "cluster" &&
+          (n.summary_membership_churn > 0 ||
+            n.summary === "" ||
+            n.name === ""),
+      )
+      .map((n) => n.id);
+    const stalecount = staleClusterIds.length;
+    const summarizeStaleBtn = document.createElement("button");
+    summarizeStaleBtn.type = "button";
+    summarizeStaleBtn.className = "cep-btn";
+    summarizeStaleBtn.textContent =
+      stalecount > 0
+        ? `Summarize new / changed (${stalecount})`
+        : "Summarize new / changed";
+    summarizeStaleBtn.setAttribute(
+      "aria-label",
+      "Summarize new / changed clusters",
+    );
+    if (stalecount === 0) {
+      summarizeStaleBtn.disabled = true;
+      summarizeStaleBtn.title =
+        "Everything is fresh — nothing to summarize";
+    } else {
+      summarizeStaleBtn.title =
+        "Summarize new / changed — enqueue a summarize task for every cluster whose membership shifted or whose name/summary is empty";
+      summarizeStaleBtn.addEventListener("click", async () => {
+        summarizeStaleBtn.disabled = true;
+        try {
+          const params = {
+            scope: { kind: "stale-or-unfilled" },
+            subtree_root: null,
+            recursive: true,
+            summarize_mode: "llm",
+            overwrite_user_edited: false,
+          };
+          const outcome: SummarizeSweepOutcome = await invoke(
+            "cluster_summarize",
+            { treeId, paramsJson: JSON.stringify(params) },
+          );
+          showToast(summarizeOutcomeToast(outcome, stalecount));
+        } catch (err) {
+          showToast(`Summarize failed: ${String(err)}`);
+          summarizeStaleBtn.disabled = false;
+        }
+      });
+    }
+    head.appendChild(summarizeStaleBtn);
+
     // status: cluster-build-rebuild
     const rebuildBtn = document.createElement("button");
     rebuildBtn.type = "button";
@@ -466,38 +547,111 @@ export function mountClusterEditorPane(
     // toggle and apply button — see the trailing `head.appendChild`s.
 
     // status: cluster-editor-graph-view-toggle
-    // View-variant toggle (tree vs graph). Selection survives the
-    // switch — shared `sharedSelection` set.
-    const variantToggle = document.createElement("div");
-    variantToggle.className = "cep-view-toggle";
-    for (const v of ["tree", "graph", "markdown"] as const) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "cep-btn cep-icon-btn cep-view-toggle-btn";
-      const label = v === "tree" ? "Tree" : v === "graph" ? "Graph" : "Markdown";
-      b.innerHTML =
-        v === "tree"
-          ? Icons.clusterTreeShape()
-          : v === "graph"
-            ? Icons.graphNodes()
-            : Icons.mdLabel();
-      b.title = label;
-      b.setAttribute("aria-label", label);
-      if (treeViewVariant === v) b.classList.add("active");
-      b.addEventListener("click", () => {
-        if (treeViewVariant === v) return;
-        treeViewVariant = v;
-        // Destroy the graph view if leaving it — lazy-mount again on
-        // re-entry.
-        if (v !== "graph" && graphApi) {
-          graphApi.destroy();
-          graphApi = null;
-        }
-        paint();
-      });
-      variantToggle.appendChild(b);
+    // status: cluster-editor-graph-view-view-menu
+    //
+    // Unified "view options" menu (eye icon, matching the editor
+    // toolbar's `#view-menu-btn`). Always painted in the pane toolbar.
+    // The menu carries a "View as" radio (Tree / Graph / Markdown) and,
+    // when the graph variant is active, the graph-specific options
+    // (leaves visibility, layout, show outliers, fit/reset, note
+    // preview toggle) folded in from `graphApi.getViewMenuItems()`.
+    // Previously these lived as a separate 3-button strip on the
+    // toolbar; consolidating them keeps the pinned bar tidier.
+    const viewMenuBtn = document.createElement("button");
+    viewMenuBtn.type = "button";
+    viewMenuBtn.className = "cep-btn cep-icon-btn";
+    viewMenuBtn.innerHTML = Icons.eye();
+    viewMenuBtn.setAttribute("aria-label", "View options");
+    viewMenuBtn.title = "View options";
+    viewMenuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openViewMenuFor(viewMenuBtn);
+    });
+    head.appendChild(viewMenuBtn);
+
+    function openViewMenuFor(anchor: HTMLElement): void {
+      // Guard against the menu being reopened against a stale anchor.
+      // Can happen when `paint()` (rather than `paintBody()`) ran since
+      // the menu items were built — the old eye button is detached,
+      // and anchoring the popover to it gives a useless 0,0 position.
+      // Fall back to the current eye button.
+      if (!anchor.isConnected) {
+        const live = root.querySelector<HTMLButtonElement>(
+          ".cep-head .cep-icon-btn[aria-label='View options']",
+        );
+        if (!live) return;
+        anchor = live;
+      }
+      const items: CtxMenuItem[] = [
+        {
+          kind: "radio",
+          label: "View as",
+          value: treeViewVariant,
+          options: [
+            { label: "Tree", value: "tree" },
+            { label: "Graph", value: "graph" },
+            { label: "Markdown", value: "markdown" },
+          ],
+          onChange: (v) => {
+            const next = v as "tree" | "graph" | "markdown";
+            if (treeViewVariant === next) return;
+            treeViewVariant = next;
+            // Swap *only* the body. The toolbar (and our anchor button)
+            // stays in place across the view-mode switch — that's the
+            // whole point of factoring `paintBody` out from `paintTree`.
+            // graphApi teardown is owned by `paintBody` (it knows when
+            // it's about to draw a non-graph variant).
+            if (paintBodyHook) paintBodyHook();
+            else paint();
+            // Refresh the menu in place against the still-mounted
+            // anchor. `openContextMenu` has a same-trigger toggle-close
+            // short-circuit; bypass it by explicitly closing first.
+            closeContextMenu();
+            openViewMenuFor(viewMenuBtn);
+          },
+        },
+      ];
+      if (treeViewVariant === "tree") {
+        items.push({
+          label: "Expand all",
+          run: () => {
+            // status: cluster-editor-row-primitive
+            // Seed the pane-local `expanded` set with every cluster /
+            // outlier-bucket node so the entire tree opens at once.
+            // Leaves don't have children to expand; skip them. Use
+            // `paintBodyHook` rather than `paint()` so the toolbar
+            // (and the menu's anchor) survives the repaint.
+            const ex = expandedByTree.get(treeId);
+            if (!ex) return;
+            for (const n of cachedNodes) {
+              if (
+                n.kind === "cluster"
+                || n.kind === "outlier-bucket"
+              ) {
+                ex.add(n.id);
+              }
+            }
+            if (paintBodyHook) paintBodyHook();
+            else paint();
+          },
+        });
+        items.push({
+          label: "Collapse all",
+          run: () => {
+            const ex = expandedByTree.get(treeId);
+            if (!ex) return;
+            ex.clear();
+            if (paintBodyHook) paintBodyHook();
+            else paint();
+          },
+        });
+      }
+      if (treeViewVariant === "graph" && graphApi) {
+        items.push(...graphApi.getViewMenuItems());
+      }
+      const rect = anchor.getBoundingClientRect();
+      openContextMenu(rect.right, rect.bottom, items, anchor);
     }
-    head.appendChild(variantToggle);
 
     // Divider between the view-toggle cluster and the accept/reject
     // pair (Apply ✓ / Discard ✕).
@@ -516,6 +670,28 @@ export function mountClusterEditorPane(
     // close affordance for this tab kind.
 
     root.appendChild(head);
+
+    // Body rendering is factored out so view-mode switches can re-render
+    // just the body without rebuilding the toolbar. Keeping the toolbar
+    // (and the eye button on it) stable across switches is what lets the
+    // view-options menu refresh in place: the menu's anchor element
+    // doesn't disappear under it.
+    paintBody();
+
+    function paintBody(): void {
+      // Tear down any prior body content. Multi-select toolbar lives in
+      // the head — leave it alone; remove only the children added by
+      // earlier `paintBody()` calls.
+      for (const el of Array.from(
+        root.querySelectorAll(":scope > .cep-graph-host, :scope > .cep-markdown-host, :scope > .cep-tree-body"),
+      )) {
+        el.remove();
+      }
+      // Destroy any live graph view before we paint a non-graph body.
+      if (graphApi && treeViewVariant !== "graph") {
+        graphApi.destroy();
+        graphApi = null;
+      }
 
     if (treeViewVariant === "graph") {
       // status: cluster-editor-graph-view
@@ -540,7 +716,34 @@ export function mountClusterEditorPane(
           },
         }),
       ).then((api) => {
+        // If the user switched away (or to a *different* graph mount)
+        // before this async mount resolved, this `api` is attached to
+        // an orphaned `gHost`. Destroy it here — without this guard
+        // sigma's document-level listeners (mousemove / mouseup /
+        // touchend / touchmove + window resize) accumulate one set per
+        // orphaned mount and the pane gradually stops responding.
+        //
+        // The decisive check is `gHost.isConnected`: paintBody removes
+        // the prior gHost when it re-renders, so any in-flight mount
+        // whose gHost is no longer in the DOM is stale by definition.
+        if (!gHost.isConnected || treeViewVariant !== "graph") {
+          api.destroy();
+          return;
+        }
+        // Newer mount already won — also destroy this stale one.
+        if (graphApi !== null) {
+          api.destroy();
+          return;
+        }
         graphApi = api;
+        // If the user already opened the view-options menu (anchored
+        // to the still-mounted, stable eye button), refresh its items
+        // now that `graphApi.getViewMenuItems()` can return the graph-
+        // specific switches.
+        if (isContextMenuOpen(viewMenuBtn)) {
+          closeContextMenu();
+          openViewMenuFor(viewMenuBtn);
+        }
         // Selection survives the row/graph switch — re-applying any
         // prior selection isn't supported by the current graph API
         // (no `setSelection`), but the shared set is preserved here
@@ -595,10 +798,19 @@ export function mountClusterEditorPane(
     }
     const body = document.createElement("div");
     body.className = "cep-tree-body";
+    // status: cluster-editor-dnd-visual-feedback
+    const band = renderPromoteBand(surface, rowDeps(treeId));
+    if (band) body.appendChild(band);
     const rootNodes = cachedNodes.filter((n) => n.parent === null);
     const els = renderSiblingsWithOutliers(surface, rowDeps(treeId), rootNodes, 0);
     for (const el of els) body.appendChild(el);
     root.appendChild(body);
+    }
+
+    // Expose the body-only repaint to the radio onChange so view-mode
+    // switches stay decoupled from the toolbar (so the eye button —
+    // the menu's anchor — survives the switch).
+    paintBodyHook = paintBody;
   }
 
   // status: cluster-editor-markdown-view-toggle
@@ -915,6 +1127,13 @@ export function mountClusterEditorPane(
       });
     }
   }
+
+  // status: cluster-editor-dnd-visual-feedback
+  // Re-paint when a drag starts or ends so the promote-to-top band
+  // surfaces and tears down without polling.
+  onDragStateChange(() => {
+    if (sub?.kind === "tree") paint();
+  });
 
   // Auto-refresh the open tree view when a `raptor_summarize` task
   // completes — the worker writes new auto-generated names + summaries

@@ -513,12 +513,23 @@ export function mountPatchReview(deps: PatchReviewDeps): PatchReviewApi {
   // Install the extension via appendConfig so the host doesn't have to
   // know about a new compartment. Idempotent: the StateField / decoration
   // compute / gutter are inert when the proposals list is empty.
-  deps.dispatch({
-    effects: StateEffect.appendConfig.of([
-      proposalsField,
-      decorationsField,
-      hunkGutter,
-    ]),
+  //
+  // Deferred to a microtask so the dispatch happens *after* the
+  // synchronous `mountEditorPane` body finishes. Without the defer, the
+  // dispatch fires the editor's `statusUpdater` plugin → host's
+  // `onAfterStatus` callback → reaches into `statusBar` / `mutationsMenu`
+  // / `modeControls` / `editor`, which may still be in their TDZ
+  // depending on which one of those host-side `const`s lands after this
+  // mount call in source order. Deferring sidesteps the ordering
+  // fragility entirely.
+  queueMicrotask(() => {
+    deps.dispatch({
+      effects: StateEffect.appendConfig.of([
+        proposalsField,
+        decorationsField,
+        hunkGutter,
+      ]),
+    });
   });
 
   return {

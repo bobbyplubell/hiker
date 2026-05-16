@@ -1235,19 +1235,19 @@ impl Config {
             ))
         })?;
 
-        // Cross-field validation: model is the only supported value in v1
-        // (the field exists for forward compatibility). batch_size must be
-        // non-zero.
-        if cfg.indexing.model != default_model() {
+        // Cross-field validation: model must be one of the supported
+        // fastembed ids (per `embedder-model-selectable`). batch_size must
+        // be non-zero.
+        if !crate::embed::is_known_model(&cfg.indexing.model) {
             tracing::error!(
                 key = "indexing.model",
                 value = %cfg.indexing.model,
                 "unsupported settings value",
             );
             return Err(HikerError::Config(format!(
-                "indexing.model = \"{}\" — only \"{}\" is supported in v1",
+                "indexing.model = \"{}\" — supported: {}",
                 cfg.indexing.model,
-                default_model(),
+                crate::embed::supported_model_ids().join(", "),
             )));
         }
         if cfg.indexing.batch_size == 0 {
@@ -1512,6 +1512,10 @@ enum ValueType {
     RecencyBias,
     /// `all | lazy` for `[indexing] id_stamping`.
     IdStamping,
+    /// One of the supported fastembed model ids — `bge-small-en-v1.5` /
+    /// `bge-m3` / `embedding-gemma-300m`. Used by `[indexing] model`.
+    /// status: embedder-model-selectable
+    EmbedderModel,
 }
 
 const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -1539,6 +1543,12 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "trails.new_trail_dir",          ty: ValueType::String },
     // status: note-id-stamping
     EligibleKey { path: "indexing.id_stamping",          ty: ValueType::IdStamping },
+    // status: embedder-model-selectable
+    // status: settings-embedder-model-change-warning
+    // Gated in the UI by a confirm modal (`settings-embedder-model-change-warning`)
+    // because a flip re-embeds every note in the vault and — when the dim
+    // differs — rebuilds the vec0 table via `store-rebuild-chunk-vecs-on-dim-change`.
+    EligibleKey { path: "indexing.model",                ty: ValueType::EmbedderModel },
     EligibleKey { path: "search.modes.semantic",         ty: ValueType::Bool },
     EligibleKey { path: "search.modes.lexical",          ty: ValueType::Bool },
     EligibleKey { path: "search.sections.results_expanded", ty: ValueType::Bool },
@@ -1623,6 +1633,10 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
 const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "vault.recent",  ty: ValueType::StringArray },
     EligibleKey { path: "vault.default", ty: ValueType::String },
+    // status: embedder-model-selectable
+    // Also eligible at user scope as a global default; per-vault override
+    // wins per the standard merge rule.
+    EligibleKey { path: "indexing.model", ty: ValueType::EmbedderModel },
     // LLM section. Default scope for the settings pane is `user` so
     // API-key env name + provider live in the platform config dir; the
     // vault TOML can still override per-workspace via the eligible-vault
@@ -1751,6 +1765,7 @@ fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), Hi
         (ValueType::IdStamping, J::String(s)) => {
             matches!(s.as_str(), "all" | "lazy")
         }
+        (ValueType::EmbedderModel, J::String(s)) => crate::embed::is_known_model(s),
         _ => false,
     };
     if !ok {

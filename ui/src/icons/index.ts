@@ -197,4 +197,14 @@ export const Icons = {
       opts,
     );
   },
+
+  /// Eye — same shape as the editor toolbar's view-options button
+  /// (`#view-menu-btn`). Used by the cluster-editor pane's graph-view
+  /// "View options" trigger so the two surfaces share the same glyph.
+  eye(opts: SvgWrapperOptions = { size: 14, strokeWidth: 1.5 }): string {
+    return svgWrapper(
+      `<path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>`,
+      opts,
+    );
+  },
 };

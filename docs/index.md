@@ -38,10 +38,12 @@ CREATE TABLE chunks (
   UNIQUE(note_id, chunk_index)
 );
 
--- vec0 virtual table; one row per chunk
+-- vec0 virtual table; one row per chunk. The `N` is filled in at CREATE
+-- time from the loaded embedder's `dim()`; 384 for bge-small, 768 for
+-- embedding-gemma-300m, 1024 for bge-m3. See "Dim-from-model" below.
 CREATE VIRTUAL TABLE chunk_vecs USING vec0(
   chunk_id      TEXT PRIMARY KEY,
-  embedding     FLOAT[384]                  -- dimension fixed by chosen model
+  embedding     FLOAT[N]
 );
 
 -- ulid stability across renames: path → id
@@ -101,16 +103,17 @@ Heading-bounded splits over the markdown AST, with a soft size cap.
 
 ## Embedder
 
-`fastembed-rs` with `BAAI/bge-small-en-v1.5` (384 dims, ~30MB model, runs on CPU, English-tuned). Stored as `embedder_version: "bge-small-en-v1.5"` in `notes`. [embedder-fastembed-bge-small, embedder-version-tag]
+`fastembed-rs` v5 with one of three selectable models, picked via `[indexing].model` in settings: [embedder-fastembed-v5, embedder-model-selectable]
 
-Choice rationale:
+| `model` id | fastembed variant | Dim | Ctx | Notes |
+| --- | --- | --- | --- | --- |
+| `bge-small-en-v1.5` (default) | `EmbeddingModel::BGESmallENV15` | 384 | 512 | English-tuned, ~30MB, CPU-friendly |
+| `bge-m3` | `EmbeddingModel::BGEM3` | 1024 | 8192 | Multilingual (100+ languages), long context, ~1.2GB |
+| `embedding-gemma-300m` | `EmbeddingModel::EmbeddingGemma300M` | 768 | 2048 | Google's 300M-param embedder; ONNX from `onnx-community/embeddinggemma-300m-ONNX` |
 
-- Small enough to ship in the binary or download once on first run; no GPU required.
-- bge-small consistently beats MiniLM-L6 on retrieval benchmarks at similar size.
-- 384 dims keeps the vec table compact (~1.5KB per chunk).
-- English-only is acceptable for v1 personal use; multilingual is a swap-in later (`bge-m3`).
+`bge-small-en-v1.5` stays the default — smallest, fastest, no download surprise on first run. The other two are opt-in for users who want multilingual, longer chunks, or a quality bump. Stored as the model id verbatim in `notes.embedder_version`. [embedder-version-tag, embedder-version-per-model]
 
-Bumping `embedder_version` triggers full re-embed naturally — query for stale rows, regenerate. No migration code needed.
+Bumping `[indexing].model` triggers full re-embed naturally — the `embedder_version` column on every existing row goes stale, and the indexer re-embeds. No migration code needed for the embedding bytes themselves. Dim changes additionally require a schema rebuild — see "Dim-from-model and schema rebuild" below.
 
 Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never block command handlers. [embedder-batch-64]
 
@@ -121,6 +124,19 @@ Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never bl
 **Model storage:** downloaded model files live under the platform data dir (Linux `~/.local/share/hiker/models/`, macOS `~/Library/Application Support/hiker/models/`, Windows `%APPDATA%\hiker\models\`). Use the `directories` crate; do not roll path logic by hand. Treated as durable data rather than cache because re-downloading 30MB on a slow or metered connection is a real cost; users may still delete the directory and the app re-downloads on next launch. [embedder-platform-data-dir]
 
 **First-run UX:** model download is non-blocking. Vault opens normally; the indexer starts but defers any embedding work until the model is on disk. Status bar / settings surface the download progress. Search/related queries return empty with a "indexing not yet ready" indicator until the first batch completes. See `settings.md` for tunables (download timing, model selection, batch size, manual reindex triggers). [embedder-first-run-nonblocking]
+
+**Model load as a queue task.** Both first-run download and hot-swap (`embedder-hot-reload-on-model-change`) can take from seconds (cached) to minutes (cold download of `bge-m3`'s ~1.2GB). To make the work visible, the indexer wraps every `FastembedEmbedder::load_id` call in a task queue row — a new `TaskKind::EmbedderModelLoad { model_id }` enqueued just before the `spawn_blocking` load and marked complete (or failed) when the load returns. The row is **indeterminate**: no byte-progress, no percentage — fastembed v5 doesn't expose a download-progress callback, and the v1 goal is just "the user can see something is happening." Queue badge counts the row like any other task; queue detail page shows the model id and elapsed time. Failed loads stay as a failed-task row with the error so the user can see why the swap didn't take. [embedder-model-load-as-task]
+
+### Dim-from-model and schema rebuild
+
+The `chunk_vecs` vec0 virtual table fixes its embedding column width at `CREATE` time — `embedding float[N]` is baked into the table definition. Different models have different dims (384 / 768 / 1024), so v1's single-`const EMBED_DIM = 384` posture no longer holds. [embedder-dim-from-model]
+
+- `EmbedDim` (a small `usize`-newtype wrapper) is reported by the loaded `Embedder` via `Embedder::dim()`. It's the single source of truth at runtime.
+- `Store::open` reads the on-disk vec0 column dim once at startup. If it matches the loaded embedder's `dim()`, nothing to do. If it differs (or the table doesn't exist yet), the store creates `chunk_vecs` with the new dim before any ingest runs. [store-rebuild-chunk-vecs-on-dim-change]
+- The rebuild path: `DROP TABLE chunk_vecs` → recreate with the new `float[N]` → clear `notes.note_embedding` (different-dim packed f32s are garbage at the new dim) → clear `notes.embedder_version` so the existing per-note re-embed trigger (`embedder-version-tag`) picks them all up on the next ingest pass. Schema-version bump *not* required — the rebuild is observable through the dim mismatch itself, and the `notes` / `chunks` shapes don't change.
+- Reading the on-disk dim: sqlite-vec doesn't expose the vec0 column dim through `PRAGMA table_info` (the declared type slot comes back empty). The store keeps a small `meta(key, value)` sidecar table and writes the active dim into a `chunk_vecs_dim` row whenever `chunk_vecs` is created or recreated. `Store::open` reads it from there; missing row + existing `chunk_vecs` is treated as the legacy 384 case and migrated.
+
+Why drop-and-recreate rather than ALTER: vec0 doesn't support column-type changes, and there's no useful data to preserve — every chunk has to be re-embedded anyway because the embeddings themselves are dim-incompatible. Faster to truncate than to migrate vectors that will all be overwritten.
 
 ### Alternative embedder backends (cloud / Ollama)
 

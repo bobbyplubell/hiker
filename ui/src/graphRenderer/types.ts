@@ -60,6 +60,10 @@ export interface RendererCallbacks {
   /// node, etc.). Sigma's default doubleClick-to-zoom is suppressed
   /// when this fires so the gesture doesn't dual-fire.
   onNodeDoubleClick?: (id: string, ev: { shift: boolean }) => void;
+  /// Right-click (contextmenu) on a node. Consumers can use this to
+  /// open a node-specific menu. The renderer suppresses the browser's
+  /// default context menu when this fires.
+  onNodeRightClick?: (id: string, ev: { clientX: number; clientY: number }) => void;
   onNodeHover?: (id: string | null) => void;
   /// Background (canvas) click, no node hit. Useful for "deselect on
   /// blank click".

@@ -1,0 +1,279 @@
+/* status: queue-detail-shared-page, task-queue-row-pulsing-leased
+   Detail page lives inside `#vault-home` and inherits its padding +
+   typography. Structural elements reuse `.vault-home-header`,
+   `.vault-home-section`, and `.toolbar-btn` so the chrome matches the
+   rest of the home / detail surfaces. */
+.queue-detail-pills {
+  /* Same shape as `.vault-home-filters` (square 4px-radius toolbar
+     buttons), pulled out here only to scope the active-state colors. */
+  margin-bottom: 16px;
+}
+.queue-detail-pills .queue-pill {
+  font-size: 12px;
+  padding: 3px 10px;
+  color: var(--text-muted);
+}
+.queue-detail-pills .queue-pill.active {
+  background: var(--accent-fill);
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+.queue-detail-toggles {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+}
+.queue-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.queue-toggle-label input[type="checkbox"] {
+  margin: 0;
+}
+.queue-toggle-label select.toolbar-btn {
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.queue-toggle-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+  font-style: italic;
+}
+.queue-toggle-status.error { color: var(--danger-text-strong); font-style: normal; }
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border-divider);
+  font-size: 12px;
+}
+.queue-row:first-child { border-top: none; }
+/* Priority pill: square chip matching the same border ramp as other
+   chrome buttons. Color comes from a left-edge accent so the chip
+   itself stays neutral. */
+.queue-pri {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 38px;
+  text-align: center;
+}
+/* status: vault-bar-queue-button — `--queue-pri-high-color` etc. live
+   in the consolidated :root block at the top. */
+.queue-pri-high   { color: var(--queue-pri-high-color); border-color: var(--queue-pri-high-border); }
+.queue-pri-normal { color: var(--text-muted); }
+.queue-pri-low    { color: var(--text-dim); }
+.queue-kind {
+  color: var(--text-strong);
+}
+.queue-summary {
+  color: var(--text-muted);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-state {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.queue-state-ok { color: var(--success-strong); }
+.queue-state-err { color: var(--danger-text-strong); }
+.queue-state-cancelled { color: var(--text-dim); }
+.queue-state-leased { color: var(--text-strong); }
+.queue-pulse-dot {
+  display: inline-block;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  margin-left: 4px;
+  background: currentColor;
+  animation: queue-pulse 1.2s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes queue-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* status: staging-review-top-bar-badge
+   Numeric badge over the vault-bar queue button. Shows combined count
+   (active tasks + pending reviews). Blue pulsing when active tasks exist,
+   static accent when only pending reviews. Dim red dot (no text) for
+   unread failures. */
+.queue-btn-indicator {
+  position: absolute;
+  top: 0px;
+  right: 0px;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  padding: 0 4px;
+  pointer-events: none;
+  color: #fff;
+}
+.queue-btn-indicator.queue-indicator-active {
+  background: var(--queue-active-pulse-color);
+  animation: queue-pulse 1.4s ease-in-out infinite;
+}
+.queue-btn-indicator.queue-indicator-failed {
+  background: var(--queue-pri-high-color);
+  opacity: 0.85;
+}
+#queue-btn { position: relative; }
+
+/* status: task-queue-row-details — click-to-expand panel under each
+   row showing prompt / response / error / metadata. */
+.queue-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+.queue-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.queue-row-clickable .queue-row-head { cursor: pointer; }
+.queue-row.expanded {
+  background: var(--bg-panel-elevated);
+  border-radius: 4px;
+}
+.queue-row-details {
+  padding: 8px 4px 4px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+.queue-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.queue-detail-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.queue-detail-pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-panel-elevated-strong);
+  border: 1px solid var(--border-panel-strong);
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-strong);
+}
+.queue-detail-pre-err {
+  border-color: var(--queue-pri-high-border);
+  color: var(--queue-pri-high-color);
+}
+.queue-detail-pre-meta {
+  color: var(--text-muted);
+}
+.queue-detail-loading,
+.queue-detail-error {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.queue-detail-error { color: var(--queue-pri-high-color); }
+.queue-worker {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.queue-cancel {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+}
+.queue-cancel:hover { color: var(--danger-text-strong); }
+
+/* status: queue-detail-shared-row-primitive */
+.queue-source-badge {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-weight: 500;
+  min-width: 38px;
+  text-align: center;
+}
+
+/* status: note-properties-tab */
+#properties-pane {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.props-section {
+  margin-bottom: 28px;
+}
+.props-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-divider);
+}
+.props-dl {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+.props-dl dt {
+  color: var(--text-muted);
+  text-align: right;
+}
+.props-dl dd {
+  color: var(--text-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.props-empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+

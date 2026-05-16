@@ -49,9 +49,15 @@ use crate::error::HikerError;
 /// stays consistent with the live chunk-vecs table.
 pub const SCHEMA_VERSION: i32 = 7;
 
-/// Embedding dimension for the v1 model (bge-small-en-v1.5). Pinned here so
-/// the schema and the embedder agree.
-pub const EMBED_DIM: usize = 384;
+/// Default embedding dimension — matches the v1 default model
+/// (`bge-small-en-v1.5`). Used as the initial `chunk_vecs` column width on
+/// a brand-new vault and as the dim every test embedder reports. Per-model
+/// dim is the actual source of truth at runtime (`Embedder::dim()`); the
+/// store rebuilds `chunk_vecs` to match via `ensure_chunk_vecs_dim`.
+///
+/// status: embedder-dim-from-model
+pub const DEFAULT_EMBED_DIM: usize = 384;
+
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -397,11 +403,22 @@ pub struct NoteUpsert<'a> {
 pub struct Store {
     conn: Connection,
     db_path: PathBuf,
+    /// Live embedding dimension this store enforces — initialized from the
+    /// on-disk `chunk_vecs` column width (or `DEFAULT_EMBED_DIM` on a
+    /// brand-new vault) and reseated by `ensure_chunk_vecs_dim` if the
+    /// loaded embedder reports a different dim. Source of truth for every
+    /// dim check inside this module; `DEFAULT_EMBED_DIM` is no more.
+    ///
+    /// status: embedder-dim-from-model
+    dim: usize,
 }
 
 impl Store {
     /// Open or create the index db at `<vault_root>/.hiker/index.db`. Runs
     /// idempotent schema setup on a matching version, fails loud on mismatch.
+    /// On a fresh vault the `chunk_vecs` table is created at
+    /// `DEFAULT_EMBED_DIM`; the indexer task reseats it via
+    /// `ensure_chunk_vecs_dim(embedder.dim())` before processing any jobs.
     pub fn open(vault_root: &Path) -> Result<Self, StoreError> {
         register_vec_extension();
         let db_path = vault_root.join(".hiker").join("index.db");
@@ -410,8 +427,15 @@ impl Store {
         }
         let conn = Connection::open(&db_path)?;
         configure_connection(&conn)?;
-        ensure_schema(&conn)?;
-        Ok(Self { conn, db_path })
+        ensure_schema(&conn, DEFAULT_EMBED_DIM)?;
+        let dim = read_chunk_vecs_dim(&conn)?.unwrap_or(DEFAULT_EMBED_DIM);
+        Ok(Self { conn, db_path, dim })
+    }
+
+    /// Live `chunk_vecs` embedding dimension. Equal to the loaded
+    /// `Embedder::dim()` after `ensure_chunk_vecs_dim` has run.
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     /// Open a fresh read-only connection against the same db. Cheap (sub-ms on
@@ -798,7 +822,7 @@ impl Store {
             // the note rather than treating a zero-vector as a real point.
             return Ok(None);
         }
-        let pooled = byte_weighted_mean_pool(&weighted)?;
+        let pooled = byte_weighted_mean_pool(&weighted, self.dim)?;
         let blob = embedding_to_blob(&pooled);
         self.conn.execute(
             "UPDATE notes SET note_embedding = ?1 WHERE id = ?2",
@@ -857,11 +881,12 @@ impl Store {
     /// Atomic upsert: replace any existing chunks + vec rows for this note,
     /// then write the new ones. Single transaction.
     pub fn upsert_note(&mut self, upsert: NoteUpsert<'_>) -> Result<(), StoreError> {
+        let expected = self.dim;
         for (_, emb) in &upsert.chunks {
-            if emb.len() != EMBED_DIM {
+            if emb.len() != expected {
                 return Err(StoreError::EmbedDim {
                     got: emb.len(),
-                    expected: EMBED_DIM,
+                    expected,
                 });
             }
         }
@@ -1380,6 +1405,66 @@ impl Store {
         Ok(n)
     }
 
+    /// Reseat `chunk_vecs` to the dim reported by the loaded embedder.
+    /// Idempotent: a matching on-disk dim is a no-op. A mismatch (or a
+    /// missing table — sqlite returns no rows from `PRAGMA table_info` in
+    /// that case) drops + recreates the vec0 table at the new dim and
+    /// clears every per-note artifact that depends on the prior dim:
+    ///
+    /// - `notes.note_embedding` (packed f32 mean-pool — different-dim
+    ///   bytes are garbage at the new dim, per `cluster-note-embeddings`).
+    /// - `notes.embedder_version` (set to empty string) so the existing
+    ///   `embedder-version-tag` per-note re-embed trigger picks every row
+    ///   up on the next ingest pass.
+    ///
+    /// Called by the indexer task once the embedder has loaded, before
+    /// any ingest runs. Schema-version bump is intentionally not required
+    /// — the rebuild is observable through the dim mismatch itself, and
+    /// the `notes` / `chunks` shapes don't change.
+    ///
+    /// status: store-rebuild-chunk-vecs-on-dim-change
+    pub fn ensure_chunk_vecs_dim(&mut self, expected_dim: usize) -> Result<(), StoreError> {
+        let current = read_chunk_vecs_dim(&self.conn)?;
+        if current == Some(expected_dim) {
+            self.dim = expected_dim;
+            return Ok(());
+        }
+        tracing::info!(
+            current = ?current,
+            expected = expected_dim,
+            "store: rebuilding chunk_vecs at new embedder dim",
+        );
+        let tx = self.conn.transaction()?;
+        // vec0 doesn't support column-type changes; drop and recreate.
+        // `DROP TABLE IF EXISTS` covers both "no such table yet" (fresh
+        // db corner case) and the live mismatch path.
+        tx.execute("DROP TABLE IF EXISTS chunk_vecs", [])?;
+        tx.execute(
+            &format!(
+                "CREATE VIRTUAL TABLE chunk_vecs USING vec0(
+                    chunk_id  TEXT PRIMARY KEY,
+                    embedding float[{expected_dim}]
+                )",
+            ),
+            [],
+        )?;
+        // Per-note caches that are dim-incompatible at the new dim. Pool
+        // bytes get wiped; `embedder_version` gets blanked so the
+        // existing per-note re-embed trigger (`embedder-version-tag`) on
+        // the next ingest catches every row regardless of which model
+        // wrote them.
+        tx.execute("UPDATE notes SET note_embedding = NULL", [])?;
+        tx.execute("UPDATE notes SET embedder_version = ''", [])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('chunk_vecs_dim', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![expected_dim.to_string()],
+        )?;
+        tx.commit()?;
+        self.dim = expected_dim;
+        Ok(())
+    }
+
     /// KNN search. Returns the top-k chunks by similarity to `query`, with
     /// chunks belonging to `exclude_note_id` (if Some) filtered out.
     pub fn knn_chunks(
@@ -1400,10 +1485,11 @@ pub fn knn_chunks_on(
     top_k: usize,
     exclude_note_id: Option<&str>,
 ) -> Result<Vec<ChunkHit>, StoreError> {
-    if query.len() != EMBED_DIM {
+    let expected = read_chunk_vecs_dim(conn)?.unwrap_or(DEFAULT_EMBED_DIM);
+    if query.len() != expected {
         return Err(StoreError::EmbedDim {
             got: query.len(),
-            expected: EMBED_DIM,
+            expected,
         });
     }
     // Pull a wider candidate set than top_k since we filter post-hoc; vec0
@@ -1500,13 +1586,14 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 /// unweighted mean. See `cluster-note-embeddings` in `clustering.md`.
 fn byte_weighted_mean_pool(
     weighted: &[(Vec<f32>, u64)],
+    expected_dim: usize,
 ) -> Result<Vec<f32>, StoreError> {
     debug_assert!(!weighted.is_empty());
     let dim = weighted[0].0.len();
-    if dim != EMBED_DIM {
+    if dim != expected_dim {
         return Err(StoreError::EmbedDim {
             got: dim,
-            expected: EMBED_DIM,
+            expected: expected_dim,
         });
     }
     let mut acc = vec![0.0f32; dim];
@@ -1577,7 +1664,34 @@ fn configure_connection(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
+/// Read the on-disk `chunk_vecs` embedding column dim. Returns `None` when
+/// the dim hasn't been recorded yet (the meta row is missing — fresh db
+/// state before the first `ensure_schema` run).
+///
+/// Implementation note: `PRAGMA table_info(chunk_vecs)` does *not* report
+/// the bracketed `float[N]` type the spec describes — sqlite-vec
+/// `declare_vtab`s the embedding column with an empty type slot (see
+/// sqlite-vec 0.1.x `vec0_init`, which builds `CREATE TABLE x(...
+/// "embedding", distance hidden, k hidden)`). So we persist the dim
+/// ourselves in a tiny `meta` key/value table at `ensure_schema` /
+/// rebuild time, and read it back here. The PRAGMA-based approach in the
+/// original spec would only work against a vec0 release that surfaces
+/// the dim in `table_info`; this is the equivalent guarantee until then.
+///
+/// status: store-rebuild-chunk-vecs-on-dim-change
+fn read_chunk_vecs_dim(conn: &Connection) -> Result<Option<usize>, StoreError> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'chunk_vecs_dim'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row.and_then(|s| s.parse().ok()))
+}
+
+
+fn ensure_schema(conn: &Connection, dim: usize) -> Result<(), StoreError> {
     let user_version: i32 =
         conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version != 0 && user_version != SCHEMA_VERSION {
@@ -1673,8 +1787,22 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS trail_waypoints_source_id       ON trail_waypoints(source_id);
         CREATE INDEX IF NOT EXISTS trail_waypoints_source_path     ON trail_waypoints(source_path);
         CREATE INDEX IF NOT EXISTS trail_waypoints_parent_waypoint ON trail_waypoints(parent_waypoint_id);
+
+        -- status: store-rebuild-chunk-vecs-on-dim-change
+        -- Tiny key/value sidecar for store-wide metadata. Today the only
+        -- key is `chunk_vecs_dim` (the live embedding dim, set by
+        -- ensure_chunk_vecs_dim). vec0 doesn't surface the dim in
+        -- PRAGMA table_info, so we persist it here ourselves. Added
+        -- without a schema-version bump — `CREATE TABLE IF NOT EXISTS`
+        -- makes it forward-compatible with older v7 dbs (they get the
+        -- table on first open and the dim falls back to
+        -- DEFAULT_EMBED_DIM until a model switch forces a rebuild).
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         "#,
-        dim = EMBED_DIM,
+        dim = dim,
     ))?;
 
     if user_version == 0 {
@@ -1684,6 +1812,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
             "store: created index db schema",
         );
     }
+    // Seed the chunk_vecs_dim meta row on first open if it's not already
+    // there. Idempotent: an existing row (any value) is left alone — the
+    // live writer's `ensure_chunk_vecs_dim` is the only path that bumps
+    // it.
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_vecs_dim', ?1)",
+        params![dim.to_string()],
+    )?;
     Ok(())
 }
 
@@ -1723,7 +1859,7 @@ mod tests {
     fn unit_vec(seed: f32) -> Vec<f32> {
         // Deterministic, distinct vectors. Each entry differs from the next by
         // a fixed offset; not unit-norm but fine for L2 KNN tests.
-        (0..EMBED_DIM).map(|i| seed + i as f32 * 0.001).collect()
+        (0..DEFAULT_EMBED_DIM).map(|i| seed + i as f32 * 0.001).collect()
     }
 
     fn fresh_store() -> (tempfile::TempDir, Store) {
@@ -1815,8 +1951,8 @@ mod tests {
         c1.byte_end = 40;
         // Make every dim of c0's embedding 1.0 and c1's 5.0; weighted
         // mean = (10*1 + 30*5) / 40 = 4.0.
-        let e0 = vec![1.0f32; EMBED_DIM];
-        let e1 = vec![5.0f32; EMBED_DIM];
+        let e0 = vec![1.0f32; DEFAULT_EMBED_DIM];
+        let e1 = vec![5.0f32; DEFAULT_EMBED_DIM];
 
         store
             .upsert_note(NoteUpsert {
@@ -1838,7 +1974,7 @@ mod tests {
             .compute_and_store_note_embedding("n.md")
             .unwrap()
             .expect("note has chunks");
-        assert_eq!(pooled.len(), EMBED_DIM);
+        assert_eq!(pooled.len(), DEFAULT_EMBED_DIM);
         for v in &pooled {
             assert!((v - 4.0).abs() < 1e-4, "expected ~4.0, got {v}");
         }
@@ -1848,7 +1984,7 @@ mod tests {
             .note_embedding_for_path("n.md")
             .unwrap()
             .expect("now cached");
-        assert_eq!(cached.len(), EMBED_DIM);
+        assert_eq!(cached.len(), DEFAULT_EMBED_DIM);
         assert!((cached[0] - 4.0).abs() < 1e-4);
 
         // Re-upserting (chunks changed) must clear the pool.
@@ -1861,7 +1997,7 @@ mod tests {
                 size: 5,
                 indexed_at: 1,
                 embedder_version: "test",
-                chunks: vec![(mk_chunk(0, "x"), vec![2.0f32; EMBED_DIM])],
+                chunks: vec![(mk_chunk(0, "x"), vec![2.0f32; DEFAULT_EMBED_DIM])],
             })
             .unwrap();
         assert!(store.note_embedding_for_path("n.md").unwrap().is_none());
@@ -2143,7 +2279,7 @@ mod tests {
     fn embed_dim_mismatch_rejected() {
         let (_dir, mut store) = fresh_store();
         let id = new_id();
-        let bad = vec![0.0_f32; EMBED_DIM - 1];
+        let bad = vec![0.0_f32; DEFAULT_EMBED_DIM - 1];
         let res = store.upsert_note(NoteUpsert {
             id: &id,
             path: "x.md",

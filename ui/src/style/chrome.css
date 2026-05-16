@@ -1,0 +1,361 @@
+
+/* ============================================================
+   TS-side helpers — class hooks for *.ts modules that previously
+   set `el.style.color = "#hex"` directly. The class assigns the
+   color from a token so retheming flows through :root above.
+   ============================================================ */
+.txt-muted { color: var(--text-muted); }
+
+#vault-bar,
+#editor-toolbar,
+#discovery-bar,
+#sidebar-mode-switcher {
+  box-sizing: border-box;
+  height: var(--top-bar-height);
+}
+
+#status-bar,
+#trash-header,
+#chat-resize-handle {
+  box-sizing: border-box;
+  height: var(--bottom-bar-height);
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+/* status: four-region-layout, top-strip-layout
+   Top strip across the full width, then the existing three-column grid
+   below. The top strip auto-sizes to its content; the body row absorbs
+   the rest of the viewport (1fr) so collapsing the sidebar / discovery
+   panel still works exactly as before. */
+#app {
+  /* status: side-panel-resize — column widths come from these vars so
+     the resize-handle drag can update them live; defaults match the
+     prior fixed pixel widths. `set_setting("vault.sidebar_width" /
+     "vault.discovery_width", ...)` persists per-vault. */
+  --sidebar-width: 280px;
+  --discovery-width: 320px;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr var(--discovery-width);
+  grid-template-rows: auto 1fr;
+}
+
+#top-strip {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default);
+  font-size: 12px;
+  box-sizing: border-box;
+  height: var(--top-bar-height);
+  /* The strip is the OS title bar (decorations: false in tauri.conf).
+     `data-tauri-drag-region` on the element handles the drag itself;
+     this rule kills the I-beam cursor over empty space so the affordance
+     reads as draggable chrome rather than selectable text. */
+  cursor: default;
+  user-select: none;
+}
+
+/* Custom window controls (Min / Max / Close) shown in the top strip
+   because the OS chrome is gone. */
+#window-controls {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+.win-ctrl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 100%;
+  min-height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.win-ctrl:hover {
+  background: var(--surface-hover);
+}
+.win-ctrl-close:hover {
+  background: var(--danger-close-hover);
+  color: white;
+}
+
+#top-strip-leading {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+#top-strip-leading > button {
+  flex-shrink: 0;
+}
+
+/* Repositioned vault-path label sits between the leading cluster and the
+   tab strip. status: ui-no-sibling-pushout. */
+#top-strip > #vault-path {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 30%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+}
+
+/* status: editor-tab-strip — fills the rest of the row. */
+#tab-strip {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+#tab-strip::-webkit-scrollbar {
+  height: 4px;
+}
+
+/* status: editor-tab-strip / -active-state / -dirty-marker / -overflow
+   Flat tabs with a uniform bottom border (not folder-tab style). Border
+   on every tab; no fill when inactive; grey fill on active. */
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 180px;
+  min-width: 6ch;
+  max-width: 240px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+}
+.tab:hover {
+  background: var(--surface-hover-soft);
+}
+.tab--active {
+  background: var(--surface-active);
+  color: var(--text-strong);
+}
+.tab-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* status: editor-preview-tab — italic title for preview tabs only. */
+.tab--preview .tab-label {
+  font-style: italic;
+}
+.tab-folder-hint {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: 4px;
+}
+.tab-close {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 2px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+.tab-close:hover {
+  background: var(--surface-active);
+}
+.tab-dirty-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+/* On hover, swap the dirty dot for a close × per editor-tab-dirty-marker. */
+.tab:hover .tab-dirty-dot {
+  display: none;
+}
+.tab:not(:hover) .tab-close-shadow {
+  display: none;
+}
+
+#app.sidebar-collapsed {
+  grid-template-columns: 0 1fr var(--discovery-width);
+}
+
+#app.related-collapsed {
+  grid-template-columns: var(--sidebar-width) 1fr 0;
+}
+
+#app.sidebar-collapsed.related-collapsed {
+  grid-template-columns: 0 1fr 0;
+}
+
+/* status: side-panel-resize — 4px drag handle absolutely positioned over
+   the inner edge of each side column. Sits on top of any column content
+   (z-index above the panel chrome). The collapsed-column rules below
+   hide both panels wholesale, which already hides the handle with them. */
+#sidebar-resize-handle,
+#discovery-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  z-index: 10;
+  cursor: col-resize;
+  background: transparent;
+  user-select: none;
+}
+#sidebar-resize-handle {
+  right: 0;
+}
+#discovery-resize-handle {
+  left: 0;
+}
+#sidebar-resize-handle:hover,
+#sidebar-resize-handle.dragging,
+#discovery-resize-handle:hover,
+#discovery-resize-handle.dragging {
+  background: var(--accent);
+}
+
+#sidebar,
+#discovery {
+  overflow: hidden;
+  transition: visibility 0.1s;
+}
+
+#app.sidebar-collapsed #sidebar {
+  visibility: hidden;
+}
+
+#app.related-collapsed #discovery {
+  visibility: hidden;
+}
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-default);
+  min-height: 0;
+  position: relative;
+}
+
+#vault-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default);
+  font-size: 12px;
+}
+
+#vault-bar > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* status: tab-kinds — renderActiveTab() in main.ts manages visibility of all
+   center-pane content (CM6 editor, toolbar, status bar, vault home, settings,
+   queue, properties) based on activeKind(). The prior .home-view / .settings-view
+   CSS class-based visibility rules are replaced by hidden-attribute toggles. */
+
+#editor-pane #editor {
+  /* shown/hidden by renderActiveTab() */
+}
+#vault-home {
+  /* shown/hidden by renderActiveTab() */
+}
+#settings-pane {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.settings-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.settings-header h1 {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0;
+  color: var(--text-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.settings-card {
+  margin-bottom: 24px;
+  border: 1px solid var(--border-divider);
+  border-radius: 4px;
+  padding: 0;
+}
+.settings-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid var(--border-divider);
+}
+.settings-card.collapsed .settings-card-header {
+  border-bottom: none;
+}
+.settings-card-chevron {
+  width: 12px;
+  display: inline-block;
+  text-align: center;
+  color: var(--text-muted);
+}
+.settings-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  flex: 1;
+  min-width: 0;
+}
+.settings-card-deferred-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  flex-shrink: 0;
+}

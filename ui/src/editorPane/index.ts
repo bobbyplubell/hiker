@@ -308,15 +308,14 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     formatError,
   });
 
-  // ---- Patch-review hunk decorations ----
-  // status: patch-review-mode
-  const patchReview: PatchReviewApi = mountPatchReview({
-    dispatch: editor.dispatch,
-    acceptHunk: onPatchReviewAcceptHunk,
-    rejectHunk: onPatchReviewRejectHunk,
-  });
-
   // ---- Mutations menu (wand button) ----
+  //
+  // Declared before `mountPatchReview` because mountPatchReview
+  // synchronously dispatches an editor transaction during setup, which
+  // fan-outs through the editor's `onAfterStatus` callback — that
+  // callback closes over `mutationsMenu` and previously hit a TDZ
+  // (`Cannot access 'mutationsMenu' before initialization`) when
+  // bootstrap ran in this order.
 
   const mutationsMenu: MutationsMenuApi = mountMutationsMenu(
     {
@@ -340,6 +339,14 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
       },
     },
   );
+
+  // ---- Patch-review hunk decorations ----
+  // status: patch-review-mode
+  const patchReview: PatchReviewApi = mountPatchReview({
+    dispatch: editor.dispatch,
+    acceptHunk: onPatchReviewAcceptHunk,
+    rejectHunk: onPatchReviewRejectHunk,
+  });
 
   // ---- Buffer-scoped toolbar wiring ----
 

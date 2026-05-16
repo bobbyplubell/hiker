@@ -44,7 +44,9 @@ import { showToast } from "../widgets/toast";
 import { Icons } from "../icons";
 import {
   Api,
+  onDragStateChange,
   renderMultiSelectToolbar,
+  renderPromoteBand,
   renderSiblingsWithOutliers,
   type ClusterNodeRow,
   type TreeRowDeps,
@@ -247,6 +249,12 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
     if (state.open) {
       const body = document.createElement("div");
       body.className = "ce-tree-body";
+      // status: cluster-editor-dnd-visual-feedback
+      // Promote-to-top band renders above the tree's root list while a
+      // drag is in flight; surfaces below the band still receive drop
+      // events normally.
+      const band = renderPromoteBand(state, rowDeps(state));
+      if (band) body.appendChild(band);
       const rootNodes = state.nodes.filter((n) => n.parent === null);
       const renderedRoot = renderSiblingsWithOutliers(state, rowDeps(state), rootNodes, 0);
       for (const el of renderedRoot) body.appendChild(el);
@@ -351,6 +359,11 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
     ];
     openContextMenu(rect.right, rect.bottom, items, triggerEl);
   }
+
+  // status: cluster-editor-dnd-visual-feedback
+  // Re-paint when a drag starts or ends so the promote-to-top band
+  // surfaces and tears down without polling.
+  onDragStateChange(() => paint());
 
   // Initial load.
   void refresh();

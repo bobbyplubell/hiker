@@ -1,0 +1,155 @@
+/* status: settings-pane-scope-toggle */
+.settings-scope-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.settings-scope-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.settings-scope-toggle button.active {
+  background: var(--accent-fill);
+  color: var(--text-strong);
+}
+.settings-card-body {
+  padding: 4px 0;
+}
+.settings-card.collapsed .settings-card-body {
+  display: none;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  min-height: 28px;
+}
+.settings-row:nth-child(odd) {
+  background: var(--bg-zebra);
+}
+.settings-row-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+.settings-row-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: block;
+  margin-top: 2px;
+}
+.settings-row-control {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-row-readonly {
+  font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, monospace);
+  color: var(--text-muted);
+  font-size: 12px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* status: settings-pane-readonly-display */
+.settings-row-info {
+  background: transparent;
+  border: 1px solid var(--border-input);
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+/* status: settings-pane-reset-row */
+.settings-row-reset {
+  background: transparent;
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+.settings-row-reset:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+/* Match the shared input shape used by `#search-input` / `.chat-input`:
+   transparent over the surrounding card bg, soft `--border-strong` border,
+   accent focus outline. Keeps every form field in the app on one set of tokens. */
+.settings-row-input {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: inherit;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.settings-row-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.settings-row-input[type="number"] {
+  width: 64px;
+}
+.settings-row-checkbox {
+  width: 14px;
+  height: 14px;
+}
+.settings-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-divider);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.settings-footer .schema {
+  flex: 1;
+}
+.settings-footer button {
+  background: transparent;
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  color: var(--text-strong);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.settings-popover {
+  position: fixed;
+  background: var(--bg-popover);
+  border: 1px solid var(--border-input);
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-strong);
+  z-index: 1000;
+  max-width: 360px;
+  box-shadow: 0 4px 12px var(--shadow-strong);
+}
+.settings-popover .source {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+.settings-popover button {
+  margin-top: 8px;
+}

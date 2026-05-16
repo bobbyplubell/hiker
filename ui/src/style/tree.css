@@ -1,0 +1,442 @@
+/* status: staging-accept-reject-from-tree */
+#tree li.staging-new {
+  color: var(--text-dim);
+  font-style: italic;
+}
+#tree li.staging-dirty::after {
+  content: " ●";
+  color: var(--warn);
+}
+
+/* status: tree-row-unsupported-marker / tree-row-skipped-marker / tree-row-queued-marker
+   Index-state dot lives in a child .ix-marker span, suffixed onto the
+   filename so it sits next to the dirty dot (li::after) without colliding
+   for the single ::after slot. Color comes from the row's ix-* class. */
+#tree li > .ix-marker {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-radius: 50%;
+}
+#tree li.ix-unsupported > .ix-marker {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+}
+#tree li.ix-skipped > .ix-marker {
+  background: var(--warn);
+}
+#tree li.ix-queued > .ix-marker {
+  background: var(--accent);
+  animation: ix-queued-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ix-queued-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* status: trail-row-icon — squiggly-trail glyph prefixed onto trail-doc
+   rows in the file tree. Muted by default, accent on row hover /
+   selection so trail-docs read as ordinary md notes with a hint of
+   provenance. */
+#tree li > .tree-trail-icon {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+  color: var(--fg-muted);
+  opacity: 0.75;
+}
+#tree li:hover > .tree-trail-icon,
+#tree li.active > .tree-trail-icon {
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* status: trail-row-dropdown-chevron — caret next to the trail icon
+   that toggles inline waypoint expansion. Same chevron glyph the
+   folder rows use, just placed via a child span (the folder rows
+   carry it inline in the text node). */
+#tree li > .tree-trail-chevron {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 0.85em;
+}
+#tree li > .tree-trail-chevron:hover {
+  color: var(--accent);
+}
+
+/* Inline waypoint children. Indented to read as nested under the
+   trail-doc row; mirrors the folder-children indentation already
+   provided by the global `#tree ul ul` rules. */
+#tree .tree-trail-children > ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 1.25em;
+}
+#tree li.tree-trail-waypoint {
+  color: var(--fg-muted);
+}
+#tree li.tree-trail-waypoint:hover {
+  color: var(--fg);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-overlay-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-dialog {
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px var(--shadow-strong);
+  padding: 20px;
+  min-width: 360px;
+  max-width: 520px;
+  font-size: 13px;
+}
+
+.modal-message {
+  margin: 0 0 16px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.modal-btn {
+  font: inherit;
+  padding: 6px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.modal-btn:hover {
+  background: var(--surface-hover);
+}
+
+.modal-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.modal-btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.modal-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.modal-btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: white;
+}
+
+.modal-btn-danger:hover {
+  background: var(--danger-hover);
+}
+
+/* status: tree-context-menu */
+.ctx-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 160px;
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px var(--shadow-strong);
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 14px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ctx-menu-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: white;
+}
+
+.ctx-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* status: editor-view-options-menu — checkable rows reserve room for a
+   leading checkmark so checked/unchecked items align horizontally. */
+.ctx-menu-item.checkable {
+  padding-left: 28px;
+  position: relative;
+}
+
+.ctx-menu-item.checkable.checked::before {
+  content: "✓";
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+}
+
+.ctx-menu-item.danger {
+  color: var(--danger);
+}
+
+.ctx-menu-item.danger:hover {
+  background: var(--danger);
+  color: white;
+}
+
+/* status: search-mode-options-menu — slider / number / radio row shapes
+   for the lexical and semantic options popovers. Same horizontal padding
+   as `.ctx-menu-item` so checkable booleans and option rows can stack
+   without visual jank. */
+.ctx-menu-row {
+  padding: 6px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ctx-menu-row-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-default);
+}
+
+.ctx-menu-row-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.ctx-menu-slider input[type="range"] {
+  width: 100%;
+  margin: 0;
+}
+
+.ctx-menu-number input[type="number"] {
+  width: 56px;
+  padding: 2px 4px;
+  background: var(--bg-app);
+  color: inherit;
+  border: 1px solid var(--border-input);
+  border-radius: 4px;
+  font: inherit;
+}
+
+.ctx-menu-radio-group {
+  display: flex;
+  gap: 4px;
+}
+
+.ctx-menu-radio-btn {
+  flex: 1;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.ctx-menu-radio-btn:hover {
+  background: var(--surface-hover);
+}
+
+.ctx-menu-radio-btn.active {
+  background: var(--accent);
+  color: var(--accent-on-strong);
+  border-color: var(--accent);
+}
+
+#toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--bg-toast);
+  color: white;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px var(--shadow-strong);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: none;
+  z-index: 1200;
+  max-width: 360px;
+}
+
+#toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+#toast .toast-message {
+  margin-right: 12px;
+}
+
+#toast .toast-action {
+  font: inherit;
+  background: transparent;
+  color: var(--accent);
+  border: 0;
+  padding: 0 4px;
+  cursor: pointer;
+  text-transform: uppercase;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+
+#toast .toast-action:hover {
+  color: var(--accent-link-hover);
+}
+
+/* status: tree-trash-bin */
+#trash-bin {
+  border-top: 1px solid var(--border-default);
+  font-size: 12px;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
+#trash-header {
+  padding: 6px 10px;
+  cursor: pointer;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#trash-header .trash-icon {
+  flex: 0 0 auto;
+}
+
+#trash-header:hover {
+  background: var(--surface-hover-soft);
+}
+
+#trash-bin.collapsed #trash-list {
+  display: none;
+}
+
+#trash-list {
+  padding: 2px 0 6px;
+}
+
+.trash-row {
+  padding: 4px 12px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.trash-row:hover {
+  background: var(--surface-hover-soft);
+}
+
+.trash-row.active {
+  background: var(--accent-fill-strong);
+  border-left-color: var(--accent);
+}
+
+.trash-row.orphaned .trash-row-main {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.trash-row-main {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.trash-row-meta {
+  font-size: 11px;
+  opacity: 0.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* status: tree-trash-preview, snapshot-preview-mode
+   Mode-specific controls live in the editor toolbar's center cluster
+   (#mode-controls) instead of separate colored banners. Quieter — same
+   icon-only language as the rest of the toolbar. */
+#mode-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+#mode-controls .mode-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 360px;
+}
+#mode-controls .mode-label .mode-id {
+  color: var(--text-muted);
+  opacity: 0.65;
+  margin-left: 6px;
+}
+.status-snapshot-id {
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* status: diff-renderer
+   Diff is no longer its own pane — the renderer paints into the main
+   editor's CM6 view. The decoration classes (cm-diff-add / cm-diff-del /
+   cm-diff-sep) are registered as a CM6 `baseTheme` from `diffTheme` in
+   `ui/src/diff/index.ts`; nothing extra needs to live here. */
+

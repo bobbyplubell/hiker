@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -17,10 +17,36 @@ use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
 use crate::chunker::{Chunker, MarkdownChunker, TxtChunker};
-use crate::embed::{Embedder, EmbedError};
+use crate::embed::{Embedder, EmbedError, FastembedEmbedder};
 use crate::hash::hash_str;
 use crate::store::{new_id, NoteUpsert, Store, StoreError};
 use crate::watcher::{is_ignored, FileEvent};
+
+/// Submit a `TaskKind::EmbedderModelLoad` row to the queue around an
+/// active `FastembedEmbedder::load_id` call. Returns the row's task id;
+/// the caller resolves it via `Queue::submit_result` / `Queue::fail`
+/// when the underlying `spawn_blocking` load returns.
+///
+/// status: embedder-model-load-as-task
+async fn submit_embedder_load_task(
+    queue: &Arc<crate::tasks::Queue>,
+    model_id: &str,
+) -> crate::tasks::TaskId {
+    use crate::tasks::{Priority, Task, TaskKind, TaskPayload, TaskShape};
+    let task = Task {
+        id: String::new(), // queue stamps a ULID
+        kind: TaskKind::EmbedderModelLoad {
+            model_id: model_id.to_string(),
+        },
+        priority: Priority::High,
+        shape: TaskShape::Direct,
+        payload: TaskPayload::default(),
+        output_schema: None,
+        submitted_at: std::time::SystemTime::now(),
+        metadata: serde_json::Value::Null,
+    };
+    queue.submit_self_managed(task).await
+}
 
 const PROGRESS_CAPACITY: usize = 256;
 /// Max markdown size we'll attempt to index, in bytes. Larger files are
@@ -82,6 +108,21 @@ pub enum IndexJob {
     ///
     /// status: note-access-tracking
     TouchAccess { rel_path: String, ts: i64 },
+    /// Hot-swap the loaded embedder to `model_id`. The indexer loads the
+    /// new `FastembedEmbedder` via `spawn_blocking`; on success it swaps
+    /// the live `Arc<dyn Embedder>` (visible to the search-query embedder
+    /// via the same cell — see `IndexerHandle::embedder`), reseats
+    /// `chunk_vecs` to the new dim via `store.ensure_chunk_vecs_dim`, and
+    /// enqueues a full vault reindex. On failure the old embedder stays
+    /// loaded and the caller (typically `set_setting`) is expected to
+    /// roll back any on-disk TOML write. Reply oneshot returns the
+    /// outcome.
+    ///
+    /// status: embedder-hot-reload-on-model-change
+    ReloadEmbedder {
+        model_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+    },
 }
 
 /// Snapshot of indexer state, served to the UI on demand.
@@ -138,13 +179,18 @@ pub struct IndexerHandle {
     /// mpsc, recv'd, or actively processing). Backs the Queued tree-row
     /// marker via `tauri-cmd-file-index-state`.
     pending: Arc<Mutex<HashSet<String>>>,
-    /// Filled by the indexer task once `embedder_loader` resolves.
-    /// Exposed via `embedder()` so the search command can embed query
-    /// strings off the same loaded model without re-loading. Stays
-    /// `None` while the model is loading and after a load failure
-    /// (search returns empty until ready, mirroring the
-    /// `embedder-first-run-nonblocking` posture).
-    embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Filled by the indexer task once `embedder_loader` resolves; later
+    /// hot-swapped on `IndexJob::ReloadEmbedder`. Exposed via `embedder()`
+    /// so the search command can embed query strings off the same loaded
+    /// model without re-loading. Stays `None` while the model is loading
+    /// and after a load failure (search returns empty until ready,
+    /// mirroring the `embedder-first-run-nonblocking` posture).
+    ///
+    /// RwLock (not OnceCell) so `ReloadEmbedder` can replace the inner
+    /// Arc in place; readers see the swap on their next `embedder()` call.
+    ///
+    /// status: embedder-hot-reload-on-model-change
+    embedder: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     /// Late-bound watcher reference, used by the trails auto-update path
     /// (`trail-auto-update-on-note-move`). Filled by the host (Tauri /
     /// CLI) via `attach_watcher` after both the indexer and the watcher
@@ -230,18 +276,21 @@ impl IndexerHandle {
 
     /// Loaded embedder, or `None` while the model is still loading or
     /// after a load failure. Cheap clone (Arc); intended for the search
-    /// command's query-string embedding hop.
+    /// command's query-string embedding hop. Picks up the latest
+    /// hot-swapped model on each call (`embedder-hot-reload-on-model-change`).
     pub fn embedder(&self) -> Option<Arc<dyn Embedder>> {
-        self.embedder.get().cloned()
+        self.embedder.read().ok().and_then(|g| g.clone())
     }
 
     /// Closure form of `embedder()` — usable across module boundaries
-    /// without exporting the `OnceCell` type. The returned closure clones
-    /// the inner Arc on each call (cheap), or yields `None` while the
-    /// model is still loading or after a load failure.
+    /// without exporting the cell type. The returned closure clones the
+    /// inner Arc on each call (cheap), or yields `None` while the model
+    /// is still loading or after a load failure. Reads the live cell on
+    /// every invocation so a `ReloadEmbedder` swap is visible to existing
+    /// holders of the provider.
     pub fn embedder_provider(&self) -> Arc<dyn Fn() -> Option<Arc<dyn Embedder>> + Send + Sync> {
         let cell = self.embedder.clone();
-        Arc::new(move || cell.get().cloned())
+        Arc::new(move || cell.read().ok().and_then(|g| g.clone()))
     }
 
     pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressEvent> {
@@ -301,6 +350,21 @@ impl IndexerHandle {
     }
 }
 
+/// Optional task-queue plumbing for the indexer. When `Some`, every
+/// `FastembedEmbedder::load_id` call inside the indexer task (first-run
+/// startup + hot-reload on `[indexing].model` change) is wrapped in a
+/// `TaskKind::EmbedderModelLoad` row so the UI can surface the work.
+/// Hosts that don't have a task queue (CLI, tests) pass `None`.
+///
+/// status: embedder-model-load-as-task
+pub struct EmbedderLoadTaskPlumbing {
+    pub queue: Arc<crate::tasks::Queue>,
+    /// Model id used for the startup load. Hot-reload calls pass their
+    /// own id via the `ReloadEmbedder` job payload — this field is just
+    /// the seed for the very first load.
+    pub initial_model_id: String,
+}
+
 /// Construct the indexer. The embedder begins loading on a blocking thread
 /// immediately; jobs queued before load completes wait until it does.
 ///
@@ -315,12 +379,27 @@ pub fn start_indexer<F>(
 where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
+    start_indexer_with_tasks(vault, store, embedder_loader, None)
+}
+
+/// Same as `start_indexer` but threads a task-queue handle + the
+/// initial model id into the loop so the embedder-load work surfaces
+/// in the queue. status: embedder-model-load-as-task
+pub fn start_indexer_with_tasks<F>(
+    vault: crate::vault::Vault,
+    store: Store,
+    embedder_loader: F,
+    tasks: Option<EmbedderLoadTaskPlumbing>,
+) -> IndexerHandle
+where
+    F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
+{
     let vault_root = vault.root().to_path_buf();
     let (tx, rx) = mpsc::channel::<IndexJob>(256);
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(PROGRESS_CAPACITY);
     let (status_tx, status_rx) = watch::channel(IndexStatus::default());
     let pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
+    let embedder_cell: Arc<RwLock<Option<Arc<dyn Embedder>>>> = Arc::new(RwLock::new(None));
 
     // Seed total_notes from the store; surface a count failure as
     // last_error rather than silently showing 0 (a corrupted index would
@@ -364,6 +443,7 @@ where
         self_tx,
         watcher_cell_for_task,
         changes_cell_for_task,
+        tasks,
     ));
 
     IndexerHandle {
@@ -388,17 +468,52 @@ async fn indexer_loop<F>(
     progress: broadcast::Sender<ProgressEvent>,
     status: watch::Sender<IndexStatus>,
     pending: Arc<Mutex<HashSet<String>>>,
-    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    embedder_cell: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     self_tx: IndexJobTx,
     watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>>,
+    tasks: Option<EmbedderLoadTaskPlumbing>,
 ) where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
     // Load the embedder on a blocking thread. Until it returns, jobs queue
     // up in the mpsc channel without being processed.
+    //
+    // status: embedder-model-load-as-task
+    // Wrap the load in a queue task (if the host provided one) so the
+    // user gets a visible row for the work — first-run downloads can
+    // take minutes on `bge-m3` and the previous silent path left the
+    // user wondering whether anything was happening.
+    // Clone the queue handle out of the plumbing so we can keep using
+    // it for the hot-reload path after the initial load resolves.
+    let tasks_queue: Option<Arc<crate::tasks::Queue>> = tasks.as_ref().map(|p| p.queue.clone());
+    let load_task_id = if let Some(p) = tasks.as_ref() {
+        Some(submit_embedder_load_task(&p.queue, &p.initial_model_id).await)
+    } else {
+        None
+    };
     let load = tokio::task::spawn_blocking(embedder_loader).await;
-    let embedder: Arc<dyn Embedder> = match load {
+    // status: embedder-model-load-as-task
+    // Resolve the queue row before falling into the success / failure
+    // branches below. Errors on resolve are best-effort — a queue
+    // hiccup shouldn't take down the indexer's startup path.
+    if let (Some(p), Some(id)) = (tasks.as_ref(), load_task_id.as_ref()) {
+        match &load {
+            Ok(Ok(_)) => {
+                let _ = p
+                    .queue
+                    .submit_result(id, serde_json::json!({ "ok": true }))
+                    .await;
+            }
+            Ok(Err(e)) => {
+                let _ = p.queue.fail(id, format!("embedder load: {e}")).await;
+            }
+            Err(e) => {
+                let _ = p.queue.fail(id, format!("embedder spawn: {e}")).await;
+            }
+        }
+    }
+    let mut embedder: Arc<dyn Embedder> = match load {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "indexer: embedder load failed");
@@ -441,6 +556,12 @@ async fn indexer_loop<F>(
                     }
                     IndexJob::FullScan { .. } => None,
                     IndexJob::TouchAccess { .. } => None,
+                    IndexJob::ReloadEmbedder { reply, .. } => {
+                        let _ = reply.send(Err(crate::error::HikerError::Io(
+                            "embedder unavailable".into(),
+                        )));
+                        None
+                    }
                 };
                 if path.is_some() {
                     let _ = progress.send(ProgressEvent::Error {
@@ -456,16 +577,27 @@ async fn indexer_loop<F>(
             return;
         }
     };
+    // status: store-rebuild-chunk-vecs-on-dim-change
+    // Reseat the `chunk_vecs` table to the loaded embedder's dim before any
+    // ingest runs. No-op when the on-disk dim already matches (the common
+    // case); otherwise drops + recreates the vec0 table and clears the
+    // per-note caches that go stale at the new dim.
+    if let Err(e) = store.ensure_chunk_vecs_dim(embedder.dim()) {
+        tracing::error!(error = %e, "indexer: ensure_chunk_vecs_dim failed");
+        update_status(&status, |s| {
+            s.last_error = Some(format!("chunk_vecs rebuild: {e}"));
+        });
+    }
     update_status(&status, |s| {
         s.model_ready = true;
         s.last_error = None;
     });
     // Publish the loaded embedder so search/related callers can embed
-    // query strings off the same model. `set` only fails if the cell was
-    // already filled (we never fill it elsewhere), so the error is unreachable
-    // — log defensively and move on rather than panicking.
-    if embedder_cell.set(embedder.clone()).is_err() {
-        tracing::error!("indexer: embedder OnceCell already filled");
+    // query strings off the same model. `ReloadEmbedder` later swaps the
+    // inner Arc in place; the cell stays alive across model changes.
+    match embedder_cell.write() {
+        Ok(mut guard) => *guard = Some(embedder.clone()),
+        Err(_) => tracing::error!("indexer: embedder cell lock poisoned at init"),
     }
     tracing::info!(
         embedder_version = embedder.version(),
@@ -525,6 +657,25 @@ async fn indexer_loop<F>(
                     });
                 }
             },
+            // status: embedder-hot-reload-on-model-change
+            // Handled inline (not via `handle_simple_job`) so the new
+            // model can be assigned to the loop-local `embedder`
+            // binding; subsequent jobs see the swap immediately.
+            IndexJob::ReloadEmbedder { model_id, reply } => {
+                handle_reload_embedder(
+                    &mut embedder,
+                    &embedder_cell,
+                    &mut store,
+                    &status,
+                    &progress,
+                    &self_tx,
+                    &pending,
+                    model_id,
+                    reply,
+                    tasks_queue.as_ref(),
+                )
+                .await;
+            }
             other => {
                 handle_simple_job(
                     &vault,
@@ -546,6 +697,146 @@ async fn indexer_loop<F>(
         // Job done — published queue depth now reflects only the still-queued
         // jobs (no in-flight bump until the next recv).
         update_queue_count_idle(&status, &rx);
+    }
+}
+
+/// Handle `IndexJob::ReloadEmbedder` — load a fresh `FastembedEmbedder` for
+/// `model_id` on `spawn_blocking`, and on success swap the live embedder
+/// (loop-local binding + the shared cell observed by the search-query
+/// embedder), reseat `chunk_vecs` to the new dim, and enqueue a full
+/// `force = true` reindex so every note re-embeds against the new model.
+///
+/// Failure semantics (the "load embedder first, write TOML only on
+/// success" posture used by `set_setting`): if the load fails, the old
+/// embedder stays loaded (loop-local + cell untouched), the reply
+/// returns `Err`, and no reindex is enqueued. If the load succeeds but
+/// `ensure_chunk_vecs_dim` fails afterward, the new embedder is left in
+/// place (we've already committed to it from the caller's perspective)
+/// and the dim-rebuild error surfaces through both the reply and
+/// `last_error`; the reindex still enqueues so the next run gets
+/// another shot. Same-id reloads short-circuit and return Ok without
+/// touching anything.
+///
+/// status: embedder-hot-reload-on-model-change
+#[allow(clippy::too_many_arguments)]
+async fn handle_reload_embedder(
+    embedder: &mut Arc<dyn Embedder>,
+    embedder_cell: &Arc<RwLock<Option<Arc<dyn Embedder>>>>,
+    store: &mut Store,
+    status: &watch::Sender<IndexStatus>,
+    progress: &broadcast::Sender<ProgressEvent>,
+    self_tx: &IndexJobTx,
+    pending: &Arc<Mutex<HashSet<String>>>,
+    model_id: String,
+    reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+    tasks: Option<&Arc<crate::tasks::Queue>>,
+) {
+    // Same model id → no-op. The set_setting caller already short-circuits
+    // on identical TOML values, but defensive: a redundant ReloadEmbedder
+    // (e.g. from a future MCP path or test) shouldn't tear down chunk_vecs.
+    //
+    // status: embedder-model-load-as-task
+    // The queue submit happens *after* the short-circuit so a redundant
+    // reload doesn't create an empty / instantly-complete row.
+    if embedder.version() == model_id {
+        let _ = reply.send(Ok(()));
+        return;
+    }
+    tracing::info!(
+        from = embedder.version(),
+        to = %model_id,
+        "indexer: hot-reloading embedder",
+    );
+    // Enqueue a queue row for the load so the user sees the work in the
+    // queue badge / detail page.
+    let load_task_id = if let Some(q) = tasks {
+        Some(submit_embedder_load_task(q, &model_id).await)
+    } else {
+        None
+    };
+    let id_for_load = model_id.clone();
+    let load = tokio::task::spawn_blocking(move || {
+        FastembedEmbedder::load_id(&id_for_load).map(|e| {
+            let arc: Arc<dyn Embedder> = Arc::new(e);
+            arc
+        })
+    })
+    .await;
+    // Resolve the queue row up front so a downstream `ensure_chunk_vecs_dim`
+    // failure doesn't leave the row stuck in Leased. Mirror of the startup
+    // path's resolve.
+    if let (Some(q), Some(id)) = (tasks, load_task_id.as_ref()) {
+        match &load {
+            Ok(Ok(_)) => {
+                let _ = q
+                    .submit_result(id, serde_json::json!({ "ok": true }))
+                    .await;
+            }
+            Ok(Err(e)) => {
+                let _ = q.fail(id, format!("embedder reload: {e}")).await;
+            }
+            Err(e) => {
+                let _ = q.fail(id, format!("embedder reload spawn: {e}")).await;
+            }
+        }
+    }
+    let new_embedder: Arc<dyn Embedder> = match load {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            let msg = format!("embedder reload failed: {e}");
+            tracing::error!(error = %e, model = %model_id, "indexer: embedder reload failed");
+            update_status(status, |s| s.last_error = Some(msg.clone()));
+            let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
+            let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
+            return;
+        }
+        Err(e) => {
+            let msg = format!("embedder reload spawn: {e}");
+            tracing::error!(error = %e, "indexer: embedder reload spawn failed");
+            update_status(status, |s| s.last_error = Some(msg.clone()));
+            let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
+            let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
+            return;
+        }
+    };
+    let new_dim = new_embedder.dim();
+    // Swap the live Arc — loop-local first so any same-tick logic uses
+    // it, then the shared cell so the search-query embedder picks it up
+    // on its next read.
+    *embedder = new_embedder.clone();
+    match embedder_cell.write() {
+        Ok(mut guard) => *guard = Some(new_embedder),
+        Err(_) => tracing::error!("indexer: embedder cell lock poisoned on reload"),
+    }
+    // Reseat chunk_vecs to the new dim. Same helper used at indexer
+    // startup; drops + recreates the vec0 table and clears
+    // notes.embedder_version so the upcoming reindex actually re-embeds.
+    if let Err(e) = store.ensure_chunk_vecs_dim(new_dim) {
+        let msg = format!("chunk_vecs rebuild after model swap: {e}");
+        tracing::error!(error = %e, "indexer: ensure_chunk_vecs_dim failed after reload");
+        update_status(status, |s| s.last_error = Some(msg.clone()));
+        let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
+        // The new embedder is already swapped in — the caller has
+        // committed to this model. Report the dim-rebuild failure
+        // but still enqueue the reindex so we don't leave the queue
+        // empty with a half-applied change.
+        let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
+    } else {
+        update_status(status, |s| {
+            s.last_error = None;
+            s.model_ready = true;
+        });
+        let _ = progress.send(ProgressEvent::ModelLoaded);
+        let _ = reply.send(Ok(()));
+    }
+    // Enqueue a full vault reindex with `force = true` so the
+    // (now-cleared) embedder_version short-circuit doesn't keep any
+    // rows from being re-embedded. self_tx tracks pending paths
+    // automatically once per-file Upserts fan out inside the loop.
+    let _ = self_tx; // appease borrow checker — used below
+    let _ = pending; // (the FullScan handler manages pending itself)
+    if let Err(e) = self_tx.send(IndexJob::FullScan { force: true }).await {
+        tracing::warn!(error = %e, "indexer: failed to enqueue post-reload FullScan");
     }
 }
 
@@ -779,6 +1070,11 @@ async fn handle_simple_job(
         }
         IndexJob::FullScan { .. } => {
             unreachable!("FullScan must be handled by the main loop, not handle_simple_job");
+        }
+        IndexJob::ReloadEmbedder { .. } => {
+            unreachable!(
+                "ReloadEmbedder must be handled by the main loop, not handle_simple_job"
+            );
         }
         // status: note-access-tracking
         IndexJob::TouchAccess { rel_path, ts } => {

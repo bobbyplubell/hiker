@@ -14,6 +14,15 @@ cargo test -p hiker-core --lib || fail "cargo test -p hiker-core --lib"
 echo "==> cargo check -p hiker-ui"
 cargo check -p hiker-ui || fail "cargo check -p hiker-ui"
 
+echo "==> cargo clippy (function-length budget, see clippy.toml)"
+cargo clippy --workspace --all-targets -- \
+    -D clippy::too_many_lines \
+    -D clippy::cognitive_complexity \
+    || fail "cargo clippy"
+
+echo "==> file-length budget (see scripts/check-lengths.py)"
+python3 scripts/check-lengths.py || fail "file-length budget"
+
 echo "==> tsc --noEmit (via ui/compose.yaml)"
 ( cd ui && docker compose run --rm --no-deps -T ui ./node_modules/.bin/tsc --noEmit ) \
     || fail "tsc --noEmit"

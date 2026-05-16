@@ -38,7 +38,10 @@ interface TaskKind {
 }
 
 interface WorkerKind {
-  kind: "direct_llm" | "mcp_client";
+  // `indexer` covers self-managed queue rows produced by the indexer
+  // task (currently: `embedder_model_load`).
+  // status: embedder-model-load-as-task
+  kind: "direct_llm" | "mcp_client" | "indexer";
   client_id?: string;
   via?: "external" | "in_process_chat_agent";
 }
@@ -529,11 +532,18 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
   function workerLabel(w?: WorkerKind): string {
     if (!w) return "";
     if (w.kind === "direct_llm") return "Direct LLM";
+    if (w.kind === "indexer") return "Indexer";
     if (w.via === "in_process_chat_agent") return "Chat agent";
     return `External: ${w.client_id ?? "unknown"}`;
   }
 
   function kindSummary(k: TaskKind): string {
+    // status: embedder-model-load-as-task
+    // Show "Loading embedder model: <id>" so the user can see the
+    // first-run download / hot-swap is actually doing something.
+    if (k.type === "embedder_model_load" && typeof k.model_id === "string") {
+      return `Loading embedder model: ${k.model_id}`;
+    }
     if (typeof k.source_path === "string") return k.source_path;
     if (typeof k.cluster_id === "string") {
       return `cluster ${k.cluster_id}`;

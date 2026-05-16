@@ -64,13 +64,53 @@ export type CtxMenuItem =
 
 let openMenuEl: HTMLElement | null = null;
 let openMenuTrigger: HTMLElement | null = null;
+// Document-level listeners installed for the currently-open menu (and the
+// pending setTimeout id used to defer their attachment past the opening
+// click). Tracked at module scope so `closeContextMenu` can deterministically
+// cancel the pending timer and detach already-installed listeners. Without
+// this, a fast close+reopen (e.g. the radio onChange that swaps menu items
+// in place) leaked one pair per cycle: the original cleanup hook was a
+// MutationObserver that disconnected as soon as the menu was removed, but
+// the listeners were still queued for attachment via setTimeout and ran
+// AFTER the observer had detached. The stale listeners then closed any
+// later-opened menu on mousedown, breaking click delivery to its items —
+// the "stuck in graph mode" bug in the cluster editor view-options menu.
+let openAttachTimer: number | null = null;
+let openDocMouseDown: ((ev: MouseEvent) => void) | null = null;
+let openDocKey: ((ev: KeyboardEvent) => void) | null = null;
+
+function detachDocListeners(): void {
+  if (openAttachTimer != null) {
+    window.clearTimeout(openAttachTimer);
+    openAttachTimer = null;
+  }
+  if (openDocMouseDown) {
+    document.removeEventListener("mousedown", openDocMouseDown, true);
+    openDocMouseDown = null;
+  }
+  if (openDocKey) {
+    document.removeEventListener("keydown", openDocKey, true);
+    openDocKey = null;
+  }
+}
 
 export function closeContextMenu(): void {
+  detachDocListeners();
   if (openMenuEl) {
     openMenuEl.remove();
     openMenuEl = null;
   }
   openMenuTrigger = null;
+}
+
+/// True iff a context menu is currently open. When `trigger` is
+/// supplied, narrows the check to "open and anchored at this trigger" —
+/// useful when a caller wants to refresh the menu's contents only if
+/// the menu it owns is still on screen.
+export function isContextMenuOpen(trigger?: HTMLElement): boolean {
+  if (!openMenuEl) return false;
+  if (trigger && openMenuTrigger !== trigger) return false;
+  return true;
 }
 
 export function openContextMenu(
@@ -129,18 +169,19 @@ export function openContextMenu(
       closeContextMenu();
     }
   };
-  setTimeout(() => {
+  // Defer attachment past the opening click (so the same mousedown that
+  // triggered the open doesn't immediately fire the outside-click close).
+  // Both the timer id and the resolved listeners are tracked at module
+  // scope so `closeContextMenu` can cancel/detach deterministically — see
+  // the comment on `openAttachTimer` for why a MutationObserver-based
+  // cleanup isn't sufficient.
+  openAttachTimer = window.setTimeout(() => {
+    openAttachTimer = null;
+    openDocMouseDown = onDocDown;
+    openDocKey = onKey;
     document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onKey, true);
   });
-  const cleanup = new MutationObserver(() => {
-    if (!document.body.contains(menu)) {
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onKey, true);
-      cleanup.disconnect();
-    }
-  });
-  cleanup.observe(document.body, { childList: true });
 }
 
 function buildButton(item: CtxMenuButton): HTMLElement {

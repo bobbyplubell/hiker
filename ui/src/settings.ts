@@ -21,6 +21,7 @@
 // system file manager via `reveal_config_file`.
 
 import { Ipc } from "./ipc";
+import { confirmAccent } from "./widgets/confirm";
 
 // Mirror of `core::config::SettingsScope`. Snake-case for serde.
 export type SettingsScope = "user" | "vault";
@@ -120,6 +121,11 @@ const DEFAULTS = {
     intraline_diff: false,
     tab_size: 2,
   },
+  // status: embedder-model-selectable
+  // Mirror of `IndexingConfig::default()` in core/src/config.rs.
+  indexing: {
+    model: "bge-small-en-v1.5" as const,
+  },
   vault: {
     sidebar_open: true,
     related_open: false,
@@ -184,6 +190,24 @@ const DEFAULTS = {
   },
 } as const;
 
+// Mirror of the fastembed model registry in `core::embed::KNOWN_MODELS`
+// (`embedder-model-selectable`). Order matches the spec table in
+// `docs/index.md`. Used by the model dropdown and by the change-warning
+// modal to render the optional "Dim change" bullet. Kept in sync by hand —
+// the set is fixed at three entries; drift is a one-line check at PR time.
+//
+// status: settings-embedder-model-change-warning
+const EMBEDDER_MODELS: Array<{ id: string; label: string; dim: number }> = [
+  { id: "bge-small-en-v1.5",   label: "bge-small-en-v1.5 (default, 384-dim, English)", dim: 384 },
+  { id: "bge-m3",              label: "bge-m3 (1024-dim, multilingual, 8k context)",   dim: 1024 },
+  { id: "embedding-gemma-300m", label: "embedding-gemma-300m (768-dim)",                dim: 768 },
+];
+
+function embedderModelDim(id: string): number | null {
+  const m = EMBEDDER_MODELS.find((m) => m.id === id);
+  return m ? m.dim : null;
+}
+
 type RowControl =
   | { kind: "bool" }
   | { kind: "enum"; options: Array<[string, string]> }
@@ -246,9 +270,14 @@ const SECTIONS: SectionSpec[] = [
     title: "Indexing",
     defaultScope: "vault",
     rows: [
+      // status: embedder-model-selectable
+      // status: settings-embedder-model-change-warning
+      // Live dropdown; flips are gated by a confirm modal (per spec) that
+      // names the consequences and (when applicable) flags the dim change.
       { key: "indexing.model", label: "Model",
-        desc: "Only bge-small-en-v1.5 is supported in v1.",
-        writeScope: null, control: null },
+        desc: "bge-small-en-v1.5 (default), bge-m3, embedding-gemma-300m.",
+        writeScope: "vault", control: { kind: "enum",
+          options: EMBEDDER_MODELS.map((m) => [m.id, m.label]) } },
       { key: "indexing.batch_size", label: "Batch size",
         writeScope: null, control: null },
       { key: "indexing.ignored_paths", label: "Ignored paths",
@@ -747,6 +776,7 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     if (c.kind === "enum") {
       const sel = document.createElement("select");
       sel.className = "settings-row-input";
+      const prior = String(value ?? "");
       for (const [v, label] of c.options) {
         const opt = document.createElement("option");
         opt.value = v;
@@ -754,7 +784,19 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
         if (String(value) === v) opt.selected = true;
         sel.appendChild(opt);
       }
-      sel.addEventListener("change", () => {
+      sel.addEventListener("change", async () => {
+        const next = sel.value;
+        // status: settings-embedder-model-change-warning
+        // The embedder-model flip is gated by a consequential-confirm
+        // modal. Cancel reverts the dropdown without writing. Same-value
+        // change (defensive) is a no-op.
+        if (row.key === "indexing.model" && next !== prior) {
+          const ok = await confirmEmbedderModelChange(prior, next);
+          if (!ok) {
+            sel.value = prior;
+            return;
+          }
+        }
         void persist(row.key, writeScope, sel.value);
       });
       return sel;
@@ -945,6 +987,32 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   return { isVisible, setVisible, toggle, refresh: render };
+}
+
+// status: settings-embedder-model-change-warning
+// Confirm modal for the embedder-model dropdown. Names the current + new
+// model verbatim, states the re-embed consequence in plain language, only
+// shows the "Dim change" bullet when the two models differ in dim, and
+// hands the user a qualitative time-range estimate (per spec — vault size
+// and CPU vary too widely for a computed number to be honest). Cancel is
+// default-focused inside `confirmAccent`.
+async function confirmEmbedderModelChange(
+  prior: string,
+  next: string,
+): Promise<boolean> {
+  const priorDim = embedderModelDim(prior);
+  const nextDim = embedderModelDim(next);
+  const dimChange = priorDim !== null && nextDim !== null && priorDim !== nextDim;
+  const lines: string[] = [
+    `Switching from ${prior} to ${next} will re-embed every note in this vault.`,
+    "",
+    "• All chunks re-embedded (no chat / search answers from semantic until done)",
+  ];
+  if (dimChange) {
+    lines.push(`• Dim change (${priorDim} → ${nextDim}): the vector table is dropped and recreated`);
+  }
+  lines.push("• Expect minutes to hours depending on vault size and CPU");
+  return confirmAccent(lines.join("\n"), "Change model and re-embed");
 }
 
 // Walk a dotted path through a record and return the leaf value, or

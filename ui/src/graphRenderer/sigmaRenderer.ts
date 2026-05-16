@@ -80,6 +80,24 @@ export function createSigmaRenderer(
       callbacks.onNodeDoubleClick?.(payload.node, { shift });
     });
   }
+  if (callbacks.onNodeRightClick) {
+    sigma.on("rightClickNode", (payload) => {
+      // Suppress the browser's native context menu so the consumer
+      // can paint its own.
+      payload.preventSigmaDefault();
+      const ev = payload.event as unknown as {
+        original?: MouseEvent;
+        x?: number;
+        y?: number;
+      };
+      if (ev?.original) {
+        ev.original.preventDefault?.();
+      }
+      const clientX = ev?.original?.clientX ?? ev?.x ?? 0;
+      const clientY = ev?.original?.clientY ?? ev?.y ?? 0;
+      callbacks.onNodeRightClick?.(payload.node, { clientX, clientY });
+    });
+  }
   if (callbacks.onBackgroundClick) {
     sigma.on("clickStage", () => callbacks.onBackgroundClick?.());
   }

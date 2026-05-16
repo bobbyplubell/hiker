@@ -1,0 +1,7 @@
+# Hard caps; no per-function attribute overrides. Tighten or loosen via
+# this file, never via `#[allow(clippy::too_many_lines)]` at the call
+# site. Loosening is a deliberate posture change, not an agent's escape
+# hatch. See scripts/check.sh.
+
+too-many-lines-threshold = 200
+cognitive-complexity-threshold = 30

@@ -88,11 +88,49 @@ Indexer tunables. Vault-level only is the natural scope (different vaults have d
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
-| `model` | string | `"bge-small-en-v1.5"` | Embedder model id; bumping forces re-embed via `embedder-version-tag`. Other values aren't supported in v1 — declared so the field exists, but anything other than the default fails the strict load until a second model lands |
+| `model` | string | `"bge-small-en-v1.5"` | Embedder model id. One of `bge-small-en-v1.5` (default, 384-dim, English), `bge-m3` (1024-dim, multilingual, 8k context), `embedding-gemma-300m` (768-dim). Strict-load rejects anything else. Bumping forces full re-embed via `embedder-version-tag`; a dim change additionally rebuilds the vec0 table via `store-rebuild-chunk-vecs-on-dim-change`. UI surface: interactive dropdown gated by `settings-embedder-model-change-warning` |
 | `batch_size` | u16 | `64` | Embed batch size; backs the partial `embedder-batch-64` |
 | `ignored_paths` | array of strings | `[]` | Additional ignore patterns on top of the hard-coded list in `watcher-ignore-hardcoded`. gitignore-style globs, evaluated against vault-relative paths. Replaces, doesn't concatenate, per the array-merge rule above |
 
 The destructive **Reindex (rebuild)** verb (`reindex-rebuild-action`) lives here in the *eventual* settings UI per `editor.md`; the verb itself stays planned in `status.md` until the UI shell lands. The CLI counterpart `cli-reindex-rebuild` continues to cover the operational case.
+
+#### Embedder-model change warning [settings-embedder-model-change-warning]
+
+Switching `[indexing].model` is the single most expensive setting flip in the app — every note in the vault has to be re-embedded, and a dim change additionally rebuilds the vec0 table. A pulldown that commits silently would let users trigger hours of CPU work on an accidental click. The model dropdown gates the write through a confirm modal:
+
+```
+┌─ Change embedding model? ─────────────────────────┐
+│                                                   │
+│  Switching from bge-small-en-v1.5 to bge-m3 will  │
+│  re-embed every note in this vault.               │
+│                                                   │
+│  • All chunks re-embedded (no chat / search       │
+│    answers from semantic until done)              │
+│  • Dim change (384 → 1024): the vector table is   │
+│    dropped and recreated                          │
+│  • Expect minutes to hours depending on vault     │
+│    size and CPU                                   │
+│                                                   │
+│  [Cancel]              [Change model and re-embed]│
+└───────────────────────────────────────────────────┘
+```
+
+Cancel is default-focused; the action button carries the standard accent treatment used for other consequential confirms (`confirm3-real-modal`). The "Dim change" bullet is only rendered when the new model's dim differs from the current one — same-dim swaps (e.g. a hypothetical future 384-dim model) omit it.
+
+Body wording rules:
+- Names the *current* model and the *new* model verbatim, so the user can verify they're switching the thing they think they're switching.
+- States the re-embed consequence in plain language; no jargon about `embedder_version` or vec0.
+- The time estimate is a qualitative range, not a computed estimate — vault size and CPU vary too widely for a number to be honest.
+
+Behavior on Confirm:
+1. `set_setting("indexing.model", new_id)` writes through `toml_edit` per `settings-write-back`.
+2. The indexer hot-reloads the embedder in place — no app / vault restart. A new `IndexJob::ReloadEmbedder { model_id }` job goes through the existing mpsc channel; the indexer task loads the new model on `spawn_blocking`, swaps it into the live `Arc<dyn Embedder>` (also visible to the search-query embedder via the `OnceCell` per `search-query-embed-spawn-blocking`), calls `Store::ensure_chunk_vecs_dim(new_dim)` to run any rebuild, then enqueues a vault-wide reindex. [embedder-hot-reload-on-model-change]
+3. The store's dim-check inside that handler (`store-rebuild-chunk-vecs-on-dim-change`) catches the dim mismatch and rebuilds `chunk_vecs` before the first new batch lands.
+4. Status bar reflects the re-embed progress via the existing `status-bar-index-label` machinery, with a transient "Loading <model>…" sub-state while the new model weights download / load.
+
+Behavior on Cancel: the dropdown reverts to the previous value; no write occurs.
+
+The warning is only on the **settings UI** path. Hand-edits to the vault TOML don't surface a warning — strict-load picks up the new value on the *next launch*, the embedder loads at the new model id, and the re-embed runs. (Hot-reload is a UI-driven path only; the TOML hand-edit case is rare enough that "restart to apply" is acceptable, same posture as the rest of `settings-load-once-at-startup`.) Documented in the inline "Notes" comment of the auto-created TOML.
 
 ### [vault] [settings-section-vault]
 
@@ -434,7 +472,7 @@ A vault-bar gear button toggles a settings surface that replaces the editor (sam
 │    Tab size                       [ 2 ] [reset]  │
 │                                                   │
 │  ▾ Indexing                       [User] [Vault] │
-│    Model                bge-small-en-v1.5  ⓘ     │  ← read-only, ⓘ = "edit TOML to change"
+│    Model         [bge-small-en-v1.5 ▾]  [reset]  │  ← dropdown; flip prompts re-embed
 │    Batch size                       64            │  ← read-only
 │    Ignored paths                  [empty]         │  ← read-only
 │                                                   │
@@ -492,7 +530,7 @@ Reserves `settings.open` in `keybind-registry`. Chord: `Cmd-,` on macOS (matches
 - **Theme / font / color-scheme.** Visual customization needs a theme system first; settings UI doesn't ship its own. Lands when theming is real.
 - **Live keybind editor.** The `[keymap]` section is a stub — the loader doesn't yet read keybind overrides per `settings-section-keymap`. Settings UI shows the section header with "no overrides yet" and a one-line pointer to `keybind-registry`. The full editor lands with the loader.
 - **LLM provider / model picker.** Lives behind the deferred `[llm]` section; the settings UI shows the section as deferred. Lands with `llm-providers-config`.
-- **Embedder model picker.** Same shape — `[embedder]` is deferred until a second model lands. The card surfaces it as deferred with a one-line note.
+- **Cloud / Ollama embedder provider picker.** The `[embedder]` *provider* section stays deferred until `embedder-llm-crate-backed` lands. Within-fastembed model selection (bge-small / bge-m3 / embedding-gemma-300m) is live in `[indexing].model` per `embedder-model-selectable`.
 - **ACP agent picker.** Deferred with `core::acp`.
 - **Schema migration UI.** Schema bumps are still hard-fail per `settings-schema-version`; "delete to regenerate" is the workaround. A migration UI is deferred until post-real-use migration is a real concern.
 - **Search across settings.** A search input that filters rows by key/description. Useful at scale; v1 has ~12 interactive keys total — search would be more chrome than benefit.

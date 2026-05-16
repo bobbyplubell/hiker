@@ -1,0 +1,337 @@
+/* status: vault-home-screen */
+#vault-home {
+  overflow: auto;
+  padding: 24px 32px 48px;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.vault-home-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+  border: none;
+  padding: 0;
+  background: transparent;
+}
+#vault-home-title {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0;
+  color: var(--text-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+#vault-home-new-note {
+  /* Text button, not an icon — opt out of the toolbar-btn square sizing. */
+  flex-shrink: 0;
+  width: auto;
+  height: auto;
+  padding: 4px 10px;
+}
+.vault-home-section {
+  margin-bottom: 28px;
+}
+.vault-home-section h2 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+}
+.vault-home-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+.vault-home-stat {
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 10px 12px;
+  color: var(--text-strong);
+}
+.vault-home-stat .num {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+.vault-home-stat .label {
+  font-size: 11px;
+  color: var(--text-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+.vault-home-stat-empty {
+  color: var(--text-dim);
+  font-style: italic;
+}
+.vault-home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.vault-home-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  /* Same type ramp as the activity-detail rows: 11px muted by default,
+     name standout below at 13px strong. */
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vault-home-list li:hover {
+  background: var(--accent-fill);
+}
+.vault-home-list .name {
+  color: var(--text-strong);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.vault-home-list .rel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.vault-home-list .when {
+  flex-shrink: 0;
+}
+.vault-home-list .empty {
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 6px 8px;
+  cursor: default;
+}
+.vault-home-list .empty:hover {
+  background: transparent;
+}
+
+/* status: vault-home-recent-activity-widget
+   All activity-row meta (op, author, when, id, badges) share one type
+   ramp: 11px default-font, muted color. The note name is 13px strong.
+   Two sizes, two colors — no mono font, no extra letter-spacing tricks
+   beyond a single uppercase op label. */
+.activity-op,
+.activity-author,
+.activity-id,
+.rollback-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.activity-op {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 56px;
+}
+.activity-id {
+  /* Slightly dimmer than other meta so the id reads as ambient ref data
+     rather than a primary label. */
+  color: var(--text-dim);
+}
+.activity-author {
+  display: inline-flex;
+  align-items: center;
+}
+.activity-author svg {
+  width: 13px;
+  height: 13px;
+}
+/* Right-pinned cluster on activity rows. Holds [when] [author-icon]
+   [#id] in fixed reading order; `margin-left: auto` pushes the whole
+   group to the row's right edge regardless of how long the path is. */
+.row-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* status: vault-home-detail-views — overview/detail hidden toggles ride
+   the `hidden` attribute; renderActiveTab() manages the show/hide of the
+   pane root. */
+#vault-home-overview[hidden] { display: none; }
+#vault-home-detail[hidden] { display: none; }
+.vault-home-detail-count {
+  color: var(--text-muted);
+  font-size: 11px;
+  align-self: baseline;
+}
+/* status: vault-home-recent-activity-author-filter */
+.vault-home-filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+/* Filter pills share the .toolbar-btn type ramp (4px radius, neutral
+   border) so they match every other icon-button in the chrome. The icon
+   sits next to the class label inside a single button. */
+.vault-home-filters .filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vault-home-filters .filter-pill.active {
+  color: var(--text-strong);
+}
+.vault-home-filters .filter-pill svg {
+  width: 12px;
+  height: 12px;
+}
+.vault-home-filters .filter-pill > span {
+  letter-spacing: 0.04em;
+}
+/* status: vault-home-recent-activity-author-filter, queue-detail-filter-tasks,
+   queue-detail-filter-index — icon-only filter pill: drop the trailing text
+   slot's gap and bump the SVG up since there's no label competing for space. */
+.vault-home-filters .filter-pill-icon-only {
+  gap: 0;
+  padding: 4px 6px;
+}
+.vault-home-filters .filter-pill-icon-only svg {
+  width: 16px;
+  height: 16px;
+}
+/* Queue-detail pills should match other toolbar icons in the chrome
+   (the top strip's `.toolbar-btn svg` default of 18px). Forced because
+   both the parent `.vault-home-filters .filter-pill-icon-only svg` rule
+   and `.toolbar-btn svg` would otherwise clip the size lower. */
+.queue-detail-pills .queue-pill.filter-pill-icon-only svg {
+  width: 18px !important;
+  height: 18px !important;
+}
+/* Empty state: pill is shown but dimmed so users can see the affordance
+   exists before any rows of that class arrive. Click still toggles —
+   harmless when there's nothing to show. */
+.vault-home-filters .filter-pill.empty {
+  opacity: 0.45;
+}
+
+/* status: vault-home-recent-activity-detail */
+.vault-home-activity-detail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.vault-home-activity-detail-list > li {
+  border-top: 1px solid var(--border-divider);
+  padding: 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.vault-home-activity-detail-list > li.recently-rolled-back {
+  background: var(--warn-fill);
+  border-left: 2px solid var(--warn-strong);
+}
+.vault-home-activity-detail-list .row-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+/* Note name is the only standout in the row; everything else inherits
+   the row-line muted/11px ramp above. */
+.vault-home-activity-detail-list .row-line .name {
+  color: var(--text-strong);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.vault-home-activity-detail-list .row-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.vault-home-activity-detail-list button.row-action {
+  border: 1px solid var(--text-muted);
+  background: transparent;
+  color: var(--text-strong);
+  padding: 3px 9px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+.vault-home-activity-detail-list button.row-action:hover {
+  background: var(--accent-fill);
+}
+/* status: patch-review-per-hunk-accept
+   Icon-only Accept / Reject buttons in the activity list (widget + detail).
+   Same rounded-rectangle shape as `.toolbar-btn`; hover tints green / red
+   so the meaning stays legible without permanent color. */
+button.row-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-strong);
+  cursor: pointer;
+  transition: color 0.1s, border-color 0.1s, background 0.1s;
+}
+button.row-action-icon svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+button.row-action-icon:hover {
+  background: var(--surface-hover);
+}
+button.row-action-icon.row-action-accept:hover {
+  color: rgb(60, 160, 90);
+  border-color: rgb(60, 160, 90);
+  background: rgba(60, 160, 90, 0.08);
+}
+button.row-action-icon.row-action-reject:hover {
+  color: rgb(220, 60, 60);
+  border-color: rgb(220, 60, 60);
+  background: rgba(220, 60, 60, 0.08);
+}
+
+/* Mode-controls slot Accept / Reject icon buttons — same accent/danger
+   tint on hover as the activity-row icons. */
+.toolbar-btn.mode-controls-accept:hover:not(:disabled) {
+  color: rgb(60, 160, 90);
+  border-color: rgb(60, 160, 90);
+  background: rgba(60, 160, 90, 0.08);
+}
+.toolbar-btn.mode-controls-reject:hover:not(:disabled) {
+  color: rgb(220, 60, 60);
+  border-color: rgb(220, 60, 60);
+  background: rgba(220, 60, 60, 0.08);
+}
+
+.vault-home-activity-detail-list .un-rollback-prompt {
+  font-size: 11px;
+  color: var(--warn-soft-text);
+}
+
+#vault-path {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+

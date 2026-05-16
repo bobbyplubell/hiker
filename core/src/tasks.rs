@@ -126,6 +126,28 @@ pub enum TaskKind {
         cluster_params_json: String,
         carry_policies_down: bool,
     },
+    /// Embedder model load — wraps every `FastembedEmbedder::load_id`
+    /// call (first-run startup load + hot-swap on `[indexing].model`
+    /// change) so the user sees the work in the queue. Indeterminate
+    /// row: no byte-progress (fastembed v5 exposes no callback), just
+    /// kind + model id + start/end + outcome. Self-managed by the
+    /// indexer — leased on submit (`WorkerKind::Indexer`), completed
+    /// or failed when the underlying `spawn_blocking` load returns.
+    /// status: embedder-model-load-as-task
+    EmbedderModelLoad { model_id: String },
+    /// Umbrella coordinator task for a Summarize sweep (`Trees::summarize`).
+    /// Submitted at `Priority::High` ahead of the per-cluster
+    /// `RaptorSummarize` fan-out so the queue page shows one row covering
+    /// the whole sweep; the per-cluster tasks each carry their own row.
+    /// Per `cluster-op-summarize-sweep`. The coordinator has no direct
+    /// worker payload — it's left in the `Leased` state by the producer
+    /// and the orphan-fail sweep clears it after the synthetic expiry.
+    ClusterSummarize {
+        tree_id: String,
+        /// One of `"all"`, `"stale-or-unfilled"`, `"subset"`.
+        scope_kind: String,
+        n_targets: u32,
+    },
 }
 
 impl TaskKind {
@@ -140,6 +162,8 @@ impl TaskKind {
             TaskKind::ClusterBuildTree { .. } => "cluster_build_tree",
             TaskKind::ClusterRebuildTree { .. } => "cluster_rebuild_tree",
             TaskKind::ClusterReclusterSubtree { .. } => "cluster_recluster_subtree",
+            TaskKind::EmbedderModelLoad { .. } => "embedder_model_load",
+            TaskKind::ClusterSummarize { .. } => "cluster_summarize",
         }
     }
 
@@ -163,6 +187,14 @@ impl TaskKind {
             TaskKind::ClusterReclusterSubtree { tree_id, node_id, .. } => {
                 format!("recluster {tree_id}/{node_id}")
             }
+            TaskKind::EmbedderModelLoad { model_id } => {
+                format!("Loading embedder model: {model_id}")
+            }
+            TaskKind::ClusterSummarize {
+                tree_id,
+                scope_kind,
+                n_targets,
+            } => format!("summarize {tree_id} [{scope_kind}] ×{n_targets}"),
         }
     }
 }
@@ -228,6 +260,13 @@ pub enum WorkerKind {
     /// Any rmcp caller. `via` discriminates the basic chat agent's
     /// in-process dispatch from external HTTP rmcp clients.
     McpClient { client_id: String, via: McpClientVia },
+    /// Self-managed by the indexer task — used for non-LLM work that
+    /// rides the queue purely for UI visibility (currently:
+    /// `EmbedderModelLoad`). The indexer owns the lease + the
+    /// complete/fail call; the queue's worker-arbitration code never
+    /// hands these tasks out via `checkout_*`.
+    /// status: embedder-model-load-as-task
+    Indexer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +284,7 @@ impl WorkerKind {
                 McpClientVia::InProcessChatAgent => "Chat agent".to_string(),
                 McpClientVia::External => format!("External: {client_id}"),
             },
+            WorkerKind::Indexer => "Indexer".to_string(),
         }
     }
 }
@@ -522,6 +562,71 @@ impl Queue {
         drop(state);
         let _ = self.inner.events_tx.send(event);
         TaskHandle { id, rx }
+    }
+
+    /// Insert a task in `Leased` state, owned by an in-process producer
+    /// (the indexer) that runs the underlying work itself. Returns the
+    /// id; the producer then drives the slot through `submit_result` /
+    /// `fail` on completion.
+    ///
+    /// Used for non-LLM work that rides the queue purely for UI
+    /// visibility (e.g. `EmbedderModelLoad`). The slot is never offered
+    /// via `checkout_direct` / `checkout_mcp` (those only consider
+    /// `Queued` slots), so there's no risk of a worker double-leasing.
+    /// The producer handle is internal: drop fires no cancel, mirroring
+    /// the existing `task-queue-submit-handle` semantics. Callers that
+    /// want cancel can still call `Queue::cancel(id)` — the slot will
+    /// flip to `Cancelled` and the producer's next `complete`/`fail`
+    /// call will return `StaleLease`.
+    ///
+    /// status: embedder-model-load-as-task
+    pub async fn submit_self_managed(&self, mut task: Task) -> TaskId {
+        if task.id.is_empty() {
+            task.id = ulid::Ulid::new().to_string();
+        }
+        let id = task.id.clone();
+        let now = SystemTime::now();
+        let worker = WorkerKind::Indexer;
+        let queued_event = QueueEvent::TaskQueued {
+            id: id.clone(),
+            kind: task.kind.clone(),
+            priority: task.priority,
+            shape: task.shape,
+            submitted_at_ms: ms_since_epoch(task.submitted_at),
+        };
+        // No real lease timeout for the indexer — it runs the work
+        // synchronously inside `spawn_blocking` and reports completion
+        // through `submit_result` / `fail`. We still stamp an expiry so
+        // a wedged producer eventually has the row GC'd by maintenance.
+        let expires = now + Duration::from_secs(3600);
+        let leased_event = QueueEvent::TaskLeased {
+            id: id.clone(),
+            worker: worker.clone(),
+            lease_expires_at_ms: ms_since_epoch(expires),
+        };
+        let mut state = self.inner.state.lock().await;
+        state.slots.insert(
+            id.clone(),
+            Slot {
+                task,
+                state: TaskState::Leased,
+                sender: None,
+                lease: Some(Lease {
+                    worker: worker.clone(),
+                    expires_at: expires,
+                    stop: None,
+                }),
+                finished_at: None,
+                last_worker: Some(worker),
+                eligible_to_direct_at: now,
+                last_result: None,
+                last_error: None,
+            },
+        );
+        drop(state);
+        let _ = self.inner.events_tx.send(queued_event);
+        let _ = self.inner.events_tx.send(leased_event);
+        id
     }
 
     /// Snapshot every non-GC'd row. Sorted by drain order: priority desc,
@@ -815,11 +920,23 @@ impl Queue {
         let now = SystemTime::now();
         // Requeue expired leases.
         let mut to_requeue: Vec<TaskId> = Vec::new();
+        let mut to_orphan_fail: Vec<TaskId> = Vec::new();
         for (id, slot) in state.slots.iter() {
             if matches!(slot.state, TaskState::Leased) {
                 if let Some(lease) = &slot.lease {
                     if lease.expires_at <= now {
-                        to_requeue.push(id.clone());
+                        // Indexer-owned (self-managed) leases never go
+                        // back into the queue — no other worker can
+                        // make progress on them. An expired one means
+                        // the indexer producer dropped the row without
+                        // calling complete/fail (shouldn't happen, but
+                        // we orphan-fail it to avoid stuck rows).
+                        // status: embedder-model-load-as-task
+                        if matches!(lease.worker, WorkerKind::Indexer) {
+                            to_orphan_fail.push(id.clone());
+                        } else {
+                            to_requeue.push(id.clone());
+                        }
                     }
                 }
             }
@@ -831,6 +948,23 @@ impl Queue {
             // Once the task has been around long enough that the direct
             // worker is eligible, it stays eligible — the grace window
             // is from initial submit, not requeue.
+        }
+        let mut failed_events: Vec<QueueEvent> = Vec::new();
+        for id in &to_orphan_fail {
+            let slot = state.slots.get_mut(id).unwrap();
+            let worker = slot.lease.as_ref().map(|l| l.worker.clone());
+            let started = slot.task.submitted_at;
+            let err = "self-managed lease expired without completion".to_string();
+            slot.state = TaskState::Failed;
+            slot.finished_at = Some(now);
+            slot.lease = None;
+            slot.last_error = Some(err.clone());
+            failed_events.push(QueueEvent::TaskFailed {
+                id: id.clone(),
+                worker,
+                error_summary: summarize(&err, 80),
+                duration_ms: duration_ms(started, now),
+            });
         }
         // GC terminal rows past retention.
         let stale_terminal: Vec<TaskId> = state
@@ -847,6 +981,10 @@ impl Queue {
             .collect();
         for id in stale_terminal {
             state.slots.remove(&id);
+        }
+        drop(state);
+        for ev in failed_events {
+            let _ = self.inner.events_tx.send(ev);
         }
     }
 

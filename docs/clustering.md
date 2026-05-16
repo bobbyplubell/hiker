@@ -5,104 +5,220 @@ How Hiker builds a hierarchical tree of topics from an unorganized vault. This d
 Not built in v1. Lands alongside the suggestions surface (post-v1, after the related-notes panel proves the index pipeline). Speccing now because (a) the build algorithm shapes what suggestions look like, (b) it determines the cost model that decides whether a one-shot run takes seconds or minutes, and (c) it's the thing the synthetic-corpus eval (`qa.md`) is supposed to validate.
 
 
-## Approach: recursive cluster + LLM-summarize (RAPTOR-shaped)
+## Operations framework
 
-Bottom-up tree construction. Repeatedly cluster the current level's embeddings, ask an LLM to summarize each cluster, embed the summary, and recurse. The summary serves three roles at once: it names the node (proposed name in the reconcile UI), it's the embedding seed for the parent level, and it becomes the user-visible "what's in this branch" description. [cluster-build-recursive]
+Tree construction and edits are composed from three primitive operations. The cluster editor surfaces each as a verb; the build recipe (below) is a canonical composition. Every action a user takes on a tree — initial build, manual edits, regenerating names, growing a parent layer — decomposes into a sequence of these three.
+
+| Op | Signature | Effect |
+| --- | --- | --- |
+| **Split** | `Trees::split_cluster(target, params)` | Partitions a target cluster's leaves into child sub-clusters using `params.algorithm`. The target can be a real `cluster_nodes` row or a virtual root containing every note in the build scope. Recursive sub-splits are governed by `leaf_min_size` / `leaf_cohesion_threshold`. [cluster-op-split] |
+| **Summarize** | `Trees::summarize(scope, params)` | Generates `name` + `summary` for every cluster matching `scope`. Decoupled from Split — clusters Split produces have placeholder names until Summarize runs against them. Idempotent on `StaleOrUnfilled`. [cluster-op-summarize-sweep] |
+| **Roll-up** | `Trees::rollup(input_node_ids, params)` | Embeds each input cluster's `summary` text via `Embedder::embed_batch`, partitions those summary embeddings, and inserts the resulting groups as a new parent layer above the inputs. Requires every input cluster to have a non-empty `summary` (errors `MissingSummary { node_id }` otherwise). [cluster-op-rollup] |
+
+The headline framing decisions:
+
+- **Split is top-down divisive.** A Split against the virtual root produces a coarse top-level partition; recursive sub-splits descend into each top-level child's members. At each sub-split, the algorithm operates on actual note embeddings within the parent's member set, not on geometric centroids. The pathology of clustering already-distinct cluster centroids (centroids of well-separated clusters are by construction well-separated, so no partition algorithm finds structure at the parent level) doesn't arise — each Split level sees the right granularity of data. [cluster-op-split]
+- **Summarize is its own op, never run implicitly by Split.** Split produces unnamed clusters with `name = "Cluster N"` placeholders. The user invokes Summarize explicitly via the cluster editor (per-node, multi-select subset, or scope-driven sweep), or the build recipe composes Split + Summarize as a canned recipe. This separation lets the user defer or skip LLM-naming entirely (run on a `[llm].enabled = false` vault, name clusters by hand, or batch-name later). [cluster-op-summarize-sweep]
+- **Roll-up is the way to grow a parent layer.** When the user wants to coarsen an already-named tree's top level, they invoke Roll-up over the top-level cluster ids. Roll-up clusters the summary *embeddings* (not centroids of member embeddings) so the new parent layer reflects semantic similarity between *what the clusters are about*, not geometric similarity between their members. This is the RAPTOR-shaped step, available as an explicit user action rather than a step baked into every build. [cluster-op-rollup]
+
+### Split
+
+`Split` partitions a target cluster's leaves into sub-clusters and reparents the leaves under the new children. The target's own row is preserved (id, name, summary, user-edit flags, policy); only its descendants change.
+
+Inputs: `target_node_id` (or a virtual-root sentinel for the build scope), `ClusterParams` (algorithm + per-algorithm tunables, plus the recipe's leaf stop conditions when invoked recursively).
+
+Algorithm choice drives the partition step inside Split (see §"Algorithm choices" below). Leiden is the default; HDBSCAN, Hybrid, and a GMM stub are selectable.
+
+Recursive sub-split — when Split is invoked with `recurse: true`, each newly-produced child whose member count exceeds `leaf_min_size` (default 5) and whose intra-cluster cohesion radius exceeds `leaf_cohesion_threshold` (default 0.15) is itself Split. Branches stop when either threshold trips. The recipe (below) sets `recurse: true`; the cluster editor's row-menu "Split" verb uses `recurse: false` (one level only). [cluster-op-split]
+
+History row op `split` snapshots the prior subtree for undo per `cluster-editor-undo-redo`.
+
+### Summarize
+
+`Summarize` generates `name` + `summary` for every cluster matching `scope`. One LLM call per cluster, batched through the task queue.
+
+```rust
+enum SummarizeScope {
+    All,                                  // every cluster in the (sub)tree
+    StaleOrUnfilled,                      // summary_membership_churn > 0 OR summary IS NULL
+    Subset { ids: Vec<ClusterId> },       // arbitrary set, typically from multi-select
+}
+
+struct SummarizeParams {
+    scope: SummarizeScope,
+    subtree_root: Option<ClusterId>,      // None = whole tree; constrains All / StaleOrUnfilled
+    recursive: bool,                      // default true; only relevant for subtree_root != None
+    summarize: SummarizeMode,             // None / Template / Llm
+    overwrite_user_edited: bool,          // default false
+}
+```
+
+Scope semantics:
+
+- **`All`** — every cluster row in the (sub)tree.
+- **`StaleOrUnfilled`** — every cluster row where `summary_membership_churn > 0 OR summary IS NULL OR name IS NULL`. The staleness counter (`cluster-summary-staleness-counter`) is the load-bearing infrastructure; every reshape op already bumps it, so this scope is a no-op once everything is fresh.
+- **`Subset { ids }`** — exactly the listed cluster ids; useful for "Summarize this one cluster" (single-element subset) and "Summarize selected" (multi-select subset). Out-of-tree ids are silently dropped.
+
+`overwrite_user_edited` defaults to `false`: clusters whose `user_edited_name` or `user_edited_summary` flag is set get skipped. Set to `true` for explicit per-node Regenerate. The flag composes with `scope` — a `Subset` summarize with `overwrite_user_edited = false` against a user-edited node is a no-op (returns `SkippedUserEdited`).
+
+`SummarizeMode::None` short-circuits without invoking the summarizer; the cluster keeps its placeholder name. This is the path used by the build recipe when the user wants Split + Roll-up without naming.
+
+Queue integration: every `Summarize` invocation enqueues one `TaskKind::ClusterSummarize { tree_id, scope_kind, n_targets }` row that the user can watch in the queue. Per-cluster `RaptorSummarize` tasks (already specced as `cluster-editor-regenerate-via-task-queue`) are the fan-out underneath. [cluster-op-summarize-sweep]
+
+Bottom-up submission ordering carries over from `cluster-editor-regenerate-via-task-queue` — when the scope contains parent clusters, those tasks are submitted only after their children's tasks complete so the parent's summary input is the children's freshly-generated names, not placeholders.
+
+### Roll-up
+
+`Roll-up` grows a new parent layer over a set of existing clusters by clustering the *summary embeddings* (not the geometric centroids of member embeddings).
+
+```rust
+struct RollupParams {
+    input_node_ids: Vec<ClusterId>,
+    algorithm: ClusterAlgorithm,          // same as Split
+    leiden: LeidenParams,
+    min_cluster_size: u32,                // for HDBSCAN
+    new_layer_name_pattern: Option<String>,  // default "Group {n}"
+}
+```
+
+Steps:
+
+1. Validate every `input_node_id` exists in the same tree and carries a non-empty `summary`. Errors `MissingSummary { node_id }` on the first violation. The caller's responsibility to run `Summarize` first.
+2. For each input cluster, embed its `summary` text via `Embedder::embed_batch`. The summary embedding's dim is whatever the loaded embedder reports (`embedder-dim-from-model`); the result is stored only in memory for the partition step, not persisted.
+3. Run the partition algorithm (`partition` for HDBSCAN, `partition_leiden` for Leiden) over the summary embeddings.
+4. For each resulting community, insert a new `cluster_nodes` row at the layer above the inputs. Each new parent's `members` = the input clusters that landed in its community; their `parent_id` is updated to point at the new parent. The new parents have placeholder names (`new_layer_name_pattern.unwrap_or("Group {n}")`); a subsequent `Summarize { Subset(new_parent_ids) }` invocation fills them in.
+5. The new parents' `centroid` is the L2-normalized mean of their input clusters' summary embeddings. `radius` is the 90th-percentile cosine distance from centroid to inputs. `confidence` is inherited from the partition's confidence metric (HDBSCAN stability or Leiden modularity contribution).
+
+If the partition produces a single community, Roll-up returns `Refused { reason: "all inputs landed in one community" }` without inserting any rows — a single super-parent is uninformative. The user can lower the algorithm's resolution (Leiden) or `min_cluster_size` (HDBSCAN) and re-invoke. Symmetrically, when every input lands in its own singleton community, Roll-up returns `Refused { reason: "no inputs merged" }`.
+
+Roll-up does not recurse on its own — one invocation produces at most one new layer. The user runs Roll-up again over the new parents if they want a deeper hierarchy. [cluster-op-rollup]
+
+History row op `rollup` snapshots the prior `parent_id`s of the inputs + the new parent rows so undo restores the original top-level structure.
+
+### Why top-down divisive Split rather than recursive bottom-up Roll-up as the default build
+
+The recipe builds the initial tree via recursive `Split` from the virtual root, not via recursive `Roll-up` from leaf clusters. Top-down at each sub-split clusters real note embeddings within a narrower scope, which Leiden and HDBSCAN both handle well. Recursive Roll-up would require running `Summarize` at every level before the next Roll-up, doubling the LLM dependency surface and forcing a strict naming-blocks-structure ordering. Roll-up stays available as an explicit verb when the user wants to coarsen an already-named tree; the default doesn't depend on it.
+
+
+## Build recipe
+
+"Build a tree from scratch" is a composition of the three ops, not a monolithic algorithm. The clustering review tab (`cluster-review-tab` in `cluster-editor.md`) drives the recipe:
 
 ```
-level 0: note embeddings              ─┐
-              cluster ─→ summarize     │ recurse
-level 1: cluster summaries (embedded)  │
-              cluster ─→ summarize     │
-level 2: meta-cluster summaries        │
-              ...                     ─┘
-root: one node summarizing the vault
+1. Split { target: virtual_root(scope), params: ClusterParams { recurse: true, ... } }
+   → produces a tree of leaf clusters with placeholder names
+
+2. Summarize { scope: All, subtree_root: None, summarize: <user choice> }
+   → fills name + summary on every cluster row
+
+3. (Optional, default off) Rollup { input_node_ids: top_level_cluster_ids, ... }
+   → grows a parent layer above the initial top level when the user wants
+     additional hierarchy depth
 ```
 
-Termination: stop recursing when the level has fewer than `MIN_CLUSTERS_TO_RECURSE` (default 4) nodes, or when a cluster's summary fails to add information beyond its members (signal: cosine similarity between the summary embedding and the mean of its member embeddings exceeds a saturation threshold — the summary is just restating the centroid).
+[cluster-build-recipe]
 
-The named technique in the literature is RAPTOR (Sarthi et al., 2024). Borrowed directly because the algorithm is straightforward and matches the data shape. Where Hiker diverges from the paper: clusters notes (not chunks) at level 0, and uses HDBSCAN rather than GMM (rationale below).
+Steps 1 and 2 are gated separately in the review tab — the structural pass (Run clustering) is step 1 alone; Confirm-and-name is step 1 followed by step 2; Confirm-no-naming is step 1 alone with the result persisted. Step 3 is invoked from the cluster editor's toolbar after the tree is persisted (not from the review tab); doing so during the build is unnecessary since top-down divisive Split already produces a hierarchical shape.
+
+Top-down divisive parameters that the recipe sets on the Split call:
+
+- **`top_level_resolution`** (Leiden only) — γ override for the *first* Split call against the virtual root. Default `0.3`, lower than the default `1.0` used at sub-splits. Lower γ produces coarser, fewer communities at the top level (target: 3–8 broad clusters). Recursive sub-splits revert to `LeidenParams.resolution` for finer structure. Lives on `LeidenParams` as a new field with `#[serde(default = "default_leiden_top_resolution")]`. [cluster-leiden-params]
+- **`leaf_min_size`** — recursive sub-split stops when a child has fewer members than this. Default `5`. On `ClusterParams`.
+- **`leaf_cohesion_threshold`** — recursive sub-split stops when a child's intra-cluster cohesion radius (90th-percentile cosine distance from members to centroid) is below this. Default `0.15`. On `ClusterParams`.
+
+The previously-used `min_clusters_to_recurse` knob is removed — the recursion termination criterion is now per-branch (member count / cohesion), not per-level (cardinality). Persisted `cluster_trees.method` JSON for trees built before the recipe lands deserializes with the field absent and is treated as "use the new defaults" via `#[serde(default)]`. Saved trees do not store `min_clusters_to_recurse` going forward.
+
+Surviving / changed knobs at a glance:
+
+| Knob | Change | Notes |
+| --- | --- | --- |
+| `min_cluster_size` | survives | HDBSCAN tunable, drives partition at every level |
+| `min_samples` | survives | HDBSCAN tunable |
+| `min_clusters_to_recurse` | **removed** | replaced by per-branch leaf conditions |
+| `summary_confidence_threshold` | survives | marks below-threshold clusters as "uncertain" in the review surface |
+| `include_outliers` | survives | controls force-routing of outliers at the top-level Split |
+| `disable_recursion` | survives | when `true`, Split runs once and returns; equivalent to `recurse: false` on the top-level Split |
+| `leaf_min_size` | new | recursive Split stop condition |
+| `leaf_cohesion_threshold` | new | recursive Split stop condition |
+| `leiden.top_level_resolution` | new | first-Split γ override; recursive sub-splits use `leiden.resolution` |
+| `leiden.resolution` | survives | sub-split γ |
+| `leiden.k_nearest`, `edge_weight_floor`, `iterations`, `min_cluster_size` | survive | unchanged |
 
 
-## Level 0 input: note embeddings, not chunk embeddings
+## Note embeddings input
 
-The curated tree is a tree of notes — placement is per-note, the leaves are notes. So clustering operates on **note-level** embeddings at level 0, not chunk-level.
+Every Split operates on note-level embeddings, regardless of where in the tree it runs. A Split against the virtual root sees every note in the build scope; a Split against a real cluster sees that cluster's leaves' embeddings.
 
-The note embedding is the mean of the note's chunk embeddings, weighted by chunk byte length. Computed lazily on first cluster pass and cached on the `notes` row (new column: `note_embedding BLOB`). Recomputed when any of the note's chunks change. This is cheap — a vector mean over typically <20 chunks — and avoids spending a separate embedder pass on each note. [cluster-note-embeddings]
+The note embedding is the mean of the note's chunk embeddings, weighted by chunk byte length. Computed lazily on first cluster pass and cached on the `notes` row (`note_embedding BLOB`). Recomputed when any of the note's chunks change. Cheap — a vector mean over typically <20 chunks — and avoids spending a separate embedder pass on each note. [cluster-note-embeddings]
 
-Why mean-pool rather than embed the full note text directly: `bge-small`'s context window is 512 tokens (~2000 characters). A note longer than that gets silently truncated by the embedder, and personal-vault notes commonly exceed this — anything longer than a couple of paragraphs. Mean-pool over chunks sidesteps the limit entirely (each chunk is ~1200 chars by the chunker's cap, so each chunk fits), and the resulting representation already reflects the chunker's heading-bounded structure. There is no practical max note size for clustering with mean-pool. If we ever swap to a long-context embedder (`bge-m3` does 8k tokens, `nomic-embed-text` does 8k), direct embed becomes viable for most notes; mean-pool stays as a fallback for outliers.
+Why mean-pool rather than embed the full note text directly: the default embedder `bge-small`'s context window is 512 tokens (~2000 characters). A note longer than that gets silently truncated by the embedder, and personal-vault notes commonly exceed this — anything longer than a couple of paragraphs. Mean-pool over chunks sidesteps the limit entirely (each chunk is ~1200 chars by the chunker's cap, so each chunk fits), and the resulting representation already reflects the chunker's heading-bounded structure. There is no practical max note size for clustering with mean-pool.
+
+When the user selects a long-context embedder via `embedder-model-selectable` (`bge-m3` at 8k tokens, `embedding-gemma-300m` at 2k), direct full-note embed becomes viable for most notes; mean-pool stays as the fallback for outliers that still exceed the model's context. Implementing the direct-embed path is deferred — the mean-pool path already works for every model and isn't observably wrong; the direct-embed quality win is a follow-up that lands when there's evidence the difference matters. [cluster-note-embeddings-direct-long-context]
 
 Empty notes (no chunks) get no embedding and are excluded from clustering — they end up in the "inbox" (unplaced) bucket, same as outliers.
 
 
-## Clustering algorithm
+## Algorithm choices
 
-Two algorithms are supported, selectable per build via `ClusterParams.algorithm`. HDBSCAN is the default; Leiden is opt-in via the clustering review tab's Advanced disclosure.
+`ClusterParams.algorithm` selects which partitioner runs inside Split (and inside Roll-up). Four variants: Leiden (default), HDBSCAN, Hybrid, GMM-stubbed.
 
-### HDBSCAN
+### Leiden (default)
 
-HDBSCAN over GMM (RAPTOR's choice) for three reasons specific to personal-vault scale: [cluster-hdbscan]
+Modularity-optimization community detection over a kNN cosine-similarity graph. Every node lands in some community; small communities (below `min_cluster_size`) post-flag as outliers. [cluster-leiden]
 
-1. **Outlier handling.** Personal vaults always have a long tail of notes that don't belong to any cohesive topic — fleeting thoughts, one-off snippets, miscellaneous reference. HDBSCAN labels these as outliers natively; they go to the inbox rather than being force-fit into a cluster they don't belong in. GMM's soft-probabilistic assignment can't represent "doesn't belong anywhere."
-2. **No K.** Personal vault sizes vary by 100×. Tuning K per vault is annoying; HDBSCAN's `min_cluster_size` is more stable across scales (default 5).
-3. **Determinism given seed.** Stable across reconcile runs — important because `reconcile-history.yaml` keys on rejected proposals, and unstable cluster identity makes that bookkeeping useless.
-
-Tunables:
-- `min_cluster_size` — smallest cluster the algorithm will form. Default 5; user-overridable per vault in `vault/.hiker/config.toml`.
-- `min_samples` — density threshold. Default = `min_cluster_size`. Higher → more outliers.
-- Distance metric — cosine, on the note embeddings.
-
-Watch for: small vaults (<50 notes) where HDBSCAN may produce all-outliers and an empty tree. Fallback: if the level-0 pass produces fewer than 2 clusters, skip auto-org and surface a "vault is too small" message rather than a misleading tree of one node.
-
-**Crate choice: `petal-clustering`.** Rust-native HDBSCAN implementation, MIT-licensed, no C/C++ FFI, used in production by the Petabi suite. Builds clean on the project's target stack (Tauri + Rust workspace), no extra system deps. The crate exposes `Hdbscan::new(min_cluster_size, min_samples).fit(&data) -> Vec<i32>` plus cluster-stability metadata — exactly the surface `core::cluster::partition` needs. Vector distance is cosine via pre-normalized embeddings (the crate operates on Euclidean by default; we normalize once and pass-through). [cluster-hdbscan-crate-petal]
-
-Alternatives considered:
-- **`linfa-clustering`** — covers KMeans / DBSCAN / GMM but not HDBSCAN as of writing. Would force a custom HDBSCAN port; not worth the cost.
-- **PyO3 + sklearn** — adds a Python runtime dependency; rejected for the Tauri-app distribution model.
-- **Hand-rolled** — HDBSCAN's mutual-reachability-distance + single-linkage + condensed-tree-extraction is real work; not justified when `petal-clustering` exists.
-
-Possible future swap: GMM behind the same trait if outlier rate proves too aggressive. The clustering call lives in a single `core::cluster::partition(embeddings) -> Vec<ClusterAssignment>` boundary so swaps are local. Same module discipline as `core::store` and `core::embed`.
-
-**User-selectable algorithm.** A `cluster.algorithm` setting in `vault/.hiker/config.toml` picks between `hdbscan` (default), `gmm`, and `hybrid`. Per-vault rather than per-user — different vaults have different shapes (a structured reference vault vs. a fleeting-thoughts journal cluster very differently). [cluster-algorithm-selectable]
-
-**Hybrid mode.** `hdbscan` runs first to extract cohesive clusters and the outlier set. `gmm` then runs only on the outliers, with K = sqrt(outlier_count). Outliers that GMM places with probability > 0.6 join the corresponding HDBSCAN cluster as soft members; the rest stay in the inbox. This recovers the "doesn't fit confidently anywhere but isn't truly miscellaneous" middle ground without forcing every note into a cluster the way pure GMM does. Soft members are tagged in the cluster row so the reconcile UI can show them differently from primary members. [cluster-hybrid-outlier-recovery]
-
-A second hybrid form — HDBSCAN structure with GMM soft-membership across *siblings* (every note gets P(cluster) for its cluster's siblings) — is interesting for surfacing "this note also touches topic Y" and connects naturally to the multi-axis idea in `design.md:215`. Deferred until the simpler hybrid is in production.
-
-
-### Leiden community detection
-
-Selected via `ClusterParams.algorithm = Leiden`. Lands as an opt-in alternative for vaults where HDBSCAN under-clusters — personal-vault sized corpora with `min_cluster_size = 5` and loose `bge-small` embeddings often produce 0–1 cohesive cluster + everything-as-outliers, which makes the suggestions surface useless. Leiden runs modularity optimization on a kNN cosine-similarity graph; every node lands in some community, and the *community count* falls out of the data rather than out of a density threshold. [cluster-leiden]
-
-How it differs from HDBSCAN, when to pick which:
-
-- **HDBSCAN labels low-density points as outliers.** Good when the vault genuinely has a long miscellaneous tail you want sent to the outlier bucket (the default posture). Bad when *everything* falls below the density floor — the user sees an empty tree.
-- **Leiden places every point in a community.** No outliers fall out of the algorithm itself; small communities (below `min_cluster_size`) get post-flagged as outliers so the downstream tree shape stays consistent. Good when the corpus is small or topically tight. Bad when you genuinely want a miscellaneous bucket (you'll get a few singletons but most notes will be placed).
-- **HDBSCAN respects density gaps.** Two topically-close clusters separated by a thin density bridge stay separate.
-- **Leiden respects modularity.** Two topically-close clusters connected by enough kNN edges may merge; conversely, a small topically-tight subgroup can split off even if the surrounding density is uniform.
+Why default: Leiden handles the personal-vault scale gracefully — loose `bge-small` embeddings often produce 0–1 cohesive HDBSCAN cluster + everything-as-outliers (a useless suggestion surface), where Leiden produces 5–20 communities reflecting the natural topical structure. The configuration parameter γ is a direct granularity knob, giving the build recipe the lever it needs for both the coarse top-level pass (`top_level_resolution`, default `0.3`) and the finer sub-splits (`resolution`, default `1.0`).
 
 Pipeline: [cluster-leiden-knn-graph]
 
 1. L2-normalize the input embeddings so cosine similarity reduces to a dot product.
 2. For each point, find its top-`k_nearest` neighbors by cosine similarity (brute-force O(n²) — same scale ceiling as HDBSCAN's path).
 3. Drop neighbor edges whose weight (cosine similarity) is below `edge_weight_floor`.
-4. Construct an undirected graph (edges symmetrize on insertion; if A is in B's top-k but not vice versa we still keep the edge — mutual-kNN is too aggressive at vault scale).
+4. Construct an undirected graph (edges symmetrize on insertion; mutual-kNN is too aggressive at vault scale).
 5. Construct a `single_clustering::network::CSRNetwork` from the deduped edges (`from`, `to`, `cosine_weight`) plus a unit `node_weights` vec.
-6. Build a `RBConfigurationPartition<f64, VectorGrouping>` with the configured `resolution` (γ), then run `LeidenOptimizer::optimize_single_partition` over it.
-7. Each node's community id comes from `partition.membership(node)`; group nodes by id, densify the surviving ids, and emit `ClusterAssignment` per input point.
-8. Communities smaller than `min_cluster_size` are flagged as outliers (post-filter, not algorithmic).
+6. Build a `RBConfigurationPartition<f64, VectorGrouping>` with the configured `resolution` (γ — the recipe substitutes `top_level_resolution` on the first call), then run `LeidenOptimizer::optimize_single_partition` over it.
+7. Each node's community id comes from `partition.membership(node)`; group nodes by id, densify the surviving ids, emit `ClusterAssignment` per input point.
+8. Communities smaller than `min_cluster_size` flag as outliers (post-filter, not algorithmic).
 
 Tunables: [cluster-leiden-params]
 
-- `k_nearest` — number of nearest neighbors per node. Default `15`. Smaller = sparser graph = more, smaller communities; larger = denser graph = fewer, bigger communities. Clamped to `n-1` so it doesn't ask for more neighbors than exist; at recursion levels where the level cardinality is small, it's clamped per-level so a default `k=15` doesn't ask for 15 neighbors among 4 cluster summaries.
+- `k_nearest` — number of nearest neighbors per node. Default `15`. Smaller = sparser graph = more, smaller communities; larger = denser graph = fewer, bigger communities. Clamped to `n-1` so it doesn't ask for more neighbors than exist.
 - `edge_weight_floor` — minimum cosine similarity for a kNN edge to survive. Default `0.0` (keep every kNN edge). Raise to strip weak neighbor links and tighten community boundaries.
-- `resolution` (γ) — Reichardt-Bornholdt resolution parameter on the RB configuration partition. Default `1.0` (modularity-equivalent). γ > 1 biases toward finer / more communities; γ < 1 toward coarser / fewer. This is the standard Leiden quality knob and the primary way to tune cluster granularity at fixed `k_nearest`.
+- `resolution` (γ) — Reichardt-Bornholdt resolution parameter on sub-splits. Default `1.0`. γ > 1 biases toward finer / more communities; γ < 1 toward coarser / fewer.
+- `top_level_resolution` — γ override for the *first* Split call against the virtual root (when Split is invoked from the build recipe). Default `0.3` — explicitly coarser than `resolution` to produce 3–8 broad top-level clusters that the recursive sub-splits drill into. Ignored when Split is invoked on a non-virtual target.
 - `iterations` — cap on Leiden refinement iterations (`LeidenConfig.max_iterations`). Default `100`. Algorithm converges fast; the cap is a safety rail.
 - `min_cluster_size` — minimum community size; smaller communities flag as outliers. Default `2`.
 
-**Crate choice: `single-clustering` 0.6.1.** BSD-3-Clause licensed; pure Rust; builds on aarch64-linux (verified locally). Replaced `fa-leiden-cd` because the latter exposes only standard modularity with no resolution knob, leaving cluster granularity tunable only indirectly via `k_nearest` and `edge_weight_floor`. `single-clustering` provides both `ModularityPartition` and `RBConfigurationPartition` (used here for the resolution parameter), plus optional HNSW-based kNN primitives we deliberately do not use — our hand-rolled cosine kNN is clear about its weight semantics where the crate's "Gaussian" variants apply `exp(-d²/σ²)` weighting. The crate is marked "under heavy development" in its README, so the workspace dep is **exact-version pinned to `=0.6.1`** — any bump is a deliberate re-test. Public surface used: `CSRNetwork::from_edges`, `LeidenConfig`, `LeidenOptimizer::new` + `optimize_single_partition`, `RBConfigurationPartition::with_resolution`, `VectorGrouping`, `VertexPartition::membership`. Repository: <https://github.com/SingleRust/single-clustering>. [cluster-leiden-crate-single-clustering]
+**Crate choice: `single-clustering` 0.6.1.** BSD-3-Clause licensed; pure Rust; builds on aarch64-linux (verified locally). Provides both `ModularityPartition` and `RBConfigurationPartition` (used here for the resolution parameter), plus optional HNSW-based kNN primitives we deliberately do not use — our hand-rolled cosine kNN is clear about its weight semantics where the crate's "Gaussian" variants apply `exp(-d²/σ²)` weighting. The crate is marked "under heavy development" in its README, so the workspace dep is **exact-version pinned to `=0.6.1`** — any bump is a deliberate re-test. Public surface used: `CSRNetwork::from_edges`, `LeidenConfig`, `LeidenOptimizer::new` + `optimize_single_partition`, `RBConfigurationPartition::with_resolution`, `VectorGrouping`, `VertexPartition::membership`. Repository: <https://github.com/SingleRust/single-clustering>. [cluster-leiden-crate-single-clustering]
 
-**Hybrid mode does not use Leiden.** The existing hybrid path (`cluster-hybrid-outlier-recovery`) runs HDBSCAN then reassigns outliers to nearest centroid. Leiden places every point in a community by construction, so there's no outlier set to recover. When `algorithm == Leiden` and the user also sets `Hybrid`-style behavior, the hybrid recovery pass is suppressed; small-community-flagged outliers still get force-routed when `include_outliers = false`, which is the same posture HDBSCAN uses. [cluster-hybrid-outlier-recovery]
+### HDBSCAN
+
+Density-based hierarchical clustering. Selectable via `ClusterParams.algorithm = Hdbscan`. [cluster-hdbscan]
+
+Picks over Leiden when:
+
+- The vault has a long miscellaneous tail the user wants explicitly bucketed as outliers (HDBSCAN labels low-density points as outliers natively; Leiden places every point and post-filters singletons).
+- The user wants density gaps respected (two topically-close clusters separated by a thin density bridge stay separate under HDBSCAN; under Leiden they may merge if mutually kNN-connected).
+
+Tunables:
+- `min_cluster_size` — smallest cluster the algorithm will form. Default 5; user-overridable per vault in `vault/.hiker/config.toml`.
+- `min_samples` — density threshold. Default = `min_cluster_size`. Higher → more outliers.
+- Distance metric — cosine, on the note embeddings.
+
+Watch for: small vaults (<50 notes) where HDBSCAN may produce all-outliers and an empty tree. Fallback: if the top-level Split produces fewer than 2 clusters, surface a "vault is too small" message rather than a misleading tree of one node.
+
+**Crate choice: `petal-clustering`.** Rust-native HDBSCAN implementation, MIT-licensed, no C/C++ FFI, used in production by the Petabi suite. Builds clean on the project's target stack (Tauri + Rust workspace), no extra system deps. The crate exposes `Hdbscan::new(min_cluster_size, min_samples).fit(&data) -> Vec<i32>` plus cluster-stability metadata — exactly the surface `core::cluster::partition` needs. Vector distance is cosine via pre-normalized embeddings (the crate operates on Euclidean by default; we normalize once and pass-through). [cluster-hdbscan-crate-petal]
+
+### Hybrid mode
+
+HDBSCAN runs first; outliers get reassigned to the nearest cohesive cluster's centroid if cosine ≥ 0.6. Selectable via `ClusterParams.algorithm = Hybrid`. Useful when HDBSCAN's default outlier set is too aggressive but the user doesn't want pure Leiden's "every point gets a home" posture either. Soft members tag distinctly in the cluster row so the cluster editor can render them differently from primary members. Not wired under `algorithm = Leiden` (Leiden places every point in a community by construction, so there's no outlier set to recover). [cluster-hybrid-outlier-recovery]
+
+### GMM (stub)
+
+`ClusterParams.algorithm = Gmm` is reserved; the runtime falls back to HDBSCAN with a warning until a GMM crate goes through dep review. Linfa-clustering doesn't ship GMM in the form needed; petal doesn't have GMM at all. Real GMM lands when the dep choice is made. [cluster-algorithm-selectable]
+
+### Algorithm selection
+
+`cluster.algorithm` lives in `vault/.hiker/config.toml` as a per-vault default; the clustering review tab's Advanced disclosure overrides it per build. Per-vault rather than per-user — different vaults have different shapes (a structured reference vault vs. a fleeting-thoughts journal cluster very differently). [cluster-algorithm-selectable]
 
 
 ## Build scope
@@ -139,18 +255,21 @@ Saved triage trees persist their scope; the triage classifier (`cluster-place-be
 
 ```rust
 enum BuildMethod {
-    Cluster   { params: ClusterParams },      // RAPTOR-shaped (default; everything above in this doc)
+    Cluster   { params: ClusterParams },      // runs the build recipe (default)
     FromFolders { params: FolderDeriveParams }, // mirror the filesystem hierarchy
 }
 
 struct ClusterParams {
-    algorithm: ClusterAlgorithm,    // hdbscan / gmm / hybrid (cluster-algorithm-selectable)
+    algorithm: ClusterAlgorithm,    // leiden (default) / hdbscan / gmm / hybrid (cluster-algorithm-selectable)
+    leiden: LeidenParams,           // Leiden-only knobs incl. top_level_resolution
     min_cluster_size: u32,          // HDBSCAN tunable
     min_samples: Option<u32>,       // HDBSCAN tunable; None → defaults to min_cluster_size
-    min_clusters_to_recurse: u32,   // termination threshold
+    leaf_min_size: u32,             // recursive Split stops below this member count (default 5)
+    leaf_cohesion_threshold: f32,   // recursive Split stops below this radius (default 0.15)
     summary_confidence_threshold: f32, // marks clusters "uncertain" below this
     include_outliers: bool,         // when false, force-routes outliers into nearest cluster
-    summarize: SummarizeMode,       // llm / template / none
+    summarize: SummarizeMode,       // llm / template / none — invoked by Summarize op, not by Split
+    disable_recursion: bool,        // when true, Split runs once and stops (per cluster-review-tab-disable-recursion)
 }
 
 struct FolderDeriveParams {
@@ -164,7 +283,7 @@ struct FolderDeriveParams {
 
 ### `Cluster` method
 
-The RAPTOR-shaped pipeline described in the rest of this doc. Default. `ClusterParams.include_outliers` defaults to `true`; setting it to `false` runs the existing hybrid mode's outlier-recovery pass with the threshold lowered to absorb every outlier into its closest cluster (no minimum confidence — every note gets a home). [cluster-build-cluster-method]
+Default. Runs the build recipe (`cluster-build-recipe`): top-down divisive `Split` from the virtual root, followed by `Summarize { All }` if the user picks Confirm-and-name (else the tree persists with placeholder names and the user runs `Summarize` later). `ClusterParams.include_outliers` defaults to `true`; setting it to `false` runs the existing hybrid-mode outlier-recovery pass with the threshold lowered to absorb every outlier into its closest cluster (no minimum confidence — every note gets a home). [cluster-build-cluster-method]
 
 ### `FromFolders` method
 
@@ -173,7 +292,7 @@ Skip clustering entirely. Walk the filesystem under the build scope; produce a `
 - One `ClusterNode` per folder (kind `Cluster`).
 - One leaf node per note, parented to the folder it lives in.
 - Root = the scope's root (`vault/` for `Vault`, `<rel>/` for `Folder(rel)`, a synthetic single-cluster root for `Notes(ids)`).
-- Centroids: mean of member embeddings (same as `Cluster` method's level-0 centroids). Computed lazily on save-as-triage so the placement classifier (`cluster-place-beam-descent`) works against the folder-derived tree the same way it works against a RAPTOR tree.
+- Centroids: mean of member embeddings (same as `Cluster` method's leaf-level centroids). Computed lazily on save-as-triage so the placement classifier (`cluster-place-beam-descent`) works against the folder-derived tree the same way it works against a `Cluster`-method tree.
 - Outliers at build time: not generated. Every note already in the scope has a folder; the build's leaf-set is exactly the scope's notes.
 - Outliers at triage time (Evergreen use): the saved tree's `outlier_threshold` parameter gates whether new notes that don't fit any existing folder go to the outlier bucket. When the placement classifier descends to the nearest folder and finds the final cosine distance exceeds `outlier_threshold` (default `0.5`, configurable per `FolderDeriveParams`), the note is routed to the outlier bucket instead of force-fit into the nearest folder. The outlier bucket node is created lazily on the first such match. The bucket can carry its own policy (per `cluster-editor-outlier-policy`) — typically `Move` to an `inbox/unsorted/` folder. Setting `include_outliers = false` disables this check; every new note is routed to its nearest existing folder regardless of similarity. [cluster-build-from-folders-outliers]
 - Confidence: 1.0 on every node (the folder structure is the source of truth, not a probabilistic guess).
@@ -181,7 +300,7 @@ Skip clustering entirely. Walk the filesystem under the build scope; produce a `
 
 [cluster-build-from-folders]
 
-Why it exists: users with already-organized vaults want a saved Evergreen tree built on their actual structure, not on what RAPTOR thinks the structure should be. Triage against a folder-derived tree is just "find the most similar existing folder and put the new note there" — the obvious thing, made explicit. Avoids the "I already organized my vault; why does the AI want to re-organize it" friction.
+Why it exists: users with already-organized vaults want a saved Evergreen tree built on their actual structure, not on what the partitioner thinks the structure should be. Triage against a folder-derived tree is just "find the most similar existing folder and put the new note there" — the obvious thing, made explicit. Avoids the "I already organized my vault; why does the AI want to re-organize it" friction.
 
 The output `ClusterTree` shape is identical to the `Cluster` method's — same `ClusterNode` type, same downstream consumers. The cluster editor doesn't distinguish how a tree was built once it exists; reshape operations (merge / split / move-note) work the same way. Splitting a folder-derived node re-runs HDBSCAN against just that node's members — a folder-derived tree can grow cluster-derived subtrees through user editing without ceremony. The `meta.json` (now `cluster_trees.method` column) records the original build method for reference and re-build. [cluster-build-from-folders-uniform-output]
 
@@ -195,7 +314,7 @@ The trigger is the same `hiker:file-changed` rename event the indexer already co
 
 Why a counter rather than a stale-bool: a single move barely shifts a 30-note cluster's meaning, but ten moves probably do. The integer lets the user calibrate when to regenerate (`↻ 1` is noise; `↻ 12` is a real drift signal). A bool would force the user to either over-regenerate or ignore real drift. Embedding-distance drift was considered as an alternative metric but rejected as overkill for v1 — the counter ships first, distance-based staleness can replace it later if churn proves too coarse.
 
-The counter applies to FromFolders trees primarily, where filesystem moves drive churn. RAPTOR `Cluster` trees can use the same field for reshape operations (move-note-between-clusters / merge / split via the cluster editor) — same column, same UI treatment. [cluster-summary-staleness-counter]
+The counter applies to FromFolders trees primarily, where filesystem moves drive churn. `Cluster`-method trees use the same field for reshape operations (move-note-between-clusters / merge / split via the cluster editor) — same column, same UI treatment. The counter is also the staleness signal consumed by `cluster-op-summarize-sweep`'s `StaleOrUnfilled` scope: a Summarize sweep runs the LLM on exactly the clusters with `summary_membership_churn > 0 OR summary IS NULL`. [cluster-summary-staleness-counter]
 
 
 ### Re-building Evergreen trees
@@ -241,7 +360,7 @@ Why beam over greedy (`K=1`): the failure mode of greedy is "the top cluster at 
 
 ## Per-note placement (online, cheap)
 
-The recursive build pass in this doc is the **batch / seed** operation — runs only on `hiker reconcile`, produces a fresh tree, expensive enough to be worth doing rarely. The complementary cheap operation is **per-note placement**: drop a single new note into the existing tree without touching anyone else's placement, no LLM calls, no re-clustering.
+The build recipe in this doc is the **batch / seed** operation — runs only on `hiker reconcile`, produces a fresh tree, expensive enough to be worth doing rarely. The complementary cheap operation is **per-note placement**: drop a single new note into the existing tree without touching anyone else's placement, no LLM calls, no re-clustering.
 
 Per-note placement is fully specced in `design.md:252-257` (greedy centroid descent over the existing curated tree). Mentioned here to make the pairing explicit:
 
@@ -261,9 +380,9 @@ The build pipeline produces a `ClusterTree` (shape below). `suggestions.md` cons
 The build engine is unaware of which flow consumes its output — same algorithm, same `ClusterTree`. See `suggestions.md` for everything downstream.
 
 
-## Why notes (not chunks) at level 0 — and what chunk-level clustering is good for instead
+## Why notes (not chunks) at the leaf level — and what chunk-level clustering is good for instead
 
-Note-level clustering at level 0 is the right default because the curated tree's leaves are notes — placement is per-note, navigation is per-note, the user's mental model of "where does this thing live" is per-note. A tree of chunks would index a different abstraction than the one users navigate.
+Note-level clustering at the leaf level is the right default because the curated tree's leaves are notes — placement is per-note, navigation is per-note, the user's mental model of "where does this thing live" is per-note. A tree of chunks would index a different abstraction than the one users navigate.
 
 That said, chunk-level clustering has real uses as a *parallel* feature, not a replacement:
 
@@ -295,7 +414,7 @@ Members:
 Return strict JSON: {"name": ..., "summary": ..., "confidence": ...}
 ```
 
-At level 0 the per-note summary input comes from the existing `Summary` enrichment (`design.md:293`) — already cached on the note's frontmatter or in the store. At level 1+ the inputs are child cluster summaries; same prompt, no special-casing.
+For a leaf cluster, the per-note summary input comes from the existing `Summary` enrichment (`design.md:293`) — already cached on the note's frontmatter or in the store. For a parent cluster (anything with children that are themselves clusters), the inputs are the child clusters' summaries; same prompt, no special-casing.
 
 Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the suggestions flow shows it but flags it for explicit review before applying.
 
@@ -306,15 +425,15 @@ Model choice: provider/model are user-configured in `[llm]` per `llm.md`; a smal
 
 ## Cost model
 
-Dominant cost: LLM calls for summarization. One call per cluster per level.
+Dominant cost: LLM calls for summarization. One call per cluster in the `Summarize` scope.
 
-Rough numbers for a small local model (~3B, ~50ms/call on CPU):
+Rough numbers for a small local model (~3B, ~50ms/call on CPU), assuming a fresh build (full recipe: Split + Summarize { All }):
 
-| Vault size | Leaf clusters | Mid levels | Total calls | Wall time |
-| ---------- | ------------- | ---------- | ----------- | --------- |
-| 100 notes  | ~10           | 1          | ~13         | <1s       |
-| 1k notes   | ~80           | ~12, ~3    | ~95         | ~5s       |
-| 10k notes  | ~500          | ~70, ~10, ~2 | ~580      | ~30s      |
+| Vault size | Leaf clusters | Intermediate clusters | Total summaries | Wall time |
+| ---------- | ------------- | --------------------- | --------------- | --------- |
+| 100 notes  | ~10           | ~3                    | ~13             | <1s       |
+| 1k notes   | ~80           | ~15                   | ~95             | ~5s       |
+| 10k notes  | ~500          | ~80                   | ~580            | ~30s      |
 
 Embedding cost (one extra call per cluster summary) is negligible relative to summarization.
 
@@ -335,13 +454,13 @@ The cluster pass produces a `ClusterTree`: [cluster-tree-output]
 
 ```rust
 struct ClusterTree {
-    levels: Vec<Vec<ClusterNode>>,    // levels[0] = leaf clusters (notes), levels[N] = root
+    levels: Vec<Vec<ClusterNode>>,    // levels[0] = leaf clusters, levels.last() = top-level clusters
     outliers: Vec<NoteId>,            // unplaced
 }
 
 struct ClusterNode {
     id: ClusterId,                    // ephemeral per-run; not durable across runs
-    members: Vec<MemberRef>,          // notes (level 0) or child clusters (higher)
+    members: Vec<MemberRef>,          // notes (leaf clusters) or child clusters (parents)
     centroid: Vec<f32>,               // mean of member embeddings
     radius: f32,                      // 90th-percentile member distance from centroid
     name: String,                     // LLM-proposed

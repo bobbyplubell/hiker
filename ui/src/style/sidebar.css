@@ -1,0 +1,502 @@
+/* status: sidebar-mode-switcher, sidebar-toolbar-actions-menu, create-note-button
+   Single uniform icon-only top row for the sidebar. Mode buttons on the
+   left, then a flex spacer + divider, then `+` (new note) and `⋯`
+   (actions menu) on the right. Layout never shifts on mode switch. */
+#sidebar-mode-switcher {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.sidebar-toolbar-spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar-toolbar-divider {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 18px;
+  background: var(--border-default);
+  margin: 0 4px;
+}
+
+.sidebar-mode-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.sidebar-mode-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.sidebar-mode-btn.active {
+  background: var(--accent-fill);
+  border-color: var(--accent);
+}
+
+.sidebar-mode-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Mode-driven body visibility. Files mode is the default; switching to
+   another mode hides the file tree. The trash bin (`#trash-bin`) is
+   shared across modes per spec, so it stays visible. The unified top
+   row (`#sidebar-mode-switcher`) is also shared across modes — `+` and
+   `⋯` are mode-aware in *behavior*, not visibility. */
+#sidebar.mode-clusters #tree,
+#sidebar.mode-trails #tree {
+  display: none;
+}
+
+/* Cluster + trails bodies are hidden by default; mode classes show them.
+   This mirrors `.sidebar-trails-body { display: none }` below for the
+   trails body; we need the same default for clusters so the panel
+   doesn't bleed into other modes. */
+#sidebar-clusters-body {
+  display: none;
+}
+
+#sidebar.mode-clusters #sidebar-clusters-body {
+  display: block;
+}
+
+#sidebar.mode-trails #sidebar-trails-body {
+  display: block;
+}
+
+/* status: trails-mode-body — Trails-mode sidebar body. Read-only
+   navigation surface (waypoint cards open source notes; no in-place
+   editing per `trails-mode-sidebar-read-only`). */
+.sidebar-trails-body {
+  display: none;
+  font-size: 12px;
+  color: var(--text-strong);
+}
+
+.sidebar-trails-body .trails-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 6px 8px;
+  border-bottom: 1px solid var(--border-divider);
+}
+
+.sidebar-trails-body .trails-dropdown-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  padding: 4px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-trails-body .trails-dropdown-btn:hover {
+  background: var(--surface-hover);
+}
+
+.sidebar-trails-body .trails-head-btn,
+.sidebar-trails-body .trails-expand-all-btn {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.sidebar-trails-body .trails-head-btn:hover:not(:disabled),
+.sidebar-trails-body .trails-expand-all-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.sidebar-trails-body .trails-head-btn:disabled,
+.sidebar-trails-body .trails-expand-all-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.sidebar-trails-body .trails-cards {
+  padding: 4px 4px 8px 4px;
+}
+
+/* status: trail-append-cursor-indicator — header hint row beneath the
+   dropdown / trail-head / expand-all row. Muted text + a small reset
+   action button on the right when the cursor is non-null. */
+.sidebar-trails-body .trails-cursor-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+  padding: 2px 8px 6px 8px;
+}
+
+.sidebar-trails-body .trails-cursor-hint > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-trails-body .trails-cursor-reset-btn {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+.sidebar-trails-body .trails-cursor-reset-btn:hover {
+  background: var(--surface-hover);
+}
+
+.sidebar-trails-body .trails-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sidebar-trails-body .trails-empty p {
+  margin: 0 0 6px 0;
+}
+
+.sidebar-trails-body .trails-empty button {
+  margin-top: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.sidebar-trails-body .trails-empty button:hover {
+  background: var(--surface-hover);
+}
+
+.sidebar-trails-body .waypoint-card {
+  margin: 4px 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.sidebar-trails-body .waypoint-card:hover {
+  background: var(--surface-hover-soft);
+}
+
+.sidebar-trails-body .waypoint-card.expanded {
+  background: var(--surface-hover-soft);
+}
+
+.sidebar-trails-body .waypoint-card.orphan {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.sidebar-trails-body .waypoint-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.sidebar-trails-body .waypoint-card-seq {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+/* status: trail-append-cursor-indicator — little-person glyph on the
+   cursor's waypoint card head; accent color marks "you are here". */
+.sidebar-trails-body .waypoint-card-cursor-indicator {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  margin-right: 2px;
+}
+
+.sidebar-trails-body .waypoint-card-basename {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.sidebar-trails-body .waypoint-card-basename:hover {
+  text-decoration: underline;
+}
+
+.sidebar-trails-body .waypoint-card.orphan .waypoint-card-basename {
+  cursor: default;
+  text-decoration: none;
+}
+
+.sidebar-trails-body .waypoint-card-chevron {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.sidebar-trails-body .waypoint-card-snippet {
+  margin-top: 2px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+}
+
+.sidebar-trails-body .waypoint-card-pill {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: var(--danger-fill);
+  color: var(--danger-text);
+  font-size: 10px;
+}
+
+.sidebar-trails-body .waypoint-card-body {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-divider);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-default);
+  font-size: 12px;
+}
+
+/* status: trails-mode-side-trail-render — nested side-trail block.
+   One indent step per nesting level + a thin left rule running the
+   block's full height so the user can visually trace the digression
+   back to its parent. */
+.sidebar-trails-body .trails-side-trail {
+  margin-left: 12px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border-default);
+}
+
+.sidebar-trails-body .waypoint-card-side-chevron {
+  flex: 0 0 auto;
+  margin-right: 2px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.sidebar-trails-body .waypoint-card-side-chevron:hover {
+  color: var(--text-default);
+}
+
+.sidebar-trails-body .waypoint-card-edit {
+  display: inline-block;
+  margin-top: 6px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  padding: 0;
+}
+
+.sidebar-trails-body .waypoint-card-edit:hover {
+  text-decoration: underline;
+}
+
+.sidebar-mode-placeholder {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sidebar-mode-placeholder p {
+  margin: 0 0 6px 0;
+}
+
+.sidebar-mode-placeholder-hint {
+  color: var(--text-faint);
+}
+
+.sidebar-mode-placeholder code {
+  font-size: 11px;
+  background: var(--bg-zebra);
+  padding: 1px 3px;
+  border-radius: 2px;
+}
+
+.icon-btn {
+  font: inherit;
+  font-size: 14px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.icon-btn:hover {
+  background: var(--surface-hover);
+}
+
+.icon-btn.active {
+  background: var(--accent-fill);
+  border-color: var(--accent);
+}
+
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.icon-btn svg,
+.toolbar-btn svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+
+#vault-bar > .icon-btn {
+  padding: 4px 6px;
+}
+
+#sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  display: flex;
+  flex-direction: column;
+}
+
+#tree {
+  padding: 8px;
+  font-size: 13px;
+  flex: 1 0 auto;
+}
+
+#tree li.drop-target {
+  background: var(--accent-fill);
+  outline: 1px dashed var(--accent);
+}
+
+#tree li.dragging {
+  opacity: 0.5;
+}
+
+.tree-rename-input {
+  font: inherit;
+  font-size: 13px;
+  padding: 0 2px;
+  margin: 0;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: Canvas;
+  color: CanvasText;
+  width: calc(100% - 12px);
+}
+
+#tree ul {
+  list-style: none;
+  padding-left: 12px;
+  margin: 0;
+}
+
+#tree li {
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-strong);
+}
+
+#tree li:hover {
+  background: var(--surface-hover);
+}
+
+#tree li.active {
+  background: var(--accent-fill);
+}
+
+#editor-pane {
+  /* Flex column rather than `grid-template-rows: auto 1fr auto`:
+     the prior 3-row grid only had one `1fr` track, and inserting the
+     `#write-note-pending-banner` between toolbar and `#editor` stole
+     that track, ballooning the banner to two-thirds of the pane
+     (`bug-write-note-pending-banner-oversized`). Flex column lets the
+     toolbar / banner / status-bar stay `flex: 0 0 auto` while only
+     the active content surface flexes. */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+#editor-pane > #editor,
+#editor-pane > #vault-home,
+#editor-pane > #settings-pane,
+#editor-pane > #properties-pane,
+#editor-pane > #cluster-editor-pane,
+#editor-pane > #cluster-review-pane {
+  flex: 1 1 0;
+  min-height: 0;
+}
+

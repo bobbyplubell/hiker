@@ -4,23 +4,32 @@
 //! `Embedder` trait and the DTOs it returns. Both `load` and `embed_batch`
 //! are synchronous + CPU-bound; tokio-aware callers (the indexer task) must
 //! wrap them in `spawn_blocking`.
+//!
+//! status: embedder-fastembed-v5
+//! status: embedder-model-selectable
+//! status: embedder-version-per-model
+//! status: embedder-dim-from-model
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use thiserror::Error;
 
-use crate::store::EMBED_DIM;
+/// Default model id — the v1 fastembed pick. Stays as the loader default and
+/// the value `notes.embedder_version` gets when no `[indexing].model` is
+/// configured. See `embedder-fastembed-bge-small`.
+pub const DEFAULT_MODEL_ID: &str = "bge-small-en-v1.5";
 
-/// Version string stored in `notes.embedder_version`. Bump this whenever the
-/// model identity changes — the indexer treats a mismatch as "re-embed
-/// everything." Format is the model id verbatim so it's recognizable.
-pub const EMBEDDER_VERSION: &str = "bge-small-en-v1.5";
+/// Back-compat alias for the v1 default; some tests still reference this.
+pub const EMBEDDER_VERSION: &str = DEFAULT_MODEL_ID;
 
 #[derive(Debug, Error)]
 pub enum EmbedError {
     #[error("no platform data dir available")]
     NoDataDir,
+    #[error("unknown embedder model id: {0}")]
+    UnknownModel(String),
     #[error("model load: {0}")]
     Load(String),
     #[error("embed: {0}")]
@@ -37,11 +46,13 @@ pub enum EmbedError {
 pub trait Embedder: Send + Sync {
     /// Stable identifier for the model (and any preprocessing) currently in
     /// use. Stored alongside each note's row in the index; bumps trigger
-    /// re-embed naturally.
+    /// re-embed naturally. For fastembed, this is the model id verbatim
+    /// (`bge-small-en-v1.5`, `bge-m3`, `embedding-gemma-300m`).
     fn version(&self) -> &str;
 
-    /// Output vector dimension. Must match `store::EMBED_DIM` for the index
-    /// to accept the vectors.
+    /// Output vector dimension. Source of truth for the chunk_vecs schema —
+    /// `Store::ensure_chunk_vecs_dim(embedder.dim())` runs once at indexer
+    /// startup before any ingest.
     fn dim(&self) -> usize;
 
     /// Embed a batch of texts. Synchronous and CPU-bound — wrap in
@@ -50,48 +61,104 @@ pub trait Embedder: Send + Sync {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
 }
 
+/// Static registry of the supported fastembed models. Mirrors the spec table
+/// in `docs/index.md` §"Embedder". The dim is duplicated from fastembed's
+/// per-model `ModelInfo` so the loader can answer `Embedder::dim()` without
+/// having to run an inference probe.
+const KNOWN_MODELS: &[(&str, EmbeddingModel, usize)] = &[
+    ("bge-small-en-v1.5", EmbeddingModel::BGESmallENV15, 384),
+    ("bge-m3", EmbeddingModel::BGEM3, 1024),
+    ("embedding-gemma-300m", EmbeddingModel::EmbeddingGemma300M, 768),
+];
+
+/// Resolve a model id (e.g. `"bge-small-en-v1.5"`) to its fastembed variant
+/// and output dim. Returns `None` for unknown ids — callers convert that
+/// into `EmbedError::UnknownModel` or `HikerError::Config` as appropriate.
+pub fn resolve_model(id: &str) -> Option<(EmbeddingModel, usize)> {
+    KNOWN_MODELS
+        .iter()
+        .find(|(name, _, _)| *name == id)
+        .map(|(_, m, d)| (m.clone(), *d))
+}
+
+/// Dim for a known model id, or `None` if the id isn't in the registry.
+/// Used by the settings UI ("Dim change" bullet) and by validators that
+/// want to reject an unsupported model id before any expensive load.
+pub fn model_dim(id: &str) -> Option<usize> {
+    resolve_model(id).map(|(_, d)| d)
+}
+
+/// True if `id` names a supported fastembed model. Backs the strict-load
+/// validator in `core::config` (`[indexing].model`).
+pub fn is_known_model(id: &str) -> bool {
+    resolve_model(id).is_some()
+}
+
+/// All supported model ids, in spec order. Used by the settings dropdown
+/// row builder so the TS side doesn't hand-maintain a parallel list.
+pub fn supported_model_ids() -> Vec<&'static str> {
+    KNOWN_MODELS.iter().map(|(name, _, _)| *name).collect()
+}
+
 /// Production embedder backed by fastembed-rs. Constructed once per process;
-/// model weights load lazily on first embed call (fastembed handles that
-/// internally), but the model files themselves download on `load`.
+/// model weights load on `load_in` (fastembed downloads them on first call).
+///
+/// fastembed v5's `embed` takes `&mut self`, so the inner handle is wrapped
+/// in a `Mutex`. The embedder is CPU-bound and called from the indexer's
+/// `spawn_blocking` worker, so the lock is uncontended in practice.
 pub struct FastembedEmbedder {
-    inner: TextEmbedding,
+    inner: Mutex<TextEmbedding>,
+    model_id: String,
+    dim: usize,
     model_dir: PathBuf,
 }
 
 impl FastembedEmbedder {
-    /// Resolve the platform-appropriate model cache directory and load (or
-    /// download on first call) the bge-small model. Synchronous; multi-second
-    /// on a cold cache. Wrap in `spawn_blocking` from async code.
+    /// Resolve the platform-appropriate model cache directory and load the
+    /// default model. Synchronous; multi-second on a cold cache. Wrap in
+    /// `spawn_blocking` from async code.
     pub fn load() -> Result<Self, EmbedError> {
-        let dir = default_model_dir()?;
-        Self::load_in(&dir)
+        Self::load_id(DEFAULT_MODEL_ID)
     }
 
-    /// Same as `load` but with an explicit model cache directory. Useful for
-    /// tests and for callers that want the location overridden via settings.
-    pub fn load_in(model_dir: &Path) -> Result<Self, EmbedError> {
+    /// Load a specific model by id (one of `KNOWN_MODELS`).
+    pub fn load_id(model_id: &str) -> Result<Self, EmbedError> {
+        let dir = default_model_dir()?;
+        Self::load_in(&dir, model_id)
+    }
+
+    /// Same as `load_id` but with an explicit model cache directory. Useful
+    /// for tests and for callers that want the location overridden via
+    /// settings.
+    pub fn load_in(model_dir: &Path, model_id: &str) -> Result<Self, EmbedError> {
+        let (variant, expected_dim) = resolve_model(model_id)
+            .ok_or_else(|| EmbedError::UnknownModel(model_id.to_string()))?;
         std::fs::create_dir_all(model_dir)?;
         let inner = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15)
+            TextInitOptions::new(variant)
                 .with_cache_dir(model_dir.to_path_buf())
                 .with_show_download_progress(true),
         )
         .map_err(|e| EmbedError::Load(e.to_string()))?;
         let me = Self {
-            inner,
+            inner: Mutex::new(inner),
+            model_id: model_id.to_string(),
+            dim: expected_dim,
             model_dir: model_dir.to_path_buf(),
         };
-        // Sanity-check the dimension early so a mismatch surfaces on load,
-        // not on the first index pass.
-        let probe = me
-            .inner
-            .embed(vec!["dimension probe"], None)
-            .map_err(|e| EmbedError::Embed(e.to_string()))?;
+        // Sanity-check the dimension early so a model registry / runtime
+        // mismatch surfaces on load, not on the first index pass.
+        let probe = {
+            let mut guard = me.inner.lock().expect("embedder mutex poisoned");
+            guard
+                .embed(vec!["dimension probe"], None)
+                .map_err(|e| EmbedError::Embed(e.to_string()))?
+        };
         let got = probe.first().map(|v| v.len()).unwrap_or(0);
-        if got != EMBED_DIM {
+        if got != expected_dim {
             return Err(EmbedError::DimMismatch {
                 got,
-                expected: EMBED_DIM,
+                expected: expected_dim,
             });
         }
         Ok(me)
@@ -104,28 +171,30 @@ impl FastembedEmbedder {
 
 impl Embedder for FastembedEmbedder {
     fn version(&self) -> &str {
-        EMBEDDER_VERSION
+        &self.model_id
     }
 
     fn dim(&self) -> usize {
-        EMBED_DIM
+        self.dim
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // fastembed wants Vec<&str>-shaped input; clone is cheap (string refs).
+        // fastembed wants `impl AsRef<[S]>`-shaped input; collect to Vec<&str>.
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let out = self
-            .inner
-            .embed(refs, None)
-            .map_err(|e| EmbedError::Embed(e.to_string()))?;
+        let out = {
+            let mut guard = self.inner.lock().expect("embedder mutex poisoned");
+            guard
+                .embed(refs, None)
+                .map_err(|e| EmbedError::Embed(e.to_string()))?
+        };
         for v in &out {
-            if v.len() != EMBED_DIM {
+            if v.len() != self.dim {
                 return Err(EmbedError::DimMismatch {
                     got: v.len(),
-                    expected: EMBED_DIM,
+                    expected: self.dim,
                 });
             }
         }
@@ -154,7 +223,7 @@ impl MockEmbedder {
     pub fn new(version: impl Into<String>) -> Self {
         Self {
             version: version.into(),
-            dim: EMBED_DIM,
+            dim: crate::store::DEFAULT_EMBED_DIM,
         }
     }
 
@@ -196,6 +265,7 @@ impl Embedder for MockEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::DEFAULT_EMBED_DIM;
 
     #[test]
     fn mock_embedder_returns_correct_dim() {
@@ -204,8 +274,8 @@ mod tests {
             .embed_batch(&["hello".to_string(), "world".to_string()])
             .unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].len(), EMBED_DIM);
-        assert_eq!(out[1].len(), EMBED_DIM);
+        assert_eq!(out[0].len(), DEFAULT_EMBED_DIM);
+        assert_eq!(out[1].len(), DEFAULT_EMBED_DIM);
     }
 
     #[test]
@@ -241,19 +311,35 @@ mod tests {
     #[test]
     fn default_model_dir_resolves() {
         let dir = default_model_dir().unwrap();
-        // Don't create it here — just confirm we got a non-empty path.
         assert!(!dir.as_os_str().is_empty());
     }
 
-    /// Real-model smoke test. Downloads ~30MB on first run and pegs CPU
-    /// briefly. Run manually with `cargo test -- --ignored`.
+    #[test]
+    fn known_models_have_expected_dims() {
+        assert_eq!(model_dim("bge-small-en-v1.5"), Some(384));
+        assert_eq!(model_dim("bge-m3"), Some(1024));
+        assert_eq!(model_dim("embedding-gemma-300m"), Some(768));
+        assert_eq!(model_dim("nonsense"), None);
+    }
+
+    #[test]
+    fn supported_model_ids_lists_v1_set() {
+        let ids = supported_model_ids();
+        assert_eq!(
+            ids,
+            vec!["bge-small-en-v1.5", "bge-m3", "embedding-gemma-300m"]
+        );
+    }
+
+    /// Real-model smoke test for the default model. Downloads ~30MB on first
+    /// run and pegs CPU briefly. Run manually with `cargo test -- --ignored`.
     #[test]
     #[ignore = "downloads model + slow"]
-    fn fastembed_load_and_embed() {
+    fn fastembed_load_and_embed_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let emb = FastembedEmbedder::load_in(tmp.path()).unwrap();
-        assert_eq!(emb.dim(), EMBED_DIM);
-        assert_eq!(emb.version(), EMBEDDER_VERSION);
+        let emb = FastembedEmbedder::load_in(tmp.path(), DEFAULT_MODEL_ID).unwrap();
+        assert_eq!(emb.dim(), DEFAULT_EMBED_DIM);
+        assert_eq!(emb.version(), DEFAULT_MODEL_ID);
 
         let out = emb
             .embed_batch(&[
@@ -262,7 +348,7 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].len(), EMBED_DIM);
+        assert_eq!(out[0].len(), DEFAULT_EMBED_DIM);
         // Determinism within a single load (same model state).
         let again = emb
             .embed_batch(&["Hiker is a personal notes app".to_string()])

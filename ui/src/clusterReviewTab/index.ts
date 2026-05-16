@@ -131,6 +131,10 @@ interface PaneState {
   /// True when the Configuration section is collapsed (auto-collapses
   /// after the first successful Run).
   configCollapsed: boolean;
+  /// True when the Advanced disclosure inside the Configuration section
+  /// is open. Persisted across repaints (method / algorithm switches)
+  /// so toggling either of those doesn't collapse it.
+  advancedOpen: boolean;
 }
 
 export interface ClusterReviewDeps {
@@ -196,6 +200,12 @@ const Api = {
     tree: BuiltClusterTree;
     carry_policies_down: boolean;
     user_renamed: Record<string, string>;
+    /// status: cluster-review-tab-confirm-skip-naming
+    /// When false, the backend skips submitting `RaptorSummarize` tasks
+    /// for the new subtree — placeholder cluster names stay intact and
+    /// the user can run "Regenerate names" from the cluster pane later.
+    /// Mirrors the same flag on `cluster_persist_built_tree`.
+    submit_naming: boolean;
   }): Promise<{ new_cluster_ids: string[]; task_ids: string[] }> {
     return invoke("cluster_op_recluster_subtree_from_built", { args });
   },
@@ -237,7 +247,7 @@ function defaultLeidenParams(): LeidenParams {
 
 function defaultClusterParams(): ClusterParams {
   return {
-    algorithm: "hdbscan",
+    algorithm: "leiden",
     min_cluster_size: 5,
     min_samples: null,
     min_clusters_to_recurse: 4,
@@ -364,6 +374,7 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       running: false,
       confirming: false,
       configCollapsed: false,
+      advancedOpen: false,
     };
     panes.set(key, state);
     if (purpose.kind === "rebuild") prefillRebuild(state);
@@ -456,25 +467,24 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     // status: cluster-review-tab-confirm-skip-naming
     // Second confirm button — persists the tree but skips the LLM
     // naming pass, so placeholder names ("Cluster 1", "Cluster 2", …)
-    // stay intact. Only meaningful for new-tree / rebuild: the
-    // recluster path's `cluster_op_recluster_subtree_from_built` has
-    // its own naming submission flow, separate from this command.
-    if (state.purpose.kind !== "recluster-subtree") {
-      const confirmNoNameBtn = document.createElement("button");
-      confirmNoNameBtn.type = "button";
-      confirmNoNameBtn.className = "crt-btn";
-      confirmNoNameBtn.textContent = state.confirming
-        ? "Submitting…"
-        : "Confirm (no naming)";
-      confirmNoNameBtn.disabled =
-        state.running || state.confirming || !state.result;
-      confirmNoNameBtn.title =
-        "Persist the tree with placeholder cluster names. Run 'Regenerate names' from the cluster pane later to LLM-name clusters.";
-      confirmNoNameBtn.addEventListener("click", () =>
-        void confirmAndName(state, false),
-      );
-      row.appendChild(confirmNoNameBtn);
-    }
+    // stay intact. Now offered for the recluster path too: the
+    // `cluster_op_recluster_subtree_from_built` command honors the same
+    // `submit_naming: false` flag and short-circuits its
+    // `RaptorSummarize` submission loop.
+    const confirmNoNameBtn = document.createElement("button");
+    confirmNoNameBtn.type = "button";
+    confirmNoNameBtn.className = "crt-btn";
+    confirmNoNameBtn.textContent = state.confirming
+      ? "Submitting…"
+      : "Confirm (no naming)";
+    confirmNoNameBtn.disabled =
+      state.running || state.confirming || !state.result;
+    confirmNoNameBtn.title =
+      "Persist the tree with placeholder cluster names. Run 'Regenerate names' from the cluster pane later to LLM-name clusters.";
+    confirmNoNameBtn.addEventListener("click", () =>
+      void confirmAndName(state, false),
+    );
+    row.appendChild(confirmNoNameBtn);
 
     const discardBtn = document.createElement("button");
     discardBtn.type = "button";
@@ -657,6 +667,10 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
   function renderAdvanced(state: PaneState): HTMLElement {
     const det = document.createElement("details");
     det.className = "crt-advanced";
+    det.open = state.advancedOpen;
+    det.addEventListener("toggle", () => {
+      state.advancedOpen = det.open;
+    });
     const sum = document.createElement("summary");
     sum.textContent = "Advanced";
     det.appendChild(sum);
@@ -1159,9 +1173,10 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
   // `submitNaming = false` is the "Confirm (no naming)" path: persist
   // the tree with placeholder cluster names ("Cluster 1", "Cluster 2",
   // …) but don't enqueue `RaptorSummarize` tasks. The user can run
-  // "Regenerate names" from the cluster pane later. Recluster always
-  // submits naming tasks — its skip-LLM variant isn't requested yet
-  // and its task wiring lives in a different command.
+  // "Regenerate names" from the cluster pane later. Both the new-tree /
+  // rebuild path (`cluster_persist_built_tree`) and the recluster path
+  // (`cluster_op_recluster_subtree_from_built`) honor the flag and
+  // short-circuit their `RaptorSummarize` submission loop.
   async function confirmAndName(
     state: PaneState,
     submitNaming: boolean,
@@ -1186,8 +1201,15 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
           tree: state.result.tree,
           carry_policies_down: state.form.carryPoliciesDown,
           user_renamed: renamedRecord,
+          submit_naming: submitNaming,
         });
-        showToast("Subtree reclustered. Naming tasks queued.");
+        if (submitNaming) {
+          showToast("Subtree reclustered. Naming tasks queued.");
+        } else {
+          showToast(
+            "Subtree reclustered with placeholder names — run 'Regenerate names' later to LLM-name clusters.",
+          );
+        }
         await deps.transitionToPane(state.key, state.purpose.treeId, state.form.name);
       } else {
         const source = state.form.lifecycle === "evergreen" ? "saved-triage" : "one-shot";

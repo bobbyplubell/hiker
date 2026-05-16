@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::RecencyBias;
-use crate::store::{knn_chunks_on, Store, StoreError, EMBED_DIM};
+use crate::store::{knn_chunks_on, Store, StoreError};
+#[cfg(test)]
+use crate::store::DEFAULT_EMBED_DIM;
 
 /// Per-backend top-k pulled internally before fusion. Spec: 25 per backend
 /// gives RRF a tail of below-the-fold candidates from each side without
@@ -47,6 +49,9 @@ pub enum SearchError {
     Store(#[from] StoreError),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    // Kept as a typed shape callers may construct in the future; the live
+    // dim check now lives in `knn_chunks_on` and surfaces via `Store`.
+    #[allow(dead_code)]
     #[error("embed dim mismatch: got {got}, expected {expected}")]
     EmbedDim { got: usize, expected: usize },
 }
@@ -288,12 +293,10 @@ impl<'a> SemanticEngine for VecSemanticEngine<'a> {
         embedding: &[f32],
         top_k: usize,
     ) -> Result<Vec<NoteHit>, SearchError> {
-        if embedding.len() != EMBED_DIM {
-            return Err(SearchError::EmbedDim {
-                got: embedding.len(),
-                expected: EMBED_DIM,
-            });
-        }
+        // Dim check is owned by `knn_chunks_on`, which reads the live
+        // on-disk `chunk_vecs` dim and rejects mismatches there — that's
+        // the source of truth after `embedder-dim-from-model`, not a
+        // const baked into search.
         // Pull a wider candidate set so per-note dedupe still produces top_k
         // distinct notes. knn_chunks_on already over-pulls (×4) internally,
         // but here we want note-level top_k, not chunk-level.
@@ -656,7 +659,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn unit_vec(seed: f32) -> Vec<f32> {
-        (0..EMBED_DIM).map(|i| seed + i as f32 * 0.001).collect()
+        (0..DEFAULT_EMBED_DIM).map(|i| seed + i as f32 * 0.001).collect()
     }
 
     fn mk_chunk(idx: u32, text: &str) -> Chunk {

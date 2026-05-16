@@ -119,6 +119,16 @@ export interface GraphViewDeps {
 export interface GraphViewApi {
   /// Replace the in-canvas data with fresh rows (after a mutation).
   setNodes(nodes: ClusterNodeRow[]): void;
+  /// Open the view-options popover anchored to `anchor`. Exposed so
+  /// the host pane can host the trigger button on its own toolbar
+  /// rather than inside the graph view's local chrome.
+  openViewMenu(anchor: HTMLElement): void;
+  /// Returns the graph-specific view-options items (leaves visibility,
+  /// layout, show outliers, fit/reset). Exposed so the pane can fold
+  /// these into a unified "view" menu that also carries the view-mode
+  /// (tree / graph / markdown) selector, without each surface having
+  /// to maintain its own menu trigger.
+  getViewMenuItems(): import("../../widgets/contextMenu").CtxMenuItem[];
   destroy(): void;
 }
 
@@ -170,6 +180,15 @@ function mount(
   // canvas's top-left when no pointer movement has been observed yet.
   let lastMouse: { x: number; y: number } | null = null;
 
+  // Pin-state for the note-preview card. Declared up here (rather than
+  // alongside the rendering helpers below) because the initial
+  // `refreshNoteOverlayVisibility()` call during chrome setup reads
+  // `pinnedLeafId`, and a `let` declared further down would be in TDZ
+  // at that point.
+  const noteBodyCache = new Map<string, string>();
+  const noteFetchInFlight = new Set<string>();
+  let pinnedLeafId: string | null = null;
+
   // Build chrome: filter strip on top, view-menu button, canvas, and
   // a selection-count footer.
   hostEl.replaceChildren();
@@ -214,18 +233,10 @@ function mount(
     }
   }
 
-  // View-menu button (eye icon).
+  // View-menu trigger lives on the parent pane's toolbar (see
+  // `clusterEditorPane/index.ts::paintTree` — eye-icon button next to
+  // the view toggle). Exposed below via `GraphViewApi.openViewMenu`.
   // status: cluster-editor-graph-view-view-menu
-  const viewMenuBtn = document.createElement("button");
-  viewMenuBtn.type = "button";
-  viewMenuBtn.className = "cep-graph-view-btn";
-  viewMenuBtn.title = "View options";
-  viewMenuBtn.textContent = "View ▾";
-  viewMenuBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openViewMenu(viewMenuBtn);
-  });
-  chrome.appendChild(viewMenuBtn);
 
   hostEl.appendChild(chrome);
 
@@ -287,6 +298,7 @@ function mount(
   renderer = rendererMod.createSigmaRenderer(canvasHost, {
     onNodeClick: (id, { shift }) => handleNodeClick(id, shift),
     onNodeDoubleClick: (id) => handleNodeDoubleClick(id),
+    onNodeRightClick: (id, pos) => handleNodeRightClick(id, pos),
     onNodeHover: (id) => handleHover(id),
     onBackgroundClick: () => {
       if (selection.size > 0) {
@@ -295,6 +307,9 @@ function mount(
         rebuild();
         renderFooter();
       }
+      // Clearing the selection on a blank click also dismisses the
+      // pinned note-preview overlay.
+      unpinLeaf();
       hideTooltip();
     },
     onCameraUpdate: (cam) => {
@@ -348,31 +363,28 @@ function mount(
   //
   // A small card pinned to the top-right of the canvas. Single-click a
   // leaf to load its body here (lazy, cached); double-click opens the
-  // note as a full editor tab.
-
-  const noteBodyCache = new Map<string, string>();
-  const noteFetchInFlight = new Set<string>();
-  let pinnedLeafId: string | null = null;
+  // note as a full editor tab. The `pinnedLeafId` / cache state is
+  // hoisted up near `lastMouse` so the early-init call can read it.
 
   function refreshNoteOverlayVisibility(): void {
-    noteOverlay.hidden = !viewState.showNotePreview;
-    if (viewState.showNotePreview && pinnedLeafId == null) {
-      renderEmptyPreview();
-    }
-  }
-
-  function renderEmptyPreview(): void {
-    noteOverlay.replaceChildren();
-    const hint = document.createElement("div");
-    hint.className = "cep-graph-note-hint";
-    hint.textContent = "Click a note to preview · double-click to open";
-    noteOverlay.appendChild(hint);
+    // Only show the overlay once the user has selected a leaf — there's
+    // no value in occluding the canvas with an empty "click a note"
+    // hint card when no preview is pinned.
+    noteOverlay.hidden = !viewState.showNotePreview || pinnedLeafId == null;
   }
 
   function pinLeaf(leaf: ClusterNodeRow): void {
     if (!leaf.note_path) return;
     pinnedLeafId = leaf.id;
     renderPinnedNote(leaf);
+    refreshNoteOverlayVisibility();
+  }
+
+  function unpinLeaf(): void {
+    if (pinnedLeafId == null) return;
+    pinnedLeafId = null;
+    noteOverlay.replaceChildren();
+    refreshNoteOverlayVisibility();
   }
 
   function renderPinnedNote(leaf: ClusterNodeRow): void {
@@ -556,28 +568,45 @@ function mount(
   function handleNodeClick(id: string, shift: boolean): void {
     const row = nodes.find((n) => n.id === id);
     if (!row) return;
+    // status: cluster-editor-graph-view-selection-outline
+    // Plain left-click selects the node (single-select, replacing any
+    // existing selection). Shift+click extends/toggles the multi-select.
+    // The policy popover moved to right-click (`onNodeRightClick`).
     if (shift) {
-      // status: cluster-editor-graph-view-selection-outline
       if (selection.has(id)) selection.delete(id);
       else selection.add(id);
-      onSelectionChanged?.(new Set(selection));
-      rebuild();
-      renderFooter();
-      return;
+    } else {
+      selection.clear();
+      selection.add(id);
     }
-    if (row.kind === "leaf") {
-      if (!row.note_path) return;
-      // status: cluster-editor-graph-view-leaf-click-opens-note
-      // Single-click on a leaf pins the note into the preview card and
-      // shows the hover tooltip; double-click opens the note as a full
-      // editor tab. The double-click gesture is the sigma renderer's
-      // native `doubleClickNode` event, wired below as
-      // `handleNodeDoubleClick`.
-      if (viewState.showNotePreview) pinLeaf(row);
-      return;
+    onSelectionChanged?.(new Set(selection));
+    rebuild();
+    renderFooter();
+    // For a leaf, also pin its note into the preview card so a single
+    // click acts as "select + show contents" (the preview affordance
+    // only fires when the user has the overlay enabled).
+    if (
+      !shift
+      && row.kind === "leaf"
+      && row.note_path
+      && viewState.showNotePreview
+    ) {
+      pinLeaf(row);
     }
+  }
+
+  function handleNodeRightClick(
+    id: string,
+    pos: { clientX: number; clientY: number },
+  ): void {
+    const row = nodes.find((n) => n.id === id);
+    if (!row) return;
     // status: cluster-editor-graph-view-click-to-edit-policy
-    openPolicyMenuFor(row, id);
+    // Right-click opens the policy menu on cluster / outlier-bucket
+    // nodes. Leaves have no per-node menu yet — falling through is
+    // intentional (matches the row primitive's right-click behavior).
+    if (row.kind === "leaf") return;
+    openPolicyMenuFor(row, id, pos);
   }
 
   function handleNodeDoubleClick(id: string): void {
@@ -587,15 +616,19 @@ function mount(
     // opens the policy popover (above) and double-click is a no-op so
     // accidental rapid clicks don't fire twice.
     if (row.kind !== "leaf" || !row.note_path) return;
-    void openNote(row.note_path, { preview: false });
+    // Open as a preview tab (matches sidebar / activity behavior) —
+    // the full tab is reachable from the preview's own pin affordance.
+    void openNote(row.note_path, { preview: true });
   }
 
-  function openPolicyMenuFor(row: ClusterNodeRow, sigmaNodeId: string): void {
-    // Anchor at the screen position of the node — sigma exposes
-    // viewport coords via internal helpers. For Sprint E we use the
-    // canvas center as a reasonable anchor (the menu is short-lived
-    // and accuracy at <100px doesn't matter much). A follow-up can
-    // reach into the renderer for exact node screen coords.
+  function openPolicyMenuFor(
+    row: ClusterNodeRow,
+    sigmaNodeId: string,
+    anchor?: { clientX: number; clientY: number },
+  ): void {
+    // Anchor at the pointer location when called from the right-click
+    // path (the natural place for a context menu); fall back to the
+    // canvas center for legacy/programmatic call sites.
     const rect = canvasHost!.getBoundingClientRect();
     const items: CtxMenuItem[] = [
       {
@@ -654,7 +687,9 @@ function mount(
         },
       });
     }
-    openContextMenu(rect.left + rect.width / 2, rect.top + rect.height / 2, items);
+    const anchorX = anchor?.clientX ?? rect.left + rect.width / 2;
+    const anchorY = anchor?.clientY ?? rect.top + rect.height / 2;
+    openContextMenu(anchorX, anchorY, items);
     // Silence unused-var warning for sigmaNodeId — kept in the
     // signature to make future "anchor at exact node coords" work
     // straightforward.
@@ -795,7 +830,13 @@ function mount(
   // ── View menu ─────────────────────────────────────────────────────
 
   function openViewMenu(anchor: HTMLElement): void {
-    const items: CtxMenuItem[] = [
+    const items = buildViewMenuItems();
+    const rect = anchor.getBoundingClientRect();
+    openContextMenu(rect.right, rect.bottom, items, anchor);
+  }
+
+  function buildViewMenuItems(): CtxMenuItem[] {
+    return [
       // status: cluster-editor-graph-view-leaf-visibility
       {
         kind: "radio",
@@ -860,8 +901,6 @@ function mount(
         },
       },
     ];
-    const rect = anchor.getBoundingClientRect();
-    openContextMenu(rect.right, rect.bottom, items, anchor);
   }
 
   function leafVisibilityLabel(v: LeafVisibility): string {
@@ -905,7 +944,7 @@ function mount(
     renderer = null;
   }
 
-  return { setNodes, destroy };
+  return { setNodes, destroy, openViewMenu, getViewMenuItems: buildViewMenuItems };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

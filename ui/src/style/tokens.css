@@ -1,0 +1,114 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: light dark;
+  /* Shared height for the three top bars (vault-bar, editor-toolbar,
+     discovery-bar) so they line up across columns. */
+  --top-bar-height: 40px;
+  /* Shared height for the bottom strips (editor status bar + collapsed
+     trash header) so the two sidebar/editor columns line up at the
+     bottom. When trash is expanded the header keeps this height; the
+     list flows above it inside the sidebar's scroll container. */
+  --bottom-bar-height: 32px;
+
+  /* ============================================================
+     Color tokens — single source of truth for the whole stylesheet.
+     Rules below reference these only; no rule should reach for a
+     bare hex / rgba literal. The :root { ... } block here is the
+     spot a future `[data-theme="dark"]` (or system-pref media query)
+     can override every visual without touching another selector.
+     ============================================================ */
+
+  /* --- Accent (the "hiker blue" used by every active / selected /
+         focused surface). `--accent-fill*` are hardcoded rgba so
+         older webviews that resolve `color-mix` to invalid don't
+         silently break the whole declaration. --- */
+  --accent: #4a90e2;
+  --accent-fill: rgba(74, 144, 226, 0.27);
+  --accent-fill-strong: rgba(74, 144, 226, 0.20);
+  --accent-fill-soft: rgba(74, 144, 226, 0.13);
+  --accent-hover: #3a80d2;
+  --accent-soft-fill: #5588dd33;          /* @-mention selected row */
+  --accent-link: #58a;                    /* chat note links */
+  --accent-link-hover: #6aa8f0;           /* toast action hover */
+  --accent-link-bright: #3b82f6;          /* livePreview link (light) */
+  --accent-link-bright-hover: #60a5fa;    /* livePreview link (dark) */
+  --accent-chunk: #d97757;                /* chunk-boundary rule + gutter */
+  --accent-on-strong: #fff;               /* text on filled accent surface */
+
+  /* --- Text (foreground) ---
+         Strong is the primary text color (filenames, stat-tile values).
+         Default is body / settings / vault-home text.
+         Muted folds together what was previously #888 / #999 / #aaa —
+         the three were within visual rounding of each other and only
+         drifted because each rule picked a fresh hex. */
+  --text-strong: #000;
+  --text-default: #ccc;                   /* settings/vault-home body (was #ccc + #ddd) */
+  --text-muted: #999;                     /* secondary (was #888 + #999 + #aaa) */
+  --text-dim: #777;                       /* tertiary / id refs */
+  --text-faint: #555;                     /* disabled rows */
+
+  /* --- Surface overlays (neutral grey alpha — the historical `#888X`
+         family). Theme-agnostic because they're already alpha over
+         whatever bg sits beneath, but pulling them into tokens means
+         a future theme can override the alpha curve in one place. --- */
+  --surface-hover-soft: #8881;
+  --surface-hover: #8882;
+  --surface-active: #8883;
+  --border-default: #8884;
+  --border-strong: #8886;
+
+  /* --- Solid surfaces / dividers --- */
+  --bg-app: #1a1a1a;                      /* base app bg (unused today; declared for future theme) */
+  --bg-popover: #1a1a1a;                  /* settings info popover */
+  --bg-toast: #222;
+  --bg-pre: #0001;                        /* chat-tool-call json bg */
+  --bg-zebra: rgba(255, 255, 255, 0.015); /* settings odd-row */
+  --bg-panel-elevated: rgba(255, 255, 255, 0.03);
+  --bg-panel-elevated-strong: rgba(255, 255, 255, 0.04);
+  --border-panel-strong: rgba(255, 255, 255, 0.06);
+  --border-divider: #2a2a2a;              /* card / list dividers (was #2a2a2a + #2c2c2c) */
+  --border-input: #333;
+
+  /* --- Shadows / overlay washes --- */
+  --shadow-soft: #0003;                   /* popover */
+  --shadow-strong: #0006;                 /* modal / toast / context menu */
+  --bg-overlay-modal: #0008;              /* modal backdrop */
+
+  /* --- Danger / error --- */
+  --danger: #c0392b;                      /* modal-btn-danger, ctx-menu danger */
+  --danger-hover: #a83224;
+  --danger-close-hover: #e81123;          /* window close button hover */
+  --danger-text: #c44;                    /* chat tool-call fail / error msg text */
+  --danger-fill: #c441;                   /* chat error msg bg / session-trash hover */
+  --danger-border: #c44a;
+  --danger-text-strong: #d75d5d;          /* queue error states */
+
+  /* --- Warn / dirty --- */
+  --warn: #e0a040;                        /* dirty dot, skipped marker (was #e0a040 + #f0a020) */
+  --warn-strong: #b88a36;                 /* rolled-back row left-edge */
+  --warn-soft-text: #d2a866;              /* un-rollback prompt text */
+  --warn-fill: rgba(255, 200, 80, 0.04);  /* rolled-back row bg */
+  --highlight-mark: #ffe06688;            /* FTS5 snippet <mark> */
+
+  /* --- Success --- */
+  --success: #4a4;                        /* chat tool-call ok */
+  --success-strong: #6da76d;              /* queue ok */
+
+  /* --- Diff (decoration fills painted into the editor's CM6 view) --- */
+  --diff-add-fill: rgba(60, 180, 100, 0.18);
+  --diff-del-fill: rgba(220, 80, 80, 0.18);
+  --diff-add-intra-fill: rgba(60, 180, 100, 0.45);
+  --diff-del-intra-fill: rgba(220, 80, 80, 0.45);
+  --diff-sep-border: rgba(255, 255, 255, 0.12);
+
+  /* --- Live-preview neutral overlays (50% grey alpha — intentionally
+         theme-agnostic, used by livePreview's CM6 baseTheme for inline
+         code + fence-line bg). --- */
+  --lp-code-bg: rgba(127, 127, 127, 0.15);
+  --lp-fence-bg: rgba(127, 127, 127, 0.08);
+
+  /* --- Queue (high-priority chip + active pulse) --- */
+  --queue-pri-high-color: #d68a78;
+  --queue-pri-high-border: #c25a4d66;
+  --queue-active-pulse-color: #5da7e6;
+}

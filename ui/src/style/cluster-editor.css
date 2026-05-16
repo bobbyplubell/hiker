@@ -1,0 +1,886 @@
+/* status: chat-panel-expand-to-editor */
+#app.agent-tab-open #chat-region,
+#app.agent-tab-open #chat-resize-handle {
+  display: none;
+}
+#chat-expand-btn {
+  /* icon-only, styled by the chat-panel handle area */
+}
+
+/* status: cluster-editor-sidebar-mode
+   status: cluster-editor-row-primitive
+   Cluster editor body — the sidebar mode body for clusters trees. The
+   row primitive is local to this module for Sprint B; future
+   hierarchical surfaces can lift it into `ui/src/treeRows/`. */
+.cluster-editor {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--text-strong);
+  padding: 4px 0;
+  gap: 4px;
+}
+.cluster-editor .ce-header {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  font-weight: 600;
+}
+.cluster-editor .ce-empty {
+  padding: 8px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.cluster-editor .ce-action-primary {
+  display: block;
+  margin: 4px 8px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px dashed var(--border-default);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  border-radius: 4px;
+}
+.cluster-editor .ce-action-primary:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor .ce-tree {
+  border-top: 1px solid var(--border-divider);
+}
+.cluster-editor .ce-tree-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  user-select: none;
+}
+.cluster-editor .ce-tree-name {
+  font-weight: 600;
+}
+.cluster-editor .ce-state-pill {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+.cluster-editor .ce-state-draft {
+  background: var(--surface-hover);
+}
+.cluster-editor .ce-state-applied {
+  background: var(--accent-soft, var(--surface-hover));
+}
+.cluster-editor .ce-tree-icon-btn {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 4px 8px;
+  min-width: 28px;
+  min-height: 24px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cluster-editor .ce-tree-icon-btn:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor .ce-tree-body {
+  padding: 2px 0;
+}
+.cluster-editor .ce-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  cursor: default;
+  border-radius: 3px;
+}
+.cluster-editor .ce-row:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor .ce-row-selected {
+  background: var(--accent-soft, var(--surface-hover));
+}
+.cluster-editor .ce-row-outliers {
+  font-style: italic;
+}
+.cluster-editor .ce-chev {
+  width: 12px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.cluster-editor .ce-row-icon {
+  width: 12px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.cluster-editor .ce-row-name {
+  cursor: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+.cluster-editor .ce-row-name-leaf {
+  cursor: pointer;
+  color: var(--text-default);
+}
+.cluster-editor .ce-row-name-leaf:hover {
+  text-decoration: underline;
+}
+.cluster-editor .ce-row-name-edited {
+  font-style: italic;
+}
+.cluster-editor .ce-row-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 0 6px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: text;
+}
+/* Expanded clusters reveal the full summary as a wrapping textbox so the
+   user can read + click-to-edit it without leaving the tree view.
+   The depth-based left offset is applied inline (`margin-left:
+   depth * 14 + 16px`) so the box's left edge lines up with the row's
+   name-text column; don't add a constant left margin here that would
+   override it. */
+.cluster-editor .ce-row-summary.ce-row-summary-expanded {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.4;
+  padding: 4px 8px 6px;
+  margin-top: 2px;
+  margin-right: 4px;
+  margin-bottom: 6px;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border-default, rgba(128, 128, 128, 0.25));
+  border-radius: 4px;
+}
+.cluster-editor .ce-row-count {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.cluster-editor .ce-row-policy {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.cluster-editor .ce-row-policy:hover {
+  background: var(--surface-hover);
+}
+/* status: cluster-editor-summary-staleness-badge */
+.cluster-editor .ce-row-staleness {
+  font-size: 10px;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+.cluster-editor .ce-row-staleness:hover {
+  background: var(--surface-hover);
+  color: var(--text-default);
+}
+.cluster-editor .ce-row-menu-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  min-width: 20px;
+  min-height: 20px;
+  margin-right: 4px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cluster-editor .ce-row-menu-btn:hover {
+  color: var(--text-default);
+  background: var(--surface-hover);
+}
+.cluster-editor .ce-inline-edit {
+  font: inherit;
+  background: var(--surface-hover);
+  color: inherit;
+  border: 1px solid var(--accent, var(--border-default));
+  border-radius: 2px;
+  padding: 1px 4px;
+  flex: 1;
+  min-width: 80px;
+}
+/* Multiline variant — hosts a CM6 EditorView. Sits where the summary
+   div was, wraps onto multiple lines, and resizes with content. */
+.ce-inline-edit-multiline {
+  margin: 2px 4px 6px 24px;
+  border: 1px solid var(--accent, var(--border-default));
+  border-radius: 4px;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+  overflow: hidden;
+}
+.ce-inline-edit-multiline .cm-editor {
+  font: inherit;
+  font-size: 11px;
+  background: transparent;
+  outline: none;
+}
+.ce-inline-edit-multiline .cm-editor.cm-focused {
+  outline: none;
+}
+.ce-inline-edit-multiline .cm-content {
+  padding: 6px 8px;
+  line-height: 1.4;
+  caret-color: var(--accent, currentColor);
+  min-height: 1.4em;
+}
+.ce-inline-edit-multiline .cm-line {
+  padding: 0;
+}
+/* Slightly more generous in the center pane (matches the expanded-
+   summary padding) so the live editor doesn't look cramped relative to
+   the surrounding tree rows. */
+.cluster-editor-pane .ce-inline-edit-multiline {
+  margin: 4px 6px 8px 24px;
+}
+.cluster-editor-pane .ce-inline-edit-multiline .cm-content {
+  padding: 8px 10px;
+  line-height: 1.45;
+}
+.cluster-editor .ce-msel-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.cluster-editor .ce-msel-btn {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.cluster-editor .ce-msel-btn:hover {
+  background: var(--surface-hover);
+}
+
+/* The legacy New-tree / Recluster-subtree modal styles (`.ce-modal*`)
+   were removed when the clustering review tab landed (per
+   `cluster-review-tab-from-new-tree-action` /
+   `cluster-review-tab-from-recluster-action`). Modal markup is gone;
+   the review surface lives at `.cluster-review-tab` instead. */
+
+/* status: cluster-editor-pane-mode
+   status: cluster-editor-batch-review-pane
+   Expanded cluster-editor pane — peer surface of #editor / #vault-home /
+   #settings-pane / #properties-pane. Two sub-states share the same root
+   (`cluster-tree` and `cluster-batch-review`); class names live in
+   `ui/src/clusterEditorPane/index.ts`. Visual language is the same
+   editor-pane vocabulary as the sidebar cluster editor (`.ce-*`), just
+   re-scoped under `.cep-*` so the expanded surface can diverge without
+   destabilizing the sidebar primitive. */
+.cluster-editor-pane {
+  overflow: auto;
+  /* No top/horizontal padding — `.cep-head` is a full-width toolbar bar
+     pinned to the top edge (like `#editor-toolbar`). The tree/graph/md
+     body provides its own inset via `.cep-tree-body` etc. */
+  padding: 0 0 24px;
+  color: var(--text-strong);
+  font-size: 13px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+/* The class rule above sets `display: flex`, which on its own beats the
+   browser's `[hidden] { display: none }` UA rule (same specificity, later
+   author stylesheet wins). Re-assert hidden so `renderActiveTab` toggling
+   `clusterPaneEl.hidden` actually hides the pane outside cluster-batch-review
+   tabs — without this the pane stays half-visible under home / editor. */
+#cluster-editor-pane[hidden] {
+  display: none;
+}
+/* Fixed-height toolbar bar at the top of the pane, matching
+   `#editor-toolbar`'s shape (shared `--top-bar-height`, 6/8 padding,
+   bottom border, no surrounding gap). The tree title is demoted to a
+   toolbar-sized label inline with the action buttons. */
+.cluster-editor-pane .cep-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--top-bar-height);
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default);
+  /* Pane scrolls (`overflow: auto`); pin the toolbar to the top edge so
+     it stays visible as the tree body scrolls past, matching how
+     `#editor-toolbar` reads as fixed chrome above the editor. */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fff;
+}
+.cluster-editor-pane .cep-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cluster-editor-pane .cep-head h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.cluster-editor-pane .cep-spacer {
+  flex: 1;
+}
+.cluster-editor-pane .cep-state-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+.cluster-editor-pane .cep-state-pill[data-state="applied"] {
+  background: var(--accent-soft, var(--surface-hover));
+}
+.cluster-editor-pane .cep-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+}
+.cluster-editor-pane .cep-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .cep-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.cluster-editor-pane .cep-btn-primary {
+  background: var(--accent-soft, var(--surface-hover));
+  border-color: var(--accent, var(--border-default));
+}
+.cluster-editor-pane .cep-btn-primary:hover:not(:disabled) {
+  background: var(--accent, var(--surface-hover));
+  color: var(--text-on-accent, var(--text-default));
+}
+.cluster-editor-pane .cep-tree-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* Pane root no longer pads its children (the toolbar bar needs to
+     touch the edges); restore inset on the actual content body. */
+  padding: 12px 16px 0;
+}
+/* status: cluster-editor-row-primitive
+   The pane consumes the shared row primitive in
+   `ui/src/clusterEditor/rowPrimitive.ts`, which emits `.ce-*` class
+   names. Re-target the same rules to the pane wrapper so the
+   sidebar's row chrome reads identically in the pane. The legacy
+   `.cep-row*` selectors were removed alongside the inline pane
+   renderer. */
+.cluster-editor-pane .ce-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  cursor: default;
+  border-radius: 3px;
+}
+.cluster-editor-pane .ce-row:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .ce-row-selected {
+  background: var(--accent-soft, var(--surface-hover));
+}
+.cluster-editor-pane .ce-row-outliers {
+  font-style: italic;
+}
+.cluster-editor-pane .ce-chev {
+  width: 12px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.cluster-editor-pane .ce-row-icon {
+  width: 12px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.cluster-editor-pane .ce-row-name {
+  cursor: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+.cluster-editor-pane .ce-row-name-leaf {
+  cursor: pointer;
+  color: var(--text-default);
+}
+.cluster-editor-pane .ce-row-name-leaf:hover {
+  text-decoration: underline;
+}
+.cluster-editor-pane .ce-row-name-edited {
+  font-style: italic;
+}
+.cluster-editor-pane .ce-row-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 0 6px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: text;
+}
+/* Expanded clusters reveal the full summary as a wrapping textbox.
+   Slightly more generous in the center pane than in the sidebar since the
+   pane has the width to spare. Left offset is inline
+   (`depth * 14 + 16px`) to align with the row's name-text column. */
+.cluster-editor-pane .ce-row-summary.ce-row-summary-expanded {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.45;
+  padding: 6px 10px 8px;
+  margin-top: 4px;
+  margin-right: 6px;
+  margin-bottom: 8px;
+  background: var(--surface-raised, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border-default, rgba(128, 128, 128, 0.25));
+  border-radius: 4px;
+}
+.cluster-editor-pane .ce-row-count {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.cluster-editor-pane .ce-row-policy {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.cluster-editor-pane .ce-row-policy:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .ce-row-staleness {
+  font-size: 10px;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+.cluster-editor-pane .ce-row-staleness:hover {
+  background: var(--surface-hover);
+  color: var(--text-default);
+}
+.cluster-editor-pane .ce-inline-edit {
+  font: inherit;
+  background: var(--surface-hover);
+  color: inherit;
+  border: 1px solid var(--accent, var(--border-default));
+  border-radius: 2px;
+  padding: 1px 4px;
+  flex: 1;
+  min-width: 80px;
+}
+.cluster-editor-pane .ce-msel-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.cluster-editor-pane .ce-msel-btn {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.cluster-editor-pane .ce-msel-btn:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .cep-msel-host {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+}
+.cluster-editor-pane .cep-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 16px 20px;
+}
+.cluster-editor-pane .cep-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 16px 0;
+}
+.cluster-editor-pane .cep-prow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-divider, var(--border-default));
+  border-radius: 4px;
+  background: var(--bg-default, transparent);
+}
+.cluster-editor-pane .cep-prow:hover {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .cep-prow-conflicted {
+  border-color: var(--warning, var(--border-default));
+  background: var(--warning-soft, var(--surface-hover));
+}
+.cluster-editor-pane .cep-prow-left {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+.cluster-editor-pane .cep-prow-warn {
+  color: var(--warning, var(--text-muted));
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.cluster-editor-pane .cep-prow-btn {
+  font: inherit;
+  font-size: 12px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  color: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.cluster-editor-pane .cep-prow-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.cluster-editor-pane .cep-prow-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Vertical separator line between toolbar button clusters — same shape
+   as `.sidebar-toolbar-divider` on the vault-bar mode switcher. */
+.cluster-editor-pane .cep-divider {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 18px;
+  background: var(--border-default);
+}
+/* Square icon button — matches `.toolbar-btn`'s 28x28 chip shape. Used
+   by every icon-only button in the cep toolbar (view toggle, save-as-
+   triage, rebuild, discard). Overrides `.cep-btn`'s text-button padding. */
+.cluster-editor-pane .cep-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cluster-editor-pane .cep-graph-host,
+.cluster-editor-pane .cep-graph {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 400px;
+  height: 100%;
+}
+/* status: cluster-editor-markdown-view-toggle */
+.cluster-editor-pane .cep-markdown-host {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 16px;
+}
+.cluster-editor-pane .cep-markdown-body {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  margin: 0;
+  color: var(--text-default);
+}
+.cluster-editor-pane .cep-graph-chrome {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default);
+  flex-shrink: 0;
+}
+.cluster-editor-pane .cep-graph-filter {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.cluster-editor-pane .cep-graph-filter-btn {
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  color: inherit;
+  cursor: pointer;
+}
+.cluster-editor-pane .cep-graph-filter-btn.active {
+  background: var(--surface-active);
+  border-color: var(--accent, var(--border-default));
+}
+.cluster-editor-pane .cep-graph-canvas {
+  flex: 1;
+  min-height: 320px;
+  position: relative;
+}
+.cluster-editor-pane .cep-graph-note-overlay {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: min(420px, 45%);
+  /* Give the card a real height so the inner `flex: 1` body can take
+     space; without this, the absolutely-positioned flex column shrinks
+     to its content (loading state = ~10px tall sliver). `max-height`
+     alone bounds but doesn't establish height. */
+  height: min(60%, 480px);
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  color: #111;
+  border: 1px solid var(--border-default, #ccc);
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  font-size: 12px;
+  /* Sigma stacks several internal canvas layers inside `canvasHost`
+     (labels, edges, nodes, mouse). Each gets its own `z-index`; the
+     top one is around 3. Bump the overlay well above that so the
+     card's text isn't visually covered. */
+  z-index: 100;
+  /* Don't intercept clicks on the empty (hint-only) card — otherwise
+     nodes under the top-right rectangle become unselectable while the
+     preview is enabled but nothing's been pinned yet. The inner
+     content opts back in via `pointer-events: auto`. */
+  pointer-events: none;
+}
+.cluster-editor-pane .cep-graph-note-overlay > * {
+  pointer-events: auto;
+}
+/* Hint state has no interactive content — leave it click-through too. */
+.cluster-editor-pane .cep-graph-note-overlay .cep-graph-note-hint {
+  pointer-events: none;
+}
+.cluster-editor-pane .cep-graph-note-overlay[hidden] {
+  display: none;
+}
+.cluster-editor-pane .cep-graph-note-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-default, #ddd);
+  flex-shrink: 0;
+}
+.cluster-editor-pane .cep-graph-note-header strong {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cluster-editor-pane .cep-graph-note-open {
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  cursor: pointer;
+  color: inherit;
+}
+.cluster-editor-pane .cep-graph-note-body {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #111;
+}
+.cluster-editor-pane .cep-graph-note-hint {
+  padding: 10px 12px;
+  font-size: 11px;
+  color: #666;
+  font-style: italic;
+}
+.cluster-editor-pane .cep-graph-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--border-default);
+  font-size: 11px;
+  color: var(--text-muted, inherit);
+  min-height: 22px;
+  flex-shrink: 0;
+}
+.cluster-editor-pane .cep-graph-selcount {
+  font-weight: 600;
+}
+.cluster-editor-pane .cep-graph-foot-note {
+  opacity: 0.7;
+}
+/* Tooltip is body-anchored, not under .cluster-editor-pane. */
+.cep-graph-tooltip {
+  position: fixed;
+  background: var(--surface-default, #1f1f1f);
+  color: var(--text-default, #eee);
+  border: 1px solid var(--border-default, #444);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+  /* Min-width keeps a tooltip with sparse content from collapsing to a
+     single-pixel slash; max-width caps long summaries. */
+  min-width: 160px;
+  max-width: 320px;
+  z-index: 9999;
+  pointer-events: none;
+}
+.cep-graph-tooltip-meta {
+  font-size: 11px;
+  opacity: 0.75;
+  margin-top: 2px;
+}
+.cep-graph-tooltip-summary {
+  font-size: 11px;
+  margin-top: 4px;
+  opacity: 0.85;
+  max-height: 4.5em;
+  overflow: hidden;
+}
+.cep-graph-tooltip-members {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 0 0;
+  font-size: 11px;
+}
+.cep-graph-tooltip-members li {
+  padding: 1px 0;
+}
+.cep-graph-tooltip-more {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+/* ============================================================
+   Drag-and-drop reparent (cluster-editor-dnd-visual-feedback)
+   ============================================================ */
+
+/* Shared row drag-and-drop visual states. Both the sidebar
+   (`.cluster-editor .ce-row`) and the expanded pane
+   (`.cluster-editor-pane .ce-row`) pick these up because the row
+   classes are emitted by the shared row primitive. */
+.ce-row-drop-target {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background: var(--accent-fill-soft, var(--accent-fill)) !important;
+}
+.ce-row-drop-invalid {
+  cursor: not-allowed;
+}
+
+/* Floating chip that follows the pointer during drag. Rendered into
+   document.body so it escapes any clipping contexts the row might
+   live inside. */
+.ce-drop-chip {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  background: #ffffff;
+  color: #222;
+  border: 1px solid #c8c8c8;
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 12px;
+  line-height: 1.3;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+  white-space: nowrap;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* "Drop here to make top-level" affordance rendered above each tree's
+   root list while a drag is in flight. */
+.ce-drop-promote-band {
+  margin: 2px 6px;
+  padding: 6px 10px;
+  border: 1px dashed var(--accent);
+  border-radius: 3px;
+  background: var(--accent-fill-soft, var(--accent-fill));
+  color: var(--text-default);
+  font-size: 11px;
+  text-align: center;
+  letter-spacing: 0.02em;
+  opacity: 0.85;
+}
+.ce-drop-promote-band-active {
+  background: var(--accent-fill);
+  opacity: 1;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.ce-drop-promote-band-invalid {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
