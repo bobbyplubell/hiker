@@ -7,6 +7,7 @@
 
 import { Logger } from "../../logger";
 import { showToast } from "../../widgets/toast";
+import { describeErr } from "../../ipc/runCommand";
 import { Api, type ClusterNodeRow } from "./api";
 import { attachRowDnD } from "./dnd";
 import { countMembers, renderPolicyLabel } from "./helpers";
@@ -93,7 +94,7 @@ export function renderTreeNode(
           await deps.refresh();
         } catch (err) {
           Logger.error("ui::clusterEditor", "rename failed", { err });
-          showToast(`Rename failed: ${String(err)}`);
+          showToast(`Rename failed: ${describeErr(err)}`);
         }
       });
     });
@@ -123,7 +124,7 @@ export function renderTreeNode(
         const ids = await Api.regenerateNames(state.tree.id);
         showToast(`Queued ${ids.length} regeneration tasks`);
       } catch (err) {
-        showToast(`Regenerate failed: ${String(err)}`);
+        showToast(`Regenerate failed: ${describeErr(err)}`);
       }
     });
     row.appendChild(badge);
@@ -191,7 +192,7 @@ export function renderTreeNode(
           await deps.refresh();
         } catch (err) {
           Logger.error("ui::clusterEditor", "set_summary failed", { err });
-          showToast(`Edit summary failed: ${String(err)}`);
+          showToast(`Edit summary failed: ${describeErr(err)}`);
         }
       });
     });

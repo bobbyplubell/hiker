@@ -11,7 +11,7 @@
 // buffer. The preview reuses the buffer-mode union's `{kind: "trash"}`
 // variant so save / dirty / file-switch guards take the read-only path.
 
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEvent } from "../events";
 import { Ipc } from "../ipc";
 import { Logger } from "../logger";
 import type { SettingsManager } from "../settings/manager";
@@ -328,7 +328,7 @@ export function mountTrash(deps: TrashDeps): TrashController {
 
   // Listen for any trash-changing op and re-render. Also clear the preview
   // buffer if the entry being previewed was emptied/restored under us.
-  void listen("hiker:trash-changed", async () => {
+  void onHikerEvent("hiker:trash-changed", async () => {
     await refresh();
     const buffer = deps.getBuffer();
     if (buffer?.mode.kind === "trash") {

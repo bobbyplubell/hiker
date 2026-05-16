@@ -19,15 +19,15 @@ impl Trees {
                 node_id: node_id.to_string(),
             }
         })?;
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes
                  SET parent_id = ?1
                  WHERE tree_id = ?2 AND node_id = ?3",
                 params![new_parent, tree_id, node_id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "node_id": node_id, "parent_id": new_parent });
         let undo = serde_json::json!({ "node_id": node_id, "parent_id": prior.parent });
         self.append_history(tree_id, "move", &args, &undo)?;
@@ -80,8 +80,7 @@ impl Trees {
         // chain after the move. Read in a short-lived scope to avoid
         // holding the mutex across the bump_churn_chain calls below
         // (which re-acquire it).
-        let prior_parents: Vec<Option<String>> = {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        let prior_parents: Vec<Option<String>> = self.with_conn(|conn| {
             let mut out = Vec::with_capacity(moves.len());
             for (id, _) in moves {
                 let p: Option<Option<String>> = conn
@@ -93,10 +92,9 @@ impl Trees {
                     .optional()?;
                 out.push(p.unwrap_or(None));
             }
-            out
-        };
-        {
-            let mut conn = self.conn.lock().expect("trees mutex poisoned");
+            Ok(out)
+        })?;
+        self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             for (id, parent) in moves {
                 tx.execute(
@@ -105,7 +103,8 @@ impl Trees {
                 )?;
             }
             tx.commit()?;
-        }
+            Ok(())
+        })?;
         // Bump churn on both ends of each move, stopping at the LCA so
         // common ancestors (whose subtree leaf set didn't change) don't
         // accumulate spurious staleness. Same shape as `move_node`.
@@ -160,13 +159,13 @@ impl Trees {
                 node_id: leaf_id.to_string(),
             }
         })?;
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes SET parent_id = ?1 WHERE tree_id = ?2 AND node_id = ?3",
                 params![new_parent, tree_id, leaf_id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "leaf_id": leaf_id, "parent_id": new_parent });
         let undo = serde_json::json!({ "leaf_id": leaf_id, "parent_id": prior.parent });
         self.append_history(tree_id, "promote-outlier", &args, &undo)?;

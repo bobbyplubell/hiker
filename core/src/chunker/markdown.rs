@@ -98,10 +98,10 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
                     }
                     TagEnd::CodeBlock => {
                         in_code_block = false;
-                        if block_depth == 0 {
-                            if let Some((s, e)) = pending_range.take() {
-                                state.append_block(s, e, body, body_start);
-                            }
+                        if block_depth == 0
+                            && let Some((s, e)) = pending_range.take()
+                        {
+                            state.append_block(s, e, body, body_start);
                             // Even if we've blown past the soft cap, never split
                             // mid-code-block — but after the code block closes,
                             // we *can* break for the next block.
@@ -109,16 +109,16 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
                     }
                     _ => {}
                 }
-                if block_depth == 0 {
-                    if let Some((s, e)) = pending_range.take() {
-                        // Heading ranges are added on Start; everything else is
-                        // appended here.
-                        if !matches!(tag_end, TagEnd::Heading(_)) {
-                            state.append_block(s, e, body, body_start);
-                        }
-                        if !in_code_block && state.size() >= SOFT_SIZE_LIMIT {
-                            state.flush_chunk();
-                        }
+                if block_depth == 0
+                    && let Some((s, e)) = pending_range.take()
+                {
+                    // Heading ranges are added on Start; everything else is
+                    // appended here.
+                    if !matches!(tag_end, TagEnd::Heading(_)) {
+                        state.append_block(s, e, body, body_start);
+                    }
+                    if !in_code_block && state.size() >= SOFT_SIZE_LIMIT {
+                        state.flush_chunk();
                     }
                 }
             }

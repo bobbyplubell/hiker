@@ -91,13 +91,13 @@ impl Trees {
         // expects a NodeKind::Cluster destination via the same database
         // transaction and we want to capture the prior_parent for churn
         // bumping below.
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes SET parent_id = ?1 WHERE tree_id = ?2 AND node_id = ?3",
                 params![new_folder_cluster_id, tree_id, leaf.id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({
             "note_id": note_id,
             "leaf_id": leaf.id,
@@ -121,15 +121,14 @@ impl Trees {
         // empty placeholders so the user's rule survives a transient
         // empty state)."
         if let Some(prev_id) = prior_parent {
-            let still_has_children: i64 = {
-                let conn = self.conn.lock().expect("trees mutex poisoned");
-                conn.query_row(
+            let still_has_children: i64 = self.with_conn(|conn| {
+                Ok(conn.query_row(
                     "SELECT COUNT(*) FROM cluster_nodes
                      WHERE tree_id = ?1 AND parent_id = ?2",
                     params![tree_id, prev_id],
                     |row| row.get(0),
-                )?
-            };
+                )?)
+            })?;
             if still_has_children == 0 {
                 let prev_node = self.get_node(tree_id, &prev_id)?;
                 if let Some(pn) = prev_node {

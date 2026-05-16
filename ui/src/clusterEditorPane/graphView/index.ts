@@ -31,6 +31,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "../../logger";
 import { showToast } from "../../widgets/toast";
+import { describeErr } from "../../ipc/runCommand";
 import { openContextMenu, type CtxMenuItem } from "../../widgets/contextMenu";
 import type { ClusterNodeRow } from "../../clusterEditor";
 import type {
@@ -428,7 +429,7 @@ function mount(
         noteFetchInFlight.delete(path);
         Logger.error("ui::clusterEditor", "note read failed", { err, path });
         if (pinnedLeafId === leaf.id) {
-          body.textContent = `Failed to load: ${String(err)}`;
+          body.textContent = `Failed to load: ${describeErr(err)}`;
         }
       });
   }
@@ -682,7 +683,7 @@ function mount(
             nodeId: row.id,
           }).then(
             () => showToast("Summary regeneration queued"),
-            (err) => showToast(`Regenerate failed: ${String(err)}`),
+            (err) => showToast(`Regenerate failed: ${describeErr(err)}`),
           );
         },
       });
@@ -705,7 +706,7 @@ function mount(
       });
       await onMutated();
     } catch (err) {
-      showToast(`Policy failed: ${String(err)}`);
+      showToast(`Policy failed: ${describeErr(err)}`);
     }
   }
 

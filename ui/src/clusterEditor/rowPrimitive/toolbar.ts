@@ -4,6 +4,7 @@
 // appears when the selection contains at least one cluster row.
 
 import { showToast } from "../../widgets/toast";
+import { describeErr } from "../../ipc/runCommand";
 import { Api } from "./api";
 import { summarizeOutcomeToast } from "./toasts";
 import type { TreeRowDeps, TreeRowSurfaceState } from "./state";
@@ -42,7 +43,7 @@ export function renderMultiSelectToolbar(
       state.selection.clear();
       await deps.refresh();
     } catch (err) {
-      showToast(`Merge failed: ${String(err)}`);
+      showToast(`Merge failed: ${describeErr(err)}`);
     }
   });
   make("Drop", async () => {
@@ -56,7 +57,7 @@ export function renderMultiSelectToolbar(
       try {
         await Api.dropCluster(state.tree.id, id, bucket.id);
       } catch (err) {
-        showToast(`Drop failed for ${id}: ${String(err)}`);
+        showToast(`Drop failed for ${id}: ${describeErr(err)}`);
       }
     }
     state.selection.clear();
@@ -85,7 +86,7 @@ export function renderMultiSelectToolbar(
             summarizeOutcomeToast(outcome, selectedClusterIds.length),
           );
         } catch (err) {
-          showToast(`Summarize failed: ${String(err)}`);
+          showToast(`Summarize failed: ${describeErr(err)}`);
         }
       },
       `Summarize the ${selectedClusterIds.length} selected cluster${selectedClusterIds.length === 1 ? "" : "s"}`,
@@ -112,7 +113,7 @@ export function renderMultiSelectToolbar(
       state.selection.clear();
       await deps.refresh();
     } catch (err) {
-      showToast(`Stage move failed: ${String(err)}`);
+      showToast(`Stage move failed: ${describeErr(err)}`);
     }
   });
   // status: cluster-editor-multi-select-stage-tag
@@ -133,7 +134,7 @@ export function renderMultiSelectToolbar(
       state.selection.clear();
       await deps.refresh();
     } catch (err) {
-      showToast(`Stage tag failed: ${String(err)}`);
+      showToast(`Stage tag failed: ${describeErr(err)}`);
     }
   });
   make("Clear", () => {

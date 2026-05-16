@@ -76,11 +76,11 @@ impl Trees {
                     if !set.insert(id.clone()) {
                         continue;
                     }
-                    if params.recursive {
-                        if let Some(kids) = children_by_parent.get(&id) {
-                            for k in kids {
-                                stack.push(k.clone());
-                            }
+                    if params.recursive
+                        && let Some(kids) = children_by_parent.get(&id)
+                    {
+                        for k in kids {
+                            stack.push(k.clone());
                         }
                     }
                 }
@@ -101,10 +101,10 @@ impl Trees {
                 continue;
             }
             // Subtree filter.
-            if let Some(set) = &subtree_set {
-                if !set.contains(&id) {
-                    continue;
-                }
+            if let Some(set) = &subtree_set
+                && !set.contains(&id)
+            {
+                continue;
             }
             // User-edit gating.
             if !params.overwrite_user_edited

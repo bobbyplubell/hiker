@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use notify::{Event as NotifyEvent, EventKind as NotifyEventKind, Watcher as NotifyWatcher, RecursiveMode};
 use serde::Deserialize;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use hiker_core::changes::Changes;
 use hiker_core::config::Config;
@@ -158,6 +158,12 @@ pub(crate) fn log_from_frontend(
 /// task lives until the returned handle is dropped (which happens when the
 /// `VaultSession` containing it is dropped — i.e. on vault swap or app
 /// shutdown).
+///
+// Each parameter maps slot-by-slot onto a distinct field of
+// `hiker_mcp::McpDeps`; a wrapper struct here would just duplicate that
+// shape. The single call site lives next to the existing `SessionHandle`
+// bundle in bootstrap.rs, so allow the lint locally.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_mcp(
     vault: &Vault,
     root: &PathBuf,
@@ -292,21 +298,21 @@ pub(crate) async fn start_config_watcher(
                             Ok(config) => {
                                 // Swap in-memory copy + live mirrors.
                                 let state = app.state::<AppState>();
-                                if let Ok(guard) = state.session.lock() {
-                                    if let Some(session) = guard.as_ref() {
-                                        if let Ok(mut w) = session.config.write() {
-                                            *w = config.clone();
-                                        }
-                                        session.tasks.set_cfg(config.tasks.clone());
-                                        if let Ok(mut tools) = session.mcp_tools.write() {
-                                            *tools = config.mcp.tools.clone();
-                                        }
-                                        if let Ok(mut s) = session.staging_config.write() {
-                                            *s = config.staging.clone();
-                                        }
+                                if let Ok(guard) = state.session.lock()
+                                    && let Some(session) = guard.as_ref()
+                                {
+                                    if let Ok(mut w) = session.config.write() {
+                                        *w = config.clone();
+                                    }
+                                    session.tasks.set_cfg(config.tasks.clone());
+                                    if let Ok(mut tools) = session.mcp_tools.write() {
+                                        *tools = config.mcp.tools.clone();
+                                    }
+                                    if let Ok(mut s) = session.staging_config.write() {
+                                        *s = config.staging.clone();
                                     }
                                 }
-                                let _ = app.emit("hiker:config-reloaded", &config);
+                                crate::events::emit_config_reloaded(&app, &config);
                                 tracing::debug!("config watcher: reloaded, emitted hiker:config-reloaded");
                             }
                             Err(e) => {

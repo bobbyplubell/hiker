@@ -4,7 +4,7 @@ use hiker_core::activity::{ActivityFilter, ActivityItem, ActivitySource};
 use serde::Deserialize;
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdResult};
 
 /// Argument shape for `activity_list*` commands. Mirrors
 /// `hiker_core::activity::ActivityFilter` but kept independent so the
@@ -41,13 +41,11 @@ impl From<ActivityFilterArg> for ActivityFilter {
 pub(crate) fn activity_list(
     state: State<'_, AppState>,
     filter: Option<ActivityFilterArg>,
-) -> Result<Vec<ActivityItem>, String> {
-    let result = (|| -> Result<Vec<ActivityItem>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<Vec<ActivityItem>> {
+    let result = with_session(&state, |session| {
         let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
-        session.activity.list(f).map_err(|e| e.to_string())
-    })();
+        Ok(session.activity.list(f).map_err(|e| e.to_string())?)
+    });
     log_cmd_result("activity_list", result)
 }
 
@@ -58,16 +56,14 @@ pub(crate) fn activity_list_for_path(
     state: State<'_, AppState>,
     path: String,
     filter: Option<ActivityFilterArg>,
-) -> Result<Vec<ActivityItem>, String> {
-    let result = (|| -> Result<Vec<ActivityItem>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<Vec<ActivityItem>> {
+    let result = with_session(&state, |session| {
         let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
-        session
+        Ok(session
             .activity
             .list_for_path(&path, f)
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("activity_list_for_path", result)
 }
 
@@ -76,12 +72,10 @@ pub(crate) fn activity_list_for_path(
 pub(crate) fn activity_count(
     state: State<'_, AppState>,
     filter: Option<ActivityFilterArg>,
-) -> Result<u32, String> {
-    let result = (|| -> Result<u32, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<u32> {
+    let result = with_session(&state, |session| {
         let f: ActivityFilter = filter.map(Into::into).unwrap_or_default();
-        session.activity.count(f).map_err(|e| e.to_string())
-    })();
+        Ok(session.activity.count(f).map_err(|e| e.to_string())?)
+    });
     log_cmd_result("activity_count", result)
 }

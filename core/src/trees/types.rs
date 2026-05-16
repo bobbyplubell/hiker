@@ -28,6 +28,8 @@ pub enum TreesError {
     TreeNotFound(String),
     #[error("node not found: tree={tree_id} node={node_id}")]
     NodeNotFound { tree_id: String, node_id: String },
+    #[error("connection mutex poisoned")]
+    Poisoned,
 }
 
 impl From<TreesError> for crate::error::HikerError {

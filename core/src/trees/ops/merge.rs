@@ -48,8 +48,7 @@ impl Trees {
         // re-parent is reversible by recording each child's prior parent.
         let mut absorbed_snapshots: Vec<serde_json::Value> = Vec::new();
         let mut child_moves: Vec<serde_json::Value> = Vec::new();
-        {
-            let mut conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             for abs_id in &absorbed {
                 // Snapshot full row.
@@ -101,7 +100,8 @@ impl Trees {
                 )?;
             }
             tx.commit()?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({
             "survivor": survivor,
             "absorbed": absorbed,
@@ -130,8 +130,7 @@ impl Trees {
         // grand-child's prior parent.
         let mut absorbed_snapshots: Vec<serde_json::Value> = Vec::new();
         let mut grandchild_moves: Vec<serde_json::Value> = Vec::new();
-        {
-            let mut conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             let mut child_stmt = tx.prepare(
                 "SELECT node_id, kind FROM cluster_nodes WHERE tree_id = ?1 AND parent_id = ?2",
@@ -193,7 +192,8 @@ impl Trees {
                 )?;
             }
             tx.commit()?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "parent_id": parent_id });
         let undo = serde_json::json!({
             "parent_id": parent_id,

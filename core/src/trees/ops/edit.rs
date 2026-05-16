@@ -24,13 +24,13 @@ impl Trees {
             Some(p) => Some(serde_json::to_string(p)?),
             None => None,
         };
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes SET policy = ?1 WHERE tree_id = ?2 AND node_id = ?3",
                 params![policy_json, tree_id, node_id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "node_id": node_id, "policy": policy });
         let undo = serde_json::json!({ "node_id": node_id, "policy": prior.policy });
         self.append_history(tree_id, "set-policy", &args, &undo)?;
@@ -46,15 +46,15 @@ impl Trees {
                 node_id: node_id.to_string(),
             }
         })?;
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes
                  SET name = ?1, user_edited_name = 1
                  WHERE tree_id = ?2 AND node_id = ?3",
                 params![new_name, tree_id, node_id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "node_id": node_id, "name": new_name });
         let undo = serde_json::json!({
             "node_id": node_id,
@@ -89,8 +89,7 @@ impl Trees {
         if !write_name && !write_summary {
             return Ok((false, false));
         }
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             match (write_name, write_summary) {
                 (true, true) => {
                     conn.execute(
@@ -118,7 +117,8 @@ impl Trees {
                 }
                 (false, false) => unreachable!(),
             }
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({
             "node_id": node_id,
             "name": new_name,
@@ -150,15 +150,15 @@ impl Trees {
                 node_id: node_id.to_string(),
             }
         })?;
-        {
-            let conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes
                  SET summary = ?1, user_edited_summary = 1
                  WHERE tree_id = ?2 AND node_id = ?3",
                 params![new_summary, tree_id, node_id],
             )?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({ "node_id": node_id, "summary": new_summary });
         let undo = serde_json::json!({
             "node_id": node_id,

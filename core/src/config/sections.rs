@@ -1,0 +1,997 @@
+//! Sub-configuration sections: structs, `Default` impls, and `default_*`
+//! helpers used as serde defaults. Split out of `core::config` for file-length
+//! reasons; the parent module re-exports everything here as `hiker_core::config::*`.
+
+use serde::{Deserialize, Serialize};
+
+pub(super) fn yes() -> bool {
+    true
+}
+
+pub(super) fn no() -> bool {
+    false
+}
+
+/// `[suggestions]` + `[suggestions.triage]` config. See
+/// `docs/suggestions.md` §"`[suggestions.triage]` config section". The
+/// outer table currently only carries the triage subsection; the
+/// `tag_field` and other knobs land alongside their feature wiring.
+///
+/// status: triage-review-required
+/// status: triage-staging-proposals
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionsConfig {
+    #[serde(default)]
+    pub triage: TriageConfig,
+}
+
+/// `[suggestions.triage]` subsection. Triage-level behavior — auto-accept
+/// gating, source-folder safety boundary, optional scheduled re-run.
+///
+/// status: triage-review-required
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriageConfig {
+    /// When `true`, every triage match stays pending in `staging.db`
+    /// until the user accepts. When `false`, `auto-*` matches auto-accept
+    /// at insert time. Live-applied.
+    #[serde(default = "no")]
+    pub review_required: bool,
+    /// Source-folder boundary for triage moves. Triage never produces a
+    /// `move_note` row whose `source_path` is outside this folder. Also
+    /// drives the on-save trigger's default folder.
+    #[serde(default = "default_triage_scope")]
+    pub scope: String,
+    /// Duration-string grammar (`30m` / `1h` / `6h` / `24h` / `7d`); empty
+    /// disables. Per `cluster-editor-triage-scheduled-rerun`. NOTE: the spec
+    /// calls for cron-shape values (e.g. `"0 3 * * *"`); the runtime currently
+    /// accepts only the duration grammar above and silently logs + disables
+    /// anything else. Cron-shape support is tracked as
+    /// `cluster-editor-triage-scheduled-rerun-cron-syntax`.
+    #[serde(default)]
+    pub scheduled_rerun: String,
+    /// Opt-in: re-run triage when a note's embedding shifts beyond
+    /// `modified_rerun_cosine_guard` distance from its last triaged
+    /// state. Per `cluster-editor-triage-modified-rerun`. Default off.
+    #[serde(default = "no")]
+    pub modified_rerun: bool,
+    /// Cosine-distance threshold gating the modified-note rerun
+    /// (0.0 = always re-run; 1.0 = never). Default 0.15 — typical save
+    /// noise sits below this; meaningful edits clear it.
+    #[serde(default = "default_modified_rerun_cosine_guard")]
+    pub modified_rerun_cosine_guard: f32,
+}
+
+fn default_modified_rerun_cosine_guard() -> f32 {
+    0.15
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        Self {
+            review_required: false,
+            scope: default_triage_scope(),
+            scheduled_rerun: String::new(),
+            modified_rerun: false,
+            modified_rerun_cosine_guard: default_modified_rerun_cosine_guard(),
+        }
+    }
+}
+
+fn default_triage_scope() -> String {
+    "inbox/".to_string()
+}
+
+/// `[staging]` section. Behavior that applies regardless of which producer
+/// staged a proposal. See `docs/settings.md` §`[staging]` config section.
+///
+/// status: staging-config-section
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagingConfig {
+    /// When `true`, the `applyable → conflicted` state transition
+    /// immediately invokes `reject(id)`. Live-applied. Default false.
+    ///
+    /// status: staging-auto-reject-on-conflict
+    #[serde(default = "no")]
+    pub auto_reject_on_conflict: bool,
+    /// GC age threshold consumed by `Staging::gc` on vault open. Lifts the
+    /// previously-hardcoded 14-day value.
+    #[serde(default = "default_staging_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self {
+            auto_reject_on_conflict: false,
+            retention_days: default_staging_retention_days(),
+        }
+    }
+}
+
+fn default_staging_retention_days() -> u32 {
+    14
+}
+
+/// `[trails]` section. Configures trail-doc placement and other vault-wide
+/// trail policy. See `docs/trails.md`.
+///
+/// status: trails-default-location
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrailsConfig {
+    /// Default directory for newly-created trail-docs. Vault-relative.
+    /// Empty string places trails at vault root. Auto-created on first
+    /// trail. Vault-scope eligible per `settings-write-back`.
+    #[serde(default = "default_new_trail_dir")]
+    pub new_trail_dir: String,
+}
+
+impl Default for TrailsConfig {
+    fn default() -> Self {
+        Self {
+            new_trail_dir: default_new_trail_dir(),
+        }
+    }
+}
+
+fn default_new_trail_dir() -> String {
+    "trails/".to_string()
+}
+
+/// `[acp]` section. Configures the optional Agent Client Protocol backend
+/// for the chat panel. When `command` is non-empty, the chat panel routes
+/// through an external ACP agent instead of the built-in basic agent loop.
+/// The `command` value is the full command line to launch the agent (e.g.
+/// `"auggie --acp"`, `"gemini --acp"`, `"cursor --acp"`). The first
+/// whitespace-delimited word is the binary; the rest are arguments.
+/// The agent binary must be installed and on PATH independently.
+/// See `docs/acp.md`.
+///
+/// status: llm-acp-client-optional
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpConfig {
+    /// Full command line to launch the ACP agent. Empty string means
+    /// ACP is disabled. Split on whitespace; first token = binary,
+    /// remainder = args.
+    #[serde(default)]
+    pub command: String,
+}
+
+/// `[tasks]` section. Configures the unified work queue (`core::tasks`).
+/// See `docs/task-queue.md`.
+///
+/// status: task-queue-settings-section
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TasksConfig {
+    #[serde(default)]
+    pub worker_preference: WorkerPreferenceCfg,
+    #[serde(default = "default_terminal_retention_secs")]
+    pub terminal_retention_secs: u64,
+    #[serde(default)]
+    pub direct_worker: DirectWorkerConfig,
+    /// Whether the in-process basic chat agent gets the `task_*` MCP
+    /// tools advertised in its tool set. External rmcp clients are
+    /// unaffected — they always see `task_*` when `[mcp] enabled = true`.
+    #[serde(default = "yes")]
+    pub expose_to_chat_agent: bool,
+    #[serde(default)]
+    pub lease: LeaseConfig,
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            worker_preference: WorkerPreferenceCfg::default(),
+            terminal_retention_secs: default_terminal_retention_secs(),
+            direct_worker: DirectWorkerConfig::default(),
+            expose_to_chat_agent: true,
+            lease: LeaseConfig::default(),
+        }
+    }
+}
+
+impl TasksConfig {
+    /// Grace window the direct worker waits before becoming eligible for
+    /// a newly-queued task, per `worker_preference`. `internal` = 0,
+    /// `auto` = 1s, `external` = 5s.
+    pub fn direct_grace(&self) -> std::time::Duration {
+        match self.worker_preference {
+            WorkerPreferenceCfg::Internal => std::time::Duration::from_secs(0),
+            WorkerPreferenceCfg::Auto => std::time::Duration::from_secs(1),
+            WorkerPreferenceCfg::External => std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPreferenceCfg {
+    #[default]
+    Auto,
+    Internal,
+    External,
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectWorkerConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_direct_parallelism")]
+    pub parallelism: u8,
+}
+
+impl Default for DirectWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            parallelism: default_direct_parallelism(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    #[serde(default = "default_lease_default_secs")]
+    pub default_secs: u64,
+    #[serde(default = "default_lease_max_secs")]
+    pub max_secs: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            default_secs: default_lease_default_secs(),
+            max_secs: default_lease_max_secs(),
+        }
+    }
+}
+
+fn default_terminal_retention_secs() -> u64 {
+    60
+}
+
+fn default_direct_parallelism() -> u8 {
+    1
+}
+
+fn default_lease_default_secs() -> u64 {
+    60
+}
+
+fn default_lease_max_secs() -> u64 {
+    600
+}
+
+/// `[llm]` section. Configures generative LLM access for `core::llm` and
+/// the basic agent loop (`core::agent`). Mirrors the shape pinned in
+/// `docs/llm.md` §`core::llm` and the v3.5 stub in `docs/settings.md`.
+///
+/// status: llm-providers-config
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Master switch. When false, `core::llm` is treated as unavailable
+    /// (background / fan-out / chat panel all no-op). Reserved for
+    /// `llm-disable-mode`; left here so the loader doesn't reject the key
+    /// once that slug lands.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: LlmProviderConfig,
+    #[serde(default)]
+    pub limits: LlmLimitsConfig,
+    #[serde(default)]
+    pub agent: LlmAgentConfig,
+    #[serde(default)]
+    pub audit: LlmAuditConfig,
+    #[serde(default)]
+    pub background: LlmBackgroundConfig,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: LlmProviderConfig::default(),
+            limits: LlmLimitsConfig::default(),
+            agent: LlmAgentConfig::default(),
+            audit: LlmAuditConfig::default(),
+            background: LlmBackgroundConfig::default(),
+        }
+    }
+}
+
+/// `[llm.background]` — config for debounced background LLM features
+/// (auto-tagging, summarization, etc.). Stub in v3 — `review_required`
+/// is the only field that ships now; the rest land when their backing
+/// features do.
+///
+/// status: agent-write-review-mode
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmBackgroundConfig {
+    /// When true, debounced background LLM features write to staging
+    /// instead of mutating frontmatter directly. Default false (off).
+    #[serde(default = "no")]
+    pub review_required: bool,
+}
+
+/// `[llm.provider]` — backend selection and connection-shaped knobs. API
+/// keys are *never* stored in TOML; `api_key_env` names an environment
+/// variable that the runtime reads at provider construction time. Empty
+/// strings on `api_key_env` / `base_url` are treated as unset (the TOML
+/// auto-create writes the field even when blank, so the loader has to
+/// tolerate that case rather than aborting).
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProviderConfig {
+    /// Backend id (`anthropic` / `openai` / `ollama` / `google` / ...). The
+    /// canonical list lives in graniet/`llm`'s `LLMBackend::FromStr`; the
+    /// runtime validates this when the client is built.
+    #[serde(default = "default_llm_backend")]
+    pub backend: String,
+    /// Model id within the chosen backend.
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// Name of the env var holding the API key. Empty = no key (e.g. local
+    /// Ollama). Used as the fallback when `api_key` (user-scope literal)
+    /// is empty.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// User-scope literal API key. Plain text on disk in the platform
+    /// config dir; takes precedence over `api_key_env` when set. The
+    /// eligibility list refuses writes to this field from the vault
+    /// TOML so a synced vault can't carry the secret. Empty by default;
+    /// users who want shell-managed keys should leave this empty and
+    /// set `api_key_env`. See `llm.md` §`[llm-providers-config]`.
+    #[serde(default)]
+    pub api_key: String,
+    /// Optional override (Ollama URL, OpenAI-compatible proxy, etc.).
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl Default for LlmProviderConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_llm_backend(),
+            model: default_llm_model(),
+            api_key_env: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmLimitsConfig {
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_llm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for LlmLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_llm_max_tokens(),
+            timeout_secs: default_llm_timeout_secs(),
+        }
+    }
+}
+
+/// `[llm.agent]` — basic agent loop tunables. Defaults match the
+/// circuit-breaker numbers pinned in `llm.md`.
+///
+/// status: agent-iteration-cap-prompt
+/// status: agent-tool-call-timeout
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAgentConfig {
+    #[serde(default = "default_iteration_cap")]
+    pub iteration_cap: u32,
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
+}
+
+impl Default for LlmAgentConfig {
+    fn default() -> Self {
+        Self {
+            iteration_cap: default_iteration_cap(),
+            tool_timeout_secs: default_tool_timeout_secs(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAuditConfig {
+    /// Mirror of `[mcp.audit] log_full_input`. When false (default), the
+    /// JSONL audit log records call metadata but redacts large prompt
+    /// bodies.
+    #[serde(default = "no")]
+    pub log_full_prompt: bool,
+}
+
+fn default_llm_backend() -> String {
+    "anthropic".to_string()
+}
+
+fn default_llm_model() -> String {
+    "claude-sonnet-4-7".to_string()
+}
+
+fn default_llm_max_tokens() -> u32 {
+    4096
+}
+
+fn default_llm_timeout_secs() -> u64 {
+    60
+}
+
+fn default_iteration_cap() -> u32 {
+    10
+}
+
+fn default_tool_timeout_secs() -> u64 {
+    30
+}
+
+/// `[mcp]` section. Configures the in-process MCP server (see `docs/mcp.md`).
+/// Loader lands alongside the v3 milestone — until then the section is
+/// recognized so users can enable/disable the server and tune top_k caps.
+///
+/// status: mcp-config-section
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Bind host. Defaults to `127.0.0.1` (loopback-only, matching the
+    /// localhost-trust auth model). Anything else exposes vault contents
+    /// to whoever can reach the listening port — the settings UI shows
+    /// a warning. See `mcp-bind-host-configurable`.
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
+    /// `0` = ephemeral OS-assigned port; otherwise bind that fixed port.
+    #[serde(default)]
+    pub port: u16,
+    /// Vault-relative path to the JSON discovery file written on bind and
+    /// removed on shutdown.
+    #[serde(default = "default_mcp_discovery_file")]
+    pub discovery_file: String,
+    /// Cap on agent-requested `top_k` for `search_notes` / `related_notes`.
+    #[serde(default = "default_mcp_max_top_k")]
+    pub max_top_k: u32,
+    #[serde(default)]
+    pub tools: McpToolsConfig,
+    #[serde(default)]
+    pub audit: McpAuditConfig,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: default_mcp_host(),
+            port: 0,
+            discovery_file: default_mcp_discovery_file(),
+            max_top_k: default_mcp_max_top_k(),
+            tools: McpToolsConfig::default(),
+            audit: McpAuditConfig::default(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolsConfig {
+    /// Master gate for the write tools (`write_note`, `set_frontmatter`,
+    /// `apply_tag`, `remove_tag`). Kept for backwards compatibility with
+    /// existing TOMLs — when false, every write tool refuses with `1004
+    /// disabled` regardless of the per-tool flags below.
+    #[serde(default = "yes")]
+    pub writes_enabled: bool,
+    /// If true, agents passing `scope` can fetch redacted bodies.
+    /// Conservative default (false) per spec.
+    #[serde(default = "no")]
+    pub allow_redacted_lookup: bool,
+    // status: agent-write-review-mode
+    /// When true, MCP write tools (`write_note`, `set_frontmatter`,
+    /// `apply_tag`, `remove_tag`) route through `core::staging::propose()`
+    /// instead of applying directly. Default false — agents write directly
+    /// + append a changelog row (existing behavior).
+    #[serde(default = "no")]
+    pub review_required: bool,
+    // Per-tool toggles (status: mcp-tool-toggles). Default true.
+    // Reads:
+    #[serde(default = "yes")] pub search_notes_enabled: bool,
+    #[serde(default = "yes")] pub get_note_enabled: bool,
+    #[serde(default = "yes")] pub related_notes_enabled: bool,
+    // Writes (also gated by `writes_enabled` master flag):
+    #[serde(default = "yes")] pub write_note_enabled: bool,
+    #[serde(default = "yes")] pub edit_note_enabled: bool,
+    #[serde(default = "yes")] pub set_frontmatter_enabled: bool,
+    #[serde(default = "yes")] pub apply_tag_enabled: bool,
+    #[serde(default = "yes")] pub remove_tag_enabled: bool,
+    // Task-queue tools (also gated by `[tasks] expose_to_chat_agent`
+    // for the in-process chat agent path):
+    #[serde(default = "yes")] pub task_checkout_enabled: bool,
+    #[serde(default = "yes")] pub task_submit_enabled: bool,
+    #[serde(default = "yes")] pub task_fail_enabled: bool,
+    #[serde(default = "yes")] pub task_heartbeat_enabled: bool,
+    #[serde(default = "yes")] pub task_list_enabled: bool,
+}
+
+impl McpToolsConfig {
+    /// Live check used by the dispatch path. Combines the per-tool
+    /// flag with the relevant master gate.
+    pub fn tool_allowed(&self, name: &str) -> bool {
+        let is_write = matches!(
+            name,
+            "write_note" | "edit_note" | "set_frontmatter" | "apply_tag" | "remove_tag"
+        );
+        if is_write && !self.writes_enabled {
+            return false;
+        }
+        match name {
+            "search_notes" => self.search_notes_enabled,
+            "get_note" => self.get_note_enabled,
+            "related_notes" => self.related_notes_enabled,
+            "write_note" => self.write_note_enabled,
+            "edit_note" => self.edit_note_enabled,
+            "set_frontmatter" => self.set_frontmatter_enabled,
+            "apply_tag" => self.apply_tag_enabled,
+            "remove_tag" => self.remove_tag_enabled,
+            "task_checkout" => self.task_checkout_enabled,
+            "task_submit" => self.task_submit_enabled,
+            "task_fail" => self.task_fail_enabled,
+            "task_heartbeat" => self.task_heartbeat_enabled,
+            "task_list" => self.task_list_enabled,
+            _ => true, // unknown tools fall through to the dispatcher's "unknown tool" error
+        }
+    }
+}
+
+impl Default for McpToolsConfig {
+    fn default() -> Self {
+        Self {
+            writes_enabled: true,
+            allow_redacted_lookup: false,
+            review_required: false,
+            search_notes_enabled: true,
+            get_note_enabled: true,
+            related_notes_enabled: true,
+            write_note_enabled: true,
+            edit_note_enabled: true,
+            set_frontmatter_enabled: true,
+            apply_tag_enabled: true,
+            remove_tag_enabled: true,
+            task_checkout_enabled: true,
+            task_submit_enabled: true,
+            task_fail_enabled: true,
+            task_heartbeat_enabled: true,
+            task_list_enabled: true,
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAuditConfig {
+    /// Mirror of `[llm.audit] log_full_prompt`. When false (default), the
+    /// JSONL audit log records call metadata but redacts large input bodies.
+    #[serde(default = "no")]
+    pub log_full_input: bool,
+}
+
+fn default_mcp_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_mcp_discovery_file() -> String {
+    ".hiker/mcp.json".to_string()
+}
+
+fn default_mcp_max_top_k() -> u32 {
+    50
+}
+
+/// `[search]` section. Holds discovery-panel state: which backends run by
+/// default (mode toggles), and the per-section collapsed/expanded state
+/// inside the panel. Vault-scoped via `settings-write-back`.
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub modes: SearchModesConfig,
+    #[serde(default)]
+    pub sections: SearchSectionsConfig,
+    #[serde(default)]
+    pub lexical: SearchLexicalConfig,
+    #[serde(default)]
+    pub semantic: SearchSemanticConfig,
+}
+
+/// `[search.lexical]` — per-mode option flags surfaced via the right-click
+/// options menu on the Lexical (`Aa`) toggle. Defaults preserve current
+/// behavior (everything off) so existing users see no change until they
+/// reach into the menu.
+///
+/// status: search-lexical-options
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchLexicalConfig {
+    #[serde(default = "no")]
+    pub case_sensitive: bool,
+    #[serde(default = "no")]
+    pub diacritic_sensitive: bool,
+    #[serde(default = "no")]
+    pub prefix_match: bool,
+    #[serde(default = "no")]
+    pub phrase_mode: bool,
+}
+
+/// `[search.semantic]` — per-mode option flags surfaced via the right-click
+/// options menu on the Semantic (brain) toggle.
+///
+/// status: search-semantic-options
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSemanticConfig {
+    /// Cosine-similarity floor; hits below this are dropped before fusion.
+    /// Range 0.00–0.95 in 0.05 steps; default 0.00 (no filter).
+    /// status: search-semantic-min-similarity
+    #[serde(default = "default_min_similarity")]
+    pub min_similarity: f32,
+    /// Override of `PER_BACKEND_TOP_K` for the semantic side only. Range
+    /// 5–100; default 25 (matches the lexical side).
+    /// status: search-semantic-top-k-override
+    #[serde(default = "default_semantic_top_k")]
+    pub top_k: u32,
+    /// RRF blend of `notes.mtime` rank into the semantic score; off/mild/strong.
+    /// status: search-semantic-recency-bias
+    #[serde(default)]
+    pub recency_bias: RecencyBias,
+}
+
+impl Default for SearchSemanticConfig {
+    fn default() -> Self {
+        Self {
+            min_similarity: default_min_similarity(),
+            top_k: default_semantic_top_k(),
+            recency_bias: RecencyBias::default(),
+        }
+    }
+}
+
+fn default_min_similarity() -> f32 { 0.0 }
+fn default_semantic_top_k() -> u32 { 25 }
+
+/// Recency-bias weighting for the semantic engine. `Off` = no recency
+/// blend (default); `Mild` / `Strong` mix mtime rank into the score via
+/// the same RRF k=60 shape as cross-mode fusion (weights 0.5 / 1.0).
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecencyBias {
+    #[default]
+    Off,
+    Mild,
+    Strong,
+}
+
+impl RecencyBias {
+    pub fn weight(self) -> f32 {
+        match self {
+            RecencyBias::Off => 0.0,
+            RecencyBias::Mild => 0.5,
+            RecencyBias::Strong => 1.0,
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchModesConfig {
+    #[serde(default = "yes")]
+    pub semantic: bool,
+    #[serde(default = "yes")]
+    pub lexical: bool,
+}
+
+impl Default for SearchModesConfig {
+    fn default() -> Self {
+        Self { semantic: true, lexical: true }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSectionsConfig {
+    #[serde(default = "yes")]
+    pub results_expanded: bool,
+    #[serde(default = "yes")]
+    pub related_expanded: bool,
+}
+
+impl Default for SearchSectionsConfig {
+    fn default() -> Self {
+        Self { results_expanded: true, related_expanded: true }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorConfig {
+    #[serde(default = "yes")]
+    pub render_txt_as_markdown: bool,
+    #[serde(default = "yes")]
+    pub live_preview: bool,
+    #[serde(default = "yes")]
+    pub word_wrap: bool,
+    #[serde(default = "yes")]
+    pub show_line_numbers: bool,
+    #[serde(default = "no")]
+    pub show_whitespace: bool,
+    #[serde(default = "no")]
+    pub show_chunk_boundaries: bool,
+    #[serde(default = "no")]
+    pub hide_frontmatter: bool,
+    // status: view-intraline-diff-toggle
+    #[serde(default = "no")]
+    pub intraline_diff: bool,
+    #[serde(default = "default_tab_size")]
+    pub tab_size: u8,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            render_txt_as_markdown: true,
+            live_preview: true,
+            word_wrap: true,
+            show_line_numbers: true,
+            show_whitespace: false,
+            show_chunk_boundaries: false,
+            hide_frontmatter: false,
+            intraline_diff: false,
+            tab_size: 2,
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexingConfig {
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u16,
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
+    /// Controls when notes get their `hiker.id` stamped into frontmatter.
+    /// `lazy` (default) stamps only when a note becomes a reference target
+    /// (e.g. trail waypoint, future wikilink). `all` stamps every note on
+    /// first ingest. Both modes share the invariant that any *referenced*
+    /// note is stamped.
+    ///
+    /// status: note-id-stamping
+    #[serde(default)]
+    pub id_stamping: IdStampingMode,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            model: default_model(),
+            batch_size: default_batch_size(),
+            ignored_paths: Vec::new(),
+            id_stamping: IdStampingMode::default(),
+        }
+    }
+}
+
+/// Note-id stamping policy. See `docs/trails.md` §"Note ID stamping policy".
+///
+/// status: note-id-stamping
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdStampingMode {
+    /// Stamp every note on first ingest (lazy backfill via reindex).
+    All,
+    /// Stamp only when a note becomes a reference target. Default.
+    #[default]
+    Lazy,
+}
+
+fn default_model() -> String {
+    "bge-small-en-v1.5".to_string()
+}
+
+fn default_batch_size() -> u16 {
+    64
+}
+
+fn default_tab_size() -> u8 {
+    2
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    #[serde(default)]
+    pub recent: Vec<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default = "yes")]
+    pub sidebar_open: bool,
+    #[serde(default = "no")]
+    pub related_open: bool,
+    #[serde(default = "no")]
+    pub trash_expanded: bool,
+    /// Chat region height as a fraction of the discovery panel height.
+    /// status: chat-panel-default-height
+    #[serde(default = "default_chat_height")]
+    pub chat_height: f32,
+    /// Sidebar column width in CSS pixels.
+    /// status: side-panel-resize
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u32,
+    /// Discovery (right) column width in CSS pixels.
+    /// status: side-panel-resize
+    #[serde(default = "default_discovery_width")]
+    pub discovery_width: u32,
+    /// Surface `.hiker/sessions/` as a virtual top-level "Sessions" group
+    /// in the tree. Default off — sessions stay hidden alongside other
+    /// `.hiker/` sidecars. Search and related-notes always include
+    /// sessions regardless of this toggle.
+    /// status: chat-session-show-in-tree-toggle
+    #[serde(default = "no")]
+    pub show_sessions_in_tree: bool,
+    /// Active sidebar mode (Files / Cluster trees / Trails).
+    /// status: sidebar-mode-switcher
+    #[serde(default)]
+    pub sidebar_mode: SidebarMode,
+    /// Vault-relative path of the currently active trail-doc, or `None`
+    /// if no trail is active. At most one active trail per vault. Persisted
+    /// via `set_setting` so it survives restarts.
+    ///
+    /// status: active-trail-state
+    #[serde(default)]
+    pub active_trail: Option<String>,
+    /// User-set chat input height in CSS pixels, or 0 for auto-grow mode.
+    #[serde(default)]
+    pub chat_input_height: u32,
+    #[serde(default)]
+    pub tree: TreeConfig,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            recent: Vec::new(),
+            default: None,
+            sidebar_open: true,
+            related_open: false,
+            trash_expanded: false,
+            chat_height: default_chat_height(),
+            sidebar_width: default_sidebar_width(),
+            discovery_width: default_discovery_width(),
+            show_sessions_in_tree: false,
+            sidebar_mode: SidebarMode::default(),
+            active_trail: None,
+            chat_input_height: 0,
+            tree: TreeConfig::default(),
+        }
+    }
+}
+
+fn default_chat_height() -> f32 {
+    0.30
+}
+
+fn default_sidebar_width() -> u32 {
+    280
+}
+
+fn default_discovery_width() -> u32 {
+    320
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeConfig {
+    #[serde(default)]
+    pub sort_by: TreeSortBy,
+}
+
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeSortBy {
+    #[default]
+    NameAsc,
+    NameDesc,
+    MtimeDesc,
+    MtimeAsc,
+}
+
+/// Active sidebar mode. Persisted per-vault under `vault.sidebar_mode`.
+/// status: sidebar-mode-switcher
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarMode {
+    #[default]
+    Files,
+    Clusters,
+    Trails,
+}

@@ -1,5 +1,9 @@
 mod chat;
+mod cmd_error;
 mod cmds;
+mod events;
+
+pub(crate) use cmd_error::{CmdError, CmdResult};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -293,160 +297,15 @@ impl hiker_core::tasks::NonLlmHandlers for DirectWorkerHandlers {
     ) -> Result<Option<serde_json::Value>, String> {
         match &task.kind {
             hiker_core::tasks::TaskKind::RaptorTriageMatch { tree_id, source_path } => {
-                let store_guard = self.read_store.lock().map_err(|e| e.to_string())?;
-                let note_id = store_guard
-                    .id_for_path(source_path)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("note not indexed: {source_path}"))?;
-                let embedding = store_guard
-                    .note_embedding_for_path(source_path)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("no embedding for {source_path}"))?;
-                let cfg_triage = self
-                    .config
-                    .read()
-                    .map_err(|_| "config lock poisoned".to_string())?
-                    .suggestions
-                    .triage
-                    .clone();
-                let opts = hiker_core::suggest::TriageOpts {
-                    review_required: cfg_triage.review_required,
-                    scope: cfg_triage.scope.clone(),
-                    beam_width: 2,
-                };
-                let input = hiker_core::suggest::TriageInput {
-                    tree_id,
-                    note_id: &note_id,
-                    source_path,
-                    embedding: &embedding,
-                    // status: triage-author-class
-                    // The task payload carries no author hint in Sprint
-                    // D — agent-author routing arrives with the
-                    // auto-accept worker (see `triage-author-class`
-                    // status row, currently `partial`).
-                    author_class: hiker_core::suggest::NoteAuthorClass::User,
-                    opts: &opts,
-                };
-                let outcome = hiker_core::suggest::triage_match(
-                    &self.trees,
-                    &self.vault,
-                    &store_guard,
-                    &self.staging,
-                    input,
-                )
-                .map_err(|e| e.to_string())?;
-                Ok(Some(serde_json::to_value(&outcome).map_err(|e| e.to_string())?))
+                self.handle_raptor_triage_match(tree_id, source_path).map(Some)
             }
             hiker_core::tasks::TaskKind::RaptorSummarize {
                 tree_id,
                 cluster_node_id,
                 level,
-            } => {
-                let node = self
-                    .trees
-                    .get_node(tree_id, cluster_node_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!("cluster node not found: {tree_id}/{cluster_node_id}")
-                    })?;
-                if !matches!(node.kind, hiker_core::trees::NodeKind::Cluster) {
-                    return Err(format!(
-                        "raptor_summarize target is not a cluster: {cluster_node_id}"
-                    ));
-                }
-                if node.user_edited_name && node.user_edited_summary {
-                    // Both fields user-edited — nothing to write back.
-                    return Ok(Some(serde_json::json!({
-                        "node_id": cluster_node_id,
-                        "skipped": "user_edited",
-                    })));
-                }
-                let children = self
-                    .trees
-                    .children_of(tree_id, Some(cluster_node_id))
-                    .map_err(|e| e.to_string())?;
-                if children.is_empty() {
-                    return Err(format!(
-                        "cluster has no children to summarize: {cluster_node_id}"
-                    ));
-                }
-                // Resolve member info for the prompt. Cluster children
-                // contribute their name+summary; leaf children contribute
-                // the note's basename (looked up from the read store) and
-                // an empty summary — matches the producer shape used by
-                // the inline `build_and_persist` summarization pass.
-                struct OwnedMember {
-                    title: String,
-                    summary: String,
-                }
-                let mut owned: Vec<OwnedMember> = Vec::with_capacity(children.len());
-                {
-                    let store_guard = self.read_store.lock().map_err(|e| e.to_string())?;
-                    for c in &children {
-                        match c.kind {
-                            hiker_core::trees::NodeKind::Cluster => {
-                                owned.push(OwnedMember {
-                                    title: c.name.clone(),
-                                    summary: c.summary.clone(),
-                                });
-                            }
-                            hiker_core::trees::NodeKind::Leaf => {
-                                let title = match c.note_ref.as_deref() {
-                                    Some(id) => match store_guard.path_for_id(id) {
-                                        Ok(Some(p)) => title_from_rel_path(&p),
-                                        _ => c.note_ref.clone().unwrap_or_default(),
-                                    },
-                                    None => c.name.clone(),
-                                };
-                                owned.push(OwnedMember {
-                                    title,
-                                    summary: String::new(),
-                                });
-                            }
-                            hiker_core::trees::NodeKind::OutlierBucket => {
-                                // Outliers contribute as a structural
-                                // entry only; no representative title.
-                                owned.push(OwnedMember {
-                                    title: "(outliers)".to_string(),
-                                    summary: String::new(),
-                                });
-                            }
-                        }
-                    }
-                }
-                let members: Vec<hiker_core::cluster::MemberInfo<'_>> = owned
-                    .iter()
-                    .map(|m| hiker_core::cluster::MemberInfo {
-                        title: m.title.as_str(),
-                        summary: m.summary.as_str(),
-                    })
-                    .collect();
-                let summarizer = self.cluster_summarizer()?;
-                use hiker_core::cluster::Summarizer as _;
-                let out = summarizer
-                    .summarize(hiker_core::cluster::SummarizeInput {
-                        level: *level as usize,
-                        members,
-                    })
-                    .map_err(|e| format!("summarize: {e}"))?;
-                let (wrote_name, wrote_summary) = self
-                    .trees
-                    .auto_set_name_summary(
-                        tree_id,
-                        cluster_node_id,
-                        &out.name,
-                        &out.summary,
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(Some(serde_json::json!({
-                    "node_id": cluster_node_id,
-                    "name": out.name,
-                    "summary": out.summary,
-                    "confidence": out.confidence,
-                    "wrote_name": wrote_name,
-                    "wrote_summary": wrote_summary,
-                })))
-            }
+            } => self
+                .handle_raptor_summarize(tree_id, cluster_node_id, *level)
+                .map(Some),
             hiker_core::tasks::TaskKind::ClusterBuildTree {
                 name,
                 source,
@@ -520,13 +379,205 @@ impl hiker_core::tasks::NonLlmHandlers for DirectWorkerHandlers {
     }
 }
 
+impl DirectWorkerHandlers {
+    fn handle_raptor_triage_match(
+        &self,
+        tree_id: &str,
+        source_path: &str,
+    ) -> Result<serde_json::Value, String> {
+        let store_guard = self.read_store.lock().map_err(|e| e.to_string())?;
+        let note_id = store_guard
+            .id_for_path(source_path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("note not indexed: {source_path}"))?;
+        let embedding = store_guard
+            .note_embedding_for_path(source_path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no embedding for {source_path}"))?;
+        let cfg_triage = self
+            .config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .suggestions
+            .triage
+            .clone();
+        let opts = hiker_core::suggest::TriageOpts {
+            review_required: cfg_triage.review_required,
+            scope: cfg_triage.scope.clone(),
+            beam_width: 2,
+        };
+        let input = hiker_core::suggest::TriageInput {
+            tree_id,
+            note_id: &note_id,
+            source_path,
+            embedding: &embedding,
+            // status: triage-author-class
+            // The task payload carries no author hint in Sprint
+            // D — agent-author routing arrives with the
+            // auto-accept worker (see `triage-author-class`
+            // status row, currently `partial`).
+            author_class: hiker_core::suggest::NoteAuthorClass::User,
+            opts: &opts,
+        };
+        let outcome = hiker_core::suggest::triage_match(
+            &self.trees,
+            &self.vault,
+            &store_guard,
+            &self.staging,
+            input,
+        )
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(&outcome).map_err(|e| e.to_string())
+    }
+
+    fn handle_raptor_summarize(
+        &self,
+        tree_id: &str,
+        cluster_node_id: &str,
+        level: u8,
+    ) -> Result<serde_json::Value, String> {
+        let node = self
+            .trees
+            .get_node(tree_id, cluster_node_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("cluster node not found: {tree_id}/{cluster_node_id}"))?;
+        if !matches!(node.kind, hiker_core::trees::NodeKind::Cluster) {
+            return Err(format!(
+                "raptor_summarize target is not a cluster: {cluster_node_id}"
+            ));
+        }
+        if node.user_edited_name && node.user_edited_summary {
+            // Both fields user-edited — nothing to write back.
+            return Ok(serde_json::json!({
+                "node_id": cluster_node_id,
+                "skipped": "user_edited",
+            }));
+        }
+        let children = self
+            .trees
+            .children_of(tree_id, Some(cluster_node_id))
+            .map_err(|e| e.to_string())?;
+        if children.is_empty() {
+            return Err(format!(
+                "cluster has no children to summarize: {cluster_node_id}"
+            ));
+        }
+        // Resolve member info for the prompt. Cluster children
+        // contribute their name+summary; leaf children contribute
+        // the note's basename (looked up from the read store) and
+        // an empty summary — matches the producer shape used by
+        // the inline `build_and_persist` summarization pass.
+        struct OwnedMember {
+            title: String,
+            summary: String,
+        }
+        let mut owned: Vec<OwnedMember> = Vec::with_capacity(children.len());
+        {
+            let store_guard = self.read_store.lock().map_err(|e| e.to_string())?;
+            for c in &children {
+                match c.kind {
+                    hiker_core::trees::NodeKind::Cluster => {
+                        owned.push(OwnedMember {
+                            title: c.name.clone(),
+                            summary: c.summary.clone(),
+                        });
+                    }
+                    hiker_core::trees::NodeKind::Leaf => {
+                        let title = match c.note_ref.as_deref() {
+                            Some(id) => match store_guard.path_for_id(id) {
+                                Ok(Some(p)) => title_from_rel_path(&p),
+                                _ => c.note_ref.clone().unwrap_or_default(),
+                            },
+                            None => c.name.clone(),
+                        };
+                        owned.push(OwnedMember {
+                            title,
+                            summary: String::new(),
+                        });
+                    }
+                    hiker_core::trees::NodeKind::OutlierBucket => {
+                        // Outliers contribute as a structural
+                        // entry only; no representative title.
+                        owned.push(OwnedMember {
+                            title: "(outliers)".to_string(),
+                            summary: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        let members: Vec<hiker_core::cluster::MemberInfo<'_>> = owned
+            .iter()
+            .map(|m| hiker_core::cluster::MemberInfo {
+                title: m.title.as_str(),
+                summary: m.summary.as_str(),
+            })
+            .collect();
+        let summarizer = self.cluster_summarizer()?;
+        use hiker_core::cluster::Summarizer as _;
+        let out = summarizer
+            .summarize(hiker_core::cluster::SummarizeInput {
+                level: level as usize,
+                members,
+            })
+            .map_err(|e| format!("summarize: {e}"))?;
+        let (wrote_name, wrote_summary) = self
+            .trees
+            .auto_set_name_summary(tree_id, cluster_node_id, &out.name, &out.summary)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "node_id": cluster_node_id,
+            "name": out.name,
+            "summary": out.summary,
+            "confidence": out.confidence,
+            "wrote_name": wrote_name,
+            "wrote_summary": wrote_summary,
+        }))
+    }
+}
+
 pub(crate) fn with_vault<R>(
     state: &State<AppState>,
-    f: impl FnOnce(&Vault) -> Result<R, String>,
-) -> Result<R, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+    f: impl FnOnce(&Vault) -> CmdResult<R>,
+) -> CmdResult<R> {
+    let guard = state.session.lock()?;
+    let session = guard.as_ref().ok_or_else(CmdError::no_vault_open)?;
     f(&session.vault)
+}
+
+/// Run a closure with a borrow of the open `VaultSession`. Returns
+/// `CmdError::no_vault_open` if no vault is open. The lock is held only
+/// while the closure runs — callers that need to drop it before an
+/// `.await` should clone what they need out via `with_session_async`,
+/// not this helper.
+pub(crate) fn with_session<R>(
+    state: &State<AppState>,
+    f: impl FnOnce(&VaultSession) -> CmdResult<R>,
+) -> CmdResult<R> {
+    let guard = state.session.lock()?;
+    let session = guard.as_ref().ok_or_else(CmdError::no_vault_open)?;
+    f(session)
+}
+
+/// Async variant of `with_session`: snapshot the cloneable handles you
+/// need from the session inside the synchronous `picker`, drop the lock,
+/// then run `body` with those handles. The closure shape enforces the
+/// "drop guard before await" rule statically (the picker can't `.await`).
+pub(crate) async fn with_session_async<T, R, F, Fut>(
+    state: &State<'_, AppState>,
+    picker: impl FnOnce(&VaultSession) -> CmdResult<T>,
+    body: F,
+) -> CmdResult<R>
+where
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = CmdResult<R>>,
+{
+    let picked = {
+        let guard = state.session.lock()?;
+        let session = guard.as_ref().ok_or_else(CmdError::no_vault_open)?;
+        picker(session)?
+    };
+    body(picked).await
 }
 
 /// Log an `Err(_)` returned to the frontend, then pass the Result through

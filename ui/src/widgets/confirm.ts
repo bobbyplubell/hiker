@@ -3,28 +3,13 @@
 // `confirmDanger` is the two-button cancel/destructive shape used by delete
 // modals and trash-empty.
 
+import { el } from "./dom";
+
 export function confirmDanger(
   message: string,
   dangerLabel: string,
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-    const dialog = document.createElement("div");
-    dialog.className = "modal-dialog";
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    const msg = document.createElement("p");
-    msg.className = "modal-message";
-    msg.textContent = message;
-    const btnRow = document.createElement("div");
-    btnRow.className = "modal-buttons";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "modal-btn";
-    cancelBtn.textContent = "Cancel";
-    const dangerBtn = document.createElement("button");
-    dangerBtn.className = "modal-btn modal-btn-danger";
-    dangerBtn.textContent = dangerLabel;
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const finish = (v: boolean) => {
       document.removeEventListener("keydown", onKey, true);
@@ -36,15 +21,29 @@ export function confirmDanger(
       if (e.key === "Escape") { e.preventDefault(); finish(false); }
       else if (e.key === "Enter") { e.preventDefault(); finish(false); }
     };
-    cancelBtn.addEventListener("click", () => finish(false));
-    dangerBtn.addEventListener("click", () => finish(true));
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) finish(false);
+    const cancelBtn = el("button", {
+      class: "modal-btn",
+      text: "Cancel",
+      onClick: () => finish(false),
     });
+    const dangerBtn = el("button", {
+      class: "modal-btn modal-btn-danger",
+      text: dangerLabel,
+      onClick: () => finish(true),
+    });
+    const overlay = el("div", {
+      class: "modal-overlay",
+      on: { mousedown: (e) => { if (e.target === overlay) finish(false); } },
+    }, [
+      el("div", {
+        class: "modal-dialog",
+        attrs: { role: "dialog", "aria-modal": "true" },
+      }, [
+        el("p", { class: "modal-message", text: message }),
+        el("div", { class: "modal-buttons" }, [dangerBtn, cancelBtn]),
+      ]),
+    ]);
     document.addEventListener("keydown", onKey, true);
-    btnRow.append(dangerBtn, cancelBtn);
-    dialog.append(msg, btnRow);
-    overlay.append(dialog);
     document.body.append(overlay);
     cancelBtn.focus();
   });
@@ -62,26 +61,6 @@ export function confirmAccent(
   confirmLabel: string,
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-    const dialog = document.createElement("div");
-    dialog.className = "modal-dialog";
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    const msg = document.createElement("p");
-    msg.className = "modal-message";
-    // Preserve embedded newlines so the bullet body renders as the spec's
-    // multi-line layout rather than collapsing to a single paragraph.
-    msg.style.whiteSpace = "pre-line";
-    msg.textContent = message;
-    const btnRow = document.createElement("div");
-    btnRow.className = "modal-buttons";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "modal-btn";
-    cancelBtn.textContent = "Cancel";
-    const confirmBtn = document.createElement("button");
-    confirmBtn.className = "modal-btn modal-btn-primary";
-    confirmBtn.textContent = confirmLabel;
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const finish = (v: boolean) => {
       document.removeEventListener("keydown", onKey, true);
@@ -97,15 +76,35 @@ export function confirmAccent(
         finish(false);
       }
     };
-    cancelBtn.addEventListener("click", () => finish(false));
-    confirmBtn.addEventListener("click", () => finish(true));
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) finish(false);
+    const cancelBtn = el("button", {
+      class: "modal-btn",
+      text: "Cancel",
+      onClick: () => finish(false),
     });
+    const confirmBtn = el("button", {
+      class: "modal-btn modal-btn-primary",
+      text: confirmLabel,
+      onClick: () => finish(true),
+    });
+    const overlay = el("div", {
+      class: "modal-overlay",
+      on: { mousedown: (e) => { if (e.target === overlay) finish(false); } },
+    }, [
+      el("div", {
+        class: "modal-dialog",
+        attrs: { role: "dialog", "aria-modal": "true" },
+      }, [
+        // Preserve embedded newlines so the bullet body renders as the spec's
+        // multi-line layout rather than collapsing to a single paragraph.
+        el("p", {
+          class: "modal-message",
+          text: message,
+          style: { whiteSpace: "pre-line" },
+        }),
+        el("div", { class: "modal-buttons" }, [confirmBtn, cancelBtn]),
+      ]),
+    ]);
     document.addEventListener("keydown", onKey, true);
-    btnRow.append(confirmBtn, cancelBtn);
-    dialog.append(msg, btnRow);
-    overlay.append(dialog);
     document.body.append(overlay);
     // Cancel default-focused per spec.
     cancelBtn.focus();
@@ -119,31 +118,6 @@ export function confirm3(
   cancel: string,
 ): Promise<"a" | "b" | "cancel"> {
   return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-
-    const dialog = document.createElement("div");
-    dialog.className = "modal-dialog";
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-
-    const msg = document.createElement("p");
-    msg.className = "modal-message";
-    msg.textContent = message;
-
-    const btnRow = document.createElement("div");
-    btnRow.className = "modal-buttons";
-
-    const aBtn = document.createElement("button");
-    aBtn.className = "modal-btn modal-btn-primary";
-    aBtn.textContent = a;
-    const bBtn = document.createElement("button");
-    bBtn.className = "modal-btn";
-    bBtn.textContent = b;
-    const cBtn = document.createElement("button");
-    cBtn.className = "modal-btn";
-    cBtn.textContent = cancel;
-
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const finish = (choice: "a" | "b" | "cancel") => {
       document.removeEventListener("keydown", onKey, true);
@@ -157,18 +131,34 @@ export function confirm3(
       else if (e.key === "1") { e.preventDefault(); finish("a"); }
       else if (e.key === "2") { e.preventDefault(); finish("b"); }
     };
-
-    aBtn.addEventListener("click", () => finish("a"));
-    bBtn.addEventListener("click", () => finish("b"));
-    cBtn.addEventListener("click", () => finish("cancel"));
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) finish("cancel");
+    const aBtn = el("button", {
+      class: "modal-btn modal-btn-primary",
+      text: a,
+      onClick: () => finish("a"),
     });
+    const bBtn = el("button", {
+      class: "modal-btn",
+      text: b,
+      onClick: () => finish("b"),
+    });
+    const cBtn = el("button", {
+      class: "modal-btn",
+      text: cancel,
+      onClick: () => finish("cancel"),
+    });
+    const overlay = el("div", {
+      class: "modal-overlay",
+      on: { mousedown: (e) => { if (e.target === overlay) finish("cancel"); } },
+    }, [
+      el("div", {
+        class: "modal-dialog",
+        attrs: { role: "dialog", "aria-modal": "true" },
+      }, [
+        el("p", { class: "modal-message", text: message }),
+        el("div", { class: "modal-buttons" }, [cBtn, bBtn, aBtn]),
+      ]),
+    ]);
     document.addEventListener("keydown", onKey, true);
-
-    btnRow.append(cBtn, bBtn, aBtn);
-    dialog.append(msg, btnRow);
-    overlay.append(dialog);
     document.body.append(overlay);
     aBtn.focus();
   });

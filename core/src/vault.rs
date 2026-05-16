@@ -321,11 +321,11 @@ pub fn move_note(
             return Err(HikerError::Io(e.to_string()));
         }
     };
-    if let Some(id) = id_opt {
-        if let Err(e) = store.rename_note(&id, to) {
-            let _ = fs::rename(&to_abs, &from_abs);
-            return Err(HikerError::Io(e.to_string()));
-        }
+    if let Some(id) = id_opt
+        && let Err(e) = store.rename_note(&id, to)
+    {
+        let _ = fs::rename(&to_abs, &from_abs);
+        return Err(HikerError::Io(e.to_string()));
     }
     Ok(())
 }
@@ -504,11 +504,11 @@ fn delete_file(
             return Err(HikerError::Io(e.to_string()));
         }
     };
-    if let Some(id) = id_opt {
-        if let Err(e) = store.delete_note(&id) {
-            let _ = rollback_file(vault, trash, &entry);
-            return Err(HikerError::Io(e.to_string()));
-        }
+    if let Some(id) = id_opt
+        && let Err(e) = store.delete_note(&id)
+    {
+        let _ = rollback_file(vault, trash, &entry);
+        return Err(HikerError::Io(e.to_string()));
     }
 
     if let Err(e) = trash.append(&entry) {
@@ -585,10 +585,10 @@ pub fn restore_note(
     if dest.exists() {
         return Err(HikerError::AlreadyExists(entry.original_path.clone()));
     }
-    if let Some(parent) = dest.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = dest.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     if let Some(w) = watcher {
@@ -642,12 +642,12 @@ fn rollback_folder(vault: &Vault, trash: &Trash, entry: &TrashEntry) -> Result<(
 mod tests {
     use super::*;
     use crate::store::{new_id, NoteUpsert, Store};
+    use crate::test_helpers;
     use tempfile::tempdir;
 
     #[test]
     fn create_note_writes_empty_file_and_returns_path() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (dir, vault) = test_helpers::test_vault();
         let p = vault.create_note("alpha.md").unwrap();
         assert_eq!(p, "alpha.md");
         let bytes = fs::read(dir.path().join("alpha.md")).unwrap();
@@ -669,8 +669,7 @@ mod tests {
 
     #[test]
     fn create_note_missing_parent_errors() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (_dir, vault) = test_helpers::test_vault();
         assert!(matches!(
             vault.create_note("nope/a.md"),
             Err(HikerError::NotFound(_))
@@ -734,8 +733,7 @@ mod tests {
 
     #[test]
     fn move_note_source_missing_errors() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (dir, vault) = test_helpers::test_vault();
         let mut store = Store::open(dir.path()).unwrap();
         assert!(matches!(
             move_note(&vault, &mut store, None, "nope.md", "x.md"),
@@ -823,8 +821,7 @@ mod tests {
 
     #[test]
     fn move_folder_source_missing_errors() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (dir, vault) = test_helpers::test_vault();
         let mut store = Store::open(dir.path()).unwrap();
         match move_folder(&vault, &mut store, None, "ghost", "x") {
             Err(HikerError::NotFound(_)) => {}
@@ -882,8 +879,7 @@ mod tests {
 
     #[test]
     fn delete_note_source_missing_errors() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (dir, vault) = test_helpers::test_vault();
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
         match delete_note(&vault, &mut store, None, &trash, "ghost.md") {
@@ -1005,8 +1001,7 @@ mod tests {
 
     #[test]
     fn restore_note_unknown_id_errors() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (_dir, vault) = test_helpers::test_vault();
         let trash = crate::trash::Trash::open(vault.root());
         match restore_note(&vault, None, &trash, "no-such-id") {
             Err(HikerError::NotFound(_)) => {}
@@ -1016,8 +1011,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_absolute_path() {
-        let dir = tempdir().unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
+        let (_dir, vault) = test_helpers::test_vault();
         let err = vault.resolve("/etc/passwd").unwrap_err();
         match err {
             HikerError::PathEscape(msg) => assert!(msg.contains("absolute")),

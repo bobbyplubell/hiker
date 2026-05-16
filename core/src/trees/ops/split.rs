@@ -18,6 +18,19 @@ use super::super::types::{
     EditableNode, NodeInsert, NodeKind, SplitOutcome, Trees, TreesError,
 };
 
+/// Borrow-bundle of the invariants that stay fixed across every
+/// recursion frame of `split_cluster_recursive`: the tree id, cluster
+/// params, leaf-embedding resolver, and recursion cap. Only the
+/// `target_node_id`, `virtual_root_inputs`, `is_top_level`, and
+/// `depth` differ per frame; `outcome` is the shared `&mut`
+/// accumulator threaded separately.
+pub(in crate::trees) struct SplitRecursionCtx<'a> {
+    pub tree_id: &'a str,
+    pub params: &'a crate::cluster::ClusterParams,
+    pub embeddings_for_leaf: &'a dyn Fn(&str) -> Option<Vec<f32>>,
+    pub max_depth: u8,
+}
+
 impl Trees {
     // ── cluster-op-split ───────────────────────────────────────────────
     //
@@ -52,33 +65,36 @@ impl Trees {
             total_levels: 0,
             outliers: Vec::new(),
         };
-        self.split_cluster_recursive(
+        let ctx = SplitRecursionCtx {
             tree_id,
-            target_node_id,
             params,
             embeddings_for_leaf,
+            max_depth: MAX_RECURSION_LEVELS,
+        };
+        self.split_cluster_recursive(
+            &ctx,
+            target_node_id,
             virtual_root_inputs,
             true,
             0,
-            MAX_RECURSION_LEVELS,
             &mut outcome,
         )?;
         Ok(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::trees) fn split_cluster_recursive(
         &self,
-        tree_id: &str,
+        ctx: &SplitRecursionCtx<'_>,
         target_node_id: Option<&str>,
-        params: &crate::cluster::ClusterParams,
-        embeddings_for_leaf: &dyn Fn(&str) -> Option<Vec<f32>>,
         virtual_root_inputs: Option<&[crate::cluster::NoteInput]>,
         is_top_level: bool,
         depth: u8,
-        max_depth: u8,
         outcome: &mut SplitOutcome,
     ) -> Result<(), TreesError> {
+        let tree_id = ctx.tree_id;
+        let params = ctx.params;
+        let embeddings_for_leaf = ctx.embeddings_for_leaf;
+        let max_depth = ctx.max_depth;
         if depth >= max_depth {
             return Ok(());
         }
@@ -308,14 +324,11 @@ impl Trees {
                 // recipe will wire that case when it lands.
                 if target_node_id.is_some() {
                     self.split_cluster_recursive(
-                        tree_id,
+                        ctx,
                         Some(&new_id),
-                        params,
-                        embeddings_for_leaf,
                         None,
                         false,
                         depth + 1,
-                        max_depth,
                         outcome,
                     )?;
                 }

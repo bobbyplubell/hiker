@@ -20,23 +20,18 @@ use hiker_core::HikerError;
 use tauri::State;
 
 use crate::cmds::vault::reveal_path;
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdError, CmdResult};
 
 /// Snapshot of the active vault's merged settings. Frontend uses this on
 /// vault open to seed View menu / tree-state defaults.
 ///
 /// status: settings-load-once-at-startup
 #[tauri::command]
-pub(crate) fn get_settings(state: State<AppState>) -> Result<Config, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let cfg = session
-            .config
-            .read()
-            .map_err(|_| "config lock poisoned".to_string())?;
+pub(crate) fn get_settings(state: State<AppState>) -> CmdResult<Config> {
+    let result = with_session(&state, |session| {
+        let cfg = session.config.read()?;
         Ok(cfg.clone())
-    })();
+    });
     log_cmd_result("get_settings", result)
 }
 
@@ -96,35 +91,34 @@ async fn set_setting_inner(
     // value never disagrees with the loaded model. Same-value writes
     // short-circuit and fall through to the regular path (which itself
     // no-ops if the file is unchanged).
-    if key == "indexing.model" {
-        if let Some(new_id) = value.as_str() {
-            if new_id != prev_indexing_model {
-                // Validate the id before paying the load cost. Unknown
-                // models bail with a clean Config error and no side
-                // effects; matches the `is_known_model` check in
-                // `core::config` strict-load.
-                if !hiker_core::embed::is_known_model(new_id) {
-                    return Err(HikerError::Config(format!(
-                        "unknown embedder model: {new_id}"
-                    )));
-                }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                reload_tx
-                    .send(IndexJob::ReloadEmbedder {
-                        model_id: new_id.to_string(),
-                        reply: tx,
-                    })
-                    .await
-                    .map_err(|_| HikerError::Config("indexer unavailable".into()))?;
-                match rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(HikerError::Config(
-                            "indexer dropped reload reply".into(),
-                        ))
-                    }
-                }
+    if key == "indexing.model"
+        && let Some(new_id) = value.as_str()
+        && new_id != prev_indexing_model
+    {
+        // Validate the id before paying the load cost. Unknown
+        // models bail with a clean Config error and no side
+        // effects; matches the `is_known_model` check in
+        // `core::config` strict-load.
+        if !hiker_core::embed::is_known_model(new_id) {
+            return Err(HikerError::Config(format!(
+                "unknown embedder model: {new_id}"
+            )));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reload_tx
+            .send(IndexJob::ReloadEmbedder {
+                model_id: new_id.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| HikerError::Config("indexer unavailable".into()))?;
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(HikerError::Config(
+                    "indexer dropped reload reply".into(),
+                ))
             }
         }
     }
@@ -241,10 +235,10 @@ async fn restart_mcp_server(state: &State<'_, AppState>, updated: &Config) {
     };
     match hiker_mcp::start(deps).await {
         Ok(handle) => {
-            if let Ok(mut guard) = state.session.lock() {
-                if let Some(session) = guard.as_mut() {
-                    session.mcp = Some(handle);
-                }
+            if let Ok(mut guard) = state.session.lock()
+                && let Some(session) = guard.as_mut()
+            {
+                session.mcp = Some(handle);
             }
         }
         Err(hiker_mcp::StartError::Disabled) => {}
@@ -377,9 +371,9 @@ pub(crate) fn reveal_config_file(
 ///
 /// status: settings-default-vault-autoopen
 #[tauri::command]
-pub(crate) fn get_default_vault() -> Result<Option<String>, String> {
+pub(crate) fn get_default_vault() -> CmdResult<Option<String>> {
     log_cmd_result(
         "get_default_vault",
-        hiker_core::config::Config::user_default_vault().map_err(|e| e.to_string()),
+        hiker_core::config::Config::user_default_vault().map_err(CmdError::from),
     )
 }

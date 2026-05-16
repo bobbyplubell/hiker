@@ -263,10 +263,10 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
             // (and vice versa) without a normalization pass — so the
             // narrower setting is enforced by exactly the same byte-level
             // contains check as case_sensitive.
-            if opts.case_sensitive || opts.diacritic_sensitive {
-                if !chunk_contains(q, &chunk_text, opts) {
-                    continue;
-                }
+            if (opts.case_sensitive || opts.diacritic_sensitive)
+                && !chunk_contains(q, &chunk_text, opts)
+            {
+                continue;
             }
             chunk_hits.push(hit);
         }

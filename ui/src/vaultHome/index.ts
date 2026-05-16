@@ -24,6 +24,7 @@ import {
 } from "../ipc";
 import { Logger } from "../logger";
 import { Icons } from "../icons";
+import { el } from "../widgets/dom";
 import {
   createPanelController,
   type PanelController,
@@ -140,17 +141,16 @@ function makeIconButton(
   title: string,
   onClick: (e: MouseEvent) => void | Promise<void>,
 ): HTMLButtonElement {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = `row-action row-action-icon row-action-${kind}`;
-  btn.title = title;
-  btn.setAttribute("aria-label", label);
-  btn.innerHTML =
-    kind === "accept"
-      ? `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="3,8 7,12 13,4"/></svg>`
-      : `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>`;
-  btn.addEventListener("click", (e) => void onClick(e));
-  return btn;
+  return el("button", {
+    class: `row-action row-action-icon row-action-${kind}`,
+    title,
+    attrs: { type: "button", "aria-label": label },
+    html:
+      kind === "accept"
+        ? `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><polyline points="3,8 7,12 13,4"/></svg>`
+        : `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>`,
+    onClick: (e) => void onClick(e),
+  });
 }
 
 function opLabel(op: ChangeOp): string {
@@ -215,26 +215,17 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
       ["Skipped", stats.skipped],
     ];
     deps.statsBodyEl.replaceChildren(
-      ...cells.map(([label, num]) => {
-        const cell = document.createElement("div");
-        cell.className = "vault-home-stat";
-        const numEl = document.createElement("div");
-        numEl.className = "num";
-        numEl.textContent = String(num);
-        const lbl = document.createElement("div");
-        lbl.className = "label";
-        lbl.textContent = label;
-        cell.append(numEl, lbl);
-        return cell;
-      }),
+      ...cells.map(([label, num]) =>
+        el("div", { class: "vault-home-stat" }, [
+          el("div", { class: "num", text: String(num) }),
+          el("div", { class: "label", text: label }),
+        ]),
+      ),
     );
   }
 
   function buildStatEmpty(text: string): HTMLElement {
-    const el = document.createElement("div");
-    el.className = "vault-home-stat-empty";
-    el.textContent = text;
-    return el;
+    return el("div", { class: "vault-home-stat-empty", text });
   }
 
   async function refreshRecentModified(): Promise<void> {
@@ -263,23 +254,17 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   // hit's vault-relative path so the delegated handler can resolve back
   // to it via `closest("[data-path]")`.
   function domForRecentRow(r: RecentNote, field: "mtime" | "accessed"): HTMLElement {
-    const li = document.createElement("li");
-    li.dataset.path = r.path;
     const ts = field === "mtime" ? r.mtime : (r.last_accessed_at ?? r.mtime);
-    const when = relativeTime(ts);
-    const nameEl = document.createElement("span");
-    nameEl.className = "name";
-    nameEl.textContent = r.title;
-    const relEl = document.createElement("span");
-    relEl.className = "rel";
     const parent = r.path.includes("/") ? r.path.slice(0, r.path.lastIndexOf("/")) : "";
-    relEl.textContent = parent;
-    const whenEl = document.createElement("span");
-    whenEl.className = "when";
-    whenEl.textContent = when;
-    whenEl.title = new Date(ts * 1000).toLocaleString();
-    li.append(nameEl, relEl, whenEl);
-    return li;
+    return el("li", { data: { path: r.path } }, [
+      el("span", { class: "name", text: r.title }),
+      el("span", { class: "rel", text: parent }),
+      el("span", {
+        class: "when",
+        text: relativeTime(ts),
+        title: new Date(ts * 1000).toLocaleString(),
+      }),
+    ]);
   }
 
   function onRecentListClick(e: MouseEvent): void {
@@ -311,10 +296,7 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   ): void {
     ensureRecentListDelegation(ul);
     if (rows.length === 0) {
-      const li = document.createElement("li");
-      li.className = "empty";
-      li.textContent = emptyText;
-      ul.replaceChildren(li);
+      ul.replaceChildren(el("li", { class: "empty", text: emptyText }));
       return;
     }
     ul.replaceChildren(...rows.map((r) => domForRecentRow(r, field)));
@@ -432,45 +414,10 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
   // Accept/Reject affordances per
   // `staging-accept-reject-from-activity-detail`.
   function buildPendingPreviewRow(p: Proposal): HTMLElement {
-    const li = document.createElement("li");
-    li.classList.add("clickable");
-    li.addEventListener("click", (e) => {
-      if ((e.target as HTMLElement).closest("button")) return;
-      void deps.onOpenStagingProposal(p);
-    });
-
-    const op = document.createElement("span");
-    op.className = "activity-op";
-    op.textContent = "pending";
-
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = p.target_path.split("/").pop() ?? p.target_path;
-    if (p.trail_id) name.title = `Trail: ${p.trail_id}`;
-
-    const rel = document.createElement("span");
-    rel.className = "rel";
-    rel.textContent = p.target_path.includes("/")
-      ? p.target_path.slice(0, p.target_path.lastIndexOf("/"))
-      : "";
-
-    const right = document.createElement("span");
-    right.className = "row-right";
-
-    const when = document.createElement("span");
-    when.className = "when";
-    when.textContent = relativeTime(Math.floor(p.created_at_ms / 1000));
-    when.title = new Date(p.created_at_ms).toLocaleString();
-
-    const author = document.createElement("span");
-    author.className = "activity-author";
     const authorClass =
       typeof p.metadata?.author_class === "string"
         ? p.metadata.author_class
         : "agent";
-    author.innerHTML = authorPillIcon(authorClass);
-    author.title = `Pending (${p.surface})`;
-
     const acceptBtn = makeIconButton(
       "accept",
       "Accept",
@@ -486,7 +433,6 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
         await refreshActivityWidget();
       },
     );
-
     const rejectBtn = makeIconButton(
       "reject",
       "Reject",
@@ -502,57 +448,84 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
         await refreshActivityWidget();
       },
     );
-
-    right.append(when, author, acceptBtn, rejectBtn);
-    li.append(op, name, rel, right);
-    return li;
+    return el("li", {
+      class: "clickable",
+      onClick: (e) => {
+        if ((e.target as HTMLElement).closest("button")) return;
+        void deps.onOpenStagingProposal(p);
+      },
+    }, [
+      el("span", { class: "activity-op", text: "pending" }),
+      el("span", {
+        class: "name",
+        text: p.target_path.split("/").pop() ?? p.target_path,
+        title: p.trail_id ? `Trail: ${p.trail_id}` : undefined,
+      }),
+      el("span", {
+        class: "rel",
+        text: p.target_path.includes("/")
+          ? p.target_path.slice(0, p.target_path.lastIndexOf("/"))
+          : "",
+      }),
+      el("span", { class: "row-right" }, [
+        el("span", {
+          class: "when",
+          text: relativeTime(Math.floor(p.created_at_ms / 1000)),
+          title: new Date(p.created_at_ms).toLocaleString(),
+        }),
+        el("span", {
+          class: "activity-author",
+          html: authorPillIcon(authorClass),
+          title: `Pending (${p.surface})`,
+        }),
+        acceptBtn,
+        rejectBtn,
+      ]),
+    ]);
   }
 
   function buildActivityPreviewRow(r: ChangeRow): HTMLElement {
-    const li = document.createElement("li");
-    const op = document.createElement("span");
-    op.className = "activity-op";
-    op.textContent = opLabel(r.op);
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = r.path.split("/").pop() ?? r.path;
-    const rel = document.createElement("span");
-    rel.className = "rel";
-    rel.textContent = r.path.includes("/")
-      ? r.path.slice(0, r.path.lastIndexOf("/"))
-      : "";
-    const right = document.createElement("span");
-    right.className = "row-right";
-    const when = document.createElement("span");
-    when.className = "when";
-    when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
-    when.title = new Date(r.timestamp_ms).toLocaleString();
-    const cls = r.author_class;
-    const author = document.createElement("span");
-    author.className = "activity-author";
-    author.innerHTML = authorPillIcon(cls);
-    author.title = r.author;
-    const idEl = document.createElement("span");
-    idEl.className = "activity-id";
-    idEl.textContent = `#${r.id}`;
-    idEl.title = `Snapshot id ${r.id}`;
-    right.append(when, author, idEl);
-
-    li.append(op, name);
     const meta = r.metadata as Record<string, unknown>;
     const src = (meta?.["restored_from"] ?? meta?.["rolled_back_from"]) as
       | number
       | undefined;
-    if (src !== undefined) {
-      const badge = document.createElement("span");
-      badge.className = "rollback-badge";
-      badge.textContent = `↩ #${src}`;
-      badge.title = `This save was a Restore of snapshot #${src}`;
-      li.appendChild(badge);
-    }
-    li.append(rel, right);
-    li.addEventListener("click", () => requestRecentActivityDetail());
-    return li;
+    const right = el("span", { class: "row-right" }, [
+      el("span", {
+        class: "when",
+        text: relativeTime(Math.floor(r.timestamp_ms / 1000)),
+        title: new Date(r.timestamp_ms).toLocaleString(),
+      }),
+      el("span", {
+        class: "activity-author",
+        html: authorPillIcon(r.author_class),
+        title: r.author,
+      }),
+      el("span", {
+        class: "activity-id",
+        text: `#${r.id}`,
+        title: `Snapshot id ${r.id}`,
+      }),
+    ]);
+    return el("li", {
+      onClick: () => requestRecentActivityDetail(),
+    }, [
+      el("span", { class: "activity-op", text: opLabel(r.op) }),
+      el("span", { class: "name", text: r.path.split("/").pop() ?? r.path }),
+      src !== undefined
+        ? el("span", {
+            class: "rollback-badge",
+            text: `↩ #${src}`,
+            title: `This save was a Restore of snapshot #${src}`,
+          })
+        : null,
+      el("span", {
+        class: "rel",
+        text: r.path.includes("/")
+          ? r.path.slice(0, r.path.lastIndexOf("/"))
+          : "",
+      }),
+      right,
+    ]);
   }
 
   // status: activity-feed-activity-detail-consumer
@@ -617,27 +590,26 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     // Render author-class filter pills.
     const sortedClasses = [...allClasses].sort();
     for (const cls of sortedClasses) {
-      const pill = document.createElement("button");
-      pill.className = "filter-pill toolbar-btn";
-      pill.type = "button";
-      if (activeAuthorFilters.has(cls)) pill.classList.add("active");
       const hasRows = presentClasses.has(cls);
-      if (!hasRows) pill.classList.add("empty");
-      pill.innerHTML = authorPillIcon(cls);
-      pill.classList.add("filter-pill-icon-only");
-      pill.setAttribute("aria-label", `Toggle ${cls} activity`);
-      pill.title = hasRows
-        ? `Show ${cls} activity`
-        : `No ${cls} activity in the recent window yet`;
-      pill.addEventListener("click", () => {
-        if (activeAuthorFilters.has(cls)) {
-          activeAuthorFilters.delete(cls);
-        } else {
-          activeAuthorFilters.add(cls);
-        }
-        renderActivityDetail();
-      });
-      deps.detailFiltersEl.appendChild(pill);
+      const classes = ["filter-pill", "toolbar-btn", "filter-pill-icon-only"];
+      if (activeAuthorFilters.has(cls)) classes.push("active");
+      if (!hasRows) classes.push("empty");
+      deps.detailFiltersEl.appendChild(el("button", {
+        class: classes.join(" "),
+        html: authorPillIcon(cls),
+        title: hasRows
+          ? `Show ${cls} activity`
+          : `No ${cls} activity in the recent window yet`,
+        attrs: { type: "button", "aria-label": `Toggle ${cls} activity` },
+        onClick: () => {
+          if (activeAuthorFilters.has(cls)) {
+            activeAuthorFilters.delete(cls);
+          } else {
+            activeAuthorFilters.add(cls);
+          }
+          renderActivityDetail();
+        },
+      }));
     }
 
     // Build unified timeline
@@ -661,24 +633,25 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
     const listChildren: HTMLElement[] = [];
 
     if (proposals.length > 0) {
-      const acceptAllRow = document.createElement("li");
+      const acceptAllRow = el("li", {}, [
+        el("button", {
+          class: "row-action",
+          text: `Accept all (${proposals.length})`,
+          title: "Confirm then batch-apply every pending proposal.",
+          onClick: async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Accept all ${proposals.length} pending proposals?\n\nEach proposal will be drift-checked against its target file before writing.`)) return;
+            try {
+              await Ipc.stagingAcceptAll();
+            } catch (err) {
+              alert(`Accept all failed: ${deps.formatErr(err)}`);
+              return;
+            }
+            await refreshActivityDetail();
+          },
+        }),
+      ]);
       acceptAllRow.style.cssText = "padding:4px 8px;display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--border-divider)";
-      const acceptAllBtn = document.createElement("button");
-      acceptAllBtn.className = "row-action";
-      acceptAllBtn.textContent = `Accept all (${proposals.length})`;
-      acceptAllBtn.title = "Confirm then batch-apply every pending proposal.";
-      acceptAllBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        if (!confirm(`Accept all ${proposals.length} pending proposals?\n\nEach proposal will be drift-checked against its target file before writing.`)) return;
-        try {
-          await Ipc.stagingAcceptAll();
-        } catch (err) {
-          alert(`Accept all failed: ${deps.formatErr(err)}`);
-          return;
-        }
-        await refreshActivityDetail();
-      });
-      acceptAllRow.appendChild(acceptAllBtn);
       listChildren.push(acceptAllRow);
     }
 
@@ -695,51 +668,10 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
 
   // status: staging-review-activity-detail-filter
   function buildProposalRow(p: Proposal): HTMLElement {
-    const li = document.createElement("li");
-    li.classList.add("clickable");
-    li.style.cursor = "pointer";
-    li.addEventListener("click", (e) => {
-      if ((e.target as HTMLElement).closest("button")) return;
-      void deps.onOpenStagingProposal(p);
-    });
-
-    const line = document.createElement("div");
-    line.className = "row-line";
-
     // Proposal type indicator.
-    const op = document.createElement("span");
-    op.className = "activity-op";
     const surfaceLabel = p.surface === "mcp-tool-call" ? "Write" :
       p.surface === "trails" ? (p.action.includes("trail") ? "Trail draft" : "Waypoint") :
       p.surface === "batch-mutation" ? "Batch" : p.action;
-    op.textContent = surfaceLabel;
-
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = p.target_path;
-    if (p.trail_id) name.title = `Trail: ${p.trail_id}`;
-
-    const right = document.createElement("span");
-    right.className = "row-right";
-
-    const when = document.createElement("span");
-    when.className = "when";
-    when.textContent = relativeTime(Math.floor(p.created_at_ms / 1000));
-    when.title = new Date(p.created_at_ms).toLocaleString();
-
-    const surface = document.createElement("span");
-    surface.className = "activity-author";
-    surface.textContent = p.surface;
-    surface.title = `Source: ${p.surface}`;
-
-    right.append(when, surface);
-    line.append(op, name, right);
-    li.appendChild(line);
-
-    // Accept / Reject action buttons.
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-
     const acceptBtn = makeIconButton(
       "accept",
       "Accept",
@@ -755,8 +687,6 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
         await refreshActivityDetail();
       },
     );
-    actions.appendChild(acceptBtn);
-
     const rejectBtn = makeIconButton(
       "reject",
       "Reject",
@@ -772,115 +702,130 @@ export function mountVaultHome(deps: VaultHomeDeps): VaultHomeController {
         await refreshActivityDetail();
       },
     );
-    actions.appendChild(rejectBtn);
-
-    li.appendChild(actions);
-    return li;
+    return el("li", {
+      class: "clickable",
+      style: { cursor: "pointer" },
+      onClick: (e) => {
+        if ((e.target as HTMLElement).closest("button")) return;
+        void deps.onOpenStagingProposal(p);
+      },
+    }, [
+      el("div", { class: "row-line" }, [
+        el("span", { class: "activity-op", text: surfaceLabel }),
+        el("span", {
+          class: "name",
+          text: p.target_path,
+          title: p.trail_id ? `Trail: ${p.trail_id}` : undefined,
+        }),
+        el("span", { class: "row-right" }, [
+          el("span", {
+            class: "when",
+            text: relativeTime(Math.floor(p.created_at_ms / 1000)),
+            title: new Date(p.created_at_ms).toLocaleString(),
+          }),
+          el("span", {
+            class: "activity-author",
+            text: p.surface,
+            title: `Source: ${p.surface}`,
+          }),
+        ]),
+      ]),
+      // Accept / Reject action buttons.
+      el("div", { class: "row-actions" }, [acceptBtn, rejectBtn]),
+    ]);
   }
 
   function buildActivityDetailRow(r: ChangeRow): HTMLElement {
-    const li = document.createElement("li");
     const isRestoreRow =
       r.metadata && typeof r.metadata === "object" &&
       ("restored_from" in r.metadata || "rolled_back_from" in r.metadata);
     const isCurrent = r.is_current;
-    if (recentlyRestoredFromId === r.id) {
-      li.classList.add("recently-rolled-back");
-    }
-
     const canPreview = r.op !== "deleted";
-    if (canPreview) {
-      li.classList.add("clickable");
-      li.style.cursor = "pointer";
-      li.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest("button")) return;
-        void deps.onOpenSnapshot(r);
-      });
-    }
 
-    const line = document.createElement("div");
-    line.className = "row-line";
-
-    const op = document.createElement("span");
-    op.className = "activity-op";
-    op.textContent = opLabel(r.op);
-
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = r.path;
-    if (r.rename_from) name.title = `renamed from ${r.rename_from}`;
-
-    const right = document.createElement("span");
-    right.className = "row-right";
-
-    const when = document.createElement("span");
-    when.className = "when";
-    when.textContent = relativeTime(Math.floor(r.timestamp_ms / 1000));
-    when.title = new Date(r.timestamp_ms).toLocaleString();
-
-    const cls = r.author_class;
-    const author = document.createElement("span");
-    author.className = "activity-author";
-    author.innerHTML = authorPillIcon(cls);
-    author.title = r.author;
-
-    const idEl = document.createElement("span");
-    idEl.className = "activity-id";
-    idEl.textContent = `#${r.id}`;
-    idEl.title = `Snapshot id ${r.id}`;
-
-    line.append(op, name);
+    const lineChildren: (ChildNode | null)[] = [
+      el("span", { class: "activity-op", text: opLabel(r.op) }),
+      el("span", {
+        class: "name",
+        text: r.path,
+        title: r.rename_from ? `renamed from ${r.rename_from}` : undefined,
+      }),
+    ];
     if (isRestoreRow) {
       const meta = r.metadata as Record<string, unknown>;
       const src = (meta["restored_from"] ?? meta["rolled_back_from"]) as
         | number
         | undefined;
-      const badge = document.createElement("span");
-      badge.className = "rollback-badge";
-      badge.textContent =
-        src !== undefined ? `↩ restored from #${src}` : "↩ restored";
-      badge.title =
-        src !== undefined
+      lineChildren.push(el("span", {
+        class: "rollback-badge",
+        text: src !== undefined ? `↩ restored from #${src}` : "↩ restored",
+        title: src !== undefined
           ? `This save wrote the content of snapshot #${src} back to disk`
-          : "This save was a Restore";
-      line.appendChild(badge);
+          : "This save was a Restore",
+      }));
     }
     if (isCurrent) {
-      const cur = document.createElement("span");
-      cur.className = "rollback-badge";
-      cur.textContent = "current";
-      cur.title = "This is the file's current state on disk";
-      line.appendChild(cur);
+      lineChildren.push(el("span", {
+        class: "rollback-badge",
+        text: "current",
+        title: "This is the file's current state on disk",
+      }));
     }
-    right.append(when, author, idEl);
-    line.append(right);
-    li.appendChild(line);
+    lineChildren.push(el("span", { class: "row-right" }, [
+      el("span", {
+        class: "when",
+        text: relativeTime(Math.floor(r.timestamp_ms / 1000)),
+        title: new Date(r.timestamp_ms).toLocaleString(),
+      }),
+      el("span", {
+        class: "activity-author",
+        html: authorPillIcon(r.author_class),
+        title: r.author,
+      }),
+      el("span", {
+        class: "activity-id",
+        text: `#${r.id}`,
+        title: `Snapshot id ${r.id}`,
+      }),
+    ]));
+
+    const liClasses: string[] = [];
+    if (recentlyRestoredFromId === r.id) liClasses.push("recently-rolled-back");
+    if (canPreview) liClasses.push("clickable");
+
+    const liChildren: (ChildNode | null)[] = [
+      el("div", { class: "row-line" }, lineChildren),
+    ];
 
     if (canPreview && !isCurrent) {
-      const actions = document.createElement("div");
-      actions.className = "row-actions";
-
-      const restoreBtn = document.createElement("button");
-      restoreBtn.className = "row-action";
-      restoreBtn.textContent = "Restore this version";
-      restoreBtn.title =
-        "Write this snapshot's contents back to the file. Append-only — the restore is itself logged as a new modified event.";
-      restoreBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void doRestoreSnapshot(r);
-      });
-      actions.appendChild(restoreBtn);
-
+      const actionsChildren: (ChildNode | null)[] = [
+        el("button", {
+          class: "row-action",
+          text: "Restore this version",
+          title:
+            "Write this snapshot's contents back to the file. Append-only — the restore is itself logged as a new modified event.",
+          onClick: (e) => {
+            e.stopPropagation();
+            void doRestoreSnapshot(r);
+          },
+        }),
+      ];
       if (recentlyRestoredFromId === r.id) {
-        const prompt = document.createElement("span");
-        prompt.className = "un-rollback-prompt";
-        prompt.textContent = "← previous state — click Restore to undo";
-        actions.appendChild(prompt);
+        actionsChildren.push(el("span", {
+          class: "un-rollback-prompt",
+          text: "← previous state — click Restore to undo",
+        }));
       }
-
-      li.appendChild(actions);
+      liChildren.push(el("div", { class: "row-actions" }, actionsChildren));
     }
-    return li;
+
+    return el("li", {
+      class: liClasses.join(" ") || undefined,
+      style: canPreview ? { cursor: "pointer" } : undefined,
+      onClick: canPreview ? (e) => {
+        if ((e.target as HTMLElement).closest("button")) return;
+        void deps.onOpenSnapshot(r);
+      } : undefined,
+    }, liChildren);
   }
 
   async function doRestoreSnapshot(row: ChangeRow): Promise<void> {

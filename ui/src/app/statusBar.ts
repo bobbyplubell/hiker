@@ -18,7 +18,8 @@
 /// status-bar-version-dropdown, status-bar-version-dropdown-selection,
 /// status-bar-version-dropdown-uses-unified-feed,
 /// status-bar-version-dropdown-live-refresh
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { type UnlistenFn } from "@tauri-apps/api/event";
+import { onHikerEvent } from "../events";
 
 import { Ipc, type ActivityItem } from "../ipc";
 import type { ChangeRow } from "../snapshotPreview";
@@ -562,12 +563,12 @@ export function mountStatusBar(deps: StatusBarDeps): StatusBarApi {
   }
 
   const unlisteners: UnlistenFn[] = [];
-  void listen<ChangeRow>("hiker:changes-appended", (event) => {
+  void onHikerEvent("hiker:changes-appended", (payload) => {
     const cur = activeBufferPath();
     if (!cur) return;
-    if (event.payload.path === cur) scheduleDropdownRefresh(cur);
+    if (payload.path === cur) scheduleDropdownRefresh(cur);
   }).then((u) => unlisteners.push(u));
-  void listen("hiker:staging-changed", () => {
+  void onHikerEvent("hiker:staging-changed", () => {
     const cur = activeBufferPath();
     if (cur) scheduleDropdownRefresh(cur);
   }).then((u) => unlisteners.push(u));

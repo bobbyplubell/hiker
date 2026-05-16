@@ -6,6 +6,7 @@
 
 import { openContextMenu, type CtxMenuItem } from "../../widgets/contextMenu";
 import { showToast } from "../../widgets/toast";
+import { describeErr } from "../../ipc/runCommand";
 import { Api, type ClusterNodeRow } from "./api";
 import { summarizeOutcomeToast } from "./toasts";
 import { collectDescendants } from "./helpers";
@@ -32,7 +33,7 @@ export function openNodeMenu(
           await Api.split(state.tree.id, node.id);
           await deps.refresh();
         } catch (err) {
-          showToast(`Split failed: ${String(err)}`);
+          showToast(`Split failed: ${describeErr(err)}`);
         }
       },
     });
@@ -48,7 +49,7 @@ export function openNodeMenu(
           await Api.mergeChildrenUp(state.tree.id, node.id);
           await deps.refresh();
         } catch (err) {
-          showToast(`Merge-up failed: ${String(err)}`);
+          showToast(`Merge-up failed: ${describeErr(err)}`);
         }
       },
     });
@@ -60,7 +61,7 @@ export function openNodeMenu(
           const outcome = await Api.summarizeSubset(state.tree.id, [node.id]);
           showToast(summarizeOutcomeToast(outcome, 1));
         } catch (err) {
-          showToast(`Summarize failed: ${String(err)}`);
+          showToast(`Summarize failed: ${describeErr(err)}`);
         }
       },
     });
@@ -76,7 +77,7 @@ export function openNodeMenu(
           await Api.dropCluster(state.tree.id, node.id, bucket.id);
           await deps.refresh();
         } catch (err) {
-          showToast(`Drop failed: ${String(err)}`);
+          showToast(`Drop failed: ${describeErr(err)}`);
         }
       },
     });
@@ -102,7 +103,7 @@ export function openNodeMenu(
           await Api.promoteOutlier(state.tree.id, node.id, bucket.id);
           await deps.refresh();
         } catch (err) {
-          showToast(`Move failed: ${String(err)}`);
+          showToast(`Move failed: ${describeErr(err)}`);
         }
       },
     });
@@ -135,7 +136,7 @@ export function openMoveTargetPicker(
         }
         await deps.refresh();
       } catch (err) {
-        showToast(`Move failed: ${String(err)}`);
+        showToast(`Move failed: ${describeErr(err)}`);
       }
     },
   }));
@@ -167,7 +168,7 @@ export function openPolicyMenu(
         });
         void Api.setPolicy(state.tree.id, node.id, policy)
           .then(() => deps.refresh())
-          .catch((err) => showToast(`Policy failed: ${String(err)}`));
+          .catch((err) => showToast(`Policy failed: ${describeErr(err)}`));
       },
     },
     {
@@ -183,7 +184,7 @@ export function openPolicyMenu(
         });
         void Api.setPolicy(state.tree.id, node.id, policy)
           .then(() => deps.refresh())
-          .catch((err) => showToast(`Policy failed: ${String(err)}`));
+          .catch((err) => showToast(`Policy failed: ${describeErr(err)}`));
       },
     },
     {
@@ -192,7 +193,7 @@ export function openPolicyMenu(
         const policy = JSON.stringify({ kind: "freeze" });
         void Api.setPolicy(state.tree.id, node.id, policy)
           .then(() => deps.refresh())
-          .catch((err) => showToast(`Policy failed: ${String(err)}`));
+          .catch((err) => showToast(`Policy failed: ${describeErr(err)}`));
       },
     },
     {
@@ -200,7 +201,7 @@ export function openPolicyMenu(
       run: () => {
         void Api.setPolicy(state.tree.id, node.id, null)
           .then(() => deps.refresh())
-          .catch((err) => showToast(`Policy failed: ${String(err)}`));
+          .catch((err) => showToast(`Policy failed: ${describeErr(err)}`));
       },
     },
   ];

@@ -11,7 +11,7 @@ use hiker_core::search::{self, LexicalOpts, SearchModes, SearchResponse, Semanti
 use hiker_core::store::RelatedHit;
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdResult};
 
 /// Hybrid search across the vault. Runs the lexical + semantic backends
 /// in parallel (per the requested modes) and returns all three buckets
@@ -29,7 +29,7 @@ pub(crate) async fn search_vault(
     epoch: u64,
     lexical_opts: Option<LexicalOpts>,
     semantic_opts: Option<SemanticOpts>,
-) -> Result<SearchResponse, String> {
+) -> CmdResult<SearchResponse> {
     log_cmd_result(
         "search_vault",
         search_vault_inner(
@@ -51,7 +51,7 @@ async fn search_vault_inner(
     epoch: u64,
     lexical_opts: LexicalOpts,
     semantic_opts: SemanticOpts,
-) -> Result<SearchResponse, String> {
+) -> CmdResult<SearchResponse> {
     // Empty buckets short-circuit: empty query, both modes off, or no
     // session. Each early-return preserves the echoed `epoch` so the
     // frontend's stale-result check still works.
@@ -69,17 +69,12 @@ async fn search_vault_inner(
     // `search-query-embed-spawn-blocking`. Skip entirely when the model
     // isn't ready — search returns empty rather than blocking.
     let embedding: Option<Vec<f32>> = if modes.semantic {
-        let embedder = {
-            let guard = state.session.lock().map_err(|e| e.to_string())?;
-            let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-            session.indexer.embedder()
-        };
+        let embedder = with_session(&state, |s| Ok(s.indexer.embedder()))?;
         match embedder {
             Some(e) => {
                 let q = query.clone();
                 let res = tokio::task::spawn_blocking(move || e.embed_batch(&[q]))
-                    .await
-                    .map_err(|e| e.to_string())?
+                    .await?
                     .map_err(|e| e.to_string())?;
                 res.into_iter().next()
             }
@@ -98,22 +93,19 @@ async fn search_vault_inner(
         semantic: modes.semantic && embedding.is_some(),
     };
 
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-    let read_store = session
-        .read_store
-        .lock()
-        .map_err(|_| "read_store mutex poisoned".to_string())?;
-    search::query(
-        &read_store,
-        epoch,
-        effective_modes,
-        Some(&query),
-        embedding.as_deref(),
-        lexical_opts,
-        semantic_opts,
-    )
-    .map_err(|e| e.to_string())
+    with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
+        Ok(search::query(
+            &read_store,
+            epoch,
+            effective_modes,
+            Some(&query),
+            embedding.as_deref(),
+            lexical_opts,
+            semantic_opts,
+        )
+        .map_err(|e| e.to_string())?)
+    })
 }
 
 #[tauri::command]
@@ -121,21 +113,16 @@ pub(crate) fn related_notes(
     state: State<AppState>,
     rel: String,
     top_k: Option<usize>,
-) -> Result<Vec<RelatedHit>, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
+) -> CmdResult<Vec<RelatedHit>> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
         let id = match read_store.id_for_path(&rel).map_err(|e| e.to_string())? {
             Some(id) => id,
             None => return Ok(Vec::new()),
         };
-        read_store
+        Ok(read_store
             .related_notes(&id, top_k.unwrap_or(10))
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("related_notes", result)
 }

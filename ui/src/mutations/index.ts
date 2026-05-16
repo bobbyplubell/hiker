@@ -20,7 +20,8 @@
 // source_path when the buffer has been closed, per
 // `note-mutation-pending-apply-toast`).
 
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { type UnlistenFn } from "@tauri-apps/api/event";
+import { onHikerEventAs } from "../events";
 import { Ipc } from "../ipc";
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
@@ -173,8 +174,8 @@ export function mountMutationsMenu(
   });
 
   void (async () => {
-    unlistenQueue = await listen<QueueEventLite>("hiker:queue-event", (ev) => {
-      const p = ev.payload;
+    unlistenQueue = await onHikerEventAs<QueueEventLite>("hiker:queue-event", (payload) => {
+      const p = payload;
       if (p.event === "task_queued") {
         if (!p.kind || p.kind.type !== "note_mutation" || !p.id) return;
         const sourcePath = p.kind.source_path;
@@ -203,11 +204,11 @@ export function mountMutationsMenu(
         refreshButtonState();
       }
     });
-    unlistenFailed = await listen<MutationFailedEvent>(
+    unlistenFailed = await onHikerEventAs<MutationFailedEvent>(
       "hiker:note-mutation-failed",
-      (ev) => {
+      (payload) => {
         showToast(
-          `Mutation failed (${ev.payload.mutation}): ${ev.payload.error}`,
+          `Mutation failed (${payload.mutation}): ${payload.error}`,
           undefined,
           8000,
         );

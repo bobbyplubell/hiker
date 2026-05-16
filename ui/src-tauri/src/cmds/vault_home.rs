@@ -21,7 +21,7 @@ use hiker_core::store::{RecentNote, VaultStats};
 use serde::Serialize;
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, with_session_async, AppState, CmdError, CmdResult};
 
 /// Vault home stats payload: cheap counts off the index store, plus the live
 /// queued count from the indexer handle. Surfaced by the home page; refreshed
@@ -38,14 +38,9 @@ pub(crate) struct VaultHomeStats {
 }
 
 #[tauri::command]
-pub(crate) fn vault_home_stats(state: State<AppState>) -> Result<VaultHomeStats, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
+pub(crate) fn vault_home_stats(state: State<AppState>) -> CmdResult<VaultHomeStats> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
         let stats: VaultStats = read_store.vault_stats().map_err(|e| e.to_string())?;
         let queued = session.indexer.status().queued;
         Ok(VaultHomeStats {
@@ -55,7 +50,7 @@ pub(crate) fn vault_home_stats(state: State<AppState>) -> Result<VaultHomeStats,
             skipped: stats.skipped,
             queued,
         })
-    })();
+    });
     log_cmd_result("vault_home_stats", result)
 }
 
@@ -67,18 +62,13 @@ pub(crate) fn vault_home_stats(state: State<AppState>) -> Result<VaultHomeStats,
 pub(crate) fn recent_notes_modified(
     state: State<AppState>,
     limit: Option<usize>,
-) -> Result<Vec<RecentNote>, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
-        read_store
+) -> CmdResult<Vec<RecentNote>> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
+        Ok(read_store
             .recent_notes_by_mtime(limit.unwrap_or(10))
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("recent_notes_modified", result)
 }
 
@@ -90,18 +80,13 @@ pub(crate) fn recent_notes_modified(
 pub(crate) fn recent_notes_accessed(
     state: State<AppState>,
     limit: Option<usize>,
-) -> Result<Vec<RecentNote>, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
-        read_store
+) -> CmdResult<Vec<RecentNote>> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
+        Ok(read_store
             .recent_notes_by_access(limit.unwrap_or(10))
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("recent_notes_accessed", result)
 }
 
@@ -112,20 +97,21 @@ pub(crate) fn recent_notes_accessed(
 ///
 /// status: note-access-tracking
 #[tauri::command]
-pub(crate) async fn note_accessed(state: State<'_, AppState>, rel: String) -> Result<(), String> {
-    let jobs = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session.indexer.job_sender()
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let send_result = jobs
-        .send(IndexJob::TouchAccess { rel_path: rel, ts })
-        .await
-        .map_err(|e| e.to_string());
+pub(crate) async fn note_accessed(state: State<'_, AppState>, rel: String) -> CmdResult<()> {
+    let send_result = with_session_async(
+        &state,
+        |s| Ok(s.indexer.job_sender()),
+        |jobs| async move {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            jobs.send(IndexJob::TouchAccess { rel_path: rel, ts })
+                .await
+                .map_err(|e| CmdError::from(e.to_string()))
+        },
+    )
+    .await;
     log_cmd_result("note_accessed", send_result)
 }
 
@@ -156,18 +142,13 @@ pub struct NotePropertiesDto {
 pub(crate) fn note_properties(
     state: State<AppState>,
     rel: String,
-) -> Result<NotePropertiesDto, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
+) -> CmdResult<NotePropertiesDto> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
         let mut props = read_store
             .note_properties(&rel)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("note not indexed: {rel}"))?;
+            .ok_or_else(|| CmdError::from(format!("note not indexed: {rel}")))?;
         let change_count = session
             .changes
             .count_for_path(&rel)
@@ -189,7 +170,7 @@ pub(crate) fn note_properties(
             last_accessed_at: props.last_accessed_at,
             change_count: props.change_count,
         })
-    })();
+    });
     log_cmd_result("note_properties", result)
 }
 
@@ -210,26 +191,22 @@ pub struct AtNoteResolved {
 pub(crate) fn chat_resolve_at_note(
     state: State<AppState>,
     rel_no_ext: String,
-) -> Result<AtNoteResolved, String> {
-    let result = (|| -> Result<AtNoteResolved, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let vault = session.vault.clone();
-        drop(guard);
+) -> CmdResult<AtNoteResolved> {
+    let result = (|| -> CmdResult<AtNoteResolved> {
+        let vault = with_session(&state, |s| Ok(s.vault.clone()))?;
         for ext in hiker_core::indexer::INDEXABLE_EXTENSIONS {
             let candidate = format!("{}.{}", rel_no_ext, ext);
-            if let Ok(abs) = vault.abs_path(&candidate) {
-                if abs.is_file() {
-                    if let Ok(content) = vault.read_file(&candidate) {
-                        return Ok(AtNoteResolved {
-                            rel_path: candidate,
-                            content,
-                        });
-                    }
-                }
+            if let Ok(abs) = vault.abs_path(&candidate)
+                && abs.is_file()
+                && let Ok(content) = vault.read_file(&candidate)
+            {
+                return Ok(AtNoteResolved {
+                    rel_path: candidate,
+                    content,
+                });
             }
         }
-        Err(format!("note not found: {rel_no_ext}"))
+        Err(CmdError::from(format!("note not found: {rel_no_ext}")))
     })();
     log_cmd_result("chat_resolve_at_note", result)
 }
@@ -245,17 +222,12 @@ pub(crate) fn chat_at_autocomplete(
     state: State<AppState>,
     prefix: String,
     limit: Option<u32>,
-) -> Result<Vec<hiker_core::store::AtSuggestion>, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
-        read_store
+) -> CmdResult<Vec<hiker_core::store::AtSuggestion>> {
+    let result = with_session(&state, |session| {
+        let read_store = session.read_store.lock()?;
+        Ok(read_store
             .at_autocomplete(&prefix, limit.unwrap_or(10) as usize)
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("chat_at_autocomplete", result)
 }

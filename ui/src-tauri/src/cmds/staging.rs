@@ -9,7 +9,7 @@ use hiker_core::staging::{AcceptOutcome, Proposal, StagingFilter};
 use serde::Deserialize;
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdResult};
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct StagingFilterArg {
@@ -35,26 +35,22 @@ impl From<StagingFilterArg> for StagingFilter {
 pub(crate) fn staging_list(
     state: State<'_, AppState>,
     filter: Option<StagingFilterArg>,
-) -> Result<Vec<Proposal>, String> {
-    let result = (|| -> Result<Vec<Proposal>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<Vec<Proposal>> {
+    let result = with_session(&state, |session| {
         let f: StagingFilter = filter.unwrap_or_default().into();
-        session.staging.list(&f).map_err(|e| e.to_string())
-    })();
+        Ok(session.staging.list(&f).map_err(|e| e.to_string())?)
+    });
     log_cmd_result("staging_list", result)
 }
 
 #[tauri::command]
-pub(crate) fn staging_count(state: State<'_, AppState>) -> Result<u32, String> {
-    let result = (|| -> Result<u32, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session
+pub(crate) fn staging_count(state: State<'_, AppState>) -> CmdResult<u32> {
+    let result = with_session(&state, |session| {
+        Ok(session
             .staging
             .count(&StagingFilter::default())
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("staging_count", result)
 }
 
@@ -62,16 +58,14 @@ pub(crate) fn staging_count(state: State<'_, AppState>) -> Result<u32, String> {
 pub(crate) fn staging_accept(
     state: State<'_, AppState>,
     proposal_id: String,
-) -> Result<AcceptOutcome, String> {
-    let result = (|| -> Result<AcceptOutcome, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<AcceptOutcome> {
+    let result = with_session(&state, |session| {
         let outcome = session
             .staging
             .accept(&proposal_id, &session.vault, Some(&session.changes))
             .map_err(|e| e.to_string())?;
         Ok(outcome)
-    })();
+    });
     log_cmd_result("staging_accept", result)
 }
 
@@ -79,34 +73,31 @@ pub(crate) fn staging_accept(
 pub(crate) fn staging_reject(
     state: State<'_, AppState>,
     proposal_id: String,
-) -> Result<(), String> {
-    let result = (|| -> Result<(), String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<()> {
+    let result = with_session(&state, |session| {
         session
             .staging
             .reject(&proposal_id)
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    });
     log_cmd_result("staging_reject", result)
 }
 
 #[tauri::command]
 pub(crate) fn staging_accept_all(
     state: State<'_, AppState>,
-) -> Result<Vec<AcceptOutcome>, String> {
-    let result = (|| -> Result<Vec<AcceptOutcome>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session
+) -> CmdResult<Vec<AcceptOutcome>> {
+    let result = with_session(&state, |session| {
+        Ok(session
             .staging
             .accept_all(
                 &StagingFilter::default(),
                 &session.vault,
                 Some(&session.changes),
             )
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("staging_accept_all", result)
 }
 
@@ -119,14 +110,12 @@ pub(crate) fn staging_accept_all(
 pub(crate) fn staging_content(
     state: State<'_, AppState>,
     proposal_id: String,
-) -> Result<String, String> {
-    let result = (|| -> Result<String, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session
+) -> CmdResult<String> {
+    let result = with_session(&state, |session| {
+        Ok(session
             .staging
             .content(&proposal_id)
-            .map_err(|e| e.to_string())
-    })();
+            .map_err(|e| e.to_string())?)
+    });
     log_cmd_result("staging_content", result)
 }

@@ -29,6 +29,9 @@ pub mod trash;
 pub mod vault;
 pub mod watcher;
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 pub use error::HikerError;
 pub use hash::hash_str;
 pub use vault::{DirEntryDto, EntryKind, Vault};

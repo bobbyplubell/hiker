@@ -14,7 +14,7 @@ use hiker_core::store::Store;
 use hiker_core::trash::{Trash, TrashEntry};
 use hiker_core::{config::Config, HikerError};
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::State;
 
 use crate::{log_cmd_result, AppState};
 
@@ -132,15 +132,17 @@ async fn trail_append_waypoint_inner(
     // the reference across `.await` points and `MutexGuard` isn't `Send`.
     let mut store = Store::open(vault.root()).map_err(|e| HikerError::Io(e.to_string()))?;
     let outcome = hiker_core::trails::append_waypoint(
-        &watcher,
-        &jobs,
-        &vault,
-        Some(&changes),
-        &mut store,
-        &trail_doc_rel,
-        &source_rel,
-        parent_waypoint_id.as_deref(),
-        annotation.as_deref(),
+        hiker_core::trails::AppendWaypointArgs {
+            watcher: &watcher,
+            jobs: &jobs,
+            vault: &vault,
+            changes: Some(&changes),
+            store: &mut store,
+            trail_doc_rel: &trail_doc_rel,
+            source_rel: &source_rel,
+            parent_waypoint_id: parent_waypoint_id.as_deref(),
+            annotation: annotation.as_deref(),
+        },
     )
     .await?;
     Ok(WaypointAppendedDto {
@@ -260,7 +262,7 @@ async fn trail_delete_inner(
     )
     .await?;
     // Trash bin auto-refresh hook — same shape as `delete_note_inner`.
-    let _ = app.emit("hiker:trash-changed", ());
+    crate::events::emit_trash_changed(&app);
     Ok(entry)
 }
 
@@ -381,8 +383,8 @@ async fn trail_set_active_inner(
     // activating a non-None value). If stamping fails we still proceed
     // to persist the setting — the timestamp is dropdown-ordering chrome,
     // not load-bearing for activation correctness.
-    if let Some(rel) = trail_doc_rel.as_deref() {
-        if let Err(e) = hiker_core::trails::stamp_last_activated_at(
+    if let Some(rel) = trail_doc_rel.as_deref()
+        && let Err(e) = hiker_core::trails::stamp_last_activated_at(
             &watcher,
             &jobs,
             &vault,
@@ -390,10 +392,9 @@ async fn trail_set_active_inner(
             rel,
         )
         .await
-        {
-            tracing::warn!(error = %e, path = %rel,
-                "trail_set_active: stamp_last_activated_at failed; proceeding");
-        }
+    {
+        tracing::warn!(error = %e, path = %rel,
+            "trail_set_active: stamp_last_activated_at failed; proceeding");
     }
 
     let value = match trail_doc_rel {

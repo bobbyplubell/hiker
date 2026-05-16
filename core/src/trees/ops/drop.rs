@@ -78,8 +78,7 @@ impl Trees {
                 })
             })
             .collect();
-        {
-            let mut conn = self.conn.lock().expect("trees mutex poisoned");
+        self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             for l in &leaf_descendants {
                 tx.execute(
@@ -98,7 +97,8 @@ impl Trees {
                 params![tree_id, node_id],
             )?;
             tx.commit()?;
-        }
+            Ok(())
+        })?;
         let args = serde_json::json!({
             "node_id": node_id,
             "outlier_bucket_id": outlier_bucket_id,

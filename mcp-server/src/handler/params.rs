@@ -1,0 +1,468 @@
+//! Parameter / DTO types for the MCP tool surface, plus their `Serialize`
+//! impls (used by the audit log) and any `JsonSchema` / `From` conversions.
+//! Inbound `Deserialize` comes from the derive; outbound `Serialize` is
+//! hand-rolled so the `Deserialize` derive stays scoped to JSON-RPC parsing.
+
+use hiker_core::tasks::{Priority as TaskPriority, TaskShape as TaskShapeKind, TaskState};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+// ---------- parameter types ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchModesParam {
+    #[serde(default = "yes")]
+    pub semantic: bool,
+    #[serde(default = "yes")]
+    pub lexical: bool,
+}
+
+pub(super) fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchNotesParams {
+    /// Free-text query. Empty queries return empty buckets without erroring.
+    pub query: String,
+    /// Optional toggles for which backends to run. Both default on for
+    /// hybrid search via reciprocal rank fusion.
+    #[serde(default)]
+    pub modes: Option<SearchModesParam>,
+    /// Cap on the fused bucket size. Default `FUSED_TOP_K = 20`. Capped
+    /// server-side at `[mcp] max_top_k`.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteDetail {
+    Digest,
+    Snippet,
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetNoteParams {
+    /// Vault-relative path of the note to fetch.
+    pub rel_path: String,
+    /// Progressive disclosure level. Default `full` for explicit fetches.
+    #[serde(default)]
+    pub detail: NoteDetail,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RelatedNotesParams {
+    pub rel_path: String,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteNoteParams {
+    pub rel_path: String,
+    pub content: String,
+    /// If provided, the write is drift-aware: errors `1003 drift` when the
+    /// on-disk hash differs.
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+}
+
+/// One span-anchored edit in an `edit_note` call. `replace_all = true`
+/// allows the anchor to match N times (all replaced); the default requires
+/// exactly one match.
+///
+/// status: mcp-tool-edit-note
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EditSpec {
+    pub old_str: String,
+    pub new_str: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditNoteParams {
+    pub rel_path: String,
+    pub edits: Vec<EditSpec>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetFrontmatterParams {
+    pub rel_path: String,
+    /// Object whose fields are deep-merged into the note's frontmatter.
+    /// Typed as `Map` (rather than `Value`) so the JSON schema advertises
+    /// `type: object` to MCP clients — without it some clients wrap the
+    /// arg in a JSON string and the merge rejects non-object payloads.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ApplyTagParams {
+    pub rel_path: String,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorityParam {
+    Low,
+    Normal,
+    High,
+}
+
+impl From<PriorityParam> for TaskPriority {
+    fn from(p: PriorityParam) -> Self {
+        match p {
+            PriorityParam::Low => TaskPriority::Low,
+            PriorityParam::Normal => TaskPriority::Normal,
+            PriorityParam::High => TaskPriority::High,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeParam {
+    Direct,
+    Agent,
+}
+
+impl From<ShapeParam> for TaskShapeKind {
+    fn from(p: ShapeParam) -> Self {
+        match p {
+            ShapeParam::Direct => TaskShapeKind::Direct,
+            ShapeParam::Agent => TaskShapeKind::Agent,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskCheckoutParams {
+    /// Filter by `TaskKind` variant name (e.g. `auto_tag`).
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+    #[serde(default)]
+    pub shapes: Option<Vec<ShapeParam>>,
+    #[serde(default)]
+    pub min_priority: Option<PriorityParam>,
+    /// Lease window in seconds. Capped server-side at `[tasks.lease] max_secs`.
+    #[serde(default)]
+    pub lease_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskSubmitParams {
+    pub task_id: String,
+    pub value: serde_json::Value,
+}
+
+impl JsonSchema for TaskSubmitParams {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskSubmitParams".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut schema = schemars::Schema::default();
+        let obj = schema.ensure_object();
+        obj.insert("type".into(), "object".into());
+        obj.insert(
+            "description".into(),
+            "Submit a result for a leased task. `value` can be any JSON.".into(),
+        );
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "task_id".to_string(),
+            generator.subschema_for::<String>().into(),
+        );
+        // Use an empty schema object (not boolean true) so MCP clients
+        // see a valid object schema for the value field.
+        properties.insert("value".to_string(), schemars::Schema::default().into());
+        obj.insert("properties".into(), serde_json::Value::Object(properties));
+        obj.insert(
+            "required".into(),
+            serde_json::Value::Array(vec!["task_id".into(), "value".into()]),
+        );
+        schema
+    }
+    fn _schemars_private_non_optional_json_schema(
+        generator: &mut schemars::SchemaGenerator,
+    ) -> schemars::Schema {
+        Self::json_schema(generator)
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskFailParams {
+    pub task_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskHeartbeatParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStateParam {
+    Queued,
+    Leased,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<TaskStateParam> for TaskState {
+    fn from(p: TaskStateParam) -> Self {
+        match p {
+            TaskStateParam::Queued => TaskState::Queued,
+            TaskStateParam::Leased => TaskState::Leased,
+            TaskStateParam::Completed => TaskState::Completed,
+            TaskStateParam::Failed => TaskState::Failed,
+            TaskStateParam::Cancelled => TaskState::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskListParams {
+    #[serde(default)]
+    pub states: Option<Vec<TaskStateParam>>,
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+}
+
+// ---------- response shapes ----------
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct GetNoteDigest {
+    pub(super) rel_path: String,
+    pub(super) title: String,
+    pub(super) detail: &'static str,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct GetNoteSnippet {
+    pub(super) rel_path: String,
+    pub(super) title: String,
+    pub(super) detail: &'static str,
+    pub(super) heading_path: Option<String>,
+    pub(super) snippet: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct GetNoteFull {
+    pub(super) rel_path: String,
+    pub(super) title: String,
+    pub(super) detail: &'static str,
+    pub(super) content: String,
+    pub(super) content_hash: String,
+}
+
+/// Response shape for `edit_note`. Either `status: "staged"` with the per-edit
+/// `staging_ids` (review mode) or `status: "written"` with the final
+/// `content_hash` (direct mode). `edit_count` is the number of edits in the
+/// originating call.
+///
+/// status: mcp-tool-edit-note
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct EditOutcome {
+    pub(super) rel_path: String,
+    pub(super) status: &'static str,
+    pub(super) edit_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) staging_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) batch_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct WriteOutcome {
+    pub(super) rel_path: String,
+    pub(super) content_hash: String,
+    /// When `review_required` is on, `"staged"` with the proposal id in
+    /// `staging_id`. When off, absent (the default is `"written"`).
+    ///
+    /// status: staging-review-pending-response
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) staging_id: Option<String>,
+}
+
+// ---------- params Serialize for audit ----------
+//
+// Each param struct is `Serialize`d into the audit log; without this impl
+// `serde_json::to_value` fails on the params handed to record(). Done as
+// a separate impl so the Deserialize derive on the param structs stays
+// scoped to inbound JSON-RPC parsing.
+impl Serialize for SearchModesParam {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_struct("SearchModesParam", 2)?;
+        serde::ser::SerializeStruct::serialize_field(&mut m, "semantic", &self.semantic)?;
+        serde::ser::SerializeStruct::serialize_field(&mut m, "lexical", &self.lexical)?;
+        serde::ser::SerializeStruct::end(m)
+    }
+}
+impl Serialize for SearchNotesParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("SearchNotesParams", 3)?;
+        m.serialize_field("query", &self.query)?;
+        m.serialize_field("modes", &self.modes)?;
+        m.serialize_field("top_k", &self.top_k)?;
+        m.end()
+    }
+}
+impl Serialize for NoteDetail {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            NoteDetail::Digest => "digest",
+            NoteDetail::Snippet => "snippet",
+            NoteDetail::Full => "full",
+        })
+    }
+}
+impl Serialize for GetNoteParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("GetNoteParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("detail", &self.detail)?;
+        m.end()
+    }
+}
+impl Serialize for RelatedNotesParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("RelatedNotesParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("top_k", &self.top_k)?;
+        m.end()
+    }
+}
+impl Serialize for WriteNoteParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("WriteNoteParams", 3)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("content", &self.content)?;
+        m.serialize_field("expected_hash", &self.expected_hash)?;
+        m.end()
+    }
+}
+impl Serialize for SetFrontmatterParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("SetFrontmatterParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("fields", &serde_json::Value::Object(self.fields.clone()))?;
+        m.end()
+    }
+}
+impl Serialize for PriorityParam {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            PriorityParam::Low => "low",
+            PriorityParam::Normal => "normal",
+            PriorityParam::High => "high",
+        })
+    }
+}
+impl Serialize for ShapeParam {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            ShapeParam::Direct => "direct",
+            ShapeParam::Agent => "agent",
+        })
+    }
+}
+impl Serialize for TaskStateParam {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            TaskStateParam::Queued => "queued",
+            TaskStateParam::Leased => "leased",
+            TaskStateParam::Completed => "completed",
+            TaskStateParam::Failed => "failed",
+            TaskStateParam::Cancelled => "cancelled",
+        })
+    }
+}
+impl Serialize for TaskCheckoutParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("TaskCheckoutParams", 4)?;
+        m.serialize_field("types", &self.types)?;
+        m.serialize_field("shapes", &self.shapes)?;
+        m.serialize_field("min_priority", &self.min_priority)?;
+        m.serialize_field("lease_secs", &self.lease_secs)?;
+        m.end()
+    }
+}
+impl Serialize for TaskSubmitParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("TaskSubmitParams", 2)?;
+        m.serialize_field("task_id", &self.task_id)?;
+        m.serialize_field("value", &self.value)?;
+        m.end()
+    }
+}
+impl Serialize for TaskFailParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("TaskFailParams", 2)?;
+        m.serialize_field("task_id", &self.task_id)?;
+        m.serialize_field("error", &self.error)?;
+        m.end()
+    }
+}
+impl Serialize for TaskHeartbeatParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("TaskHeartbeatParams", 1)?;
+        m.serialize_field("task_id", &self.task_id)?;
+        m.end()
+    }
+}
+impl Serialize for TaskListParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("TaskListParams", 2)?;
+        m.serialize_field("states", &self.states)?;
+        m.serialize_field("types", &self.types)?;
+        m.end()
+    }
+}
+impl Serialize for EditSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("EditSpec", 3)?;
+        m.serialize_field("old_str", &self.old_str)?;
+        m.serialize_field("new_str", &self.new_str)?;
+        m.serialize_field("replace_all", &self.replace_all)?;
+        m.end()
+    }
+}
+impl Serialize for EditNoteParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("EditNoteParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("edits", &self.edits)?;
+        m.end()
+    }
+}
+impl Serialize for ApplyTagParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("ApplyTagParams", 2)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.serialize_field("tag", &self.tag)?;
+        m.end()
+    }
+}

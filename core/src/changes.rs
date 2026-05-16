@@ -66,6 +66,8 @@ pub enum ChangesError {
         content_hash: Option<String>,
         message: String,
     },
+    #[error("connection mutex poisoned")]
+    Poisoned,
 }
 
 /// One row in the changelog. `content` is fetched separately via
@@ -217,6 +219,18 @@ impl Changes {
         &self.db_path
     }
 
+    /// Lock the connection mutex and run `f` against the shared connection.
+    /// Standardizes the lock + poisoning-error mapping that every SQL call
+    /// site used to spell inline; lock poisoning surfaces as
+    /// `ChangesError::Poisoned` rather than panicking.
+    fn with_conn<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, ChangesError>,
+    ) -> Result<R, ChangesError> {
+        let conn = self.conn.lock().map_err(|_| ChangesError::Poisoned)?;
+        f(&conn)
+    }
+
     /// Subscribe to "row appended" notifications. Each successful `append`
     /// fires once. Lagging receivers are dropped silently — consumers
     /// should re-query `recent` on resume rather than rely on the stream
@@ -233,12 +247,13 @@ impl Changes {
     /// — snapshot the *pre-mutation* state once, on the first append for
     /// the path, then proceed normally. See `ensure_baseline`.
     pub fn has_any_for_path(&self, path: &str) -> Result<bool, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM changes WHERE path = ?1 LIMIT 1",
-            params![path],
-            |row| row.get(0),
-        )?;
+        let n: i64 = self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM changes WHERE path = ?1 LIMIT 1",
+                params![path],
+                |row| row.get(0),
+            )?)
+        })?;
         Ok(n > 0)
     }
 
@@ -288,8 +303,7 @@ impl Changes {
             Some(bytes) => Some(zstd::encode_all(bytes, ZSTD_LEVEL)?),
             None => None,
         };
-        let id = {
-            let conn = self.conn.lock().expect("changes mutex poisoned");
+        let id = self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO changes
                     (timestamp, path, op, author, content_hash, content, rename_from, metadata)
@@ -305,8 +319,8 @@ impl Changes {
                     metadata_str,
                 ],
             )?;
-            conn.last_insert_rowid()
-        };
+            Ok(conn.last_insert_rowid())
+        })?;
         // Notify subscribers (Tauri bridge etc.) without holding the
         // connection mutex. Send failure when there are no receivers — fine.
         let author_class = AuthorClass::from_author(append.author);
@@ -329,12 +343,13 @@ impl Changes {
 
     /// Most recent N rows across the whole vault, descending by id.
     pub fn recent(&self, limit: usize) -> Result<Vec<ChangeRow>, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(LIST_SQL_BY_ID)?;
-        let rows = stmt
-            .query_map(params![limit as i64], map_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(LIST_SQL_BY_ID)?;
+            let rows = stmt
+                .query_map(params![limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// Most recent N rows with `author` matching the SQL LIKE pattern. Use
@@ -344,12 +359,13 @@ impl Changes {
         author_pattern: &str,
         limit: usize,
     ) -> Result<Vec<ChangeRow>, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(LIST_SQL_BY_AUTHOR)?;
-        let rows = stmt
-            .query_map(params![author_pattern, limit as i64], map_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(LIST_SQL_BY_AUTHOR)?;
+            let rows = stmt
+                .query_map(params![author_pattern, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// Most recent N rows for a single path, descending. Backs the
@@ -360,25 +376,26 @@ impl Changes {
         path: &str,
         limit: usize,
     ) -> Result<Vec<ChangeRow>, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let mut stmt = conn.prepare(LIST_SQL_BY_PATH)?;
-        let rows = stmt
-            .query_map(params![path, limit as i64], map_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(LIST_SQL_BY_PATH)?;
+            let rows = stmt
+                .query_map(params![path, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     // status: note-properties-tab-content
     /// Count of changes rows for a single path. Used by the
     /// `hiker_core::store::note_properties` response (changes section).
     pub fn count_for_path(&self, path: &str) -> Result<i64, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM changes WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM changes WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )?)
+        })
     }
 
     /// Pull the content blob for a given change row. Returns `None` for
@@ -386,18 +403,19 @@ impl Changes {
     /// status: changes-content-zstd — decodes the stored zstd frame
     /// transparently; consumers see plaintext bytes.
     pub fn content_at(&self, change_id: i64) -> Result<Option<Vec<u8>>, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let row = conn
-            .query_row(
-                "SELECT content, content_hash FROM changes WHERE id = ?1",
-                params![change_id],
-                |row| {
-                    let blob: Option<Vec<u8>> = row.get(0)?;
-                    let content_hash: Option<String> = row.get(1)?;
-                    Ok((blob, content_hash))
-                },
-            )
-            .optional()?;
+        let row = self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT content, content_hash FROM changes WHERE id = ?1",
+                    params![change_id],
+                    |row| {
+                        let blob: Option<Vec<u8>> = row.get(0)?;
+                        let content_hash: Option<String> = row.get(1)?;
+                        Ok((blob, content_hash))
+                    },
+                )
+                .optional()?)
+        })?;
         let Some((blob, content_hash)) = row else {
             return Ok(None);
         };
@@ -421,22 +439,23 @@ impl Changes {
         path: &str,
         before_id: i64,
     ) -> Result<Option<(i64, Vec<u8>)>, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let row = conn
-            .query_row(
-                "SELECT id, content, content_hash FROM changes
-                 WHERE path = ?1 AND id < ?2 AND content IS NOT NULL
-                 ORDER BY id DESC
-                 LIMIT 1",
-                params![path, before_id],
-                |row| {
-                    let id: i64 = row.get(0)?;
-                    let content: Vec<u8> = row.get(1)?;
-                    let content_hash: Option<String> = row.get(2)?;
-                    Ok((id, content, content_hash))
-                },
-            )
-            .optional()?;
+        let row = self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, content, content_hash FROM changes
+                     WHERE path = ?1 AND id < ?2 AND content IS NOT NULL
+                     ORDER BY id DESC
+                     LIMIT 1",
+                    params![path, before_id],
+                    |row| {
+                        let id: i64 = row.get(0)?;
+                        let content: Vec<u8> = row.get(1)?;
+                        let content_hash: Option<String> = row.get(2)?;
+                        Ok((id, content, content_hash))
+                    },
+                )
+                .optional()?)
+        })?;
         match row {
             None => Ok(None),
             Some((id, blob, hash)) => Ok(Some((id, decode_blob(id, &hash, &blob)?))),
@@ -455,36 +474,37 @@ impl Changes {
             return Ok(0);
         }
         let keep = keep_per_pair as i64;
-        let conn = self.conn.lock().expect("changes mutex poisoned");
         // Per (path, author), rank only the non-`deleted` rows by id DESC and
         // drop those past the Nth. Deleted rows are excluded from the
         // partition entirely so they never count toward the quota and are
         // never themselves dropped here (per spec they're the rollback
         // target for "undelete").
-        let removed = conn.execute(
-            "DELETE FROM changes WHERE id IN (
-                 SELECT id FROM (
-                     SELECT id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY path, author
-                                ORDER BY id DESC
-                            ) AS rn
-                     FROM changes
-                     WHERE op != 'deleted'
-                 )
-                 WHERE rn > ?1
-             )",
-            params![keep],
-        )?;
+        let removed = self.with_conn(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM changes WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY path, author
+                                    ORDER BY id DESC
+                                ) AS rn
+                         FROM changes
+                         WHERE op != 'deleted'
+                     )
+                     WHERE rn > ?1
+                 )",
+                params![keep],
+            )?)
+        })?;
         Ok(removed)
     }
 
     /// Total row count. Cheap; used by the home-page recent-activity widget
     /// to decide whether to render at all (hidden when empty).
     pub fn count(&self) -> Result<i64, ChangesError> {
-        let conn = self.conn.lock().expect("changes mutex poisoned");
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))?;
-        Ok(n)
+        self.with_conn(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))?)
+        })
     }
 }
 

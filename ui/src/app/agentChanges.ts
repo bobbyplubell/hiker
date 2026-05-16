@@ -21,21 +21,13 @@
 /// note-mutation-applies-as-buffer-edit
 ///
 /// Step 4c of the main.ts refactor.
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEvent } from "../events";
 import { Ipc } from "../ipc";
 import { Logger } from "../logger";
 import { showToast } from "../widgets/toast";
 import type { ChangeRow } from "../snapshotPreview";
 import type { Buffer, OpenBufferEntry } from "./state";
 import type { EditorHost } from "./editor";
-
-interface NoteMutationAppliedEvent {
-  task_id: string;
-  source_path: string;
-  mutation_kind: string;
-  content: string;
-  source_hash_at_submit: string;
-}
 
 export interface AgentChangesDeps {
   editor: EditorHost;
@@ -132,8 +124,8 @@ export function mountAgentChanges(deps: AgentChangesDeps): void {
     }
   }
 
-  void listen<NoteMutationAppliedEvent>("hiker:note-mutation-applied", (ev) => {
-    const p = ev.payload;
+  void onHikerEvent("hiker:note-mutation-applied", (payload) => {
+    const p = payload;
     applyMutationToBuffer(
       p.source_path,
       p.content,
@@ -213,9 +205,9 @@ export function mountAgentChanges(deps: AgentChangesDeps): void {
     }
   }
 
-  void listen<ChangeRow>("hiker:changes-appended", (event) => {
+  void onHikerEvent("hiker:changes-appended", (payload) => {
     deps.notifyChangesAppended();
-    const row = event.payload;
+    const row = payload;
     if (row.author_class !== "agent") return;
     void handleAgentChange(row);
   });

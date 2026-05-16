@@ -153,10 +153,10 @@ fn append_change_best_effort(
     changes: Option<&Arc<Changes>>,
     append: ChangeAppend<'_>,
 ) {
-    if let Some(c) = changes {
-        if let Err(e) = c.append(append) {
-            tracing::warn!(error = %e, "changes: append failed");
-        }
+    if let Some(c) = changes
+        && let Err(e) = c.append(append)
+    {
+        tracing::warn!(error = %e, "changes: append failed");
     }
 }
 
@@ -530,6 +530,20 @@ pub async fn restore(
     result
 }
 
+/// Borrowed bundle for the four agent_* write helpers. The first six
+/// arguments are identical across `agent_write_note`,
+/// `agent_set_frontmatter`, `agent_apply_tag`, and `agent_remove_tag`;
+/// bundling them keeps the signatures (and call sites) under the
+/// `too_many_arguments` threshold without changing any behavior.
+pub struct AgentWriteCtx<'a> {
+    pub watcher: &'a Watcher,
+    pub jobs: &'a IndexJobTx,
+    pub vault: &'a Vault,
+    pub changes: Option<&'a Arc<Changes>>,
+    pub client_id: &'a str,
+    pub tool: &'a str,
+}
+
 /// Agent write of a note's full body. Routes through the indexer so the
 /// post-write upsert runs against the same writer the UI uses; appends an
 /// `author='agent:<client_id>'` changelog row with the post-write content
@@ -542,46 +556,41 @@ pub async fn restore(
 ///
 /// status: mcp-tool-write-note
 pub async fn agent_write_note(
-    watcher: &Watcher,
-    jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    client_id: &str,
-    tool: &str,
+    ctx: &AgentWriteCtx<'_>,
     rel: &str,
     content: &str,
     expected_hash: Option<&str>,
 ) -> Result<String, HikerError> {
-    watcher.suppress(rel.to_string());
+    ctx.watcher.suppress(rel.to_string());
 
     // Snapshot the pre-write content as a baseline if this is the first time
     // hiker has touched the path (mirrors the UI's `ensure_baseline` hook on
     // user saves so rollback of an agent-authored save has somewhere to go).
-    if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel)) {
-        if let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash) {
-            tracing::warn!(error = %e, "changes: ensure_baseline failed (agent write)");
-        }
+    if let (Some(c), Ok((pre_text, pre_hash))) = (ctx.changes, ctx.vault.read_file_with_hash(rel))
+        && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
+    {
+        tracing::warn!(error = %e, "changes: ensure_baseline failed (agent write)");
     }
 
-    let abs = vault.abs_path(rel)?;
+    let abs = ctx.vault.abs_path(rel)?;
     let existed = abs.exists();
     let new_hash = match expected_hash {
-        Some(h) => vault.write_file_checked(rel, h, content)?,
+        Some(h) => ctx.vault.write_file_checked(rel, h, content)?,
         None => {
-            vault.write_file(rel, content)?;
+            ctx.vault.write_file(rel, content)?;
             hash_str(content)
         }
     };
 
     // Re-suppress so the TTL window starts close to when notify surfaces the
     // post-write event.
-    watcher.suppress(rel.to_string());
+    ctx.watcher.suppress(rel.to_string());
 
     let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
-    let author = format!("agent:{client_id}");
-    let metadata = serde_json::json!({"tool": tool});
+    let author = format!("agent:{}", ctx.client_id);
+    let metadata = serde_json::json!({"tool": ctx.tool});
     append_change_best_effort(
-        changes,
+        ctx.changes,
         ChangeAppend {
             path: rel,
             op,
@@ -594,7 +603,8 @@ pub async fn agent_write_note(
     );
 
     // Re-index the new content so search/related see the agent's changes.
-    let _ = jobs
+    let _ = ctx
+        .jobs
         .send(IndexJob::Upsert {
             rel_path: rel.to_string(),
             force: false,
@@ -613,22 +623,14 @@ pub async fn agent_write_note(
 ///
 /// status: mcp-tool-set-frontmatter
 pub async fn agent_set_frontmatter(
-    watcher: &Watcher,
-    jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    client_id: &str,
-    tool: &str,
+    ctx: &AgentWriteCtx<'_>,
     rel: &str,
     fields: serde_json::Value,
 ) -> Result<String, HikerError> {
-    let existing = vault.read_file(rel)?;
+    let existing = ctx.vault.read_file(rel)?;
     let merged = crate::frontmatter::merge_agent_patch(&existing, fields)
         .map_err(|e| HikerError::Io(format!("frontmatter: {e}")))?;
-    agent_write_note(
-        watcher, jobs, vault, changes, client_id, tool, rel, &merged, None,
-    )
-    .await
+    agent_write_note(ctx, rel, &merged, None).await
 }
 
 /// Agent tag append. Convenience over `agent_set_frontmatter` for the most
@@ -638,59 +640,29 @@ pub async fn agent_set_frontmatter(
 ///
 /// status: mcp-tool-apply-tag-remove-tag
 pub async fn agent_apply_tag(
-    watcher: &Watcher,
-    jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    client_id: &str,
-    tool: &str,
+    ctx: &AgentWriteCtx<'_>,
     rel: &str,
     tag: &str,
 ) -> Result<String, HikerError> {
-    let existing_tags = read_existing_tags(vault, rel)?;
+    let existing_tags = read_existing_tags(ctx.vault, rel)?;
     let mut tags = existing_tags;
     if !tags.iter().any(|t| t == tag) {
         tags.push(tag.to_string());
     }
-    agent_set_frontmatter(
-        watcher,
-        jobs,
-        vault,
-        changes,
-        client_id,
-        tool,
-        rel,
-        serde_json::json!({"tags": tags}),
-    )
-    .await
+    agent_set_frontmatter(ctx, rel, serde_json::json!({"tags": tags})).await
 }
 
 /// Agent tag removal. No-op if the tag isn't present. Mirrors `agent_apply_tag`.
 ///
 /// status: mcp-tool-apply-tag-remove-tag
 pub async fn agent_remove_tag(
-    watcher: &Watcher,
-    jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    client_id: &str,
-    tool: &str,
+    ctx: &AgentWriteCtx<'_>,
     rel: &str,
     tag: &str,
 ) -> Result<String, HikerError> {
-    let mut tags = read_existing_tags(vault, rel)?;
+    let mut tags = read_existing_tags(ctx.vault, rel)?;
     tags.retain(|t| t != tag);
-    agent_set_frontmatter(
-        watcher,
-        jobs,
-        vault,
-        changes,
-        client_id,
-        tool,
-        rel,
-        serde_json::json!({"tags": tags}),
-    )
-    .await
+    agent_set_frontmatter(ctx, rel, serde_json::json!({"tags": tags})).await
 }
 
 fn read_existing_tags(vault: &Vault, rel: &str) -> Result<Vec<String>, HikerError> {
@@ -791,12 +763,11 @@ pub fn commit_buffer(
     // changelog row exists for this path yet, so rollback has somewhere
     // to go. No-op when a row already exists. Read failures fall through
     // silently — better to log a baseline-less write than to refuse it.
-    if existed {
-        if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel)) {
-            if let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash) {
-                tracing::warn!(error = %e, "changes: ensure_baseline failed (commit_buffer)");
-            }
-        }
+    if existed
+        && let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel))
+        && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
+    {
+        tracing::warn!(error = %e, "changes: ensure_baseline failed (commit_buffer)");
     }
 
     vault.write_file(rel, new_text)?;
@@ -848,12 +819,11 @@ pub fn resolve_drift(
         DriftChoice::KeepMine => {
             let abs = vault.abs_path(rel)?;
             let existed = abs.exists();
-            if existed {
-                if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel)) {
-                    if let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash) {
-                        tracing::warn!(error = %e, "changes: ensure_baseline failed (resolve_drift keep_mine)");
-                    }
-                }
+            if existed
+                && let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel))
+                && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
+            {
+                tracing::warn!(error = %e, "changes: ensure_baseline failed (resolve_drift keep_mine)");
             }
             vault.write_file(rel, new_text)?;
             let new_hash = hash_str(new_text);
@@ -935,17 +905,17 @@ pub async fn ensure_note_id_stamped(
     let existing = vault.read_file(rel)?;
     let split = crate::frontmatter::split(&existing);
     if let Some(id) = read_hiker_id(&split.frontmatter) {
-        if let Ok(Some(path_id)) = store.id_for_path(rel) {
-            if path_id != id {
-                tracing::warn!(
-                    path = %rel,
-                    frontmatter_id = %id,
-                    path_ids_id = %path_id,
-                    "ensure_note_id_stamped: pre-existing id mismatch; \
-                     keeping frontmatter id (resolve_reference may surface \
-                     PathConflict until reconciled)",
-                );
-            }
+        if let Ok(Some(path_id)) = store.id_for_path(rel)
+            && path_id != id
+        {
+            tracing::warn!(
+                path = %rel,
+                frontmatter_id = %id,
+                path_ids_id = %path_id,
+                "ensure_note_id_stamped: pre-existing id mismatch; \
+                 keeping frontmatter id (resolve_reference may surface \
+                 PathConflict until reconciled)",
+            );
         }
         return Ok(id);
     }
@@ -975,10 +945,10 @@ pub async fn ensure_note_id_stamped(
 
     watcher.suppress(rel.to_string());
 
-    if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel)) {
-        if let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash) {
-            tracing::warn!(error = %e, "changes: ensure_baseline failed (id stamp)");
-        }
+    if let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel))
+        && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
+    {
+        tracing::warn!(error = %e, "changes: ensure_baseline failed (id stamp)");
     }
 
     let abs = vault.abs_path(rel)?;

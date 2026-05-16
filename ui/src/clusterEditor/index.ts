@@ -37,10 +37,11 @@
 // surface-local state.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEventAs } from "../events";
 import { Logger } from "../logger";
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
+import { describeErr } from "../ipc/runCommand";
 import { Icons } from "../icons";
 import {
   Api,
@@ -199,7 +200,7 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
         await refreshOne(state);
       } catch (err) {
         Logger.error("ui::clusterEditor", "undo failed", { err });
-        showToast(`Undo failed: ${String(err)}`);
+        showToast(`Undo failed: ${describeErr(err)}`);
       }
     });
     head.appendChild(undoBtn);
@@ -219,7 +220,7 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
         await refreshOne(state);
       } catch (err) {
         Logger.error("ui::clusterEditor", "redo failed", { err });
-        showToast(`Redo failed: ${String(err)}`);
+        showToast(`Redo failed: ${describeErr(err)}`);
       }
     });
     head.appendChild(redoBtn);
@@ -273,7 +274,7 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
             await SidebarApi.discard(state.tree.id);
             await refresh();
           } catch (err) {
-            showToast(`Discard failed: ${String(err)}`);
+            showToast(`Discard failed: ${describeErr(err)}`);
           }
         },
       },
@@ -381,8 +382,8 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
     id?: string;
     kind?: { type?: string };
   };
-  void listen<QueueEvt>("hiker:queue-event", (ev) => {
-    const p = ev.payload;
+  void onHikerEventAs<QueueEvt>("hiker:queue-event", (payload) => {
+    const p = payload;
     if (p.event === "task_queued") {
       const kindType = p.kind?.type;
       if (p.id && kindType && CLUSTER_BUILD_KINDS.has(kindType)) {

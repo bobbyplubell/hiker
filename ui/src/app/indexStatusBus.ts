@@ -7,7 +7,7 @@
 /// indexer's `watch::Sender<IndexStatus>` changes. Progress events
 /// (`hiker:reindex-progress`) own the per-path marker + outstanding-count
 /// bookkeeping; the full `IndexStatus` snapshot rides the status event.
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEvent } from "../events";
 import type { IndexState } from "../tree";
 
 export interface IndexStatus {
@@ -63,15 +63,15 @@ export function mountIndexStatusBus(deps: IndexStatusBusDeps): IndexStatusBus {
   // scan_complete adds, every terminal event subtracts, Started is a no-op.
   let outstandingCount = 0;
 
-  void listen<IndexStatus>("hiker:index-status", (event) => {
-    indexStatus = event.payload;
+  void onHikerEvent("hiker:index-status", (payload) => {
+    indexStatus = payload;
     deps.onStatusChanged(indexStatus);
     // Stats counts shift with model_ready / total_notes / last_error too.
     deps.scheduleStatsRefresh();
   });
 
-  void listen<ProgressEvent>("hiker:reindex-progress", (event) => {
-    const ev = event.payload;
+  void onHikerEvent("hiker:reindex-progress", (payload) => {
+    const ev = payload;
     switch (ev.kind) {
       case "model_loaded":
         indexStatus = { ...indexStatus, model_ready: true, last_error: null };

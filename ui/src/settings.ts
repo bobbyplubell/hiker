@@ -21,89 +21,20 @@
 // system file manager via `reveal_config_file`.
 
 import { Ipc } from "./ipc";
+import { runCommand } from "./ipc/runCommand";
 import { confirmAccent } from "./widgets/confirm";
+import { el } from "./widgets/dom";
 
-// Mirror of `core::config::SettingsScope`. Snake-case for serde.
-export type SettingsScope = "user" | "vault";
-
-// Mirrors core::config::Config (subset the pane reads). Kept loose because
-// any field-level type strictness lives on the Rust side; the pane only
-// renders rows for the keys it knows about.
-export interface SettingsConfig {
-  schema_version: number;
-  editor: {
-    render_txt_as_markdown: boolean;
-    live_preview: boolean;
-    word_wrap: boolean;
-    show_line_numbers: boolean;
-    show_whitespace: boolean;
-    show_chunk_boundaries: boolean;
-    hide_frontmatter: boolean;
-    intraline_diff: boolean;
-    tab_size: number;
-  };
-  indexing: {
-    model: string;
-    batch_size: number;
-    ignored_paths: string[];
-  };
-  vault: {
-    recent: string[];
-    default: string | null;
-    sidebar_open: boolean;
-    related_open: boolean;
-    trash_expanded: boolean;
-    chat_height: number;
-    chat_input_height: number;
-    sidebar_width: number;
-    discovery_width: number;
-    show_sessions_in_tree: boolean;
-    sidebar_mode: "files" | "clusters" | "trails";
-    /// status: active-trail-state
-    /// Vault-relative path of the active trail-doc, or `null` when none
-    /// is active. Persisted via `set_setting` / `trail_set_active` (the
-    /// latter is the canonical writer because it also stamps
-    /// `hiker.last_activated_at` on the trail-doc).
-    active_trail: string | null;
-    tree: { sort_by: "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc" };
-  };
-  search: {
-    modes: { semantic: boolean; lexical: boolean };
-    sections: { results_expanded: boolean; related_expanded: boolean };
-    lexical: {
-      case_sensitive: boolean;
-      diacritic_sensitive: boolean;
-      prefix_match: boolean;
-      phrase_mode: boolean;
-    };
-    semantic: {
-      min_similarity: number;
-      top_k: number;
-      recency_bias: "off" | "mild" | "strong";
-    };
-  };
-  // Loosely shaped — the pane only inspects keys via dotted-path lookup,
-  // and the deferred sections (llm, mcp) don't have rendered rows yet.
-  // Carrying the full Rust shape here would add a maintenance ratchet
-  // every time core::config grows a key the pane doesn't display.
-  llm: {
-    enabled: boolean;
-    provider: {
-      backend: string;
-      model: string;
-      api_key_env: string;
-      api_key: string;
-      base_url: string;
-    };
-    limits: { max_tokens: number; timeout_secs: number };
-    agent: { iteration_cap: number; tool_timeout_secs: number };
-    audit: { log_full_prompt: boolean };
-  };
-  mcp: unknown;
-  acp: {
-    command: string;
-  };
-}
+// Generated mirror of `core::config::*`. The Rust struct definitions in
+// `core/src/config/sections.rs` are the source of truth; the TS shapes
+// land via `cargo test --features ts-export gen_ts_types` and are
+// verified-in-sync by `scripts/check.sh`. Adding a Rust field no longer
+// requires a matching TS edit — the generated file lights up the new
+// shape on the next codegen run.
+import type { Config as SettingsConfig } from "./generatedTypes/Config";
+export type { Config as SettingsConfig } from "./generatedTypes/Config";
+export type { SettingsScope } from "./generatedTypes/SettingsScope";
+import type { SettingsScope } from "./generatedTypes/SettingsScope";
 
 // Mirror of `Config::default()` from `core::config`. Used by the per-row
 // reset affordance. Kept in sync by hand — there's no Rust → TS export for
@@ -607,27 +538,27 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   function buildHeader(): HTMLElement {
-    const h = document.createElement("header");
-    h.className = "settings-header";
-    const title = document.createElement("h1");
-    title.textContent = `Settings · ${vaultPathEl.title || vaultPathEl.textContent || "Vault"}`;
-    const refresh = document.createElement("button");
-    refresh.type = "button";
-    refresh.className = "toolbar-btn";
-    refresh.textContent = "Refresh";
-    refresh.title = "Reload from disk";
-    // status: settings-pane-manual-refresh
-    refresh.addEventListener("click", async () => {
-      try {
-        const cfg = await Ipc.reloadConfig();
-        deps.onSettingApplied(cfg);
-        await render();
-      } catch (err) {
-        console.error("reload_config failed:", err);
-      }
-    });
-    h.append(title, refresh);
-    return h;
+    return el("header", { class: "settings-header" }, [
+      el("h1", {
+        text: `Settings · ${vaultPathEl.title || vaultPathEl.textContent || "Vault"}`,
+      }),
+      el("button", {
+        class: "toolbar-btn",
+        text: "Refresh",
+        title: "Reload from disk",
+        attrs: { type: "button" },
+        // status: settings-pane-manual-refresh
+        onClick: async () => {
+          try {
+            const cfg = await Ipc.reloadConfig();
+            deps.onSettingApplied(cfg);
+            await render();
+          } catch (err) {
+            console.error("reload_config failed:", err);
+          }
+        },
+      }),
+    ]);
   }
 
   async function buildSections(): Promise<HTMLElement[]> {
@@ -635,50 +566,47 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   async function buildSectionCard(spec: SectionSpec): Promise<HTMLElement> {
-    const card = document.createElement("section");
-    card.className = "settings-card";
     const collapsed = sectionCollapsed.get(spec.id) ?? false;
-    if (collapsed) card.classList.add("collapsed");
-
-    const header = document.createElement("header");
-    header.className = "settings-card-header";
-    const chevron = document.createElement("span");
-    chevron.className = "settings-card-chevron";
-    chevron.textContent = collapsed ? "▸" : "▾";
-    const title = document.createElement("span");
-    title.className = "settings-card-title";
-    title.textContent = spec.title;
-    header.append(chevron, title);
-    if (spec.deferred) {
-      const note = document.createElement("span");
-      note.className = "settings-card-deferred-note";
-      note.textContent = "deferred";
-      header.append(note);
-    } else {
-      header.append(buildScopeToggle(spec));
-    }
-    header.addEventListener("click", (e) => {
-      // Don't collapse when clicking inside the scope toggle.
-      if ((e.target as HTMLElement).closest(".settings-scope-toggle")) return;
-      const next = !card.classList.contains("collapsed");
-      card.classList.toggle("collapsed", next);
-      sectionCollapsed.set(spec.id, next);
-      chevron.textContent = next ? "▸" : "▾";
+    const chevron = el("span", {
+      class: "settings-card-chevron",
+      text: collapsed ? "▸" : "▾",
     });
+    const headerChildren: (ChildNode | null)[] = [
+      chevron,
+      el("span", { class: "settings-card-title", text: spec.title }),
+    ];
+    if (spec.deferred) {
+      headerChildren.push(el("span", {
+        class: "settings-card-deferred-note",
+        text: "deferred",
+      }));
+    } else {
+      headerChildren.push(buildScopeToggle(spec));
+    }
+    const card = el("section", {
+      class: collapsed ? "settings-card collapsed" : "settings-card",
+    });
+    const header = el("header", {
+      class: "settings-card-header",
+      onClick: (e) => {
+        // Don't collapse when clicking inside the scope toggle.
+        if ((e.target as HTMLElement).closest(".settings-scope-toggle")) return;
+        const next = !card.classList.contains("collapsed");
+        card.classList.toggle("collapsed", next);
+        sectionCollapsed.set(spec.id, next);
+        chevron.textContent = next ? "▸" : "▾";
+      },
+    }, headerChildren);
     card.appendChild(header);
 
-    const body = document.createElement("div");
-    body.className = "settings-card-body";
+    const body = el("div", { class: "settings-card-body" });
     if (spec.deferred) {
-      const stub = document.createElement("div");
-      stub.className = "settings-row";
-      const lbl = document.createElement("div");
-      lbl.className = "settings-row-label";
-      lbl.style.fontStyle = "italic";
-      lbl.classList.add("txt-muted");
-      lbl.textContent = spec.deferred;
-      stub.appendChild(lbl);
-      body.appendChild(stub);
+      const lbl = el("div", {
+        class: "settings-row-label txt-muted",
+        text: spec.deferred,
+        style: { fontStyle: "italic" },
+      });
+      body.appendChild(el("div", { class: "settings-row" }, [lbl]));
     } else {
       const scope = sectionScope.get(spec.id) ?? spec.defaultScope;
       const cfg = await loadScopedConfig(scope);
@@ -696,23 +624,21 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   function buildScopeToggle(spec: SectionSpec): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "settings-scope-toggle";
     const current = sectionScope.get(spec.id) ?? spec.defaultScope;
-    for (const s of ["user", "vault"] as SettingsScope[]) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = s === "user" ? "User" : "Vault";
-      if (s === current) btn.classList.add("active");
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        if (sectionScope.get(spec.id) === s) return;
-        sectionScope.set(spec.id, s);
-        await render();
-      });
-      wrap.appendChild(btn);
-    }
-    return wrap;
+    const buttons = (["user", "vault"] as SettingsScope[]).map((s) =>
+      el("button", {
+        class: s === current ? "active" : undefined,
+        text: s === "user" ? "User" : "Vault",
+        attrs: { type: "button" },
+        onClick: async (e) => {
+          e.stopPropagation();
+          if (sectionScope.get(spec.id) === s) return;
+          sectionScope.set(spec.id, s);
+          await render();
+        },
+      }),
+    );
+    return el("span", { class: "settings-scope-toggle" }, buttons);
   }
 
   async function loadScopedConfig(scope: SettingsScope): Promise<SettingsConfig> {
@@ -731,22 +657,13 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     scope: SettingsScope,
     scoped: SettingsConfig,
   ): HTMLElement {
-    const el = document.createElement("div");
-    el.className = "settings-row";
-
-    const label = document.createElement("div");
-    label.className = "settings-row-label";
-    label.textContent = row.label;
+    const labelChildren: (ChildNode | string)[] = [row.label];
     if (row.desc) {
-      const d = document.createElement("span");
-      d.className = "settings-row-desc";
-      d.textContent = row.desc;
-      label.append(d);
+      labelChildren.push(el("span", { class: "settings-row-desc", text: row.desc }));
     }
-    el.append(label);
+    const label = el("div", { class: "settings-row-label" }, labelChildren);
 
-    const ctrl = document.createElement("div");
-    ctrl.className = "settings-row-control";
+    const ctrl = el("div", { class: "settings-row-control" });
     const value = readKey(scoped, row.key);
 
     if (row.control && row.writeScope) {
@@ -757,56 +674,55 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
       ctrl.append(buildReadonlyDisplay(value));
       ctrl.append(buildInfoPopover(row, scope));
     }
-    el.append(ctrl);
-    return el;
+    return el("div", { class: "settings-row" }, [label, ctrl]);
   }
 
   function buildControl(row: RowSpec, value: unknown, writeScope: SettingsScope): HTMLElement {
     const c = row.control!;
     if (c.kind === "bool") {
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.className = "settings-row-checkbox";
-      cb.checked = !!value;
-      cb.addEventListener("change", () => {
-        void persist(row.key, writeScope, cb.checked);
+      const cb = el("input", {
+        class: "settings-row-checkbox",
+        attrs: { type: "checkbox" },
+        on: { change: () => { void persist(row.key, writeScope, cb.checked); } },
       });
+      cb.checked = !!value;
       return cb;
     }
     if (c.kind === "enum") {
-      const sel = document.createElement("select");
-      sel.className = "settings-row-input";
       const prior = String(value ?? "");
-      for (const [v, label] of c.options) {
-        const opt = document.createElement("option");
+      const options = c.options.map(([v, label]) => {
+        const opt = el("option", { text: label });
         opt.value = v;
-        opt.textContent = label;
         if (String(value) === v) opt.selected = true;
-        sel.appendChild(opt);
-      }
-      sel.addEventListener("change", async () => {
-        const next = sel.value;
-        // status: settings-embedder-model-change-warning
-        // The embedder-model flip is gated by a consequential-confirm
-        // modal. Cancel reverts the dropdown without writing. Same-value
-        // change (defensive) is a no-op.
-        if (row.key === "indexing.model" && next !== prior) {
-          const ok = await confirmEmbedderModelChange(prior, next);
-          if (!ok) {
-            sel.value = prior;
-            return;
-          }
-        }
-        void persist(row.key, writeScope, sel.value);
+        return opt;
       });
+      const sel = el("select", {
+        class: "settings-row-input",
+        on: {
+          change: async () => {
+            const next = sel.value;
+            // status: settings-embedder-model-change-warning
+            // The embedder-model flip is gated by a consequential-confirm
+            // modal. Cancel reverts the dropdown without writing. Same-value
+            // change (defensive) is a no-op.
+            if (row.key === "indexing.model" && next !== prior) {
+              const ok = await confirmEmbedderModelChange(prior, next);
+              if (!ok) {
+                sel.value = prior;
+                return;
+              }
+            }
+            void persist(row.key, writeScope, sel.value);
+          },
+        },
+      }, options);
       return sel;
     }
     if (c.kind === "number") {
-      const inp = document.createElement("input");
-      inp.type = "number";
-      inp.className = "settings-row-input";
-      inp.min = String(c.min);
-      inp.max = String(c.max);
+      const inp = el("input", {
+        class: "settings-row-input",
+        attrs: { type: "number", min: String(c.min), max: String(c.max) },
+      });
       if (c.step) inp.step = String(c.step);
       inp.value = String(value);
       let timer: number | null = null;
@@ -821,10 +737,11 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
       return inp;
     }
     if (c.kind === "string") {
-      const inp = document.createElement("input");
-      inp.type = "text";
-      inp.className = "settings-row-input";
-      inp.value = typeof value === "string" ? value : "";
+      const inp = el("input", {
+        class: "settings-row-input",
+        attrs: { type: "text" },
+        value: typeof value === "string" ? value : "",
+      });
       let timer: number | null = null;
       inp.addEventListener("input", () => {
         if (timer !== null) window.clearTimeout(timer);
@@ -846,13 +763,14 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
     currentValue: unknown,
     control: HTMLElement,
   ): HTMLElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "settings-row-reset";
-    btn.textContent = "reset";
-    btn.title = "Reset to default";
     const def = readKey(DEFAULTS as unknown as SettingsConfig, row.key);
-    btn.disabled = sameValue(currentValue, def);
+    const btn = el("button", {
+      class: "settings-row-reset",
+      text: "reset",
+      title: "Reset to default",
+      attrs: { type: "button" },
+      disabled: sameValue(currentValue, def),
+    });
     btn.addEventListener("click", () => {
       if (row.writeScope === null || def === undefined) return;
       // Update the control's displayed value in place — `persist` no
@@ -877,21 +795,22 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   function buildReadonlyDisplay(value: unknown): HTMLElement {
-    const el = document.createElement("span");
-    el.className = "settings-row-readonly";
-    el.textContent = formatValue(value);
-    return el;
+    return el("span", {
+      class: "settings-row-readonly",
+      text: formatValue(value),
+    });
   }
 
   function buildInfoPopover(row: RowSpec, scope: SettingsScope): HTMLElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "settings-row-info";
-    btn.textContent = "ⓘ";
-    btn.title = "Edit the TOML to change.";
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openInfoPopover(btn, row, scope);
+    const btn = el("button", {
+      class: "settings-row-info",
+      text: "ⓘ",
+      title: "Edit the TOML to change.",
+      attrs: { type: "button" },
+      onClick: (e) => {
+        e.stopPropagation();
+        openInfoPopover(btn, row, scope);
+      },
     });
     return btn;
   }
@@ -899,27 +818,25 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   let activePopover: HTMLElement | null = null;
   function openInfoPopover(anchor: HTMLElement, row: RowSpec, scope: SettingsScope): void {
     closePopover();
-    const pop = document.createElement("div");
-    pop.className = "settings-popover";
-    const head = document.createElement("div");
-    head.textContent = `${row.key} — read-only`;
-    pop.appendChild(head);
-    const src = document.createElement("div");
-    src.className = "source";
-    src.textContent = scope === "user"
-      ? "User TOML at the platform config dir"
-      : "vault/.hiker/config.toml";
-    pop.appendChild(src);
-    const open = document.createElement("button");
-    open.type = "button";
-    open.textContent = "Open in file manager";
-    open.addEventListener("click", () => {
-      void Ipc.revealConfigFile({ scope }).catch((err) => {
-        console.error("reveal_config_file failed:", err);
-      });
-      closePopover();
-    });
-    pop.appendChild(open);
+    const pop = el("div", { class: "settings-popover" }, [
+      el("div", { text: `${row.key} — read-only` }),
+      el("div", {
+        class: "source",
+        text: scope === "user"
+          ? "User TOML at the platform config dir"
+          : "vault/.hiker/config.toml",
+      }),
+      el("button", {
+        text: "Open in file manager",
+        attrs: { type: "button" },
+        onClick: () => {
+          // `silent: true` preserves pre-pipeline behavior — this site logged
+          // to console only, never showed a toast on failure.
+          void runCommand("ipc.revealConfigFile", () => Ipc.revealConfigFile({ scope }), { silent: true });
+          closePopover();
+        },
+      }),
+    ]);
     document.body.appendChild(pop);
     const rect = anchor.getBoundingClientRect();
     pop.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - pop.offsetHeight - 4)}px`;
@@ -966,24 +883,20 @@ export function mountSettingsPane(deps: SettingsPaneDeps): SettingsPaneApi {
   }
 
   function buildFooter(): HTMLElement {
-    const f = document.createElement("footer");
-    f.className = "settings-footer";
-    const schema = document.createElement("span");
-    schema.className = "schema";
-    schema.textContent = "Schema version: 1";
-    f.append(schema);
+    const children: ChildNode[] = [
+      el("span", { class: "schema", text: "Schema version: 1" }),
+    ];
     for (const scope of ["user", "vault"] as SettingsScope[]) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = scope === "user" ? "Open user config.toml" : "Open vault config.toml";
-      btn.addEventListener("click", () => {
-        void Ipc.revealConfigFile({ scope }).catch((err) => {
-          console.error("reveal_config_file failed:", err);
-        });
-      });
-      f.append(btn);
+      children.push(el("button", {
+        text: scope === "user" ? "Open user config.toml" : "Open vault config.toml",
+        attrs: { type: "button" },
+        onClick: () => {
+          // `silent: true` preserves pre-pipeline behavior — console-only log.
+          void runCommand("ipc.revealConfigFile", () => Ipc.revealConfigFile({ scope }), { silent: true });
+        },
+      }));
     }
-    return f;
+    return el("footer", { class: "settings-footer" }, children);
   }
 
   return { isVisible, setVisible, toggle, refresh: render };

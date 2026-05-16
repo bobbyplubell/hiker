@@ -25,39 +25,31 @@ use hiker_core::store::ChunkBounds;
 use hiker_core::trash::{Trash, TrashEntry, TrashListItem};
 use hiker_core::{DirEntryDto, HikerError};
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::State;
 
-use crate::{log_cmd_result, with_vault, AppState};
+use crate::{log_cmd_result, with_session, with_vault, AppState, CmdResult};
 
 #[tauri::command]
 pub(crate) fn list_dir(
     state: State<AppState>,
     rel: String,
     sort: Option<TreeSortBy>,
-) -> Result<Vec<DirEntryDto>, String> {
-    let result = (|| -> Result<Vec<DirEntryDto>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+) -> CmdResult<Vec<DirEntryDto>> {
+    let result = with_session(&state, |session| {
         let order = match sort {
             Some(o) => o,
-            None => session
-                .config
-                .read()
-                .map_err(|_| "config lock poisoned".to_string())?
-                .vault
-                .tree
-                .sort_by,
+            None => session.config.read()?.vault.tree.sort_by,
         };
-        session.vault.list_dir(&rel, order).map_err(|e| e.to_string())
-    })();
+        Ok(session.vault.list_dir(&rel, order)?)
+    });
     log_cmd_result("list_dir", result)
 }
 
 #[tauri::command]
-pub(crate) fn read_file(state: State<AppState>, rel: String) -> Result<String, String> {
+pub(crate) fn read_file(state: State<AppState>, rel: String) -> CmdResult<String> {
     log_cmd_result(
         "read_file",
-        with_vault(&state, |v| v.read_file(&rel).map_err(|e| e.to_string())),
+        with_vault(&state, |v| Ok(v.read_file(&rel)?)),
     )
 }
 
@@ -68,13 +60,12 @@ pub(crate) struct FileWithHash {
 }
 
 #[tauri::command]
-pub(crate) fn read_file_with_hash(state: State<AppState>, rel: String) -> Result<FileWithHash, String> {
+pub(crate) fn read_file_with_hash(state: State<AppState>, rel: String) -> CmdResult<FileWithHash> {
     log_cmd_result(
         "read_file_with_hash",
         with_vault(&state, |v| {
-            v.read_file_with_hash(&rel)
-                .map(|(contents, hash)| FileWithHash { contents, hash })
-                .map_err(|e| e.to_string())
+            let (contents, hash) = v.read_file_with_hash(&rel)?;
+            Ok(FileWithHash { contents, hash })
         }),
     )
 }
@@ -98,36 +89,27 @@ pub(crate) fn write_file(
     rel: String,
     contents: String,
     extra_metadata: Option<serde_json::Value>,
-) -> Result<(), String> {
-    let result = (|| -> Result<(), String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let abs = session
-            .vault
-            .abs_path(&rel)
-            .map_err(|e| e.to_string())?;
+) -> CmdResult<()> {
+    let result = with_session(&state, |session| {
+        let abs = session.vault.abs_path(&rel)?;
         let existed = abs.exists();
         // Baseline-on-first-save: if the file already existed but the
         // changelog has no row for it, snapshot the pre-write state so
         // rollback of this save has somewhere to go. Read failures fall
         // through silently — better to log a hash-less save than refuse
         // the write.
-        if existed {
-            if let Ok((pre_text, pre_hash)) = session.vault.read_file_with_hash(&rel) {
-                if let Err(e) = session.changes.ensure_baseline(
-                    &rel,
-                    "user",
-                    pre_text.as_bytes(),
-                    &pre_hash,
-                ) {
-                    tracing::warn!(error = %e, "changes: ensure_baseline failed");
-                }
-            }
+        if existed
+            && let Ok((pre_text, pre_hash)) = session.vault.read_file_with_hash(&rel)
+            && let Err(e) = session.changes.ensure_baseline(
+                &rel,
+                "user",
+                pre_text.as_bytes(),
+                &pre_hash,
+            )
+        {
+            tracing::warn!(error = %e, "changes: ensure_baseline failed");
         }
-        session
-            .vault
-            .write_file(&rel, &contents)
-            .map_err(|e| e.to_string())?;
+        session.vault.write_file(&rel, &contents)?;
         // status: changes-write-path
         let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
         let hash = hiker_core::hash_str(&contents);
@@ -143,7 +125,7 @@ pub(crate) fn write_file(
             tracing::warn!(error = %e, "changes: append (write_file) failed");
         }
         Ok(())
-    })();
+    });
     log_cmd_result("write_file", result)
 }
 
@@ -252,17 +234,16 @@ pub(crate) fn write_file_checked(
         // Baseline-on-first-save: snapshot the pre-write content before
         // overwriting so rollback of this save restores the prior state.
         // No-op when the changelog already has a row for this path.
-        if existed {
-            if let Ok((pre_text, pre_hash)) = session.vault.read_file_with_hash(&rel) {
-                if let Err(e) = session.changes.ensure_baseline(
-                    &rel,
-                    "user",
-                    pre_text.as_bytes(),
-                    &pre_hash,
-                ) {
-                    tracing::warn!(error = %e, "changes: ensure_baseline failed");
-                }
-            }
+        if existed
+            && let Ok((pre_text, pre_hash)) = session.vault.read_file_with_hash(&rel)
+            && let Err(e) = session.changes.ensure_baseline(
+                &rel,
+                "user",
+                pre_text.as_bytes(),
+                &pre_hash,
+            )
+        {
+            tracing::warn!(error = %e, "changes: ensure_baseline failed");
         }
         let new_hash = session
             .vault
@@ -478,7 +459,7 @@ async fn delete_note_inner(
     // `tree-trash-flat-by-deleted` silently, so it stays in the Tauri layer
     // (core::ops doesn't depend on tauri).
     if result.is_ok() {
-        let _ = app.emit("hiker:trash-changed", ());
+        crate::events::emit_trash_changed(&app);
     }
     result
 }
@@ -525,7 +506,7 @@ async fn restore_trash_entry_inner(
     // Trash bin auto-refresh hook — kept in the Tauri layer, see
     // `delete_note_inner` for the same rationale.
     if result.is_ok() {
-        let _ = app.emit("hiker:trash-changed", ());
+        crate::events::emit_trash_changed(&app);
     }
     result
 }
@@ -567,7 +548,7 @@ pub(crate) fn empty_trash(app: tauri::AppHandle, state: State<AppState>) -> Resu
         trash.empty()
     })();
     if result.is_ok() {
-        let _ = app.emit("hiker:trash-changed", ());
+        crate::events::emit_trash_changed(&app);
     }
     log_cmd_result("empty_trash", result)
 }
@@ -599,7 +580,7 @@ pub(crate) fn permanent_delete_trash_entry(
         trash.permanent_delete(&trashed_name)
     })();
     if result.is_ok() {
-        let _ = app.emit("hiker:trash-changed", ());
+        crate::events::emit_trash_changed(&app);
     }
     log_cmd_result("permanent_delete_trash_entry", result)
 }
@@ -610,27 +591,22 @@ pub(crate) fn permanent_delete_trash_entry(
 ///
 /// status: tauri-cmd-chunks-for-path
 #[tauri::command]
-pub(crate) fn chunks_for(state: State<AppState>, rel: String) -> Result<Vec<ChunkBounds>, String> {
-    let result = (|| -> Result<Vec<ChunkBounds>, String> {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+pub(crate) fn chunks_for(state: State<AppState>, rel: String) -> CmdResult<Vec<ChunkBounds>> {
+    let result = with_session(&state, |session| {
         let mut bounds = {
-            let read_store = session
-                .read_store
-                .lock()
-                .map_err(|_| "read_store mutex poisoned".to_string())?;
+            let read_store = session.read_store.lock()?;
             read_store.chunk_bounds_for(&rel).map_err(|e| e.to_string())?
         };
         // Read the file once and enrich each row's UTF-8 byte offsets with
         // matching UTF-16 char offsets. JS strings (and CM6) index by UTF-16
         // code units, so this saves the frontend from re-doing the encode
         // step every time it wants to map a chunk into the editor.
-        if !bounds.is_empty() {
-            if let Ok(text) = session.vault.read_file(&rel) {
-                hiker_core::store::enrich_char_offsets(&text, &mut bounds);
-            }
+        if !bounds.is_empty()
+            && let Ok(text) = session.vault.read_file(&rel)
+        {
+            hiker_core::store::enrich_char_offsets(&text, &mut bounds);
         }
         Ok(bounds)
-    })();
+    });
     log_cmd_result("chunks_for", result)
 }

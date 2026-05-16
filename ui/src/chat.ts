@@ -20,13 +20,16 @@
 // status: chat-panel-tool-call-collapsible
 // status: chat-panel-stop-button
 
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEvent, onHikerEventAs } from "./events";
 import { Ipc, type SessionListItem } from "./ipc";
 import { mountChatMarkdown, type ChatMarkdownView } from "./chatMarkdownView";
 import { mountAtMentions, type AtMentionsApi, type ParsedAtToken } from "./atMentions";
 import { resolveAtNote } from "./notes/resolver";
-import type { BufferApi } from "./app/state";
+import { getActiveBufferSnapshot } from "./app/state";
 import { Icons } from "./icons";
+import { mountToolCards, type ToolCardController } from "./chat/toolCard";
+import { clamp, describeErr, formatShortDate, shortLabel } from "./chat/utils";
+import { el } from "./widgets/dom";
 
 type AgentEvent =
   | { kind: "turn_started"; turn_id: string; user_message_summary: string }
@@ -154,14 +157,6 @@ export interface ChatPanelOptions {
   /// through `openProposalReview`, which dispatches to patch-review or
   /// write-note review via `note-open-routes-to-pending-review`.
   onOpenStagingProposal: (proposal: { id: string; target_path: string }) => void;
-  /// Cross-module read surface for the active editable buffer +
-  /// selection. Replaces the prior `getActiveNote` / `getActiveSelection`
-  /// closures over main.ts internals (`bug-chat-couples-to-main-buffer-globals`).
-  /// Chat polls `bufferApi.getActive()` at submit time; subscriptions
-  /// aren't wired since chat has no reactive surface today.
-  /// status: chat-active-note-context-injection
-  /// status: chat-input-at-selection
-  bufferApi: BufferApi;
   /// Surface a transient toast (e.g. for failed `@<rel-path>` resolution
   /// at submit time). The host wires this to its existing toast helper.
   /// status: chat-input-at-mentions
@@ -181,42 +176,6 @@ interface RenderState {
   // The currently-rendering assistant message bubble (text deltas stream
   // into here). Reset on `step_started`.
   assistantBubble: { body: HTMLElement; mdView: ChatMarkdownView } | null;
-  // Currently-rendering tool-call cards keyed by `call_id` so
-  // ToolCallArgsDelta can stream into the right place.
-  toolCards: Map<string, ToolCardEls>;
-}
-
-interface ToolCardEls {
-  root: HTMLElement;
-  headEl: HTMLElement;
-  glyphEl: HTMLElement;
-  nameEl: HTMLElement;
-  argsSummaryEl: HTMLElement;
-  resultSummaryEl: HTMLElement;
-  expandedEl: HTMLElement;
-  toolName: string;
-  argsBuf: string;
-  finalArgs: string | null;
-  result: { ok: boolean; summary: string } | null;
-  expanded: boolean;
-  /// Touched-note routing payload extracted from the tool result for
-  /// note-touching tools (`write_note` / `edit_note` / `set_frontmatter`
-  /// / `apply_tag` / `remove_tag`). When set, the head-click opens the
-  /// note (or its staged proposal); chevron-click still toggles.
-  /// `bug-chat-tool-card-no-link-for-staged-writes`.
-  touched: TouchedNoteRouting | null;
-}
-
-/// Resolved routing info for a note-touching tool call. `stagingIds`
-/// carries any pending proposal ids the result returned (singular
-/// `staging_id` for `write_note` / `set_frontmatter` / `apply_tag`,
-/// plural `staging_ids` for `edit_note`). When `stagingIds` is non-empty
-/// AND any of those ids is still in the live staging set, the head-click
-/// routes through `onOpenStagingProposal`; otherwise it falls back to
-/// opening the note directly.
-interface TouchedNoteRouting {
-  targetPath: string;
-  stagingIds: string[];
 }
 
 export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
@@ -236,7 +195,6 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     onInputHeightPersist,
     onOpenNoteLink,
     onOpenStagingProposal,
-    bufferApi,
     toast,
   } = opts;
 
@@ -245,7 +203,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   const atMentions: AtMentionsApi = mountAtMentions({
     inputEl,
     anchorEl: panelEl,
-    hasEditorSelection: () => (bufferApi.getActive()?.selection ?? null) !== null,
+    hasEditorSelection: () => (getActiveBufferSnapshot()?.selection ?? null) !== null,
   });
 
   let activeSessionId: string | null = null;
@@ -258,8 +216,21 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   let thinkingEl: HTMLElement | null = null;
   const renderState: RenderState = {
     assistantBubble: null,
-    toolCards: new Map(),
   };
+
+  // Tool-call card rendering lives in `chat/toolCard.ts`; pass the
+  // closures it needs so it can route touched-note clicks and re-render
+  // when staging changes.
+  const toolCards: ToolCardController = mountToolCards({
+    transcriptEl,
+    scrollToBottom: () => scrollToBottom(),
+    onOpenNoteLink: (rel) => onOpenNoteLink(rel),
+    onOpenStagingProposal: (p) => onOpenStagingProposal(p),
+    onClearAssistantBubble: () => {
+      renderState.assistantBubble = null;
+    },
+    getPendingStagingIds: () => pendingStagingIds,
+  });
 
   // status: staging-accept-reject-from-chat-card
   // `bug-chat-tool-card-stale-after-cross-surface-accept` /
@@ -280,12 +251,10 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     } catch {
       pendingStagingIds = new Set();
     }
-    for (const c of renderState.toolCards.values()) {
-      renderActionButtons(c);
-    }
+    toolCards.rerenderAllActionButtons();
   }
   void refreshPendingStagingIds();
-  void listen("hiker:staging-changed", () => {
+  void onHikerEvent("hiker:staging-changed", () => {
     void refreshPendingStagingIds();
   });
 
@@ -384,7 +353,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     const seenRelPaths = new Set<string>();
 
     // One snapshot per send — the buffer / selection can't change mid-compose.
-    const active = bufferApi.getActive();
+    const active = getActiveBufferSnapshot();
     if (active) {
       blocks.push({
         kind: "activeNote",
@@ -482,26 +451,24 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
 
   function openSessionMenu(items: SessionListItem[]): void {
     closeSessionMenu();
-    const pop = document.createElement("div");
-    pop.className = "chat-session-menu-popover";
-    pop.setAttribute("role", "menu");
-
-    const newRow = document.createElement("button");
-    newRow.type = "button";
-    newRow.className = "chat-session-menu-row chat-session-menu-row-new";
-    newRow.setAttribute("role", "menuitem");
-    newRow.innerHTML = `<span class="chat-session-menu-row-icon">+</span><span class="chat-session-menu-row-label">New session</span>`;
-    newRow.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      closeSessionMenu();
-      void doNewSession();
-    });
-    pop.appendChild(newRow);
+    const pop = el("div", {
+      class: "chat-session-menu-popover",
+      attrs: { role: "menu" },
+    }, [
+      el("button", {
+        class: "chat-session-menu-row chat-session-menu-row-new",
+        html: `<span class="chat-session-menu-row-icon">+</span><span class="chat-session-menu-row-label">New session</span>`,
+        attrs: { type: "button", role: "menuitem" },
+        onClick: (ev) => {
+          ev.stopPropagation();
+          closeSessionMenu();
+          void doNewSession();
+        },
+      }),
+    ]);
 
     if (items.length > 0) {
-      const sep = document.createElement("div");
-      sep.className = "chat-session-menu-sep";
-      pop.appendChild(sep);
+      pop.appendChild(el("div", { class: "chat-session-menu-sep" }));
     }
 
     for (const item of items) {
@@ -509,46 +476,37 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       // + a small trash icon overlaid on the right. We can't nest a
       // <button> inside the row's <button>, so the row is a <div role=
       // "menuitem"> with an inner click target and a sibling icon.
-      const row = document.createElement("div");
-      row.className = "chat-session-menu-row";
-      if (item.isActive) row.classList.add("active");
-      row.setAttribute("role", "menuitem");
       const date = formatShortDate(item.mtimeUnix);
       const preview = item.firstUserPreview || "(empty session)";
-
-      const dateEl = document.createElement("span");
-      dateEl.className = "chat-session-menu-row-date";
-      dateEl.textContent = date;
-      const labelEl = document.createElement("span");
-      labelEl.className = "chat-session-menu-row-label";
-      labelEl.textContent = preview;
-      const countEl = document.createElement("span");
-      countEl.className = "chat-session-menu-row-count";
-      countEl.textContent = String(item.turnCount);
-      // status: chat-session-trash
-      const trashBtn = document.createElement("button");
-      trashBtn.type = "button";
-      trashBtn.className = "chat-session-menu-row-trash";
-      trashBtn.title = "Move session to trash";
-      trashBtn.setAttribute("aria-label", "Move session to trash");
-      trashBtn.innerHTML = Icons.trash();
-      trashBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        void doDeleteSession(item.sessionId, item.isActive);
-      });
-
-      row.append(dateEl, labelEl, countEl, trashBtn);
-      row.addEventListener("click", (ev) => {
-        if (ev.target instanceof Element && ev.target.closest(".chat-session-menu-row-trash")) {
-          return;
-        }
-        ev.stopPropagation();
-        closeSessionMenu();
-        if (!item.isActive) {
-          void doOpenSession(item.sessionId);
-        }
-      });
-      pop.appendChild(row);
+      pop.appendChild(el("div", {
+        class: item.isActive ? "chat-session-menu-row active" : "chat-session-menu-row",
+        attrs: { role: "menuitem" },
+        onClick: (ev) => {
+          if (ev.target instanceof Element && ev.target.closest(".chat-session-menu-row-trash")) {
+            return;
+          }
+          ev.stopPropagation();
+          closeSessionMenu();
+          if (!item.isActive) {
+            void doOpenSession(item.sessionId);
+          }
+        },
+      }, [
+        el("span", { class: "chat-session-menu-row-date", text: date }),
+        el("span", { class: "chat-session-menu-row-label", text: preview }),
+        el("span", { class: "chat-session-menu-row-count", text: String(item.turnCount) }),
+        // status: chat-session-trash
+        el("button", {
+          class: "chat-session-menu-row-trash",
+          title: "Move session to trash",
+          html: Icons.trash(),
+          attrs: { type: "button", "aria-label": "Move session to trash" },
+          onClick: (ev) => {
+            ev.stopPropagation();
+            void doDeleteSession(item.sessionId, item.isActive);
+          },
+        }),
+      ]));
     }
 
     // Position above the trigger; the popover floats absolutely against
@@ -600,7 +558,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       activeTurnId = null;
       pausedAtCap = false;
       renderState.assistantBubble = null;
-      renderState.toolCards.clear();
+      toolCards.clear();
       transcriptEl.replaceChildren();
       inputEl.value = "";
       autoSizeInput();
@@ -628,7 +586,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       pausedAtCap = false;
       thinkingEl = null;
       renderState.assistantBubble = null;
-      renderState.toolCards.clear();
+      toolCards.clear();
       transcriptEl.replaceChildren();
       setSessionLabel("New session");
     }
@@ -663,16 +621,11 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
 
   function ensureAssistantBubble(): { body: HTMLElement; mdView: ChatMarkdownView } {
     if (renderState.assistantBubble) return renderState.assistantBubble;
-    const wrap = document.createElement("div");
-    wrap.className = "chat-msg chat-msg-assistant";
-    const role = document.createElement("span");
-    role.className = "chat-msg-role";
-    role.textContent = "Agent";
-    const body = document.createElement("div");
-    body.className = "chat-msg-body";
-    wrap.appendChild(role);
-    wrap.appendChild(body);
-    transcriptEl.appendChild(wrap);
+    const body = el("div", { class: "chat-msg-body" });
+    transcriptEl.appendChild(el("div", { class: "chat-msg chat-msg-assistant" }, [
+      el("span", { class: "chat-msg-role", text: "Agent" }),
+      body,
+    ]));
     const mdView = mountChatMarkdown({
       host: body,
       onOpenNoteLink,
@@ -683,10 +636,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   }
 
   function appendUserMessage(text: string): void {
-    const wrap = document.createElement("div");
-    wrap.className = "chat-msg chat-msg-user";
-    wrap.textContent = text;
-    transcriptEl.appendChild(wrap);
+    transcriptEl.appendChild(el("div", { class: "chat-msg chat-msg-user", text }));
     scrollToBottom();
     renderState.assistantBubble = null;
   }
@@ -697,395 +647,34 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     scrollToBottom();
   }
 
-  function appendToolCallStart(callId: string, toolName: string): void {
-    const card = document.createElement("div");
-    card.className = "chat-tool-call collapsed";
-
-    const head = document.createElement("div");
-    head.className = "chat-tool-call-head";
-    head.setAttribute("role", "button");
-    head.tabIndex = 0;
-
-    const chevron = document.createElement("span");
-    chevron.className = "chat-tool-call-chevron";
-    chevron.textContent = "▸";
-    const glyph = document.createElement("span");
-    glyph.className = "chat-tool-call-glyph";
-    glyph.textContent = "⏳";
-    const nameEl = document.createElement("span");
-    nameEl.className = "chat-tool-call-name";
-    nameEl.textContent = toolName;
-    const argsSummary = document.createElement("span");
-    argsSummary.className = "chat-tool-call-args-summary";
-    argsSummary.textContent = "()";
-    const resultSummary = document.createElement("span");
-    resultSummary.className = "chat-tool-call-result-summary";
-
-    head.append(chevron, glyph, nameEl, argsSummary, resultSummary);
-
-    const expanded = document.createElement("div");
-    expanded.className = "chat-tool-call-expanded";
-    expanded.hidden = true;
-
-    card.append(head, expanded);
-    transcriptEl.appendChild(card);
-
-    const els: ToolCardEls = {
-      root: card,
-      headEl: head,
-      glyphEl: glyph,
-      nameEl,
-      argsSummaryEl: argsSummary,
-      resultSummaryEl: resultSummary,
-      expandedEl: expanded,
-      toolName,
-      argsBuf: "",
-      finalArgs: null,
-      result: null,
-      expanded: false,
-      touched: null,
-    };
-    // Chevron click expands; clicks elsewhere on the head route through
-    // `handleHeadClick`, which opens the touched note (or its staged
-    // proposal) for note-touching tool calls and falls back to toggling
-    // for everything else. The Accept/Reject button cluster, when
-    // present, lives inside the head and stops propagation itself.
-    // Pairs with `chat-tool-call-opens-touched-note` (still planned;
-    // this lands the routing seam plus the staged-write prong from
-    // `bug-chat-tool-card-no-link-for-staged-writes`).
-    chevron.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      toggleCard(els);
-    });
-    head.addEventListener("click", () => handleHeadClick(els));
-    head.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") {
-        ev.preventDefault();
-        handleHeadClick(els);
-      }
-    });
-
-    renderState.toolCards.set(callId, els);
-    scrollToBottom();
-    renderState.assistantBubble = null;
-  }
-
-  // Tools whose successful result identifies a single touched note.
-  // `chat-tool-call-opens-touched-note` resolution-rule tool list;
-  // `edit_note` is included per
-  // `bug-chat-tool-card-no-link-for-staged-writes`.
-  const TOUCHED_NOTE_TOOLS = new Set<string>([
-    "get_note",
-    "write_note",
-    "edit_note",
-    "set_frontmatter",
-    "apply_tag",
-    "remove_tag",
-  ]);
-
-  function handleHeadClick(c: ToolCardEls): void {
-    if (!c.touched) {
-      toggleCard(c);
-      return;
-    }
-    const stagedId = c.touched.stagingIds.find((id) => pendingStagingIds.has(id));
-    if (stagedId) {
-      // Staged: route through the staging-preview seam so the host
-      // lands the user in the appropriate review surface
-      // (`note-open-routes-to-pending-review`). Single seam for both
-      // `write_note` (singular `staging_id`) and `edit_note` (N
-      // `staging_ids` sharing a `batch_id`) — `openProposalReview` walks
-      // through `openFile`, which auto-routes by action.
-      onOpenStagingProposal({ id: stagedId, target_path: c.touched.targetPath });
-      return;
-    }
-    // Not staged (or staging proposal already resolved): the file
-    // exists on disk; open it directly.
-    onOpenNoteLink(c.touched.targetPath);
-  }
-
-  function toggleCard(c: ToolCardEls): void {
-    c.expanded = !c.expanded;
-    c.root.classList.toggle("collapsed", !c.expanded);
-    c.expandedEl.hidden = !c.expanded;
-    if (c.expanded) {
-      renderExpanded(c);
-    }
-  }
-
-  function renderExpanded(c: ToolCardEls): void {
-    c.expandedEl.replaceChildren();
-    const argsPre = document.createElement("pre");
-    argsPre.className = "chat-tool-call-json";
-    argsPre.textContent = `args:\n${prettyJson(c.finalArgs ?? c.argsBuf)}`;
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "chat-tool-call-copy";
-    copy.textContent = "Copy";
-    copy.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      void navigator.clipboard.writeText(argsPre.textContent ?? "");
-    });
-    c.expandedEl.append(argsPre, copy);
-    if (c.result) {
-      const resPre = document.createElement("pre");
-      resPre.className = "chat-tool-call-json";
-      resPre.textContent = `result (${c.result.ok ? "ok" : "fail"}):\n${c.result.summary}`;
-      c.expandedEl.append(resPre);
-    }
-  }
-
-  function prettyJson(s: string): string {
-    if (!s.trim()) return "(empty)";
-    try {
-      return JSON.stringify(JSON.parse(s), null, 2);
-    } catch {
-      return s;
-    }
-  }
-
-  function appendToolCallArgsDelta(callId: string, delta: string): void {
-    const c = renderState.toolCards.get(callId);
-    if (!c) return;
-    c.argsBuf += delta;
-    // Don't re-render the summary on every delta; stream-time summaries
-    // would churn. We update once on `tool_call_complete`.
-  }
-
-  function appendToolCallComplete(callId: string, args: string): void {
-    const c = renderState.toolCards.get(callId);
-    if (!c) return;
-    c.finalArgs = args;
-    c.argsSummaryEl.textContent = `(${shortenArgs(args)})`;
-    if (c.expanded) renderExpanded(c);
-  }
-
-  function shortenArgs(args: string): string {
-    let parsed: Record<string, unknown> | null = null;
-    try {
-      const v = JSON.parse(args);
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        parsed = v as Record<string, unknown>;
-      }
-    } catch {
-      /* fall through */
-    }
-    if (!parsed) {
-      const trimmed = args.replace(/\s+/g, " ").trim();
-      return trimmed.length > 80 ? trimmed.slice(0, 79) + "…" : trimmed;
-    }
-    const pairs: string[] = [];
-    let used = 0;
-    for (const [k, v] of Object.entries(parsed)) {
-      const repr = JSON.stringify(v) ?? String(v);
-      const tail = repr.length > 30 ? repr.slice(0, 29) + "…" : repr;
-      const piece = `${k}: ${tail}`;
-      pairs.push(piece);
-      used += piece.length + 2;
-      if (pairs.length >= 2 || used > 60) break;
-    }
-    let out = pairs.join(", ");
-    if (Object.keys(parsed).length > pairs.length) out += ", …";
-    return out.length > 80 ? out.slice(0, 79) + "…" : out;
-  }
-
-  function appendToolResult(callId: string, ok: boolean, summary: string, output?: string): void {
-    const c = renderState.toolCards.get(callId);
-    if (!c) return;
-    c.result = { ok, summary };
-    c.glyphEl.textContent = ok ? "✓" : "✗";
-    c.resultSummaryEl.textContent = ` — ${summary}`;
-    c.resultSummaryEl.classList.toggle("ok", ok);
-    c.resultSummaryEl.classList.toggle("fail", !ok);
-    // Resolve touched-note routing for note-touching tool calls so the
-    // head-click opens the right surface
-    // (`chat-tool-call-opens-touched-note`).
-    c.touched = resolveTouchedNote(c, output);
-    c.headEl.classList.toggle("has-touched", c.touched !== null);
-    renderActionButtons(c);
-    if (c.expanded) renderExpanded(c);
-    scrollToBottom();
-  }
-
-  /// Parse the tool result's JSON output and extract touched-note
-  /// routing info for note-touching tools. Resolution rule per
-  /// `chat-tool-call-opens-touched-note`: prefer the result's
-  /// `rel_path` / `path` field; fall back to the call's args. Carries
-  /// `staging_id` (write_note / set_frontmatter / apply_tag) and/or
-  /// `staging_ids` (edit_note) when the result is staged.
-  function resolveTouchedNote(c: ToolCardEls, output?: string): TouchedNoteRouting | null {
-    if (!c.result?.ok) return null;
-    if (!TOUCHED_NOTE_TOOLS.has(c.toolName)) return null;
-
-    let parsed: Record<string, unknown> | null = null;
-    if (output) {
-      try {
-        const v = JSON.parse(output);
-        if (v && typeof v === "object" && !Array.isArray(v)) {
-          parsed = v as Record<string, unknown>;
-        }
-      } catch {
-        /* fall through to args fallback */
-      }
-    }
-
-    const targetPath =
-      pickRelPath(parsed) ?? pickRelPathFromArgs(c.finalArgs ?? c.argsBuf);
-    if (!targetPath) return null;
-
-    const stagingIds: string[] = [];
-    if (parsed) {
-      const sid = parsed.staging_id;
-      if (typeof sid === "string" && sid) stagingIds.push(sid);
-      const sids = parsed.staging_ids;
-      if (Array.isArray(sids)) {
-        for (const v of sids) if (typeof v === "string" && v) stagingIds.push(v);
-      }
-    }
-    return { targetPath, stagingIds };
-  }
-
-  function pickRelPath(obj: Record<string, unknown> | null): string | null {
-    if (!obj) return null;
-    for (const k of ["rel_path", "path"]) {
-      const v = obj[k];
-      if (typeof v === "string" && v) return v;
-    }
-    return null;
-  }
-
-  function pickRelPathFromArgs(argsJson: string): string | null {
-    if (!argsJson.trim()) return null;
-    try {
-      const v = JSON.parse(argsJson);
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        return pickRelPath(v as Record<string, unknown>);
-      }
-    } catch {
-      /* ignore */
-    }
-    return null;
-  }
-
-  /// (Re-)render the Accept/Reject button cluster on the card head from
-  /// the current pending-staging set. Called from `appendToolResult` and
-  /// from the `hiker:staging-changed` listener so a cross-surface
-  /// accept/reject in another surface clears the buttons live
-  /// (`bug-chat-tool-card-stale-after-cross-surface-accept`).
-  function renderActionButtons(c: ToolCardEls): void {
-    const prevAction = c.headEl.querySelector(".chat-tool-call-action");
-    if (prevAction) prevAction.remove();
-    if (!c.touched) return;
-    const liveStagedIds = c.touched.stagingIds.filter((id) =>
-      pendingStagingIds.has(id),
-    );
-    if (liveStagedIds.length === 0) return;
-
-    // status: staging-accept-reject-from-chat-card
-    const actionEl = document.createElement("span");
-    actionEl.className = "chat-tool-call-action";
-    // Stop click propagation so the head's open-note routing doesn't
-    // fire when the user clicks Accept / Reject (the buttons live
-    // inside the head element).
-    actionEl.addEventListener("click", (ev) => ev.stopPropagation());
-
-    // `bug-write-note-review-accept-stale-proposal-id`: the captured
-    // `staging_id` can go stale when a write_note proposal is replayed
-    // / reissued through staging churn. For whole-file proposals
-    // (single captured id), refresh by `(target_path, action)` and
-    // pick the newest. For batch (`edit_note`) shapes the captured
-    // ids are still the source of truth — they're authoritative until
-    // accepted/rejected (staged once per `propose_batch`).
-    const resolveLiveProposalIds = async (): Promise<string[]> => {
-      if (!c.touched) return liveStagedIds;
-      if (liveStagedIds.length !== 1) return liveStagedIds;
-      const captured = liveStagedIds[0];
-      const targetPath = c.touched.targetPath;
-      try {
-        const live = await Ipc.stagingList({ path: targetPath });
-        const matches = live.filter(
-          (p) => p.action === c.toolName && p.target_path === targetPath,
-        );
-        if (matches.length === 0) return [captured];
-        if (matches.some((p) => p.id === captured)) return [captured];
-        matches.sort((a, b) => b.created_at_ms - a.created_at_ms);
-        return [matches[0].id];
-      } catch {
-        return [captured];
-      }
-    };
-
-    const acceptBtn = document.createElement("button");
-    acceptBtn.className = "chat-tool-call-action-accept";
-    acceptBtn.textContent = "Accept";
-    acceptBtn.addEventListener("click", async () => {
-      try {
-        const ids = await resolveLiveProposalIds();
-        let target = c.touched?.targetPath ?? null;
-        for (const id of ids) {
-          const outcome = await Ipc.stagingAccept({ proposalId: id });
-          target = outcome.target_path;
-        }
-        if (target) onOpenNoteLink(target);
-      } catch {
-        /* host listener will surface failure via toast on the IPC layer */
-      }
-      // Optimistic UX update; the `hiker:staging-changed` listener
-      // re-renders us authoritatively right after.
-      c.resultSummaryEl.textContent = " — ✓ Applied";
-      c.resultSummaryEl.classList.add("ok");
-      c.resultSummaryEl.classList.remove("fail");
-    });
-
-    const rejectBtn = document.createElement("button");
-    rejectBtn.className = "chat-tool-call-action-reject";
-    rejectBtn.textContent = "Reject";
-    rejectBtn.addEventListener("click", async () => {
-      try {
-        const ids = await resolveLiveProposalIds();
-        for (const id of ids) {
-          await Ipc.stagingReject({ proposalId: id });
-        }
-      } catch {
-        /* host listener will surface failure via toast on the IPC layer */
-      }
-      c.resultSummaryEl.textContent = " — ✗ Rejected";
-      c.glyphEl.textContent = "✗";
-      c.resultSummaryEl.classList.add("fail");
-      c.resultSummaryEl.classList.remove("ok");
-    });
-
-    actionEl.append(acceptBtn, rejectBtn);
-    c.headEl.appendChild(actionEl);
-  }
-
   function appendCapRow(turnId: string, completed: number): void {
-    const row = document.createElement("div");
-    row.className = "chat-cap-row";
-    const text = document.createElement("span");
-    text.textContent = `Agent has made ${completed} tool calls — `;
-    const cont = document.createElement("button");
-    cont.textContent = "Continue";
-    cont.addEventListener("click", () => {
-      row.remove();
-      pausedAtCap = false;
-      void Ipc.chatContinue({
-        sessionId: activeSessionId,
-        turnId,
-      });
-      setBusy(true);
-    });
-    const stop = document.createElement("button");
-    stop.textContent = "Stop";
-    stop.addEventListener("click", () => {
-      row.remove();
-      pausedAtCap = false;
-      void Ipc.chatStop({
-        sessionId: activeSessionId,
-        turnId,
-      });
-    });
-    row.append(text, cont, stop);
+    const row = el("div", { class: "chat-cap-row" });
+    row.append(
+      el("span", { text: `Agent has made ${completed} tool calls — ` }),
+      el("button", {
+        text: "Continue",
+        onClick: () => {
+          row.remove();
+          pausedAtCap = false;
+          void Ipc.chatContinue({
+            sessionId: activeSessionId,
+            turnId,
+          });
+          setBusy(true);
+        },
+      }),
+      el("button", {
+        text: "Stop",
+        onClick: () => {
+          row.remove();
+          pausedAtCap = false;
+          void Ipc.chatStop({
+            sessionId: activeSessionId,
+            turnId,
+          });
+        },
+      }),
+    );
     transcriptEl.appendChild(row);
     pausedAtCap = true;
     scrollToBottom();
@@ -1096,18 +685,12 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   }
 
   function appendError(message: string): void {
-    const row = document.createElement("div");
-    row.className = "chat-msg-error";
-    row.textContent = message;
-    transcriptEl.appendChild(row);
+    transcriptEl.appendChild(el("div", { class: "chat-msg-error", text: message }));
     scrollToBottom();
   }
 
   function appendSystemRow(message: string): void {
-    const row = document.createElement("div");
-    row.className = "chat-msg-system";
-    row.textContent = message;
-    transcriptEl.appendChild(row);
+    transcriptEl.appendChild(el("div", { class: "chat-msg-system", text: message }));
     scrollToBottom();
   }
 
@@ -1126,17 +709,16 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   // text nodes; the pulse is pure CSS.
   function showThinking(): void {
     if (thinkingEl) return;
-    const el = document.createElement("div");
-    el.className = "chat-msg chat-msg-thinking";
-    el.setAttribute("aria-label", "Agent is thinking");
+    const dots: HTMLElement[] = [];
     for (let i = 0; i < 3; i++) {
-      const dot = document.createElement("span");
-      dot.className = "chat-thinking-dot";
-      dot.textContent = "•";
-      el.appendChild(dot);
+      dots.push(el("span", { class: "chat-thinking-dot", text: "•" }));
     }
-    transcriptEl.appendChild(el);
-    thinkingEl = el;
+    const node = el("div", {
+      class: "chat-msg chat-msg-thinking",
+      attrs: { "aria-label": "Agent is thinking" },
+    }, dots);
+    transcriptEl.appendChild(node);
+    thinkingEl = node;
     scrollToBottom();
   }
 
@@ -1164,16 +746,16 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       case "tool_call_start":
         // Tool card is also content for the spec's purposes.
         hideThinking();
-        appendToolCallStart(ev.call_id, ev.tool_name);
+        toolCards.appendToolCallStart(ev.call_id, ev.tool_name);
         break;
       case "tool_call_args_delta":
-        appendToolCallArgsDelta(ev.call_id, ev.args_delta);
+        toolCards.appendToolCallArgsDelta(ev.call_id, ev.args_delta);
         break;
       case "tool_call_complete":
-        appendToolCallComplete(ev.call_id, ev.args);
+        toolCards.appendToolCallComplete(ev.call_id, ev.args);
         break;
       case "tool_result":
-        appendToolResult(ev.call_id, ev.ok, ev.summary, ev.output);
+        toolCards.appendToolResult(ev.call_id, ev.ok, ev.summary, ev.output);
         // Tool returned → model goes quiet again until the next step's
         // first TextDelta / ToolCallStart. Show the indicator so the
         // pause is visible rather than implied.
@@ -1206,8 +788,8 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     }
   }
 
-  void listen<AgentEvent>("hiker:chat-event", (event) => {
-    handleEvent(event.payload);
+  void onHikerEventAs<AgentEvent>("hiker:chat-event", (payload) => {
+    handleEvent(payload);
   });
 
   // ---------- resize ----------
@@ -1252,11 +834,14 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   // Create a resize handle just above the chat input form. Mirrors the
   // shape of `#chat-resize-handle` one level up: a thin horizontal grab
   // bar that the user drags to grow/shrink the input area.
-  const inputResizeEl = document.createElement("div");
-  inputResizeEl.className = "chat-input-resize-handle";
-  inputResizeEl.setAttribute("role", "separator");
-  inputResizeEl.setAttribute("aria-orientation", "horizontal");
-  inputResizeEl.setAttribute("aria-label", "Resize chat input");
+  const inputResizeEl = el("div", {
+    class: "chat-input-resize-handle",
+    attrs: {
+      role: "separator",
+      "aria-orientation": "horizontal",
+      "aria-label": "Resize chat input",
+    },
+  });
   formEl.before(inputResizeEl);
 
   let inputDragStartY = 0;
@@ -1361,7 +946,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
       pausedAtCap = false;
       thinkingEl = null;
       renderState.assistantBubble = null;
-      renderState.toolCards.clear();
+      toolCards.clear();
       transcriptEl.replaceChildren();
       inputEl.value = "";
       autoSizeInput();
@@ -1379,7 +964,7 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
     pausedAtCap = false;
     thinkingEl = null;
     renderState.assistantBubble = null;
-    renderState.toolCards.clear();
+    toolCards.clear();
     transcriptEl.replaceChildren();
     if (!active) {
       activeSessionId = null;
@@ -1401,32 +986,6 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   // `scrollHeight` reads the laid-out element rather than a zero-width
   // / display-pending state.
   requestAnimationFrame(() => autoSizeInput());
-}
-
-function shortLabel(s: string, max: number): string {
-  const one = s.split(/\r?\n/, 1)[0] ?? "";
-  if (one.length <= max) return one;
-  return one.slice(0, max - 1) + "…";
-}
-
-function formatShortDate(unix: number): string {
-  if (!unix) return "";
-  const d = new Date(unix * 1000);
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${m}-${day}`;
-}
-
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
-}
-
-function describeErr(e: unknown): string {
-  if (typeof e === "string") return e;
-  if (e && typeof e === "object" && "message" in e) {
-    return String((e as { message: unknown }).message);
-  }
-  return JSON.stringify(e);
 }
 
 export type { AgentEvent, FinishReason, ActiveSessionDto };

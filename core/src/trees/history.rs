@@ -20,19 +20,19 @@ impl Trees {
         let args_json = serde_json::to_string(args)?;
         let undo_json = serde_json::to_string(undo_args)?;
         let now = now_ms();
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let next_seq: i64 = conn
-            .query_row(
+        self.with_conn(|conn| {
+            let next_seq: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM cluster_tree_history WHERE tree_id = ?1",
                 params![tree_id],
                 |row| row.get(0),
             )?;
-        conn.execute(
-            "INSERT INTO cluster_tree_history (tree_id, seq, ts_ms, op, args, undo_args)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![tree_id, next_seq, now, op, args_json, undo_json],
-        )?;
-        Ok(next_seq)
+            conn.execute(
+                "INSERT INTO cluster_tree_history (tree_id, seq, ts_ms, op, args, undo_args)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![tree_id, next_seq, now, op, args_json, undo_json],
+            )?;
+            Ok(next_seq)
+        })
     }
 
     /// Record a `split-cluster` history entry. Caller (cluster editor)
@@ -99,6 +99,11 @@ impl Trees {
     ///
     /// status: cluster-editor-recluster-subtree
     /// status: cluster-editor-recluster-subtree-policy-loss
+    // Each parameter is a distinct history-recording payload (root id,
+    // prior-subtree snapshot, prior leaf parentage, new node rows, leaf
+    // moves, carried policy) with no natural grouping — bundling would be
+    // a cosmetic rename of the call site, so allow the lint here.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_recluster_subtree(
         &self,
         tree_id: &str,
@@ -152,15 +157,44 @@ impl Trees {
     /// when the log is empty). Used by undo: caller reads `entry.op` +
     /// `entry.undo_args` and inverts the change.
     pub fn pop_last_history(&self, tree_id: &str) -> Result<Option<HistoryEntry>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let entry: Option<HistoryEntry> = conn
-            .query_row(
-                "SELECT seq, ts_ms, op, args, undo_args
-                 FROM cluster_tree_history
-                 WHERE tree_id = ?1
-                 ORDER BY seq DESC LIMIT 1",
-                params![tree_id],
-                |row| {
+        self.with_conn(|conn| {
+            let entry: Option<HistoryEntry> = conn
+                .query_row(
+                    "SELECT seq, ts_ms, op, args, undo_args
+                     FROM cluster_tree_history
+                     WHERE tree_id = ?1
+                     ORDER BY seq DESC LIMIT 1",
+                    params![tree_id],
+                    |row| {
+                        Ok(HistoryEntry {
+                            seq: row.get(0)?,
+                            ts_ms: row.get(1)?,
+                            op: row.get(2)?,
+                            args_json: row.get(3)?,
+                            undo_args_json: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(e) = &entry {
+                conn.execute(
+                    "DELETE FROM cluster_tree_history WHERE tree_id = ?1 AND seq = ?2",
+                    params![tree_id, e.seq],
+                )?;
+            }
+            Ok(entry)
+        })
+    }
+
+    /// Read the history log for a tree, oldest first.
+    pub fn history(&self, tree_id: &str) -> Result<Vec<HistoryEntry>, TreesError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, ts_ms, op, args, undo_args FROM cluster_tree_history
+                 WHERE tree_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![tree_id], |row| {
                     Ok(HistoryEntry {
                         seq: row.get(0)?,
                         ts_ms: row.get(1)?,
@@ -168,36 +202,9 @@ impl Trees {
                         args_json: row.get(3)?,
                         undo_args_json: row.get(4)?,
                     })
-                },
-            )
-            .optional()?;
-        if let Some(e) = &entry {
-            conn.execute(
-                "DELETE FROM cluster_tree_history WHERE tree_id = ?1 AND seq = ?2",
-                params![tree_id, e.seq],
-            )?;
-        }
-        Ok(entry)
-    }
-
-    /// Read the history log for a tree, oldest first.
-    pub fn history(&self, tree_id: &str) -> Result<Vec<HistoryEntry>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT seq, ts_ms, op, args, undo_args FROM cluster_tree_history
-             WHERE tree_id = ?1 ORDER BY seq ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![tree_id], |row| {
-                Ok(HistoryEntry {
-                    seq: row.get(0)?,
-                    ts_ms: row.get(1)?,
-                    op: row.get(2)?,
-                    args_json: row.get(3)?,
-                    undo_args_json: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 }

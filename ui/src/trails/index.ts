@@ -48,6 +48,7 @@ import {
 import { Icons } from "../icons";
 import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
+import { el } from "../widgets/dom";
 import { confirmDanger } from "../widgets/confirm";
 import { activeTrailStore } from "../app/state";
 
@@ -303,57 +304,51 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
   }
 
   function renderHeader(): HTMLElement {
-    const header = document.createElement("div");
-    header.className = "trails-header";
-
-    const dropdownBtn = document.createElement("button");
-    dropdownBtn.type = "button";
-    dropdownBtn.className = "trails-dropdown-btn";
-    dropdownBtn.textContent = `${dropdownLabel()} ▾`;
-    dropdownBtn.title = "Active trail";
-    dropdownBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openTrailDropdown(dropdownBtn);
-    });
-    header.appendChild(dropdownBtn);
-
-    // status: trails-mode-trail-head-icon — squiggly-trail icon button.
-    const headBtn = document.createElement("button");
-    headBtn.type = "button";
-    headBtn.className = "trails-head-btn";
-    headBtn.title = "Open trail-doc";
-    headBtn.setAttribute("aria-label", "Open trail-doc");
-    headBtn.innerHTML = Icons.trail({ size: 14 });
     const activeRel = activeTrailRel();
-    headBtn.disabled = activeRel === null;
-    headBtn.addEventListener("click", () => {
-      const rel = activeTrailRel();
-      if (rel === null) return;
-      void deps.openNote(rel, { preview: true });
-    });
-    header.appendChild(headBtn);
-
-    // "Expand all" toggle.
-    const expandBtn = document.createElement("button");
-    expandBtn.type = "button";
-    expandBtn.className = "trails-expand-all-btn";
-    expandBtn.textContent = expandAll ? "▾" : "▸";
-    expandBtn.title = expandAll ? "Collapse all" : "Expand all";
-    expandBtn.setAttribute(
-      "aria-label",
-      expandAll ? "Collapse all" : "Expand all",
-    );
     const hasWaypoints =
       detailCache !== null && detailCache.waypoints.length > 0;
-    expandBtn.disabled = !hasWaypoints;
-    expandBtn.addEventListener("click", () => {
-      expandAll = !expandAll;
-      if (!expandAll) expandedWaypointId = null;
-      paint();
+    const dropdownBtn = el("button", {
+      class: "trails-dropdown-btn",
+      text: `${dropdownLabel()} ▾`,
+      title: "Active trail",
+      attrs: { type: "button" },
+      onClick: (e) => {
+        e.stopPropagation();
+        openTrailDropdown(dropdownBtn);
+      },
     });
-    header.appendChild(expandBtn);
-
-    return header;
+    return el("div", { class: "trails-header" }, [
+      dropdownBtn,
+      // status: trails-mode-trail-head-icon — squiggly-trail icon button.
+      el("button", {
+        class: "trails-head-btn",
+        title: "Open trail-doc",
+        html: Icons.trail({ size: 14 }),
+        attrs: { type: "button", "aria-label": "Open trail-doc" },
+        disabled: activeRel === null,
+        onClick: () => {
+          const rel = activeTrailRel();
+          if (rel === null) return;
+          void deps.openNote(rel, { preview: true });
+        },
+      }),
+      // "Expand all" toggle.
+      el("button", {
+        class: "trails-expand-all-btn",
+        text: expandAll ? "▾" : "▸",
+        title: expandAll ? "Collapse all" : "Expand all",
+        attrs: {
+          type: "button",
+          "aria-label": expandAll ? "Collapse all" : "Expand all",
+        },
+        disabled: !hasWaypoints,
+        onClick: () => {
+          expandAll = !expandAll;
+          if (!expandAll) expandedWaypointId = null;
+          paint();
+        },
+      }),
+    ]);
   }
 
   // status: trail-append-cursor-indicator — header hint row beneath
@@ -363,29 +358,28 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     const activeRel = activeTrailRel();
     if (activeRel === null) return null;
     if (detailCache === null) return null;
-    const row = document.createElement("div");
-    row.className = "trails-cursor-hint";
     const cursorId = detailCache.append_under;
     const basename = cursorId !== null ? cursorBasename() : null;
     if (cursorId === null || basename === null) {
       // Cursor null OR stale (id doesn't resolve in current tree); the
       // next append self-heals so treat as main-line visually.
-      row.textContent = "Appending to main line";
-      return row;
+      return el("div", {
+        class: "trails-cursor-hint",
+        text: "Appending to main line",
+      });
     }
-    const label = document.createElement("span");
-    label.textContent = `Appending under ${basename}`;
-    row.appendChild(label);
-    const resetBtn = document.createElement("button");
-    resetBtn.type = "button";
-    resetBtn.className = "trails-cursor-reset-btn";
-    resetBtn.textContent = "Reset to main line";
-    resetBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void resetCursor();
-    });
-    row.appendChild(resetBtn);
-    return row;
+    return el("div", { class: "trails-cursor-hint" }, [
+      el("span", { text: `Appending under ${basename}` }),
+      el("button", {
+        class: "trails-cursor-reset-btn",
+        text: "Reset to main line",
+        attrs: { type: "button" },
+        onClick: (e) => {
+          e.stopPropagation();
+          void resetCursor();
+        },
+      }),
+    ]);
   }
 
   function renderEmptyState(): HTMLElement {
@@ -393,47 +387,44 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     // the vault, no active trail (but trails exist), active trail with
     // zero waypoints. Orphan-only / partial-orphan trails just render
     // their cards (orphan ones styled per `trails-mode-orphan-card`).
-    const wrap = document.createElement("div");
-    wrap.className = "trails-empty";
     const activeRel = activeTrailRel();
     if (listCache.length === 0) {
-      const p = document.createElement("p");
-      p.textContent = "No trails in this vault yet.";
-      wrap.appendChild(p);
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = "Create a trail";
-      btn.addEventListener("click", () => void createNewTrailAndActivate());
-      wrap.appendChild(btn);
-      return wrap;
+      return el("div", { class: "trails-empty" }, [
+        el("p", { text: "No trails in this vault yet." }),
+        el("button", {
+          text: "Create a trail",
+          attrs: { type: "button" },
+          onClick: () => void createNewTrailAndActivate(),
+        }),
+      ]);
     }
     if (activeRel === null) {
-      const p = document.createElement("p");
-      p.textContent = "Pick a trail to walk from the dropdown above.";
-      wrap.appendChild(p);
-      return wrap;
+      return el("div", { class: "trails-empty" }, [
+        el("p", { text: "Pick a trail to walk from the dropdown above." }),
+      ]);
     }
     if (detailCache !== null && detailCache.waypoints.length === 0) {
-      const p = document.createElement("p");
-      p.textContent =
-        "Empty trail — capture into it or use + to add the first waypoint.";
-      wrap.appendChild(p);
-      return wrap;
+      return el("div", { class: "trails-empty" }, [
+        el("p", {
+          text: "Empty trail — capture into it or use + to add the first waypoint.",
+        }),
+      ]);
     }
-    return wrap;
+    return el("div", { class: "trails-empty" });
   }
 
   function renderWaypointCard(w: ResolvedWaypoint): HTMLElement {
-    const card = document.createElement("div");
-    card.className = "waypoint-card";
-    card.dataset.waypointId = w.waypoint_id;
     const orphan = isOrphanLike(w.resolution);
-    if (orphan) card.classList.add("orphan");
     const expanded = expandAll || expandedWaypointId === w.waypoint_id;
-    if (expanded) card.classList.add("expanded");
+    const classes = ["waypoint-card"];
+    if (orphan) classes.push("orphan");
+    if (expanded) classes.push("expanded");
+    const card = el("div", {
+      class: classes.join(" "),
+      data: { waypointId: w.waypoint_id },
+    });
 
-    const head = document.createElement("div");
-    head.className = "waypoint-card-head";
+    const head = el("div", { class: "waypoint-card-head" });
 
     const hasChildren = (w.children?.length ?? 0) > 0;
     const sideCollapsed = sideTrailCollapsed.has(w.waypoint_id);
@@ -444,32 +435,31 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     // so it's visually distinct from the body-expand chevron on the
     // right edge of the card.
     if (hasChildren) {
-      const sideChev = document.createElement("button");
-      sideChev.type = "button";
-      sideChev.className = "waypoint-card-side-chevron";
-      sideChev.textContent = sideCollapsed ? "▸" : "▾";
-      sideChev.title = sideCollapsed ? "Expand side trail" : "Collapse side trail";
-      sideChev.setAttribute(
-        "aria-label",
-        sideCollapsed ? "Expand side trail" : "Collapse side trail",
-      );
-      sideChev.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (sideCollapsed) {
-          sideTrailCollapsed.delete(w.waypoint_id);
-        } else {
-          sideTrailCollapsed.add(w.waypoint_id);
-        }
-        paint();
-      });
-      head.appendChild(sideChev);
+      head.appendChild(el("button", {
+        class: "waypoint-card-side-chevron",
+        text: sideCollapsed ? "▸" : "▾",
+        title: sideCollapsed ? "Expand side trail" : "Collapse side trail",
+        attrs: {
+          type: "button",
+          "aria-label": sideCollapsed ? "Expand side trail" : "Collapse side trail",
+        },
+        onClick: (e) => {
+          e.stopPropagation();
+          if (sideCollapsed) {
+            sideTrailCollapsed.delete(w.waypoint_id);
+          } else {
+            sideTrailCollapsed.add(w.waypoint_id);
+          }
+          paint();
+        },
+      }));
     }
 
-    const seq = document.createElement("span");
-    seq.className = "waypoint-card-seq";
-    // tree_path is the dotted 1-based ordinal ("1", "1.2", "1.2.1").
-    seq.textContent = w.tree_path;
-    head.appendChild(seq);
+    head.appendChild(el("span", {
+      class: "waypoint-card-seq",
+      // tree_path is the dotted 1-based ordinal ("1", "1.2", "1.2.1").
+      text: w.tree_path,
+    }));
 
     // status: trail-append-cursor-indicator — little-person glyph in
     // the card head when this waypoint is the append cursor. Same
@@ -478,27 +468,28 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     const isCursor =
       detailCache !== null && detailCache.append_under === w.waypoint_id;
     if (isCursor) {
-      const cursorGlyph = document.createElement("span");
-      cursorGlyph.className = "waypoint-card-cursor-indicator";
-      cursorGlyph.setAttribute("aria-label", "append cursor");
-      cursorGlyph.title = "Next append lands here";
-      cursorGlyph.innerHTML = Icons.user({ size: 12 });
-      head.appendChild(cursorGlyph);
+      head.appendChild(el("span", {
+        class: "waypoint-card-cursor-indicator",
+        title: "Next append lands here",
+        html: Icons.user({ size: 12 }),
+        attrs: { "aria-label": "append cursor" },
+      }));
     }
 
-    const basenameBtn = document.createElement("button");
-    basenameBtn.type = "button";
-    basenameBtn.className = "waypoint-card-basename";
-    basenameBtn.dataset.action = "open-source";
     const sourceRel = sourcePathFor(w);
-    basenameBtn.textContent = basenameOf(w.source_ref.path);
+    const basenameChildren: (ChildNode | string)[] = [basenameOf(w.source_ref.path)];
     if (orphan) {
-      const pill = document.createElement("span");
-      pill.className = "waypoint-card-pill";
-      pill.textContent = "broken reference";
-      basenameBtn.appendChild(document.createTextNode(" "));
-      basenameBtn.appendChild(pill);
+      basenameChildren.push(" ");
+      basenameChildren.push(el("span", {
+        class: "waypoint-card-pill",
+        text: "broken reference",
+      }));
     }
+    const basenameBtn = el("button", {
+      class: "waypoint-card-basename",
+      attrs: { type: "button" },
+      data: { action: "open-source" },
+    }, basenameChildren);
     basenameBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       if (orphan) {
@@ -512,40 +503,40 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     });
     head.appendChild(basenameBtn);
 
-    const chevron = document.createElement("span");
-    chevron.className = "waypoint-card-chevron";
-    chevron.textContent = expanded ? "▾" : "▸";
-    head.appendChild(chevron);
+    head.appendChild(el("span", {
+      class: "waypoint-card-chevron",
+      text: expanded ? "▾" : "▸",
+    }));
 
     card.appendChild(head);
 
     if (!expanded) {
       const snippet = firstNonEmptyLine(w.annotation_body);
       if (snippet.length > 0) {
-        const snip = document.createElement("div");
-        snip.className = "waypoint-card-snippet";
-        snip.textContent = snippet;
-        card.appendChild(snip);
+        card.appendChild(el("div", {
+          class: "waypoint-card-snippet",
+          text: snippet,
+        }));
       }
     } else {
-      const body = document.createElement("div");
-      body.className = "waypoint-card-body";
       // Plain-text rendering — markdown live-preview is out of scope
       // for this slice. Newlines preserved via `white-space: pre-wrap`
       // in CSS so users see the shape of their annotation.
-      body.textContent = w.annotation_body;
-      card.appendChild(body);
+      card.appendChild(el("div", {
+        class: "waypoint-card-body",
+        text: w.annotation_body,
+      }));
 
-      const editBtn = document.createElement("button");
-      editBtn.type = "button";
-      editBtn.className = "waypoint-card-edit";
-      editBtn.dataset.action = "open-waypoint";
-      editBtn.textContent = "edit annotation";
-      editBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void deps.openNote(w.waypoint_rel, { preview: true });
-      });
-      card.appendChild(editBtn);
+      card.appendChild(el("button", {
+        class: "waypoint-card-edit",
+        text: "edit annotation",
+        attrs: { type: "button" },
+        data: { action: "open-waypoint" },
+        onClick: (e) => {
+          e.stopPropagation();
+          void deps.openNote(w.waypoint_rel, { preview: true });
+        },
+      }));
     }
 
     // Card-body click toggles expansion (excluding clicks on inner
@@ -658,8 +649,7 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
     }
 
     if (detailCache !== null && detailCache.waypoints.length > 0) {
-      const cards = document.createElement("div");
-      cards.className = "trails-cards";
+      const cards = el("div", { class: "trails-cards" });
       // status: trails-mode-side-trail-render — render the recursive
       // waypoint tree directly; nested children render in a
       // `.trails-side-trail` block under their parent (one indent
@@ -675,17 +665,12 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
   // (when it has children and the side trail isn't collapsed) a
   // nested side-trail block holding each child rendered the same way.
   function renderWaypointBlock(w: ResolvedWaypoint): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "waypoint-block";
-    wrap.appendChild(renderWaypointCard(w));
+    const wrap = el("div", { class: "waypoint-block" }, [renderWaypointCard(w)]);
     const children = w.children ?? [];
     if (children.length > 0 && !sideTrailCollapsed.has(w.waypoint_id)) {
-      const nested = document.createElement("div");
-      nested.className = "trails-side-trail";
-      for (const c of children) {
-        nested.appendChild(renderWaypointBlock(c));
-      }
-      wrap.appendChild(nested);
+      wrap.appendChild(el("div", { class: "trails-side-trail" },
+        children.map((c) => renderWaypointBlock(c)),
+      ));
     }
     return wrap;
   }

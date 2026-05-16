@@ -10,6 +10,7 @@
 // primary content and the diff rendering. See docs/diff.md.
 
 import { Ipc, type DiffResult, type DiffLine } from "../ipc";
+import { describeErr } from "../ipc/runCommand";
 import { Compartment, type Extension, RangeSetBuilder } from "@codemirror/state";
 import { EditorView, Decoration, type DecorationSet } from "@codemirror/view";
 
@@ -212,15 +213,7 @@ function decorationsFor(view: EditorView, rows: Row[]): DecorationSet {
   return builder.finish();
 }
 
-function formatErr(err: unknown): string {
-  if (typeof err === "string") return err;
-  if (err && typeof err === "object") {
-    const e = err as { message?: unknown };
-    if (typeof e.message === "string") return e.message;
-    try { return JSON.stringify(err); } catch { /* fall through */ }
-  }
-  return String(err);
-}
+const formatErr = describeErr;
 
 /// Compute the diff for `input` (round-trips through `compute_diff` so the
 /// `similar` Myers algorithm runs in Rust per `diff-core-module`) and paint

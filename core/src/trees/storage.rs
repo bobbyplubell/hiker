@@ -39,6 +39,28 @@ impl Trees {
         &self.db_path
     }
 
+    /// Lock the connection mutex and run `f` against the shared
+    /// connection. Standardizes the lock + poisoning-error mapping that
+    /// every SQL call site used to spell inline; lock poisoning surfaces
+    /// as `TreesError::Poisoned` rather than panicking.
+    pub(super) fn with_conn<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, TreesError>,
+    ) -> Result<R, TreesError> {
+        let conn = self.conn.lock().map_err(|_| TreesError::Poisoned)?;
+        f(&conn)
+    }
+
+    /// Mutable counterpart of `with_conn`. Use this whenever the closure
+    /// needs `conn.transaction()` (which borrows `&mut Connection`).
+    pub(super) fn with_conn_mut<R>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<R, TreesError>,
+    ) -> Result<R, TreesError> {
+        let mut conn = self.conn.lock().map_err(|_| TreesError::Poisoned)?;
+        f(&mut conn)
+    }
+
     // ── Tree-level operations ────────────────────────────────────────
 
     /// Insert a new tree row. Returns the tree id (generated when the
@@ -46,59 +68,63 @@ impl Trees {
     pub fn insert_tree(&self, t: TreeInsert) -> Result<super::types::TreeId, TreesError> {
         let id = t.id.unwrap_or_else(crate::store::new_id);
         let now = now_ms();
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "INSERT INTO cluster_trees
-               (id, name, source, state, scope, method, created_at_ms, vault_snapshot)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                id,
-                t.name,
-                t.source,
-                t.state,
-                t.scope_json,
-                t.method_json,
-                now,
-                t.vault_snapshot,
-            ],
-        )?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO cluster_trees
+                   (id, name, source, state, scope, method, created_at_ms, vault_snapshot)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    t.name,
+                    t.source,
+                    t.state,
+                    t.scope_json,
+                    t.method_json,
+                    now,
+                    t.vault_snapshot,
+                ],
+            )?;
+            Ok(())
+        })?;
         Ok(id)
     }
 
     /// Look up one tree row by id. Returns `None` if it doesn't exist.
     pub fn get_tree(&self, tree_id: &str) -> Result<Option<TreeRow>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let row = conn
-            .query_row(
-                "SELECT id, name, source, state, scope, method, created_at_ms, vault_snapshot
-                 FROM cluster_trees WHERE id = ?1",
-                params![tree_id],
-                map_tree_row,
-            )
-            .optional()?;
-        Ok(row)
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, name, source, state, scope, method, created_at_ms, vault_snapshot
+                     FROM cluster_trees WHERE id = ?1",
+                    params![tree_id],
+                    map_tree_row,
+                )
+                .optional()?)
+        })
     }
 
     /// List every tree row, newest first.
     pub fn list_trees(&self) -> Result<Vec<TreeRow>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, name, source, state, scope, method, created_at_ms, vault_snapshot
-             FROM cluster_trees ORDER BY created_at_ms DESC",
-        )?;
-        let rows = stmt
-            .query_map([], map_tree_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, source, state, scope, method, created_at_ms, vault_snapshot
+                 FROM cluster_trees ORDER BY created_at_ms DESC",
+            )?;
+            let rows = stmt
+                .query_map([], map_tree_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// Update a tree's state. Returns `TreeNotFound` if no row matched.
     pub fn set_tree_state(&self, tree_id: &str, state: &str) -> Result<(), TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let n = conn.execute(
-            "UPDATE cluster_trees SET state = ?1 WHERE id = ?2",
-            params![state, tree_id],
-        )?;
+        let n = self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE cluster_trees SET state = ?1 WHERE id = ?2",
+                params![state, tree_id],
+            )?)
+        })?;
         if n == 0 {
             return Err(TreesError::TreeNotFound(tree_id.to_string()));
         }
@@ -108,12 +134,13 @@ impl Trees {
     /// Delete a tree row. Cascades to `cluster_nodes` and
     /// `cluster_tree_history` via FK ON DELETE CASCADE.
     pub fn delete_tree(&self, tree_id: &str) -> Result<(), TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "DELETE FROM cluster_trees WHERE id = ?1",
-            params![tree_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM cluster_trees WHERE id = ?1",
+                params![tree_id],
+            )?;
+            Ok(())
+        })
     }
 
     // ── Node-level operations ────────────────────────────────────────
@@ -121,23 +148,143 @@ impl Trees {
     /// Bulk-insert nodes for a tree under one transaction. Used by the
     /// build pipeline when it lands a fresh tree's initial state.
     pub fn insert_nodes(&self, tree_id: &str, nodes: &[NodeInsert]) -> Result<(), TreesError> {
-        let mut conn = self.conn.lock().expect("trees mutex poisoned");
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO cluster_nodes
+                       (tree_id, node_id, parent_id, kind, note_id, name, summary,
+                        user_edited_name, user_edited_summary, policy, centroid,
+                        confidence, summary_membership_churn)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                )?;
+                for n in nodes {
+                    let policy_json = match &n.policy {
+                        Some(p) => Some(serde_json::to_string(p)?),
+                        None => None,
+                    };
+                    let centroid_bytes = n.centroid.as_ref().map(pack_centroid);
+                    stmt.execute(params![
+                        tree_id,
+                        n.node_id,
+                        n.parent_id,
+                        n.kind.as_str(),
+                        n.note_id,
+                        n.name,
+                        n.summary,
+                        n.user_edited_name as i32,
+                        n.user_edited_summary as i32,
+                        policy_json,
+                        centroid_bytes,
+                        n.confidence as f64,
+                        n.summary_membership_churn as i64,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Fetch one node, hydrated into an `EditableNode`.
+    pub fn get_node(
+        &self,
+        tree_id: &str,
+        node_id: &str,
+    ) -> Result<Option<EditableNode>, TreesError> {
+        let row = self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    NODE_SELECT_SQL,
+                    params![tree_id, node_id],
+                    map_editable_node,
+                )
+                .optional()?)
+        })?;
+        row.transpose()
+    }
+
+    /// Every node in the tree, in arbitrary order. Caller groups by
+    /// `parent` to walk the tree.
+    pub fn list_nodes(&self, tree_id: &str) -> Result<Vec<EditableNode>, TreesError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT node_id, parent_id, kind, note_id, name, summary,
+                        user_edited_name, user_edited_summary, policy, centroid,
+                        confidence, summary_membership_churn
+                 FROM cluster_nodes WHERE tree_id = ?1",
+            )?;
+            let rows: Vec<EditableNode> = stmt
+                .query_map(params![tree_id], map_editable_node)?
+                .collect::<Result<Vec<Result<EditableNode, TreesError>>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Children of a given parent (or the root when `parent_id` is
+    /// `None`). Cheap thanks to the `(tree_id, parent_id)` index.
+    pub fn children_of(
+        &self,
+        tree_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<EditableNode>, TreesError> {
+        let rows = self.with_conn(|conn| {
+            let (sql, rows) = match parent_id {
+                Some(pid) => (
+                    "SELECT node_id, parent_id, kind, note_id, name, summary,
+                            user_edited_name, user_edited_summary, policy, centroid,
+                            confidence, summary_membership_churn
+                     FROM cluster_nodes WHERE tree_id = ?1 AND parent_id = ?2",
+                    {
+                        let mut stmt = conn.prepare(
+                            "SELECT node_id, parent_id, kind, note_id, name, summary,
+                                    user_edited_name, user_edited_summary, policy, centroid,
+                                    confidence, summary_membership_churn
+                             FROM cluster_nodes WHERE tree_id = ?1 AND parent_id = ?2",
+                        )?;
+                        stmt.query_map(params![tree_id, pid], map_editable_node)?
+                            .collect::<Result<Vec<_>, _>>()?
+                    },
+                ),
+                None => (
+                    "(root)",
+                    {
+                        let mut stmt = conn.prepare(
+                            "SELECT node_id, parent_id, kind, note_id, name, summary,
+                                    user_edited_name, user_edited_summary, policy, centroid,
+                                    confidence, summary_membership_churn
+                             FROM cluster_nodes WHERE tree_id = ?1 AND parent_id IS NULL",
+                        )?;
+                        stmt.query_map(params![tree_id], map_editable_node)?
+                            .collect::<Result<Vec<_>, _>>()?
+                    },
+                ),
+            };
+            let _ = sql;
+            Ok(rows)
+        })?;
+        rows.into_iter().collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Append a single new node row. Used by split + future operations
+    /// that grow the tree mid-edit. Doesn't write a history row itself —
+    /// callers wrap this inside a higher-level op that does.
+    pub fn insert_single_node(&self, tree_id: &str, n: NodeInsert) -> Result<(), TreesError> {
+        let policy_json = match &n.policy {
+            Some(p) => Some(serde_json::to_string(p)?),
+            None => None,
+        };
+        let centroid_bytes = n.centroid.as_ref().map(pack_centroid);
+        self.with_conn(|conn| {
+            conn.execute(
                 "INSERT INTO cluster_nodes
                    (tree_id, node_id, parent_id, kind, note_id, name, summary,
                     user_edited_name, user_edited_summary, policy, centroid,
                     confidence, summary_membership_churn)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for n in nodes {
-                let policy_json = match &n.policy {
-                    Some(p) => Some(serde_json::to_string(p)?),
-                    None => None,
-                };
-                let centroid_bytes = n.centroid.as_ref().map(pack_centroid);
-                stmt.execute(params![
+                params![
                     tree_id,
                     n.node_id,
                     n.parent_id,
@@ -151,124 +298,10 @@ impl Trees {
                     centroid_bytes,
                     n.confidence as f64,
                     n.summary_membership_churn as i64,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Fetch one node, hydrated into an `EditableNode`.
-    pub fn get_node(
-        &self,
-        tree_id: &str,
-        node_id: &str,
-    ) -> Result<Option<EditableNode>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let row = conn
-            .query_row(
-                NODE_SELECT_SQL,
-                params![tree_id, node_id],
-                map_editable_node,
-            )
-            .optional()?;
-        row.transpose()
-    }
-
-    /// Every node in the tree, in arbitrary order. Caller groups by
-    /// `parent` to walk the tree.
-    pub fn list_nodes(&self, tree_id: &str) -> Result<Vec<EditableNode>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT node_id, parent_id, kind, note_id, name, summary,
-                    user_edited_name, user_edited_summary, policy, centroid,
-                    confidence, summary_membership_churn
-             FROM cluster_nodes WHERE tree_id = ?1",
-        )?;
-        let rows: Vec<EditableNode> = stmt
-            .query_map(params![tree_id], map_editable_node)?
-            .collect::<Result<Vec<Result<EditableNode, TreesError>>, _>>()?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Children of a given parent (or the root when `parent_id` is
-    /// `None`). Cheap thanks to the `(tree_id, parent_id)` index.
-    pub fn children_of(
-        &self,
-        tree_id: &str,
-        parent_id: Option<&str>,
-    ) -> Result<Vec<EditableNode>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let (sql, rows) = match parent_id {
-            Some(pid) => (
-                "SELECT node_id, parent_id, kind, note_id, name, summary,
-                        user_edited_name, user_edited_summary, policy, centroid,
-                        confidence, summary_membership_churn
-                 FROM cluster_nodes WHERE tree_id = ?1 AND parent_id = ?2",
-                {
-                    let mut stmt = conn.prepare(
-                        "SELECT node_id, parent_id, kind, note_id, name, summary,
-                                user_edited_name, user_edited_summary, policy, centroid,
-                                confidence, summary_membership_churn
-                         FROM cluster_nodes WHERE tree_id = ?1 AND parent_id = ?2",
-                    )?;
-                    stmt.query_map(params![tree_id, pid], map_editable_node)?
-                        .collect::<Result<Vec<_>, _>>()?
-                },
-            ),
-            None => (
-                "(root)",
-                {
-                    let mut stmt = conn.prepare(
-                        "SELECT node_id, parent_id, kind, note_id, name, summary,
-                                user_edited_name, user_edited_summary, policy, centroid,
-                                confidence, summary_membership_churn
-                         FROM cluster_nodes WHERE tree_id = ?1 AND parent_id IS NULL",
-                    )?;
-                    stmt.query_map(params![tree_id], map_editable_node)?
-                        .collect::<Result<Vec<_>, _>>()?
-                },
-            ),
-        };
-        let _ = sql;
-        rows.into_iter().collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Append a single new node row. Used by split + future operations
-    /// that grow the tree mid-edit. Doesn't write a history row itself —
-    /// callers wrap this inside a higher-level op that does.
-    pub fn insert_single_node(&self, tree_id: &str, n: NodeInsert) -> Result<(), TreesError> {
-        let policy_json = match &n.policy {
-            Some(p) => Some(serde_json::to_string(p)?),
-            None => None,
-        };
-        let centroid_bytes = n.centroid.as_ref().map(pack_centroid);
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "INSERT INTO cluster_nodes
-               (tree_id, node_id, parent_id, kind, note_id, name, summary,
-                user_edited_name, user_edited_summary, policy, centroid,
-                confidence, summary_membership_churn)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                tree_id,
-                n.node_id,
-                n.parent_id,
-                n.kind.as_str(),
-                n.note_id,
-                n.name,
-                n.summary,
-                n.user_edited_name as i32,
-                n.user_edited_summary as i32,
-                policy_json,
-                centroid_bytes,
-                n.confidence as f64,
-                n.summary_membership_churn as i64,
-            ],
-        )?;
-        Ok(())
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Delete a single node by id. Reserved for the cluster editor's
@@ -284,12 +317,13 @@ impl Trees {
     /// `move_node` / `reparent_many` / `promote_outlier`, all of which
     /// bump their ancestor chains directly.
     pub fn delete_node(&self, tree_id: &str, node_id: &str) -> Result<(), TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "DELETE FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
-            params![tree_id, node_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
+                params![tree_id, node_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Collect a node and all of its ancestors up to the root as a set.
@@ -301,24 +335,25 @@ impl Trees {
         tree_id: &str,
         node_id: &str,
     ) -> Result<std::collections::HashSet<String>, TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        let mut out = std::collections::HashSet::new();
-        let mut cursor: Option<String> = Some(node_id.to_string());
-        while let Some(id) = cursor {
-            let parent: Option<Option<String>> = conn
-                .query_row(
-                    "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
-                    params![tree_id, id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
-            let Some(parent) = parent else {
-                break;
-            };
-            out.insert(id);
-            cursor = parent;
-        }
-        Ok(out)
+        self.with_conn(|conn| {
+            let mut out = std::collections::HashSet::new();
+            let mut cursor: Option<String> = Some(node_id.to_string());
+            while let Some(id) = cursor {
+                let parent: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
+                        params![tree_id, id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let Some(parent) = parent else {
+                    break;
+                };
+                out.insert(id);
+                cursor = parent;
+            }
+            Ok(out)
+        })
     }
 
     /// Like `bump_churn_chain` but stops (without bumping) when the walk
@@ -335,33 +370,34 @@ impl Trees {
         if delta == 0 {
             return Ok(());
         }
-        let mut conn = self.conn.lock().expect("trees mutex poisoned");
-        let tx = conn.transaction()?;
-        let mut cursor: Option<String> = Some(from_node.to_string());
-        while let Some(id) = cursor {
-            if stop_at.contains(&id) {
-                break;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let mut cursor: Option<String> = Some(from_node.to_string());
+            while let Some(id) = cursor {
+                if stop_at.contains(&id) {
+                    break;
+                }
+                let parent: Option<Option<String>> = tx
+                    .query_row(
+                        "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
+                        params![tree_id, id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let Some(parent) = parent else {
+                    break;
+                };
+                tx.execute(
+                    "UPDATE cluster_nodes
+                     SET summary_membership_churn = summary_membership_churn + ?1
+                     WHERE tree_id = ?2 AND node_id = ?3",
+                    params![delta as i64, tree_id, id],
+                )?;
+                cursor = parent;
             }
-            let parent: Option<Option<String>> = tx
-                .query_row(
-                    "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
-                    params![tree_id, id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
-            let Some(parent) = parent else {
-                break;
-            };
-            tx.execute(
-                "UPDATE cluster_nodes
-                 SET summary_membership_churn = summary_membership_churn + ?1
-                 WHERE tree_id = ?2 AND node_id = ?3",
-                params![delta as i64, tree_id, id],
-            )?;
-            cursor = parent;
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Increment the membership-churn counter on a node and every
@@ -376,43 +412,45 @@ impl Trees {
         if delta == 0 {
             return Ok(());
         }
-        let mut conn = self.conn.lock().expect("trees mutex poisoned");
-        let tx = conn.transaction()?;
-        let mut cursor: Option<String> = Some(from_node.to_string());
-        while let Some(id) = cursor {
-            let parent: Option<Option<String>> = tx
-                .query_row(
-                    "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
-                    params![tree_id, id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
-            let Some(parent) = parent else {
-                break;
-            };
-            tx.execute(
-                "UPDATE cluster_nodes
-                 SET summary_membership_churn = summary_membership_churn + ?1
-                 WHERE tree_id = ?2 AND node_id = ?3",
-                params![delta as i64, tree_id, id],
-            )?;
-            cursor = parent;
-        }
-        tx.commit()?;
-        Ok(())
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let mut cursor: Option<String> = Some(from_node.to_string());
+            while let Some(id) = cursor {
+                let parent: Option<Option<String>> = tx
+                    .query_row(
+                        "SELECT parent_id FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
+                        params![tree_id, id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let Some(parent) = parent else {
+                    break;
+                };
+                tx.execute(
+                    "UPDATE cluster_nodes
+                     SET summary_membership_churn = summary_membership_churn + ?1
+                     WHERE tree_id = ?2 AND node_id = ?3",
+                    params![delta as i64, tree_id, id],
+                )?;
+                cursor = parent;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Reset the churn counter on one node — called when the user runs
     /// "Regenerate" on the node.
     pub fn reset_churn(&self, tree_id: &str, node_id: &str) -> Result<(), TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "UPDATE cluster_nodes
-             SET summary_membership_churn = 0
-             WHERE tree_id = ?1 AND node_id = ?2",
-            params![tree_id, node_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE cluster_nodes
+                 SET summary_membership_churn = 0
+                 WHERE tree_id = ?1 AND node_id = ?2",
+                params![tree_id, node_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Set the churn counter on one node to a specific value. Used by ops
@@ -425,14 +463,15 @@ impl Trees {
         node_id: &str,
         value: u32,
     ) -> Result<(), TreesError> {
-        let conn = self.conn.lock().expect("trees mutex poisoned");
-        conn.execute(
-            "UPDATE cluster_nodes
-             SET summary_membership_churn = ?1
-             WHERE tree_id = ?2 AND node_id = ?3",
-            params![value as i64, tree_id, node_id],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE cluster_nodes
+                 SET summary_membership_churn = ?1
+                 WHERE tree_id = ?2 AND node_id = ?3",
+                params![value as i64, tree_id, node_id],
+            )?;
+            Ok(())
+        })
     }
 }
 

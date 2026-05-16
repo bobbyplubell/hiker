@@ -34,10 +34,18 @@
 // the synthetic path key, not the form; restoring a tab returns to the
 // configure phase with defaults.
 
-import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "../logger";
+import { describeErr as formatErr } from "../ipc/runCommand";
 import { showToast } from "../widgets/toast";
 import { confirmDanger } from "../widgets/confirm";
+import { el } from "../widgets/dom";
+import {
+  beginInlineEdit,
+  renderCheckboxRow,
+  renderNumberRow,
+  renderRadioRow,
+  renderTextRow,
+} from "./formRows";
 
 // ── Wire types ──────────────────────────────────────────────────────
 
@@ -68,7 +76,7 @@ export type Purpose =
   | { kind: "recluster-subtree"; treeId: string; nodeId: string; nodeName?: string }
   | { kind: "rebuild"; treeId: string };
 
-interface LeidenParams {
+export interface LeidenParams {
   k_nearest: number;
   edge_weight_floor: number;
   iterations: number;
@@ -76,7 +84,7 @@ interface LeidenParams {
   resolution: number;
 }
 
-interface ClusterParams {
+export interface ClusterParams {
   algorithm: "hdbscan" | "hybrid" | "gmm" | "leiden";
   min_cluster_size: number;
   min_samples: number | null;
@@ -90,13 +98,13 @@ interface ClusterParams {
   disable_recursion: boolean;
 }
 
-interface FolderParams {
+export interface FolderParams {
   summarize: "llm" | "none";
   include_outliers: boolean;
   outlier_threshold: number;
 }
 
-interface ClusterReviewForm {
+export interface ClusterReviewForm {
   name: string;
   /// One of "sapling" | "evergreen". Ignored for non-new-tree purposes.
   lifecycle: "sapling" | "evergreen";
@@ -117,7 +125,7 @@ interface ClusterReviewForm {
   folderParams: FolderParams;
 }
 
-interface PaneState {
+export interface PaneState {
   key: string;
   purpose: Purpose;
   form: ClusterReviewForm;
@@ -168,194 +176,17 @@ export interface ClusterReviewApi {
   hide(): void;
 }
 
-const Api = {
-  runStructural(args: {
-    scope_json?: string;
-    method_json: string;
-    recluster_target?: { tree_id: string; node_id: string };
-  }): Promise<StructuralBuildDto> {
-    return invoke("cluster_run_structural", { args });
-  },
-  persist(args: {
-    name: string;
-    source: string;
-    scope_json: string;
-    method_json: string;
-    tree: BuiltClusterTree;
-    user_renamed: Record<string, string>;
-    /// status: cluster-review-tab-confirm-skip-naming
-    /// When false, the backend skips submitting `RaptorSummarize`
-    /// tasks for un-renamed clusters — the tree lands with the
-    /// placeholder `"Cluster N"` names intact and the user can run
-    /// "Regenerate names" from the cluster pane later. Defaults to
-    /// true on the backend if omitted (matches the original "Confirm
-    /// and name" behavior).
-    submit_naming: boolean;
-  }): Promise<{ tree_id: string; task_ids: string[] }> {
-    return invoke("cluster_persist_built_tree", { args });
-  },
-  reclusterFromBuilt(args: {
-    tree_id: string;
-    node_id: string;
-    tree: BuiltClusterTree;
-    carry_policies_down: boolean;
-    user_renamed: Record<string, string>;
-    /// status: cluster-review-tab-confirm-skip-naming
-    /// When false, the backend skips submitting `RaptorSummarize` tasks
-    /// for the new subtree — placeholder cluster names stay intact and
-    /// the user can run "Regenerate names" from the cluster pane later.
-    /// Mirrors the same flag on `cluster_persist_built_tree`.
-    submit_naming: boolean;
-  }): Promise<{ new_cluster_ids: string[]; task_ids: string[] }> {
-    return invoke("cluster_op_recluster_subtree_from_built", { args });
-  },
-  listTrees(): Promise<
-    Array<{ id: string; name: string; scope_json: string; method_json: string }>
-  > {
-    return invoke("cluster_trees_list").then((rows) =>
-      (rows as Array<{ id: string; name: string; scope_json: string; method_json: string }>) ?? [],
-    );
-  },
-};
+import { PURPOSE_CONFIGS, purposeToKey } from "./purposeConfigs";
 
 // ── Module state ────────────────────────────────────────────────────
 
 const panes = new Map<string, PaneState>();
-
-function purposeToKey(purpose: Purpose): string {
-  // Mirrors the `__hiker:cluster-review:*` shape used by other app-page
-  // tabs. The key is the dedup id (one tab per (kind, target)).
-  switch (purpose.kind) {
-    case "new-tree":
-      return "__hiker:cluster-review:new-tree";
-    case "recluster-subtree":
-      return `__hiker:cluster-review:recluster-subtree:${purpose.treeId}:${purpose.nodeId}`;
-    case "rebuild":
-      return `__hiker:cluster-review:rebuild:${purpose.treeId}`;
-  }
-}
-
-function defaultLeidenParams(): LeidenParams {
-  return {
-    k_nearest: 15,
-    edge_weight_floor: 0.0,
-    iterations: 100,
-    min_cluster_size: 2,
-    resolution: 1.0,
-  };
-}
-
-function defaultClusterParams(): ClusterParams {
-  return {
-    algorithm: "leiden",
-    min_cluster_size: 5,
-    min_samples: null,
-    min_clusters_to_recurse: 4,
-    summary_confidence_threshold: 0.5,
-    include_outliers: true,
-    summarize: "none",
-    leiden: defaultLeidenParams(),
-    disable_recursion: false,
-  };
-}
-
-function defaultFolderParams(): FolderParams {
-  return { summarize: "none", include_outliers: true, outlier_threshold: 0.5 };
-}
-
-function defaultForm(purpose: Purpose): ClusterReviewForm {
-  const today = new Date().toISOString().slice(0, 10);
-  switch (purpose.kind) {
-    case "new-tree":
-      return {
-        name: `${today} reorg`,
-        lifecycle: "sapling",
-        scope: { kind: "vault" },
-        sourceTypes: ["md", "txt"],
-        method: "cluster",
-        carryPoliciesDown: false,
-        clusterParams: defaultClusterParams(),
-        folderParams: defaultFolderParams(),
-      };
-    case "recluster-subtree":
-      return {
-        name: `Subcluster ${purpose.nodeName ?? "subtree"}`,
-        lifecycle: "sapling",
-        scope: { kind: "vault" },
-        sourceTypes: ["md", "txt"],
-        method: "cluster",
-        carryPoliciesDown: false,
-        clusterParams: defaultClusterParams(),
-        folderParams: defaultFolderParams(),
-      };
-    case "rebuild":
-      return {
-        name: "rebuild",
-        lifecycle: "evergreen",
-        scope: { kind: "vault" },
-        sourceTypes: ["md", "txt"],
-        method: "cluster",
-        carryPoliciesDown: false,
-        clusterParams: defaultClusterParams(),
-        folderParams: defaultFolderParams(),
-      };
-  }
-}
 
 // ── Mount ────────────────────────────────────────────────────────────
 
 export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi {
   const root = deps.rootEl;
   root.classList.add("cluster-review-tab");
-
-  // status: cluster-review-tab-rebuild-prefill
-  //
-  // Best-effort prefill of the form for the `rebuild` purpose. Fires
-  // after open() to fetch the tree's saved scope/method JSON; failures
-  // fall back to defaults silently.
-  function prefillRebuild(state: PaneState): void {
-    if (state.purpose.kind !== "rebuild") return;
-    const treeId = state.purpose.treeId;
-    void Api.listTrees().then((rows) => {
-      const row = rows.find((r) => r.id === treeId);
-      if (!row) return;
-      state.form.name = `${row.name} (rebuild)`;
-      try {
-        const scope = JSON.parse(row.scope_json);
-        if (scope?.kind === "vault") state.form.scope = { kind: "vault" };
-        else if (scope?.kind === "folder" && typeof scope.rel === "string") {
-          state.form.scope = { kind: "folder", rel: scope.rel };
-        }
-        // status: cluster-build-scope-source-types — carry the filter
-        // forward on rebuild so the new tree inherits the same source-
-        // types posture by default; user can edit before Run.
-        if (Array.isArray(scope?.source_types)) {
-          state.form.sourceTypes = scope.source_types.filter(
-            (s: unknown): s is string => typeof s === "string",
-          );
-        }
-      } catch {}
-      try {
-        const method = JSON.parse(row.method_json);
-        if (method?.kind === "cluster" && method?.params) {
-          state.form.method = "cluster";
-          state.form.clusterParams = {
-            ...state.form.clusterParams,
-            ...method.params,
-            summarize: "none",
-          };
-        } else if (method?.kind === "from-folders" && method?.params) {
-          state.form.method = "folders";
-          state.form.folderParams = {
-            ...state.form.folderParams,
-            ...method.params,
-            summarize: "none",
-          };
-        }
-      } catch {}
-      paint(state);
-    });
-  }
 
   function open(purpose: Purpose): string {
     const key = purposeToKey(purpose);
@@ -365,10 +196,11 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       // Preserve form + result on re-activation.
       return key;
     }
+    const cfg = PURPOSE_CONFIGS[purpose.kind];
     const state: PaneState = {
       key,
       purpose,
-      form: defaultForm(purpose),
+      form: cfg.defaultForm(purpose),
       userRenamed: new Map(),
       result: null,
       running: false,
@@ -377,7 +209,7 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       advancedOpen: false,
     };
     panes.set(key, state);
-    if (purpose.kind === "rebuild") prefillRebuild(state);
+    if (cfg.onMount) void cfg.onMount(state, paint);
     return key;
   }
 
@@ -418,41 +250,20 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
   }
 
   function renderHeader(state: PaneState): HTMLElement {
-    const h = document.createElement("h2");
-    h.className = "crt-title";
-    let title = "Cluster review: new tree";
-    if (state.purpose.kind === "recluster-subtree") {
-      title = `Subcluster: "${state.purpose.nodeName ?? state.purpose.nodeId}"`;
-    } else if (state.purpose.kind === "rebuild") {
-      title = `Cluster review: rebuild`;
-    }
-    h.textContent = title;
-    return h;
+    return el("h2", {
+      class: "crt-title",
+      text: PURPOSE_CONFIGS[state.purpose.kind].title(state.purpose),
+    });
   }
 
   function renderActions(state: PaneState): HTMLElement {
-    const row = document.createElement("div");
-    row.className = "crt-actions";
-
-    const runBtn = document.createElement("button");
-    runBtn.type = "button";
-    runBtn.className = "crt-btn crt-btn-primary";
-    runBtn.textContent = state.running
-      ? "Running…"
-      : state.result
-        ? "Re-run clustering"
-        : "Run clustering";
-    runBtn.disabled = state.running || state.confirming;
-    runBtn.addEventListener("click", () => void runStructural(state));
-    row.appendChild(runBtn);
-
-    const confirmBtn = document.createElement("button");
-    confirmBtn.type = "button";
-    confirmBtn.className = "crt-btn crt-btn-primary";
-    confirmBtn.textContent = state.confirming ? "Submitting…" : "Confirm and name →";
-    confirmBtn.disabled = state.running || state.confirming || !state.result;
-    confirmBtn.addEventListener("click", () => void confirmAndName(state, true));
-    row.appendChild(confirmBtn);
+    const confirmBtn = el("button", {
+      class: "crt-btn crt-btn-primary",
+      text: state.confirming ? "Submitting…" : "Confirm and name →",
+      attrs: { type: "button" },
+      disabled: state.running || state.confirming || !state.result,
+      onClick: () => void confirmAndName(state, true),
+    });
     // Lazy LLM-enabled check — if disabled, override the disabled state
     // and tooltip. The skip-naming button below is NOT gated on this
     // since its whole point is to avoid the LLM call.
@@ -464,63 +275,69 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       }
     });
 
-    // status: cluster-review-tab-confirm-skip-naming
-    // Second confirm button — persists the tree but skips the LLM
-    // naming pass, so placeholder names ("Cluster 1", "Cluster 2", …)
-    // stay intact. Now offered for the recluster path too: the
-    // `cluster_op_recluster_subtree_from_built` command honors the same
-    // `submit_naming: false` flag and short-circuits its
-    // `RaptorSummarize` submission loop.
-    const confirmNoNameBtn = document.createElement("button");
-    confirmNoNameBtn.type = "button";
-    confirmNoNameBtn.className = "crt-btn";
-    confirmNoNameBtn.textContent = state.confirming
-      ? "Submitting…"
-      : "Confirm (no naming)";
-    confirmNoNameBtn.disabled =
-      state.running || state.confirming || !state.result;
-    confirmNoNameBtn.title =
-      "Persist the tree with placeholder cluster names. Run 'Regenerate names' from the cluster pane later to LLM-name clusters.";
-    confirmNoNameBtn.addEventListener("click", () =>
-      void confirmAndName(state, false),
-    );
-    row.appendChild(confirmNoNameBtn);
-
-    const discardBtn = document.createElement("button");
-    discardBtn.type = "button";
-    discardBtn.className = "crt-btn";
-    discardBtn.textContent = "Discard";
-    discardBtn.disabled = state.running || state.confirming;
-    discardBtn.addEventListener("click", () => void discard(state));
-    row.appendChild(discardBtn);
-
-    return row;
+    return el("div", { class: "crt-actions" }, [
+      el("button", {
+        class: "crt-btn crt-btn-primary",
+        text: state.running
+          ? "Running…"
+          : state.result
+            ? "Re-run clustering"
+            : "Run clustering",
+        attrs: { type: "button" },
+        disabled: state.running || state.confirming,
+        onClick: () => void runStructural(state),
+      }),
+      confirmBtn,
+      // status: cluster-review-tab-confirm-skip-naming
+      // Second confirm button — persists the tree but skips the LLM
+      // naming pass, so placeholder names ("Cluster 1", "Cluster 2", …)
+      // stay intact. Now offered for the recluster path too: the
+      // `cluster_op_recluster_subtree_from_built` command honors the same
+      // `submit_naming: false` flag and short-circuits its
+      // `RaptorSummarize` submission loop.
+      el("button", {
+        class: "crt-btn",
+        text: state.confirming ? "Submitting…" : "Confirm (no naming)",
+        attrs: { type: "button" },
+        disabled: state.running || state.confirming || !state.result,
+        title:
+          "Persist the tree with placeholder cluster names. Run 'Regenerate names' from the cluster pane later to LLM-name clusters.",
+        onClick: () => void confirmAndName(state, false),
+      }),
+      el("button", {
+        class: "crt-btn",
+        text: "Discard",
+        attrs: { type: "button" },
+        disabled: state.running || state.confirming,
+        onClick: () => void discard(state),
+      }),
+    ]);
   }
 
   // status: cluster-review-tab-config-section
   function renderConfig(state: PaneState): HTMLElement {
-    const wrap = document.createElement("section");
-    wrap.className = "crt-section";
-    const header = document.createElement("button");
-    header.type = "button";
-    header.className = "crt-section-header";
-    header.textContent = state.configCollapsed ? "▸ Configuration" : "▾ Configuration";
-    header.addEventListener("click", () => {
-      state.configCollapsed = !state.configCollapsed;
-      paint(state);
-    });
-    wrap.appendChild(header);
+    const cfg = PURPOSE_CONFIGS[state.purpose.kind];
+    const wrap = el("section", { class: "crt-section" }, [
+      el("button", {
+        class: "crt-section-header",
+        text: state.configCollapsed ? "▸ Configuration" : "▾ Configuration",
+        attrs: { type: "button" },
+        onClick: () => {
+          state.configCollapsed = !state.configCollapsed;
+          paint(state);
+        },
+      }),
+    ]);
 
     if (state.configCollapsed) {
-      const summary = document.createElement("div");
-      summary.className = "crt-section-summary";
-      summary.textContent = oneLineConfigSummary(state);
-      wrap.appendChild(summary);
+      wrap.appendChild(el("div", {
+        class: "crt-section-summary",
+        text: oneLineConfigSummary(state),
+      }));
       return wrap;
     }
 
-    const body = document.createElement("div");
-    body.className = "crt-section-body";
+    const body = el("div", { class: "crt-section-body" });
 
     // Name
     body.appendChild(renderTextRow("Name", state.form.name, (v) => {
@@ -528,7 +345,7 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     }));
 
     // Lifecycle — hidden for recluster
-    if (state.purpose.kind !== "recluster-subtree") {
+    if (cfg.showLifecycleRow) {
       body.appendChild(
         renderRadioRow(
           "Lifecycle",
@@ -545,7 +362,7 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     }
 
     // Scope — hidden for recluster
-    if (state.purpose.kind !== "recluster-subtree") {
+    if (cfg.showScopeRow) {
       const scopeKind = state.form.scope.kind;
       const scopeRow = renderRadioRow(
         "Scope",
@@ -579,36 +396,31 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     // narrow to one type). Empty selection is rejected at Run-time below
     // since "no types selected" produces an empty input set.
     {
-      const wrap = document.createElement("div");
-      wrap.className = "crt-row";
-      const lbl = document.createElement("span");
-      lbl.className = "crt-row-label";
-      lbl.textContent = "Source types";
-      wrap.appendChild(lbl);
-      const group = document.createElement("span");
-      group.className = "crt-radio-group";
       const renderTypeBox = (id: string, label: string) => {
-        const box = document.createElement("label");
-        box.className = "crt-radio";
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = state.form.sourceTypes.includes(id);
-        cb.addEventListener("change", () => {
-          const cur = new Set(state.form.sourceTypes);
-          if (cb.checked) cur.add(id);
-          else cur.delete(id);
-          state.form.sourceTypes = Array.from(cur);
+        const cb = el("input", {
+          attrs: { type: "checkbox" },
+          on: {
+            change: () => {
+              const cur = new Set(state.form.sourceTypes);
+              if (cb.checked) cur.add(id);
+              else cur.delete(id);
+              state.form.sourceTypes = Array.from(cur);
+            },
+          },
         });
-        box.appendChild(cb);
-        const txt = document.createElement("span");
-        txt.textContent = label;
-        box.appendChild(txt);
-        return box;
+        cb.checked = state.form.sourceTypes.includes(id);
+        return el("label", { class: "crt-radio" }, [
+          cb,
+          el("span", { text: label }),
+        ]);
       };
-      group.appendChild(renderTypeBox("md", "Markdown (.md)"));
-      group.appendChild(renderTypeBox("txt", "Plain text (.txt)"));
-      wrap.appendChild(group);
-      body.appendChild(wrap);
+      body.appendChild(el("div", { class: "crt-row" }, [
+        el("span", { class: "crt-row-label", text: "Source types" }),
+        el("span", { class: "crt-radio-group" }, [
+          renderTypeBox("md", "Markdown (.md)"),
+          renderTypeBox("txt", "Plain text (.txt)"),
+        ]),
+      ]));
     }
 
     // Method
@@ -645,7 +457,7 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     );
 
     // Carry policies down — recluster only
-    if (state.purpose.kind === "recluster-subtree") {
+    if (cfg.showCarryPoliciesRow) {
       body.appendChild(
         renderCheckboxRow(
           "Carry policies down from selected node",
@@ -665,37 +477,30 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
   }
 
   function renderAdvanced(state: PaneState): HTMLElement {
-    const det = document.createElement("details");
-    det.className = "crt-advanced";
+    const det = el("details", {
+      class: "crt-advanced",
+      on: { toggle: () => { state.advancedOpen = det.open; } },
+    }, [
+      el("summary", { text: "Advanced" }),
+    ]);
     det.open = state.advancedOpen;
-    det.addEventListener("toggle", () => {
-      state.advancedOpen = det.open;
-    });
-    const sum = document.createElement("summary");
-    sum.textContent = "Advanced";
-    det.appendChild(sum);
 
     if (state.form.method === "cluster") {
       const p = state.form.clusterParams;
       const selectRow = (label: string, options: string[], current: string, onChange: (v: string) => void) => {
-        const wrap = document.createElement("label");
-        wrap.className = "crt-row";
-        const lbl = document.createElement("span");
-        lbl.className = "crt-row-label";
-        lbl.textContent = label;
-        wrap.appendChild(lbl);
-        const sel = document.createElement("select");
-        sel.className = "crt-input";
-        for (const o of options) {
-          const opt = document.createElement("option");
+        const sel = el("select", {
+          class: "crt-input",
+          on: { change: () => onChange(sel.value) },
+        }, options.map((o) => {
+          const opt = el("option", { text: o });
           opt.value = o;
-          opt.textContent = o;
           if (o === current) opt.selected = true;
-          sel.appendChild(opt);
-        }
-        sel.addEventListener("change", () => onChange(sel.value));
-        wrap.appendChild(sel);
-        return wrap;
+          return opt;
+        }));
+        return el("label", { class: "crt-row" }, [
+          el("span", { class: "crt-row-label", text: label }),
+          sel,
+        ]);
       };
       // status: cluster-leiden
       // Algorithm select drives which tunables are shown below.
@@ -751,20 +556,18 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       // Toggle that short-circuits the recursive merge loop in
       // `core::cluster::build_cluster_tree`. Surfaces as a checkbox so
       // it reads as opt-in rather than overloading numeric tunables.
-      const disableRow = document.createElement("label");
-      disableRow.className = "crt-row";
-      const dLbl = document.createElement("span");
-      dLbl.className = "crt-row-label";
-      dLbl.textContent = "disable_recursion (single-level tree)";
-      disableRow.appendChild(dLbl);
-      const dCb = document.createElement("input");
-      dCb.type = "checkbox";
-      dCb.checked = p.disable_recursion;
-      dCb.addEventListener("change", () => {
-        p.disable_recursion = dCb.checked;
+      const dCb = el("input", {
+        attrs: { type: "checkbox" },
+        on: { change: () => { p.disable_recursion = dCb.checked; } },
       });
-      disableRow.appendChild(dCb);
-      det.appendChild(disableRow);
+      dCb.checked = p.disable_recursion;
+      det.appendChild(el("label", { class: "crt-row" }, [
+        el("span", {
+          class: "crt-row-label",
+          text: "disable_recursion (single-level tree)",
+        }),
+        dCb,
+      ]));
     } else {
       const p = state.form.folderParams;
       if (p.include_outliers) {
@@ -777,20 +580,16 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
           },
         ));
       } else {
-        const note = document.createElement("p");
-        note.className = "crt-row-note";
-        note.textContent = "(Outlier threshold only applies when Include outliers is on.)";
-        det.appendChild(note);
+        det.appendChild(el("p", {
+          class: "crt-row-note",
+          text: "(Outlier threshold only applies when Include outliers is on.)",
+        }));
       }
     }
     return det;
   }
 
   function renderResult(state: PaneState): HTMLElement {
-    const wrap = document.createElement("section");
-    wrap.className = "crt-section";
-    const header = document.createElement("div");
-    header.className = "crt-section-header crt-section-header-static";
     let label = "▾ Result";
     if (state.result) {
       const tree = state.result.tree;
@@ -802,25 +601,18 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     } else {
       label = "▾ Result — click Run clustering to build";
     }
-    header.textContent = label;
-    wrap.appendChild(header);
 
-    const body = document.createElement("div");
-    body.className = "crt-section-body";
+    const body = el("div", { class: "crt-section-body" });
 
     if (state.running) {
-      const p = document.createElement("p");
-      p.className = "crt-empty";
-      p.textContent = "Clustering in progress — this runs locally, no LLM calls.";
-      body.appendChild(p);
+      body.appendChild(el("p", {
+        class: "crt-empty",
+        text: "Clustering in progress — this runs locally, no LLM calls.",
+      }));
     } else if (!state.result) {
-      const p = document.createElement("p");
-      p.className = "crt-empty";
-      p.textContent = "No result yet.";
-      body.appendChild(p);
+      body.appendChild(el("p", { class: "crt-empty", text: "No result yet." }));
     } else {
-      const list = document.createElement("div");
-      list.className = "crt-result-list";
+      const list = el("div", { class: "crt-result-list" });
       const tree = state.result.tree;
       const leaf = tree.levels[0] ?? [];
       // Display in member-count-descending order (matches the build's
@@ -835,28 +627,27 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       body.appendChild(list);
     }
 
-    wrap.appendChild(body);
-    return wrap;
+    return el("section", { class: "crt-section" }, [
+      el("div", {
+        class: "crt-section-header crt-section-header-static",
+        text: label,
+      }),
+      body,
+    ]);
   }
 
   // status: cluster-review-tab-structure-preview
   // status: cluster-review-tab-rename-before-llm
   function renderResultCluster(state: PaneState, c: BuiltClusterNode): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "crt-cluster";
-
-    const head = document.createElement("div");
-    head.className = "crt-cluster-head";
-    const ic = document.createElement("span");
-    ic.className = "crt-cluster-icon";
-    ic.textContent = "◉";
-    head.appendChild(ic);
-    const nameSpan = document.createElement("span");
-    nameSpan.className = "crt-cluster-name";
     const displayName = state.userRenamed.get(c.id) ?? c.name;
-    nameSpan.textContent = displayName;
-    if (state.userRenamed.has(c.id)) nameSpan.classList.add("crt-cluster-name-edited");
-    nameSpan.title = "Click to rename before Confirm";
+    const isEdited = state.userRenamed.has(c.id);
+    const nameSpan = el("span", {
+      class: isEdited
+        ? "crt-cluster-name crt-cluster-name-edited"
+        : "crt-cluster-name",
+      text: displayName,
+      title: "Click to rename before Confirm",
+    });
     nameSpan.addEventListener("click", () => beginInlineEdit(nameSpan, displayName, (v) => {
       const trimmed = v.trim();
       if (!trimmed || trimmed === c.name) {
@@ -866,210 +657,67 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
       }
       paint(state);
     }));
-    head.appendChild(nameSpan);
-    const cnt = document.createElement("span");
-    cnt.className = "crt-cluster-count";
-    cnt.textContent = `(${c.members.length})`;
-    head.appendChild(cnt);
+
+    const headChildren: (ChildNode | null)[] = [
+      el("span", { class: "crt-cluster-icon", text: "◉" }),
+      nameSpan,
+      el("span", { class: "crt-cluster-count", text: `(${c.members.length})` }),
+    ];
     if (c.radius > 0) {
-      const rad = document.createElement("span");
-      rad.className = "crt-cluster-radius";
-      rad.textContent = `r=${c.radius.toFixed(2)}`;
-      rad.title = "90th-percentile member distance from centroid";
-      head.appendChild(rad);
+      headChildren.push(el("span", {
+        class: "crt-cluster-radius",
+        text: `r=${c.radius.toFixed(2)}`,
+        title: "90th-percentile member distance from centroid",
+      }));
     }
-    wrap.appendChild(head);
 
     const titles = state.result?.note_titles ?? {};
     const sample = c.members.slice(0, 3);
-    const members = document.createElement("ul");
-    members.className = "crt-cluster-members";
-    for (const id of sample) {
-      const li = document.createElement("li");
-      li.textContent = titles[id] ?? id;
-      members.appendChild(li);
-    }
+    const memberItems: HTMLElement[] = sample.map((id) =>
+      el("li", { text: titles[id] ?? id }),
+    );
     if (c.members.length > sample.length) {
-      const li = document.createElement("li");
-      li.className = "crt-cluster-members-more";
-      li.textContent = `… and ${c.members.length - sample.length} more`;
-      members.appendChild(li);
+      memberItems.push(el("li", {
+        class: "crt-cluster-members-more",
+        text: `… and ${c.members.length - sample.length} more`,
+      }));
     }
-    wrap.appendChild(members);
-    return wrap;
+    return el("div", { class: "crt-cluster" }, [
+      el("div", { class: "crt-cluster-head" }, headChildren),
+      el("ul", { class: "crt-cluster-members" }, memberItems),
+    ]);
   }
 
   function renderResultOutliers(state: PaneState, outliers: string[]): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "crt-cluster crt-cluster-outliers";
-    const head = document.createElement("div");
-    head.className = "crt-cluster-head";
-    const ic = document.createElement("span");
-    ic.className = "crt-cluster-icon";
-    ic.textContent = "◇";
-    head.appendChild(ic);
-    const name = document.createElement("span");
-    name.className = "crt-cluster-name";
-    name.textContent = "Outliers";
-    head.appendChild(name);
-    const cnt = document.createElement("span");
-    cnt.className = "crt-cluster-count";
-    cnt.textContent = `(${outliers.length})`;
-    head.appendChild(cnt);
-    wrap.appendChild(head);
-
     const titles = state.result?.note_titles ?? {};
     const sample = outliers.slice(0, 3);
-    const list = document.createElement("ul");
-    list.className = "crt-cluster-members";
-    for (const id of sample) {
-      const li = document.createElement("li");
-      li.textContent = titles[id] ?? id;
-      list.appendChild(li);
-    }
+    const memberItems: HTMLElement[] = sample.map((id) =>
+      el("li", { text: titles[id] ?? id }),
+    );
     if (outliers.length > sample.length) {
-      const li = document.createElement("li");
-      li.className = "crt-cluster-members-more";
-      li.textContent = `… and ${outliers.length - sample.length} more`;
-      list.appendChild(li);
+      memberItems.push(el("li", {
+        class: "crt-cluster-members-more",
+        text: `… and ${outliers.length - sample.length} more`,
+      }));
     }
-    wrap.appendChild(list);
-    return wrap;
-  }
-
-  // ── Form-row helpers ──────────────────────────────────────────────
-
-  function renderTextRow(label: string, value: string, onChange: (v: string) => void): HTMLElement {
-    const wrap = document.createElement("label");
-    wrap.className = "crt-row";
-    const lbl = document.createElement("span");
-    lbl.className = "crt-row-label";
-    lbl.textContent = label;
-    wrap.appendChild(lbl);
-    const inp = document.createElement("input");
-    inp.type = "text";
-    inp.className = "crt-input";
-    inp.value = value;
-    inp.addEventListener("input", () => onChange(inp.value));
-    wrap.appendChild(inp);
-    return wrap;
-  }
-
-  function renderNumberRow(
-    label: string,
-    initial: string,
-    min: number,
-    step: number,
-    onChange: (n: number, raw: string) => void,
-  ): HTMLElement {
-    const wrap = document.createElement("label");
-    wrap.className = "crt-row";
-    const lbl = document.createElement("span");
-    lbl.className = "crt-row-label";
-    lbl.textContent = label;
-    wrap.appendChild(lbl);
-    const inp = document.createElement("input");
-    inp.type = "number";
-    inp.className = "crt-input";
-    inp.value = initial;
-    inp.min = String(min);
-    inp.step = String(step);
-    inp.addEventListener("input", () => {
-      const raw = inp.value;
-      const n = Number(raw);
-      if (Number.isFinite(n)) onChange(n, raw);
-      else onChange(min, raw);
-    });
-    wrap.appendChild(inp);
-    return wrap;
-  }
-
-  function renderCheckboxRow(label: string, checked: boolean, onChange: (v: boolean) => void): HTMLElement {
-    const wrap = document.createElement("label");
-    wrap.className = "crt-row crt-row-checkbox";
-    const inp = document.createElement("input");
-    inp.type = "checkbox";
-    inp.checked = checked;
-    inp.addEventListener("change", () => onChange(inp.checked));
-    wrap.appendChild(inp);
-    const lbl = document.createElement("span");
-    lbl.className = "crt-row-label";
-    lbl.textContent = label;
-    wrap.appendChild(lbl);
-    return wrap;
-  }
-
-  function renderRadioRow(
-    label: string,
-    options: { value: string; label: string }[],
-    current: string,
-    onChange: (v: string) => void,
-  ): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "crt-row";
-    const lbl = document.createElement("span");
-    lbl.className = "crt-row-label";
-    lbl.textContent = label;
-    wrap.appendChild(lbl);
-    const group = document.createElement("div");
-    group.className = "crt-radio-group";
-    for (const o of options) {
-      const rowLab = document.createElement("label");
-      rowLab.className = "crt-radio";
-      const inp = document.createElement("input");
-      inp.type = "radio";
-      inp.name = label;
-      inp.value = o.value;
-      inp.checked = o.value === current;
-      inp.addEventListener("change", () => {
-        if (inp.checked) onChange(o.value);
-      });
-      rowLab.appendChild(inp);
-      rowLab.appendChild(document.createTextNode(" " + o.label));
-      group.appendChild(rowLab);
-    }
-    wrap.appendChild(group);
-    return wrap;
-  }
-
-  function beginInlineEdit(
-    el: HTMLElement,
-    initial: string,
-    commit: (v: string) => void,
-  ): void {
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "crt-inline-edit";
-    input.value = initial;
-    const parent = el.parentElement;
-    if (!parent) return;
-    parent.replaceChild(input, el);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = (save: boolean) => {
-      if (done) return;
-      done = true;
-      if (save) commit(input.value);
-      else parent.replaceChild(el, input);
-    };
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        finish(true);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        finish(false);
-      }
-    });
-    input.addEventListener("blur", () => finish(true));
+    return el("div", { class: "crt-cluster crt-cluster-outliers" }, [
+      el("div", { class: "crt-cluster-head" }, [
+        el("span", { class: "crt-cluster-icon", text: "◇" }),
+        el("span", { class: "crt-cluster-name", text: "Outliers" }),
+        el("span", { class: "crt-cluster-count", text: `(${outliers.length})` }),
+      ]),
+      el("ul", { class: "crt-cluster-members" }, memberItems),
+    ]);
   }
 
   function oneLineConfigSummary(state: PaneState): string {
+    const cfg = PURPOSE_CONFIGS[state.purpose.kind];
     const bits: string[] = [];
     bits.push(`name=${JSON.stringify(state.form.name)}`);
-    if (state.purpose.kind !== "recluster-subtree") {
+    if (cfg.showLifecycleRow) {
       bits.push(`lifecycle=${state.form.lifecycle}`);
+    }
+    if (cfg.showScopeRow) {
       if (state.form.scope.kind === "vault") bits.push("scope=vault");
       else if (state.form.scope.kind === "folder") bits.push(`scope=folder:${state.form.scope.rel}`);
     }
@@ -1078,44 +726,13 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     if (state.form.method === "cluster") {
       bits.push(`min_cs=${state.form.clusterParams.min_cluster_size}`);
     }
-    if (state.purpose.kind === "recluster-subtree") {
-      bits.push(`carry=${state.form.carryPoliciesDown}`);
+    if (cfg.summaryExtras) {
+      for (const extra of cfg.summaryExtras(state.form)) bits.push(extra);
     }
     return bits.join("  ·  ");
   }
 
   // ── Run / Confirm / Discard ──────────────────────────────────────
-
-  function methodJsonFromForm(form: ClusterReviewForm): string {
-    if (form.method === "cluster") {
-      // status: cluster-review-tab-structural-pass-no-llm
-      // Force summarize=none on the way out — the structural pass
-      // mandates it, but pinning here means the form's source-of-truth
-      // matches what the backend will see.
-      return JSON.stringify({
-        kind: "cluster",
-        params: { ...form.clusterParams, summarize: "none" },
-      });
-    }
-    return JSON.stringify({
-      kind: "from-folders",
-      params: { ...form.folderParams, summarize: "none" },
-    });
-  }
-
-  function scopeJsonFromForm(form: ClusterReviewForm): string {
-    // status: cluster-build-scope-source-types — every variant carries
-    // an optional `source_types` filter. Empty array = "every indexable
-    // extension." `"md"` covers both `.md` and `.markdown`.
-    const source_types = form.sourceTypes;
-    if (form.scope.kind === "vault") {
-      return JSON.stringify({ kind: "vault", source_types });
-    }
-    if (form.scope.kind === "folder") {
-      return JSON.stringify({ kind: "folder", rel: form.scope.rel, source_types });
-    }
-    return JSON.stringify({ kind: "notes", ids: form.scope.ids, source_types });
-  }
 
   // status: cluster-review-tab-run-clustering
   // status: cluster-review-tab-iterate
@@ -1135,23 +752,8 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     state.userRenamed.clear();
     paint(state);
     try {
-      const methodJson = methodJsonFromForm(state.form);
-      let result: StructuralBuildDto;
-      if (state.purpose.kind === "recluster-subtree") {
-        result = await Api.runStructural({
-          method_json: methodJson,
-          recluster_target: {
-            tree_id: state.purpose.treeId,
-            node_id: state.purpose.nodeId,
-          },
-        });
-      } else {
-        const scopeJson = scopeJsonFromForm(state.form);
-        result = await Api.runStructural({
-          scope_json: scopeJson,
-          method_json: methodJson,
-        });
-      }
+      const cfg = PURPOSE_CONFIGS[state.purpose.kind];
+      const result = await cfg.runStructural(state.form, state.purpose);
       state.result = result;
       state.configCollapsed = true;
       showToast(
@@ -1194,43 +796,13 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
     try {
       const renamedRecord: Record<string, string> = {};
       for (const [k, v] of state.userRenamed.entries()) renamedRecord[k] = v;
-      if (state.purpose.kind === "recluster-subtree") {
-        await Api.reclusterFromBuilt({
-          tree_id: state.purpose.treeId,
-          node_id: state.purpose.nodeId,
-          tree: state.result.tree,
-          carry_policies_down: state.form.carryPoliciesDown,
-          user_renamed: renamedRecord,
-          submit_naming: submitNaming,
-        });
-        if (submitNaming) {
-          showToast("Subtree reclustered. Naming tasks queued.");
-        } else {
-          showToast(
-            "Subtree reclustered with placeholder names — run 'Regenerate names' later to LLM-name clusters.",
-          );
-        }
-        await deps.transitionToPane(state.key, state.purpose.treeId, state.form.name);
-      } else {
-        const source = state.form.lifecycle === "evergreen" ? "saved-triage" : "one-shot";
-        const res = await Api.persist({
-          name: state.form.name.trim() || "untitled",
-          source,
-          scope_json: state.result.scope_json,
-          method_json: state.result.method_json,
-          tree: state.result.tree,
-          user_renamed: renamedRecord,
-          submit_naming: submitNaming,
-        });
-        if (submitNaming) {
-          showToast(`Tree persisted. ${res.task_ids.length} naming tasks queued.`);
-        } else {
-          showToast(
-            "Tree persisted with placeholder names — run 'Regenerate names' later to LLM-name clusters.",
-          );
-        }
-        await deps.transitionToPane(state.key, res.tree_id, state.form.name);
-      }
+      const cfg = PURPOSE_CONFIGS[state.purpose.kind];
+      const { treeId, taskCount } = await cfg.confirm(state.form, state.purpose, state.result, {
+        submitNaming,
+        userRenamed: renamedRecord,
+      });
+      showToast(cfg.confirmSuccessToast({ submitNaming, taskCount }));
+      await deps.transitionToPane(state.key, treeId, state.form.name);
       // Tab has flipped to cluster-pane; drop our pane state.
       panes.delete(state.key);
     } catch (err) {
@@ -1255,9 +827,4 @@ export function mountClusterReviewTab(deps: ClusterReviewDeps): ClusterReviewApi
   }
 
   return { open, findKey, showTab, hasUnsavedResult, dropTab, hide };
-}
-
-function formatErr(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }

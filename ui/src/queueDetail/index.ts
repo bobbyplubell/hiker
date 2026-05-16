@@ -12,7 +12,8 @@
 // stay strictly separate at the data layer — this module is only the
 // rendering primitive + a small in-memory mirror of each event channel.
 
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { type UnlistenFn } from "@tauri-apps/api/event";
+import { onHikerEventAs } from "../events";
 import { Ipc } from "../ipc";
 import { Logger } from "../logger";
 import {
@@ -503,12 +504,12 @@ export function mountQueueDetail(deps: QueueDetailDeps): QueueDetailController {
   }
 
   async function start(): Promise<void> {
-    unlistenQueue = await listen<QueueEvent>("hiker:queue-event", (ev) => {
-      applyEvent(ev.payload);
+    unlistenQueue = await onHikerEventAs<QueueEvent>("hiker:queue-event", (payload) => {
+      applyEvent(payload);
     });
-    unlistenIndex = await listen<ProgressEvent>(
+    unlistenIndex = await onHikerEventAs<ProgressEvent>(
       "hiker:reindex-progress",
-      (ev) => applyIndexEvent(ev.payload),
+      (payload) => applyIndexEvent(payload),
     );
     await seedSnapshot();
   }

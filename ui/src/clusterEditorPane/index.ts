@@ -27,9 +27,10 @@
 // `#vault-home`, `#settings-pane`, `#properties-pane`.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { onHikerEventAs } from "../events";
 import { Logger } from "../logger";
 import { showToast } from "../widgets/toast";
+import { describeErr } from "../ipc/runCommand";
 import {
   closeContextMenu,
   isContextMenuOpen,
@@ -37,6 +38,7 @@ import {
   type CtxMenuItem,
 } from "../widgets/contextMenu";
 import { Icons } from "../icons";
+import { el } from "../widgets/dom";
 import type {
   ClusterNodeRow,
   ClusterTreeRow,
@@ -325,31 +327,27 @@ export function mountClusterEditorPane(
   // ── Tree view ────────────────────────────────────────────────────
 
   function paintTree(treeId: string): void {
-    const head = document.createElement("header");
-    head.className = "cep-head";
-    const title = document.createElement("h2");
-    title.textContent = cachedTree?.name ?? "(unknown tree)";
-    head.appendChild(title);
-    const meta = document.createElement("span");
-    meta.className = "cep-state-pill";
-    meta.textContent = cachedTree?.state ?? "draft";
-    meta.dataset.state = cachedTree?.state ?? "draft";
-    head.appendChild(meta);
-    const spacer = document.createElement("span");
-    spacer.className = "cep-spacer";
-    head.appendChild(spacer);
+    const head = el("header", { class: "cep-head" }, [
+      el("h2", { text: cachedTree?.name ?? "(unknown tree)" }),
+      el("span", {
+        class: "cep-state-pill",
+        text: cachedTree?.state ?? "draft",
+        data: { state: cachedTree?.state ?? "draft" },
+      }),
+      el("span", { class: "cep-spacer" }),
+    ]);
 
     // Toolbar: build the icon buttons in this order: Save-as-triage,
     // Regenerate names, Rebuild, view toggle, then Apply (✓) + Discard
     // (✕) as the trailing accept/reject pair. `applyBtn` is created
     // here but appended later, just before `discardBtn`, so the pair
     // sits together.
-    const applyBtn = document.createElement("button");
-    applyBtn.type = "button";
-    applyBtn.className = "cep-btn cep-btn-primary cep-icon-btn";
-    applyBtn.innerHTML = Icons.check();
-    applyBtn.setAttribute("aria-label", "Apply");
-    applyBtn.title = "Apply — emit staging rows for every Tag/Move-policied leaf";
+    const applyBtn = el("button", {
+      class: "cep-btn cep-btn-primary cep-icon-btn",
+      html: Icons.check(),
+      title: "Apply — emit staging rows for every Tag/Move-policied leaf",
+      attrs: { type: "button", "aria-label": "Apply" },
+    });
     applyBtn.addEventListener("click", async () => {
       applyBtn.disabled = true;
       try {
@@ -368,7 +366,7 @@ export function mountClusterEditorPane(
         await showBatchReview(treeId);
       } catch (err) {
         Logger.error("ui::clusterEditor", "apply failed", { err });
-        showToast(`Apply failed: ${String(err)}`);
+        showToast(`Apply failed: ${describeErr(err)}`);
         applyBtn.disabled = false;
       }
     });
@@ -381,11 +379,11 @@ export function mountClusterEditorPane(
     // classifier — new note saves get routed against it via
     // `cluster_triage_enqueue`. The tree's `state` flips to
     // `saved-as-triage`; subsequent re-renders show the new state pill.
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "cep-btn cep-icon-btn";
-    saveBtn.innerHTML = Icons.triageStar();
-    saveBtn.setAttribute("aria-label", "Save as triage");
+    const saveBtn = el("button", {
+      class: "cep-btn cep-icon-btn",
+      html: Icons.triageStar(),
+      attrs: { type: "button", "aria-label": "Save as triage" },
+    });
     const alreadySaved = cachedTree?.state === "saved-as-triage";
     if (alreadySaved) {
       saveBtn.disabled = true;
@@ -403,7 +401,7 @@ export function mountClusterEditorPane(
           await showTree(treeId);
         } catch (err) {
           Logger.error("ui::clusterEditor", "save-as-triage failed", { err });
-          showToast(`Save failed: ${String(err)}`);
+          showToast(`Save failed: ${describeErr(err)}`);
           saveBtn.disabled = false;
         }
       });
@@ -412,13 +410,12 @@ export function mountClusterEditorPane(
 
     // status: cluster-editor-regenerate-via-task-queue
     // status: cluster-editor-llm-actions-via-task-queue
-    const regenBtn = document.createElement("button");
-    regenBtn.type = "button";
-    regenBtn.className = "cep-btn cep-icon-btn";
-    regenBtn.innerHTML = Icons.restore();
-    regenBtn.setAttribute("aria-label", "Regenerate names");
-    regenBtn.title =
-      "Regenerate names — enqueue one summarize task per non-user-edited cluster row";
+    const regenBtn = el("button", {
+      class: "cep-btn cep-icon-btn",
+      html: Icons.restore(),
+      title: "Regenerate names — enqueue one summarize task per non-user-edited cluster row",
+      attrs: { type: "button", "aria-label": "Regenerate names" },
+    });
     regenBtn.addEventListener("click", async () => {
       regenBtn.disabled = true;
       try {
@@ -427,7 +424,7 @@ export function mountClusterEditorPane(
         });
         showToast(`Queued ${ids.length} regeneration tasks`);
       } catch (err) {
-        showToast(`Regenerate failed: ${String(err)}`);
+        showToast(`Regenerate failed: ${describeErr(err)}`);
       } finally {
         regenBtn.disabled = false;
       }
@@ -453,17 +450,13 @@ export function mountClusterEditorPane(
       )
       .map((n) => n.id);
     const stalecount = staleClusterIds.length;
-    const summarizeStaleBtn = document.createElement("button");
-    summarizeStaleBtn.type = "button";
-    summarizeStaleBtn.className = "cep-btn";
-    summarizeStaleBtn.textContent =
-      stalecount > 0
+    const summarizeStaleBtn = el("button", {
+      class: "cep-btn",
+      text: stalecount > 0
         ? `Summarize new / changed (${stalecount})`
-        : "Summarize new / changed";
-    summarizeStaleBtn.setAttribute(
-      "aria-label",
-      "Summarize new / changed clusters",
-    );
+        : "Summarize new / changed",
+      attrs: { type: "button", "aria-label": "Summarize new / changed clusters" },
+    });
     if (stalecount === 0) {
       summarizeStaleBtn.disabled = true;
       summarizeStaleBtn.title =
@@ -487,7 +480,7 @@ export function mountClusterEditorPane(
           );
           showToast(summarizeOutcomeToast(outcome, stalecount));
         } catch (err) {
-          showToast(`Summarize failed: ${String(err)}`);
+          showToast(`Summarize failed: ${describeErr(err)}`);
           summarizeStaleBtn.disabled = false;
         }
       });
@@ -495,13 +488,12 @@ export function mountClusterEditorPane(
     head.appendChild(summarizeStaleBtn);
 
     // status: cluster-build-rebuild
-    const rebuildBtn = document.createElement("button");
-    rebuildBtn.type = "button";
-    rebuildBtn.className = "cep-btn cep-icon-btn";
-    rebuildBtn.innerHTML = Icons.hammer();
-    rebuildBtn.setAttribute("aria-label", "Rebuild");
-    rebuildBtn.title =
-      "Rebuild — re-run the original build pipeline against the current vault state; user-edited names / summaries / policies on overlapping clusters are preserved";
+    const rebuildBtn = el("button", {
+      class: "cep-btn cep-icon-btn",
+      html: Icons.hammer(),
+      title: "Rebuild — re-run the original build pipeline against the current vault state; user-edited names / summaries / policies on overlapping clusters are preserved",
+      attrs: { type: "button", "aria-label": "Rebuild" },
+    });
     rebuildBtn.addEventListener("click", async () => {
       const confirmMsg = `Rebuild "${cachedTree?.name ?? treeId}" against the current vault? A new draft tree will be created — this one stays put.`;
       if (!confirm(confirmMsg)) return;
@@ -515,7 +507,7 @@ export function mountClusterEditorPane(
         rebuildBtn.disabled = false;
       } catch (err) {
         Logger.error("ui::clusterEditor", "rebuild submit failed", { err });
-        showToast(`Rebuild failed to submit: ${String(err)}`);
+        showToast(`Rebuild failed to submit: ${describeErr(err)}`);
         rebuildBtn.disabled = false;
       }
     });
@@ -523,24 +515,24 @@ export function mountClusterEditorPane(
 
     // Divider between the build/manage cluster (Triage/Regen/Rebuild)
     // and the view-toggle cluster.
-    const divider1 = document.createElement("span");
-    divider1.className = "cep-divider";
-    divider1.setAttribute("aria-hidden", "true");
-    head.appendChild(divider1);
+    head.appendChild(el("span", {
+      class: "cep-divider",
+      attrs: { "aria-hidden": "true" },
+    }));
 
-    const discardBtn = document.createElement("button");
-    discardBtn.type = "button";
-    discardBtn.className = "cep-btn cep-icon-btn";
-    discardBtn.innerHTML = Icons.close();
-    discardBtn.setAttribute("aria-label", "Discard draft");
-    discardBtn.title = "Discard draft";
+    const discardBtn = el("button", {
+      class: "cep-btn cep-icon-btn",
+      html: Icons.close(),
+      title: "Discard draft",
+      attrs: { type: "button", "aria-label": "Discard draft" },
+    });
     discardBtn.addEventListener("click", async () => {
       if (!confirm(`Discard draft "${cachedTree?.name ?? treeId}"?`)) return;
       try {
         await Api.discard(treeId);
         deps.closePane();
       } catch (err) {
-        showToast(`Discard failed: ${String(err)}`);
+        showToast(`Discard failed: ${describeErr(err)}`);
       }
     });
     // discardBtn is appended at the end of the toolbar, after the view
@@ -557,15 +549,15 @@ export function mountClusterEditorPane(
     // preview toggle) folded in from `graphApi.getViewMenuItems()`.
     // Previously these lived as a separate 3-button strip on the
     // toolbar; consolidating them keeps the pinned bar tidier.
-    const viewMenuBtn = document.createElement("button");
-    viewMenuBtn.type = "button";
-    viewMenuBtn.className = "cep-btn cep-icon-btn";
-    viewMenuBtn.innerHTML = Icons.eye();
-    viewMenuBtn.setAttribute("aria-label", "View options");
-    viewMenuBtn.title = "View options";
-    viewMenuBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openViewMenuFor(viewMenuBtn);
+    const viewMenuBtn = el("button", {
+      class: "cep-btn cep-icon-btn",
+      html: Icons.eye(),
+      title: "View options",
+      attrs: { type: "button", "aria-label": "View options" },
+      onClick: (e) => {
+        e.stopPropagation();
+        openViewMenuFor(viewMenuBtn);
+      },
     });
     head.appendChild(viewMenuBtn);
 
@@ -655,10 +647,10 @@ export function mountClusterEditorPane(
 
     // Divider between the view-toggle cluster and the accept/reject
     // pair (Apply ✓ / Discard ✕).
-    const divider2 = document.createElement("span");
-    divider2.className = "cep-divider";
-    divider2.setAttribute("aria-hidden", "true");
-    head.appendChild(divider2);
+    head.appendChild(el("span", {
+      class: "cep-divider",
+      attrs: { "aria-hidden": "true" },
+    }));
 
     // Trailing accept/reject pair — Apply (✓) immediately left of
     // Discard (✕), matching the left-to-right accept-then-reject reading
@@ -696,8 +688,7 @@ export function mountClusterEditorPane(
     if (treeViewVariant === "graph") {
       // status: cluster-editor-graph-view
       // status: cluster-editor-graph-view-lazy-load
-      const gHost = document.createElement("div");
-      gHost.className = "cep-graph-host";
+      const gHost = el("div", { class: "cep-graph-host" });
       root.appendChild(gHost);
       // Dynamic import — sigma + graphology bundle paid on first open.
       import("./graphView").then((mod) =>
@@ -756,23 +747,19 @@ export function mountClusterEditorPane(
         }
       }).catch((err) => {
         Logger.error("ui::clusterEditor", "graph view mount failed", { err });
-        showToast(`Graph view failed: ${String(err)}`);
+        showToast(`Graph view failed: ${describeErr(err)}`);
       });
       return;
     }
 
     if (treeViewVariant === "markdown") {
       // status: cluster-editor-markdown-view-toggle
-      const mdHost = document.createElement("div");
-      mdHost.className = "cep-markdown-host";
-      const pre = document.createElement("pre");
-      pre.className = "cep-markdown-body";
-      pre.textContent = renderTreeAsMarkdown(
-        cachedTree,
-        cachedNodes,
-      );
-      mdHost.appendChild(pre);
-      root.appendChild(mdHost);
+      root.appendChild(el("div", { class: "cep-markdown-host" }, [
+        el("pre", {
+          class: "cep-markdown-body",
+          text: renderTreeAsMarkdown(cachedTree, cachedNodes),
+        }),
+      ]));
       return;
     }
 
@@ -791,13 +778,11 @@ export function mountClusterEditorPane(
     // toolbar buttons when there's an active selection. Re-uses the
     // shared `.ce-msel-toolbar` chrome.
     if (surface.selection.size > 0) {
-      const mselHost = document.createElement("div");
-      mselHost.className = "cep-msel-host";
-      mselHost.appendChild(renderMultiSelectToolbar(surface, rowDeps(treeId)));
-      head.appendChild(mselHost);
+      head.appendChild(el("div", { class: "cep-msel-host" }, [
+        renderMultiSelectToolbar(surface, rowDeps(treeId)),
+      ]));
     }
-    const body = document.createElement("div");
-    body.className = "cep-tree-body";
+    const body = el("div", { class: "cep-tree-body" });
     // status: cluster-editor-dnd-visual-feedback
     const band = renderPromoteBand(surface, rowDeps(treeId));
     if (band) body.appendChild(band);
@@ -930,85 +915,69 @@ export function mountClusterEditorPane(
   // ── Batch review ─────────────────────────────────────────────────
 
   function paintBatchReview(treeId: string): void {
-    const head = document.createElement("header");
-    head.className = "cep-head";
-    const title = document.createElement("h2");
-    title.textContent = `Apply review: ${cachedTree?.name ?? treeId}`;
-    head.appendChild(title);
-    const count = document.createElement("span");
-    count.className = "cep-row-count";
-    count.textContent = `${cachedRows.length} pending`;
-    head.appendChild(count);
-    const spacer = document.createElement("span");
-    spacer.className = "cep-spacer";
-    head.appendChild(spacer);
-
-    const acceptAllBtn = document.createElement("button");
-    acceptAllBtn.type = "button";
-    acceptAllBtn.className = "cep-btn cep-btn-primary";
-    acceptAllBtn.textContent = `Accept all (${cachedRows.length})`;
-    acceptAllBtn.disabled = cachedRows.length === 0;
-    acceptAllBtn.addEventListener("click", async () => {
-      if (cachedRows.length > 5) {
-        if (!confirm(`Accept all ${cachedRows.length} rows?`)) return;
-      }
-      let n = 0;
-      for (const r of cachedRows) {
-        try {
-          await Api.staging_accept(r.id);
-          n += 1;
-        } catch (err) {
-          Logger.error("ui::clusterEditor", "accept failed", {
-            err,
-            id: r.id,
-          });
-        }
-      }
-      showToast(`Accepted ${n} of ${cachedRows.length} rows`);
-      await maybeFlipApplied(treeId);
-      await showBatchReview(treeId);
-    });
-    head.appendChild(acceptAllBtn);
-
-    const rejectAllBtn = document.createElement("button");
-    rejectAllBtn.type = "button";
-    rejectAllBtn.className = "cep-btn";
-    rejectAllBtn.textContent = "Reject all";
-    rejectAllBtn.disabled = cachedRows.length === 0;
-    rejectAllBtn.addEventListener("click", async () => {
-      if (!confirm(`Reject all ${cachedRows.length} rows?`)) return;
-      for (const r of cachedRows) {
-        await rejectRow(r);
-      }
-      await maybeFlipApplied(treeId);
-      await showBatchReview(treeId);
-    });
-    head.appendChild(rejectAllBtn);
-
-    const backBtn = document.createElement("button");
-    backBtn.type = "button";
-    backBtn.className = "cep-btn";
-    backBtn.textContent = "← Back to tree";
-    backBtn.addEventListener("click", () => {
-      void showTree(treeId);
-    });
-    head.appendChild(backBtn);
-
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "cep-btn";
-    closeBtn.textContent = "✕";
-    closeBtn.addEventListener("click", () => deps.closePane());
-    head.appendChild(closeBtn);
-
-    root.appendChild(head);
+    root.appendChild(el("header", { class: "cep-head" }, [
+      el("h2", { text: `Apply review: ${cachedTree?.name ?? treeId}` }),
+      el("span", { class: "cep-row-count", text: `${cachedRows.length} pending` }),
+      el("span", { class: "cep-spacer" }),
+      el("button", {
+        class: "cep-btn cep-btn-primary",
+        text: `Accept all (${cachedRows.length})`,
+        attrs: { type: "button" },
+        disabled: cachedRows.length === 0,
+        onClick: async () => {
+          if (cachedRows.length > 5) {
+            if (!confirm(`Accept all ${cachedRows.length} rows?`)) return;
+          }
+          let n = 0;
+          for (const r of cachedRows) {
+            try {
+              await Api.staging_accept(r.id);
+              n += 1;
+            } catch (err) {
+              Logger.error("ui::clusterEditor", "accept failed", {
+                err,
+                id: r.id,
+              });
+            }
+          }
+          showToast(`Accepted ${n} of ${cachedRows.length} rows`);
+          await maybeFlipApplied(treeId);
+          await showBatchReview(treeId);
+        },
+      }),
+      el("button", {
+        class: "cep-btn",
+        text: "Reject all",
+        attrs: { type: "button" },
+        disabled: cachedRows.length === 0,
+        onClick: async () => {
+          if (!confirm(`Reject all ${cachedRows.length} rows?`)) return;
+          for (const r of cachedRows) {
+            await rejectRow(r);
+          }
+          await maybeFlipApplied(treeId);
+          await showBatchReview(treeId);
+        },
+      }),
+      el("button", {
+        class: "cep-btn",
+        text: "← Back to tree",
+        attrs: { type: "button" },
+        onClick: () => { void showTree(treeId); },
+      }),
+      el("button", {
+        class: "cep-btn",
+        text: "✕",
+        attrs: { type: "button" },
+        onClick: () => deps.closePane(),
+      }),
+    ]));
 
     if (cachedRows.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "cep-empty";
-      empty.textContent =
-        "All rows resolved. The tree is marked applied.";
-      root.appendChild(empty);
+      root.appendChild(el("p", {
+        class: "cep-empty",
+        text: "All rows resolved. The tree is marked applied.",
+      }));
       return;
     }
 
@@ -1023,74 +992,68 @@ export function mountClusterEditorPane(
     rows: StagingProposal[],
     treeId: string,
   ): HTMLElement {
-    const sec = document.createElement("section");
-    sec.className = "cep-group";
-    const h = document.createElement("h3");
-    h.textContent = `${label} (${rows.length})`;
-    sec.appendChild(h);
     rows.sort((a, b) => a.target_path.localeCompare(b.target_path));
-    for (const r of rows) {
-      sec.appendChild(renderProposalRow(r, treeId));
-    }
-    return sec;
+    return el("section", { class: "cep-group" }, [
+      el("h3", { text: `${label} (${rows.length})` }),
+      ...rows.map((r) => renderProposalRow(r, treeId)),
+    ]);
   }
 
   function renderProposalRow(
     row: StagingProposal,
     treeId: string,
   ): HTMLElement {
-    const el = document.createElement("div");
-    el.className = "cep-prow";
     const conflicted = row.state === "conflicted";
-    if (conflicted) el.classList.add("cep-prow-conflicted");
-    const left = document.createElement("span");
-    left.className = "cep-prow-left";
+    let leftText: string;
     if (row.action === "move_note") {
-      left.textContent = `${row.source_path ?? "?"} → ${row.target_path}`;
+      leftText = `${row.source_path ?? "?"} → ${row.target_path}`;
     } else {
       const md = (row.metadata ?? {}) as Record<string, unknown>;
       const slug = typeof md["tag_slug"] === "string" ? (md["tag_slug"] as string) : "";
-      left.textContent = `${row.target_path}   + ${slug}`;
+      leftText = `${row.target_path}   + ${slug}`;
     }
-    el.appendChild(left);
-    if (conflicted) {
-      const warn = document.createElement("span");
-      warn.className = "cep-prow-warn";
-      warn.textContent = `⚠ ${row.conflict_reason ?? "conflict"}`;
-      el.appendChild(warn);
-    }
-    const acc = document.createElement("button");
-    acc.type = "button";
-    acc.className = "cep-prow-btn";
-    acc.textContent = "✓";
-    acc.title = "Accept";
-    acc.disabled = conflicted;
-    acc.addEventListener("click", async () => {
-      try {
-        await Api.staging_accept(row.id);
-        await maybeFlipApplied(treeId);
-        await showBatchReview(treeId);
-      } catch (err) {
-        showToast(`Accept failed: ${String(err)}`);
-      }
-    });
-    el.appendChild(acc);
-    const rej = document.createElement("button");
-    rej.type = "button";
-    rej.className = "cep-prow-btn";
-    rej.textContent = "✗";
-    rej.title = "Reject";
-    rej.addEventListener("click", async () => {
-      try {
-        await rejectRow(row);
-        await maybeFlipApplied(treeId);
-        await showBatchReview(treeId);
-      } catch (err) {
-        showToast(`Reject failed: ${String(err)}`);
-      }
-    });
-    el.appendChild(rej);
-    return el;
+    return el("div", {
+      class: conflicted ? "cep-prow cep-prow-conflicted" : "cep-prow",
+    }, [
+      el("span", { class: "cep-prow-left", text: leftText }),
+      conflicted
+        ? el("span", {
+            class: "cep-prow-warn",
+            text: `⚠ ${row.conflict_reason ?? "conflict"}`,
+          })
+        : null,
+      el("button", {
+        class: "cep-prow-btn",
+        text: "✓",
+        title: "Accept",
+        attrs: { type: "button" },
+        disabled: conflicted,
+        onClick: async () => {
+          try {
+            await Api.staging_accept(row.id);
+            await maybeFlipApplied(treeId);
+            await showBatchReview(treeId);
+          } catch (err) {
+            showToast(`Accept failed: ${describeErr(err)}`);
+          }
+        },
+      }),
+      el("button", {
+        class: "cep-prow-btn",
+        text: "✗",
+        title: "Reject",
+        attrs: { type: "button" },
+        onClick: async () => {
+          try {
+            await rejectRow(row);
+            await maybeFlipApplied(treeId);
+            await showBatchReview(treeId);
+          } catch (err) {
+            showToast(`Reject failed: ${describeErr(err)}`);
+          }
+        },
+      }),
+    ]);
   }
 
   async function rejectRow(row: StagingProposal): Promise<void> {
@@ -1145,8 +1108,8 @@ export function mountClusterEditorPane(
     id?: string;
     kind?: { type?: string };
   };
-  void listen<QueueEvt>("hiker:queue-event", (ev) => {
-    const p = ev.payload;
+  void onHikerEventAs<QueueEvt>("hiker:queue-event", (payload) => {
+    const p = payload;
     if (p.event === "task_queued") {
       if (p.id && p.kind?.type === "raptor_summarize") {
         pendingRaptor.add(p.id);

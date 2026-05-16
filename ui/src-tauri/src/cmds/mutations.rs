@@ -15,9 +15,9 @@
 //! open buffer (or hold + toast if the buffer was closed).
 
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdError, CmdResult};
 
 /// Frontend payload for a successful mutation result. The frontend
 /// dispatches a single CM6 transaction replacing the active buffer's
@@ -60,7 +60,7 @@ pub(crate) async fn submit_note_mutation(
     mutation: String,
     source_extension: String,
     content: String,
-) -> Result<NoteMutationSubmitOutcome, String> {
+) -> CmdResult<NoteMutationSubmitOutcome> {
     let outcome = submit_note_mutation_inner(state, app, rel, mutation, source_extension, content)
         .await;
     log_cmd_result("submit_note_mutation", outcome)
@@ -73,29 +73,26 @@ async fn submit_note_mutation_inner(
     mutation: String,
     source_extension: String,
     content: String,
-) -> Result<NoteMutationSubmitOutcome, String> {
+) -> CmdResult<NoteMutationSubmitOutcome> {
     if mutation != "reformat-as-markdown" {
-        return Err(format!("unknown mutation: {mutation}"));
+        return Err(CmdError::from(format!("unknown mutation: {mutation}")));
     }
 
     // Grab the per-vault handles we need before awaiting anywhere — clone
     // out from under the sync mutex. The source hash captured here is the
     // pre-mutation on-disk hash; the frontend uses it at apply-time to
     // decide whether the buffer's content still matches what the LLM saw.
-    let (queue, prompts, source_hash) = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+    let (queue, prompts, source_hash) = with_session(&state, |session| {
         let source_hash = session
             .vault
             .read_file_with_hash(&rel)
-            .map(|(_, h)| h)
-            .map_err(|e| e.to_string())?;
-        (
+            .map(|(_, h)| h)?;
+        Ok((
             session.tasks.clone(),
             session.prompts.clone(),
             source_hash,
-        )
-    };
+        ))
+    })?;
 
     let title = std::path::Path::new(&rel)
         .file_stem()
@@ -165,8 +162,8 @@ async fn submit_note_mutation_inner(
                 // response — replacing the buffer with empty bytes is a
                 // worse failure than surfacing the problem.
                 if result_body.trim().is_empty() {
-                    let _ = app_for_await.emit(
-                        "hiker:note-mutation-failed",
+                    crate::events::emit_note_mutation_failed(
+                        &app_for_await,
                         &NoteMutationFailedEvent {
                             task_id: &task_id,
                             source_path: &rel_for_await,
@@ -176,8 +173,8 @@ async fn submit_note_mutation_inner(
                     );
                     return;
                 }
-                let _ = app_for_await.emit(
-                    "hiker:note-mutation-applied",
+                crate::events::emit_note_mutation_applied(
+                    &app_for_await,
                     &NoteMutationAppliedEvent {
                         task_id: &task_id,
                         source_path: &rel_for_await,
@@ -188,8 +185,8 @@ async fn submit_note_mutation_inner(
                 );
             }
             hiker_core::tasks::TaskOutcome::Failed { error, .. } => {
-                let _ = app_for_await.emit(
-                    "hiker:note-mutation-failed",
+                crate::events::emit_note_mutation_failed(
+                    &app_for_await,
                     &NoteMutationFailedEvent {
                         task_id: &task_id,
                         source_path: &rel_for_await,

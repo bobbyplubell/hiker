@@ -33,10 +33,10 @@ use hiker_core::sessions::{self, SessionId, SessionMeta};
 use hiker_core::ChatContextBlock;
 use hiker_mcp::McpAgentDispatcher;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tokio::sync::mpsc;
 
-use crate::AppState;
+use crate::{with_session, AppState, CmdError, CmdResult};
 
 /// Per-session live state. Persists across user turns (per
 /// `chat-session-persisted-history`); only ends on explicit
@@ -167,7 +167,7 @@ pub async fn chat_send(
     turn_id: String,
     message: String,
     context_blocks: Option<Vec<ChatContextBlock>>,
-) -> Result<String, String> {
+) -> CmdResult<String> {
     let turn_id = TurnId::from(turn_id);
     let prep = prepare_for_turn(&state)?;
     let sid = resolve_or_create_session(&state, &prep, session_id)?;
@@ -205,16 +205,20 @@ pub async fn chat_continue(
     state: State<'_, AppState>,
     session_id: String,
     turn_id: String,
-) -> Result<(), String> {
+) -> CmdResult<()> {
     let turn_id = TurnId::from(turn_id);
     let sid = SessionId(session_id);
     let prep = prepare_for_turn(&state)?;
 
     // status: llm-acp-client-optional
     if !prep.acp_command.is_empty() {
-        spawn_acp_turn(app, prep, sid, turn_id, String::new(), Vec::new()).map(|_| ())
+        spawn_acp_turn(app, prep, sid, turn_id, String::new(), Vec::new())
+            .map(|_| ())
+            .map_err(CmdError::from)
     } else {
-        spawn_turn_task(app, prep, sid, turn_id, None, Vec::new()).map(|_| ())
+        spawn_turn_task(app, prep, sid, turn_id, None, Vec::new())
+            .map(|_| ())
+            .map_err(CmdError::from)
     }
 }
 
@@ -225,12 +229,12 @@ pub async fn chat_stop(
     state: State<'_, AppState>,
     session_id: String,
     _turn_id: String,
-) -> Result<(), String> {
+) -> CmdResult<()> {
     let registry = registry_from_state(&state)?;
-    if let Some(entry) = registry.entry(&SessionId(session_id)) {
-        if let Ok(guard) = entry.lock() {
-            guard.stop.user_halt();
-        }
+    if let Some(entry) = registry.entry(&SessionId(session_id))
+        && let Ok(guard) = entry.lock()
+    {
+        guard.stop.user_halt();
     }
     Ok(())
 }
@@ -242,12 +246,12 @@ pub async fn chat_cancel(
     state: State<'_, AppState>,
     session_id: String,
     _turn_id: String,
-) -> Result<(), String> {
+) -> CmdResult<()> {
     let registry = registry_from_state(&state)?;
-    if let Some(entry) = registry.entry(&SessionId(session_id)) {
-        if let Ok(guard) = entry.lock() {
-            guard.stop.cancel();
-        }
+    if let Some(entry) = registry.entry(&SessionId(session_id))
+        && let Ok(guard) = entry.lock()
+    {
+        guard.stop.cancel();
     }
     Ok(())
 }
@@ -269,14 +273,11 @@ pub struct SessionListItem {
 }
 
 #[tauri::command]
-pub fn chat_session_list(state: State<'_, AppState>) -> Result<Vec<SessionListItem>, String> {
-    let (vault_root, registry) = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        (session.root.clone(), session.chat.clone())
-    };
+pub fn chat_session_list(state: State<'_, AppState>) -> CmdResult<Vec<SessionListItem>> {
+    let (vault_root, registry) =
+        with_session(&state, |s| Ok((s.root.clone(), s.chat.clone())))?;
     let active = registry.active();
-    let infos = sessions::list_sessions(&vault_root).map_err(|e| e.to_string())?;
+    let infos = sessions::list_sessions(&vault_root)?;
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
         let turns = sessions::parse_session(&info.abs_path).unwrap_or_default();
@@ -309,16 +310,13 @@ pub fn chat_session_list(state: State<'_, AppState>) -> Result<Vec<SessionListIt
 pub fn chat_session_open(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Option<ActiveSessionDto>, String> {
-    let (vault_root, registry) = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        (session.root.clone(), session.chat.clone())
-    };
+) -> CmdResult<Option<ActiveSessionDto>> {
+    let (vault_root, registry) =
+        with_session(&state, |s| Ok((s.root.clone(), s.chat.clone())))?;
     let id = SessionId(session_id);
     // If the entry isn't yet in the registry, hydrate it from disk.
     if registry.entry(&id).is_none() {
-        let infos = sessions::list_sessions(&vault_root).map_err(|e| e.to_string())?;
+        let infos = sessions::list_sessions(&vault_root)?;
         let Some(info) = infos.into_iter().find(|i| i.id == id) else {
             return Ok(None);
         };
@@ -343,9 +341,9 @@ pub fn chat_session_open(
     registry.set_active(Some(id.clone()));
     let entry = registry
         .entry(&id)
-        .ok_or_else(|| "session vanished".to_string())?;
+        .ok_or_else(|| CmdError::from("session vanished"))?;
     let (path, rel_path) = {
-        let guard = entry.lock().map_err(|e| e.to_string())?;
+        let guard = entry.lock()?;
         (guard.file_path.clone(), guard.rel_path.clone())
     };
     let turns = sessions::parse_session(&path)
@@ -378,38 +376,35 @@ pub async fn chat_session_delete(
     app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<(), String> {
+) -> CmdResult<()> {
     let id = SessionId(session_id);
-    let (vault_root, registry, watcher, vault, jobs, changes) = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        (
-            session.root.clone(),
-            session.chat.clone(),
-            session.watcher.clone(),
-            session.vault.clone(),
-            session.indexer.job_sender(),
-            session.changes.clone(),
-        )
-    };
+    let (vault_root, registry, watcher, vault, jobs, changes) = with_session(&state, |s| {
+        Ok((
+            s.root.clone(),
+            s.chat.clone(),
+            s.watcher.clone(),
+            s.vault.clone(),
+            s.indexer.job_sender(),
+            s.changes.clone(),
+        ))
+    })?;
     // Resolve the session's vault-relative path. Prefer the registry's
     // cached entry (covers active + already-loaded sessions); fall back
     // to a disk walk for sessions not yet hydrated this session.
     let rel = if let Some(entry) = registry.entry(&id) {
-        let g = entry.lock().map_err(|e| e.to_string())?;
+        let g = entry.lock()?;
         g.rel_path.clone()
     } else {
-        let infos = sessions::list_sessions(&vault_root).map_err(|e| e.to_string())?;
+        let infos = sessions::list_sessions(&vault_root)?;
         infos
             .into_iter()
             .find(|i| i.id == id)
             .map(|i| i.rel_path)
-            .ok_or_else(|| "session not found".to_string())?
+            .ok_or_else(|| CmdError::from("session not found"))?
     };
 
     hiker_core::ops::delete(&watcher, &jobs, &vault, Some(&changes), &rel)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     // Drop the in-memory entry. If the deleted session was the active
     // one, the next vault open / chat_session_active call will pick a
@@ -417,7 +412,7 @@ pub async fn chat_session_delete(
     // pick a different existing session.
     registry.forget(&id);
 
-    let _ = app.emit("hiker:trash-changed", ());
+    crate::events::emit_trash_changed(&app);
     Ok(())
 }
 
@@ -441,7 +436,7 @@ fn short_preview(s: &str, max: usize) -> String {
 /// path inside `chat_send` covers the "first send of an app launch"
 /// case.
 #[tauri::command]
-pub async fn chat_session_new(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn chat_session_new(state: State<'_, AppState>) -> CmdResult<String> {
     let prep = prepare_for_turn(&state)?;
     let sid = create_session(&state, &prep)?;
     Ok(sid.0)
@@ -451,16 +446,15 @@ pub async fn chat_session_new(state: State<'_, AppState>) -> Result<String, Stri
 /// the resumed transcript so the frontend can paint the panel on vault
 /// open. Drives `chat-session-resume-latest`.
 #[tauri::command]
-pub fn chat_session_active(state: State<'_, AppState>) -> Result<Option<ActiveSessionDto>, String> {
+pub fn chat_session_active(state: State<'_, AppState>) -> CmdResult<Option<ActiveSessionDto>> {
     let registry = registry_from_state(&state)?;
     let Some(sid) = registry.active() else { return Ok(None) };
     let Some(entry) = registry.entry(&sid) else { return Ok(None) };
     let path = {
-        let guard = entry.lock().map_err(|e| e.to_string())?;
+        let guard = entry.lock()?;
         guard.file_path.clone()
     };
-    let turns = sessions::parse_session(&path)
-        .map_err(|e| e.to_string())?
+    let turns = sessions::parse_session(&path)?
         .into_iter()
         .map(|t| ResumedTurnDto {
             user: t.user,
@@ -468,7 +462,7 @@ pub fn chat_session_active(state: State<'_, AppState>) -> Result<Option<ActiveSe
         })
         .collect::<Vec<_>>();
     let rel_path = {
-        let guard = entry.lock().map_err(|e| e.to_string())?;
+        let guard = entry.lock()?;
         guard.rel_path.clone()
     };
     Ok(Some(ActiveSessionDto {
@@ -681,7 +675,7 @@ fn spawn_turn_task(
     let app_for_events = app.clone();
     let event_pump = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let _ = app_for_events.emit("hiker:chat-event", &ev);
+            crate::events::emit_chat_event(&app_for_events, &ev);
         }
     });
 
@@ -730,17 +724,17 @@ fn spawn_turn_task(
                 if let Ok(mut g) = entry_for_task.lock() {
                     g.history = new_history.clone();
                 }
-                if terminal {
-                    if let Some(user_msg) = user_message_for_persist.as_deref() {
-                        persist_turn(
-                            &file_path,
-                            &rel_path,
-                            user_msg,
-                            &new_history,
-                            &jobs,
-                        )
-                        .await;
-                    }
+                if terminal
+                    && let Some(user_msg) = user_message_for_persist.as_deref()
+                {
+                    persist_turn(
+                        &file_path,
+                        &rel_path,
+                        user_msg,
+                        &new_history,
+                        &jobs,
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -1003,7 +997,7 @@ fn spawn_acp_turn(
     let app_for_events = app.clone();
     let event_pump = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let _ = app_for_events.emit("hiker:chat-event", &ev);
+            crate::events::emit_chat_event(&app_for_events, &ev);
         }
     });
 
@@ -1018,17 +1012,17 @@ fn spawn_acp_turn(
             log: audit,
             feature: "chat_system",
         };
-        let outcome = hiker_core::acp::run_acp_turn(
-            &command_line,
-            &vault_root,
+        let outcome = hiker_core::acp::run_acp_turn(hiker_core::acp::AcpTurnInput {
+            command_line: &command_line,
+            vault_root: &vault_root,
             mcp_port,
-            &message,
-            &context_blocks,
-            &turn_id.0,
-            &tx,
+            user_message: &message,
+            context_blocks: &context_blocks,
+            session_id: &turn_id.0,
+            event_tx: &tx,
             stop,
-            Some(agent_audit),
-        )
+            audit: Some(agent_audit),
+        })
         .await;
 
         match outcome {

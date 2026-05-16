@@ -42,8 +42,9 @@ pub struct AcpTurnOutcome {
     pub agent_text: String,
 }
 
-/// Spawn an external ACP agent, send a prompt, stream session updates
-/// as `AgentEvent`s, and return the final text + stop reason.
+/// Borrowed bundle of inputs to `run_acp_turn`. Pulled out of the
+/// positional argument list to keep the function under the
+/// `too_many_arguments` threshold; semantics are unchanged.
 ///
 /// `command_line` is the user-configured full command (e.g.
 /// `"auggie --acp"`). The first whitespace-delimited token is the
@@ -52,17 +53,32 @@ pub struct AcpTurnOutcome {
 /// `context_blocks` are context blocks from the chat panel (active-note
 /// injection, `@`-mentions). The function weaves them into the prompt
 /// string — the ACP agent interprets them as part of the user message.
-pub async fn run_acp_turn(
-    command_line: &str,
-    vault_root: &Path,
-    mcp_port: u16,
-    user_message: &str,
-    context_blocks: &[crate::ChatContextBlock],
-    session_id: &str,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    stop: StopSignal,
-    _audit: Option<AgentAudit>,
-) -> Result<AcpTurnOutcome, AcpError> {
+pub struct AcpTurnInput<'a> {
+    pub command_line: &'a str,
+    pub vault_root: &'a Path,
+    pub mcp_port: u16,
+    pub user_message: &'a str,
+    pub context_blocks: &'a [crate::ChatContextBlock],
+    pub session_id: &'a str,
+    pub event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub stop: StopSignal,
+    pub audit: Option<AgentAudit>,
+}
+
+/// Spawn an external ACP agent, send a prompt, stream session updates
+/// as `AgentEvent`s, and return the final text + stop reason.
+pub async fn run_acp_turn(input: AcpTurnInput<'_>) -> Result<AcpTurnOutcome, AcpError> {
+    let AcpTurnInput {
+        command_line,
+        vault_root,
+        mcp_port,
+        user_message,
+        context_blocks,
+        session_id,
+        event_tx,
+        stop,
+        audit: _audit,
+    } = input;
     // Split the command line into binary + args on whitespace.
     let mut parts = command_line.split_ascii_whitespace();
     let program = parts

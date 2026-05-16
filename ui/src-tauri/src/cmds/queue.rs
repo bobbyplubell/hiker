@@ -4,7 +4,7 @@
 
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session_async, AppState, CmdResult};
 
 /// Snapshot of the current queue state — every non-terminal task plus the
 /// most-recent terminal ones inside the retention window. Backed by
@@ -13,13 +13,14 @@ use crate::{log_cmd_result, AppState};
 #[tauri::command]
 pub(crate) async fn tasks_snapshot(
     state: State<'_, AppState>,
-) -> Result<Vec<hiker_core::tasks::TaskRecord>, String> {
-    let queue = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session.tasks.clone()
-    };
-    log_cmd_result("tasks_snapshot", Ok::<_, String>(queue.snapshot().await))
+) -> CmdResult<Vec<hiker_core::tasks::TaskRecord>> {
+    let result = with_session_async(
+        &state,
+        |s| Ok(s.tasks.clone()),
+        |queue| async move { Ok(queue.snapshot().await) },
+    )
+    .await;
+    log_cmd_result("tasks_snapshot", result)
 }
 
 /// status: task-queue-row-details
@@ -31,13 +32,14 @@ pub(crate) async fn tasks_snapshot(
 pub(crate) async fn task_details(
     state: State<'_, AppState>,
     id: String,
-) -> Result<Option<hiker_core::tasks::TaskDetails>, String> {
-    let queue = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session.tasks.clone()
-    };
-    log_cmd_result("task_details", Ok::<_, String>(queue.details(&id).await))
+) -> CmdResult<Option<hiker_core::tasks::TaskDetails>> {
+    let result = with_session_async(
+        &state,
+        |s| Ok(s.tasks.clone()),
+        |queue| async move { Ok(queue.details(&id).await) },
+    )
+    .await;
+    log_cmd_result("task_details", result)
 }
 
 /// status: task-queue-row-cancel-action
@@ -47,12 +49,15 @@ pub(crate) async fn task_details(
 pub(crate) async fn tasks_cancel(
     state: State<'_, AppState>,
     id: String,
-) -> Result<(), String> {
-    let queue = {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        session.tasks.clone()
-    };
-    queue.cancel(&id).await;
-    log_cmd_result("tasks_cancel", Ok::<(), String>(()))
+) -> CmdResult<()> {
+    let result = with_session_async(
+        &state,
+        |s| Ok(s.tasks.clone()),
+        |queue| async move {
+            queue.cancel(&id).await;
+            Ok(())
+        },
+    )
+    .await;
+    log_cmd_result("tasks_cancel", result)
 }

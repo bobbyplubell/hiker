@@ -15,6 +15,7 @@
 import type { EditorState } from "@codemirror/state";
 import type { ChangeRow } from "../snapshotPreview";
 import type { BufferToken } from "../ipc";
+import { controllers } from "./controllers";
 import { createStore, type Store, type Unsubscribe } from "../store/createStore";
 
 // status: tab-kinds
@@ -237,24 +238,100 @@ export const inFlightMutationsStore: Store<InFlightMutationsState> =
     paths: new Set<string>(),
   });
 
-/// Cross-module read surface for the active buffer. Future consumers
+/// Cross-module read surface for the active buffer. Consumers
 /// (chat panel per `bug-chat-couples-to-main-buffer-globals`, future
-/// panels) take this interface instead of being passed bespoke
-/// `getActiveNote` / `getActiveSelection` deps closures over main.ts
-/// internals. The host wires `getActive` to whatever produces a
-/// snapshot of the buffer + selection (CM6 view lives in main.ts).
+/// panels) call `getActiveBufferSnapshot()` / `subscribeActiveBufferSnapshot()`
+/// directly instead of being passed bespoke `getActiveNote` /
+/// `getActiveSelection` deps closures over main.ts internals.
 export interface ActiveBufferSnapshot {
   relPath: string;
   bufferText: string;
   selection: { text: string; lineRange: string } | null;
 }
 
-export interface BufferApi {
-  /// Snapshot the active editable buffer and its current selection.
-  /// Returns `null` for read-only previews (trash / snapshot) and when
-  /// no buffer is open.
-  getActive(): ActiveBufferSnapshot | null;
-  /// Subscribe to active-buffer changes (open / close / swap). Fires
-  /// after every `bufferStore.set`.
-  onChanged(cb: (snapshot: ActiveBufferSnapshot | null) => void): Unsubscribe;
+/// Snapshot the active editable buffer + its current selection. Returns
+/// `null` for read-only previews (trash / snapshot / non-buffer-kind
+/// tabs) and when no buffer is open or the editor pane hasn't mounted
+/// yet. Selection-text is read from the live CM6 view, since text /
+/// selection live there — but callers don't need to know that.
+export function getActiveBufferSnapshot(): ActiveBufferSnapshot | null {
+  const buffer = bufferStore.get().buffer;
+  if (!buffer) return null;
+  if (buffer.kind !== "buffer") return null;
+  if (buffer.mode.kind !== "file") return null;
+  const ed = controllers.editorPane.tryGet()?.host;
+  if (!ed) return null;
+  const state = ed.getState();
+  const text = state.doc.toString();
+  const sel = state.selection.main;
+  let selection: { text: string; lineRange: string } | null = null;
+  if (sel.from !== sel.to) {
+    const selText = state.sliceDoc(sel.from, sel.to);
+    if (selText.trim()) {
+      const startLine = state.doc.lineAt(sel.from).number;
+      const endLine = state.doc.lineAt(sel.to).number;
+      selection = {
+        text: selText,
+        lineRange:
+          startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`,
+      };
+    }
+  }
+  return { relPath: buffer.path, bufferText: text, selection };
+}
+
+/// Subscribe to active-buffer changes (open / close / swap). Fires
+/// after every `bufferStore.set` with a fresh snapshot.
+export function subscribeActiveBufferSnapshot(
+  cb: (snapshot: ActiveBufferSnapshot | null) => void,
+): Unsubscribe {
+  return bufferStore.subscribe(() => cb(getActiveBufferSnapshot()));
+}
+
+// ---------- Module-level state helpers ----------
+//
+// Thin accessor wrappers around the stores above. Replace `Deps` bag
+// fields like `getBuffer()` / `setBufferState()` that previously had
+// to be threaded into every extracted module.
+
+export function getBuffer(): Buffer | null {
+  return bufferStore.get().buffer;
+}
+
+export function getActivePath(): string | null {
+  return bufferStore.get().activePath;
+}
+
+export function getPreviewTabPath(): string | null {
+  return bufferStore.get().previewTabPath;
+}
+
+export function setBufferState(patch: Partial<BufferState>): void {
+  bufferStore.update((s) => ({ ...s, ...patch }));
+}
+
+export function bumpActivationCounter(): number {
+  const next = tabStore.get().activationCounter + 1;
+  tabStore.update((s) => ({ ...s, activationCounter: next }));
+  return next;
+}
+
+export function getOpenBuffers(): Map<string, OpenBufferEntry> {
+  return tabStore.get().openBuffers;
+}
+
+export function getInFlightMutationPaths(): Set<string> {
+  return inFlightMutationsStore.get().paths;
+}
+
+export function addInFlightMutationPath(path: string): void {
+  const paths = inFlightMutationsStore.get().paths;
+  paths.add(path);
+  inFlightMutationsStore.set({ paths });
+}
+
+export function removeInFlightMutationPath(path: string): void {
+  const paths = inFlightMutationsStore.get().paths;
+  paths.delete(path);
+  inFlightMutationsStore.set({ paths });
 }

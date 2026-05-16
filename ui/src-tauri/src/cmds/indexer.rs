@@ -12,7 +12,7 @@ use hiker_core::indexer::{IndexJob, IndexStatus};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::{log_cmd_result, AppState};
+use crate::{log_cmd_result, with_session, AppState, CmdResult};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -22,13 +22,9 @@ pub(crate) enum IndexScope {
 }
 
 #[tauri::command]
-pub(crate) async fn index(state: State<'_, AppState>, scope: IndexScope) -> Result<(), String> {
-    let result = (|| -> Result<(IndexJob, hiker_core::indexer::IndexJobTx), String> {
-        let job_sender = {
-            let guard = state.session.lock().map_err(|e| e.to_string())?;
-            let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-            session.indexer.job_sender()
-        };
+pub(crate) async fn index(state: State<'_, AppState>, scope: IndexScope) -> CmdResult<()> {
+    let result = (|| -> CmdResult<(IndexJob, hiker_core::indexer::IndexJobTx)> {
+        let job_sender = with_session(&state, |s| Ok(s.indexer.job_sender()))?;
         let job = match scope {
             // Explicit user-driven reindex: bypass the hash short-circuit so a
             // click on the menu actually re-embeds even when content is unchanged.
@@ -37,8 +33,11 @@ pub(crate) async fn index(state: State<'_, AppState>, scope: IndexScope) -> Resu
         };
         Ok((job, job_sender))
     })();
-    let send_result = match result {
-        Ok((job, sender)) => sender.send(job).await.map_err(|e| e.to_string()),
+    let send_result: CmdResult<()> = match result {
+        Ok((job, sender)) => {
+            sender.send(job).await?;
+            Ok(())
+        }
         Err(e) => Err(e),
     };
     log_cmd_result("index", send_result)
@@ -58,20 +57,15 @@ pub(crate) enum IndexState {
 }
 
 #[tauri::command]
-pub(crate) fn index_state_for(state: State<AppState>, rel: String) -> Result<IndexState, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
+pub(crate) fn index_state_for(state: State<AppState>, rel: String) -> CmdResult<IndexState> {
+    let result = with_session(&state, |session| {
         if !hiker_core::indexer::is_indexable_path(&rel) {
             return Ok(IndexState::Unsupported);
         }
         if session.indexer.is_pending(&rel) {
             return Ok(IndexState::Queued);
         }
-        let read_store = session
-            .read_store
-            .lock()
-            .map_err(|_| "read_store mutex poisoned".to_string())?;
+        let read_store = session.read_store.lock()?;
         match read_store.get_note_by_path(&rel).map_err(|e| e.to_string())? {
             Some(row) if row.skipped => Ok(IndexState::Skipped {
                 reason: row.skip_reason.unwrap_or_else(|| "skipped".into()),
@@ -82,7 +76,7 @@ pub(crate) fn index_state_for(state: State<AppState>, rel: String) -> Result<Ind
             // user's mental model is "queued."
             None => Ok(IndexState::Queued),
         }
-    })();
+    });
     log_cmd_result("index_state_for", result)
 }
 
@@ -93,13 +87,11 @@ pub(crate) fn index_state_for(state: State<AppState>, rel: String) -> Result<Ind
 /// the indexer's allowlist (md / markdown / txt at v1) — same rule that
 /// drives `tauri-cmd-file-index-state`.
 #[tauri::command]
-pub(crate) fn count_notes_in(state: State<AppState>, rel: String) -> Result<u32, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        let files = session.vault.walk_indexable_files(&rel).map_err(|e| e.to_string())?;
+pub(crate) fn count_notes_in(state: State<AppState>, rel: String) -> CmdResult<u32> {
+    let result = with_session(&state, |session| {
+        let files = session.vault.walk_indexable_files(&rel)?;
         Ok(u32::try_from(files.len()).unwrap_or(u32::MAX))
-    })();
+    });
     log_cmd_result("count_notes_in", result)
 }
 
@@ -118,11 +110,7 @@ pub(crate) fn compute_diff(
 }
 
 #[tauri::command]
-pub(crate) fn index_status(state: State<AppState>) -> Result<IndexStatus, String> {
-    let result = (|| {
-        let guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_ref().ok_or_else(|| "no vault open".to_string())?;
-        Ok(session.indexer.status())
-    })();
+pub(crate) fn index_status(state: State<AppState>) -> CmdResult<IndexStatus> {
+    let result = with_session(&state, |session| Ok(session.indexer.status()));
     log_cmd_result("index_status", result)
 }

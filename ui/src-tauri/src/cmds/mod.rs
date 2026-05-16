@@ -25,3 +25,4 @@ pub(crate) mod staging;
 pub(crate) mod trails;
 pub(crate) mod vault;
 pub(crate) mod vault_home;
+pub(crate) mod watcher_router;

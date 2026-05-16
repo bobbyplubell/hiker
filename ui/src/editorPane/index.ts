@@ -17,7 +17,6 @@
 
 import { mountEditor, type EditorHost } from "../app/editor";
 import { mountStatusBar, type StatusBarApi } from "../app/statusBar";
-import type { ChangeRow } from "../snapshotPreview";
 import {
   mountModeControls,
   type ModeControlsApi,
@@ -31,7 +30,7 @@ import {
   mountPatchReview,
   type PatchReviewApi,
 } from "../patchReview";
-import type { Proposal } from "../ipc";
+import { Ipc } from "../ipc";
 import {
   mountMutationsMenu,
   type MutationsMenuApi,
@@ -39,39 +38,12 @@ import {
 import type { CtxMenuItem } from "../widgets/contextMenu";
 import { openContextMenu } from "../widgets/contextMenu";
 import type { Extension } from "@codemirror/state";
-import type { Buffer } from "../app/state";
-import { viewSettingsStore } from "../app/state";
-import type { SettingsManager } from "../settings/manager";
+import { getBuffer, viewSettingsStore } from "../app/state";
+import { dom } from "../app/dom";
+import { controllers } from "../app/controllers";
+import { services } from "../app/services";
 
 export interface EditorPaneDeps {
-  /// Where to mount the CM6 view (the `#editor` element).
-  parentEl: HTMLElement;
-
-  /// Editor toolbar DOM refs.
-  saveBtn: HTMLButtonElement;
-  diffBtn: HTMLButtonElement;
-  modeControlsEl: HTMLElement;
-  viewMenuBtn: HTMLButtonElement;
-  mutationsMenuBtn: HTMLButtonElement;
-
-  /// Status bar DOM refs.
-  statusPathEl: HTMLElement;
-  statusCursorEl: HTMLElement;
-  statusWordsEl: HTMLElement;
-
-  /// Tree element (for dirty-tree-dot fan-out in the status bar).
-  treeEl: HTMLElement;
-
-  /// Buffer state accessors — main.ts owns the underlying bufferStore.
-  getBuffer: () => Buffer | null;
-  setBufferState: (
-    patch: Partial<{
-      buffer: Buffer | null;
-      activePath: string | null;
-      previewTabPath: string | null;
-    }>,
-  ) => void;
-
   /// Drift-detected fall-through. The host (main.ts) owns the modal +
   /// reseed via `openFileApi`. Forwarded into `mountEditor`.
   handleDriftDetected: (
@@ -81,11 +53,10 @@ export interface EditorPaneDeps {
   ) => Promise<boolean>;
   /// Save-time non-drift error fallthrough.
   handleSaveError: (err: unknown) => void;
-  /// True for any read-only preview buffer (trash / snapshot) or
-  /// non-buffer kind tab.
-  isReadOnlyBuffer: (b: Buffer | null) => boolean;
 
-  /// Keymap built from the host's keybind registry.
+  /// Keymap built from the host's keybind registry. Genuinely
+  /// editor-specific config: the keymap must be threaded into the CM6
+  /// extension list at view construction.
   keymap: Extension;
 
   /// Fired after a successful save — host wires into discovery refresh,
@@ -97,49 +68,9 @@ export interface EditorPaneDeps {
   /// rendering, tab-strip render, and renderActiveTab.
   onStatusPulse?: () => void;
 
-  /// Paths with an in-flight NoteMutation task. The active buffer is RO
-  /// while its path is in this set.
-  inFlightMutationPaths: Set<string>;
-
-  /// Settings manager (for View menu persistence).
-  settings: SettingsManager;
-
-  /// Sidebar / related panel toggle button sync.
-  syncToggleButtons: () => void;
-
-  /// CSS.escape passthrough (for the dirty-tree-dot per-row marker).
-  cssEscape: (s: string) => string;
-
-  /// Error formatting helper.
-  formatError: (err: unknown) => string;
-
   /// Mutations-menu host hook — fired when a path enters / leaves the
   /// in-flight mutation set. Host wires RO toggling + preview promotion.
   onMutationInFlightChanged?: (path: string, inFlight: boolean) => void;
-
-  /// status: status-bar-path-reveal — host wires the reveal-in-file-manager IPC.
-  onRevealInFileManager: (rel: string) => Promise<void>;
-  /// status: status-bar-version-dropdown-selection
-  /// Selecting "Current" in the version dropdown re-opens the live editable
-  /// file, exiting any snapshot / staging preview the buffer is in.
-  onSelectCurrentVersion: (path: string) => void | Promise<void>;
-  /// Selecting a snapshot row opens it read-only in the editor.
-  onSelectSnapshotVersion: (row: ChangeRow) => void | Promise<void>;
-  /// Selecting a staging proposal opens it as a read-only preview.
-  onSelectStagingVersion: (proposal: { id: string; target_path: string }) => void | Promise<void>;
-
-  /// status: patch-review-per-hunk-accept
-  /// Per-hunk accept handler — host owns the transactional disk + buffer
-  /// apply (per `patch-review-dirty-buffer-transactional-accept`).
-  onPatchReviewAcceptHunk: (proposal: Proposal) => Promise<void>;
-  /// status: patch-review-per-hunk-accept
-  /// Per-hunk reject handler — host owns the staging-reject IPC.
-  onPatchReviewRejectHunk: (proposal: Proposal) => Promise<void>;
-
-  /// status: patch-review-toggles-mutually-exclusive
-  /// Called by the user-diff toggle on activation so the host can exit
-  /// patch-review mode first.
-  onExitPatchReview?: () => void;
 }
 
 export interface EditorPaneApi {
@@ -192,41 +123,24 @@ export interface EditorPaneApi {
 
 export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
   const {
-    parentEl,
-    saveBtn,
-    diffBtn,
-    modeControlsEl,
-    viewMenuBtn,
-    mutationsMenuBtn,
-    statusPathEl,
-    statusCursorEl,
-    statusWordsEl,
-    treeEl,
-    getBuffer,
     handleDriftDetected,
     handleSaveError,
-    isReadOnlyBuffer,
     keymap,
     onAfterSave,
     onStatusPulse,
-    settings,
-    syncToggleButtons,
-    cssEscape,
-    formatError,
     onMutationInFlightChanged,
-    onRevealInFileManager,
-    onSelectCurrentVersion,
-    onSelectSnapshotVersion,
-    onSelectStagingVersion,
-    onPatchReviewAcceptHunk,
-    onPatchReviewRejectHunk,
-    onExitPatchReview,
   } = deps;
+
+  // DOM refs from the singleton — captured once at mount time. Status-bar
+  // / toolbar elements live inside `dom().editor` and `dom().statusBar`.
+  const domRefs = dom();
+  const editorDom = domRefs.editor;
+  const statusBarDom = domRefs.statusBar;
 
   // ---- Editor host (CM6 view + compartments + save/dirty/drift) ----
 
   const editor: EditorHost = mountEditor({
-    parent: parentEl,
+    parent: editorDom.editorEl,
     getBuffer,
     applyCommit: ({ loadedText, token, pendingChangesMetadata }) => {
       const buf = getBuffer();
@@ -237,7 +151,7 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     },
     handleDriftDetected,
     handleSaveError,
-    isReadOnlyBuffer,
+    isReadOnlyBuffer: (b) => services.isReadOnlyBuffer(b),
     onAfterStatus: () => {
       // Internal buffer-scoped fan-out.
       statusBar.repaint();
@@ -253,35 +167,37 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
   // ---- Status bar (path / cursor / words / dirty-tree-dot) ----
 
   const statusBar: StatusBarApi = mountStatusBar({
-    statusPathEl,
-    statusCursorEl,
-    statusWordsEl,
-    saveBtn,
-    diffBtn,
-    treeEl,
+    statusPathEl: statusBarDom.statusPathEl,
+    statusCursorEl: statusBarDom.statusCursorEl,
+    statusWordsEl: statusBarDom.statusWordsEl,
+    saveBtn: editorDom.saveBtn,
+    diffBtn: editorDom.diffBtn,
+    treeEl: domRefs.tree.treeEl,
     editor,
-    isReadOnlyBuffer,
+    isReadOnlyBuffer: (b) => services.isReadOnlyBuffer(b),
     isDirtyBufferDiffActive: () => dirtyBufferDiff.isActive(),
-    cssEscape,
-    onRevealInFileManager,
-    onSelectCurrent: onSelectCurrentVersion,
-    onSelectSnapshot: onSelectSnapshotVersion,
-    onSelectStaging: onSelectStagingVersion,
+    cssEscape: (s) => CSS.escape(s),
+    onRevealInFileManager: (rel) => Ipc.revealInFileManager({ rel }),
+    onSelectCurrent: (path) => services.openFile(path, { preview: false }),
+    onSelectSnapshot: (row) => controllers.snapshotPreview.get().open(row),
+    onSelectStaging: (proposal) =>
+      controllers.patchReview.get().openProposalReview(proposal),
   });
 
   // ---- View menu ----
 
   const viewMenu: ViewMenuApi = mountViewMenu({
     editor,
-    settings,
-    syncToggleButtons,
+    settings: controllers.settings.get(),
+    syncToggleButtons: () =>
+      controllers.sidebarMode.tryGet()?.syncToggleButtons(),
   });
 
   // ---- Mode controls (toolbar center slot) ----
 
   const modeControls: ModeControlsApi = mountModeControls({
-    hostEl: modeControlsEl,
-    viewMenuBtn,
+    hostEl: editorDom.modeControlsEl,
+    viewMenuBtn: editorDom.viewMenuBtn,
     buildViewMenuItems: viewMenu.buildItems,
     getActiveMode: () => {
       const buf = getBuffer();
@@ -305,7 +221,7 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
     getHideFrontmatterEnabled: () =>
       viewSettingsStore.get().hideFrontmatterEnabled,
     renderModeControls: () => modeControls.render(),
-    formatError,
+    formatError: (err) => services.formatError(err),
   });
 
   // ---- Mutations menu (wand button) ----
@@ -319,7 +235,7 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
 
   const mutationsMenu: MutationsMenuApi = mountMutationsMenu(
     {
-      buttonEl: mutationsMenuBtn,
+      buttonEl: editorDom.mutationsMenuBtn,
       getBuffer: () => {
         const buf = getBuffer();
         if (!buf) return null;
@@ -327,10 +243,10 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
       },
       getActiveBufferText: () => {
         const buf = getBuffer();
-        if (!buf || isReadOnlyBuffer(buf)) return null;
+        if (!buf || services.isReadOnlyBuffer(buf)) return null;
         return editor.getActiveText();
       },
-      formatError,
+      formatError: (err) => services.formatError(err),
     },
     {
       onInFlightChanged: (path, inFlight) => {
@@ -344,30 +260,30 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
   // status: patch-review-mode
   const patchReview: PatchReviewApi = mountPatchReview({
     dispatch: editor.dispatch,
-    acceptHunk: onPatchReviewAcceptHunk,
-    rejectHunk: onPatchReviewRejectHunk,
+    acceptHunk: (p) => controllers.patchReview.get().acceptPatchReviewHunk(p),
+    rejectHunk: (p) => controllers.patchReview.get().rejectPatchReviewHunk(p),
   });
 
   // ---- Buffer-scoped toolbar wiring ----
 
-  saveBtn.addEventListener("click", async () => {
+  editorDom.saveBtn.addEventListener("click", async () => {
     const savedPath = getBuffer()?.path ?? null;
     const ok = await editor.save();
     onAfterSave?.(savedPath, ok);
   });
 
-  diffBtn.addEventListener("click", () => {
-    if (diffBtn.disabled) return;
+  editorDom.diffBtn.addEventListener("click", () => {
+    if (editorDom.diffBtn.disabled) return;
     // status: patch-review-toggles-mutually-exclusive
     // Exit patch-review mode before activating the user-diff toggle —
     // both decorating the same buffer would conflict.
     const buf = getBuffer();
     if (buf?.mode.kind === "patch-review") {
-      onExitPatchReview?.();
+      controllers.patchReview.tryGet()?.exitPatchReviewMode();
     }
     void dirtyBufferDiff.toggle();
   });
-  diffBtn.addEventListener("contextmenu", (ev) => {
+  editorDom.diffBtn.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
     const available = editor.diffButtonAvailable();
     const active = dirtyBufferDiff.isActive();

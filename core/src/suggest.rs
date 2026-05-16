@@ -140,10 +140,10 @@ pub fn apply_tree(
                 let action = ACTION_MOVE_NOTE;
                 let fingerprint =
                     compute_fingerprint(&parent_name, &rel, action);
-                if let Some(h) = history {
-                    if h.is_rejected(&fingerprint, &rel, action) {
-                        continue;
-                    }
+                if let Some(h) = history
+                    && h.is_rejected(&fingerprint, &rel, action)
+                {
+                    continue;
                 }
                 let basename = rel.rsplit('/').next().unwrap_or(&rel);
                 let folder_trim = folder.trim_end_matches('/');
@@ -182,10 +182,10 @@ pub fn apply_tree(
             } => {
                 let action = ACTION_APPLY_TAG;
                 let fingerprint = compute_fingerprint(&parent_name, &rel, action);
-                if let Some(h) = history {
-                    if h.is_rejected(&fingerprint, &rel, action) {
-                        continue;
-                    }
+                if let Some(h) = history
+                    && h.is_rejected(&fingerprint, &rel, action)
+                {
+                    continue;
                 }
                 // Pre-compute the new file content with the tag merged
                 // into the configured `tag_field`. We snapshot
@@ -611,21 +611,16 @@ impl Default for TriageOpts {
 /// through the staging review queue regardless of `review_required`.
 ///
 /// status: triage-author-class
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NoteAuthorClass {
     /// Note created/edited by the user directly. The default; eligible
     /// for auto-accept when `review_required = false`.
+    #[default]
     User,
     /// Note authored by an agent (write_note / edit_note via MCP, ACP,
     /// etc.). Always routed pending so the user can review.
     Agent,
-}
-
-impl Default for NoteAuthorClass {
-    fn default() -> Self {
-        NoteAuthorClass::User
-    }
 }
 
 /// Outcome of one triage classifier run. Carries enough metadata for the
@@ -927,23 +922,31 @@ pub fn triage_match(
     Ok(outcome)
 }
 
+/// Borrowed bundle of the four storage handles plus the per-note
+/// inputs that `triage_all_saved_trees` needs. Kept private to this
+/// module; the public surface is the function below.
+pub struct TriageBatch<'a> {
+    pub trees: &'a Trees,
+    pub vault: &'a Vault,
+    pub store: &'a Store,
+    pub staging: &'a Staging,
+    pub note_id: &'a str,
+    pub source_path: &'a str,
+    pub embedding: &'a [f32],
+    pub author_class: NoteAuthorClass,
+    pub opts: &'a TriageOpts,
+}
+
 /// Run triage against every saved-as-triage tree. The on-save hook
 /// (`cluster-editor-triage-on-save`) iterates this list per note save.
 /// Returns one outcome per tree the note was evaluated against.
 ///
 /// status: cluster-editor-triage-on-save
 pub fn triage_all_saved_trees(
-    trees: &Trees,
-    vault: &Vault,
-    store: &Store,
-    staging: &Staging,
-    note_id: &str,
-    source_path: &str,
-    embedding: &[f32],
-    author_class: NoteAuthorClass,
-    opts: &TriageOpts,
+    batch: TriageBatch<'_>,
 ) -> Result<Vec<TriageOutcome>, HikerError> {
-    let rows = trees
+    let rows = batch
+        .trees
         .list_trees()
         .map_err(|e| HikerError::Io(e.to_string()))?;
     let mut out: Vec<TriageOutcome> = Vec::new();
@@ -961,22 +964,22 @@ pub fn triage_all_saved_trees(
         // triage to silently fall back to "match everything."
         if let Ok(scope) =
             serde_json::from_str::<crate::cluster::BuildScope>(&row.scope_json)
-            && !scope.matches_path(source_path)
+            && !scope.matches_path(batch.source_path)
         {
             continue;
         }
         let outcome = triage_match(
-            trees,
-            vault,
-            store,
-            staging,
+            batch.trees,
+            batch.vault,
+            batch.store,
+            batch.staging,
             TriageInput {
                 tree_id: &row.id,
-                note_id,
-                source_path,
-                embedding,
-                author_class,
-                opts,
+                note_id: batch.note_id,
+                source_path: batch.source_path,
+                embedding: batch.embedding,
+                author_class: batch.author_class,
+                opts: batch.opts,
             },
         )?;
         out.push(outcome);
