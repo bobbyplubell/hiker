@@ -198,11 +198,35 @@ export function setupPatchReviewWiring(): PatchReviewWiringApi {
   });
 
   // status: patch-review-mode
-  // Local cache of pending staging proposals — pulled at vault open + on
-  // every `hiker:staging-changed` event. The cache backs the patch-review
+  // Local mirror of the shared `stagingFeedCache` snapshot. Read by the
   // hunk decoration set, the agent-diff toggle's grey-when-empty state,
-  // and the openFile auto-routing rule.
+  // and the openFile auto-routing rule. The mirror updates from cache
+  // broadcasts (one per debounced `hiker:staging-changed` burst); the
+  // explicit `refreshPendingProposalsCache()` calls below force an
+  // immediate fetch after we've just mutated staging ourselves.
   let pendingProposalsCache: Proposal[] = [];
+  controllers.stagingFeedCache.get().subscribe((proposals) => {
+    pendingProposalsCache = proposals;
+    // Repaint everything that derives from the proposal set. Centralizing
+    // this here (rather than in the per-event orchestrator in
+    // `taskQueueTile.ts`) means a single shared `stagingFeedCache.refresh()`
+    // fans out to the agent-diff button, the patch-review hunk decorations,
+    // and the write-note pending banner without each surface running its
+    // own IPC round-trip.
+    const buf = getBuffer();
+    if (buf && (buf.mode.kind === "patch-review" || buf.mode.kind === "file")) {
+      const editProps = pendingEditProposalsForPath(buf.path);
+      controllers.editorPane.get().patchReview.setProposals(
+        buf.mode.kind === "patch-review" ? editProps : [],
+      );
+    }
+    refreshAgentDiffBtn();
+    // status: write-note-pending-banner — staging change may have added /
+    // removed a write-shape proposal; invalidate the on-disk existence
+    // probe cache (cheap) and repaint.
+    writeNoteTargetExistsCache.clear();
+    refreshWriteNotePendingBanner();
+  });
   function pendingEditProposalsForPath(path: string): Proposal[] {
     return pendingProposalsCache.filter(
       (p) => p.target_path === path && p.action === "edit_note" && p.edit,
@@ -214,11 +238,7 @@ export function setupPatchReviewWiring(): PatchReviewWiringApi {
     );
   }
   async function refreshPendingProposalsCache(): Promise<void> {
-    try {
-      pendingProposalsCache = await Ipc.stagingList();
-    } catch {
-      pendingProposalsCache = [];
-    }
+    pendingProposalsCache = await controllers.stagingFeedCache.get().refresh();
   }
 
   // status: patch-review-per-hunk-accept

@@ -8,7 +8,6 @@
 
 import { Ipc } from "../ipc";
 import { onHikerEvent } from "../events";
-import { getBuffer } from "./state";
 import { dom } from "./dom";
 import { controllers } from "./controllers";
 import { services } from "./services";
@@ -109,41 +108,17 @@ export function setupTaskQueueTile(): TaskQueueTileApi {
 
   // Listen for staging changes so the badge updates immediately after
   // an accept/reject/accept_all, without waiting for the next poll tick.
-  // Refresh the cached `pendingProposals` BEFORE re-rendering the tree —
-  // otherwise the render reads stale proposals and leaves the just-accepted
-  // file's row marked `staging-new` / `staging-dirty` (see
-  // `bug-accept-new-note-from-activity-page-leaves-stale-dirty-marker`).
+  //
+  // The proposal-cache refresh + per-surface repaints (tree, patch-review,
+  // write-note pending banner) used to fan out from here — each surface
+  // ran its own `Ipc.stagingList()` round-trip on every event. They now
+  // subscribe to `stagingFeedCache` and drive their repaints from the
+  // shared broadcast (single debounced fetch per burst). This handler
+  // keeps only the pieces that don't ride the cache: the badge count
+  // (separate `stagingCount` IPC) and the vault-home pulse
+  // (`bug-home-recent-activity-missing-pending-agent-review`).
   void onHikerEvent("hiker:staging-changed", () => {
     void refreshStaging();
-    void (async () => {
-      const tree = controllers.tree.get();
-      await tree.api.refreshStagingProposals();
-      await tree.api.refresh();
-    })();
-    // status: patch-review-mode
-    // Re-sync local pending-proposals cache for the agent-diff toggle
-    // grey state and the active patch-review hunk decorations.
-    void (async () => {
-      await services.refreshPendingProposalsCache();
-      const buf = getBuffer();
-      if (buf && (buf.mode.kind === "patch-review" || buf.mode.kind === "file")) {
-        const proposals = services.pendingEditProposalsForPath(buf.path);
-        controllers.editorPane.get().patchReview.setProposals(
-          buf.mode.kind === "patch-review" ? (proposals as never) : [],
-        );
-      }
-      services.refreshAgentDiffBtn();
-      // status: write-note-pending-banner
-      // Staging change may have added or removed a pending write-shape
-      // proposal for the active path. Invalidate the existence cache
-      // (cheap) so the label re-probes if the target's on-disk presence
-      // changed since last paint, then repaint.
-      services.clearWriteNoteTargetExistsCache();
-      services.refreshWriteNotePendingBanner();
-    })();
-    // bug-home-recent-activity-missing-pending-agent-review:
-    // home recent-activity widget consumes the unified feed and must
-    // repaint when staging proposals appear/disappear.
     controllers.vaultHome.get().api.notifyStagingChanged();
   });
 

@@ -23,7 +23,7 @@
 import { type UnlistenFn } from "@tauri-apps/api/event";
 import { onHikerEventAs } from "../events";
 import { Ipc } from "../ipc";
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import { openMenuAtAnchor, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 
 interface MutationFailedEvent {
@@ -169,8 +169,7 @@ export function mountMutationsMenu(
   deps.buttonEl.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    const rect = deps.buttonEl.getBoundingClientRect();
-    openContextMenu(rect.left, rect.bottom + 2, buildItems(), deps.buttonEl);
+    openMenuAtAnchor(deps.buttonEl, buildItems(), { offsetY: 2 });
   });
 
   void (async () => {

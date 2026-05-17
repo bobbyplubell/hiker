@@ -19,6 +19,7 @@ import type { EditorHost } from "../app/editor";
 
 import {
   openContextMenu,
+  openMenuAtEvent,
   type CtxMenuItem,
 } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
@@ -304,7 +305,7 @@ export function mountTrash(deps: TrashDeps): TrashController {
     e.preventDefault();
     e.stopPropagation();
     const n = trashItems.length;
-    openContextMenu(e.clientX, e.clientY, [
+    openMenuAtEvent(e, [
       {
         label: n === 0 ? "Empty trash" : `Empty trash (${n} entries)`,
         danger: true,

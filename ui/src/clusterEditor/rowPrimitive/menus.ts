@@ -4,7 +4,7 @@
 // outliers… menu plus the Tag / Move-to-folder / Freeze / Clear policy
 // popover.
 
-import { openContextMenu, type CtxMenuItem } from "../../widgets/contextMenu";
+import { openContextMenu, openMenuAtAnchor, type CtxMenuItem } from "../../widgets/contextMenu";
 import { showToast } from "../../widgets/toast";
 import { describeErr } from "../../ipc/runCommand";
 import { Api, type ClusterNodeRow } from "./api";
@@ -153,7 +153,6 @@ export function openPolicyMenu(
   node: ClusterNodeRow,
   anchor: HTMLElement,
 ): void {
-  const rect = anchor.getBoundingClientRect();
   const items: CtxMenuItem[] = [
     {
       label: "Tag…",
@@ -205,5 +204,5 @@ export function openPolicyMenu(
       },
     },
   ];
-  openContextMenu(rect.right, rect.bottom, items, anchor);
+  openMenuAtAnchor(anchor, items, { align: "right" });
 }

@@ -113,6 +113,43 @@ export function isContextMenuOpen(trigger?: HTMLElement): boolean {
   return true;
 }
 
+/// Open a menu anchored below an element. Same `triggerEl` toggle
+/// semantics as `openContextMenu`. Consolidates the
+/// `getBoundingClientRect()` + `openContextMenu(...)` boilerplate that
+/// every button-spawned menu in the codebase (mode switcher, sidebar
+/// view menus, mutations, cluster-pane view menu, …) used to repeat.
+///
+/// `align: "left"` (default) aligns the menu's left edge with the
+/// anchor's left edge; `align: "right"` aligns the menu's left edge
+/// with the anchor's right edge (useful for right-side toolbar buttons
+/// where the menu should drop down-and-to-the-left).
+export interface AnchorMenuOpts {
+  align?: "left" | "right";
+  /// Pixel offset added below the anchor's bottom edge. Defaults to 0.
+  offsetY?: number;
+}
+
+export function openMenuAtAnchor(
+  anchor: HTMLElement,
+  items: CtxMenuItem[],
+  opts?: AnchorMenuOpts,
+): void {
+  const rect = anchor.getBoundingClientRect();
+  const x = opts?.align === "right" ? rect.right : rect.left;
+  const y = rect.bottom + (opts?.offsetY ?? 0);
+  openContextMenu(x, y, items, anchor);
+}
+
+/// Open a menu at the location of a mouse event. Thin wrapper around
+/// `openContextMenu` that takes the (clientX, clientY) pair so the
+/// right-click handlers don't repeat the destructuring everywhere.
+export function openMenuAtEvent(
+  ev: { clientX: number; clientY: number },
+  items: CtxMenuItem[],
+): void {
+  openContextMenu(ev.clientX, ev.clientY, items);
+}
+
 export function openContextMenu(
   x: number,
   y: number,

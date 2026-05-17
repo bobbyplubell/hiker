@@ -13,7 +13,7 @@
 // controls colocated with its lifecycle module rather than scattered
 // across `main.ts`.
 
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import { openMenuAtAnchor, type CtxMenuItem } from "../widgets/contextMenu";
 
 export interface IconBtnSpec {
   title: string;
@@ -76,8 +76,7 @@ export function mountModeControls(deps: ModeControlsDeps): ModeControlsApi {
   deps.viewMenuBtn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    const rect = deps.viewMenuBtn.getBoundingClientRect();
-    openContextMenu(rect.left, rect.bottom + 2, deps.buildViewMenuItems(), deps.viewMenuBtn);
+    openMenuAtAnchor(deps.viewMenuBtn, deps.buildViewMenuItems(), { offsetY: 2 });
   });
 
   return { register, render };

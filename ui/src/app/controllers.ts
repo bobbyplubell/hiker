@@ -27,6 +27,7 @@ import type { NavApi } from "../navigation";
 import type { TabsApi } from "./tabs";
 import type { OpenFileApi } from "./openFile";
 import type { SettingsManager } from "../settings/manager";
+import type { StagingFeedCache } from "./stagingFeedCache";
 
 interface ChatPanelLike {
   reset(): void;
@@ -150,4 +151,5 @@ export const controllers = {
   sidebarMode: slot<SidebarModeLike>("sidebarMode"),
   vaultLifecycle: slot<VaultLifecycleLike>("vaultLifecycle"),
   settings: slot<SettingsManager>("settings"),
+  stagingFeedCache: slot<StagingFeedCache>("stagingFeedCache"),
 };

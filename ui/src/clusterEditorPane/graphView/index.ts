@@ -32,7 +32,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "../../logger";
 import { showToast } from "../../widgets/toast";
 import { describeErr } from "../../ipc/runCommand";
-import { openContextMenu, type CtxMenuItem } from "../../widgets/contextMenu";
+import { openContextMenu, openMenuAtAnchor, type CtxMenuItem } from "../../widgets/contextMenu";
 import type { ClusterNodeRow } from "../../clusterEditor";
 import type {
   GraphRenderer,
@@ -831,9 +831,7 @@ function mount(
   // ── View menu ─────────────────────────────────────────────────────
 
   function openViewMenu(anchor: HTMLElement): void {
-    const items = buildViewMenuItems();
-    const rect = anchor.getBoundingClientRect();
-    openContextMenu(rect.right, rect.bottom, items, anchor);
+    openMenuAtAnchor(anchor, buildViewMenuItems(), { align: "right" });
   }
 
   function buildViewMenuItems(): CtxMenuItem[] {

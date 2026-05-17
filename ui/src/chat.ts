@@ -20,12 +20,13 @@
 // status: chat-panel-tool-call-collapsible
 // status: chat-panel-stop-button
 
-import { onHikerEvent, onHikerEventAs } from "./events";
+import { onHikerEventAs } from "./events";
 import { Ipc, type SessionListItem } from "./ipc";
 import { mountChatMarkdown, type ChatMarkdownView } from "./chatMarkdownView";
 import { mountAtMentions, type AtMentionsApi, type ParsedAtToken } from "./atMentions";
 import { resolveAtNote } from "./notes/resolver";
 import { getActiveBufferSnapshot } from "./app/state";
+import { controllers } from "./app/controllers";
 import { Icons } from "./icons";
 import { mountToolCards, type ToolCardController } from "./chat/toolCard";
 import { clamp, describeErr, formatShortDate, shortLabel } from "./chat/utils";
@@ -236,27 +237,22 @@ export function mountChatPanel(opts: ChatPanelOptions): ChatPanel {
   // `bug-chat-tool-card-stale-after-cross-surface-accept` /
   // `bug-chat-tool-card-no-link-for-staged-writes`.
   //
-  // Local mirror of pending staging proposal ids, refreshed from
-  // `Ipc.stagingList()` on every `hiker:staging-changed` event. Used to
-  // (a) re-render the Accept/Reject buttons on tool cards so a
-  // cross-surface accept/reject (e.g. from the activity-detail page)
-  // clears them in the chat session too, and (b) decide whether the
-  // header-click on a touched-note tool card routes to the staging
-  // preview or directly to the on-disk note.
+  // Local mirror of pending staging proposal ids, driven by the shared
+  // `stagingFeedCache` broadcast (single subscription + debounced fetch
+  // shared across surfaces). Used to (a) re-render the Accept/Reject
+  // buttons on tool cards so a cross-surface accept/reject (e.g. from
+  // the activity-detail page) clears them in the chat session too, and
+  // (b) decide whether the header-click on a touched-note tool card
+  // routes to the staging preview or directly to the on-disk note.
   let pendingStagingIds: Set<string> = new Set();
-  async function refreshPendingStagingIds(): Promise<void> {
-    try {
-      const list = await Ipc.stagingList();
-      pendingStagingIds = new Set(list.map((p) => p.id));
-    } catch {
-      pendingStagingIds = new Set();
-    }
+  const stagingFeed = controllers.stagingFeedCache.get();
+  stagingFeed.subscribe((proposals) => {
+    pendingStagingIds = new Set(proposals.map((p) => p.id));
     toolCards.rerenderAllActionButtons();
-  }
-  void refreshPendingStagingIds();
-  void onHikerEvent("hiker:staging-changed", () => {
-    void refreshPendingStagingIds();
   });
+  // First-paint seed — kick a refresh so a chat session opened before any
+  // staging event fires still gets a populated pending set.
+  void stagingFeed.refresh();
 
   // User-set input height in px. 0 = auto-grow mode (no manual override).
   let userInputHeight = 0;

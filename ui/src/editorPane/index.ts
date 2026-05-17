@@ -36,7 +36,7 @@ import {
   type MutationsMenuApi,
 } from "../mutations";
 import type { CtxMenuItem } from "../widgets/contextMenu";
-import { openContextMenu } from "../widgets/contextMenu";
+import { openMenuAtEvent } from "../widgets/contextMenu";
 import type { Extension } from "@codemirror/state";
 import { getBuffer, viewSettingsStore } from "../app/state";
 import { dom } from "../app/dom";
@@ -294,7 +294,7 @@ export function mountEditorPane(deps: EditorPaneDeps): EditorPaneApi {
         run: () => void dirtyBufferDiff.toggle(),
       },
     ];
-    openContextMenu(ev.clientX, ev.clientY, items);
+    openMenuAtEvent(ev, items);
   });
 
   // ---- File-mode controls ----

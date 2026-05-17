@@ -29,7 +29,7 @@ import {
   type PanelDeps,
 } from "../panels/controller";
 import { Classes, Selectors } from "../style/classes";
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import { openMenuAtAnchor, type CtxMenuItem } from "../widgets/contextMenu";
 
 export interface LexicalSearchOpts {
   case_sensitive: boolean;
@@ -557,7 +557,6 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
   // state per the spec ("no behavioral overload of the primary
   // affordance").
   function openLexicalOptionsMenu(anchor: HTMLElement): void {
-    const rect = anchor.getBoundingClientRect();
     const items: CtxMenuItem[] = [
       {
         label: "Case sensitive",
@@ -587,11 +586,10 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
         run: () => persistLexical("phrase_mode", !lexicalOpts.phrase_mode),
       },
     ];
-    openContextMenu(rect.left, rect.bottom, items);
+    openMenuAtAnchor(anchor, items);
   }
 
   function openSemanticOptionsMenu(anchor: HTMLElement): void {
-    const rect = anchor.getBoundingClientRect();
     const items: CtxMenuItem[] = [
       {
         kind: "slider",
@@ -628,7 +626,7 @@ export function mountDiscovery(deps: DiscoveryDeps): DiscoveryController {
           ),
       },
     ];
-    openContextMenu(rect.left, rect.bottom, items);
+    openMenuAtAnchor(anchor, items);
   }
 
   // ---------- DOM listeners ----------

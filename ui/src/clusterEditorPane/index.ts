@@ -34,7 +34,7 @@ import { describeErr } from "../ipc/runCommand";
 import {
   closeContextMenu,
   isContextMenuOpen,
-  openContextMenu,
+  openMenuAtAnchor,
   type CtxMenuItem,
 } from "../widgets/contextMenu";
 import { Icons } from "../icons";
@@ -641,8 +641,7 @@ export function mountClusterEditorPane(
       if (treeViewVariant === "graph" && graphApi) {
         items.push(...graphApi.getViewMenuItems());
       }
-      const rect = anchor.getBoundingClientRect();
-      openContextMenu(rect.right, rect.bottom, items, anchor);
+      openMenuAtAnchor(anchor, items, { align: "right" });
     }
 
     // Divider between the view-toggle cluster and the accept/reject

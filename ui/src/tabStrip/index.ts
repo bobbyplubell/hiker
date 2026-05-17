@@ -17,7 +17,7 @@
 // passes a snapshot of `{ path, isDirty, basename, folder }` per tab on
 // every render and wires actions back via callbacks.
 
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import { openMenuAtEvent, type CtxMenuItem } from "../widgets/contextMenu";
 import { el } from "../widgets/dom";
 
 export interface TabSnapshot {
@@ -156,7 +156,7 @@ export function mountTabStrip(deps: TabStripDeps): TabStripApi {
               },
               { label: "Reveal in tree", run: () => deps.onRevealInTree(t.path) },
             );
-            openContextMenu(e.clientX, e.clientY, items);
+            openMenuAtEvent(e, items);
           },
         },
       }, [

@@ -29,12 +29,17 @@ import {
 } from "../panels/controller";
 import { Classes } from "../style/classes";
 
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import {
+  openContextMenu,
+  openMenuAtEvent,
+  type CtxMenuItem,
+} from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { confirmDanger } from "../widgets/confirm";
 import { Icons } from "../icons";
 import type { Proposal, ResolvedWaypoint } from "../ipc";
 import { getActiveTrailRel } from "../app/state";
+import { controllers } from "../app/controllers";
 import { getActiveTrailWaypointPaths } from "../trails/membership";
 import {
   applyIndexMarker,
@@ -179,18 +184,26 @@ export function mountTree(deps: TreeDeps): TreeController {
   const trailDetailCache = new Map<string, ResolvedWaypoint[]>();
 
   // status: staging-accept-reject-from-tree
-  // Cached pending staging proposals. Fetched on vault open and on
-  // `hiker:staging-changed`. Used by `renderDir` to inject synthetic
-  // rows for new files and dirty markers for existing files.
+  // Cached pending staging proposals — mirrors the shared `stagingFeedCache`
+  // broadcast. Used by `renderDir` to inject synthetic rows for new files
+  // and dirty markers for existing files. The explicit
+  // `refreshStagingProposals()` calls below force an immediate fetch in
+  // call sites that have just mutated staging themselves (accept / reject)
+  // and need a synchronous "fresh after my mutation" guarantee before they
+  // re-render.
   let pendingProposals: Proposal[] = [];
+  controllers.stagingFeedCache.get().subscribe((proposals) => {
+    pendingProposals = proposals;
+    // Repaint the tree so synthetic staging rows / dirty markers reflect
+    // the new snapshot. Centralizing the repaint here means the
+    // per-event orchestrator in `taskQueueTile.ts` doesn't need a
+    // separate `tree.refresh()` call; the cache broadcast already drives
+    // it.
+    void refresh();
+  });
 
   async function refreshStagingProposals(): Promise<void> {
-    try {
-      pendingProposals = await Ipc.stagingList();
-    } catch (err) {
-      Logger.error("ui::tree", "staging_list failed", { err });
-      pendingProposals = [];
-    }
+    pendingProposals = await controllers.stagingFeedCache.get().refresh();
   }
 
   /// Given a directory rel path, return a map of direct child names
@@ -937,7 +950,7 @@ export function mountTree(deps: TreeDeps): TreeController {
           },
         });
       }
-      openContextMenu(e.clientX, e.clientY, items);
+      openMenuAtEvent(e, items);
     });
   }
 
@@ -1054,7 +1067,7 @@ export function mountTree(deps: TreeDeps): TreeController {
   // Empty-space right-click → "New note here".
   deps.treeEl.addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    openContextMenu(e.clientX, e.clientY, [
+    openMenuAtEvent(e, [
       {
         label: "New note here",
         run: async () => {

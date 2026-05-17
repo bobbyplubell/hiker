@@ -39,7 +39,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onHikerEventAs } from "../events";
 import { Logger } from "../logger";
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import { openContextMenu, openMenuAtAnchor, type CtxMenuItem } from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { describeErr } from "../ipc/runCommand";
 import { Icons } from "../icons";
@@ -327,7 +327,6 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
   }
 
   function openModeMenu(triggerEl: HTMLElement): void {
-    const rect = triggerEl.getBoundingClientRect();
     const items: CtxMenuItem[] = [
       {
         // status: cluster-review-tab-from-new-tree-action
@@ -358,7 +357,7 @@ export function mountClusterEditor(deps: ClusterEditorDeps): ClusterEditorApi {
         run: () => void refresh(),
       },
     ];
-    openContextMenu(rect.right, rect.bottom, items, triggerEl);
+    openMenuAtAnchor(triggerEl, items, { align: "right" });
   }
 
   // status: cluster-editor-dnd-visual-feedback

@@ -16,6 +16,10 @@ import { initDom } from "../dom";
 import { controllers } from "../controllers";
 import { services } from "../services";
 import { createSettingsManager } from "../../settings/manager";
+import { mountStagingFeedCache } from "../stagingFeedCache";
+import { Ipc } from "../../ipc";
+import { onHikerEvent } from "../../events";
+import { Logger } from "../../logger";
 import type { Buffer } from "../state";
 import { ctx } from "./ctx";
 
@@ -62,6 +66,17 @@ export function phase1_initRuntime(): void {
     if (scope === "user") return settings.setUserSetting(key, value);
     return settings.setVaultSetting(key, value);
   }
+
+  // Shared staging-feed cache — single subscription to `hiker:staging-changed`
+  // + a debounced `Ipc.stagingList()` fetch. Consumers (patch-review, chat,
+  // tree) subscribe via the cache instead of each running their own
+  // event listener + IPC round trip.
+  const stagingFeedCache = mountStagingFeedCache({
+    fetch: () => Ipc.stagingList(),
+    onChange: (cb) => onHikerEvent("hiker:staging-changed", () => cb()),
+    onError: (err) => Logger.error("ui::app", "stagingFeedCache fetch failed", { err }),
+  });
+  controllers.stagingFeedCache.set(stagingFeedCache);
 
   // Wire up early-needed services so that modules mounted below can call them.
   services.formatError.set(formatError);

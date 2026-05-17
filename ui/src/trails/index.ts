@@ -46,7 +46,11 @@ import {
   type PanelDeps,
 } from "../panels/controller";
 import { Icons } from "../icons";
-import { openContextMenu, type CtxMenuItem } from "../widgets/contextMenu";
+import {
+  openContextMenu,
+  openMenuAtEvent,
+  type CtxMenuItem,
+} from "../widgets/contextMenu";
 import { showToast } from "../widgets/toast";
 import { el } from "../widgets/dom";
 import { confirmDanger } from "../widgets/confirm";
@@ -564,7 +568,7 @@ export function mountTrailsPanel(deps: TrailsDeps): TrailsController {
       e.stopPropagation();
       const alreadyCursor =
         detailCache !== null && detailCache.append_under === w.waypoint_id;
-      openContextMenu(e.clientX, e.clientY, [
+      openMenuAtEvent(e, [
         {
           label: "Append from here",
           disabled: alreadyCursor,
