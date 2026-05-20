@@ -20,10 +20,20 @@ The right-hand panel is one column with a fixed input row at the top and a stack
 │  [search input]      [S] [L]    │  ← input + mode toggles
 │                                 │
 │  ▼ Search results (8)           │  ← present iff query non-empty
+│    ┌─────────────────────────┐  │
+│    │ Note title         0.42 │  │
+│    │ folder/sub/note.md      │  │  ← shared card primitive
+│    │ Heading > Subheading    │  │     [discovery-result-card]
+│    │ …excerpt of the matched │  │
+│    │ chunk wrapping a few    │  │
+│    │ lines…                  │  │
+│    └─────────────────────────┘  │
 │    ...                          │
 │                                 │
 │  ▼ Related notes (5)            │  ← always present (active editor file)
-│    ...                          │
+│    ┌─ same card shape ───────┐  │
+│    │ …                       │  │
+│    └─────────────────────────┘  │
 └─────────────────────────────────┘
 ```
 
@@ -92,7 +102,7 @@ Rejected for v2: an embedder/model picker in this menu. Choosing an embedder is 
 Search runs as the user types. Mechanic:
 
 - **Debounce 250ms.** Keystroke schedules a query 250ms out; subsequent keystrokes cancel and reschedule. Empty query collapses results immediately, no debounce. [search-typeahead-debounce]
-- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch. Tauri command runs both backends in parallel; stale-epoch results dropped on the frontend before render. Mirrors the related-notes file-switch cancel pattern.
+- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch. The command runs both backends in parallel; stale-epoch results dropped on the frontend before render. Mirrors the related-notes file-switch cancel pattern.
 - **Lexical returns near-instantly** (sqlite). **Semantic embeds the query string** on the existing `spawn_blocking` pool (`embedder-spawn-blocking`), tens of ms with bge-small warm. Both run in parallel; panel renders each section as it arrives — lexical may paint a beat before semantic, covered by section spinners. [search-query-embed-spawn-blocking]
 
 
@@ -100,14 +110,18 @@ Search runs as the user types. Mechanic:
 
 One row per *note*, not per chunk. The query may match many chunks within a note; the row shows the highest-ranked chunk as snippet. Mirrors `related-notes-snippet` and matches `design.md`'s "fuse → group by parent note" rule. [search-result-grouped-by-note]
 
-Row anatomy:
+Rows are rendered as cards, not flat list items. Search results and related-notes share the same card primitive — both surfaces show the matched chunk excerpt, the answer to "why is this note here" lives inside the card next to the title. The two sections differ only in their headers and the query that fills them. [discovery-result-card]
 
-- **Title.** Basename or first H1 if present (same logic as related-notes panel).
-- **Heading-path breadcrumb.** From the matched chunk's `heading_path` (already stored, see `chunker-heading-path`). Subtle, single line, ellipsized when long.
-- **Snippet.** ~2–3 lines from the matched chunk. Lexical hits use FTS5's `snippet()` for highlighting; semantic-only hits show plain context. [search-result-row]
-- **Score.** Small, muted, right-aligned. Debug-friendly; users tend to ignore it but it's useful when ranking feels wrong.
+Card anatomy (top to bottom):
 
-**Click → open + scroll-to-chunk.** Opens the file and scrolls to the matched chunk via its stored line range (`tauri-cmd-chunks-for-path`). [search-result-click-opens-chunk]
+- **Title row.** Basename or first H1 if present (same logic across both surfaces). Right-aligned muted score, single line, ellipsized when long.
+- **Path subtitle.** Vault-relative path, muted, single line, ellipsized from the left so the filename stays visible. Lets the user disambiguate same-named notes in different folders without opening them.
+- **Heading-path breadcrumb.** From the matched chunk's `heading_path` (`chunker-heading-path`). Omitted when the chunk has none. Single line, ellipsized when long.
+- **Excerpt.** ~2–3 lines from the matched chunk. Lexical hits use FTS5's `snippet()` for highlighting; semantic-only hits show plain context centered on the chunk start. Wraps within the card; no horizontal scroll. [search-result-row]
+
+Cards are visually distinct from flat list rows: subtle bordered frame, small inner padding, vertical spacing between cards. Hover lifts the background tone; the active focus ring sits on the card itself for keyboard nav. The card is the whole click target.
+
+**Click → open + scroll-to-chunk.** Opens the file and scrolls to the matched chunk via its stored line range (`cmd-chunks-for-path`). [search-result-click-opens-chunk]
 
 **Result budget.** Each backend returns top 25 internally; fused list shows 20. RRF benefits from a tail of below-the-fold candidates per side. Fixed for v2; configurability waits until MCP needs different budgets. [search-result-budget]
 
@@ -204,17 +218,16 @@ Group-by-note happens *before* fusion: lexical hits are first reduced to one-row
 
 v2 searches the whole vault. No folder scope, tag scope, or lifecycle filters (`archive` / `redact` / `retire` from `design.md` aren't implemented yet). [search-vault-scope-only]
 
-- **Skipped notes** (`tauri-cmd-file-index-state` — too-large, not-utf-8) aren't indexed, so aren't searchable. The tree-row Skipped marker is the user-facing signal.
+- **Skipped notes** (`cmd-file-index-state` — too-large, not-utf-8) aren't indexed, so aren't searchable. The tree-row Skipped marker is the user-facing signal.
 - **`.hiker/` and ignored paths** (`watcher-ignore-hardcoded`) are already excluded from indexing, naturally excluded from search.
 - **Trash entries** under `.hiker/trash/` aren't indexed, don't appear in results. The trash bin's row list (`tree-trash-flat-by-deleted`) is the dedicated surface — by design, search shows your live vault.
 
 
-## Tauri command surface
+## Command surface
 
 A single new command:
 
 ```rust
-#[tauri::command]
 async fn search_vault(
     state: State<'_, AppState>,
     query: String,
@@ -227,16 +240,16 @@ async fn search_vault(
 
 `SearchResponse { epoch, lexical_hits: Vec<NoteHit>, semantic_hits: Vec<NoteHit>, fused: Vec<NoteHit> }`. Frontend renders `fused` when both modes are on, else the relevant single list.
 
-Both option structs use `#[serde(default)]` on every field, so older payloads decode to documented defaults — `settings-strict-load` discipline applies at config load only, not at the Tauri boundary.
+Both option structs use `#[serde(default)]` on every field, so older payloads decode to documented defaults — `settings-strict-load` discipline applies at config load only, not at the command boundary.
 
-Returning all three buckets is deliberate: keeps the command flat and lets us add UI affordances later (e.g. "show me what each backend found separately") without a new command. Frontend ignores the buckets it doesn't need. [search-tauri-cmd]
+Returning all three buckets is deliberate: keeps the command flat and lets us add UI affordances later (e.g. "show me what each backend found separately") without a new command. Frontend ignores the buckets it doesn't need. [search-cmd]
 
-Wires through `core::search::query()`, which composes the two engine traits. Tauri command is a thin wrapper (~10 lines) per the layer-split rules in `design.md`.
+Wires through `core::search::query()`, which composes the two engine traits. The command is a thin wrapper (~10 lines) per the layer-split rules in `design.md`.
 
 
 ## Module discipline
 
-- `core::search` — engine traits, fusion, public `query` function. Zero `tauri::` imports.
+- `core::search` — engine traits, fusion, public `query` function. Zero host imports.
 - `core::search::fts5` — `Fts5LexicalEngine` impl. The only place that touches FTS5 SQL.
 - `core::search::semantic` — `SemanticEngine` impl over the existing `chunk_vecs` table.
 - `core::store` — gains FTS5 writes alongside existing chunk writes; `chunks_fts` schema lives here next to the rest of the schema, rusqlite confined as before (`store-module-discipline`).

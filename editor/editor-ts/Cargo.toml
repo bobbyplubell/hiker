@@ -1,0 +1,32 @@
+[package]
+name = "editor-ts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+editor-core.workspace = true
+tree-sitter.workspace = true
+smol_str.workspace = true
+smallvec.workspace = true
+
+[features]
+# Per-language feature flags. Each gates a bundle in `languages.rs`. The
+# actual `tree-sitter-{rust,python,…}` dependencies are intentionally not
+# wired yet — hosts that need them should add the dep and uncomment the
+# corresponding bundle (see `languages.rs`).
+lang-rust = []
+lang-python = []
+lang-javascript = []
+lang-typescript = []
+lang-bash = []
+lang-go = []
+lang-json = []
+lang-yaml = []
+lang-toml = []
+lang-html = []
+lang-css = []
+
+[lints]
+workspace = true

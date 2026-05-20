@@ -29,10 +29,10 @@ use super::append_change_best_effort;
 /// hold the hash themselves — they round-trip the token verbatim through
 /// `commit_buffer` and we re-derive the drift-check inputs from it.
 ///
-/// Fields are private; the type serializes as a JSON object for the Tauri
-/// IPC seam (and any future ts-rs export) but the UI must not introspect
-/// or reconstruct it. The whole point of this slug is to delete the
-/// hash-as-cursor concept from the editor surface.
+/// Fields are private; the type serializes as a JSON object for the
+/// IPC seam but the UI must not introspect or reconstruct it. The whole
+/// point of this slug is to delete the hash-as-cursor concept from the
+/// editor surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferToken {
     path: String,
@@ -152,7 +152,7 @@ pub fn open_for_edit(vault: &Vault, rel: &str) -> Result<OpenForEditOutcome, Hik
 ///
 /// `extra_metadata` carries one-shot context (e.g.
 /// `{ "mutation": "<kind>" }` per `note-mutation-stash-changes-tag`); a
-/// non-object value is treated as `{}` to match the existing Tauri
+/// non-object value is treated as `{}` to match the existing
 /// command shape.
 pub fn commit_buffer(
     vault: &Vault,

@@ -1,5 +1,5 @@
-//! Vault-level orchestration ops shared by every adapter (Tauri today, CLI /
-//! MCP later). Each op owns the full sequence around a mutating action:
+//! Vault-level orchestration ops shared by every adapter (app, CLI,
+//! MCP). Each op owns the full sequence around a mutating action:
 //! pre-suppress watcher paths → enumerate vault/trash members → send the
 //! relevant `IndexJob` → await its oneshot reply → re-suppress for the TTL
 //! window. Adapters call one function and translate the result.

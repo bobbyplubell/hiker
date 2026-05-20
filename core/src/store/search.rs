@@ -3,7 +3,7 @@ use super::*;
 impl Store {
     /// Notes whose basename (filename minus extension) loosely matches the
     /// given prefix, ranked by match quality + recency. Backs the chat
-    /// `@`-autocomplete popover (`chat-input-at-autocomplete-tauri-cmd`).
+    /// `@`-autocomplete popover (`chat-input-at-autocomplete-cmd`).
     ///
     /// Empty prefix → most-recently-accessed notes (NULLs last via
     /// `ORDER BY last_accessed_at IS NULL, last_accessed_at DESC`).
@@ -12,7 +12,7 @@ impl Store {
     /// with the prefix; rank 1: contains it elsewhere) then by recency.
     /// Skipped rows are excluded.
     ///
-    /// status: chat-input-at-autocomplete-tauri-cmd
+    /// status: chat-input-at-autocomplete-cmd
     pub fn at_autocomplete(
         &self,
         prefix: &str,
@@ -130,7 +130,15 @@ impl Store {
         }
 
         let mut hits: Vec<ChunkHit> = best_per_note.into_values().collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Stable tiebreaker on note_id: best_per_note is a HashMap so its
+        // iteration order shuffles between calls, which made cards visibly
+        // flip-flop when scores tied across frames.
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.note_id.cmp(&b.note_id))
+        });
         hits.truncate(top_k);
 
         Ok(hits

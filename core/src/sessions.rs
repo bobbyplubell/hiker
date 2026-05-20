@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::{Message, Role, ToolCall, ToolResult};
+
 /// Wraps the per-session id. Cheap to clone, opaque to callers; the
 /// chat command surface mints fresh ones via `SessionId::generate`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -137,7 +139,8 @@ pub fn create_session_file(vault_root: &Path, meta: &SessionMeta) -> io::Result<
 
 /// Append one user/agent turn to an existing session file. `tool_blocks`
 /// renders each tool call as a fenced code block under the agent
-/// section (one ```hiker-tool-call``` block per call).
+/// section (one ```hiker-tool-call``` block per call). Legacy/raw entry
+/// point retained for callers that already have stringified blocks.
 pub fn append_turn(
     path: &Path,
     user_message: &str,
@@ -157,6 +160,60 @@ pub fn append_turn(
         s.push_str("```hiker-tool-call\n");
         s.push_str(block.trim_end());
         s.push_str("\n```\n\n");
+    }
+    f.write_all(s.as_bytes())?;
+    f.flush()
+}
+
+/// Append one structured turn, persisting tool calls and tool results as
+/// paired `hiker-tool-call` / `hiker-tool-result` fenced JSON blocks under
+/// the agent section. This is the canonical entry point per
+/// `chat-session-markdown-store` — tool-call structure round-trips on
+/// resume.
+pub fn append_turn_structured(
+    path: &Path,
+    user_message: &str,
+    agent_text: &str,
+    tool_calls: &[ToolCall],
+    tool_results: &[ToolResult],
+) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new().append(true).open(path)?;
+    let mut s = String::new();
+    s.push_str("## User\n\n");
+    s.push_str(user_message.trim_end());
+    s.push_str("\n\n## Agent\n\n");
+    if !agent_text.is_empty() {
+        s.push_str(agent_text.trim_end());
+        s.push_str("\n\n");
+    }
+    for tc in tool_calls {
+        s.push_str("```hiker-tool-call\n");
+        let json = serde_json::to_string(tc)
+            .unwrap_or_else(|_| String::from("{}"));
+        s.push_str(&json);
+        s.push_str("\n```\n\n");
+        // Pair the matching result (if any) directly after the call so
+        // resumed history keeps the assistant→tool-result alternation
+        // a provider expects.
+        if let Some(res) = tool_results.iter().find(|r| r.call_id == tc.id) {
+            s.push_str("```hiker-tool-result\n");
+            let json = serde_json::to_string(res)
+                .unwrap_or_else(|_| String::from("{}"));
+            s.push_str(&json);
+            s.push_str("\n```\n\n");
+        }
+    }
+    // Orphan results (no matching call_id in tool_calls) — write them too
+    // so we don't lose data. Rare but possible if the agent loop emitted a
+    // synthetic error result.
+    for res in tool_results {
+        if !tool_calls.iter().any(|c| c.id == res.call_id) {
+            s.push_str("```hiker-tool-result\n");
+            let json = serde_json::to_string(res)
+                .unwrap_or_else(|_| String::from("{}"));
+            s.push_str(&json);
+            s.push_str("\n```\n\n");
+        }
     }
     f.write_all(s.as_bytes())?;
     f.flush()
@@ -198,7 +255,7 @@ pub fn list_sessions(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
             mtime_unix: mtime,
         });
     }
-    out.sort_by(|a, b| b.mtime_unix.cmp(&a.mtime_unix));
+    out.sort_by_key(|s| std::cmp::Reverse(s.mtime_unix));
     Ok(out)
 }
 
@@ -210,55 +267,139 @@ pub fn most_recent_session(vault_root: &Path) -> io::Result<Option<SessionFileIn
 }
 
 /// One reconstructed turn, used to seed the in-memory cache when
-/// resuming a session at vault open. Tool-call structure is intentionally
-/// dropped — resume is a "synthetic context" rebuild, not a perfect
-/// replay; the agent will re-call tools as needed for any follow-up.
-#[derive(Debug, Clone)]
+/// resuming a session at vault open. Tool-call structure is preserved per
+/// `chat-session-markdown-store` so the agent sees its prior tool use on
+/// resume; otherwise the model infers from a tool-call-stripped history
+/// that it can write notes without ever invoking `write_note`.
+#[derive(Debug, Clone, Default)]
 pub struct ResumedTurn {
     pub user: String,
     pub agent: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_results: Vec<ToolResult>,
 }
 
-/// Parse a session file back into alternating user/agent text. Tool-call
-/// fences are stripped from the agent text.
+/// Translate a sequence of resumed turns into the provider-shaped message
+/// history the agent loop consumes. User text becomes a `User` message;
+/// agent text plus tool calls become one `Assistant` message; tool results
+/// become a `User` message with `tool_results` populated (matching the
+/// shape `chat_with_tools` produces for fresh turns).
+pub fn resumed_turns_to_history(turns: &[ResumedTurn]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(turns.len() * 2);
+    for t in turns {
+        if !t.user.is_empty() {
+            out.push(Message::user(t.user.clone()));
+        }
+        if !t.agent.is_empty() || !t.tool_calls.is_empty() {
+            out.push(Message {
+                role: Role::Assistant,
+                content: t.agent.clone(),
+                tool_calls: t.tool_calls.clone(),
+                tool_results: Vec::new(),
+            });
+        }
+        if !t.tool_results.is_empty() {
+            out.push(Message {
+                role: Role::User,
+                content: String::new(),
+                tool_calls: Vec::new(),
+                tool_results: t.tool_results.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Parse a session file back into alternating user/agent turns,
+/// preserving any `hiker-tool-call` / `hiker-tool-result` JSON blocks in
+/// the structured fields of `ResumedTurn`. Tool-call fences are stripped
+/// from the agent prose so callers can render the text cleanly.
 pub fn parse_session(path: &Path) -> io::Result<Vec<ResumedTurn>> {
     let body = fs::read_to_string(path)?;
     let body = strip_frontmatter(&body);
     let mut turns: Vec<ResumedTurn> = Vec::new();
     let mut current_section: Option<&'static str> = None; // "user" | "agent"
-    let mut buf = String::new();
+    let mut text_buf = String::new();
+    let mut block_buf = String::new();
     let mut current_user = String::new();
-    let mut in_tool_block = false;
+    let mut pending_calls: Vec<ToolCall> = Vec::new();
+    let mut pending_results: Vec<ToolResult> = Vec::new();
+    // None = not in a block; Some("call"|"result") = currently inside a
+    // tool fence of that kind.
+    let mut in_block: Option<&'static str> = None;
 
     for line in body.lines() {
-        if line == "## User" {
-            flush_section(&mut turns, &current_section, &mut current_user, &mut buf);
-            current_section = Some("user");
-            in_tool_block = false;
-            continue;
-        }
-        if line == "## Agent" {
-            flush_section(&mut turns, &current_section, &mut current_user, &mut buf);
-            current_section = Some("agent");
-            in_tool_block = false;
-            continue;
-        }
-        if line.starts_with("```hiker-tool-call") {
-            in_tool_block = true;
-            continue;
-        }
-        if in_tool_block {
+        if in_block.is_some() {
             if line.starts_with("```") {
-                in_tool_block = false;
+                let kind = in_block.take().unwrap_or("");
+                let parsed = block_buf.trim();
+                if !parsed.is_empty() {
+                    match kind {
+                        "call" => {
+                            if let Ok(tc) = serde_json::from_str::<ToolCall>(parsed) {
+                                pending_calls.push(tc);
+                            }
+                        }
+                        "result" => {
+                            if let Ok(tr) = serde_json::from_str::<ToolResult>(parsed) {
+                                pending_results.push(tr);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                block_buf.clear();
+            } else {
+                block_buf.push_str(line);
+                block_buf.push('\n');
             }
             continue;
         }
+        if line == "## User" {
+            flush_section(
+                &mut turns,
+                &current_section,
+                &mut current_user,
+                &mut text_buf,
+                &mut pending_calls,
+                &mut pending_results,
+            );
+            current_section = Some("user");
+            continue;
+        }
+        if line == "## Agent" {
+            flush_section(
+                &mut turns,
+                &current_section,
+                &mut current_user,
+                &mut text_buf,
+                &mut pending_calls,
+                &mut pending_results,
+            );
+            current_section = Some("agent");
+            continue;
+        }
+        if line.starts_with("```hiker-tool-call") {
+            in_block = Some("call");
+            continue;
+        }
+        if line.starts_with("```hiker-tool-result") {
+            in_block = Some("result");
+            continue;
+        }
         if current_section.is_some() {
-            buf.push_str(line);
-            buf.push('\n');
+            text_buf.push_str(line);
+            text_buf.push('\n');
         }
     }
-    flush_section(&mut turns, &current_section, &mut current_user, &mut buf);
+    flush_section(
+        &mut turns,
+        &current_section,
+        &mut current_user,
+        &mut text_buf,
+        &mut pending_calls,
+        &mut pending_results,
+    );
     Ok(turns)
 }
 
@@ -266,10 +407,12 @@ fn flush_section(
     turns: &mut Vec<ResumedTurn>,
     section: &Option<&'static str>,
     current_user: &mut String,
-    buf: &mut String,
+    text_buf: &mut String,
+    pending_calls: &mut Vec<ToolCall>,
+    pending_results: &mut Vec<ToolResult>,
 ) {
-    let trimmed = buf.trim().to_string();
-    buf.clear();
+    let trimmed = text_buf.trim().to_string();
+    text_buf.clear();
     match *section {
         Some("user") => {
             *current_user = trimmed;
@@ -278,6 +421,8 @@ fn flush_section(
             turns.push(ResumedTurn {
                 user: std::mem::take(current_user),
                 agent: trimmed,
+                tool_calls: std::mem::take(pending_calls),
+                tool_results: std::mem::take(pending_results),
             });
         }
         _ => {}
@@ -383,6 +528,109 @@ mod tests {
         assert_eq!(turns[1].user, "search the vault");
         // Tool fence is dropped from the parsed agent text.
         assert_eq!(turns[1].agent, "Found 2 notes.");
+    }
+
+    #[test]
+    fn tool_call_and_result_round_trip() {
+        let dir = tempdir().unwrap();
+        let meta = SessionMeta {
+            id: SessionId("abc123".into()),
+            created_at_unix: 1_754_654_400,
+            model: "claude-sonnet-4-7".into(),
+            provider: "anthropic".into(),
+        };
+        let path = create_session_file(dir.path(), &meta).unwrap();
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "search_notes".into(),
+            arguments: r#"{"q":"hiker"}"#.into(),
+        };
+        let tr = ToolResult {
+            call_id: "call_1".into(),
+            name: "search_notes".into(),
+            output: r#"{"hits":[]}"#.into(),
+            ok: true,
+        };
+        append_turn_structured(
+            &path,
+            "find hiking notes",
+            "Searching...",
+            std::slice::from_ref(&tc),
+            std::slice::from_ref(&tr),
+        )
+        .unwrap();
+        let turns = parse_session(&path).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "find hiking notes");
+        assert_eq!(turns[0].agent, "Searching...");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].id, "call_1");
+        assert_eq!(turns[0].tool_results.len(), 1);
+        assert_eq!(turns[0].tool_results[0].output, r#"{"hits":[]}"#);
+
+        let hist = resumed_turns_to_history(&turns);
+        // user / assistant(w/ tool_calls) / user(w/ tool_results)
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[0].role, Role::User);
+        assert_eq!(hist[1].role, Role::Assistant);
+        assert_eq!(hist[1].tool_calls.len(), 1);
+        assert_eq!(hist[2].role, Role::User);
+        assert_eq!(hist[2].tool_results.len(), 1);
+    }
+
+    #[test]
+    fn multi_turn_resumed_history_preserves_alternation() {
+        // Two turns: first plain text, second with a tool call+result.
+        // resumed_turns_to_history should emit exactly the message
+        // sequence the provider expects:
+        //   user1 / assistant1 / user2 / assistant2(tool_calls)
+        //   / user(tool_results)
+        let dir = tempdir().unwrap();
+        let meta = SessionMeta {
+            id: SessionId("multi".into()),
+            created_at_unix: 1_754_654_400,
+            model: "claude-sonnet-4-7".into(),
+            provider: "anthropic".into(),
+        };
+        let path = create_session_file(dir.path(), &meta).unwrap();
+        append_turn(&path, "hello", "hi", &[]).unwrap();
+        let tc = ToolCall {
+            id: "c1".into(),
+            name: "search_notes".into(),
+            arguments: r#"{"q":"x"}"#.into(),
+        };
+        let tr = ToolResult {
+            call_id: "c1".into(),
+            name: "search_notes".into(),
+            output: r#"{"hits":[]}"#.into(),
+            ok: true,
+        };
+        append_turn_structured(
+            &path,
+            "second q",
+            "second a",
+            std::slice::from_ref(&tc),
+            std::slice::from_ref(&tr),
+        )
+        .unwrap();
+
+        let turns = parse_session(&path).unwrap();
+        assert_eq!(turns.len(), 2);
+        let hist = resumed_turns_to_history(&turns);
+        assert_eq!(hist.len(), 5, "user/assistant/user/assistant+tc/user+tr");
+        assert_eq!(hist[0].role, Role::User);
+        assert_eq!(hist[0].content, "hello");
+        assert_eq!(hist[1].role, Role::Assistant);
+        assert_eq!(hist[1].content, "hi");
+        assert!(hist[1].tool_calls.is_empty());
+        assert_eq!(hist[2].role, Role::User);
+        assert_eq!(hist[2].content, "second q");
+        assert_eq!(hist[3].role, Role::Assistant);
+        assert_eq!(hist[3].tool_calls.len(), 1);
+        assert_eq!(hist[3].tool_calls[0].name, "search_notes");
+        assert_eq!(hist[4].role, Role::User);
+        assert_eq!(hist[4].tool_results.len(), 1);
+        assert!(hist[4].tool_results[0].ok);
     }
 
     #[test]

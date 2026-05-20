@@ -14,7 +14,7 @@ The headline decisions:
 
 Pre-stable SemVer (`0.MAJOR.MINOR`-style use of the slots), interpreted as:
 
-- **`0.x.0` (minor bump while pre-1.0)** — may break: vault format, `vault/.hiker/` layout, DB schema, config schema, CLI flags, Tauri command signatures consumed by the UI. The `store-version-fail-loud` rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
+- **`0.x.0` (minor bump while pre-1.0)** — may break: vault format, `vault/.hiker/` layout, DB schema, config schema, CLI flags, host command signatures consumed by the UI. The `store-version-fail-loud` rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
 - **`0.x.y` (patch bump)** — bug fixes, internal refactors, additive features that don't change persisted formats or public surfaces. Safe to upgrade in place.
 - **`1.0.0`** — when the persisted formats and public surfaces are stable enough to defend across a year. Not on the near-term roadmap.
 
@@ -26,7 +26,7 @@ What counts as a breaking change at 0.x:
 | SQLite schema (without auto-migration path) | yes |
 | `vault/.hiker/config.toml` schema | yes |
 | CLI flags / subcommand names | yes |
-| Tauri command names or signatures | yes |
+| Host command names or signatures | yes |
 | Embedder model / dimension change | yes (forces reindex; bumps `embedder_version`) |
 | Default keybinds | no — annoying but not breaking |
 | Internal Rust API between modules | no — there are no external consumers |
@@ -39,7 +39,7 @@ When in doubt: a change that requires a returning user to do anything other than
 Two declarations, kept in sync at release time:
 
 - `core/Cargo.toml` → `package.version`
-- `ui/src-tauri/tauri.conf.json` → `version`
+- `app/Cargo.toml` → `package.version`
 
 The build embeds the version into the binary; `hiker --version` prints it, and the UI surfaces it in the about dialog / status bar tooltip. A pre-release build off `main` reports the version with a `-dev` suffix or commit short SHA so a bug report identifies the exact build.
 
@@ -92,7 +92,7 @@ Anything labelled `breaking:` requires a minor (`0.x.0`) bump, a CHANGELOG entry
 ## Tagging a release
 
 1. Decide the version number per the bump rules above.
-2. Bump `core/Cargo.toml` and `ui/src-tauri/tauri.conf.json` in one squash-merged commit titled `chore: release v0.x.y`.
+2. Bump `core/Cargo.toml` and `app/Cargo.toml` in one squash-merged commit titled `chore: release v0.x.y`.
 3. Update `CHANGELOG.md` in the same commit.
 4. Tag the commit: `git tag -a v0.x.y -m "v0.x.y"` and push the tag.
 5. Build release artifacts from the tagged commit, not from `main` after-the-fact (avoids drift if `main` moves before you build).
@@ -127,12 +127,12 @@ Local development builds and one-off shares of `main` between tags get a version
 ## Deferred
 
 - **Code signing / notarization** for macOS + Windows builds. Required before any public distribution; out of scope until there's a public distribution channel.
-- **Auto-update / in-app update channel.** Tauri supports it; we don't need it until there are users on builds we don't hand to them ourselves.
-- **Release artifacts (CI-built)** uploaded to GitHub Releases on tag push. Easy to add (`tauri-action`); deferred until we want a download URL.
+- **Auto-update / in-app update channel.** Not needed until there are users on builds we don't hand to them ourselves.
+- **Release artifacts (CI-built)** uploaded to GitHub Releases on tag push. Deferred until we want a download URL.
 
 
 ## Out of scope
 
-- Public stability promises about Rust APIs between internal modules. There are no external consumers; the only contract is at the persisted-format / CLI / Tauri-command boundary.
+- Public stability promises about Rust APIs between internal modules. There are no external consumers; the only contract is at the persisted-format / CLI / host-command boundary.
 - Linux distro packaging (deb/rpm/flatpak). Not on the near-term roadmap.
 - A `dev` long-lived branch — explicitly rejected for v1; revisit if contributor count or release cadence justifies it.

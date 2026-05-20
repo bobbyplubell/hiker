@@ -1,0 +1,19 @@
+[package]
+name = "profile-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "profile-indexer"
+path = "src/main.rs"
+
+[dependencies]
+hiker-core.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dhat.workspace = true

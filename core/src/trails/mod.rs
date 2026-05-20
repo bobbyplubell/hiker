@@ -456,7 +456,7 @@ where
 ///
 /// status: trail-side-trail-shape
 pub fn find_waypoint_mut<'a>(
-    entries: &'a mut Vec<WaypointEntry>,
+    entries: &'a mut [WaypointEntry],
     waypoint_id: &str,
 ) -> Option<&'a mut WaypointEntry> {
     for entry in entries.iter_mut() {
@@ -556,7 +556,7 @@ fn empty_waypoint_note(
 }
 
 // ---------------------------------------------------------------------------
-// Listing / detail helpers (slice U1: drives Tauri `trails_list` /
+// Listing / detail helpers (slice U1: drives `trails_list` /
 // `trail_get` and the planned MCP `trails_list` / `trail_get` tools).
 // Lives in `core` (not the adapter) because both surfaces share the same
 // data-shaping policy: classify a vault note as a trail-doc by parsing

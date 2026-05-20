@@ -76,6 +76,7 @@ Per-vault toggles for the editor pane and View menu. All optional; each has an i
 | `word_wrap` | bool | `true` | Initial state of `view-word-wrap-toggle`; ungreys this entry |
 | `show_line_numbers` | bool | `true` | Initial state of `view-line-numbers-toggle` |
 | `show_whitespace` | bool | `false` | Initial state of `view-show-whitespace-toggle` |
+| `highlight_trailing_whitespace` | bool | `false` | Initial state of `view-highlight-trailing-whitespace-toggle` |
 | `show_chunk_boundaries` | bool | `false` | Initial state of `view-show-chunk-boundaries`; debugging-grade view, off by default |
 | `intraline_diff` | bool | `false` | Initial state of `view-intraline-diff-toggle`; off keeps the existing line-level rendering. See `diff.md`'s "Diff style" section |
 | `tab_size` | u8 | `2` | CM6 `EditorState.tabSize` |
@@ -149,7 +150,7 @@ Per-user vault management plus per-vault UI startup state.
 
 #### Default vault auto-open [settings-default-vault-autoopen]
 
-When `vault.default` is set, the frontend bootstrap auto-opens that path before showing the JS folder dialog. Reads via `get_default_vault()` (read-only Tauri command); if non-empty, calls `open_vault_at(path)` directly. Orchestration lives entirely in the frontend per the rule above.
+When `vault.default` is set, the frontend bootstrap auto-opens that path before showing the JS folder dialog. Reads via `get_default_vault()` (read-only command); if non-empty, calls `open_vault_at(path)` directly. Orchestration lives entirely in the frontend per the rule above.
 
 Failure modes:
 
@@ -429,7 +430,7 @@ The section is added to the strict-load schema (`#[serde(deny_unknown_fields)]` 
 
 ### Module placement
 
-- `core::staging` — `Staging` struct, `Staging::propose / propose_batch / accept / reject / list / count / recheck / gc`. Pure, no Tauri imports. All `.hiker/staging/` filesystem touches confined here.
+- `core::staging` — `Staging` struct, `Staging::propose / propose_batch / accept / reject / list / count / recheck / gc`. Pure, no host imports. All `.hiker/staging/` filesystem touches confined here.
 - `core::ops::agent_write_note` (and frontmatter / tag wrappers) branch on the loaded `Config`'s review flag and route to `core::staging::propose` when set.
 - UI: activity detail page filter + inline accept/reject, chat tool-call card buttons, trails panel banner + proposed rows, tree context menu + dot indicator, editor toolbar pill. Each surface calls `core::staging::list(filter)` with its relevant filter.
 - MCP server response shapes extend per `staging-review-pending-response`.
@@ -452,7 +453,7 @@ A vault-bar gear button toggles a settings surface that replaces the editor (sam
 - **Pane mode, not modal.** The settings surface is a sub-mode of the editor pane, alongside the vault home overview and home detail. Clicking the gear swaps `#editor-pane` to a settings layout; clicking any tree row / recents row / search result returns to the editor on that note. Same shape `setVaultHomeVisible` already uses today, with the same dirty-buffer protection (a dirty editor buffer gets the existing `file-switch-guard-dirty` modal before the swap). [settings-pane-mode]
 - **Gear icon in the vault bar between Home and Open-vault.** `vault-bar` order becomes Home / Settings / Open-vault, then the vault path display, then back/forward at the trailing edge. Same icon-only treatment as the existing vault-bar buttons (gear / cog glyph in the established line-weight family). Pressed/unpressed state reflects whether the settings pane is currently visible. Tooltip "Settings." [vault-bar-settings-icon]
 - **A long scrollable page, sections stacked.** The body mirrors `vault-home-overview`: a header with the vault name + scope toggle, then a stack of section cards — one per `[section]` in the loaded config. Each card is a list of rows; each row is one config key with its current value, an inline control, a "reset to default" affordance, and a one-line description. No left-rail tabs in v1 — a single scrollable page is honest about the v1 surface size and matches the home page's vertical stack. [settings-pane-section-list]
-- **Eligible keys are interactive; everything else is read-only with a "edit TOML" affordance.** The write-back-eligible key set (the closed list in `core::config`) drives which rows get a live control vs. a read-only display. Read-only rows show the current value in a muted code style with an "Open `config.toml`" link that opens the TOML in the system file manager via the existing `reveal_in_file_manager` Tauri command. Same fail-loud / restart-to-apply model as today — non-eligible keys can't be written through `set_setting` for safety, the TOML is the source. [settings-pane-eligible-key-controls, settings-pane-readonly-display]
+- **Eligible keys are interactive; everything else is read-only with a "edit TOML" affordance.** The write-back-eligible key set (the closed list in `core::config`) drives which rows get a live control vs. a read-only display. Read-only rows show the current value in a muted code style with an "Open `config.toml`" link that opens the TOML in the system file manager via the existing `reveal_in_file_manager` command. Same fail-loud / restart-to-apply model as today — non-eligible keys can't be written through `set_setting` for safety, the TOML is the source. [settings-pane-eligible-key-controls, settings-pane-readonly-display]
 - **Per-section scope toggle.** A small `[User] [Vault]` segmented control on each section card flips which file the displayed values come from, since either file may carry any key per "Merge & precedence." Default scope per section: vault for `[editor]` / `[vault]`-UI keys, user for `[vault].recent` / `[vault].default`. The user can flip; the choice is per-section and per-session, not persisted. [settings-pane-scope-toggle]
 
 
@@ -515,7 +516,7 @@ Read-only rows (`settings-pane-readonly-display`) show a muted info glyph; click
 ### Lifecycle
 
 - **Entering settings.** The gear button calls `setSettingsPaneVisible(true)` (same shape as `setVaultHomeVisible`), which swaps `#editor-pane` to the settings layout and renders the cards from the current `Config`. If the editor buffer is dirty, the existing `file-switch-guard-dirty` modal fires first.
-- **Live updates.** Every interactive flip calls the existing `set_setting` Tauri command. The command already updates the in-memory `Arc<Config>` and writes through `toml_edit`; the UI re-renders the affected row from the new value. No separate "save" button.
+- **Live updates.** Every interactive flip calls the existing `set_setting` command. The command already updates the in-memory `Arc<Config>` and writes through `toml_edit`; the UI re-renders the affected row from the new value. No separate "save" button.
 - **External edits.** If the user hand-edits a TOML while the settings pane is open, the displayed values are stale until the next `set_setting` (which reloads the merged Config as a side effect, per existing `settings-write-back` semantics) or until the user closes and reopens the pane. A small "Refresh" affordance in the header forces a reload without making a write — calls a new `reload_config` command that re-runs `Config::load` and re-renders. Cheap to add; lands when a user actually hits the staleness case in real use. [settings-pane-manual-refresh]
 - **Exiting settings.** Clicking any tree row, recents row, search result, or the Home button exits settings the same way it exits home — no save protection needed (nothing is dirty in the settings pane; every flip is committed).
 - **Navigation history.** Entering settings is a content-surface change; pushes onto `navigation-history-stack` like home does. Back returns the user to wherever they were.
@@ -548,7 +549,7 @@ Single `Config::load(vault_root: &Path) -> Result<Config>` in `core::config` is 
 5. Validate cross-field invariants (e.g. `tree.sort_by` is one of the known values; `model` is the supported value). Failures abort.
 6. Return the frozen `Config`.
 
-The Tauri layer calls this once inside `open_vault_at` (alongside `init_tracing` per `obs-tracing-baseline`) and stashes the result in `tauri::State<Arc<Config>>`. CLI and MCP entry points call the same `open_vault_at` helper. No mutation, no `RwLock`. [settings-load-once-at-startup]
+The host calls this once inside `open_vault_at` (alongside `init_tracing` per `obs-tracing-baseline`) and stashes the result in per-vault state as `Arc<Config>`. CLI and MCP entry points call the same `open_vault_at` helper. No mutation, no `RwLock`. [settings-load-once-at-startup]
 
 Open-a-different-vault re-runs `Config::load` against the new vault root. The old `Config` is dropped; in-memory UI state (which view toggles are flipped, which panels are open) does *not* automatically reset to the new defaults — the existing vault-swap reset path in `ui/src/main.ts` handles what should re-init.
 
@@ -557,7 +558,7 @@ Open-a-different-vault re-runs `Config::load` against the new vault root. The ol
 
 Selected in-app UI changes persist by writing back to the appropriate TOML file. The set of write-back-eligible keys is fixed (it's exactly the set with a real-time UI control); arbitrary keys are not user-mutable from inside the app in v1. Eligible keys:
 
-- `[editor].render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `show_chunk_boundaries` — written on View menu flip. Vault-scope.
+- `[editor].render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `highlight_trailing_whitespace`, `show_chunk_boundaries` — written on View menu flip. Vault-scope.
 - `[vault].sidebar_open`, `related_open`, `trash_expanded`, `tree.sort_by` — written on the corresponding UI action. Vault-scope.
 - `[vault].recent` — written by the Open Vault flow (push-to-front, dedupe, cap at ~10 entries). User-scope.
 - `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. User + vault scope. Live-applied.
@@ -565,7 +566,7 @@ Selected in-app UI changes persist by writing back to the appropriate TOML file.
 - `[staging].auto_reject_on_conflict` — bool toggle in the Staging settings section. When on, proposals that transition to `conflicted` auto-reject. User + vault scope. Live-applied. [staging-auto-reject-on-conflict]
 - `[staging].retention_days` — int (>0) in the Staging settings section. Sets GC age threshold; lifts the previously-hardcoded 14-day value. User + vault scope. Live-applied (next vault open picks up the new threshold).
 
-Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
+Single command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
 
 1. Validates the key is in the eligible set for the requested scope (rejects everything else with `not user-mutable in v1`).
 2. Validates the value's type against the field's declared type (a `bool` won't accept `"true"`).
@@ -587,7 +588,7 @@ Single Tauri command `set_setting(scope: SettingsScope, key: String, value: serd
 
 On app startup, if `vault.default` in the user TOML is set and non-empty, the frontend opens that path directly without showing the vault picker. Empty or absent → show the picker as today. [settings-default-vault-autoopen]
 
-**The picker is a frontend concern.** UI doesn't belong in Rust, and a CLI invocation should never risk spawning a folder dialog. The frontend calls `@tauri-apps/plugin-dialog` from JS only when it needs a folder. Backend exposes `open_vault_at(path)` for the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. Same shared helper the CLI / MCP entry points call; no dialog dependency in core or Tauri command layer.
+**The picker is a frontend concern.** UI doesn't belong in Rust, and a CLI invocation should never risk spawning a folder dialog. The app uses a native folder picker only when it needs a folder. Backend exposes `open_vault_at(path)` for the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. Same shared helper the CLI / MCP entry points call; no dialog dependency in core or the host layer.
 
 **Frontend bootstrap.** On window init:
 
@@ -604,7 +605,7 @@ On app startup, if `vault.default` in the user TOML is set and non-empty, the fr
 
 ## Module placement
 
-- `core::config` — `Config` struct, all section structs, `Config::load`, `Default` impls. Pure, no Tauri imports. Mirrors the `core::store` / `core::embed` discipline from `index.md`.
+- `core::config` — `Config` struct, all section structs, `Config::load`, `Default` impls. Pure, no host imports. Mirrors the `core::store` / `core::embed` discipline from `index.md`.
 - TS types auto-exported via `ts-rs` per design.md so the frontend reads `Config` shape directly without manual duplication.
 - No other module reads `*.toml` directly. If a value is needed somewhere, the path goes `Config::load` → struct field → caller; not "open the file again over here."
 

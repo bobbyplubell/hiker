@@ -17,7 +17,7 @@ impl Trees {
     //
     // status: cluster-op-summarize-sweep
     //
-    // Selection + ordering side of the Summarize sweep. The Tauri command
+    // Selection + ordering side of the Summarize sweep. The caller
     // wraps this method and performs the actual queue submission (the
     // queue is async; Trees stays sync per module discipline). Returns a
     // `SummarizePlan` carrying the umbrella task descriptor + per-cluster
@@ -143,7 +143,7 @@ impl Trees {
         // resolves, its parent's eventual summarize call has fresh
         // children to summarize over. Matches the existing
         // `cluster-editor-regenerate-via-task-queue` "Ordering" guidance.
-        selected.sort_by(|a, b| b.1.cmp(&a.1));
+        selected.sort_by_key(|s| std::cmp::Reverse(s.1));
 
         let enqueued: Vec<String> = selected.into_iter().map(|(id, _)| id).collect();
 

@@ -6,7 +6,7 @@ impl Store {
     /// Slimmer than `get_note_chunks` (no chunk text), so the wire payload
     /// to the editor pane stays small even on long notes.
     ///
-    /// status: tauri-cmd-chunks-for-path
+    /// status: cmd-chunks-for-path
     pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, StoreError> {
         let id = match self.id_for_path(rel_path)? {
             Some(id) => id,
@@ -22,7 +22,7 @@ impl Store {
                     chunk_index: row.get::<_, i64>(0)? as u32,
                     byte_start: row.get::<_, i64>(1)? as u64,
                     byte_end: row.get::<_, i64>(2)? as u64,
-                    // Filled in by `enrich_char_offsets` in the Tauri layer
+                    // Filled in by `enrich_char_offsets` in the app layer
                     // (it has access to the file contents). Default to 0
                     // so callers that don't enrich still get a valid DTO.
                     char_start: 0,
@@ -190,10 +190,8 @@ impl Store {
         // explicitly — vec0 doesn't honor the FK cascade).
         let old_chunk_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
-            let ids = stmt
-                .query_map(params![upsert.id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            ids
+            stmt.query_map(params![upsert.id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
         };
         for cid in &old_chunk_ids {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;

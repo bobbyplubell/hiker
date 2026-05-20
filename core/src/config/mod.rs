@@ -69,8 +69,6 @@ pub fn push_recent_vault(current: &[String], root: &Path) -> Vec<String> {
 }
 
 /// Top-level config struct loaded from the merged user+vault TOML.
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -98,6 +96,20 @@ pub struct Config {
     pub staging: StagingConfig,
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// UI-layer preferences. Currently just the custom-titlebar toggle;
+/// future entries will join (theme, sidebar widths, etc.). Living on
+/// `Config` means changes persist via the standard `Config::set` path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    /// When true, the app draws its own titlebar (drag region + window
+    /// controls) and asks eframe to hide native chrome.
+    #[serde(default)]
+    pub custom_titlebar: bool,
 }
 
 fn default_schema_version() -> u32 {
@@ -119,13 +131,12 @@ impl Default for Config {
             acp: AcpConfig::default(),
             staging: StagingConfig::default(),
             suggestions: SuggestionsConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
 
 /// Whether a write-back targets the per-user TOML or the per-vault TOML.
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsScope {

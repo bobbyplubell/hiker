@@ -187,7 +187,7 @@ pub struct Changes {
     conn: Mutex<Connection>,
     db_path: PathBuf,
     /// Broadcast of "a row was just appended" notifications. Carries the
-    /// new row (without content blob) so a Tauri-bridge consumer can emit
+    /// new row (without content blob) so a bridge consumer can emit
     /// `hiker:changes-appended` to the frontend without a second round
     /// trip. Capacity is small — the consumer is expected to re-fetch the
     /// recent list on its next refresh; lagging just means a few coalesced
@@ -321,7 +321,7 @@ impl Changes {
             )?;
             Ok(conn.last_insert_rowid())
         })?;
-        // Notify subscribers (Tauri bridge etc.) without holding the
+        // Notify subscribers without holding the
         // connection mutex. Send failure when there are no receivers — fine.
         let author_class = AuthorClass::from_author(append.author);
         let _ = self.appended_tx.send(ChangeRow {

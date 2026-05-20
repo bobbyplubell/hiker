@@ -207,7 +207,7 @@ Fan-out producers submit N tasks and await all handles — `try_join_all` on the
 
 ## Event stream
 
-Every state transition emits a `QueueEvent` on the Tauri channel `hiker:queue-event`:
+Every state transition emits a `QueueEvent` on the channel `hiker:queue-event`:
 
 ```rust
 enum QueueEvent {
@@ -397,9 +397,9 @@ Each row carries a small badge identifying its source (`task` / `index`); when b
 
 Embedding-queue rows render with the same chrome as task rows — priority-pill slot left empty (the indexer doesn't have priorities), state pill driven by `hiker:reindex-progress` (`queued` / `started` / `finished` / `skipped`), pulsing `…` indicator on `started` rows reusing `tree-row-queued-marker`'s animation. The indexer queue has no per-row cancel — cancelling an embedding job individually isn't supported and isn't being added with this work. The ✕ button appears only on rows from `core::tasks`. [queue-detail-embedding-row-shape]
 
-Code shared across the two: the row-rendering primitive (priority pill / state pill / pulsing indicator / hover reveal of cancel button), the section grouping (Active / Queued / Recently finished), and the event-driven local-mirror pattern (one snapshot fetch + delta updates from a Tauri event channel). The shared module lives in `ui/src/queueDetail/index.ts` (new) and exports a `<QueueRow>` primitive parameterized by source. Each queue keeps its own data fetch + event subscription. [queue-detail-shared-row-primitive]
+Code shared across the two: the row-rendering primitive (priority pill / state pill / pulsing indicator / hover reveal of cancel button), the section grouping (Active / Queued / Recently finished), and the event-driven local-mirror pattern (one snapshot fetch + delta updates from an event channel). The shared module lives in `ui/src/queueDetail/index.ts` (new) and exports a `<QueueRow>` primitive parameterized by source. Each queue keeps its own data fetch + event subscription. [queue-detail-shared-row-primitive]
 
-Code *not* shared: the data layer (separate Tauri commands, separate event channels, separate `core::*` modules), the worker controls (only the LLM queue has any), and the cancellation path. The UI is the one thing the user sees as unified; everything below the rendering layer remains decoupled.
+Code *not* shared: the data layer (separate commands, separate event channels, separate `core::*` modules), the worker controls (only the LLM queue has any), and the cancellation path. The UI is the one thing the user sees as unified; everything below the rendering layer remains decoupled.
 
 Why the embedding queue stays its own queue: scheduling, durability, and producer model differ. The embedder queue is driven by the watcher and is essentially a streaming pipeline; the task queue is producer-pull-and-await. Conflating them at the data layer would mean either dragging LLM-task semantics (priorities, leases, schemas) into the indexer (which has none of them), or stripping them out of the task queue (defeats the point). The shared UI gives the user the consolidated view without the wrong-shape coupling underneath.
 
@@ -418,7 +418,7 @@ State rendering rules:
 - **Leased** — pill carries a pulsing `…` indicator (three CSS-animated dots, same shape as `chat-panel-thinking-indicator`). Worker label tells the user who's working ("Direct LLM" / "Chat agent" / "External: Claude Code (id: …)"). [task-queue-row-pulsing-leased]
 - **Completed / Failed / Cancelled** — terminal pill with appropriate color; the row stays for `terminal_retention_secs` then disappears.
 
-Cancel button: visible on Queued + Leased rows; calls `Queue::cancel` via a Tauri command. Terminal rows have no cancel. [task-queue-row-cancel-action]
+Cancel button: visible on Queued + Leased rows; calls `Queue::cancel` via a command. Terminal rows have no cancel. [task-queue-row-cancel-action]
 
 Sort: by priority tier then by submitted_at (matches the queue's drain order so the visible order tells the user "what comes next"). Reverse-chronological grouping isn't right here — the user wants to see what's about to happen, not the freshest submit.
 

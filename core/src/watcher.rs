@@ -282,6 +282,27 @@ pub fn is_ignored(rel: &str) -> bool {
     if rel.starts_with(".git/") || rel == ".git" {
         return true;
     }
+    // Build-artifact / dependency directories. These can hold hundreds of
+    // thousands of files (a Rust `target/` for this project tops 600k+
+    // entries) and a single full scan over them allocates a path String
+    // per file plus an IndexJob enum per `.md`/`.txt` survivor. The
+    // watcher also fires events for every cargo build, which would queue
+    // a FullScan via Overflow. Skipping these directories outright is
+    // the largest single memory + CPU win for projects-as-vaults.
+    //
+    // We match by path component so a folder NAMED `target` anywhere in
+    // the tree is ignored, not just at the root (a JS monorepo can have
+    // a `packages/foo/node_modules/`). Match against the full segment to
+    // avoid false positives like `targeting.md`.
+    for component in rel.split('/') {
+        match component {
+            "target" | "node_modules" | ".venv" | "venv" | "__pycache__"
+            | "dist" | "build" | "out" | ".cache" | ".next" | ".parcel-cache"
+            | ".turbo" | ".gradle" | ".idea" | ".vscode" | ".tox"
+            | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" => return true,
+            _ => {}
+        }
+    }
     let last = rel.rsplit('/').next().unwrap_or(rel);
     if last.starts_with(".#") || last.starts_with("4913") {
         return true;
@@ -345,6 +366,22 @@ mod tests {
         // That's intentional: a user vault might have legitimate dotted
         // subdirs we shouldn't silently skip beyond the documented two.
         assert!(!is_ignored(".obsidian/config.json"));
+
+        // Build-artifact / dependency directories. These can hold
+        // hundreds of thousands of files and quickly OOM the indexer
+        // when a project root is opened as a vault.
+        assert!(is_ignored("target/debug/build/something.rs"));
+        assert!(is_ignored("packages/foo/node_modules/react/index.js"));
+        assert!(is_ignored(".venv/lib/python3.12/site-packages/x.py"));
+        assert!(is_ignored("dist/index.html"));
+        assert!(is_ignored("build/output.bin"));
+        assert!(is_ignored(".next/server/pages/_app.js"));
+        assert!(is_ignored("__pycache__/foo.cpython-312.pyc"));
+        // Exact-segment match: `targeting.md` is NOT under a `target/`.
+        assert!(!is_ignored("targeting.md"));
+        assert!(!is_ignored("a/targeting/notes.md"));
+        // But a folder literally named `target` anywhere in the tree is.
+        assert!(is_ignored("a/target/b.md"));
     }
 
     /// Integration test: write a file, expect a Modified or Created event.

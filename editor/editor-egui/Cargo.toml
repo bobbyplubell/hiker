@@ -1,0 +1,27 @@
+[package]
+name = "editor-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+editor-core.workspace = true
+editor-view.workspace = true
+egui.workspace = true
+smol_str.workspace = true
+
+[dev-dependencies]
+editor-md = { workspace = true }
+editor-diff = { workspace = true }
+egui_kittest.workspace = true
+# egui_kittest activates `egui/accesskit`, which adds an `accesskit_update`
+# field to `PlatformOutput`; egui-winit's destructure of that struct gates
+# the same field on its own `accesskit` feature. Without unifying the two,
+# the test build fails to compile egui-winit (E0027). Declared here as a
+# dev-dependency so the runtime binary build (which doesn't pull
+# egui_kittest under resolver v2) keeps accesskit out of the dep graph.
+egui-winit = { version = "0.32", features = ["accesskit"] }
+
+[lints]
+workspace = true

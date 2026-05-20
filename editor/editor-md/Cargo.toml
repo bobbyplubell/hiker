@@ -1,0 +1,15 @@
+[package]
+name = "editor-md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+editor-core.workspace = true
+editor-view.workspace = true
+pulldown-cmark.workspace = true
+smol_str.workspace = true
+
+[lints]
+workspace = true

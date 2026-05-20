@@ -1,0 +1,15 @@
+[package]
+name = "diff-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+editor-core.workspace = true
+editor-view.workspace = true
+editor-egui.workspace = true
+editor-diff.workspace = true
+egui.workspace = true
+eframe.workspace = true

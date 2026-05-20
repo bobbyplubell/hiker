@@ -98,9 +98,9 @@ pub struct RecoveredEntry {
 
 `recover()` walks the index, computes the live on-disk hash for each entry's path (or `None` when missing), and returns only entries whose `autosaved_hash != on_disk_hash` (or whose on-disk file is gone). Matches are dropped silently as part of the same call so the index file shrinks naturally. [autosave-recover-cmd]
 
-Module discipline mirrors `core::store` and `core::changes` — `core::autosave` is the only module that touches `.hiker/autosave/`, returns plain Rust types (`RecoveredEntry`, `TabState`) not internal storage types, and exposes a narrow API the Tauri layer wraps in 5–15 lines per command. [autosave-backend-module]
+Module discipline mirrors `core::store` and `core::changes` — `core::autosave` is the only module that touches `.hiker/autosave/`, returns plain Rust types (`RecoveredEntry`, `TabState`) not internal storage types, and exposes a narrow API the host wraps in 5–15 lines per command. [autosave-backend-module]
 
-The Tauri command surface matches the Rust API one-to-one: `autosave_write` / `autosave_clear` / `autosave_save_tab_state` / `autosave_load_tab_state` / `autosave_recover` / `autosave_discard`. Each command parses args → calls `Autosave::*` → translates errors → returns DTO.
+The host command surface matches the Rust API one-to-one: `autosave_write` / `autosave_clear` / `autosave_save_tab_state` / `autosave_load_tab_state` / `autosave_recover` / `autosave_discard`. Each command parses args → calls `Autosave::*` → translates errors → returns DTO.
 
 
 ## Frontend tick

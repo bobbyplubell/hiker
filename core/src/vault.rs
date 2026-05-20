@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +70,7 @@ impl Vault {
 
     /// Resolve a vault-relative path to an absolute path on disk, applying
     /// the same path-escape and symlink-ancestor rejections that
-    /// `read_file` / `write_file` use. Public so the Tauri layer can hand
+    /// `read_file` / `write_file` use. Public so the host can hand
     /// absolute paths to OS commands (e.g. reveal-in-file-manager) without
     /// duplicating the validation logic.
     pub fn abs_path(&self, rel: &str) -> Result<PathBuf, HikerError> {
@@ -186,7 +188,7 @@ impl Vault {
     }
 
     /// Walk a vault subtree for `.md` files and return their vault-relative
-    /// paths. Used by the Tauri delete command to pre-suppress watcher events
+    /// paths. Used by the delete command to pre-suppress watcher events
     /// for every member before the folder rename, and by future restore /
     /// re-index flows that need the same enumeration. `follow_links(false)`
     /// matches `walker-symlink-policy`. Returns an empty vec if `rel` is a
@@ -204,7 +206,28 @@ impl Vault {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for entry in walkdir::WalkDir::new(&abs).follow_links(false) {
+        // Prune subtrees the watcher already excludes. Without this, a
+        // walk that crosses `target/` or `node_modules/` would visit
+        // every file inside before the per-file `is_indexable_path`
+        // filter rejects them — and each visit allocates a `String`
+        // path. Pre-pruning by directory keeps the walker out of those
+        // subtrees entirely.
+        let walker = walkdir::WalkDir::new(&abs)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let path = e.path();
+                let rel_to_vault = match path.strip_prefix(&self.root) {
+                    Ok(r) => r,
+                    Err(_) => return true,
+                };
+                let rel_str = rel_to_vault.to_string_lossy().replace('\\', "/");
+                if rel_str.is_empty() {
+                    return true; // root entry
+                }
+                !crate::watcher::is_ignored(&rel_str)
+            });
+        for entry in walker {
             let entry = entry.map_err(|e| HikerError::Io(e.to_string()))?;
             if !entry.file_type().is_file() {
                 continue;
@@ -511,14 +534,12 @@ fn delete_file(
         return Err(HikerError::Io(e.to_string()));
     }
 
-    if let Err(e) = trash.append(&entry) {
-        // Manifest write failed after the file is already in trash and the
-        // index is updated. Rolling back the index would require re-ingest;
-        // leaving the file in trash without a manifest entry leaves it
-        // unrestorable. Surface the error — the file is still recoverable
-        // by hand from `.hiker/trash/`.
-        return Err(e);
-    }
+    // Manifest write failed after the file is already in trash and the
+    // index is updated. Rolling back the index would require re-ingest;
+    // leaving the file in trash without a manifest entry leaves it
+    // unrestorable. Surface the error — the file is still recoverable
+    // by hand from `.hiker/trash/`.
+    trash.append(&entry)?;
     Ok(entry)
 }
 

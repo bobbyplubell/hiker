@@ -102,7 +102,7 @@ impl Queue {
         self.inner.cfg.read().expect("tasks cfg lock poisoned").clone()
     }
 
-    /// Replace the live config. Plumbed from the Tauri `set_setting`
+    /// Replace the live config. Plumbed from the `set_setting`
     /// command after `Config::set` succeeds so flips of
     /// `worker_preference` / `direct_worker.enabled` /
     /// `terminal_retention_secs` apply without a vault restart.
@@ -360,7 +360,7 @@ impl Queue {
         }
         if let Some(schema) = slot.task.output_schema.as_ref() {
             validate_against_schema(schema, &value)
-                .map_err(|e| QueueError::SchemaViolation(e))?;
+                .map_err(QueueError::SchemaViolation)?;
         }
         let worker = slot
             .lease

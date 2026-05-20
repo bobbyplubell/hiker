@@ -60,8 +60,8 @@ word_wrap = true
     .unwrap();
     deep_merge(&mut base, over);
     let cfg: Config = base.try_into().unwrap();
-    assert_eq!(cfg.editor.live_preview, true);
-    assert_eq!(cfg.editor.word_wrap, true);
+    assert!(cfg.editor.live_preview);
+    assert!(cfg.editor.word_wrap);
 }
 
 #[test]
@@ -251,40 +251,4 @@ fn write_back_llm_keys_eligible_via_vault_scope() {
     // promise doesn't regress.
     assert!(eligible_key(SettingsScope::User, "llm.provider.api_key_env").is_ok());
     assert!(eligible_key(SettingsScope::Vault, "llm.audit.log_full_prompt").is_ok());
-}
-
-/// Drive the `ts-rs` TS-export side effect. Each `#[derive(ts_rs::TS)]
-/// #[ts(export)]` registers a writer that fires the first time any test
-/// in the crate runs under the `ts-export` feature; calling `export_all`
-/// here makes the intent explicit and gives `scripts/check.sh` a single
-/// named target to run.
-///
-/// Lives in `tests.rs` (not a separate examples file) so it shares the
-/// existing `#[cfg(test)] mod tests` wiring — no extra Cargo target needed.
-#[cfg(feature = "ts-export")]
-#[test]
-fn gen_ts_types() {
-    use ts_rs::TS;
-    // The per-type `#[ts(export_to = "../ui/src/generatedTypes/")]`
-    // attribute on each Config struct gives a path *relative to*
-    // ts-rs's export-dir. The default export-dir is `./bindings` — that
-    // would land files at `core/bindings/../ui/src/generatedTypes/`
-    // which canonicalizes to `core/ui/src/generatedTypes/` (wrong tree).
-    // Pinning export-dir to the crate root makes the relative `../ui/...`
-    // resolve to the actual `ui/src/generatedTypes/` next to `core/`.
-    // `large_int_type = "number"` flattens `u64` / `i64` / `u128` / `i128`
-    // to plain TS `number`. The hand-typed `SettingsConfig` used `number`
-    // for every timeout-secs / retention-days field; bigint would break
-    // every Tauri-IPC consumer that hands those values around as JS
-    // numbers (the values are bounded to fit in an f64 safe-integer
-    // anyway — timeouts in seconds, retention counts, etc.).
-    let cfg = ts_rs::Config::default()
-        .with_out_dir(".")
-        .with_large_int("number");
-    Config::export_all(&cfg).expect("ts-rs export_all failed");
-    // `SettingsScope` isn't a field of `Config` (it's the discriminator
-    // argument to `set_setting` / `read_file_only`), so the recursive
-    // walk from `Config` doesn't reach it. Export it explicitly so the
-    // TS side can pull the same union the Rust side hands across IPC.
-    SettingsScope::export(&cfg).expect("ts-rs export SettingsScope failed");
 }

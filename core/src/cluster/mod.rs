@@ -8,13 +8,13 @@
 //! Submodule layout:
 //!
 //! - `algo`   — pure clustering math: `partition` (HDBSCAN),
-//!              `partition_leiden`, `l2_normalize`, `cosine_similarity`,
-//!              `mean_normalize`, `ninetieth_percentile_distance`.
+//!   `partition_leiden`, `l2_normalize`, `cosine_similarity`,
+//!   `mean_normalize`, `ninetieth_percentile_distance`.
 //! - `tree`   — online placement: `place_beam_descent` over `TreeView`.
 //! - `build`  — offline build pipeline + persistence: `build_tree`,
-//!              `build_and_persist`, `rebuild_and_persist`,
-//!              `build_tree_structural`, plus the divisive top-down
-//!              recipe and the FromFolders alternative.
+//!   `build_and_persist`, `rebuild_and_persist`,
+//!   `build_tree_structural`, plus the divisive top-down
+//!   recipe and the FromFolders alternative.
 //!
 //! status: cluster-module-discipline
 //! status: cluster-hdbscan-crate-petal
@@ -36,8 +36,8 @@ pub use algo::{
     partition_leiden,
 };
 pub use build::{
-    build_and_persist, build_tree, build_tree_structural, rebuild_and_persist,
-    result_to_node_inserts_pub, NoopSummarizer,
+    build_and_persist, build_tree, build_tree_structural, build_tree_structural_streaming,
+    rebuild_and_persist, result_to_node_inserts_pub, NoopSummarizer,
 };
 pub use tree::place_beam_descent;
 
@@ -585,6 +585,84 @@ pub enum BuildError {
     Cluster(#[from] ClusterError),
     #[error("summarizer: {0}")]
     Summarizer(String),
+    /// The producer signalled cancellation via the shared atomic the
+    /// streaming build entry watches. Emitted as a build-tree return
+    /// only by the streaming variants' internals; the public streaming
+    /// API surfaces this as a `BuildEvent::Cancelled` instead.
+    ///
+    /// status: cluster-build-async-pass
+    #[error("cancelled")]
+    Cancelled,
+}
+
+/// Stable per-cluster id used in the progress stream's
+/// `ClusterDiscovered.parent`. Aliased to `NodeId` (a `String`) so the
+/// progress consumer sees the same identifier shape used everywhere
+/// else in the build pipeline.
+///
+/// status: cluster-build-progress-stream
+pub type ClusterId = NodeId;
+
+/// Phase indicator emitted on the build progress stream. Consumers
+/// render this verbatim in the review tab's progress row (per
+/// `cluster-review-tab-progress-row`).
+///
+/// status: cluster-build-progress-stream
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    /// First phase: the producer is loading note embeddings into memory.
+    /// Emitted once at the start of the streaming build.
+    LoadingEmbeddings,
+    /// Partitioner is running level `n`. Level 0 is the top-level (virtual
+    /// root) Split; deeper levels are the recursive sub-splits. Emitted at
+    /// the start of each level boundary (the cancellation check point).
+    PartitioningLevel(u32),
+    /// All partitions are done; the in-flight `SplitNode` forest is being
+    /// flattened into `BuiltClusterTree`. Emitted once just before the
+    /// terminal `Done` event.
+    Finalizing,
+}
+
+/// Event stream emitted by the async structural pass. Variants are
+/// strictly additive — the receiver consumes them in order and terminates
+/// on the first of `Done` / `Cancelled` / `Failed`.
+///
+/// status: cluster-build-async-pass
+/// status: cluster-build-progress-stream
+#[derive(Debug, Clone)]
+pub enum BuildEvent {
+    /// Phase boundary; see `Phase` doc.
+    Phase { phase: Phase },
+    /// Running totals snapshot — `items_processed` counts notes that have
+    /// been placed into a finalized cluster (i.e. once a `Leaf`'s members
+    /// list is stable). `clusters_found` is the cumulative count of
+    /// finalized `ClusterDiscovered` events; `outliers` is the top-level
+    /// outlier count (populated after the top-level Split decides).
+    Counters {
+        items_processed: u32,
+        clusters_found: u32,
+        outliers: u32,
+    },
+    /// A new cluster has been finalized inside the recursive split. The
+    /// `parent` is `None` for top-level clusters (children of the
+    /// virtual root) and `Some(parent_id)` for sub-clusters. Emitted in
+    /// child-first order: a leaf or fully-built branch fires before its
+    /// parent does, so consumers reconstructing the tree should expect
+    /// to attach children to a parent the consumer hasn't seen yet
+    /// (cache by `parent` id until the parent arrives).
+    ClusterDiscovered {
+        node: BuiltClusterNode,
+        parent: Option<ClusterId>,
+    },
+    /// Terminal: the full tree is ready. Following events are not emitted.
+    Done { tree: BuiltClusterTree },
+    /// Terminal: the producer signalled cancel via the shared atomic and
+    /// the pass aborted cleanly. Partial in-flight tree is discarded.
+    Cancelled,
+    /// Terminal: the pass errored out. The string is `BuildError`'s
+    /// `Display` form so consumers don't need to depend on the typed
+    /// error surface.
+    Failed { error: String },
 }
 
 /// LLM-backed summarizer. Renders the `cluster_summarize` prompt with the
@@ -631,8 +709,8 @@ impl Summarizer for LlmSummarizer {
         let msgs = vec![crate::llm::Message::user(rendered)];
         // Each call spins a dedicated worker thread with its own
         // multi-thread runtime so it stays isolated from whatever
-        // runtime context the caller is in (tauri sync commands run on
-        // tauri's own threads; tests may have no runtime at all).
+        // runtime context the caller is in (host sync commands run on
+        // the host's own threads; tests may have no runtime at all).
         // Building a fresh runtime per call costs ~ms; LLM round-trips
         // are seconds.
         let client = self.client.clone();

@@ -333,7 +333,7 @@ async fn edit_note_direct_applies_all_edits_and_writes_once() {
     let s = structured(&resp);
     assert_eq!(s["status"], "written", "resp: {resp}");
     assert_eq!(s["edit_count"], 2);
-    assert!(s["content_hash"].as_str().unwrap().len() > 0);
+    assert!(!s["content_hash"].as_str().unwrap().is_empty());
     let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
     assert_eq!(on_disk, "hello FOO world BAZ");
     shutdown(b).await;

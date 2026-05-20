@@ -31,6 +31,22 @@ impl Store {
         Ok(row)
     }
 
+    /// Vault-relative paths of every note the indexer flagged as
+    /// `skipped` (unsupported extension, oversize, etc.). Used by the
+    /// file-tree row renderer to badge skipped files without firing a
+    /// per-row `get_note_by_path` query on every frame.
+    pub fn list_skipped_paths(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM notes WHERE skipped = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Total count of indexed notes.
     pub fn count_notes(&self) -> Result<u32, StoreError> {
         let n: i64 = self
@@ -287,10 +303,8 @@ impl Store {
         // Clear any chunks/vecs left over from a previous successful ingest.
         let old_chunk_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
-            let ids = stmt
-                .query_map(params![id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            ids
+            stmt.query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
         };
         for cid in &old_chunk_ids {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
@@ -308,10 +322,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         let chunk_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
-            let ids = stmt
-                .query_map(params![note_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            ids
+            stmt.query_map(params![note_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
         };
         for cid in &chunk_ids {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
@@ -343,10 +355,8 @@ impl Store {
             let Some(id) = id_opt else { continue };
             let chunk_ids: Vec<String> = {
                 let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
-                let ids = stmt
-                    .query_map(params![id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                ids
+                stmt.query_map(params![id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
             };
             for cid in &chunk_ids {
                 tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;

@@ -49,8 +49,7 @@ impl Trees {
     //
     // Module discipline: this method takes a closure to fetch leaf
     // embeddings rather than importing `core::store`, mirroring the
-    // existing `Trees::*` shape. The Tauri command in `ui/src-tauri/src/lib.rs`
-    // wires up the resolver.
+    // existing `Trees::*` shape. The caller wires up the resolver.
     pub fn split_cluster(
         &self,
         tree_id: &str,
@@ -147,9 +146,9 @@ impl Trees {
                 }
             }
             (None, None) => {
-                return Err(TreesError::TreeNotFound(format!(
-                    "split_cluster: virtual-root target requires virtual_root_inputs"
-                )));
+                return Err(TreesError::TreeNotFound(
+                    "split_cluster: virtual-root target requires virtual_root_inputs".to_string(),
+                ));
             }
         }
 
@@ -157,7 +156,7 @@ impl Trees {
             // Not enough members to split — fold them into the outcome
             // as outliers at this branch and stop the recursion. Top-level
             // user-driven splits already surface this as an error from
-            // the Tauri command; recursive sub-splits silently stop.
+            // the caller; recursive sub-splits silently stop.
             if !is_top_level {
                 return Ok(());
             }

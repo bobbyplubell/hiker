@@ -12,11 +12,11 @@
 //!
 //! - `types`         — public DTOs (`Trees`, `EditableNode`, `NodeKind`, …)
 //! - `storage`       — rusqlite + schema + CRUD + SQL helpers (the **only**
-//!                      submodule that imports `rusqlite::params` /
-//!                      `OptionalExtension` / `Connection`)
+//!   submodule that imports `rusqlite::params` /
+//!   `OptionalExtension` / `Connection`)
 //! - `history`       — append/pop/read history + `record_*` helpers
 //! - `ops::edit`     — `rename` / `set_summary` / `set_policy` /
-//!                      `auto_set_name_summary`
+//!   `auto_set_name_summary`
 //! - `ops::move_node`— `move_node` / `reparent_many` / `promote_outlier`
 //! - `ops::merge`    — `merge_siblings` / `merge_children_up`
 //! - `ops::drop`     — `drop_cluster`
@@ -266,8 +266,8 @@ mod tests {
     // undo via the recorded `undo_args` → re-run forward (redo) →
     // confirm the post-redo state matches the post-forward state.
     //
-    // The actual undo machinery lives in `ui/src-tauri/src/lib.rs`
-    // (Tauri command surface); here we exercise the underlying invariant
+    // The actual undo machinery lives in the host's command surface;
+    // here we exercise the underlying invariant
     // that the forward ops are idempotent against existing-IDs and that
     // the recorded `args_json` carries enough info to replay.
     #[test]
@@ -382,7 +382,7 @@ mod tests {
     fn split_record_snapshots_new_clusters_for_redo() {
         // Confirms `record_split` persists enough state on `args_json`
         // to replay a split without re-running HDBSCAN. The redo path
-        // in `ui/src-tauri` reads `new_clusters` + `leaf_moves` and
+        // in the host reads `new_clusters` + `leaf_moves` and
         // restores via `insert_single_node` + `reparent_many`.
         let (_d, trees) = open_tmp();
         let tid = trees

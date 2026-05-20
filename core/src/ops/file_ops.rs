@@ -36,7 +36,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
 /// actually created so callers can open and inline-rename it.
 ///
 /// `name_template` lets adapters pick their own UX policy without forking
-/// the op — Tauri's tree button passes `"new-note"`; CLI / MCP can pass
+/// the op — the app's tree button passes `"new-note"`; CLI / MCP can pass
 /// `"untitled"`, `"capture-2026-05-07"`, etc.
 ///
 /// status: create-note-button

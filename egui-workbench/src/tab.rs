@@ -1,0 +1,68 @@
+//! `DocumentTab` trait + `TabState`. See `DESIGN.md`.
+//!
+//! `TabHandle` itself lives in [`crate::handle`].
+
+use crate::handle::TabHandle;
+
+/// User-facing tab payload. Implement for your app's tab type.
+pub trait DocumentTab: Clone + 'static {
+    fn title(&self) -> egui::WidgetText;
+    fn icon(&self) -> Option<egui::Image<'static>> {
+        None
+    }
+    fn is_dirty(&self) -> bool {
+        false
+    }
+    fn tooltip(&self) -> Option<String> {
+        None
+    }
+    fn closable(&self) -> bool {
+        true
+    }
+}
+
+/// Per-tab UI state. Distinct from the `Tab` payload itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TabState {
+    /// Default. Opaque title, persists across navigation.
+    #[default]
+    Regular,
+    /// Italic title. Will be replaced by the next preview-open in the
+    /// same group. Promotes to [`TabState::Regular`] on edit / double click.
+    Preview,
+    /// Sorted leftmost in the strip, smaller, with a pin glyph.
+    /// Cannot be closed by "Close others"; only an explicit close removes it.
+    Pinned,
+}
+
+/// Crate-internal payload entry. The trees store [`TabHandle`]s; this
+/// is the actual data those handles resolve to.
+pub(crate) struct TabEntry<Tab> {
+    pub tab: Tab,
+    pub state: TabState,
+    pub handle: TabHandle,
+}
+
+impl<Tab> TabEntry<Tab> {
+    pub(crate) fn new(tab: Tab, state: TabState, handle: TabHandle) -> Self {
+        Self { tab, state, handle }
+    }
+}
+
+/// Context passed to [`crate::WorkbenchBehavior::pane_ui`]. Carries the
+/// metadata about the call site that hosts often need without forcing
+/// every host to thread its own state.
+#[non_exhaustive]
+pub struct TabUiContext<'a> {
+    /// Handle of the tab whose body is being rendered.
+    pub handle: TabHandle,
+    /// Group the tab belongs to.
+    pub group: crate::handle::GroupHandle,
+    /// `true` if this tab's group is the currently focused editor group.
+    pub focused: bool,
+    /// Current UI state of the tab.
+    pub state: TabState,
+    /// Phantom so we may add lifetime-bound fields without API churn.
+    pub(crate) _marker: std::marker::PhantomData<&'a ()>,
+}

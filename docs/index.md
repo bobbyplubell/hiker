@@ -230,19 +230,19 @@ Algorithm:
 
 This is intentionally crude. No reranking, no rank fusion, no entity boosting. Good enough to validate the pipeline; the design.md:227 query pipeline arrives in v2 alongside lexical search.
 
-The full algorithm lives behind a single `Store::related_notes(source_note_id, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (Tauri command handlers, MCP later) hand it a note id and receive note-shaped hits.
+The full algorithm lives behind a single `Store::related_notes(source_note_id, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (host command handlers, MCP later) hand it a note id and receive note-shaped hits.
 
 Latency budget: the panel updates on file-open and on save (debounced 500ms). Brute-force KNN over a 100k-chunk vault should be <100ms; if it isn't, that's the signal to add an ANN index, not before.
 
 
-## Tauri command surface (v1 additions)
+## Command surface (v1 additions)
 
 Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_hash`, `write_file_checked`). v1 adds three:
 
-- `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [tauri-cmd-related-notes]
-- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. [tauri-cmd-index-status]
-- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events. [tauri-cmd-index]
-- `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [tauri-cmd-chunks-for-path]
+- `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [cmd-related-notes]
+- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. [cmd-index-status]
+- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events. [cmd-index]
+- `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
 
 `RelatedHit` shape (note-level, since the v1 panel renders by note):
 
@@ -272,7 +272,7 @@ Schema addition (v1 schema bumps to `user_version = 2`): `notes.skipped` (BOOLEA
 
 Surface:
 
-- `index_state_for(path: String) -> IndexState` Tauri command. Returns `Indexed`, `Unsupported`, `Skipped { reason: String }`, or `Queued`. One path lookup; cheap enough for the tree to call lazily on render of visible rows. The skip reason is a stable, short, human-readable string (`"file too large"`, `"not UTF-8"`) used directly in tooltips and the status bar — no translation layer. [tauri-cmd-file-index-state]
+- `index_state_for(path: String) -> IndexState` command. Returns `Indexed`, `Unsupported`, `Skipped { reason: String }`, or `Queued`. One path lookup; cheap enough for the tree to call lazily on render of visible rows. The skip reason is a stable, short, human-readable string (`"file too large"`, `"not UTF-8"`) used directly in tooltips and the status bar — no translation layer. [cmd-file-index-state]
 - `hiker:reindex-progress` events (per `ingest-progress-events`) carry per-file transitions, so the tree flips rows from Queued → Indexed (or Skipped) without polling.
 
 Indexer logic: when ingest decides to skip a file, write the `notes` row with `skipped = 1` and a reason; do not chunk, do not embed. A subsequent successful re-ingest of the same path clears the flag. Deletes cascade as before (`ingest-delete-cascade`).
@@ -280,7 +280,7 @@ Indexer logic: when ingest decides to skip a file, write the `notes` row with `s
 
 ## Reindex verbs
 
-`tauri-cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
+`cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
 
 - **Reindex all** — `index(IndexScope::All)`. No confirm modal; re-embedding identical content is non-destructive and the click is the opt-in. [reindex-all-action]
 - **Reindex this file** — `index(IndexScope::Path(currentPath))`. Greyed when no file is active. [reindex-current-file-action]

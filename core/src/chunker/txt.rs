@@ -113,8 +113,8 @@ fn detect_code_regions(lines: &[LineSpec], source: &str) -> Vec<bool> {
             .iter()
             .all(|l| symbol_count(line_text(source, l)) >= 3);
         if run.len() >= 3 && (indented || symbol_heavy) {
-            for k in i..j {
-                mask[k] = true;
+            for slot in mask.iter_mut().take(j).skip(i) {
+                *slot = true;
             }
         }
         i = j;

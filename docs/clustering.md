@@ -145,6 +145,22 @@ Surviving / changed knobs at a glance:
 | `leiden.k_nearest`, `edge_weight_floor`, `iterations`, `min_cluster_size` | survive | unchanged |
 
 
+## Async execution and progress
+
+The structural pass runs on a background task so the UI thread stays responsive. Producers (the cluster review tab is the only one in v1) submit a build request and consume a stream of progress events from `core::cluster`:
+
+- `Phase { phase }` — current pipeline phase; phase variants cover `LoadingEmbeddings`, `PartitioningLevel(u32)`, and `Finalizing`. Emitted at the start of each phase.
+- `Counters { items_processed, clusters_found, outliers }` — running totals; emitted as the partitioner advances.
+- `ClusterDiscovered { node: BuiltClusterNode, parent: Option<ClusterId> }` — emitted as each new cluster is added to the in-flight tree. Consumers use this to incrementally reveal clusters in the review surface (per `cluster-review-tab-live-cluster-reveal`) rather than waiting for the full tree.
+- `Done { tree: BuiltClusterTree }` — terminal: the full tree is ready.
+- `Cancelled` — terminal: the producer signalled cancel and the pass aborted cleanly.
+- `Failed { error }` — terminal: the pass errored out (partition refused, embeddings missing, etc.).
+
+The stream is owned by `core::cluster` and consumed by the producer through a channel-shaped interface (concrete IPC shape lives in the producer's command layer, not pinned here). Cancellation is cooperative: the producer signals cancel via a shared atomic, the pass checks at every level boundary and on a periodic per-node interval inside the partition loop, drops the in-flight partition results, and emits `Cancelled`. [cluster-build-async-pass, cluster-build-progress-stream]
+
+The LLM summarization pass (Summarize op) is async via the task queue (`cluster-op-summarize-sweep`) and not part of this stream — structural and naming are separate operations with separate progress surfaces.
+
+
 ## Note embeddings input
 
 Every Split operates on note-level embeddings, regardless of where in the tree it runs. A Split against the virtual root sees every note in the build scope; a Split against a real cluster sees that cluster's leaves' embeddings.
@@ -206,7 +222,7 @@ Tunables:
 
 Watch for: small vaults (<50 notes) where HDBSCAN may produce all-outliers and an empty tree. Fallback: if the top-level Split produces fewer than 2 clusters, surface a "vault is too small" message rather than a misleading tree of one node.
 
-**Crate choice: `petal-clustering`.** Rust-native HDBSCAN implementation, MIT-licensed, no C/C++ FFI, used in production by the Petabi suite. Builds clean on the project's target stack (Tauri + Rust workspace), no extra system deps. The crate exposes `Hdbscan::new(min_cluster_size, min_samples).fit(&data) -> Vec<i32>` plus cluster-stability metadata — exactly the surface `core::cluster::partition` needs. Vector distance is cosine via pre-normalized embeddings (the crate operates on Euclidean by default; we normalize once and pass-through). [cluster-hdbscan-crate-petal]
+**Crate choice: `petal-clustering`.** Rust-native HDBSCAN implementation, MIT-licensed, no C/C++ FFI, used in production by the Petabi suite. Builds clean on the project's target stack (Rust workspace), no extra system deps. The crate exposes `Hdbscan::new(min_cluster_size, min_samples).fit(&data) -> Vec<i32>` plus cluster-stability metadata — exactly the surface `core::cluster::partition` needs. Vector distance is cosine via pre-normalized embeddings (the crate operates on Euclidean by default; we normalize once and pass-through). [cluster-hdbscan-crate-petal]
 
 ### Hybrid mode
 
@@ -437,7 +453,7 @@ Rough numbers for a small local model (~3B, ~50ms/call on CPU), assuming a fresh
 
 Embedding cost (one extra call per cluster summary) is negligible relative to summarization.
 
-A full build pass is **not** an interactive operation. Run on demand via `hiker suggest` (per `suggestions.md`); results are written as a proposal the user reviews on their own time. No sub-second budgets.
+The structural pass alone (Split, no LLM) is interactive — sub-second on small vaults, low single-digit seconds on 10k notes. It runs on a background task with streaming progress (per `cluster-build-async-pass`) so the UI never blocks even when the pass is slow. The Summarize pass is the part that is *not* interactive: it spends real wall-clock time waiting on LLM calls and runs as a fan-out of queue tasks the user watches in the queue widget. The two passes are decoupled — running structural alone is a fully supported outcome (placeholder names; naming runs later, if ever).
 
 
 ## When it runs

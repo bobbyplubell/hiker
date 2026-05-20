@@ -1,4 +1,5 @@
 **/__pycache__/
+references/
 target/
 node_modules/
 dist/
@@ -10,3 +11,9 @@ scratch/
 !.claude/skills/
 !.claude/commands/
 !.claude/CLAUDE.md
+
+.hiker/
+todo.md
+*.swp
+*.swo
+.DS_Store

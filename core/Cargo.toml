@@ -36,14 +36,6 @@ agent-client-protocol.workspace = true
 petal-clustering.workspace = true
 ndarray.workspace = true
 single-clustering.workspace = true
-ts-rs = { version = "12", optional = true }
-
-[features]
-# `ts-export` turns on the `ts-rs` derives on `core::config::*` and unlocks
-# the `gen_ts_types` integration test that writes the TS mirror into
-# `ui/src/generatedTypes/`. Production builds leave this off so `ts-rs`
-# never enters the dependency graph.
-ts-export = ["dep:ts-rs"]
 
 [dev-dependencies]
 tempfile = "3"

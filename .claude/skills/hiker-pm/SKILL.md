@@ -85,7 +85,7 @@ When the user passes a dev agent's report (or points at a recent commit / branch
 1. **The dev agent's report**, in full. Note which slugs it claims to have implemented and any caveats it flagged.
 2. **Every spec doc that owns a slug the work claims to touch, in full.** `status.md` tells you which doc owns each slug (rows are grouped under `## <Topic> (<file>.md)`). The spec is the contract, the report is the claim — don't grade against the claim alone.
 3. **Follow cross-references.** If the owning spec cites a prerequisite slug or another doc, open the cited doc and read the relevant section. A correct local implementation that breaks a cross-doc constraint is the most common review miss.
-4. **`docs/design.md`** if the change touches the layer split or module discipline (anything moving logic between `core`, Tauri command layer, and frontend) — that's where the rules live.
+4. **`docs/design.md`** if the change touches the layer split or module discipline (anything moving logic between `core`, the app's command layer, and frontend) — that's where the rules live.
 5. **The actual diff.** `git diff <base>..HEAD` or read the changed files. Don't trust the report's description of the diff; read the diff. Agents' summaries describe intent, not always reality.
 6. **`status.md` for each touched slug.** Was the row updated? Did `partial`/`planned` move to `done`?
 7. **Code that links to the touched slug.** `rg "status: <slug>"` should land on the implementation site. Missing tag is a defect of completion, not just hygiene.

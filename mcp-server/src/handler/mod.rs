@@ -58,7 +58,7 @@ pub struct HikerState {
     pub config: McpConfig,
     /// status: mcp-tool-toggles
     /// Shared, mutable per-tool config. Each tool dispatch reads this
-    /// to decide whether to refuse with `1004 disabled`. The Tauri
+    /// to decide whether to refuse with `1004 disabled`. The
     /// `set_setting` command swaps the contents in place so flips in
     /// the settings UI apply without a vault restart.
     pub tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,

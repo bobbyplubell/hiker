@@ -7,7 +7,7 @@
 //! status: mcp-lifecycle-aware
 //! status: mcp-dynamic-capabilities
 //!
-//! Spawned by `ui/src-tauri` on vault open with the same `Vault`,
+//! Spawned by the app on vault open with the same `Vault`,
 //! `IndexJobTx`, read-`Store`, `Watcher`, and `Changes` the UI uses. The
 //! server runs as one tokio task hosting an axum HTTP listener wrapping
 //! rmcp's `StreamableHttpService` (per `mcp-transport-streamable-http`).
@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use crate::audit::AuditLog;
 
 /// All shared dependencies the MCP server needs from the rest of the app.
-/// Constructed by `ui/src-tauri::open_vault_at` and consumed by `start`.
+/// Constructed by the app's `open_vault_at` and consumed by `start`.
 pub struct McpDeps {
     pub vault: Vault,
     pub vault_root: PathBuf,
@@ -62,7 +62,7 @@ pub struct McpDeps {
     pub embedder_provider: Arc<dyn Fn() -> Option<Arc<dyn Embedder>> + Send + Sync>,
     pub config: McpConfig,
     /// status: mcp-tool-toggles
-    /// Shared, mutable per-tool config. The Tauri `set_setting`
+    /// Shared, mutable per-tool config. The `set_setting`
     /// command swaps the contents in place so the next dispatched tool
     /// call sees the new gate without a vault re-open. `host` and
     /// `port` aren't included here because they control the TCP bind
@@ -85,7 +85,7 @@ pub struct McpDeps {
     pub llm_enabled: bool,
     /// Shared staging instance for proposal-based writes. When
     /// `[mcp.tools].review_required` is true, MCP write tools route
-    /// through `staging.propose()`. Created by the Tauri layer at
+    /// through `staging.propose()`. Created by the host at
     /// vault open and shared with the MCP handler.
     ///
     /// status: agent-write-review-mode

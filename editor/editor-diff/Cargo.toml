@@ -1,0 +1,13 @@
+[package]
+name = "editor-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+editor-core.workspace = true
+smol_str.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,87 @@
+[package]
+name = "hiker-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hiker"
+path = "src/main.rs"
+
+[features]
+default = []
+# Puffin profiler. Turns on the `profile_function!` / `profile_scope!`
+# markers sprinkled through hot paths and spawns a `puffin_http` server
+# on 127.0.0.1:8585 at startup. View the live flame graph with
+# `puffin_viewer` (install once with `cargo install puffin_viewer`) and
+# connect to that address. Off by default — keeps release builds clean.
+# Build with `cargo run --features profiling`.
+#
+# We use `puffin_http` rather than `puffin_egui` because puffin_egui is
+# tightly coupled to a specific egui version that doesn't match the one
+# eframe pulls in. External-viewer also gives a better experience —
+# the profiler UI doesn't fight the app being profiled for frame budget.
+profiling = ["dep:puffin", "dep:puffin_http"]
+
+[dependencies]
+hiker-core.workspace = true
+puffin = { version = "0.19", optional = true, features = ["serialization"] }
+puffin_http = { version = "0.16", optional = true }
+
+# UI
+egui.workspace = true
+egui_extras.workspace = true
+egui_tiles = { version = "0.13", features = ["serde"] }
+egui_workbench = { workspace = true, features = ["serde"] }
+eframe.workspace = true
+petgraph.workspace = true
+rfd.workspace = true
+
+# MCP runtime
+hiker-mcp-server.workspace = true
+
+# Editor widget
+editor-core.workspace = true
+editor-view.workspace = true
+editor-egui.workspace = true
+editor-md.workspace = true
+editor-diff.workspace = true
+
+# Async + runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "sync", "macros", "time", "fs"] }
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Data
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+# Misc
+notify.workspace = true
+walkdir.workspace = true
+ulid.workspace = true
+smol_str.workspace = true
+time.workspace = true
+similar.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+# egui_kittest activates `egui/accesskit`, which adds an `accesskit_update`
+# field to `PlatformOutput`. egui-winit's destructure of that struct gates
+# the same field on its own `accesskit` feature. Without unifying the two,
+# the test build fails to compile egui-winit. Same workaround as
+# `editor/editor-egui/Cargo.toml`.
+egui-winit = { version = "0.32", features = ["accesskit"] }
+tempfile = "3"

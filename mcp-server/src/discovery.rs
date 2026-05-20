@@ -32,7 +32,7 @@ pub fn write(path: &Path, url: &str, vault_root: &Path) -> std::io::Result<()> {
         vault_root: vault_root.to_string_lossy().into_owned(),
     };
     let bytes = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, &bytes)?;
     fs::rename(&tmp, path)?;

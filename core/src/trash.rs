@@ -290,7 +290,7 @@ impl Trash {
             out.push(item);
         }
         // Newest first.
-        out.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+        out.sort_by_key(|t| std::cmp::Reverse(t.deleted_at));
         Ok(out)
     }
 

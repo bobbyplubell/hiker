@@ -11,8 +11,8 @@
 //!
 //! The top-level entry is `query()`. It composes the two engines based on
 //! `SearchModes`, groups chunk-level hits by note (best chunk wins per
-//! note), and fuses the two ranked lists via RRF (k=60). Callers (Tauri
-//! command, future MCP) hand it the query string + modes and get a
+//! note), and fuses the two ranked lists via RRF (k=60). Callers (the
+//! search command, MCP) hand it the query string + modes and get a
 //! `SearchResponse` with `lexical_hits`, `semantic_hits`, and `fused`
 //! all populated; the frontend renders whichever bucket matches the mode.
 
@@ -68,6 +68,9 @@ pub struct LexicalOpts {
     pub diacritic_sensitive: bool,
     pub prefix_match: bool,
     pub phrase_mode: bool,
+    /// Override for the lexical-side `top_k`. `0` defers to
+    /// `PER_BACKEND_TOP_K`. Mirrors the existing `SemanticOpts.top_k`.
+    pub top_k: u32,
 }
 
 /// Per-side option flags for the semantic engine, surfaced via the
@@ -126,9 +129,9 @@ pub struct NoteHit {
     pub snippet: String,
 }
 
-/// Wire shape returned by the `search_vault` Tauri command. We hand back
+/// Wire shape returned by the `search_vault` command. We hand back
 /// all three buckets (rather than just the one the panel will render)
-/// per `search-tauri-cmd` — keeps the command flat and enables future
+/// per `search-cmd` — keeps the command flat and enables future
 /// "show what each backend found separately" affordances without a new
 /// command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,7 +488,12 @@ pub fn query(
 
     let lexical_hits = if modes.lexical {
         let q = lexical_query_text.unwrap_or("");
-        Fts5LexicalEngine { conn: &conn }.query(q, PER_BACKEND_TOP_K, lexical_opts)?
+        let cap = if lexical_opts.top_k == 0 {
+            PER_BACKEND_TOP_K
+        } else {
+            (lexical_opts.top_k as usize).clamp(5, 100)
+        };
+        Fts5LexicalEngine { conn: &conn }.query(q, cap, lexical_opts)?
     } else {
         Vec::new()
     };
@@ -572,7 +580,7 @@ pub fn pick_bucket(
 /// status: search-semantic-recency-bias
 fn apply_recency_bias(
     conn: &Connection,
-    hits: &mut Vec<NoteHit>,
+    hits: &mut [NoteHit],
     bias: RecencyBias,
 ) -> Result<(), SearchError> {
     let weight = bias.weight();
@@ -609,7 +617,7 @@ fn apply_recency_bias(
         .iter()
         .map(|h| (h.note_id.as_str(), *mtimes.get(&h.note_id).unwrap_or(&0)))
         .collect();
-    by_recency.sort_by(|a, b| b.1.cmp(&a.1));
+    by_recency.sort_by_key(|x| std::cmp::Reverse(x.1));
     let mut recency_rank: HashMap<String, usize> = HashMap::new();
     for (i, (id, _)) in by_recency.iter().enumerate() {
         recency_rank.insert((*id).to_string(), i + 1);

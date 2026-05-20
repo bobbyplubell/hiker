@@ -185,7 +185,7 @@ impl Prompts {
     /// Render `feature` with `vars` substituted. Unknown placeholders are
     /// left as-is so a partially-customized prompt doesn't silently lose
     /// data.
-    pub fn render<'a, I, K, V>(
+    pub fn render<I, K, V>(
         &self,
         feature: &str,
         vars: I,

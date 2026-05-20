@@ -31,7 +31,7 @@ A consumer that wants to render a diff calls `renderDiff(view: EditorView, input
 The split mirrors the rest of hiker's module discipline: domain logic in `core::*`, presentation in `ui/`.
 
 - **`core::diff`** — pure function `compute(before: &str, after: &str) -> DiffResult` returning a list of hunks (each hunk is a list of `{ op: Equal | Insert | Delete, line: String, before_line_no: Option<u32>, after_line_no: Option<u32> }`). Backed by the [`similar`](https://crates.io/crates/similar) crate. Pure: no I/O, no async, no state — just text → diff. Testable in Rust without spinning up the UI. [diff-core-module]
-- **Tauri command** `compute_diff(before: String, after: String) -> Result<DiffResult>` — thin wrapper over `core::diff::compute`. The `DiffResult` shape auto-exports as a TS type via `ts-rs` per design.md.
+- **Host command** `compute_diff(before: String, after: String) -> Result<DiffResult>` — thin wrapper over `core::diff::compute`.
 - **CLI parity** — `hiker diff <path> <snapshot-id>` (and `hiker diff <path-a> <path-b>`) calls the same `core::diff::compute`, prints unified-diff output to stdout. Lands when the CLI is fleshed out. [cli-diff]
 - **MCP** — no tool surface in v1. Agents can already retrieve two blobs (`get_note` + `change_content`) and reason over them; an `mcp-tool-diff` would be an optimization, not a capability. Reserved as deferred. [mcp-tool-diff]
 
@@ -115,7 +115,7 @@ Dirty-buffer protection: snapshot and staging previews are read-only; entering o
 ## Module placement
 
 - `core::diff` — pure `compute(before, after) -> DiffResult`; `similar` crate confined to this module, mirroring the `rusqlite-only-in-store` / `fastembed-only-in-embed` pattern. Unit tests live alongside.
-- Tauri command `compute_diff` in `ui/src-tauri/src/lib.rs` — ~10-line wrapper.
+- Host command `compute_diff` — ~10-line wrapper.
 - `ui/src/diff/` — `renderDiff(view, input)` rendering helper + the toggle button component + CM6 line decorations consuming the `DiffResult`. Strings already exist UI-side; the IPC carries the diff *output*, not the inputs round-tripped.
 - Each consumer (snapshot preview, dirty-buffer Diff toggle, patch-review mode, write-note review) owns its own pane wiring and calls `renderDiff` (or, for patch-review, paints widget decorations from the same `DiffResult`) against its own CM6 view when the toggle flips on.
 - CLI: `hiker diff` lives in `cli/`, calls `core::diff::compute` directly, prints unified diff.

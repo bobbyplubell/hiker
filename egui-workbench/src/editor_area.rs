@@ -1,0 +1,768 @@
+//! Editor area — tabbed editor groups with splits. See `DESIGN.md`.
+//!
+//! Holds an `egui_tiles::Tree<TabHandle>` (groups + splits) plus a
+//! payload map keyed by handle. A crate-private Behavior impl is built
+//! per-frame and bridges egui_tiles back to the [`WorkbenchBehavior`]
+//! supplied by the host.
+
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::marker::PhantomData;
+
+use egui::{
+    Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Vec2, Visuals, vec2,
+};
+use egui_tiles::{
+    Behavior as TilesBehavior, Container, EditAction, SimplificationOptions, TabState as TilesTabState,
+    Tabs, Tile, TileId, Tiles, Tree, UiResponse,
+};
+
+use crate::behavior::WorkbenchBehavior;
+use crate::handle::{GroupHandle, TabHandle};
+use crate::internal::tree_adapter;
+use crate::tab::{DocumentTab, TabEntry, TabState, TabUiContext};
+use crate::theme::WorkbenchTheme;
+
+/// The central editor region. Owns the tab payload map and an
+/// `egui_tiles::Tree<TabHandle>` describing the groups + splits.
+pub struct EditorArea<Tab: DocumentTab> {
+    pub(crate) tree: Tree<TabHandle>,
+    pub(crate) entries: HashMap<TabHandle, TabEntry<Tab>>,
+    /// Most recently focused group (the one user actions like
+    /// "close active tab" target). May be `None` when the tree is empty.
+    pub(crate) focused_group: Option<TileId>,
+    _marker: PhantomData<Tab>,
+}
+
+impl<Tab: DocumentTab> Default for EditorArea<Tab> {
+    fn default() -> Self {
+        Self {
+            tree: Tree::empty(egui::Id::new("egui_workbench::editor_tree")),
+            entries: HashMap::new(),
+            focused_group: None,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Tab: DocumentTab> EditorArea<Tab> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct an empty editor area whose underlying `egui_tiles::Tree`
+    /// uses the given egui `Id` as its persistence key. Used by
+    /// [`crate::PanelArea`] so the two trees don't collide in egui's
+    /// data store.
+    pub fn with_tree_id(id: egui::Id) -> Self {
+        Self {
+            tree: Tree::empty(id),
+            entries: HashMap::new(),
+            focused_group: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Number of currently open tabs (across all groups).
+    pub fn tab_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate `(handle, entry)` pairs — used by persistence.
+    pub(crate) fn iter_entries(
+        &self,
+    ) -> impl Iterator<Item = (TabHandle, &TabEntry<Tab>)> {
+        self.entries.iter().map(|(h, e)| (*h, e))
+    }
+
+    /// Clone the underlying tree — used by persistence.
+    pub(crate) fn tree_clone(&self) -> Tree<TabHandle> {
+        self.tree.clone()
+    }
+
+    /// For each `Tabs` container, return the first child `TabHandle`,
+    /// in tree-iteration order. Public for tests and host-side
+    /// inspection of pinned-first enforcement.
+    pub fn leading_handle_per_group(&self) -> Vec<TabHandle> {
+        let mut out = Vec::new();
+        for (_id, tile) in self.tree.tiles.iter() {
+            if let Tile::Container(Container::Tabs(tabs)) = tile
+                && let Some(first_id) = tabs.children.first()
+                && let Some(Tile::Pane(h)) = self.tree.tiles.get(*first_id)
+            {
+                out.push(*h);
+            }
+        }
+        out
+    }
+
+    /// Replace the tree + entries wholesale. Used by persistence.
+    pub(crate) fn replace_tree(
+        &mut self,
+        tree: Tree<TabHandle>,
+        entries: HashMap<TabHandle, TabEntry<Tab>>,
+    ) {
+        self.tree = tree;
+        self.entries = entries;
+        self.focused_group = tree_adapter::first_tabs_container(&self.tree);
+    }
+
+    /// Iterate over open tabs.
+    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabHandle, &Tab)> {
+        self.entries.iter().map(|(h, e)| (*h, &e.tab))
+    }
+
+    /// Look up a tab payload by handle.
+    pub fn get(&self, handle: TabHandle) -> Option<&Tab> {
+        self.entries.get(&handle).map(|e| &e.tab)
+    }
+
+    /// Mutable access to a tab payload.
+    pub fn get_mut(&mut self, handle: TabHandle) -> Option<&mut Tab> {
+        self.entries.get_mut(&handle).map(|e| &mut e.tab)
+    }
+
+    pub fn state(&self, handle: TabHandle) -> Option<TabState> {
+        self.entries.get(&handle).map(|e| e.state)
+    }
+
+    pub(crate) fn set_state(&mut self, handle: TabHandle, state: TabState) {
+        if let Some(entry) = self.entries.get_mut(&handle) {
+            entry.state = state;
+        }
+    }
+
+    /// Insert a tab into the tree, returning the `TileId` of the new pane.
+    /// Caller supplies the handle (the workbench allocates them).
+    pub(crate) fn insert_tab(
+        &mut self,
+        handle: TabHandle,
+        tab: Tab,
+        state: TabState,
+        focus: bool,
+    ) -> TileId {
+        self.entries
+            .insert(handle, TabEntry::new(tab, state, handle));
+
+        let pane_id = self.tree.tiles.insert_pane(handle);
+
+        // Find or create the destination Tabs container, then attach
+        // the pane to it.
+        let target_group = if let Some(group) = self.focused_group
+            && self.is_tabs_container(group)
+        {
+            group
+        } else if let Some(group) = tree_adapter::first_tabs_container(&self.tree) {
+            group
+        } else {
+            // Empty tree: this pane becomes the only child of a fresh
+            // root Tabs container.
+            let new_root = self.tree.tiles.insert_tab_tile(vec![pane_id]);
+            self.tree.root = Some(new_root);
+            self.focused_group = Some(new_root);
+            return pane_id;
+        };
+
+        if let Some(Tile::Container(Container::Tabs(tabs))) =
+            self.tree.tiles.get_mut(target_group)
+        {
+            if !tabs.children.contains(&pane_id) {
+                tabs.children.push(pane_id);
+            }
+            if focus {
+                tabs.set_active(pane_id);
+            }
+        }
+        self.focused_group = Some(target_group);
+        pane_id
+    }
+
+    fn is_tabs_container(&self, id: TileId) -> bool {
+        matches!(
+            self.tree.tiles.get(id),
+            Some(Tile::Container(Container::Tabs(_)))
+        )
+    }
+
+    /// Remove a tab. Returns `true` if a tab was removed.
+    pub(crate) fn remove_tab(&mut self, handle: TabHandle) -> bool {
+        let Some(pane_id) = tree_adapter::find_pane_of(&self.tree, handle) else {
+            self.entries.remove(&handle);
+            return false;
+        };
+        self.tree.tiles.remove(pane_id);
+        self.entries.remove(&handle);
+        true
+    }
+
+    /// Return the handle of the (single) Preview tab inside `group`, if
+    /// any. Used by [`crate::Workbench::open_tab`] to enforce the
+    /// "one Preview tab per group" invariant.
+    pub(crate) fn preview_handle_in_group(&self, group: TileId) -> Option<TabHandle> {
+        let handles = tree_adapter::handles_in_group(&self.tree, group);
+        handles
+            .into_iter()
+            .find(|h| self.state(*h) == Some(TabState::Preview))
+    }
+
+    /// Mark the given group as focused for future operations.
+    pub fn set_focused_group(&mut self, group: GroupHandle) {
+        self.focused_group = Some(group.0);
+    }
+
+    pub fn focused_group(&self) -> Option<GroupHandle> {
+        self.focused_group.map(GroupHandle)
+    }
+
+    /// Drive one frame of the tabbed area: swap the tree out, run
+    /// `egui_tiles` against an [`EditorBehavior`], drain the pending-state
+    /// vectors that `tab_ui` populated, apply tab activations, drop
+    /// payload entries for closed tabs, and run the pinned-first
+    /// invariant pass. Returns a [`DriveOutcome`] describing the
+    /// context-menu / focus actions the caller still needs to apply.
+    ///
+    /// Shared by [`crate::workspace::Workbench::show_editor_area`] and
+    /// `show_panel_area` so the two tabbed surfaces don't drift.
+    pub(crate) fn drive_ui<Mode, B>(
+        &mut self,
+        ui: &mut egui::Ui,
+        behavior: &mut B,
+        theme: &WorkbenchTheme,
+        placeholder_id: egui::Id,
+    ) -> DriveOutcome
+    where
+        Mode: Clone + Eq + Hash + 'static,
+        B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+    {
+        let placeholder = Tree::empty(placeholder_id);
+        let mut tree = std::mem::replace(&mut self.tree, placeholder);
+        let focused_group = self.focused_group;
+        let pane_to_group = crate::internal::tree_adapter::pane_to_group_map(&tree);
+        let mut adapter = EditorBehavior::<Tab, Mode, _> {
+            entries: &mut self.entries,
+            behavior,
+            theme,
+            dirty: false,
+            pending_closes: Vec::new(),
+            pending_close_others: None,
+            pending_close_to_right: None,
+            pending_close_all: false,
+            pending_pin_toggles: Vec::new(),
+            pending_promote: Vec::new(),
+            pending_tab_activations: Vec::new(),
+            focused_group,
+            pane_to_group,
+            pending_focus: None,
+            _mode: PhantomData,
+        };
+        tree.ui(&mut adapter, ui);
+
+        let outcome = DriveOutcome {
+            dirty: adapter.dirty,
+            pending_close_others: adapter.pending_close_others.take(),
+            pending_close_to_right: adapter.pending_close_to_right.take(),
+            pending_close_all: adapter.pending_close_all,
+            pending_pin_toggles: std::mem::take(&mut adapter.pending_pin_toggles),
+            pending_promote: std::mem::take(&mut adapter.pending_promote),
+        };
+        let pending_closes = std::mem::take(&mut adapter.pending_closes);
+        let activations = std::mem::take(&mut adapter.pending_tab_activations);
+        let pending_focus = adapter.pending_focus.take();
+        drop(adapter);
+
+        if let Some(group) = pending_focus {
+            self.focused_group = Some(group);
+        }
+
+        // Apply "all tabs" dropdown activations from the frame.
+        for (group, child) in activations {
+            if let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get_mut(group) {
+                tabs.set_active(child);
+            }
+        }
+
+        self.tree = tree;
+        for handle in pending_closes {
+            self.entries.remove(&handle);
+        }
+
+        // Post-frame: enforce pinned-first in each Tabs container.
+        let entries = &self.entries;
+        crate::internal::enforcement::enforce_pinned_first(&mut self.tree, |h| {
+            entries.get(&h).map(|e| e.state).unwrap_or_default()
+        });
+
+        // If the focused group was pruned by simplification, fall back to
+        // the first remaining Tabs container.
+        if let Some(group) = self.focused_group
+            && self.tree.tiles.get(group).is_none()
+        {
+            self.focused_group = tree_adapter::first_tabs_container(&self.tree);
+        }
+
+        outcome
+    }
+}
+
+/// Outcome of [`EditorArea::drive_ui`]. Carries the deferred user actions
+/// that the workspace still needs to apply with cross-area awareness
+/// (e.g., toggling a pin updates the workbench `dirty` flag).
+pub(crate) struct DriveOutcome {
+    /// `true` if `egui_tiles` reported any edit (drag, resize, activate).
+    pub dirty: bool,
+    pub pending_close_others: Option<TabHandle>,
+    pub pending_close_to_right: Option<TabHandle>,
+    pub pending_close_all: bool,
+    pub pending_pin_toggles: Vec<TabHandle>,
+    pub pending_promote: Vec<TabHandle>,
+}
+
+/// Per-frame `egui_tiles::Behavior` adapter. Holds borrows of the
+/// payload map (so `pane_ui` can look up the tab) and the host
+/// behavior. Constructed and dropped within a single `Tree::ui` call.
+pub(crate) struct EditorBehavior<'a, Tab, Mode, B>
+where
+    Tab: DocumentTab,
+    Mode: Clone + Eq + Hash + 'static,
+    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+{
+    pub entries: &'a mut HashMap<TabHandle, TabEntry<Tab>>,
+    pub behavior: &'a mut B,
+    pub theme: &'a WorkbenchTheme,
+    /// Set to `true` if any edit happened (drag, resize, tab select).
+    /// The workbench uses this to mark its layout cache dirty.
+    pub dirty: bool,
+    /// Tabs the user asked to close this frame. Drained by the workbench.
+    pub pending_closes: Vec<TabHandle>,
+    /// Tabs to close (others / right-of) requested via context menu this
+    /// frame. Drained by the workbench, which applies the close-others
+    /// semantics (skip pinned).
+    pub pending_close_others: Option<TabHandle>,
+    pub pending_close_to_right: Option<TabHandle>,
+    pub pending_close_all: bool,
+    /// Tabs whose pinned state was toggled via context menu this frame.
+    pub pending_pin_toggles: Vec<TabHandle>,
+    /// Tabs whose Preview state should be promoted to Regular this frame
+    /// (e.g. because the user explicitly clicked "Keep open").
+    pub pending_promote: Vec<TabHandle>,
+    /// `(group, child)` pairs to activate this frame — sourced from the
+    /// "all tabs" dropdown rendered via `top_bar_right_ui`.
+    pub pending_tab_activations: Vec<(TileId, TileId)>,
+    /// Focused group computed from the current frame, if known.
+    pub focused_group: Option<TileId>,
+    /// Pane → owning Tabs container, precomputed before `tree.ui()` so
+    /// `pane_ui` can resolve its parent group cheaply.
+    pub pane_to_group: HashMap<TileId, TileId>,
+    /// Group the user clicked on this frame, if any — the workbench
+    /// promotes this to `focused_group` post-frame so per-group commands
+    /// (close-active, focus-next, etc.) target what the user just touched.
+    pub pending_focus: Option<TileId>,
+    pub _mode: PhantomData<Mode>,
+}
+
+impl<'a, Tab, Mode, B> TilesBehavior<TabHandle> for EditorBehavior<'a, Tab, Mode, B>
+where
+    Tab: DocumentTab,
+    Mode: Clone + Eq + Hash + 'static,
+    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+{
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        tile_id: TileId,
+        handle: &mut TabHandle,
+    ) -> UiResponse {
+        let Some(entry) = self.entries.get_mut(handle) else {
+            ui.weak("missing tab");
+            return UiResponse::None;
+        };
+        let parent = self.pane_to_group.get(&tile_id).copied();
+        let group = GroupHandle(parent.unwrap_or(tile_id));
+        let focused = match (parent, self.focused_group) {
+            (Some(p), Some(f)) => p == f,
+            _ => false,
+        };
+        let ctx = TabUiContext {
+            handle: *handle,
+            group,
+            focused,
+            state: entry.state,
+            _marker: PhantomData,
+        };
+        self.behavior.pane_ui(ui, &mut entry.tab, ctx);
+        UiResponse::None
+    }
+
+    fn tab_title_for_pane(&mut self, handle: &TabHandle) -> egui::WidgetText {
+        let Some(entry) = self.entries.get(handle) else {
+            return "(missing)".into();
+        };
+        let raw = entry.tab.title().text().to_string();
+        let mut rich = egui::RichText::new(raw);
+        if entry.state == TabState::Preview {
+            rich = rich.italics();
+        }
+        rich.into()
+    }
+
+    fn is_tab_closable(&self, tiles: &Tiles<TabHandle>, tile_id: TileId) -> bool {
+        // Closability is determined per-tab via DocumentTab::closable.
+        match tiles.get(tile_id) {
+            Some(Tile::Pane(h)) => self
+                .entries
+                .get(h)
+                .map(|e| e.tab.closable())
+                .unwrap_or(true),
+            _ => true,
+        }
+    }
+
+    fn tab_ui(
+        &mut self,
+        tiles: &mut Tiles<TabHandle>,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        tile_id: TileId,
+        state: &TilesTabState,
+    ) -> Response {
+        // Resolve the handle + flags before borrowing the painter.
+        let (handle, tab_state, is_dirty, tooltip) = match tiles.get(tile_id) {
+            Some(Tile::Pane(h)) => {
+                let entry = self.entries.get(h);
+                let s = entry.map(|e| e.state).unwrap_or_default();
+                let d = entry.map(|e| e.tab.is_dirty()).unwrap_or(false);
+                let t = entry.and_then(|e| e.tab.tooltip());
+                (*h, s, d, t)
+            }
+            _ => {
+                return ui.allocate_response(Vec2::ZERO, Sense::hover());
+            }
+        };
+
+        // Pull glyph / dirty placement state.
+        let pinned = tab_state == TabState::Pinned;
+        let preview = tab_state == TabState::Preview;
+
+        let text = self.tab_title_for_tile(tiles, tile_id);
+        let font_id = TextStyle::Button.resolve(ui.style());
+        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id.clone());
+
+        let x_margin = self.tab_title_spacing(ui.visuals());
+        let close_btn_size = Vec2::splat(self.close_button_outer_size());
+        let close_btn_left_padding = 4.0;
+        let pin_glyph_width = if pinned { 10.0 } else { 0.0 };
+        // We reserve room for either dirty dot OR close button, not both
+        // (dirty dot replaces close until hover). egui_tiles' close gating
+        // is governed by `state.closable`.
+        let right_slot_width = if state.closable {
+            close_btn_left_padding + close_btn_size.x
+        } else {
+            0.0
+        };
+
+        let button_width =
+            galley.size().x + 2.0 * x_margin + pin_glyph_width + right_slot_width;
+        let (_, tab_rect) = ui.allocate_space(vec2(button_width, ui.available_height()));
+
+        let tab_response = ui
+            .interact(tab_rect, id, Sense::click_and_drag())
+            .on_hover_cursor(self.tab_hover_cursor_icon());
+
+        if ui.is_rect_visible(tab_rect) && !state.is_being_dragged {
+            let bg_color = self.tab_bg_color(ui.visuals(), tiles, tile_id, state);
+            let stroke = self.tab_outline_stroke(ui.visuals(), tiles, tile_id, state);
+            ui.painter().rect(
+                tab_rect.shrink(0.5),
+                0.0,
+                bg_color,
+                stroke,
+                StrokeKind::Inside,
+            );
+            if state.active {
+                ui.painter().hline(
+                    tab_rect.x_range(),
+                    tab_rect.bottom(),
+                    Stroke::new(stroke.width + 1.0, bg_color),
+                );
+            }
+
+            let text_color = self.tab_text_color(ui.visuals(), tiles, tile_id, state);
+
+            // Pin glyph: a small leading vertical bar so we avoid emoji
+            // tofu. Painted, not text, to keep its size predictable.
+            let inner = tab_rect.shrink2(vec2(x_margin, 0.0));
+            let mut text_left = inner.left();
+            if pinned {
+                let cy = inner.center().y;
+                let x = inner.left() + 2.5;
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(x, cy - 4.0),
+                        vec2(2.5, 8.0),
+                    ),
+                    1.0,
+                    text_color,
+                );
+                text_left += pin_glyph_width;
+            }
+
+            let text_position = Align2::LEFT_CENTER
+                .align_size_within_rect(
+                    galley.size(),
+                    Rect::from_min_max(
+                        egui::pos2(text_left, inner.top()),
+                        inner.right_bottom(),
+                    ),
+                )
+                .min;
+            ui.painter().galley(text_position, galley, text_color);
+
+            // Right-side: dirty dot replaces close X until hover.
+            if state.closable {
+                let slot = Align2::RIGHT_CENTER
+                    .align_size_within_rect(close_btn_size, inner);
+                let show_dirty_dot = is_dirty && !tab_response.hovered();
+                if show_dirty_dot {
+                    ui.painter()
+                        .circle_filled(slot.center(), 3.5, text_color);
+                } else {
+                    let close_btn_id = ui.auto_id_with(("workbench_tab_close", tile_id));
+                    let close_resp = ui
+                        .interact(slot, close_btn_id, Sense::click_and_drag())
+                        .on_hover_cursor(egui::CursorIcon::Default);
+                    let visuals = ui.style().interact(&close_resp);
+                    let rect = slot
+                        .shrink(self.close_button_inner_margin())
+                        .expand(visuals.expansion);
+                    let stroke = visuals.fg_stroke;
+                    ui.painter().line_segment([rect.left_top(), rect.right_bottom()], stroke);
+                    ui.painter().line_segment([rect.right_top(), rect.left_bottom()], stroke);
+                    if close_resp.clicked() && self.on_tab_close(tiles, tile_id) {
+                        tiles.remove(tile_id);
+                    }
+                }
+            }
+        }
+
+        // Tooltip from DocumentTab::tooltip().
+        let tab_response = if let Some(tip) = tooltip {
+            tab_response.on_hover_text(tip)
+        } else {
+            tab_response
+        };
+
+        // Middle-click closes (subject to host veto).
+        if tab_response.clicked_by(egui::PointerButton::Middle)
+            && self.on_tab_close(tiles, tile_id)
+        {
+            tiles.remove(tile_id);
+        }
+
+        // Track focused group: any interaction on a tab promotes its
+        // owning group to the focused one for the frame.
+        if (tab_response.clicked() || tab_response.drag_started())
+            && let Some(parent) = tiles.parent_of(tile_id)
+        {
+            self.pending_focus = Some(parent);
+        }
+
+        // Preview promotion on double-click.
+        if preview && tab_response.double_clicked() {
+            self.pending_promote.push(handle);
+        }
+
+        // Context menu. Queue actions onto pending_* vecs and let the
+        // workbench apply them after egui_tiles returns control.
+        let mut close_self = false;
+        let mut close_others = false;
+        let mut close_to_right = false;
+        let mut close_all = false;
+        let mut toggle_pin = false;
+        let mut promote = false;
+        let host_extra_tab = self.entries.get(&handle).map(|e| e.tab.clone());
+        let _ = tab_response.context_menu(|ui| {
+            if ui.button("Close").clicked() {
+                close_self = true;
+                ui.close();
+            }
+            if ui.button("Close Others").clicked() {
+                close_others = true;
+                ui.close();
+            }
+            if ui.button("Close to the Right").clicked() {
+                close_to_right = true;
+                ui.close();
+            }
+            if ui.button("Close All").clicked() {
+                close_all = true;
+                ui.close();
+            }
+            ui.separator();
+            let pin_label = if tab_state == TabState::Pinned { "Unpin" } else { "Pin" };
+            if ui.button(pin_label).clicked() {
+                toggle_pin = true;
+                ui.close();
+            }
+            if preview && ui.button("Keep Open").clicked() {
+                promote = true;
+                ui.close();
+            }
+            if let Some(tab_ref) = host_extra_tab.as_ref() {
+                ui.separator();
+                self.behavior.tab_context_menu(ui, tab_ref);
+            }
+        });
+        if close_self && self.on_tab_close(tiles, tile_id) {
+            tiles.remove(tile_id);
+        }
+        if close_others {
+            self.pending_close_others = Some(handle);
+        }
+        if close_to_right {
+            self.pending_close_to_right = Some(handle);
+        }
+        if close_all {
+            self.pending_close_all = true;
+        }
+        if toggle_pin {
+            self.pending_pin_toggles.push(handle);
+        }
+        if promote {
+            self.pending_promote.push(handle);
+        }
+
+        self.on_tab_button(tiles, tile_id, tab_response)
+    }
+
+    fn on_tab_close(&mut self, tiles: &mut Tiles<TabHandle>, tile_id: TileId) -> bool {
+        let handle = match tiles.get(tile_id) {
+            Some(Tile::Pane(handle)) => *handle,
+            _ => return true,
+        };
+        let allow = self
+            .entries
+            .get(&handle)
+            .map(|e| self.behavior.on_tab_close(&e.tab))
+            .unwrap_or(true);
+        if allow {
+            self.pending_closes.push(handle);
+        }
+        allow
+    }
+
+    fn simplification_options(&self) -> SimplificationOptions {
+        SimplificationOptions {
+            prune_empty_tabs: true,
+            prune_empty_containers: true,
+            prune_single_child_tabs: false,
+            prune_single_child_containers: false,
+            all_panes_must_have_tabs: true,
+            join_nested_linear_containers: true,
+        }
+    }
+
+    fn on_edit(&mut self, _edit_action: EditAction) {
+        self.dirty = true;
+    }
+
+    fn paint_on_top_of_tile(
+        &self,
+        painter: &egui::Painter,
+        _style: &egui::Style,
+        tile_id: TileId,
+        rect: Rect,
+    ) {
+        if self.focused_group == Some(tile_id) {
+            let stroke =
+                Stroke::new(self.theme.focused_group_border_width, self.theme.focused_group_border);
+            painter.rect(
+                rect.shrink(stroke.width / 2.0),
+                0.0,
+                Color32::TRANSPARENT,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    /// Theme-accented stroke around the active drop preview.
+    fn drag_preview_stroke(&self, _visuals: &Visuals) -> Stroke {
+        Stroke::new(2.0, self.theme.accent)
+    }
+
+    /// Translucent accent fill for the active drop zone.
+    fn drag_preview_color(&self, _visuals: &Visuals) -> Color32 {
+        let a = self.theme.accent;
+        Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 64)
+    }
+
+    /// Workbench-styled drop preview. Refines the default by:
+    /// - Drawing the parent-group outline with the theme accent.
+    /// - For thin previews (tab-strip insert), drawing a 2px insert bar
+    ///   rather than a translucent rect.
+    /// - For body drops, filling the target zone with a translucent
+    ///   accent overlay and outlining it with a 2px stroke.
+    fn paint_drag_preview(
+        &self,
+        visuals: &Visuals,
+        painter: &egui::Painter,
+        parent_rect: Option<Rect>,
+        preview_rect: Rect,
+    ) {
+        let stroke = self.drag_preview_stroke(visuals);
+        let fill = self.drag_preview_color(visuals);
+
+        if let Some(parent) = parent_rect {
+            // Faint outline on the parent container so users see the
+            // group they're about to drop into.
+            let parent_stroke =
+                Stroke::new(1.0, self.theme.accent.gamma_multiply(0.5));
+            painter.rect_stroke(parent, 1.0, parent_stroke, StrokeKind::Inside);
+        }
+
+        // Heuristic: a sliver-shaped preview rect means "insert between
+        // tabs" (tab strip). Render as a solid accent bar.
+        let is_insert_bar = preview_rect.width() <= 6.0 || preview_rect.height() <= 6.0;
+        if is_insert_bar {
+            painter.rect_filled(preview_rect, 1.0, self.theme.accent);
+        } else {
+            painter.rect(preview_rect, 2.0, fill, stroke, StrokeKind::Inside);
+        }
+    }
+
+    /// "All tabs" dropdown on the right of every tab strip. Clicking
+    /// activates the chosen tab.
+    fn top_bar_right_ui(
+        &mut self,
+        tiles: &Tiles<TabHandle>,
+        ui: &mut egui::Ui,
+        tile_id: TileId,
+        tabs: &Tabs,
+        _scroll_offset: &mut f32,
+    ) {
+        let popup_id = ui.id().with(("workbench_all_tabs", tile_id));
+        let button = ui.small_button("v").on_hover_text("All tabs");
+        let mut activate: Option<TileId> = None;
+        egui::Popup::menu(&button)
+            .id(popup_id)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                ui.set_min_width(160.0);
+                for child_id in &tabs.children {
+                    let title = self.tab_title_for_tile(tiles, *child_id);
+                    let active = tabs.active == Some(*child_id);
+                    let mut rich = egui::RichText::new(title.text().to_string());
+                    if active {
+                        rich = rich.strong();
+                    }
+                    if ui.selectable_label(active, rich).clicked() {
+                        activate = Some(*child_id);
+                    }
+                }
+            });
+        if let Some(child) = activate {
+            self.pending_tab_activations.push((tile_id, child));
+        }
+    }
+}
+

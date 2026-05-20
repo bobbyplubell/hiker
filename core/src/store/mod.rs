@@ -116,7 +116,7 @@ pub struct NoteRow {
 /// directory for two-line rendering, and `last_accessed_at` so the
 /// frontend can format a recency hint if it wants.
 ///
-/// status: chat-input-at-autocomplete-tauri-cmd
+/// status: chat-input-at-autocomplete-cmd
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AtSuggestion {
@@ -320,7 +320,7 @@ pub fn enrich_char_offsets(text: &str, bounds: &mut [ChunkBounds]) {
         }
     }
     // Anything past the document end clamps to the doc-end utf16 length.
-    while let Some(&t) = targets_iter.next() {
+    for &t in targets_iter {
         byte_to_utf16.insert(t, utf16_pos);
         let _ = total_bytes;
     }

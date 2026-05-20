@@ -46,7 +46,7 @@ The same vault is navigable by a human in the desktop UI and by agents over MCP,
 
 11. **Spatial navigation as a first-class idea.** Trails (ordered walks), landmarks (pinned anchors), and the map (graph view) treat the vault as a place you move through, not just a bag of documents.
 
-12. **Open source, built in Rust, on a small native stack.** Tauri + CodeMirror 6 + a Rust core. Apache-2.0 licensed.
+12. **Open source, built in Rust, on a small native stack.** egui desktop app + a Rust core. Apache-2.0 licensed.
 
 
 ## Features
@@ -128,7 +128,7 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 
 ### Platform
 
-- **[implemented]** Tauri shell, Rust core with strict module discipline (rusqlite, fastembed, notify each isolated to one module)
+- **[implemented]** egui desktop shell, Rust core with strict module discipline (rusqlite, fastembed, notify each isolated to one module)
 - **[implemented]** Per-vault settings (TOML, user + vault layered, strict load, write-back preserving comments)
 - **[implemented]** Tracing-based observability with daily-rotating file logs; chunk-boundary editor gutter
 - **[implemented]** Multi-vault open with default-vault auto-open

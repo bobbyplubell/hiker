@@ -1,6 +1,12 @@
 # Editor
 
-CodeMirror 6 inside the Tauri webview. Live-preview decorations and widget rendering are out of scope here; see design.md.
+In-tree widget over egui. Live-preview decorations and widget rendering: see `design.md`.
+
+- `editor-core` — `Rope`, `EditorState`, `Selection`/`SelRange`/`Anchor`, `Transaction`, `Decoration`/`DecorationSet`/`RangeSet`. Pure data.
+- `editor-view` — `command::handle(state, view, event)`, decoration providers, `ViewState`, `CompletionSource` trait.
+- `editor-egui` — input translation, painter, gutter, selection, scroll.
+
+Transactions, decorations, and selections referenced below are the types from those crates.
 
 
 ## Buffer model
@@ -57,7 +63,7 @@ Both mechanisms reduce to the same conflict-resolution UI; only the trigger diff
 
 ## Keybind registry
 
-A single module owns all keybindings as a flat list. The registry is an introspection layer, not a translator — CM6's `keymap.of([...])` is the only sink in v0. Goals: discoverable (a help panel can enumerate `list()`), overridable (user config later), conflict-detectable. [keybind-registry]
+Window-level chords: `app/src/keybinds.rs`, intercepted via `ctx.input_mut(|i| i.consume_key(...))` before the editor sees them. Buffer-local chords: `editor-view::command::handle`. `known_keybindings()` returns the flat window-level list the F1 overlay enumerates. Goals: discoverable, overridable (later), conflict-detectable. [keybind-registry]
 
 Shape:
 
@@ -101,7 +107,7 @@ Bottom strip across the editor pane only (not under the tree). Three regions: [s
 - left: a **version dropdown** for the active buffer's file. Closed-state label is the basename plus a mode qualifier when a non-current version is selected (e.g. `note.md`, `note.md — Snapshot 2m ago`, `note.md — Staging · chat`). The full vault-relative path stays in the `title=` tooltip on hover. See `## Version dropdown` below. [status-bar-version-dropdown]
 - center: index status label (v1+) — short text reflecting indexer state. Concretely: `Model loading…` while the embedder loads, `Indexing X/Y` while jobs flow (X = remaining queue depth, Y = total since last idle), `Indexed (N notes)` when idle, `Index error` (with last_error in title attribute) when the indexer reports a failure. Plain text, no icons in v1; styling can come later. [status-bar-index-label]
 
-  When the *active buffer*'s file is in a non-indexed state (per `tauri-cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
+  When the *active buffer*'s file is in a non-indexed state (per `cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
 - right: line:col, word count, file type badge (`md`)
 
 Why basename rather than full path: the file tree shows location, the window title carries disambiguation, and full paths overflow on deep vaults. Tooltip + tree cover "where does it live."
@@ -109,7 +115,7 @@ Why basename rather than full path: the file tree shows location, the window tit
 Click targets:
 
 - dropdown → opens the version list (see below).
-- right-click on the dropdown's closed-state label → context menu with "Reveal in file manager" (Finder on macOS, File Explorer on Windows, default file manager on Linux; via Tauri's shell/opener API). Suppressed for trash-preview / snapshot / staging buffers so internal `.hiker/` paths don't leak. [status-bar-path-reveal]
+- right-click on the dropdown's closed-state label → context menu with "Reveal in file manager" (Finder on macOS, File Explorer on Windows, default file manager on Linux; via the OS shell/opener). Suppressed for trash-preview / snapshot / staging buffers so internal `.hiker/` paths don't leak. [status-bar-path-reveal]
 - line:col → opens a goto-line input (deferred; click is a no-op in v0) [status-bar-goto-line]
 
 
@@ -284,7 +290,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
   - **Skipped** — amber filled dot. The indexer attempted ingest and refused (>5MB sanity cap, UTF-8 decode failure, future: corrupted source). Reason string from the indexer (`"file too large"`, `"not UTF-8"`) shown in the row's `title=` tooltip. [tree-row-skipped-marker]
   - **Queued / mid-index** — pulsing accent dot. Transient; clears when the file's index job completes. Driven by `hiker:reindex-progress` events so no polling is needed. [tree-row-queued-marker]
 
-  State is supplied by `tauri-cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
+  State is supplied by `cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
 
   ### Tree source visibility
 
@@ -383,7 +389,7 @@ Each entry is a checkable item — checkmark when active, click flips it, menu c
 
 ### v1 entries
 
-- **Show chunk boundaries** — overlays the editor with a thin horizontal rule between chunks (pale reddish-orange — visible against prose without competing for attention) and the chunk index (`0`, `1`, `2`, ...) in the gutter at each chunk's start line. Backed by `tauri-cmd-chunks-for-path` (see `index.md`) which returns the active note's chunk bounds. Refreshes on save (debounced 500ms, same cadence as the related-notes panel). When the file isn't indexed (unsupported / skipped / queued per `tauri-cmd-file-index-state`), toggling on shows nothing and a faint hint in the gutter explains why. CodeMirror integration: a `StateField<DecorationSet>` plus a `gutter` extension; sits in its own slot in the CM6 extension order (after language, before keymap). [view-show-chunk-boundaries]
+- **Show chunk boundaries** — overlays the editor with a thin horizontal rule between chunks (pale reddish-orange — visible against prose without competing for attention) and the chunk index (`0`, `1`, `2`, ...) in the gutter at each chunk's start line. Backed by `cmd-chunks-for-path` (see `index.md`) which returns the active note's chunk bounds. Refreshes on save (debounced 500ms, same cadence as the related-notes panel). When the file isn't indexed (unsupported / skipped / queued per `cmd-file-index-state`), toggling on shows nothing and a faint hint in the gutter explains why. CodeMirror integration: a `StateField<DecorationSet>` plus a `gutter` extension; sits in its own slot in the CM6 extension order (after language, before keymap). [view-show-chunk-boundaries]
 
   This is genuinely a debugging-grade view of the chunker's output — useful while txt-ingest is hardening, and useful long after as a sanity check when chunker behavior changes.
 
@@ -399,6 +405,7 @@ These appear in the menu now so the surface is predictable, but render greyed-ou
 - **Render .txt as markdown** — session-scope override of `txt-render-as-markdown-default`. Greyed until `settings-vault-config-toml` lands and gives the per-vault default a real loader; see `txt-ingest.md`. Different scope from the per-note override that doc explicitly rejects — this one is "for the current app session, flip the vault default," no file mutation, no persistence in v1. [view-render-txt-as-markdown-toggle]
 - **Word wrap** — session-scope override of `settings-section-editor`'s wrap default. [view-word-wrap-toggle]
 - **Show whitespace** — toggles CM6's whitespace-rendering extension. [view-show-whitespace-toggle]
+- **Highlight trailing whitespace** — paints a faint red background over runs of `' '` / `'\t'` that sit between the last non-blank character on a line and the line terminator. Independent of `view-show-whitespace-toggle` (which renders every whitespace glyph): this one only marks the trailing run and only as a background, so it's quiet enough to leave on for code but is noisy enough on prose / `.txt` notes that it must be opt-in. Default off; persisted per-vault. The decoration provider is `editor_view::trailing_whitespace_decorations`; gate the call in the buffer panel on this flag rather than baking it into the always-on decoration stack. [view-highlight-trailing-whitespace-toggle]
 - **Show line numbers** — toggles the line-number gutter. [view-line-numbers-toggle]
 - **Show heading breadcrumb** — overlays each chunk with its `heading_path` (already stored on chunks). Pairs with chunk boundaries; defer until both have a real user. [view-heading-breadcrumb-toggle]
 
@@ -461,9 +468,9 @@ When no note is open, the editor pane shows a vault home page in place of the CM
 
 Three widgets, in this vertical order:
 
-- **Vault stats.** Total notes, total chunks, breakdown by index state (indexed / queued / skipped / unsupported), maybe disk usage of the vault directory. Pulled cheaply from the existing index store via a single Tauri command. Live-updates via the existing `hiker:reindex-progress` events so the counts reflect ongoing work. [vault-home-stats-widget]
+- **Vault stats.** Total notes, total chunks, breakdown by index state (indexed / queued / skipped / unsupported), maybe disk usage of the vault directory. Pulled cheaply from the existing index store via a single command. Live-updates via the existing `hiker:reindex-progress` events so the counts reflect ongoing work. [vault-home-stats-widget]
 - **Recently modified.** Top N (default 10) notes by filesystem mtime. Reuses the mtime field on `DirEntryDto` (`tree-sort-options`); ordering is just `ORDER BY mtime DESC LIMIT N` against the store's notes rows. Each row shows basename + relative path + relative time ("2 hours ago"). Click → open in editor. [vault-home-recent-modified]
-- **Recently accessed.** Top N notes by user-open time. Requires a new `last_accessed_at` column on the `notes` row, written from the open-file Tauri command path; same row shape and click behavior as recently-modified. [vault-home-recent-accessed]
+- **Recently accessed.** Top N notes by user-open time. Requires a new `last_accessed_at` column on the `notes` row, written from the open-file command path; same row shape and click behavior as recently-modified. [vault-home-recent-accessed]
 
 The new column rides a small slug of its own since the tracking is independent infrastructure (later consumers could include search ranking, habits-of-association, an "activity" view, etc.):
 
@@ -471,7 +478,7 @@ The new column rides a small slug of its own since the tracking is independent i
 
 Refresh shape: the home page subscribes to `hiker:reindex-progress` for live stat updates and to `hiker:file-changed` for recent-modified updates. The recently-accessed list updates on each open without watcher involvement (the writer is hiker itself).
 
-UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same Tauri call as the sidebar's `sidebar-new-item-button`.
+UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same call as the sidebar's `sidebar-new-item-button`.
 
 Out of scope for v1 of the home page: pinned/landmark notes, active-trail display, search shortcuts, discovery hints from clustering, recent-searches list, vocabulary stats, sync status. All slot in as additional widgets as their backing features land.
 
@@ -508,7 +515,7 @@ Per-widget detail views, in roughly the order they earn their keep:
     - **Notes** — full list of all notes, paginated, sortable by mtime / access / path.
     - **Indexed** — same shape, filtered to indexed-only.
     - **Chunks** — per-note chunk count, sortable; flags pathologies (notes with >100 chunks, notes with 0 chunks). Ties into the deferred `eval-sanity-stats` work — gives a real surface for spotting chunker pathology before the formal eval framework lands.
-    - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `tauri-cmd-file-index-state`). Updates on every `hiker:reindex-progress` event.
+    - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `cmd-file-index-state`). Updates on every `hiker:reindex-progress` event.
     - **Skipped** — list of skipped notes with their reasons (already tracked via `notes.skipped` + `notes.skip_reason`). Per-row "retry" affordance reroutes through `IndexJob::Upsert` with `force=true` so users can manually retry after fixing the underlying issue (file size, encoding).
 - **`vault-home-recent-activity-detail`** — full list from `core::changes::recent`, all author classes. Mental model: **each row is a saved version of the file.** Row layout: op label · path · author · time-ago, plus a `current` badge on the most recent row per path and a `↩ restored` badge on rows that were themselves a Restore. Filter pills (author class) live in the header. [vault-home-recent-activity-detail]
 
@@ -519,7 +526,7 @@ Per-widget detail views, in roughly the order they earn their keep:
     - **No separate "Open" button.** That was confusing in an earlier iteration — users expected "open" to show the historic state, not the live file. Click-the-row → snapshot preview is the only path; the live file is reached via the tree, search, or recently-modified.
     - **No separate "Rollback to before this" button.** That phrasing was confusing because the row IS the version (the content blob lives on the row), and "before this" implied off-by-one mental gymnastics. The `Restore this version` semantics are honest: what you click is what you get.
 
-    Restore writes the row's `content_at(id)` blob back to disk via `vault.write_file_checked`, then appends a new `'modified'` row stamped `metadata.restored_from = id`. Tauri command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, walks `previous_content_for_path`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same log primitives, see `changes.md` "Rollback".
+    Restore writes the row's `content_at(id)` blob back to disk via `vault.write_file_checked`, then appends a new `'modified'` row stamped `metadata.restored_from = id`. Command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, walks `previous_content_for_path`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same log primitives, see `changes.md` "Rollback".
 
     - **Filter pills — three independent toggles.** Default-all-on; state persists per-vault. Each toggle gates a distinct row population, so two-of-three off is a meaningful filter (e.g. "show only pending agent reviews"). The pills replace the earlier "author class + Pending" split — `Pending` is no longer a separate pill, the show-staging toggle owns that visibility. [vault-home-recent-activity-filter-pills]
         - **Show staging** — pending staging proposals (the rows that route to a review surface on click). Off → backend query switches `source` from `Merged` to `ChangesOnly`. Same icon family as the editor's agent-diff toggle; tooltip "Show pending agent reviews."

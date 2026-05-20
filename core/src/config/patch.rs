@@ -47,6 +47,18 @@ enum ValueType {
     /// `bge-m3` / `embedding-gemma-300m`. Used by `[indexing] model`.
     /// status: embedder-model-selectable
     EmbedderModel,
+    /// `#RRGGBB` or `#RRGGBBAA` hex color.
+    HexColor,
+    /// Minimap strip width in pixels: `16..=300`.
+    MinimapWidth,
+    /// Per-side bar padding: `0..=24`.
+    MinimapPad,
+    /// Bar corner radius: `0..=6`.
+    MinimapRadius,
+    /// Minimum bar width: `1..=12`.
+    MinimapMinBarWidth,
+    /// Bar vertical gap (tenths of a pixel): `0..=20`.
+    MinimapBarGap,
 }
 
 const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -55,9 +67,33 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.word_wrap",              ty: ValueType::Bool },
     EligibleKey { path: "editor.show_line_numbers",      ty: ValueType::Bool },
     EligibleKey { path: "editor.show_whitespace",        ty: ValueType::Bool },
+    EligibleKey { path: "editor.highlight_trailing_whitespace", ty: ValueType::Bool },
     EligibleKey { path: "editor.show_chunk_boundaries",  ty: ValueType::Bool },
     EligibleKey { path: "editor.hide_frontmatter",       ty: ValueType::Bool },
     EligibleKey { path: "editor.intraline_diff",         ty: ValueType::Bool },
+    EligibleKey { path: "editor.show_minimap",           ty: ValueType::Bool },
+    EligibleKey { path: "editor.minimap.width",                ty: ValueType::MinimapWidth },
+    EligibleKey { path: "editor.minimap.bar_padding_left",     ty: ValueType::MinimapPad },
+    EligibleKey { path: "editor.minimap.bar_padding_right",    ty: ValueType::MinimapPad },
+    EligibleKey { path: "editor.minimap.bar_corner_radius",    ty: ValueType::MinimapRadius },
+    EligibleKey { path: "editor.minimap.min_bar_width",        ty: ValueType::MinimapMinBarWidth },
+    EligibleKey { path: "editor.minimap.bar_gap_tenths",       ty: ValueType::MinimapBarGap },
+    EligibleKey { path: "editor.minimap.colored",              ty: ValueType::Bool },
+    EligibleKey { path: "editor.minimap.show_section_rules",   ty: ValueType::Bool },
+    EligibleKey { path: "editor.minimap.show_viewport",        ty: ValueType::Bool },
+    EligibleKey { path: "editor.minimap.show_left_edge",       ty: ValueType::Bool },
+    EligibleKey { path: "editor.minimap.color_heading",        ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_code",           ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_emphasis",       ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_quote",          ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_plain",          ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_background",     ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_section_rule",   ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_viewport",       ty: ValueType::HexColor },
+    EligibleKey { path: "editor.minimap.color_viewport_hover", ty: ValueType::HexColor },
+    EligibleKey { path: "editor.font_system",            ty: ValueType::String },
+    EligibleKey { path: "editor.font_editor",            ty: ValueType::String },
+    EligibleKey { path: "editor.font_code",              ty: ValueType::String },
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
@@ -229,6 +265,18 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
+fn is_hex_color(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if !matches!(bytes.first(), Some(b'#')) {
+        return false;
+    }
+    let hex = &bytes[1..];
+    if !(hex.len() == 6 || hex.len() == 8) {
+        return false;
+    }
+    hex.iter().all(|b| b.is_ascii_hexdigit())
+}
+
 pub(super) fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {
     let table = match scope {
         SettingsScope::User => ELIGIBLE_USER,
@@ -297,6 +345,27 @@ pub(super) fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Re
             matches!(s.as_str(), "all" | "lazy")
         }
         (ValueType::EmbedderModel, J::String(s)) => crate::embed::is_known_model(s),
+        (ValueType::HexColor, J::String(s)) => is_hex_color(s),
+        (ValueType::MinimapWidth, J::Number(n)) => n
+            .as_u64()
+            .map(|u| (16..=300).contains(&u))
+            .unwrap_or(false),
+        (ValueType::MinimapPad, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= 24)
+            .unwrap_or(false),
+        (ValueType::MinimapRadius, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= 6)
+            .unwrap_or(false),
+        (ValueType::MinimapMinBarWidth, J::Number(n)) => n
+            .as_u64()
+            .map(|u| (1..=12).contains(&u))
+            .unwrap_or(false),
+        (ValueType::MinimapBarGap, J::Number(n)) => n
+            .as_u64()
+            .map(|u| u <= 20)
+            .unwrap_or(false),
         _ => false,
     };
     if !ok {

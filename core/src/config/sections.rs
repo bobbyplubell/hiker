@@ -19,8 +19,6 @@ pub(super) fn no() -> bool {
 ///
 /// status: triage-review-required
 /// status: triage-staging-proposals
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuggestionsConfig {
@@ -32,8 +30,6 @@ pub struct SuggestionsConfig {
 /// gating, source-folder safety boundary, optional scheduled re-run.
 ///
 /// status: triage-review-required
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriageConfig {
@@ -91,8 +87,6 @@ fn default_triage_scope() -> String {
 /// staged a proposal. See `docs/settings.md` §`[staging]` config section.
 ///
 /// status: staging-config-section
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StagingConfig {
@@ -125,8 +119,6 @@ fn default_staging_retention_days() -> u32 {
 /// trail policy. See `docs/trails.md`.
 ///
 /// status: trails-default-location
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrailsConfig {
@@ -159,8 +151,6 @@ fn default_new_trail_dir() -> String {
 /// See `docs/acp.md`.
 ///
 /// status: llm-acp-client-optional
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpConfig {
@@ -175,8 +165,6 @@ pub struct AcpConfig {
 /// See `docs/task-queue.md`.
 ///
 /// status: task-queue-settings-section
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TasksConfig {
@@ -220,8 +208,6 @@ impl TasksConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerPreferenceCfg {
@@ -231,8 +217,6 @@ pub enum WorkerPreferenceCfg {
     External,
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectWorkerConfig {
@@ -251,8 +235,6 @@ impl Default for DirectWorkerConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseConfig {
@@ -292,8 +274,6 @@ fn default_lease_max_secs() -> u64 {
 /// `docs/llm.md` §`core::llm` and the v3.5 stub in `docs/settings.md`.
 ///
 /// status: llm-providers-config
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
@@ -334,8 +314,6 @@ impl Default for LlmConfig {
 /// features do.
 ///
 /// status: agent-write-review-mode
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmBackgroundConfig {
@@ -351,8 +329,6 @@ pub struct LlmBackgroundConfig {
 /// strings on `api_key_env` / `base_url` are treated as unset (the TOML
 /// auto-create writes the field even when blank, so the loader has to
 /// tolerate that case rather than aborting).
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProviderConfig {
@@ -394,8 +370,6 @@ impl Default for LlmProviderConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmLimitsConfig {
@@ -419,8 +393,6 @@ impl Default for LlmLimitsConfig {
 ///
 /// status: agent-iteration-cap-prompt
 /// status: agent-tool-call-timeout
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmAgentConfig {
@@ -439,8 +411,6 @@ impl Default for LlmAgentConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmAuditConfig {
@@ -480,8 +450,6 @@ fn default_tool_timeout_secs() -> u64 {
 /// recognized so users can enable/disable the server and tune top_k caps.
 ///
 /// status: mcp-config-section
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
@@ -523,8 +491,6 @@ impl Default for McpConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpToolsConfig {
@@ -618,8 +584,6 @@ impl Default for McpToolsConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpAuditConfig {
@@ -644,8 +608,6 @@ fn default_mcp_max_top_k() -> u32 {
 /// `[search]` section. Holds discovery-panel state: which backends run by
 /// default (mode toggles), and the per-section collapsed/expanded state
 /// inside the panel. Vault-scoped via `settings-write-back`.
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
@@ -665,8 +627,6 @@ pub struct SearchConfig {
 /// reach into the menu.
 ///
 /// status: search-lexical-options
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchLexicalConfig {
@@ -684,8 +644,6 @@ pub struct SearchLexicalConfig {
 /// options menu on the Semantic (brain) toggle.
 ///
 /// status: search-semantic-options
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchSemanticConfig {
@@ -721,8 +679,6 @@ fn default_semantic_top_k() -> u32 { 25 }
 /// Recency-bias weighting for the semantic engine. `Off` = no recency
 /// blend (default); `Mild` / `Strong` mix mtime rank into the score via
 /// the same RRF k=60 shape as cross-mode fusion (weights 0.5 / 1.0).
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecencyBias {
@@ -742,8 +698,6 @@ impl RecencyBias {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchModesConfig {
@@ -759,8 +713,6 @@ impl Default for SearchModesConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchSectionsConfig {
@@ -776,8 +728,6 @@ impl Default for SearchSectionsConfig {
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorConfig {
@@ -792,14 +742,33 @@ pub struct EditorConfig {
     #[serde(default = "no")]
     pub show_whitespace: bool,
     #[serde(default = "no")]
+    pub highlight_trailing_whitespace: bool,
+    #[serde(default = "no")]
     pub show_chunk_boundaries: bool,
     #[serde(default = "no")]
     pub hide_frontmatter: bool,
     // status: view-intraline-diff-toggle
     #[serde(default = "no")]
     pub intraline_diff: bool,
+    #[serde(default = "yes")]
+    pub show_minimap: bool,
+    #[serde(default)]
+    pub minimap: MinimapConfig,
     #[serde(default = "default_tab_size")]
     pub tab_size: u8,
+    /// System / chrome font. Used for non-editor UI text (toolbar,
+    /// sidebar, dialogs). Empty = use the egui default.
+    #[serde(default)]
+    pub font_system: String,
+    /// Editor body font. Used for the main prose in notes. Empty = use
+    /// the egui default monospace.
+    #[serde(default)]
+    pub font_editor: String,
+    /// Code font. Used for fenced code blocks, inline code, YAML
+    /// frontmatter, and any decoration that sets `monospace`. Empty =
+    /// use the egui default monospace.
+    #[serde(default)]
+    pub font_code: String,
 }
 
 impl Default for EditorConfig {
@@ -810,16 +779,124 @@ impl Default for EditorConfig {
             word_wrap: true,
             show_line_numbers: true,
             show_whitespace: false,
+            highlight_trailing_whitespace: false,
             show_chunk_boundaries: false,
             hide_frontmatter: false,
             intraline_diff: false,
+            show_minimap: true,
+            minimap: MinimapConfig::default(),
             tab_size: 2,
+            font_system: String::new(),
+            font_editor: String::new(),
+            font_code: String::new(),
         }
     }
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
+/// Visual + behavior knobs for the structural minimap strip rendered to
+/// the right of the editor body. All defaults match the unconfigured
+/// look so absence of `[editor.minimap]` in TOML produces the same
+/// minimap a fresh install would draw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MinimapConfig {
+    /// Strip width in pixels.
+    #[serde(default = "minimap_default_width")]
+    pub width: u16,
+    /// Left padding inside the strip before bars start.
+    #[serde(default = "minimap_default_pad")]
+    pub bar_padding_left: u16,
+    /// Right padding inside the strip after the longest bar.
+    #[serde(default = "minimap_default_pad")]
+    pub bar_padding_right: u16,
+    /// Corner radius applied to each bar.
+    #[serde(default = "minimap_default_radius")]
+    pub bar_corner_radius: u16,
+    /// Minimum bar width in pixels (very short lines get this).
+    #[serde(default = "minimap_default_min_bar_w")]
+    pub min_bar_width: u16,
+    /// Vertical sliver subtracted from each bar so neighbours don't blur.
+    /// Stored as tenths of a pixel; e.g. `5` = 0.5px.
+    #[serde(default = "minimap_default_bar_gap_tenths")]
+    pub bar_gap_tenths: u16,
+    /// Apply per-kind colors. When false the minimap renders every bar
+    /// in `color_plain` for a monochrome look.
+    #[serde(default = "yes")]
+    pub colored: bool,
+    /// Draw the faint horizontal rule above heading lines.
+    #[serde(default = "yes")]
+    pub show_section_rules: bool,
+    /// Draw the viewport thumb. Off = the minimap is a pure overview
+    /// with no scroll affordance.
+    #[serde(default = "yes")]
+    pub show_viewport: bool,
+    /// Draw the 1px gutter rule on the left edge of the strip.
+    #[serde(default = "yes")]
+    pub show_left_edge: bool,
+
+    /// Colors. Stored as `#RRGGBB` or `#RRGGBBAA`. Defaults match the
+    /// built-in palette tuned for both light and dark themes.
+    #[serde(default = "minimap_default_color_heading")]
+    pub color_heading: String,
+    #[serde(default = "minimap_default_color_code")]
+    pub color_code: String,
+    #[serde(default = "minimap_default_color_emphasis")]
+    pub color_emphasis: String,
+    #[serde(default = "minimap_default_color_quote")]
+    pub color_quote: String,
+    #[serde(default = "minimap_default_color_plain")]
+    pub color_plain: String,
+    #[serde(default = "minimap_default_color_background")]
+    pub color_background: String,
+    #[serde(default = "minimap_default_color_section_rule")]
+    pub color_section_rule: String,
+    #[serde(default = "minimap_default_color_viewport")]
+    pub color_viewport: String,
+    #[serde(default = "minimap_default_color_viewport_hover")]
+    pub color_viewport_hover: String,
+}
+
+fn minimap_default_width() -> u16 { 72 }
+fn minimap_default_pad() -> u16 { 5 }
+fn minimap_default_radius() -> u16 { 1 }
+fn minimap_default_min_bar_w() -> u16 { 2 }
+fn minimap_default_bar_gap_tenths() -> u16 { 5 }
+fn minimap_default_color_heading() -> String { "#3c7adc".into() }
+fn minimap_default_color_code() -> String { "#3c95c5".into() }
+fn minimap_default_color_emphasis() -> String { "#c98a3c".into() }
+fn minimap_default_color_quote() -> String { "#7a85a5".into() }
+fn minimap_default_color_plain() -> String { "#6a6f80".into() }
+fn minimap_default_color_background() -> String { "#00000014".into() }
+fn minimap_default_color_section_rule() -> String { "#0000001c".into() }
+fn minimap_default_color_viewport() -> String { "#3c64b41c".into() }
+fn minimap_default_color_viewport_hover() -> String { "#3c64b432".into() }
+
+impl Default for MinimapConfig {
+    fn default() -> Self {
+        Self {
+            width: minimap_default_width(),
+            bar_padding_left: minimap_default_pad(),
+            bar_padding_right: minimap_default_pad(),
+            bar_corner_radius: minimap_default_radius(),
+            min_bar_width: minimap_default_min_bar_w(),
+            bar_gap_tenths: minimap_default_bar_gap_tenths(),
+            colored: true,
+            show_section_rules: true,
+            show_viewport: true,
+            show_left_edge: true,
+            color_heading: minimap_default_color_heading(),
+            color_code: minimap_default_color_code(),
+            color_emphasis: minimap_default_color_emphasis(),
+            color_quote: minimap_default_color_quote(),
+            color_plain: minimap_default_color_plain(),
+            color_background: minimap_default_color_background(),
+            color_section_rule: minimap_default_color_section_rule(),
+            color_viewport: minimap_default_color_viewport(),
+            color_viewport_hover: minimap_default_color_viewport_hover(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
@@ -854,8 +931,6 @@ impl Default for IndexingConfig {
 /// Note-id stamping policy. See `docs/trails.md` §"Note ID stamping policy".
 ///
 /// status: note-id-stamping
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdStampingMode {
@@ -878,8 +953,6 @@ fn default_tab_size() -> u8 {
     2
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
@@ -962,8 +1035,6 @@ fn default_discovery_width() -> u32 {
     320
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeConfig {
@@ -971,8 +1042,6 @@ pub struct TreeConfig {
     pub sort_by: TreeSortBy,
 }
 
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreeSortBy {
@@ -985,8 +1054,6 @@ pub enum TreeSortBy {
 
 /// Active sidebar mode. Persisted per-vault under `vault.sidebar_mode`.
 /// status: sidebar-mode-switcher
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../ui/src/generatedTypes/"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarMode {

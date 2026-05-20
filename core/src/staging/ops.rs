@@ -281,7 +281,7 @@ impl Staging {
             Ok(conn.execute(
                 "DELETE FROM proposals WHERE created_at_ms < ?1",
                 params![cutoff],
-            )? as usize)
+            )?)
         })?;
         if removed > 0 {
             let _ = self.changed_tx.send(());

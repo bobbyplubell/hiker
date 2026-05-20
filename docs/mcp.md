@@ -17,7 +17,7 @@ The headline decisions:
 ## Architecture
 
 ```
-                   hiker UI process (Tauri)
+                   hiker UI process
                           │
        ┌──────────────────┼──────────────────┐
        │                  │                  │
@@ -34,7 +34,7 @@ The headline decisions:
    (writer connection in indexer task)
 ```
 
-`core::mcp` is started from `ui/src-tauri/src/lib.rs` on vault open with three handles:
+`core::mcp` is started from the host on vault open with three handles:
 - `IndexerHandle` (for write tools — routes through the same MPSC the UI uses).
 - A read `Store` clone (for read tools — shares the existing `read_store` pool from the arch cleanup).
 - The vault's `Vault` for path resolution + abs-path translation when needed.
@@ -48,7 +48,7 @@ v3 ships a deliberately small surface — three reads, three writes — covering
 
 ### Read tools
 
-- **`search_notes(query: string, modes?: SearchModes, top_k?: number)`** — wraps `core::search::query`. Returns `SearchResponse` per the existing `search-tauri-cmd` shape. Default top_k is the spec's `FUSED_TOP_K = 20`; agents can request smaller (1) or larger (up to a config-pinned cap, default 50). [mcp-tool-search-notes]
+- **`search_notes(query: string, modes?: SearchModes, top_k?: number)`** — wraps `core::search::query`. Returns `SearchResponse` per the existing `search-cmd` shape. Default top_k is the spec's `FUSED_TOP_K = 20`; agents can request smaller (1) or larger (up to a config-pinned cap, default 50). [mcp-tool-search-notes]
 - **`get_note(rel_path: string, detail?: 'digest'|'snippet'|'full')`** — fetch a single note. `digest` returns id + title + (when summary enrichment lands) cached summary. `snippet` returns top-1 chunk + heading_path. `full` returns the entire body. Default for explicit `get_note` calls is `full`; multi-hit search responses default to `digest`. [mcp-tool-get-note, mcp-progressive-disclosure]
 - **`related_notes(rel_path: string, top_k?: number)`** — wraps the existing `related-notes-query`. Returns the same `RelatedHit` shape the UI's related panel already consumes. [mcp-tool-related-notes]
 
@@ -158,7 +158,7 @@ until the user clicks refresh.
 Resolution: ride the existing `hiker:changes-appended` event. Every agent
 write already appends a `Changes` row tagged `author = "agent:<client-id>"`
 (per the audit-trail section below); the existing tokio bridge in
-`ui/src-tauri/src/lib.rs` re-emits each row as `hiker:changes-appended`,
+the host re-emits each row as `hiker:changes-appended`,
 which the home-page activity widget already consumes. The frontend's tree
 + buffer-reload code subscribes to the same event and applies the same
 post-mutation refresh it would for a watcher event — gated on

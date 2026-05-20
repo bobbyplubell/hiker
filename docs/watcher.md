@@ -1,6 +1,6 @@
 # Watcher
 
-Filesystem watcher that drives both the indexer and the editor's live-buffer drift detection. Built on the `notify` crate; runs in core, not in the Tauri layer. design.md names notify as the choice; this doc nails down event handling, debounce, ignored paths, and the dispatch path to frontend + indexer.
+Filesystem watcher that drives both the indexer and the editor's live-buffer drift detection. Built on the `notify` crate; runs in core, not in the host. design.md names notify as the choice; this doc nails down event handling, debounce, ignored paths, and the dispatch path to frontend + indexer.
 
 
 ## Scope
@@ -66,7 +66,7 @@ Indexer's own writes to `.hiker/index.db` would loop forever without the `.hiker
 Core exposes a broadcast channel (`tokio::sync::broadcast::channel<FileEvent>`) that anyone can subscribe to. Two subscribers in v1: [watcher-broadcast-channel]
 
 1. **Indexer task** — filters to `*.md` events, sends matching `IndexJob`s into its work queue. See index.md. [watcher-bridge-to-indexer]
-2. **Frontend bridge** — a Tauri command-layer task that subscribes and forwards events to the webview via `emit("hiker:file-changed", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. (Could filter server-side instead, but pushing all events keeps the bridge stateless and a future tree-view-refresh consumer can use the same stream without a second subscription.) [watcher-bridge-to-frontend]
+2. **Frontend bridge** — a host task that subscribes and forwards events to the app via `emit("hiker:file-changed", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. (Could filter server-side instead, but pushing all events keeps the bridge stateless and a future tree-view-refresh consumer can use the same stream without a second subscription.) [watcher-bridge-to-frontend]
 
 Event payload to frontend:
 
@@ -109,7 +109,7 @@ Non-markdown events are ignored by the v1 indexer; v2+ extractor types subscribe
 - **Vault close / swap** — drop the watcher (tokio task aborts when its handle drops), close the indexer's connection, flush any in-flight broadcast events.
 - **App shutdown** — same as close; no special teardown needed.
 
-The watcher handle lives in the `HikerCore` state struct (`tauri::State<Arc<HikerCore>>` per design.md:362). Vault-swap drops the old core and constructs a new one — clean separation, no risk of cross-vault event leakage.
+The watcher handle lives in the per-vault state held by the host. Vault-swap drops the old core and constructs a new one — clean separation, no risk of cross-vault event leakage.
 
 
 ## Failure modes

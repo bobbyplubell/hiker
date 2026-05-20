@@ -21,9 +21,9 @@
 //! `agent-tool-routing-via-mcp`) can plug in at the adapter layer without
 //! `core::agent` depending on the `mcp-server` crate.
 //!
-//! The Tauri command surface (`chat_send` / `chat_continue` / `chat_stop`
+//! The command surface (`chat_send` / `chat_continue` / `chat_stop`
 //! / `chat_cancel`) and the `Arc<Mutex<HashMap<TurnId, TurnState>>>` that
-//! addresses turns from outside live in the UI adapter — that's the
+//! addresses turns from outside live in the app layer — that's the
 //! `agent-chat-command-surface` slug.
 //
 // status: llm-basic-agent-loop
@@ -1198,7 +1198,7 @@ mod tests {
 
         let one = Arc::new(OneShot {
             inner: StreamingClient {
-                chunks: client.chunks.lock().unwrap().take().map(|c| c).into(),
+                chunks: client.chunks.lock().unwrap().take().into(),
                 terminal: Mutex::new(None),
             },
             second_terminal: Mutex::new(Some(ToolChatResponse {

@@ -122,10 +122,8 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
                     }
                 }
             }
-            Event::Text(t) | Event::Code(t) => {
-                if in_heading_text {
-                    current_heading_buf.push_str(&t);
-                }
+            Event::Text(t) | Event::Code(t) if in_heading_text => {
+                current_heading_buf.push_str(&t);
             }
             _ => {}
         }

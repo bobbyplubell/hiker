@@ -141,7 +141,7 @@ All host calls are message-shaped (JSON in / JSON out over a small set of WASM i
 
 ## UI extension: panels, buttons, status items, decorations
 
-The hard part. Plugins live in WASM and can't directly touch the DOM (hiker's UI is the Tauri webview running React/CodeMirror). Three viable patterns; **hiker should pick a declarative virtual-DOM model in v0** because it keeps the trust boundary clean and the API stable across UI tech changes.
+The hard part. Plugins live in WASM and can't directly touch the DOM (hiker's UI is the desktop app). Three viable patterns; **hiker should pick a declarative virtual-DOM model in v0** because it keeps the trust boundary clean and the API stable across UI tech changes.
 
 ### Declarative VDOM (recommended)
 

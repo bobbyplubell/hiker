@@ -25,8 +25,8 @@ fn vec_at(n: usize, dim: usize, base: f32) -> Vec<f32> {
     // Deterministic synthetic embeddings: each "cluster" lives near a
     // distinct corner of the unit hypercube so HDBSCAN separates them.
     let mut v = vec![0.0; dim];
-    for i in 0..dim {
-        v[i] = base + (n as f32) * 0.01 + (i as f32) * 0.001;
+    for (i, slot) in v.iter_mut().enumerate() {
+        *slot = base + (n as f32) * 0.01 + (i as f32) * 0.001;
     }
     v
 }
@@ -46,14 +46,12 @@ fn partition_separates_two_obvious_clusters() {
     let head_label = labels[0..10]
         .iter()
         .map(|a| a.cluster_label)
-        .filter(|&l| l != OUTLIER_LABEL)
-        .next()
+        .find(|&l| l != OUTLIER_LABEL)
         .expect("first half not all outliers");
     let tail_label = labels[10..20]
         .iter()
         .map(|a| a.cluster_label)
-        .filter(|&l| l != OUTLIER_LABEL)
-        .next()
+        .find(|&l| l != OUTLIER_LABEL)
         .expect("second half not all outliers");
     assert_ne!(head_label, tail_label, "two halves got the same cluster");
 }
@@ -250,7 +248,7 @@ fn build_tree_cluster_method_produces_levels_and_leaves() {
     // Top-down build: when there's >1 top-level cluster we add a
     // synthetic vault root at level 1, so the tree has 2 levels:
     // level 0 (leaf clusters) and level 1 (the synthetic root).
-    assert!(result.tree.levels.len() >= 1);
+    assert!(!result.tree.levels.is_empty());
     assert!(result.tree.levels[0].len() >= 2);
 }
 
@@ -383,6 +381,182 @@ fn partition_leiden_separates_two_obvious_clusters() {
 fn partition_leiden_rejects_empty() {
     let r = partition_leiden(&Vec::<Vec<f32>>::new(), &LeidenParams::default());
     assert!(matches!(r, Err(ClusterError::Empty)));
+}
+
+// ── Async streaming structural pass ──────────────────────────────────
+//
+// status: cluster-build-async-pass
+// status: cluster-build-progress-stream
+
+fn structural_streaming_fixture_notes() -> Vec<NoteInput> {
+    // Two well-separated direction-cluster groups so Leiden separates
+    // them. 6 each — comfortably above the default `leaf_min_size = 5`,
+    // so the build produces a non-trivial level-0 cluster set.
+    let mut notes: Vec<NoteInput> = Vec::new();
+    for i in 0..6 {
+        notes.push(NoteInput {
+            id: format!("a{i}"),
+            title: format!("a{i}"),
+            summary: String::new(),
+            folder: "research".into(),
+            embedding: {
+                let mut v = vec![0.0_f32; 8];
+                v[0] = 1.0;
+                v[1] = (i as f32) * 0.005;
+                v
+            },
+        });
+    }
+    for i in 0..6 {
+        notes.push(NoteInput {
+            id: format!("b{i}"),
+            title: format!("b{i}"),
+            summary: String::new(),
+            folder: "cooking".into(),
+            embedding: {
+                let mut v = vec![0.0_f32; 8];
+                v[1] = 1.0;
+                v[0] = (i as f32) * 0.005;
+                v
+            },
+        });
+    }
+    notes
+}
+
+#[tokio::test]
+async fn streaming_build_emits_phase_counters_clusters_and_done() {
+    let notes = structural_streaming_fixture_notes();
+    let params = ClusterParams {
+        algorithm: ClusterAlgorithm::Leiden,
+        min_cluster_size: 2,
+        disable_recursion: true,
+        ..Default::default()
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (handle, mut rx) = build_tree_structural_streaming(
+        BuildScope::Vault { source_types: Vec::new() },
+        BuildMethod::Cluster { params },
+        notes,
+        cancel,
+    );
+    let mut phases: Vec<Phase> = Vec::new();
+    let mut clusters_found: u32 = 0;
+    let mut got_done = false;
+    let mut got_cluster_discovered = false;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            BuildEvent::Phase { phase } => phases.push(phase),
+            BuildEvent::Counters { clusters_found: c, .. } => {
+                clusters_found = clusters_found.max(c);
+            }
+            BuildEvent::ClusterDiscovered { .. } => {
+                got_cluster_discovered = true;
+            }
+            BuildEvent::Done { tree } => {
+                got_done = true;
+                assert!(!tree.levels.is_empty(), "Done carries a non-empty tree");
+                break;
+            }
+            BuildEvent::Cancelled => panic!("unexpected Cancelled"),
+            BuildEvent::Failed { error } => panic!("unexpected Failed: {error}"),
+        }
+    }
+    handle.await.unwrap();
+    assert!(got_done, "stream terminated without Done");
+    assert!(got_cluster_discovered, "no ClusterDiscovered emitted");
+    assert!(clusters_found >= 2, "expected >= 2 clusters, got {clusters_found}");
+    // Both `LoadingEmbeddings` and at least one `PartitioningLevel` and
+    // `Finalizing` should appear.
+    assert!(phases.iter().any(|p| matches!(p, Phase::LoadingEmbeddings)));
+    assert!(phases.iter().any(|p| matches!(p, Phase::PartitioningLevel(_))));
+    assert!(phases.iter().any(|p| matches!(p, Phase::Finalizing)));
+}
+
+#[tokio::test]
+async fn streaming_build_respects_cancel_before_start() {
+    // Pre-flipped cancel atomic: the build should emit Cancelled on
+    // the first level-boundary check and never produce Done.
+    let notes = structural_streaming_fixture_notes();
+    let params = ClusterParams {
+        algorithm: ClusterAlgorithm::Leiden,
+        min_cluster_size: 2,
+        disable_recursion: true,
+        ..Default::default()
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (handle, mut rx) = build_tree_structural_streaming(
+        BuildScope::Vault { source_types: Vec::new() },
+        BuildMethod::Cluster { params },
+        notes,
+        cancel,
+    );
+    let mut got_cancelled = false;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            BuildEvent::Cancelled => {
+                got_cancelled = true;
+                break;
+            }
+            BuildEvent::Done { .. } => panic!("Done despite pre-set cancel"),
+            BuildEvent::Failed { error } => panic!("Failed despite cancel: {error}"),
+            _ => {}
+        }
+    }
+    handle.await.unwrap();
+    assert!(got_cancelled, "stream never emitted Cancelled");
+}
+
+#[tokio::test]
+async fn streaming_build_cluster_discovered_parent_link_is_consistent() {
+    // With recursion enabled the build emits ClusterDiscovered for
+    // every leaf and every branch. A child's `parent` should point at
+    // a ClusterId we eventually see in a subsequent ClusterDiscovered
+    // (or at the synthesized virtual root represented as None for
+    // top-level branches).
+    let notes = structural_streaming_fixture_notes();
+    let params = ClusterParams {
+        algorithm: ClusterAlgorithm::Leiden,
+        min_cluster_size: 2,
+        // Recurse so we get a branch + leaf mix.
+        disable_recursion: false,
+        leaf_min_size: 3,
+        leaf_cohesion_threshold: 0.0,
+        ..Default::default()
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (handle, mut rx) = build_tree_structural_streaming(
+        BuildScope::Vault { source_types: Vec::new() },
+        BuildMethod::Cluster { params },
+        notes,
+        cancel,
+    );
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut parents_seen: Vec<Option<String>> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            BuildEvent::ClusterDiscovered { node, parent } => {
+                // Child-first ordering: when a non-None parent is
+                // emitted on this event, we haven't necessarily seen
+                // it yet, but we WILL see it later. Record both.
+                seen_ids.insert(node.id.clone());
+                parents_seen.push(parent.clone());
+            }
+            BuildEvent::Done { .. } => break,
+            BuildEvent::Cancelled => panic!("unexpected Cancelled"),
+            BuildEvent::Failed { error } => panic!("unexpected Failed: {error}"),
+            _ => {}
+        }
+    }
+    handle.await.unwrap();
+    // Every non-None parent id must resolve to a cluster we saw on
+    // the stream — that's the contract consumers reconstruct on.
+    for parent in parents_seen.into_iter().flatten() {
+        assert!(
+            seen_ids.contains(&parent),
+            "ClusterDiscovered.parent {parent:?} never appeared as a node.id on the stream"
+        );
+    }
 }
 
 #[test]

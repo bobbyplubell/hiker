@@ -1,0 +1,31 @@
+[package]
+name = "egui_workbench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A configurable IDE-style workbench layout for egui — activity bar, dockable side panels, tabbed editor groups, bottom panel area, status bar. Built on egui_tiles."
+repository = "https://github.com/anthropics/hiker"
+keywords = ["egui", "gui", "workbench", "layout", "ide"]
+categories = ["gui"]
+
+[features]
+default = ["serde"]
+# Enable serde derives on all persistable types (WorkbenchLayout, TabState, etc.)
+# and egui_tiles' own serde feature so layouts round-trip through JSON.
+serde = ["dep:serde", "dep:serde_json", "egui_tiles/serde"]
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+egui_tiles.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tracing.workspace = true
+
+[dev-dependencies]
+egui.workspace = true
+egui_kittest.workspace = true
+egui-winit = { version = "0.32", features = ["accesskit"] }
+serde.workspace = true
+serde_json.workspace = true

@@ -239,7 +239,7 @@ pub(super) async fn handle_simple_job(
             handle_rename_job(ctx, store, from, to).await;
         }
         IndexJob::Move { from, to, reply } => {
-            // The Tauri layer suppresses the watcher around this; we don't
+            // The caller suppresses the watcher around this; we don't
             // need to here. Run vault::move_note on the indexer's owned
             // store so all writes flow through one connection.
             let result = crate::vault::move_note(vault, store, None, &from, &to);
@@ -283,7 +283,7 @@ pub(super) async fn handle_simple_job(
             let _ = reply.send(result);
         }
         IndexJob::DeleteNote { rel, reply } => {
-            // Same shape as Move — Tauri layer handles watcher suppression
+            // Same shape as Move — caller handles watcher suppression
             // around the call. The trash handle is cheap to construct
             // (just a path) so we build one per call rather than threading
             // it through the loop signature.
@@ -442,7 +442,7 @@ async fn handle_restore_from_trash(
         Ok(entry) => {
             // Re-ingest the restored .md files inline so the index
             // picks them up without waiting on watcher events
-            // (which the Tauri layer suppressed). For folders, walk
+            // (which the caller suppressed). For folders, walk
             // the manifest's recorded members; for files, just the
             // single original_path.
             let to_index: Vec<String> = match &entry.members {
@@ -586,7 +586,7 @@ async fn process_upsert(
         .unwrap_or(0);
     if size > MAX_FILE_BYTES {
         // Persist a Skipped row so the UI can mark this file across launches
-        // (per index.md `tauri-cmd-file-index-state`). Reason string is the
+        // (per index.md `cmd-file-index-state`). Reason string is the
         // exact human-readable text the tooltip / status bar will display.
         let reason = "file too large";
         store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
@@ -644,20 +644,6 @@ async fn process_upsert(
         return Ok(UpsertOutcome::Indexed);
     }
 
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let batch_size = texts.len();
-    let emb_clone = embedder.clone();
-    let embed_start = std::time::Instant::now();
-    let embeddings = tokio::task::spawn_blocking(move || emb_clone.embed_batch(&texts))
-        .await
-        .map_err(|e| IndexerError::Embed(EmbedError::Embed(e.to_string())))??;
-    tracing::debug!(
-        batch_size,
-        elapsed_ms = embed_start.elapsed().as_millis() as u64,
-        path = %rel_path,
-        "embedder: batch embedded",
-    );
-
     // bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids:
     // adopt the source's `hiker.id` from frontmatter when the indexer
     // has no `path_ids` row yet. Otherwise the case where a user-action
@@ -669,7 +655,44 @@ async fn process_upsert(
         None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
     };
     let indexed_at = now_secs();
-    let zipped: Vec<_> = chunks.into_iter().zip(embeddings.into_iter()).collect();
+
+    // status: trail-waypoints-derived-table
+    // Re-derive `trail_waypoints` rows for trail-docs and waypoint
+    // notes BEFORE we drop the file body — the parser needs the full
+    // contents, but afterwards we don't, and the body can be up to
+    // `MAX_FILE_BYTES` (5 MiB). Holding it alongside the chunks +
+    // embeddings dominates per-file memory; dropping it here halves
+    // the peak.
+    update_trail_waypoints_if_relevant(store, rel_path, &contents);
+    drop(contents);
+
+    // Embed in capped batches. The embedder library (fastembed/onnx)
+    // tokenizes the entire input batch into one tensor before running
+    // inference; a single 5 MiB file can yield 1000+ chunks, and
+    // embedding all of them at once allocates a tensor proportional to
+    // batch_size × max_seq_len × hidden_dim. Capping the batch bounds
+    // the embedder's transient memory regardless of file size.
+    const EMBED_BATCH_SIZE: usize = 16;
+    let chunk_count = chunks.len();
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunk_count);
+    let embed_start = std::time::Instant::now();
+    for batch in chunks.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+        let emb_clone = embedder.clone();
+        let batch_emb =
+            tokio::task::spawn_blocking(move || emb_clone.embed_batch(&texts))
+                .await
+                .map_err(|e| IndexerError::Embed(EmbedError::Embed(e.to_string())))??;
+        embeddings.extend(batch_emb);
+    }
+    tracing::debug!(
+        batch_size = chunk_count,
+        elapsed_ms = embed_start.elapsed().as_millis() as u64,
+        path = %rel_path,
+        "embedder: batch embedded",
+    );
+
+    let zipped: Vec<_> = chunks.into_iter().zip(embeddings).collect();
     store.upsert_note(NoteUpsert {
         id: &id,
         path: rel_path,
@@ -680,13 +703,6 @@ async fn process_upsert(
         embedder_version: embedder.version(),
         chunks: zipped,
     })?;
-
-    // status: trail-waypoints-derived-table
-    // After the standard notes/chunks upsert, also re-derive the
-    // `trail_waypoints` rows if this file is a trail-doc or waypoint.
-    // Parse failures here are soft errors (the file might be mid-edit) —
-    // warn-and-continue rather than failing the whole ingest.
-    update_trail_waypoints_if_relevant(store, rel_path, &contents);
 
     Ok(UpsertOutcome::Indexed)
 }

@@ -25,7 +25,7 @@ Cost is a slightly heavier dependency tree. Worth it; the next-step features (sp
 
 ## v1: subscriber setup
 
-Single `init_tracing(vault_root)` call from each binary's entry point (`ui/src-tauri`, `cli`, `mcp-server`). Two-layer subscriber:
+Single `init_tracing(vault_root)` call from each binary's entry point (`app`, `cli`, `mcp-server`). Two-layer subscriber:
 
 1. **Format layer (stderr)** — pretty-printed compact format. What you see while running the app in dev.
 2. **File layer (rolling)** — `tracing-appender` daily rotation in `vault/.hiker/logs/`, retained for 7 days. Same compact format. The vault is the right home for these (per-vault state, follows the user, gitignored by default). [obs-log-files] [obs-log-rotation]
@@ -60,7 +60,7 @@ Concretely, v1 adds events at:
 - **Indexer**: per-job decision points — file indexed (`info!(path, chunks)`), file skipped (`info!(path, reason)`), file errored (`error!(error = %e, path)`), full-scan summary (`info!(seen, queued, deleted)`).
 - **Embedder**: model load (`info!`), per-batch (`debug!(batch_size, elapsed_ms)`).
 - **Store**: schema migrations and slow queries (`warn!(query, elapsed_ms)` if elapsed > 100ms — cheap to add inline).
-- **Tauri commands**: errors only — emit on the `Err(...)` branch with `error!(error = %e, command = "<name>")`.
+- **Host commands**: errors only — emit on the `Err(...)` branch with `error!(error = %e, command = "<name>")`.
 
 That's enough to reconstruct any v1 failure from a tail of `hiker.log`. Span-based grouping ("everything that happened during job 42") is the upgrade path when this stops being enough.
 
@@ -115,7 +115,7 @@ Per-subsystem instrumentation slots already reserved:
 - **Embedder** — span on `embed_batch` with `batch_size` and elapsed; embedding is the dominant cost so its latency signal is worth pulling out. [obs-instrument-embed]
 - **Store** — slow-query log only (no span per SQL call); migrations at `info!`. [obs-instrument-store]
 - **Cluster / summarize** — top-level span on `hiker reconcile`; per-level child spans with `level`, `member_count`, `algorithm` fields. [obs-instrument-cluster]
-- **Tauri command boundary** — `#[instrument]` on every `#[tauri::command]` so each user action is one trace with everything done in service of it nested underneath. [obs-tauri-command-spans]
+- **Host command boundary** — `#[instrument]` on every host command so each user action is one trace with everything done in service of it nested underneath. [obs-command-spans]
 
 ### Env-var-driven filter [obs-env-filter]
 
@@ -123,12 +123,11 @@ Per-subsystem instrumentation slots already reserved:
 
 ### Frontend bridge [obs-frontend-bridge]
 
-The webview can't emit `tracing` events directly. A thin Tauri command pipes UI events into the same subscriber so `vault/.hiker/logs/hiker.log` becomes the unified log for both halves of the app. Promoted out of "wait for a real error" once a UI audit found dozens of `console.error` / silent-catch sites scattered across panels with no on-disk trail. Lands alongside the IPC-client refactor (`bug-tauri-invoke-scattered-no-ipc-client`) so per-call IPC errors are logged once at the wrapper, not at every panel.
+The webview can't emit `tracing` events directly. A thin host command pipes UI events into the same subscriber so `vault/.hiker/logs/hiker.log` becomes the unified log for both halves of the app. Promoted out of "wait for a real error" once a UI audit found dozens of `console.error` / silent-catch sites scattered across panels with no on-disk trail. Lands alongside the IPC-client refactor (`bug-invoke-scattered-no-ipc-client`) so per-call IPC errors are logged once at the wrapper, not at every panel.
 
-**Tauri command.** One command, fields-as-payload:
+**Command.** One command, fields-as-payload:
 
 ```rust
-#[tauri::command]
 fn log_from_frontend(
     level: String,        // "error" | "warn" | "info" | "debug" | "trace"
     target: String,       // dotted module path, e.g. "ui::tree"
@@ -158,7 +157,7 @@ export const Logger = {
 
 The wrapper also dual-writes to the devtools `console.<level>` so dev workflow doesn't change — devtools stay useful, the file just gains parity.
 
-**Migration target.** Every `console.error` / `alert(formatErr(...))` / silent `catch {}` in `ui/src/**` migrates to `Logger.error(...)`. The IPC client (`bug-tauri-invoke-scattered-no-ipc-client`) catches every `invoke` error once and routes through `Logger.error("ui::ipc", "<command> failed", { err, command })` — that single site replaces dozens of per-panel try/catches.
+**Migration target.** Every `console.error` / `alert(formatErr(...))` / silent `catch {}` in `ui/src/**` migrates to `Logger.error(...)`. The IPC client (`bug-invoke-scattered-no-ipc-client`) catches every `invoke` error once and routes through `Logger.error("ui::ipc", "<command> failed", { err, command })` — that single site replaces dozens of per-panel try/catches.
 
 **Levels by site type:**
 
@@ -173,8 +172,8 @@ The wrapper also dual-writes to the devtools `console.<level>` so dev workflow d
 
 Three-piece feature for browsing logs without leaving the app:
 
-- **Broadcast layer** — custom `tracing-subscriber` layer fans every formatted event into a `tokio::sync::broadcast` channel; Tauri side subscribes and emits each as `hiker:log-event`. [obs-log-tauri-channel]
-- **Ring buffer** — same layer keeps the most recent N events (default 2000) in a server-side `VecDeque` so the viewer has history when it opens mid-session; `get_log_buffer(filter) -> Vec<LogEvent>` Tauri command returns the snapshot. [obs-log-ring-buffer]
+- **Broadcast layer** — custom `tracing-subscriber` layer fans every formatted event into a `tokio::sync::broadcast` channel; the host subscribes and emits each as `hiker:log-event`. [obs-log-channel]
+- **Ring buffer** — same layer keeps the most recent N events (default 2000) in a server-side `VecDeque` so the viewer has history when it opens mid-session; `get_log_buffer(filter) -> Vec<LogEvent>` command returns the snapshot. [obs-log-ring-buffer]
 - **Viewer panel** — collapsible UI panel showing the live event stream. Per-row: timestamp, level, module, message, expandable fields. Top bar: level filter, free-text filter, pause/resume, "open log file" button. Filter is client-side only. [obs-log-viewer-panel]
 
 The vault `.hiker/logs/` directory is fine to read with `less` / `rg` for now; the viewer is a convenience, not a necessity.

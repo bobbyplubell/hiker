@@ -123,7 +123,7 @@ This is the original spec shape, used by MCP agent rollback (`mcp.md`): "an agen
 5. A new `'modified'` row is appended with `metadata.rolled_back_from: X`.
 ```
 
-This is the right framing when the consumer is reasoning about *changes* — "the agent did this thing, undo it, the user shouldn't have to look at versions." Tauri command: `rollback_change`.
+This is the right framing when the consumer is reasoning about *changes* — "the agent did this thing, undo it, the user shouldn't have to look at versions." Command: `rollback_change`.
 
 ### Flavor 2: restore-this-snapshot (version-list-shaped)
 
@@ -137,7 +137,7 @@ This is the home-page recent-activity widget shape: "each row is a saved version
 5. A new `'modified'` row is appended with `metadata.restored_from: X`.
 ```
 
-This is the right framing when the consumer is reasoning about *versions* — "I edited the file three times; show me each version and let me pick one." Tauri command: `restore_snapshot`.
+This is the right framing when the consumer is reasoning about *versions* — "I edited the file three times; show me each version and let me pick one." Command: `restore_snapshot`.
 
 The two share everything: same primitives, same append-only discipline, same rows in the same log. They only differ in *which row's content* gets written back — `previous_content_for_path` walks one step earlier, `content_at` reads the row itself.
 
@@ -163,7 +163,7 @@ Every row in the trace is structurally identical to every other row. Restores ar
 
 ### Baseline-on-first-mutation
 
-A practical edge case: a vault file that pre-dates the changelog has no prior row. Saving it appends one row (the save itself); rolling back from that row finds no prior content. To make first-rollback work, the save path lazy-snapshots the *pre-write* content as a `'created'` row tagged `metadata.baseline = true` whenever the path has no rows yet. `Changes::ensure_baseline` on the core side; called from the Tauri write paths. Idempotent — once any row exists for the path, the call no-ops. [changes-baseline-on-first-mutation]
+A practical edge case: a vault file that pre-dates the changelog has no prior row. Saving it appends one row (the save itself); rolling back from that row finds no prior content. To make first-rollback work, the save path lazy-snapshots the *pre-write* content as a `'created'` row tagged `metadata.baseline = true` whenever the path has no rows yet. `Changes::ensure_baseline` on the core side; called from the host write paths. Idempotent — once any row exists for the path, the call no-ops. [changes-baseline-on-first-mutation]
 
 
 ## Retention
@@ -306,7 +306,7 @@ pub struct ActivityFilter {
 
 `ActivitySource::Merged` runs both underlying queries with the same effective limit, then merges by timestamp and truncates. The two source-only variants short-circuit to the existing `Changes::recent` / `Staging::list` paths and wrap each row in the unified envelope — no behavior change for surfaces that ask for a single source. [activity-feed-merged-query]
 
-Tauri surface: a single `activity_list` command takes `ActivityFilter`; `activity_list_for_path` is the per-buffer variant the status-bar dropdown consumes. The pre-existing `recent_changes` / `staging_list` Tauri commands stay (they're cheaper and used by surfaces that genuinely want only one side), but the activity detail page migrates to `activity_list` so its merge-and-render code shrinks to a flat map.
+Host surface: a single `activity_list` command takes `ActivityFilter`; `activity_list_for_path` is the per-buffer variant the status-bar dropdown consumes. The pre-existing `recent_changes` / `staging_list` commands stay (they're cheaper and used by surfaces that genuinely want only one side), but the activity detail page migrates to `activity_list` so its merge-and-render code shrinks to a flat map.
 
 ### Consumers
 

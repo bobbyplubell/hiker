@@ -17,4 +17,16 @@ impl Staging {
         // proposal counts are small and the filter shape is identical.
         Ok(self.list(filter)?.len() as u32)
     }
+
+    /// Convenience: every proposal still in the applyable state. Wraps
+    /// `list` with the canonical filter so callers don't have to know
+    /// the `state: Some(ProposalState::Applyable)` shape. Conflicted
+    /// proposals are surfaced separately by `list_conflicted`.
+    pub fn list_pending(&self) -> Result<Vec<Proposal>, StagingError> {
+        let filter = StagingFilter {
+            state: Some(crate::staging::ProposalState::Applyable),
+            ..Default::default()
+        };
+        self.list(&filter)
+    }
 }

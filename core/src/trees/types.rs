@@ -191,7 +191,7 @@ pub struct SplitOutcome {
     pub new_clusters: Vec<NodeId>,
     pub total_levels: u8,
     /// Note ids that landed in the OUTLIER bucket at any branch of the
-    /// recursive split. The caller (Tauri command) decides whether to
+    /// recursive split. The caller decides whether to
     /// route these into the tree's outlier bucket or surface them to
     /// the user — `split_cluster` itself doesn't touch outlier nodes.
     pub outliers: Vec<NoteId>,
@@ -237,8 +237,8 @@ fn default_summarize_recursive() -> bool {
     true
 }
 
-/// Submission plan returned by `Trees::plan_summarize_sweep`. The Tauri
-/// command consumes this and performs the actual queue submission (the
+/// Submission plan returned by `Trees::plan_summarize_sweep`. The
+/// caller consumes this and performs the actual queue submission (the
 /// queue API is async; `Trees` stays sync per module discipline).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizePlan {

@@ -20,28 +20,14 @@ Sanity notes:
 
 ## Target stack
 
-Build a Reor-like personal notes + knowledge system, in Rust.
+A Reor-like personal notes + knowledge system, all-Rust.
 
-- UI shell: Tauri (Rust backend, web frontend) — much smaller binaries than Electron, single mostly-static binary
-- Editor: CodeMirror 6 in the webview, @codemirror/lang-markdown, live preview via decorations
-    - Alternative if I want full WYSIWYG: Milkdown (ProseMirror-based, round-trips clean markdown)
-- Frontend framework: deferred. Prototype v0 with vanilla TS; pick React / Svelte / Solid later only after feeling the pain in v0. Avoids guessing before contact with the actual editor surface.
+- UI shell: **egui** via eframe. Single native binary; no webview.
+- Editor: in-tree widget under `editor/` — `editor-core` (rope, `EditorState`, `Selection`, `Transaction`, `Decoration`/`DecorationSet`), `editor-view` (commands, decoration providers, `ViewState`, completion source trait), `editor-egui` (input translation + painter), `editor-diff` (read-only unified-diff view), `editor-md` (markdown indent; live-preview decorations live in `app/`).
 
-Live preview approach (CM6):
+Live preview: per-frame decoration providers in `app/src/panels/buffer.rs` produce `DecorationSet` layers fingerprint-cached on `(doc_id, selection, folds, viewport, theme)`. Decoration kinds: `Mark`, `Line`, `Replace { display }`, `Block`, `Widget`. The markdown provider walks the buffer with `pulldown-cmark`; `Replace` fades syntax markers, `Mark`/`Line` styles content, and a decoration is suppressed when its line overlaps a selection so clicking in reveals raw markers. Widgets handle images, math, wikilink pills, callouts.
 
-- Walk the markdown syntax tree (from @lezer/markdown) via a ViewPlugin that emits decorations.
-- Replace decorations hide syntax markers (e.g. `**`, `[`, `]`, `(url)`) and render styled output.
-- Mark/Line decorations style the surrounding content (bold, headings, blockquotes).
-- Cursor-on-line gating: only hide markers on lines that don't currently contain the cursor or selection. When you click into a heading/bold/link, its raw syntax reappears so you can edit it; when you click out, the syntax hides again. Same trick Obsidian's Live Preview uses.
-- Widgets for non-text rendered elements: image previews, math (KaTeX), embedded note transclusions, callouts.
-
-Wikilink support:
-
-- Extend the markdown parser via @lezer/markdown's API to add a `WikiLink` node recognizing `[[id]]` / `[[id|display]]` syntax.
-- Decorations render the wikilink as a styled pill with the resolved title.
-- Click handler resolves the id (via core's path → ulid lookup) and opens the target note.
-- Autocomplete source pulls from the indexer to suggest existing notes as you type `[[`.
-- **Incoming links surfaced somewhere visible.** When viewing note A, the user should be able to see every note that wikilinks *to* A — backlinks aren't useful as a hidden index, only as a surfaced retrieval. Natural home is the discovery panel (`search.md`), as a section alongside Search results / Related notes / etc.; the panel was designed to absorb new retrieval surfaces of this shape. Backlink resolution rides the structural index axis from `design.md`'s index-types list (which already names "graph of links" as a tracked structural signal); when wikilinks become a real feature, the backlink section in the discovery panel becomes one of its consumers.
+Wikilinks: the markdown decoration provider emits a widget for `[[id]]` / `[[id|display]]`; click resolves via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`).
 
 Other components:
 
@@ -54,16 +40,22 @@ Other components:
 - Ingestion sidecars: docling/marker for PDFs, tesseract for images, whisper.cpp for audio — each produces a sidecar .md alongside the original
 
 
-## Crate layout (initial sketch)
+## Crate layout
 
 ```
-core/       vault model, chunker, indexer, search, extractors — pure library, no frontend deps, no tauri imports
-cli/        clap-based CLI, calls core
-mcp-server/ rmcp adapter, calls core
-ui/         Tauri + CM6 frontend, thin command wrappers calling core
+core/             vault model, chunker, indexer, search, extractors, agent, llm, mcp handler, staging, sessions, trees, autosave, changes — pure library, no UI deps
+cli/              clap-based CLI, calls core
+mcp-server/       rmcp adapter, calls core (and reuses core::mcp::HikerHandler for in-process MCP)
+app/              egui desktop app. Owns tabs, panels, sidebar, toolbar, chat, settings, modals. Holds long-lived subsystems (vault, indexer, watcher, autosave, changes, staging, trees, chat, mcp) on AppState and pumps mpsc channels each frame.
+editor/
+  editor-core/    rope, EditorState, decoration model, selection, transactions — pure data
+  editor-view/    commands, decoration providers, completion source trait, search, multi-cursor — platform-agnostic
+  editor-egui/    the egui widget: input translation, painter-based rendering
+  editor-diff/    PreviewBuffer + unified-diff renderer reusing the widget surface
+  editor-md/      markdown indent provider (live-preview decorations live in app/)
 ```
 
-Discipline: core has zero knowledge of Tauri, CLI, or MCP. Each frontend is an adapter over the same core API. Tauri commands are 5–15 lines (parse args, call core, return DTO). If logic creeps into a `#[tauri::command]` function, move it to core.
+Discipline: `core/` has no UI deps. `editor-*/` knows nothing of `core` or `app` — reusable, could be lifted out. `app/` glues them: it's where multi-subsystem coordination (open buffer, resolve wikilink, run mutation, accept proposal) lives. Panel renderers stay thin — read `AppState`, fold pending channel events, draw, route mutations back into subsystem APIs.
 
 
 ## Vault layout
@@ -356,28 +348,59 @@ Generative LLM access lives in `core::llm` (built on the [`llm`](https://crates.
 Full spec in [`llm.md`](llm.md). Anywhere `design.md` mentions an LLM-driven feature (vision OCR, auto-tag, summary, cluster naming, RAG chat, etc.), the implementation flows through the path described there.
 
 
-## IPC and architecture
+## Architecture
 
-Three-layer stack:
+Two layers, in-process, no IPC:
 
-- Frontend (TS, CM6) — UI state, editor, rendering. Never touches the filesystem. Never does heavy work.
-- Tauri command layer (Rust, thin) — parses args, calls core, translates errors. 5–15 lines per command.
-- Core crate (Rust) — vault model, indexer, search, extractors. No tauri imports.
+- **`app/`** — owns the UI tree and `AppState`, which holds `Arc` handles to every long-lived subsystem (vault, indexer, watcher, autosave, changes, staging, trees, chat, mcp).
+- **`core/`** — vault, indexer, search, extractors, agent, LLM, in-process MCP handler. No UI deps.
 
-Communication paths:
+Communication: direct function calls (panels take `&mut AppState` and call subsystem APIs), `tokio::sync::mpsc` channels for async events drained each frame, `Mutex`/`RwLock` for the few cross-thread subsystems (held briefly, never across `.await`). Channels follow one pattern across `fs_events`, `indexer_events`, `mutation_events`, and `ChatRegistry::rx`: a tokio task posts, the frame loop drains with `try_recv`, state mutates before rendering.
 
-- `invoke()`/command — request/response for user-triggered operations (open file, save, search, list folder, related)
-- emit/listen — push events from Rust to frontend (file changed, indexing progress, ingestion finished). Namespace event names: `hiker:file-changed`, `hiker:reindex-progress`
-- channels — typed streaming for long-running ops (streaming search results, reindex progress, RAG chat tokens)
-- State — long-lived handles (HikerCore, indexer, db connections) in `tauri::State<Arc<HikerCore>>`; initialized at startup, accessed by every command
+Rules: all filesystem access goes through `core::vault::Vault` so the watcher stays authoritative and drift checks remain meaningful. Errors are typed enums (`HikerError`, `StoreError`, `StagingError`, …) matched per-variant by panels and routed to toasts or modals. No DTO layer — `core` types are consumed directly. Indexer is in-process; daemonization stays a future option.
 
-Rules:
+### App shell
 
-- Frontend never reads the filesystem directly — all I/O via core through commands. Keeps watcher authoritative, security model meaningful, and lets backend swap (remote / sync) without frontend changes.
-- Errors as a typed enum (HikerError) with serde, not strings. Frontend dispatches on error.kind.
-- DTOs for wire types — Tauri commands return Serialize-derived DTOs deliberately separate from internal types. Internal types may carry Arc, PathBuf, watcher handles, etc.; DTOs are flat, JSON-friendly, and frontend-shaped.
-- Auto-generate TS types from DTOs via ts-rs or specta. No manual TS/Rust type duplication.
-- Indexer runs in-process inside Tauri for v0/v1. Daemonizing as a separate OS process (so CLI/MCP/UI share one indexer) is a later option — core supports it without rework, but premature for now.
+Single window, fixed layout:
+
+- **Top strip** (`toolbar.rs`) — nav buttons, singleton-tab icons (Home / Queue / Index / Settings / Graph / Patch-review / Agent-changes / Plugins) with live count badges on Queue + Patch-review, new-chat quick button, vault picker + label (right-click → set as default), sidebar / discovery toggles, and the **tab strip** inline. `▾` overflow button reveals all open tabs.
+- **Sidebar** (`sidebar/`) — three modes via switcher: **Files** (tree, rename, dnd, index-state markers), **Clusters** (tree picker, multi-select stage-moves / stage-tags, undo/redo, graph view), **Trails** (active-trail picker, side-trail tree, orphan badges, remove / append-from-here). Trash pinned at the bottom. `…` actions menu has Refresh + Sort by.
+- **Discovery panel** (`panels/discovery.rs`) — search box, results (grouped by note, `<mark>` highlights), related notes, backlinks. All toggles + per-mode options + Limit/Types/Order filters live in a right-click menu on the 🔍 icon. Collapsible chat dock at the bottom.
+- **Central pane** — tab body dispatched by `tabs::body` from the active `TabKind`.
+
+### Tab kinds
+
+`TabKind` (in `app/src/tab.rs`) dispatches on the central pane; renderers live under `panels/`. Singletons (Home, Queue, Settings, Graph, PatchReview, Plugins, IndexerDetail, AgentChanges) open-or-focus via `toolbar::open_singleton_tab`.
+
+- `Buffer { path }` — editor widget. Chrome (version dropdown, diff-vs-disk, view-options wrench, wand-menu) and status bar in `panels/buffer.rs`.
+- `BufferDiff { path }`, `SnapshotPreview`, `StagingPreview`, `TrashPreview` — read-only review surfaces over the same widget. StagingPreview includes per-hunk review (line numbers, ±2 lines context, partial-apply via byte-range splice).
+- `Home` / `HomeDetail { which }` — vault summary, activity feed with rollback verb, snapshots, per-path history.
+- `Queue` / `QueueDetail { task_id }` — task queue with state filter pills, leased-row pulse, worker controls.
+- `IndexerDetail` — model id, status, reindex, progress log with filter pills.
+- `Settings` — scope-aware form (Refresh / Open / Reveal / Reset-to-defaults), raw-TOML fallback.
+- `Properties { path }` — disk + indexer metadata + trails / clusters membership.
+- `Graph` — vault-wide note-link force-directed graph (`petgraph` + painter).
+- `ClusterReview { config_json }` — preview-then-persist build flow.
+- `ClusterGraph { tree_id }` — radial dendrogram (color-by-policy, size-by-members, staleness tint).
+- `PatchReview` — staging proposal list with bulk + per-row accept/reject.
+- `Agent { session_id }` / `AgentChanges` — full-tab chat / agent activity feed.
+- `Plugins` — manifest viewer for `<vault>/.hiker/plugins.json`. No host runtime — manifest edits only.
+
+Buffer tabs autosave per vault path; singleton page-kinds persist via a synthetic `:<kind>` key. `bootstrap::restore_tab_state` rehydrates both on vault open; payload-bearing previews (Trash/Snapshot/Staging) drop silently.
+
+### Frame loop
+
+`app/src/main.rs::App::update` each frame:
+
+1. Enter tokio runtime guard.
+2. If `pending_vault_switch` is set, re-bootstrap and return.
+3. Run window-level keybinds before panels see input; clear `swipe_skip_rects`.
+4. Drain mpsc channels: `fs_events` (watcher → cache invalidations + clean-buffer reloads), `indexer_events` (→ ring buffer), `mutation_events` (→ buffer body + toasts), `chat::state::pump_events` (→ active session).
+5. Tick autosave every ~5s.
+6. `request_repaint_after(750ms)` to keep status / animations alive without input.
+7. Render: titlebar → toolbar → tab strip → sidebar → discovery → central body → modal → toasts.
+
+State only mutates inside the frame loop or via channel events folded by it.
 
 
 ## MCP surface
@@ -420,7 +443,7 @@ Streaming: Long-running operations (large reindex, scrape refresh) expose progre
 
 ## Build order
 
-- v0 — Tauri shell + CM6 editor + folder view. Open vault, list tree, click file → CM6 opens, save on Ctrl/Cmd-S. Markdown syntax styling via @codemirror/lang-markdown. No watcher, no index, no search yet. Hold the core/UI separation discipline from day one.
+- v0 — egui shell + in-tree editor widget + folder view. Open vault, list tree, click file → buffer opens in a tab, save on Ctrl/Cmd-S. Markdown syntax styling via `editor-md` + the live-preview decoration provider in `app/`. No watcher, no index, no search yet. Hold the core/UI separation discipline from day one.
 - v1 — notify watcher + sqlite-vec or LanceDB index of chunks + "related notes" panel for the open file.
 - v2 — search bar (hybrid lexical + semantic).
 - v3 — MCP server adapter over the same core, exposing search and related to agents.

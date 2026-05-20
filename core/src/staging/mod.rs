@@ -5,7 +5,7 @@
 //! `proposals` table. Body content lives in a zstd-compressed BLOB column
 //! (same encoding as `core::changes`). Module discipline mirrors
 //! `core::changes` and `core::store` — all SQLite + filesystem access
-//! confined here, no Tauri imports, narrow public API.
+//! confined here, no host imports, narrow public API.
 //
 // status: staging-dir
 // status: staging-sqlite-store

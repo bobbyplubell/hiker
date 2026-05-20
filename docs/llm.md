@@ -17,7 +17,7 @@ The headline decisions:
 ## Architecture
 
 ```
-                   hiker UI (Tauri)
+                   hiker UI
                           ↓
        ┌──────────────────┼──────────────────┐
        │                  │                  │
@@ -219,7 +219,7 @@ Deeper transcript chrome (tool-call confirmations, embedded-resource context car
 
 Affordances pinned here so both backends render the same thing.
 
-- **Stop button while a turn is in flight.** The send affordance flips to a Stop button as soon as `chat_send` (or `chat_continue`) returns — visible for the whole busy period, not just at the iteration-cap pause. Click invokes `chat_stop(turn_id)` and the panel falls back to the idle send state on the next `TurnFinished`. Same Tauri command the cap-hit row's Stop already calls (`agent-chat-command-surface`); the difference is surfacing it as the always-on busy-state affordance rather than only at the cap. Cancel-vs-stop semantics from the command surface stand: this is Stop (preserves streamed transcript, finish reason `user_halted`), not Cancel — the harsher mid-stream abort stays an internal affordance for now (e.g., closing the panel mid-turn). [chat-panel-stop-button]
+- **Stop button while a turn is in flight.** The send affordance flips to a Stop button as soon as `chat_send` (or `chat_continue`) returns — visible for the whole busy period, not just at the iteration-cap pause. Click invokes `chat_stop(turn_id)` and the panel falls back to the idle send state on the next `TurnFinished`. Same command the cap-hit row's Stop already calls (`agent-chat-command-surface`); the difference is surfacing it as the always-on busy-state affordance rather than only at the cap. Cancel-vs-stop semantics from the command surface stand: this is Stop (preserves streamed transcript, finish reason `user_halted`), not Cancel — the harsher mid-stream abort stays an internal affordance for now (e.g., closing the panel mid-turn). [chat-panel-stop-button]
 - **Thinking indicator between user turn and first agent event.** From the moment `chat_send` is invoked until the first `TextDelta` or `ToolCallStart` event arrives for the same `turn_id`, the panel shows a small inline indicator in the would-be assistant bubble — a labeled spinner ("Thinking…"). The indicator is tied to the absence of streamed content for the active turn, not to a timer: it disappears the instant any content arrives, and reappears between steps if a tool result comes back and the model goes quiet again before the next `TextDelta`. Cap-hit rows and tool-call cards are content for this purpose — a visible tool card displaces the indicator. [chat-panel-thinking-indicator]
 - **Agent messages render as markdown.** Assistant text bubbles render as markdown (headings, lists, inline code, fenced code blocks, links, emphasis). User messages stay plain text — what the user typed is what shows. Streaming text deltas append into a markdown-rendered buffer; the bubble re-renders on each delta against the accumulated text rather than diffing tokens, which is fine at chat-bubble sizes. Sanitize: no raw HTML pass-through, no `javascript:` links, no embedded scripts — the markdown renderer's safe mode is the contract. Code blocks get a language hint when fenced; syntax highlighting itself is deferred. The same shape applies to ACP-emitted text. [chat-panel-markdown-render]
 - **Agent-emitted note links are clickable and open the note in the editor.** When the markdown renderer encounters a link whose target resolves to a vault-relative note path (either a bare relative path like `subdir/foo.md`, or a `hiker://note/<rel-path>` URL — the latter unambiguous, the former resolved against the vault root), it renders as an in-app link that opens the note in the editor pane on click rather than opening an external browser. Non-vault links (http(s), file://) keep their normal browser-open behavior. The system prompt advertises the `hiker://note/<rel-path>` form as the canonical way for the agent to reference a note, so model output gravitates toward unambiguous links rather than bare relative paths. Hover shows the resolved absolute path; click respects the same dirty-buffer guard the file tree uses (`file-switch-guard-dirty`). [chat-panel-note-link-render]
@@ -235,7 +235,7 @@ The headline decisions:
 - **Retry button on each user message bubble.** A small icon-button (circular-arrow glyph) in the user message's right-side affordance cluster, visible on hover or always-on per the panel's existing message-action styling. Click rolls the session back to *immediately before* that user message and starts a new turn from the same text. Tooltip "Retry from here." Disabled while another turn is in flight for the session — retry is mutually exclusive with an active turn. [chat-retry-from-user-message]
 - **Truncates the in-memory session and the on-disk markdown.** Retry is a destructive history operation, not a branch: every turn at or after the retried user message is removed from the session's `SessionState` and the markdown file is rewritten to match (per `chat-session-markdown-store`'s "markdown is the source of truth" rule). A single `core::changes` row is appended to the session note covering the truncation. No "previous attempts" archive in v1 — the user opted to throw the prior outcome away; keeping a hidden branch tree complicates the resume-on-open flow for marginal gain. Branching is reserved as a future affordance (`chat-retry-branches-session`, deferred). [chat-retry-truncates-session-history]
 - **Resends the original user message verbatim.** The retried turn carries the exact text of the original user message, including any `@`-mentions; context blocks are re-resolved at submit time the same way a fresh `chat_send` would resolve them (the active note re-injects per `chat-active-note-context-injection`; `@<note-path>` mentions re-read the current file contents; `@selection` errors if the selection no longer exists). The user message is *not* prefilled into the input box for editing — that's a separate affordance ("Edit and resend," deferred as `chat-edit-and-resend`); Retry is the one-click "same prompt, redo it" path. [chat-retry-resubmits-verbatim]
-- **Tauri command + event surface.** New `chat_retry(session_id, user_message_id) -> Result<TurnId>` on the command surface (per `agent-chat-command-surface`). Implementation: truncate session state + markdown file → emit a synthetic `TurnStarted` for the new turn id → invoke the same turn-driver as `chat_send`. The frontend's existing event handling for the new `turn_id` covers the rest (streaming, tool-call cards, stop button, cap-hit row). Confirmation modal not required — the retry-discards-future-turns invariant is obvious from the UI's roll-back animation (the disappearing tail). [chat-retry-command]
+- **Command + event surface.** New `chat_retry(session_id, user_message_id) -> Result<TurnId>` on the command surface (per `agent-chat-command-surface`). Implementation: truncate session state + markdown file → emit a synthetic `TurnStarted` for the new turn id → invoke the same turn-driver as `chat_send`. The frontend's existing event handling for the new `turn_id` covers the rest (streaming, tool-call cards, stop button, cap-hit row). Confirmation modal not required — the retry-discards-future-turns invariant is obvious from the UI's roll-back animation (the disappearing tail). [chat-retry-command]
 - **Available on both backends.** The basic agent loop owns the truncate-and-rerun path directly. The ACP path (`core::acp`) maps retry onto its protocol equivalent: end the current `session/prompt` line and start a new one with the truncated history; if the configured ACP agent doesn't model history truncation natively, hiker falls back to spawning a fresh ACP session seeded with the pre-retry turns. [chat-retry-acp]
 
 Out of scope for the v1 of this feature:
@@ -267,7 +267,7 @@ Triggered when the user types `@` after whitespace (or at the start of the input
 - **Inside fenced code blocks or escaped with `\@`** — the trigger is suppressed. `\@selection` in the input stays literal in the user message and isn't parsed as a mention.
 - **Backspace into the token** treats the `@<path>` as a single unit — one backspace deletes the whole token. Cursor-arrow into the token treats it as text. Same shape as how Slack / Discord handle mention chips, just rendered as plain text rather than as a chip in v1 (chip rendering deferred to keep the input shape simple).
 
-Autocomplete data source: a Tauri command `chat_at_autocomplete(prefix, limit) -> Vec<AtSuggestion>` over the index store. Cheap — a single LIKE / fuzzy query against the notes table, ordered by `last_accessed_at DESC`. Returns at most 10 results. The `selection` synthetic entry is added frontend-side based on the live editor state; never round-trips through the Tauri command. [chat-input-at-autocomplete-tauri-cmd]
+Autocomplete data source: a command `chat_at_autocomplete(prefix, limit) -> Vec<AtSuggestion>` over the index store. Cheap — a single LIKE / fuzzy query against the notes table, ordered by `last_accessed_at DESC`. Returns at most 10 results. The `selection` synthetic entry is added frontend-side based on the live editor state; never round-trips through the command. [chat-input-at-autocomplete-cmd]
 
 ### Future `@`-mention targets (deferred)
 
@@ -279,13 +279,13 @@ Reserved as concept slugs so future spec writers know the surface. Not in v1.
 - **Mention-chip rendering** in the input box — visual chip with the resolved basename + a click-to-edit affordance, instead of the plain `@token` text. Cosmetic upgrade once the underlying parsing has shipped. [chat-input-at-mention-chips]
 
 
-## Event streams and Tauri command surface
+## Event streams and command surface
 
 The agent loop streams its progress to the chat panel through a typed event channel; the panel calls back into the loop for user-driven actions (continue past a cap, stop, cancel mid-stream). Same shape applies whether the backend is `core::agent` or `core::acp` — the UI only sees the event enum.
 
 ### AgentEvent
 
-A discriminated-union enum emitted on the Tauri event `hiker:chat-event`. Every event carries `turn_id` (one per user message) and most carry `step_id` (one per LLM call within a turn — increments on each tool-loop iteration). [agent-event-stream-shape]
+A discriminated-union enum emitted on the event `hiker:chat-event`. Every event carries `turn_id` (one per user message) and most carry `step_id` (one per LLM call within a turn — increments on each tool-loop iteration). [agent-event-stream-shape]
 
 ```rust
 enum AgentEvent {
@@ -305,9 +305,9 @@ enum AgentEvent {
 
 Translation happens at the `core::agent` boundary: provider-specific chunks from the `llm` crate's `chat_stream` are normalized into this enum so the chat panel never sees Anthropic-vs-OpenAI-vs-Ollama shape differences. The ACP path (`core::acp`) emits the same enum so the panel renders both backends identically.
 
-**Why a single global event channel** rather than Tauri 2's per-invoke `Channel<T>`: continue / stop / cancel commands address an existing in-flight turn from a separate Tauri call, which a per-invoke channel doesn't model cleanly. Frontend filters by `turn_id`; one line.
+**Why a single global event channel** rather than a per-invoke `Channel<T>`: continue / stop / cancel commands address an existing in-flight turn from a separate call, which a per-invoke channel doesn't model cleanly. Frontend filters by `turn_id`; one line.
 
-### Tauri command surface
+### Command surface
 
 ```rust
 chat_send(session_id, turn_id, message)    -> Result<()>  // start a turn within a session; events stream back

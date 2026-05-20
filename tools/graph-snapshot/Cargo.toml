@@ -1,0 +1,17 @@
+[package]
+name = "graph-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "graph-snapshot"
+path = "src/main.rs"
+
+[dependencies]
+# eframe (not just egui) so the `eframe::egui::Vec2` imports inside the
+# included production source files resolve without any shimming.
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }

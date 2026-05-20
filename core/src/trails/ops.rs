@@ -909,7 +909,7 @@ async fn rewrite_trail_doc_waypoint_entry(
     let mut fm = parse_trail_doc_for(trail_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
     fn walk_paths(
-        entries: &mut Vec<WaypointEntry>,
+        entries: &mut [WaypointEntry],
         old_rel: &str,
         new_rel: &str,
         changed: &mut bool,

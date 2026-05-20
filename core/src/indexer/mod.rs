@@ -55,9 +55,12 @@ pub(super) async fn submit_embedder_load_task(
 }
 
 const PROGRESS_CAPACITY: usize = 256;
-/// Max markdown size we'll attempt to index, in bytes. Larger files are
-/// almost certainly not handwritten markdown (committed binaries, generated
-/// dumps); skipping them keeps the embedder from thrashing.
+/// Max file size we'll attempt to index, in bytes. Past this size a file
+/// is almost certainly not handwritten markdown (committed binaries,
+/// generated dumps, vendored corpora). Memory growth from large files is
+/// bounded separately by chunked embedding + early body drop in
+/// `process_upsert`, so this cap exists to skip pathological inputs
+/// rather than to bound per-file allocation.
 pub(super) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -144,8 +147,8 @@ pub struct IndexStatus {
     pub last_error: Option<String>,
 }
 
-/// Streaming progress event, sent over a broadcast channel for the Tauri
-/// bridge to forward as `hiker:reindex-progress`.
+/// Streaming progress event, sent over a broadcast channel for the
+/// app bridge to forward as `hiker:reindex-progress`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
@@ -183,7 +186,7 @@ pub struct IndexerHandle {
     join: Option<JoinHandle<()>>,
     /// Vault-relative paths with an in-flight Upsert job (queued in the
     /// mpsc, recv'd, or actively processing). Backs the Queued tree-row
-    /// marker via `tauri-cmd-file-index-state`.
+    /// marker via `cmd-file-index-state`.
     pending: Arc<Mutex<HashSet<String>>>,
     /// Filled by the indexer task once `embedder_loader` resolves; later
     /// hot-swapped on `IndexJob::ReloadEmbedder`. Exposed via `embedder()`
@@ -198,7 +201,7 @@ pub struct IndexerHandle {
     /// status: embedder-hot-reload-on-model-change
     embedder: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     /// Late-bound watcher reference, used by the trails auto-update path
-    /// (`trail-auto-update-on-note-move`). Filled by the host (Tauri /
+    /// (`trail-auto-update-on-note-move`). Filled by the host (app /
     /// CLI) via `attach_watcher` after both the indexer and the watcher
     /// have started. CLI / tests that don't run a watcher leave this
     /// empty — `core::trails::on_note_moved` handles the missing-watcher
@@ -248,6 +251,15 @@ impl IndexerHandle {
     /// Backs the Queued tree-row marker.
     pub fn is_pending(&self, rel_path: &str) -> bool {
         self.pending.lock().unwrap().contains(rel_path)
+    }
+
+    /// Snapshot the set of paths currently queued for indexing. The result
+    /// is sorted alphabetically. UI uses this to populate the Queue panel
+    /// without holding the `pending` mutex across rendering.
+    pub fn pending_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.pending.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
     }
 
     pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), IndexerError> {
@@ -304,7 +316,7 @@ impl IndexerHandle {
     }
 
     /// Subscribe to status changes (model_ready / queued / total_notes /
-    /// last_error). The Tauri bridge forwards each change as
+    /// last_error). The app bridge forwards each change as
     /// `hiker:index-status` so the frontend can drop its 2s `index_status`
     /// poll. Initial value is observable via `borrow()` on the receiver
     /// without waiting for the next change.
@@ -323,7 +335,7 @@ impl IndexerHandle {
     }
 
     /// Late-bind the filesystem watcher used by the trails auto-update
-    /// path. The Tauri layer calls this after both the indexer and the
+    /// path. The host calls this after both the indexer and the
     /// watcher are running. Idempotent first-write-wins per `OnceCell`
     /// semantics — subsequent calls log + ignore.
     ///
@@ -479,7 +491,7 @@ pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Ve
         force,
         "full_scan starting",
     );
-    let mut on_disk: Vec<String> = Vec::new();
+    let mut on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut total_files_seen = 0_u32;
     let mut filtered_non_md = 0_u32;
     let mut filtered_ignored = 0_u32;
@@ -515,31 +527,32 @@ pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Ve
             filtered_non_md += 1;
             continue;
         }
-        on_disk.push(rel);
+        on_disk.insert(rel);
     }
-    let mut jobs: Vec<IndexJob> = on_disk
-        .iter()
-        .cloned()
-        .map(|rel_path| IndexJob::Upsert { rel_path, force })
-        .collect();
 
-    // Find indexed paths missing from disk.
+    // Walk indexed paths first so we can use `on_disk` as a HashSet for
+    // membership checks, then consume `on_disk` into the jobs list so
+    // we never hold both `Vec<String>` and `HashSet<String>` copies of
+    // every on-disk path simultaneously.
     let indexed = store.all_note_paths()?;
-    let on_disk_set: std::collections::HashSet<&str> =
-        on_disk.iter().map(String::as_str).collect();
+    let queued = on_disk.len();
+    let mut jobs: Vec<IndexJob> = Vec::with_capacity(queued + indexed.len() / 8);
     let mut deleted = 0_u32;
     for path in indexed {
-        if !on_disk_set.contains(path.as_str()) {
+        if !on_disk.contains(path.as_str()) {
             jobs.push(IndexJob::Delete { rel_path: path });
             deleted += 1;
         }
+    }
+    for rel_path in on_disk {
+        jobs.push(IndexJob::Upsert { rel_path, force });
     }
 
     tracing::info!(
         seen = total_files_seen,
         non_md = filtered_non_md,
         ignored = filtered_ignored,
-        queued = on_disk.len() as u32,
+        queued = queued as u32,
         deleted,
         "full_scan complete",
     );
