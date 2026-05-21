@@ -19,6 +19,10 @@ pub enum Layout {
     /// Full-tab Agent view. Picker header + large transcript +
     /// composer.
     FullTab,
+    /// Side-bar variant. Same as FullTab but the +/trash buttons live
+    /// in the side bar's title row, so the in-body header just shows
+    /// the picker.
+    SideBar,
     /// Bottom-docked region in the discovery panel. Compact header,
     /// scrollable transcript, single-line composer.
     #[allow(dead_code)]
@@ -49,15 +53,27 @@ pub fn show(
     }
 
     match layout {
-        Layout::FullTab => render_full_tab(ui, app, rt),
+        Layout::FullTab => render_full_tab(ui, app, rt, /*show_header=*/ true, /*show_header_buttons=*/ true),
+        // SideBar variant has its picker + buttons hoisted into the
+        // side bar's chrome title row (see `render_session_picker` +
+        // `secondary_side_bar_action_buttons`), so the body skips the
+        // header strip entirely.
+        Layout::SideBar => render_full_tab(ui, app, rt, /*show_header=*/ false, /*show_header_buttons=*/ false),
         Layout::Docked => render_docked(ui, app, rt),
     }
 }
 
-fn render_full_tab(ui: &mut egui::Ui, app: &mut AppState, rt: &Arc<tokio::runtime::Runtime>) {
-    // Header strip: session picker + new + delete.
-    header(ui, app, /*full=*/ true);
-    ui.separator();
+fn render_full_tab(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    rt: &Arc<tokio::runtime::Runtime>,
+    show_header: bool,
+    show_header_buttons: bool,
+) {
+    if show_header {
+        header(ui, app, /*full=*/ true, show_header_buttons);
+        ui.separator();
+    }
 
     // Reserve the composer at the bottom; transcript fills the rest.
     // No min-height floor on the transcript — previously a `.max(120.0)`
@@ -87,7 +103,7 @@ fn render_docked(ui: &mut egui::Ui, app: &mut AppState, rt: &Arc<tokio::runtime:
         .stroke(egui::Stroke::new(1.0, theme::divider()))
         .inner_margin(6.0)
         .show(ui, |ui| {
-            header(ui, app, /*full=*/ false);
+            header(ui, app, /*full=*/ false, /*show_header_buttons=*/ true);
             ui.add_space(2.0);
             egui::ScrollArea::vertical()
                 .max_height(180.0)
@@ -98,96 +114,136 @@ fn render_docked(ui: &mut egui::Ui, app: &mut AppState, rt: &Arc<tokio::runtime:
         });
 }
 
-fn header(ui: &mut egui::Ui, app: &mut AppState, full: bool) {
+fn header(ui: &mut egui::Ui, app: &mut AppState, full: bool, show_buttons: bool) {
+    // Layout right-to-left so the +/trash buttons stay pinned to the
+    // right edge and the picker shrinks to fill the leftover slot.
+    // A left-to-right horizontal with a fixed-width ComboBox + trailing
+    // buttons would inflate the side bar's min content width and shove
+    // the buttons off-screen when the user resizes narrower.
+    let active_id = app.session.chat.active.clone();
+    let active_label = active_label_for(&app.session.chat, active_id.as_deref());
+    let mut switch_to: Option<String> = None;
+    let mut delete: Option<String> = None;
+    let mut create_new = false;
+
     ui.horizontal(|ui| {
-        ui.add(crate::icons::chat());
-        if full {
-            ui.label(egui::RichText::new("Chat").strong());
-        }
-        ui.add_space(4.0);
-
-        // Session picker.
-        let active_id = app.session.chat.active.clone();
-        let active_label = active_label_for(&app.session.chat, active_id.as_deref());
-        let mut switch_to: Option<String> = None;
-        let mut delete: Option<String> = None;
-        let mut create_new = false;
-
-        // Reserve room for the +/trash buttons (~64px) so they don't
-        // slide off-screen when the panel is narrow; clamp to a small
-        // minimum so the picker stays usable.
-        let picker_width = (ui.available_width() - 64.0)
-            .clamp(80.0, if full { 280.0 } else { 180.0 });
-        egui::ComboBox::from_id_salt(if full { "chat_picker_full" } else { "chat_picker_docked" })
-            .selected_text(active_label)
-            .width(picker_width)
-            .show_ui(ui, |ui| {
-                // Newest-first; clone+sort to dodge borrow churn.
-                let mut rows: Vec<(String, String, i64)> = app
-                    .session.chat
-                    .sessions
-                    .values()
-                    .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
-                    .collect();
-                rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-                if rows.is_empty() {
-                    ui.label(
-                        egui::RichText::new("(no sessions yet)")
-                            .color(theme::muted())
-                            .small(),
-                    );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if show_buttons {
+                if active_id.is_some()
+                    && ui
+                        .add(egui::Button::image(crate::icons::trash()).small())
+                        .on_hover_text("Delete this session")
+                        .clicked()
+                {
+                    delete = active_id.clone();
                 }
-                for (id, preview, _mtime) in rows {
-                    let selected = active_id.as_deref() == Some(id.as_str());
-                    if ui.selectable_label(selected, &preview).clicked() {
-                        switch_to = Some(id);
+                if ui
+                    .add(egui::Button::image(crate::icons::plus()).small())
+                    .on_hover_text("New session")
+                    .clicked()
+                {
+                    create_new = true;
+                }
+            }
+
+            let cap = if full { 280.0 } else { 180.0 };
+            let picker_width = ui.available_width().min(cap).max(0.0);
+            egui::ComboBox::from_id_salt(if full { "chat_picker_full" } else { "chat_picker_docked" })
+                .selected_text(active_label)
+                .width(picker_width)
+                .show_ui(ui, |ui| {
+                    let mut rows: Vec<(String, String, i64)> = app
+                        .session.chat
+                        .sessions
+                        .values()
+                        .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
+                        .collect();
+                    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+                    if rows.is_empty() {
+                        ui.label(
+                            egui::RichText::new("(no sessions yet)")
+                                .color(theme::muted())
+                                .small(),
+                        );
                     }
-                }
-            });
-
-        if ui
-            .add(egui::Button::image(crate::icons::plus()).small())
-            .on_hover_text("New session")
-            .clicked()
-        {
-            create_new = true;
-        }
-        if active_id.is_some()
-            && ui
-                .add(egui::Button::image(crate::icons::trash()).small())
-                .on_hover_text("Delete this session")
-                .clicked()
-        {
-            delete = active_id.clone();
-        }
-
-        // Apply.
-        if let Some(id) = switch_to {
-            session::set_active(&mut app.session.chat, &id);
-        }
-        if create_new {
-            let vault_root = app.vault_session.vault_root.clone();
-            let (model, provider) = app
-                .vault_session.config
-                .read()
-                .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
-                .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
-            if let Err(err) = session::create_new(
-                &mut app.session.chat,
-                &vault_root,
-                &model,
-                &provider,
-            ) {
-                tracing::warn!(error = %err, "chat: create_new failed");
-            }
-        }
-        if let Some(id) = delete {
-            let vault_root = app.vault_session.vault_root.clone();
-            if let Err(err) = session::delete(&mut app.session.chat, &vault_root, &id) {
-                tracing::warn!(error = %err, "chat: delete failed");
-            }
-        }
+                    for (id, preview, _mtime) in rows {
+                        let selected = active_id.as_deref() == Some(id.as_str());
+                        if ui.selectable_label(selected, &preview).clicked() {
+                            switch_to = Some(id);
+                        }
+                    }
+                });
+        });
     });
+
+    // Apply picker actions (outside the layout closure so the borrows
+    // on `app` don't conflict with the combo's render).
+    if let Some(id) = switch_to {
+        session::set_active(&mut app.session.chat, &id);
+    }
+    if create_new {
+        let vault_root = app.vault_session.vault_root.clone();
+        let (model, provider) = app
+            .vault_session.config
+            .read()
+            .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
+            .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+        if let Err(err) = session::create_new(
+            &mut app.session.chat,
+            &vault_root,
+            &model,
+            &provider,
+        ) {
+            tracing::warn!(error = %err, "chat: create_new failed");
+        }
+    }
+    if let Some(id) = delete {
+        let vault_root = app.vault_session.vault_root.clone();
+        if let Err(err) = session::delete(&mut app.session.chat, &vault_root, &id) {
+            tracing::warn!(error = %err, "chat: delete failed");
+        }
+    }
+}
+
+/// Standalone session picker — the same combobox `header` builds,
+/// but rendered into an arbitrary ui so it can sit in the secondary
+/// side bar's chrome title row alongside the +/trash buttons that
+/// `secondary_side_bar_action_buttons` already places there.
+pub fn render_session_picker(ui: &mut egui::Ui, app: &mut AppState) {
+    let active_id = app.session.chat.active.clone();
+    let active_label = active_label_for(&app.session.chat, active_id.as_deref());
+    let mut switch_to: Option<String> = None;
+
+    let picker_width = ui.available_width().min(280.0).max(0.0);
+    egui::ComboBox::from_id_salt("chat_picker_sidebar_title")
+        .selected_text(active_label)
+        .width(picker_width)
+        .show_ui(ui, |ui| {
+            let mut rows: Vec<(String, String, i64)> = app
+                .session.chat
+                .sessions
+                .values()
+                .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+            if rows.is_empty() {
+                ui.label(
+                    egui::RichText::new("(no sessions yet)")
+                        .color(theme::muted())
+                        .small(),
+                );
+            }
+            for (id, preview, _mtime) in rows {
+                let selected = active_id.as_deref() == Some(id.as_str());
+                if ui.selectable_label(selected, &preview).clicked() {
+                    switch_to = Some(id);
+                }
+            }
+        });
+
+    if let Some(id) = switch_to {
+        session::set_active(&mut app.session.chat, &id);
+    }
 }
 
 fn active_label_for(reg: &ChatRegistry, id: Option<&str>) -> String {
@@ -209,15 +265,28 @@ fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
     let pending = s.pending;
     let streaming = s.streaming_buf.clone();
     let turns = s.turns.clone();
+    // Set of staging proposal IDs that are still pending in the staging
+    // service this frame. The tool-card Accept / Reject buttons only
+    // render for IDs in this set — when the user accepts or rejects a
+    // proposal elsewhere (inline patch-review surface, the bulk patch-
+    // review tab, the activity widget) it disappears from staging.db
+    // and the cached snapshot shrinks, so the stale buttons on old tool
+    // cards vanish on the next frame without any per-card bookkeeping.
+    let live_proposal_ids: std::collections::HashSet<String> = app
+        .ui_cache
+        .staging_snapshot
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
     let mut card_action: Option<ToolCardAction> = None;
     let mut link_clicked: Option<String> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for turn in &turns {
+            for (turn_idx, turn) in turns.iter().enumerate() {
                 if let Some(tool) = &turn.tool {
-                    if let Some(a) = render_tool_card(ui, tool) {
+                    if let Some(a) = render_tool_card(ui, tool, turn_idx, &live_proposal_ids) {
                         card_action = Some(a);
                     }
                 } else if let Some(target) = render_turn(ui, turn.role, &turn.text) {
@@ -248,6 +317,16 @@ fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
                 });
             }
             ui.add_space(8.0);
+            // While the agent is working we want streaming text + tool
+            // events to surface within ~one tick rather than waiting on
+            // the 750ms idle cadence in main.rs. The reply task posts
+            // ChatEvents into the mpsc, which pump_events drains at
+            // frame start — without a fast repaint kick the events
+            // sit in the channel until the next idle paint.
+            if pending {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(80));
+            }
         });
     // Apply tool-card actions on the AppState. Staging accept/reject
     // route through the live `Staging`; open-target hands off to the
@@ -337,6 +416,8 @@ pub enum ToolCardAction {
 fn render_tool_card(
     ui: &mut egui::Ui,
     tool: &crate::chat::state::ToolCard,
+    turn_idx: usize,
+    live_proposal_ids: &std::collections::HashSet<String>,
 ) -> Option<ToolCardAction> {
     let mut action: Option<ToolCardAction> = None;
     ui.add_space(6.0);
@@ -391,14 +472,46 @@ fn render_tool_card(
     // so a long transcript doesn't drown in JSON. Default open while
     // the call is in flight so the user sees args as they stream; once
     // a result lands the user can click to collapse.
-    let id_salt = format!("tool-card-{}-{}", tool.tool_name.as_str(), tool.args.len());
-    egui::CollapsingHeader::new(
-        egui::RichText::new("details").small().color(theme::muted()),
-    )
-    .id_salt(id_salt)
-    .default_open(true)
-    .show(ui, |ui| {
-    egui::Frame::default()
+    // id_salt must be stable across frames AND unique across cards. The
+    // turn index makes it unique even when two tool calls of the same name
+    // and same arg-string land in the transcript; tool_name is kept for
+    // grep-ability in egui debug overlays.
+    let id_salt = format!("tool-card-{}-{}", turn_idx, tool.tool_name.as_str());
+    // Manual collapsible — `CollapsingHeader` only treats the chevron +
+    // label glyph as the toggle hit-region, which is a tiny click target.
+    // We render a full-width clickable header strip *and* extend click
+    // sense to the yellow body Frame so clicking anywhere on the card
+    // (other than an interactive child like an Accept / Reject button)
+    // toggles open/closed.
+    let open_id = egui::Id::new(("tool-card-open", &id_salt));
+    let mut open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(open_id))
+        .unwrap_or(true);
+    let header = egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(if open {
+                    crate::icons::chevron_down()
+                } else {
+                    crate::icons::chevron_right()
+                });
+                ui.label(egui::RichText::new("details").color(theme::muted()));
+                ui.add_space(ui.available_width());
+            });
+        });
+    let header_resp = ui.interact(
+        header.response.rect,
+        egui::Id::new(("tool-card-toggle-header", &id_salt)),
+        egui::Sense::click(),
+    );
+    if header_resp.clicked() {
+        open = !open;
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+    }
+    if open {
+    let body_response = egui::Frame::default()
         .fill(egui::Color32::from_rgb(0xff, 0xf7, 0xe6))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe0, 0xc4, 0x70)))
         .inner_margin(8.0)
@@ -410,9 +523,11 @@ fn render_tool_card(
                         .color(theme::muted())
                         .small(),
                 );
+                // Body text renders at default size so JSON args / tool
+                // results are actually readable — the prior `.small()`
+                // was hard to read on dense JSON payloads.
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&tool.args).monospace().small())
-                        .wrap(),
+                    egui::Label::new(egui::RichText::new(&tool.args).monospace()).wrap(),
                 );
             }
             if let Some(result) = &tool.result {
@@ -424,20 +539,43 @@ fn render_tool_card(
                         .color(theme::muted())
                         .small(),
                 );
-                let snippet: String = result.chars().take(800).collect();
-                ui.add(
-                    egui::Label::new(egui::RichText::new(snippet).monospace().small())
-                        .wrap(),
-                );
+                // Render the full result text inside a vertical scroll
+                // shell so multi-KB tool outputs don't get silently
+                // truncated. The outer chat panel already has its own
+                // scrollbar; nest with a fixed max height so a single
+                // huge tool result doesn't push every other turn out of
+                // view.
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{}-result", id_salt))
+                    .max_height(400.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(result.as_str()).monospace(),
+                            )
+                            .wrap(),
+                        );
+                    });
             }
             // Review-mode affordance: when the tool returned a staged
             // proposal, surface inline Accept / Reject buttons paired with
             // each staging id. Matches `ui/src/chat/toolCard.ts`'s action
             // row layout.
-            if !tool.staging_ids.is_empty() {
+            // Skip stale staging IDs: when the user accepts/rejects the
+            // proposal elsewhere it disappears from `staging.db` and the
+            // pending-id set shrinks, so we drop the buttons on the
+            // next frame instead of leaving stale Accept / Reject
+            // affordances in the transcript.
+            let live_sids: Vec<&String> = tool
+                .staging_ids
+                .iter()
+                .filter(|sid| live_proposal_ids.contains(*sid))
+                .collect();
+            if !live_sids.is_empty() {
                 ui.add_space(6.0);
                 ui.separator();
-                for sid in &tool.staging_ids {
+                for sid in live_sids {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
@@ -482,9 +620,39 @@ fn render_tool_card(
                         }
                     });
                 }
+            } else if !tool.staging_ids.is_empty() {
+                // Tool returned proposal IDs but they're all resolved.
+                // Leave a muted breadcrumb so the user knows the card
+                // *did* stage something — just not waiting on input now.
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} proposal{} resolved",
+                        tool.staging_ids.len(),
+                        if tool.staging_ids.len() == 1 { "" } else { "s" },
+                    ))
+                    .color(theme::muted())
+                    .italics()
+                    .small(),
+                );
             }
         });
-    });
+    // Extend click sense to the whole body rect. egui processes
+    // interactions in paint order — interactive children (Accept /
+    // Reject buttons, the result ScrollArea) were painted first and
+    // sit on top in z-order, so they steal clicks at their own rects.
+    // Clicks on the surrounding yellow space fall through to this
+    // body-level interact and toggle the card.
+    let body_resp = ui.interact(
+        body_response.response.rect,
+        egui::Id::new(("tool-card-toggle-body", &id_salt)),
+        egui::Sense::click(),
+    );
+    if body_resp.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
+    }
+    }
     action
 }
 
@@ -878,37 +1046,24 @@ fn composer(
         .unwrap_or_default();
 
     let mut send_now = false;
+    // Wrap the composer row in a Frame with a small horizontal margin
+    // so the TextEdit's focus border doesn't sit at x=0 of the side
+    // panel — egui's `SidePanel::resizable(true)` draws a thin drag
+    // handle on the inner edge that otherwise overlaps the border
+    // (visible as a darker bar clipping the leftmost ~3px).
+    egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(4, 0))
+        .show(ui, |ui| {
+    // Layout the row right-to-left so the Send/Stop (and optional
+    // "selection") buttons are pinned to the right edge; the TextEdit
+    // then fills whatever space is left. This keeps the buttons on
+    // screen no matter how narrow the panel gets — the previous
+    // left-to-right + `desired_width = available - 80` approach forced
+    // the TextEdit to a floor that, combined with the trailing buttons,
+    // exceeded the side bar's available width and shoved Send off the
+    // right edge (and inflated the panel's content min-width).
     ui.horizontal(|ui| {
-        // Reserve room for the Send/Stop button (and optional "selection"
-        // button) on the right; clamp so the text box keeps a usable
-        // minimum width instead of going negative and shoving the
-        // buttons off-screen when the panel is narrow.
-        let edit = if multiline {
-            let w = (ui.available_width() - 80.0).max(60.0);
-            egui::TextEdit::multiline(&mut draft)
-                .hint_text("Message the assistant…  (use @ to mention a note)")
-                .desired_rows(3)
-                .desired_width(w)
-        } else {
-            let w = (ui.available_width() - 60.0).max(40.0);
-            egui::TextEdit::singleline(&mut draft)
-                .hint_text("Message…")
-                .desired_width(w)
-        };
-        let resp = ui.add(edit);
-
-        // Cmd-Enter / Ctrl-Enter to send from the editor. Single-line
-        // also accepts plain Enter.
-        if resp.has_focus() {
-            let cmd_enter = ui.input(|i| {
-                i.key_pressed(egui::Key::Enter) && (i.modifiers.command || i.modifiers.ctrl)
-            });
-            let plain_enter_singleline = !multiline
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-            if cmd_enter || plain_enter_singleline {
-                send_now = true;
-            }
-        }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
         // Pending: show Stop instead of Send. Clicking it signals the
         // in-flight turn to halt via the per-session StopSignal stored
         // in `ChatRegistry::stop_signals` (`chat-panel-stop-button`).
@@ -959,19 +1114,100 @@ fn composer(
             draft.push_str("```\n");
         }
 
+        // TextEdit fills whatever horizontal space the buttons didn't
+        // claim. Using `available_width()` after the buttons are placed
+        // (we're in right_to_left, so this is the leftover slot) lets
+        // the field shrink with the panel instead of pushing the
+        // buttons off-screen. A tiny floor keeps the caret visible.
+        let avail_w = ui.available_width().max(20.0);
+        let edit = if multiline {
+            // Plain Enter = send (handled below). Shift-Enter is the
+            // newline shortcut, which we tell the TextEdit to treat as
+            // its return key so the multiline buffer still accepts
+            // intentional newlines without inserting one on send.
+            egui::TextEdit::multiline(&mut draft)
+                .hint_text("Message the assistant…  (Enter to send, Shift-Enter for newline, @ to mention a note)")
+                .desired_rows(3)
+                .desired_width(avail_w)
+                .return_key(egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    egui::Key::Enter,
+                ))
+        } else {
+            egui::TextEdit::singleline(&mut draft)
+                .hint_text("Message…")
+                .desired_width(avail_w)
+        };
+        let resp = ui.add(edit);
+
+        // Send shortcuts: plain Enter (multiline + singleline) and
+        // Cmd/Ctrl-Enter (still honored for muscle memory). Shift-Enter
+        // is the multiline TextEdit's return key (see `.return_key`
+        // above), so it inserts a newline without firing send.
+        if resp.has_focus() {
+            let plain_enter = ui.input(|i| {
+                i.key_pressed(egui::Key::Enter)
+                    && !i.modifiers.shift
+                    && !i.modifiers.command
+                    && !i.modifiers.ctrl
+            });
+            let cmd_enter = ui.input(|i| {
+                i.key_pressed(egui::Key::Enter) && (i.modifiers.command || i.modifiers.ctrl)
+            });
+            if plain_enter || cmd_enter {
+                send_now = true;
+            }
+        }
+
         // @-mention autocomplete: when the user types `@<query>` at the
         // tail of the draft, surface vault notes whose path matches the
         // query so they can be referenced in the prompt (`llm.md:247-268`
         // @-mentions). Picking a suggestion replaces the partial token
         // with `@path/to/note`.
-        if resp.has_focus()
-            && let Some((prefix_start, query)) = active_at_mention(&draft)
-        {
+        // @-mention popup: stable persistent id + memory-tracked open
+        // state. Two failure modes the previous approach hit:
+        //   1. Re-calling `.open(true)` every frame re-anchors the popup
+        //      to the response rect — when the multiline TextEdit
+        //      grows / shrinks (e.g. on Enter), the popup visibly
+        //      jumps with it. A persistent `Popup::id` + `open_memory`
+        //      lets egui pin the popup's first-frame rect.
+        //   2. Gating render on `resp.has_focus()` killed the popup the
+        //      moment focus moved into a suggestion button — the
+        //      click never had a chance to register because the popup
+        //      closure stopped being called.
+        let mention_popup_id = ui.make_persistent_id("chat::mention_popup");
+        let mention_state = active_at_mention(&draft);
+        if let Some((_, ref query)) = mention_state {
+            let has_any = !mention_suggestions(app, query, 1).is_empty();
+            if has_any {
+                ui.memory_mut(|m| m.open_popup(mention_popup_id));
+            } else {
+                // No matches — close the popup (don't leave a stale
+                // floating frame from a previous prefix).
+                if ui.memory(|m| m.is_popup_open(mention_popup_id)) {
+                    ui.memory_mut(|m| m.close_popup(mention_popup_id));
+                }
+            }
+        } else if ui.memory(|m| m.is_popup_open(mention_popup_id)) {
+            ui.memory_mut(|m| m.close_popup(mention_popup_id));
+        }
+
+        if let Some((prefix_start, query)) = mention_state {
             let suggestions = mention_suggestions(app, &query, 8);
-            if !suggestions.is_empty() {
-                egui::Popup::menu(&resp).show(|ui| {
+            let popup_w = resp.rect.width().max(160.0);
+            egui::Popup::from_response(&resp)
+                .id(mention_popup_id)
+                .open_memory(None)
+                .align(egui::RectAlign::BOTTOM_START)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .width(popup_w)
+                .show(|ui| {
+                    ui.set_min_width(popup_w);
                     for s in &suggestions {
-                        if ui.button(s).clicked() {
+                        if ui
+                            .add(egui::Button::new(s).min_size(egui::vec2(popup_w, 0.0)))
+                            .clicked()
+                        {
                             // Replace the in-progress `@<query>` token
                             // with `@<full-path> ` so the user can
                             // continue typing immediately after.
@@ -982,13 +1218,14 @@ fn composer(
                                 &draft[prefix_start + 1 + query.len()..],
                             );
                             draft = new_draft;
-                            ui.close();
+                            ui.memory_mut(|m| m.close_popup(mention_popup_id));
                         }
                     }
                 });
-            }
         }
     });
+    });
+        });
     // Sync back the (possibly edited) draft.
     app.session.chat.drafts.insert(active_id.clone(), draft);
 
@@ -1022,6 +1259,14 @@ fn composer(
                 mcp_handler,
                 text,
             );
+            // Force an immediate repaint so the next frame picks up
+            // `s.pending = true` and the composer flips from Send to
+            // Stop. Without this the click frame finishes rendering
+            // with the old (pending=false) state, and the 750ms idle
+            // cadence in `main.rs` is the only thing that schedules
+            // the next paint — for fast operations the Stop button
+            // never gets a chance to show.
+            ui.ctx().request_repaint();
         }
     }
 }

@@ -11,9 +11,22 @@ fail() { echo "check.sh: $1 FAILED" >&2; exit 1; }
 echo "==> cargo test -p hiker-core --lib"
 cargo test -p hiker-core --lib || fail "cargo test -p hiker-core --lib"
 
-echo "==> cargo test -p hiker-core --test heap_ceiling (counting-allocator regression)"
+# Memory-regression gates. Each test installs a counting global
+# allocator in its dedicated test binary and asserts peak heap stays
+# under a fixed ceiling after exercising the relevant code path.
+# Bumping the ceilings is intentional friction — fix the regression or
+# justify the new headroom in the test file.
+echo "==> heap-ceiling regression (indexer full scan)"
 cargo test -p hiker-core --test heap_ceiling -- --nocapture \
-    || fail "heap-ceiling regression"
+    || fail "heap-ceiling regression: indexer"
+
+echo "==> heap-ceiling regression (editor apply stream)"
+cargo test -p editor-core --test heap_ceiling -- --nocapture \
+    || fail "heap-ceiling regression: editor"
+
+echo "==> heap-ceiling regression (workbench render loop)"
+cargo test -p egui_workbench --test heap_ceiling -- --nocapture \
+    || fail "heap-ceiling regression: workbench"
 
 echo "==> cargo check -p hiker-app"
 cargo check -p hiker-app || fail "cargo check -p hiker-app"
@@ -21,16 +34,39 @@ cargo check -p hiker-app || fail "cargo check -p hiker-app"
 echo "==> cargo test -p hiker-app (smoke + unit)"
 cargo test -p hiker-app || fail "cargo test -p hiker-app"
 
-echo "==> cargo clippy (function-length budget + a few line-count-shaped lints)"
+echo "==> cargo clippy (length budget + anti-arbitrary-split lints)"
+# Two clusters of lints below:
+#   (A) the original length-budget lints, and
+#   (B) lints that target arbitrary splits made to dodge those budgets.
+# Group (B) is the clippy counterpart to scripts/check-splits.py — the
+# two reinforce each other. Tighten or loosen here with intent;
+# `#[allow(...)]` at the call site is not a sanctioned escape.
 cargo clippy --workspace --all-targets -- \
     -D clippy::too_many_lines \
     -D clippy::derivable_impls \
     -D clippy::collapsible_if \
     -D clippy::field_reassign_with_default \
+    -D clippy::wildcard_imports \
+    -D clippy::module_inception \
+    -D clippy::module_name_repetitions \
+    -D clippy::pub_use \
+    -D clippy::cognitive_complexity \
+    -D clippy::unnecessary_wraps \
+    -D clippy::needless_pass_by_value \
+    -D clippy::single_call_fn \
+    -D clippy::too_many_arguments \
+    -D clippy::trivially_copy_pass_by_ref \
+    -D clippy::needless_late_init \
+    -D clippy::redundant_closure_for_method_calls \
+    -D clippy::missing_const_for_fn \
+    -D clippy::large_stack_arrays \
     || fail "cargo clippy"
 
 echo "==> file-length budget (see scripts/check-lengths.py)"
 python3 scripts/check-lengths.py || fail "file-length budget"
+
+echo "==> split-pattern detector (see scripts/check-splits.py)"
+python3 scripts/check-splits.py || fail "split-pattern detector"
 
 echo "==> emoji ban (see scripts/check-emojis.py)"
 python3 scripts/check-emojis.py || fail "emoji ban"

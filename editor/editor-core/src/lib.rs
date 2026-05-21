@@ -23,8 +23,9 @@ pub use facet::{Facet, FacetStore, FieldStore, StateField, ViewPlugin};
 pub use change::{ChangeSet, Op};
 pub use compartment::{Compartment, CompartmentId, CompartmentStore};
 pub use decoration::{
-    BlockDeco, BlockKind, BlockSide, BlockTextLine, BlockWidget, Color, Decoration, DecorationSet,
-    FoldChevron, GutterMarker, InlineWidget, LineStyle, MarkStyle,
+    ActionButton, ActionButtonStyle, ActionTone, BlockDeco, BlockKind, BlockSide, BlockTextLine,
+    BlockWidget, Color, Decoration, DecorationSet, FoldChevron, GutterMarker, InlineWidget,
+    InlineWidgetDisplay, LineStyle, MarkStyle,
 };
 pub use diagnostic::{Diagnostic, Severity};
 pub use history::History;

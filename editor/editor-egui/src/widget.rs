@@ -13,7 +13,9 @@ use editor_view::{
 };
 
 mod blocks;
+mod search_panel;
 use blocks::paint_block_zone;
+use search_panel::{refresh_search_matches, sync_search_panel};
 
 /// Per-frame snapshot of the inputs that feed the measure pass. Compared
 /// against `ViewState::measure_cache` to decide whether geometry needs to be
@@ -255,10 +257,15 @@ impl<'a> EditorWidget<'a> {
         if response.hovered() || response.has_focus() {
             let scrolled = ui.input(|i| i.smooth_scroll_delta.y);
             if scrolled.abs() > 0.0 {
+                let speed = if self.view.scroll_speed > 0.0 {
+                    self.view.scroll_speed
+                } else {
+                    1.0
+                };
                 let action = command::handle(
                     self.state,
                     self.view,
-                    &InputEvent::Scroll { delta_x: 0.0, delta_y: scrolled },
+                    &InputEvent::Scroll { delta_x: 0.0, delta_y: scrolled * speed },
                 );
                 self.consume_action(ui, action);
             }
@@ -324,55 +331,6 @@ impl<'a> EditorWidget<'a> {
                 }
             }
             Action::None => {}
-        }
-    }
-}
-
-/// Synchronize the auto-managed Search panel with `view.search.active`.
-/// When the user opens search (Cmd-F), push a bottom-anchored Search panel;
-/// when they close it, remove any registered Search panel. The panel uses a
-/// reserved id (`SEARCH_PANEL_ID`) so it can be re-found across frames.
-fn sync_search_panel(view: &mut ViewState) {
-    let has = view
-        .panels
-        .panels
-        .iter()
-        .any(|p| matches!(p.kind, PanelKind::Search));
-    if view.search.active && !has {
-        view.panels.panels.push(Panel {
-            id: SEARCH_PANEL_ID,
-            placement: PanelPlacement::Bottom,
-            height: 36.0,
-            kind: PanelKind::Search,
-        });
-    } else if !view.search.active && has {
-        view.panels
-            .panels
-            .retain(|p| !matches!(p.kind, PanelKind::Search));
-    }
-}
-
-const SEARCH_PANEL_ID: u64 = 0x5EA8_C400_0000_0001;
-
-/// Re-run the search after panel interaction so the visible match list and
-/// decorations stay in sync with `view.search.query` / flags. Cheap when the
-/// query is empty (early-return inside `run_search`).
-fn refresh_search_matches(state: &EditorState, view: &mut ViewState) {
-    if !view.search.active {
-        return;
-    }
-    let matches = editor_view::run_search(state, &view.search.query, view.search.flags);
-    if matches != view.search.matches {
-        view.search.matches = matches;
-        if view.search.matches.is_empty() {
-            view.search.current_idx = None;
-        } else if view
-            .search
-            .current_idx
-            .map(|i| i >= view.search.matches.len())
-            .unwrap_or(true)
-        {
-            view.search.current_idx = Some(0);
         }
     }
 }
@@ -774,31 +732,71 @@ fn prewrap_visible(view: &mut ViewState, state: &EditorState) {
         return;
     }
     let total = state.doc.len_lines();
-    // Two-phase strategy: first pass over ALL lines uses cached vline counts
-    // (O(line_count) but O(1) per cached line) to keep `total_visual_lines`
-    // and the height map honest; second pass only recomputes wraps for lines
-    // intersecting the viewport + margin (which is where stale entries from
-    // edits matter, and where character measurement is hot).
+    // Walk every line. `get_or_compute` short-circuits in O(1) when the
+    // line's cached entry still matches the current width and text hash
+    // (the common case after the first frame), so the per-frame cost is
+    // a single hash + width check per line — cheap even for long docs.
     //
-    // Initial population (cold cache): walk all lines once so the height map
-    // gets a valid total. After that, only the visible band recomputes.
-    let cold = view.wrap_map.peek(0).is_none();
-    let visible = view.visible_lines();
-    let margin = 32usize;
-    let scope_start = visible.start.saturating_sub(margin);
-    let scope_end = (visible.end + margin).min(total);
-
-    if cold {
-        for line in 0..total {
-            let text = state.doc.line_str(line);
-            view.wrap_map.get_or_compute(line, |_| text.clone());
-        }
-        return;
-    }
-    for line in scope_start..scope_end {
+    // We previously only re-walked the visible band on warm frames as an
+    // optimization, but that left off-screen lines uncomputed after
+    // per-line invalidations (edits). `apply_line_height_decorations`
+    // skips lines where `wrap_map.peek` is None, so those lines kept
+    // their base (unwrapped) height in `height_map` — producing
+    // LOD-style scaling in the minimap as scrolling lazily filled in
+    // off-screen wraps. Always walking keeps `total_height`,
+    // `text_height`, and `y_at_text` stable regardless of scroll
+    // position.
+    //
+    // Per-line `font_scale` (heading promotion etc.) is folded into the
+    // wrap calc so a heading whose decorated text is e.g. 1.6× the base
+    // monospace cell wraps at the right column, instead of overshooting
+    // and getting clipped by the minimap or the pane edge.
+    //
+    // Compute scales upfront via an immutable borrow of `view.decorations`,
+    // then iterate with a mutable borrow of `view.wrap_map` — the two
+    // fields are disjoint but the borrow checker can't see that across
+    // the per-line closure without a separate scoped collection.
+    let scales: Vec<f32> = (0..total)
+        .map(|line| line_font_scale(view, state, line))
+        .collect();
+    for line in 0..total {
         let text = state.doc.line_str(line);
-        view.wrap_map.get_or_compute(line, |_| text.clone());
+        view.wrap_map.get_or_compute(line, |_| text.clone(), scales[line]);
     }
+}
+
+/// Max `font_scale` of any `Mark` decoration covering `line`. Used by the
+/// soft-wrap calc so heading-scaled lines break at the right visual
+/// column. Returns `1.0` when no scaled mark covers the line, which is
+/// the unmodified base behavior.
+fn line_font_scale(view: &ViewState, state: &EditorState, line: usize) -> f32 {
+    use editor_core::Decoration;
+    let total_lines = state.doc.len_lines();
+    if line >= total_lines {
+        return 1.0;
+    }
+    let start = state.doc.line_to_byte(line);
+    let end = if line + 1 < total_lines {
+        state.doc.line_to_byte(line + 1)
+    } else {
+        state.doc.len_bytes()
+    };
+    // Empty line: nothing to scale, but probe one byte forward so a
+    // mark anchored exactly at the line break still registers (range
+    // queries are half-open).
+    let probe_end = end.max(start + 1);
+    let mut max_scale: f32 = 1.0;
+    for layer in &view.decorations.layers {
+        for (_range, deco) in layer.iter_overlapping(start..probe_end) {
+            if let Decoration::Mark(ms) = deco
+                && let Some(s) = ms.font_scale
+                && s > max_scale
+            {
+                max_scale = s;
+            }
+        }
+    }
+    max_scale
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,21 +989,45 @@ fn paint_inline_widget_placeholder(
     click_zones: &mut Vec<ClickZone>,
 ) {
     let visuals = ctx.ui.style().visuals.clone();
-    let bg = if visuals.dark_mode {
-        Color32::from_rgba_unmultiplied(70, 80, 110, 80)
-    } else {
-        Color32::from_rgba_unmultiplied(210, 220, 240, 220)
-    };
-    let border = visuals.weak_text_color().gamma_multiply(0.5);
     let rect = Rect::from_min_max(
         Pos2::new(seg_x, line_top_y),
         Pos2::new(seg_x + seg_w, line_top_y + row_height),
     );
-    ctx.painter.rect_filled(rect, 3.0, bg);
-    ctx.painter
-        .rect_stroke(rect, 3.0, Stroke::new(0.5, border), egui::StrokeKind::Inside);
-    ctx.painter
-        .galley(Pos2::new(seg_x + 2.0, label_y), label_galley.clone(), border);
+
+    if let Some(display) = widget.display() {
+        // Textual variant — host wants this widget to read as ordinary
+        // inline text with a colored background (patch-review intraline
+        // insertion, future inline diagnostics, etc.). Skip the bordered
+        // placeholder entirely and just paint a bg fill + the galley.
+        if let Some(bg) = display.bg {
+            ctx.painter.rect_filled(rect, 0.0, to_egui_color(bg));
+        }
+        let fg = display
+            .fg
+            .map(to_egui_color)
+            .unwrap_or_else(|| visuals.text_color());
+        ctx.painter
+            .galley(Pos2::new(seg_x, label_y), label_galley.clone(), fg);
+        if display.strikethrough {
+            let mid_y = line_top_y + row_height * 0.5;
+            ctx.painter.line_segment(
+                [Pos2::new(seg_x, mid_y), Pos2::new(seg_x + seg_w, mid_y)],
+                Stroke::new(1.0, fg),
+            );
+        }
+    } else {
+        let bg = if visuals.dark_mode {
+            Color32::from_rgba_unmultiplied(70, 80, 110, 80)
+        } else {
+            Color32::from_rgba_unmultiplied(210, 220, 240, 220)
+        };
+        let border = visuals.weak_text_color().gamma_multiply(0.5);
+        ctx.painter.rect_filled(rect, 3.0, bg);
+        ctx.painter
+            .rect_stroke(rect, 3.0, Stroke::new(0.5, border), egui::StrokeKind::Inside);
+        ctx.painter
+            .galley(Pos2::new(seg_x + 2.0, label_y), label_galley.clone(), border);
+    }
 
     if widget.handles_click() {
         click_zones.push(ClickZone {
@@ -1183,8 +1205,21 @@ fn build_line_layout(
 ) -> LineLayout {
     let line_byte_end = line_byte_start + line_text.len();
     let mut events: Vec<DecoEvent> = Vec::new();
+    // End-of-line widgets: an `InlineWidget` decoration anchored at
+    // `line_byte_end..line_byte_end+1` (the newline / EOF byte) clips
+    // to an empty range under the normal interior path, so it gets
+    // dropped. Collect them here and append a trailing segment after
+    // the main segment-build loop so they render at the end of the
+    // line. Patch-review's intraline `new_str` widget uses this path.
+    let mut trailing_widgets: Vec<Arc<dyn InlineWidget>> = Vec::new();
     for layer in layers {
         for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_end + 1) {
+            if let Decoration::InlineWidget { widget, .. } = deco {
+                if range.start == line_byte_end {
+                    trailing_widgets.push(widget.clone());
+                    continue;
+                }
+            }
             let clipped = range.start.max(line_byte_start)..range.end.min(line_byte_end);
             if clipped.start >= clipped.end {
                 continue;
@@ -1367,6 +1402,18 @@ fn build_line_layout(
             style: MarkStyle::default(),
             is_replacement: false,
             widget: None,
+        });
+    }
+    // Trailing widgets anchored past the line's last byte (see comment
+    // at event-collection above). Zero-width buffer range so cursor
+    // motion still treats the line as ending at line_byte_end.
+    for w in trailing_widgets {
+        segments.push(Segment {
+            display: SmolStr::default(),
+            buffer_range: line_byte_end..line_byte_end,
+            style: MarkStyle::default(),
+            is_replacement: true,
+            widget: Some(w),
         });
     }
     LineLayout { segments, base_font_size, base_color }

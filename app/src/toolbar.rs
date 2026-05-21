@@ -449,8 +449,8 @@ fn render_actions_menu(ui: &mut egui::Ui, state: &mut AppState) {
             open_singleton_tab(state, TabKind::PatchReview);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::AgentChanges, 0) {
-            open_singleton_tab(state, TabKind::AgentChanges);
+        if tab_menu_row(ui, TabKind::Changes, 0) {
+            open_singleton_tab(state, TabKind::Changes);
             ui.close();
         }
         if tab_menu_row(ui, TabKind::Plugins, 0) {

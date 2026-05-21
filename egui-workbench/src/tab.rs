@@ -19,6 +19,17 @@ pub trait DocumentTab: Clone + 'static {
     fn closable(&self) -> bool {
         true
     }
+
+    /// Should the workbench wrap this tab's body in the standard
+    /// `pane_content_inset` margin? Defaults to `true` for the typical
+    /// "settings-style" panel where the inset reads as a normal content
+    /// margin against the pane background. Tabs whose body is its own
+    /// edge-to-edge surface — markdown / source editors painting their
+    /// own background — should return `false` so a contrasting strip
+    /// of pane fill isn't visible around the editor's bg color.
+    fn wants_pane_content_inset(&self) -> bool {
+        true
+    }
 }
 
 /// Per-tab UI state. Distinct from the `Tab` payload itself.

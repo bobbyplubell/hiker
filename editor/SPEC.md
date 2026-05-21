@@ -76,11 +76,25 @@ application would be built on.
 - Custom widgets that occupy inline space within a row (e.g. a checkbox glyph, a colored
   badge, a fold-region pill).
 - Widgets are measured by the editor and laid out among the glyphs.
+- A widget may opt to render as plain styled text via the `display()` trait method
+  (returning text + bg/fg/strikethrough). The painter renders the supplied text as the
+  segment's galley with the bg fill instead of the bordered placeholder. Used by hosts
+  that want a small textual insertion at a byte position (patch-review's intraline
+  `new_str`, future inline diagnostics, etc.) without introducing a new decoration variant.
+- End-of-line widgets — an inline widget whose range starts at the line's last byte
+  (i.e. at the newline / EOF position) renders as a trailing segment after the line's
+  text rather than being clipped to zero width. Lets a host append visible text past
+  the line's final character without a Block widget.
 
 ### 3.5 Block widgets
 - Widgets that occupy a full row of their own above or below a buffer line (e.g. an inline
   image, a diff-context expander, an embedded chart).
 - Block widgets supply their own height.
+- Pure-data action-row variant — `BlockKind::ActionRow { label, glyph, tone, buttons }`
+  renders a thin horizontal strip with a label on the left and a row of clickable
+  buttons on the right. Each enabled button registers a `ClickAction::WidgetClick(id)`
+  on its own rect. Used by patch-review for the per-hunk Accept / Reject row and the
+  unanchored-pin Reject row; available to any host that wants a generic button-bar block.
 
 ### 3.6 Folding / replace
 - Hide a range of text behind a placeholder widget (the standard code-folding behavior).

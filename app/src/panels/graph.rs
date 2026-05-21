@@ -265,14 +265,38 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         update_selection(app, path);
     }
 
-    // Note-preview overlay (drawn last so it sits on top of nodes).
-    if let Some(gs) = app.panels.graph.as_ref()
-        && gs.show_preview
-        && let Some(path) = gs.selected_path.as_deref()
+    // Hover-driven preview: while `show_preview` is on, the card
+    // tracks the hovered node and anchors near its screen position.
+    let hovered_info: Option<(String, egui::Pos2)> = hovered.and_then(|idx| {
+        app.panels.graph.as_ref().and_then(|gs| {
+            let n = gs.graph.node_weight(idx)?;
+            let i = idx.index();
+            let pos = gs.positions.get(i).copied()?;
+            Some((n.path.clone(), to_screen(pos)))
+        })
+    });
+    let show_preview = app
+        .panels
+        .graph
+        .as_ref()
+        .map(|gs| gs.show_preview)
+        .unwrap_or(false);
+    if show_preview
+        && let Some((path, _)) = hovered_info.as_ref()
     {
-        let title = basename(path);
+        update_selection(app, path.clone());
+    }
+
+    // Note-preview overlay (drawn last so it sits on top of nodes).
+    // Only when we're actively hovering a node — otherwise the card
+    // would linger over the last-clicked node, which is confusing.
+    if show_preview
+        && let Some((path, anchor)) = hovered_info
+        && let Some(gs) = app.panels.graph.as_ref()
+    {
+        let title = basename(&path);
         let body = gs.selected_preview.as_deref().unwrap_or("(unable to read note)");
-        paint_preview_card(&painter, rect, &title, body);
+        paint_preview_card(&painter, rect, &title, body, anchor);
     }
 }
 
@@ -288,7 +312,12 @@ fn update_selection(app: &mut AppState, path: String) {
     if !needs_load {
         return;
     }
-    let preview = app.vault_session.vault.read_file(&path).ok().map(truncate_preview);
+    let preview = app
+        .vault_session
+        .vault
+        .read_file(&path)
+        .ok()
+        .map(|s| truncate_preview(skip_frontmatter(&s).to_string()));
     if let Some(gs) = app.panels.graph.as_mut() {
         gs.selected_path = Some(path);
         gs.selected_preview = preview;
@@ -305,53 +334,107 @@ fn truncate_preview(s: String) -> String {
     out
 }
 
-/// Paint a small note-preview card overlay in the bottom-left corner
-/// of `canvas`. Shared shape with the cluster graph; we leave the
-/// helper inline here until a third panel wants one.
+/// Skip a YAML frontmatter block at the start of a markdown file and
+/// also any blank lines that immediately follow it. Without this, the
+/// preview body opens on the YAML (`---\nid: …\n---`) instead of the
+/// real note content. If the file doesn't open with `---`, returns the
+/// input unchanged. `pub(crate)` so the cluster graph panel can reuse
+/// it.
+pub(crate) fn skip_frontmatter(source: &str) -> &str {
+    let trimmed_left = source.trim_start_matches(['\u{feff}']);
+    let Some(rest) = trimmed_left
+        .strip_prefix("---\n")
+        .or_else(|| trimmed_left.strip_prefix("---\r\n"))
+    else {
+        return source;
+    };
+    // Find the closing `---` on its own line. Bail back to the original
+    // text if the block is unterminated (corrupt frontmatter shouldn't
+    // hide the whole note).
+    let mut search_from = 0;
+    while let Some(idx) = rest[search_from..].find("\n---") {
+        let start = search_from + idx + 1; // line start of the closing fence
+        let after_fence = start + 3; // past the three dashes
+        let tail = &rest[after_fence..];
+        if tail.starts_with('\n') || tail.starts_with("\r\n") || tail.is_empty() {
+            let skip = if tail.starts_with("\r\n") { 2 } else { 1 };
+            return rest[after_fence + skip..].trim_start_matches(['\n', '\r']);
+        }
+        search_from = after_fence;
+    }
+    source
+}
+
+/// Paint a small preview card anchored near `anchor` (typically the
+/// hovered node's screen position). Placement nudges the card to keep
+/// it inside `canvas`. Shared between the vault graph and cluster
+/// graph panels.
 pub(crate) fn paint_preview_card(
     painter: &egui::Painter,
     canvas: egui::Rect,
     title: &str,
     body: &str,
+    anchor: egui::Pos2,
 ) {
     let pad = 8.0;
-    let card_size = egui::vec2(360.0, 200.0).min(canvas.size() - egui::vec2(pad * 2.0, pad * 2.0));
+    let max_size = egui::vec2(320.0, 180.0);
+    let card_size = max_size.min(canvas.size() - egui::vec2(pad * 2.0, pad * 2.0));
     if card_size.x < 80.0 || card_size.y < 60.0 {
         return;
     }
-    let card_rect = egui::Rect::from_min_size(
-        egui::pos2(canvas.left() + pad, canvas.bottom() - pad - card_size.y),
-        card_size,
-    );
-    painter.rect_filled(
-        card_rect,
-        4.0,
-        egui::Color32::from_rgba_unmultiplied(0x1e, 0x22, 0x28, 0xee),
-    );
+    // Try bottom-right of cursor first; flip to other quadrants if it
+    // would clip the canvas. 14px offset clears the node circle.
+    let offset = egui::vec2(14.0, 14.0);
+    let mut min = anchor + offset;
+    if min.x + card_size.x > canvas.right() - pad {
+        min.x = anchor.x - offset.x - card_size.x;
+    }
+    if min.y + card_size.y > canvas.bottom() - pad {
+        min.y = anchor.y - offset.y - card_size.y;
+    }
+    min.x = min.x.clamp(canvas.left() + pad, canvas.right() - pad - card_size.x);
+    min.y = min.y.clamp(canvas.top() + pad, canvas.bottom() - pad - card_size.y);
+    let card_rect = egui::Rect::from_min_size(min, card_size);
+
+    let bg = egui::Color32::from_rgb(0xfa, 0xfa, 0xfa);
+    let border = egui::Color32::from_rgb(0xc8, 0xcd, 0xd4);
+    let title_color = egui::Color32::from_rgb(0x1a, 0x1e, 0x24);
+    let body_color = egui::Color32::from_rgb(0x4a, 0x52, 0x5c);
+
+    painter.rect_filled(card_rect, 4.0, bg);
     painter.rect_stroke(
         card_rect,
         4.0,
-        egui::Stroke::new(1.0, theme::divider()),
+        egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
+
     let inner = card_rect.shrink(8.0);
-    painter.text(
-        inner.left_top(),
-        egui::Align2::LEFT_TOP,
-        title,
+    // Lay out the title with a max-width so long basenames (or cluster
+    // names) wrap inside the card instead of running off the right
+    // edge. Body then starts below however many lines the title used.
+    let title_galley = painter.layout(
+        title.to_string(),
         egui::FontId::proportional(13.0),
-        egui::Color32::from_rgb(0xe6, 0xea, 0xf0),
+        title_color,
+        inner.width(),
     );
-    let body_top = inner.left_top() + egui::vec2(0.0, 20.0);
+    let title_size = title_galley.size();
+    painter.galley(inner.left_top(), title_galley, title_color);
+
+    let body_top = inner.left_top() + egui::vec2(0.0, title_size.y + 6.0);
+    if body_top.y >= inner.bottom() {
+        return; // title alone filled the card
+    }
     let body_rect = egui::Rect::from_min_max(body_top, inner.right_bottom());
-    let galley = painter.layout(
+    let body_galley = painter.layout(
         body.to_string(),
         egui::FontId::proportional(11.0),
-        theme::muted(),
+        body_color,
         body_rect.width(),
     );
     let clip_painter = painter.with_clip_rect(body_rect);
-    clip_painter.galley(body_rect.left_top(), galley, theme::muted());
+    clip_painter.galley(body_rect.left_top(), body_galley, body_color);
 }
 
 fn view_options_menu(ui: &mut egui::Ui, gs: &mut GraphState) {

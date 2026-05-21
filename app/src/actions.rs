@@ -241,13 +241,13 @@ static A_VAULT_PATCH_REVIEW: Action = Action {
     category: ActionCategory::Vault,
 };
 
-static A_VAULT_AGENT_CHANGES: Action = Action {
-    id: "vault.open_agent_changes",
-    icon: icons::robot,
-    label: "Agent changes",
+static A_VAULT_CHANGES: Action = Action {
+    id: "vault.open_changes",
+    icon: icons::clock,
+    label: "Changes",
     badge: None,
     enabled: None,
-    run: |s| open_singleton(s, TabKind::AgentChanges),
+    run: |s| open_singleton(s, TabKind::Changes),
     category: ActionCategory::Vault,
 };
 
@@ -288,6 +288,10 @@ fn new_chat_session(state: &mut AppState) {
         state.push_toast(format!("New chat failed: {err}"), ToastLevel::Error);
     } else {
         ensure_panel_visible(state, crate::panels_registry::PANEL_CHAT);
+        // Chat lives in the workbench's secondary side bar, not the
+        // tile dock. If the user has collapsed that bar, re-show it so
+        // the freshly-created session is visible.
+        state.workbench.secondary_side_bar.visible = true;
     }
 }
 
@@ -321,6 +325,26 @@ static A_VIEW_TOOLBAR_CUSTOMIZE: Action = Action {
     badge: None,
     enabled: None,
     run: |s| s.ui.customize_toolbars = !s.ui.customize_toolbars,
+    category: ActionCategory::View,
+};
+
+static A_VIEW_TOGGLE_LEFT_SIDEBAR: Action = Action {
+    id: "view.toggle_left_sidebar",
+    icon: icons::sidebar_left,
+    label: "Toggle left sidebar",
+    badge: None,
+    enabled: None,
+    run: |s| s.workbench.primary_side_bar.toggle(),
+    category: ActionCategory::View,
+};
+
+static A_VIEW_TOGGLE_RIGHT_SIDEBAR: Action = Action {
+    id: "view.toggle_right_sidebar",
+    icon: icons::sidebar_right,
+    label: "Toggle right sidebar",
+    badge: None,
+    enabled: None,
+    run: |s| s.workbench.secondary_side_bar.toggle(),
     category: ActionCategory::View,
 };
 
@@ -455,7 +479,7 @@ static A_PANEL_TOGGLE_CLUSTERS: Action = Action {
 };
 static A_PANEL_TOGGLE_TRAILS: Action = Action {
     id: "panel.toggle.trails",
-    icon: icons::boot,
+    icon: icons::trail,
     label: "Toggle Trails panel",
     badge: None,
     enabled: None,
@@ -654,7 +678,7 @@ static ALL: &[&Action] = &[
     &A_VAULT_INDEXER,
     &A_VAULT_GRAPH,
     &A_VAULT_PATCH_REVIEW,
-    &A_VAULT_AGENT_CHANGES,
+    &A_VAULT_CHANGES,
     &A_VAULT_PLUGINS,
     &A_CHAT_NEW,
     &A_PANEL_TOGGLE_FILES,
@@ -671,6 +695,8 @@ static ALL: &[&Action] = &[
     &A_LAYOUT_RESET_FACTORY,
     &A_VIEW_TOGGLE_HELP,
     &A_VIEW_TOGGLE_PROFILER,
+    &A_VIEW_TOGGLE_LEFT_SIDEBAR,
+    &A_VIEW_TOGGLE_RIGHT_SIDEBAR,
     &A_VIEW_TOOLBAR_CUSTOMIZE,
     &A_VIEW_TOOLBAR_RESET,
     &A_FILE_CLOSE_TAB,

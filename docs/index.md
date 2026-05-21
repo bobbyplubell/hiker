@@ -194,8 +194,12 @@ Triggered three ways, all funnel into the same upsert path:
 Per-file pipeline:
 
 ```
-read file → compute blake3 hash → if hash matches notes.content_hash, no-op
+read file → compute blake3 hash → if hash matches notes.content_hash AND
+                                     embedder_version matches AND force=false → no-op
          → else: parse → chunk → embed batch → BEGIN TX
+                                                 compute byte-weighted mean-pool
+                                                   of the new chunk embeddings →
+                                                   notes.note_embedding
                                                  upsert notes row
                                                  delete old chunks + vecs for note_id
                                                  insert new chunks + vecs
@@ -203,7 +207,9 @@ read file → compute blake3 hash → if hash matches notes.content_hash, no-op
                                                COMMIT
          → emit `hiker:reindex-progress` event
 ```
-[ingest-tx-upsert, ingest-progress-events]
+[ingest-tx-upsert, ingest-progress-events, cluster-note-embeddings]
+
+The note-level pool is computed and persisted in the same transaction as the chunks, so every successful upsert leaves the cached pool in sync with the chunk set the cluster pipeline consumes. Notes with no chunks leave `note_embedding` NULL.
 
 Deletes: cascade via the FK on `chunks`; vec rows cleaned up explicitly (vec0 has no FK enforcement). [ingest-delete-cascade]
 
@@ -240,7 +246,7 @@ Latency budget: the panel updates on file-open and on save (debounced 500ms). Br
 Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_hash`, `write_file_checked`). v1 adds three:
 
 - `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [cmd-related-notes]
-- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. [cmd-index-status]
+- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. `queued` here is the mpsc-channel depth, which sits at ~1 during a `FullScan` because that handler processes per-file Upserts inline. The indexer-detail panel surfaces work-remaining via `IndexerHandle::pending_count()` instead (the size of the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start) so the user sees a number that counts down from N to 0 across the scan. [cmd-index-status, indexer-detail-pending-counter]
 - `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events. [cmd-index]
 - `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
 
@@ -282,8 +288,8 @@ Indexer logic: when ingest decides to skip a file, write the `notes` row with `s
 
 `cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
 
-- **Reindex all** — `index(IndexScope::All)`. No confirm modal; re-embedding identical content is non-destructive and the click is the opt-in. [reindex-all-action]
-- **Reindex this file** — `index(IndexScope::Path(currentPath))`. Greyed when no file is active. [reindex-current-file-action]
+- **Reindex all** — `index(IndexScope::All)` with the `force` flag set: bypasses the content-hash + embedder-version short-circuit so every note re-embeds even when nothing changed. The button is the user's explicit "redo all the work" verb; without `force` the click would be a no-op on a clean vault. The first-launch / vault-open startup scan and watcher-driven Upserts still default to `force=false` so the cheap-when-nothing-changed path keeps applying to ambient ingest. [reindex-all-action]
+- **Reindex this file** — `index(IndexScope::Path(currentPath))` with `force=true` for the same reason. Greyed when no file is active. [reindex-current-file-action]
 
 A third verb, **Reindex (rebuild)** — drops + recreates the schema, then a full reindex — is deferred to the settings page per `settings.md`'s indexing section. The CLI counterpart `cli-reindex-rebuild` covers the operational case in the meantime, so v1 ships without the in-app rebuild button. [reindex-rebuild-action]
 

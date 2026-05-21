@@ -314,7 +314,26 @@ impl<'a> HikerBehavior<'a> {
             return;
         };
         match kind {
-            TabKind::Buffer { path } => panels::buffer::show(ui, self.app, &path, self.rt),
+            TabKind::Editor { buffer, diff } => {
+                use crate::tab::BufferSource;
+                // Diff renders as a decoration layer on the same editor
+                // widget via `diff_overlay::compute`; not a separate panel.
+                let _ = diff;
+                match buffer {
+                    BufferSource::Vault { path } => {
+                        panels::buffer::show(ui, self.app, &path, self.rt)
+                    }
+                    BufferSource::Snapshot { path, change_id } => {
+                        panels::snapshot_preview::show(ui, self.app, &path, &change_id)
+                    }
+                    BufferSource::StagingProposal { proposal_id, target_path } => {
+                        panels::staging_preview::show(ui, self.app, &proposal_id, &target_path)
+                    }
+                    BufferSource::Trash { trash_path, original_path } => {
+                        panels::trash_preview::show(ui, self.app, &trash_path, &original_path)
+                    }
+                }
+            }
             TabKind::Home => panels::home::show(ui, self.app),
             TabKind::HomeDetail { which } => panels::home::show_detail(ui, self.app, &which),
             TabKind::Queue => panels::queue::show(ui, self.app),
@@ -327,20 +346,10 @@ impl<'a> HikerBehavior<'a> {
             TabKind::Agent { session_id } => {
                 panels::agent::show(ui, self.app, &session_id, self.rt)
             }
-            TabKind::TrashPreview { trash_path, original_path } => {
-                panels::trash_preview::show(ui, self.app, &trash_path, &original_path)
-            }
-            TabKind::SnapshotPreview { path, change_id } => {
-                panels::snapshot_preview::show(ui, self.app, &path, &change_id)
-            }
-            TabKind::BufferDiff { path } => panels::buffer_diff::show(ui, self.app, &path),
-            TabKind::StagingPreview { proposal_id, target_path } => {
-                panels::staging_preview::show(ui, self.app, &proposal_id, &target_path)
-            }
             TabKind::PatchReview => panels::patch_review::show(ui, self.app),
             TabKind::Plugins => panels::plugins::show(ui, self.app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, self.app, self.rt),
-            TabKind::AgentChanges => panels::agent_changes::show(ui, self.app),
+            TabKind::Changes => panels::changes::show(ui, self.app),
             TabKind::ClusterReview { config_json } => {
                 panels::cluster_review::show(ui, self.app, id, &config_json)
             }

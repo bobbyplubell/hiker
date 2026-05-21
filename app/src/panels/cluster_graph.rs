@@ -264,7 +264,7 @@ fn show_with_nodes_inner(
         }
     }
 
-    let clicked_path = paint_nodes(
+    let hits = paint_nodes(
         &painter,
         nodes,
         &ids,
@@ -277,27 +277,73 @@ fn show_with_nodes_inner(
         app,
         clickable_leaves,
     );
-    if let Some(path) = clicked_path {
+    if let Some(path) = hits.clicked {
         crate::editor_pane::open_file(app, &path, /*sticky=*/ true);
         update_selection(app, tree_id, path);
     }
 
-    // Note-preview overlay (drawn last so it sits on top of nodes).
-    if let Some(state) = app.panels.cluster_graph.get(tree_id)
-        && state.show_preview
-        && let Some(path) = state.selected_path.as_deref()
+    // Hover-driven preview. For leaves we keep `selected_preview`'s
+    // file-content cache up to date (so the body text follows the
+    // cursor across leaves). For clusters there's no file to read —
+    // the card uses the node's in-memory summary directly.
+    let show_preview = app
+        .panels
+        .cluster_graph
+        .get(tree_id)
+        .map(|s| s.show_preview)
+        .unwrap_or(false);
+    if show_preview
+        && let Some(h) = hits.hovered.as_ref()
+        && let Some(path) = h.leaf_path.as_deref()
     {
-        let title = path
-            .rsplit('/')
-            .next()
-            .unwrap_or(path)
-            .strip_suffix(".md")
-            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
-        let body = state
-            .selected_preview
-            .as_deref()
-            .unwrap_or("(unable to read note)");
-        crate::panels::graph::paint_preview_card(&painter, rect, title, body);
+        update_selection(app, tree_id, path.to_string());
+    }
+
+    if show_preview
+        && let Some(h) = hits.hovered.as_ref()
+    {
+        let cached_body = app
+            .panels
+            .cluster_graph
+            .get(tree_id)
+            .and_then(|s| s.selected_preview.clone())
+            .filter(|s| !s.is_empty());
+        let (title, body): (String, String) = if let Some(path) = h.leaf_path.as_deref() {
+            let title = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(path)
+                .strip_suffix(".md")
+                .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path))
+                .to_string();
+            // Body resolution for a leaf:
+            //   1. cached file content (post-frontmatter)
+            //   2. in-memory summary (rare for leaves but possible)
+            //   3. "(unable to read note)" fallback
+            let body = cached_body
+                .or_else(|| {
+                    if h.summary.is_empty() {
+                        None
+                    } else {
+                        Some(h.summary.clone())
+                    }
+                })
+                .unwrap_or_else(|| "(unable to read note)".to_string());
+            (title, body)
+        } else {
+            // Non-leaf: prefer in-memory summary; fall back to a
+            // cached body if some earlier hover left one (e.g. the
+            // tree's last clicked leaf), since "(no summary)" is
+            // less useful than showing real content somewhere in
+            // the tree.
+            let body = if !h.summary.is_empty() {
+                h.summary.clone()
+            } else {
+                cached_body.unwrap_or_else(|| "(no summary)".to_string())
+            };
+            (h.name.clone(), body)
+        };
+        crate::panels::graph::paint_preview_card(&painter, rect, &title, &body, h.screen_pos);
     }
 
     ui.add_space(4.0);
@@ -447,7 +493,7 @@ fn paint_nodes(
     to_screen: &dyn Fn(egui::Vec2) -> egui::Pos2,
     app: &AppState,
     clickable_leaves: bool,
-) -> Option<String> {
+) -> PaintHits {
     use hiker_core::trees::{NodeKind, NodePolicy};
 
     let members = compute_member_counts(nodes);
@@ -463,6 +509,7 @@ fn paint_nodes(
     let hover = resp.hover_pos();
     let mut tooltip: Option<(egui::Pos2, String)> = None;
     let mut clicked_path: Option<String> = None;
+    let mut hovered_node: Option<HoveredNode> = None;
     for n in nodes {
         let Some(&idx) = id_index.get(n.id.as_str()) else {
             continue;
@@ -531,14 +578,41 @@ fn paint_nodes(
         }
         if hovered {
             tooltip = Some((p + egui::Vec2::new(10.0, -10.0), n.name.clone()));
-            if clickable_leaves
-                && resp.clicked()
-                && let Some(note_id) = &n.note_ref
-                && let Ok(store) = app.vault_session.services.read_store.lock()
-                && let Ok(Some(path)) = store.path_for_id(note_id)
-            {
-                clicked_path = Some(path);
-            }
+            // Resolve the leaf path (if any) while we have a fresh
+            // store lock. For non-leaf nodes there is no file to
+            // preview — the card will render the in-memory summary
+            // instead. Either way we record the screen position so
+            // the preview can anchor near the hovered node.
+            //
+            // `note_ref` semantics differ between the persisted
+            // cluster-tree tab (a real `NoteId` looked up through the
+            // store) and the cluster-review embed (a vault-relative
+            // path stuffed into the same field, since the build runs
+            // off `NoteInput { id: rel_path, … }`). Try the store
+            // first; fall back to treating `note_ref` as a path so
+            // the review preview also gets a working preview card.
+            let leaf_path = if let Some(note_id) = &n.note_ref {
+                let resolved = app
+                    .vault_session
+                    .services
+                    .read_store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.path_for_id(note_id).ok().flatten());
+                let path = resolved.unwrap_or_else(|| note_id.clone());
+                if clickable_leaves && resp.clicked() {
+                    clicked_path = Some(path.clone());
+                }
+                Some(path)
+            } else {
+                None
+            };
+            hovered_node = Some(HoveredNode {
+                name: n.name.clone(),
+                summary: n.summary.clone(),
+                leaf_path,
+                screen_pos: p,
+            });
         }
     }
     if let Some((p, txt)) = tooltip {
@@ -556,7 +630,33 @@ fn paint_nodes(
         );
         painter.galley(p, galley, egui::Color32::BLACK);
     }
-    clicked_path
+    PaintHits {
+        clicked: clicked_path,
+        hovered: hovered_node,
+    }
+}
+
+/// Output of [`paint_nodes`]: which leaf was clicked this frame (used
+/// to open the note) and which node the cursor is currently over (used
+/// to drive the live preview card).
+struct PaintHits {
+    clicked: Option<String>,
+    hovered: Option<HoveredNode>,
+}
+
+/// Snapshot of the cluster/leaf node currently under the cursor.
+/// Carries everything the preview card needs to render — including
+/// the on-screen position so the card can anchor next to the node
+/// rather than parking in a fixed corner.
+struct HoveredNode {
+    name: String,
+    summary: String,
+    /// Resolved vault path when this is a leaf with a `note_ref`. None
+    /// for clusters (and for leaves whose note_ref can't be resolved
+    /// through the store) — the card falls back to the in-memory
+    /// `summary` for those.
+    leaf_path: Option<String>,
+    screen_pos: egui::Pos2,
 }
 
 /// Cheap shape fingerprint over the (id, parent) edges. Changes when
@@ -573,7 +673,12 @@ fn update_selection(app: &mut AppState, tree_id: &str, path: String) {
     if !needs_load {
         return;
     }
-    let preview = app.vault_session.vault.read_file(&path).ok().map(truncate_preview);
+    let preview = app
+        .vault_session
+        .vault
+        .read_file(&path)
+        .ok()
+        .map(|s| truncate_preview(crate::panels::graph::skip_frontmatter(&s).to_string()));
     if let Some(s) = app.panels.cluster_graph.get_mut(tree_id) {
         s.selected_path = Some(path);
         s.selected_preview = preview;

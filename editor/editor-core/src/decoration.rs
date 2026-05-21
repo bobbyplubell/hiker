@@ -29,6 +29,24 @@ pub trait InlineWidget: Send + Sync {
     fn widget_id(&self) -> u64 {
         0
     }
+    /// When `Some`, the inline-widget painter renders the returned text
+    /// with the supplied colors instead of the bordered "widget"
+    /// placeholder. Used by hosts that want a small textual insertion
+    /// at a byte position (patch-review intraline `new_str` rendering,
+    /// inline diagnostics, etc.) without introducing a new decoration
+    /// variant. Default `None` keeps the placeholder behavior for
+    /// non-textual widgets.
+    fn display(&self) -> Option<InlineWidgetDisplay> {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InlineWidgetDisplay {
+    pub text: SmolStr,
+    pub bg: Option<Color>,
+    pub fg: Option<Color>,
+    pub strikethrough: bool,
 }
 
 /// Data-side trait for block widgets injected in the vertical gap above /
@@ -212,6 +230,44 @@ pub enum BlockKind {
         /// chevron glyph and label tense.
         collapsed: bool,
     },
+    /// Horizontal row with a label on the left and one or more clickable
+    /// buttons on the right. Used by hosts that want a single-line "do
+    /// something" affordance attached to a block range (patch-review
+    /// per-hunk Accept/Reject, unanchored-pin rows). Each enabled button
+    /// registers a `ClickAction::WidgetClick(button.id)` zone.
+    ActionRow {
+        label: SmolStr,
+        /// Small leading glyph rendered before the label (e.g. "?" for an
+        /// unanchored hunk). Empty / None when not needed.
+        glyph: Option<SmolStr>,
+        tone: ActionTone,
+        buttons: Vec<ActionButton>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ActionTone {
+    Normal,
+    Warning,
+    Conflicted,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActionButton {
+    pub id: u64,
+    pub label: SmolStr,
+    pub style: ActionButtonStyle,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ActionButtonStyle {
+    Primary,
+    Danger,
+    Neutral,
 }
 
 #[derive(Clone, Debug)]

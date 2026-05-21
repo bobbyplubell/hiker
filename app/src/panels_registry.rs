@@ -131,7 +131,7 @@ fn render_chat(
         crate::chat::session::discover(&mut app.session.chat, &vault_root);
         app.session.chat_discovered = true;
     }
-    crate::chat::render::show(ui, app, None, crate::chat::render::Layout::FullTab, rt);
+    crate::chat::render::show(ui, app, None, crate::chat::render::Layout::SideBar, rt);
 }
 
 // ---- Static panel records -----------------------------------------------

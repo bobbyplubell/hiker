@@ -173,9 +173,22 @@ fn per_hunk_review(
             if accepted.len() != hunks.len() {
                 accepted = vec![true; hunks.len()];
             }
-            for (i, h) in hunks.iter().enumerate() {
-                render_hunk_row(ui, h, i, &mut accepted);
-            }
+            // Pin the hunk picker to a bounded scroll region so a
+            // proposal touching dozens of hunks doesn't shove the
+            // Apply button off-screen and doesn't push the diff view
+            // below out of reach. egui's ScrollArea also avoids
+            // re-painting hunk bodies that are scrolled out of the
+            // clip rect, which addresses the per-frame layout cost
+            // for large proposals.
+            egui::ScrollArea::vertical()
+                .id_salt(("hunk-picker-scroll", proposal_id))
+                .max_height(360.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, h) in hunks.iter().enumerate() {
+                        render_hunk_row(ui, h, i, &mut accepted);
+                    }
+                });
             ui.ctx().data_mut(|d| d.insert_temp(mem_id, accepted.clone()));
             if ui
                 .add(
@@ -327,7 +340,12 @@ fn handle_accept(
                 ToastLevel::Info,
             );
             app.panels.preview_buffers.remove(key);
+            // Capture the target before the tab closes so we can route
+            // the user to the freshly-rewritten note instead of dropping
+            // them back on whatever was active before review.
+            let target = outcome.target_path.clone();
             close_active(app);
+            crate::editor_pane::open_file(app, &target, /*sticky=*/ true);
         }
         Err(err) => app.push_toast(
             format!("Accept failed: {}", err),

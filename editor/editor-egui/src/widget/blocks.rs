@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use editor_core::{BlockDeco, BlockKind, BlockSide, BlockTextLine, BlockWidget, Color, Decoration};
+use editor_core::{
+    ActionButton, ActionButtonStyle, ActionTone, BlockDeco, BlockKind, BlockSide, BlockTextLine,
+    BlockWidget, Color, Decoration,
+};
 use editor_view::{ClickAction, ClickRect, ClickZone};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke};
 
@@ -148,6 +151,109 @@ fn paint_block_kind(
                 font_size, click_zones, widget_rect,
             );
         }
+        BlockKind::ActionRow { label, glyph, tone, buttons } => {
+            paint_action_row(
+                ui, painter, rect, label.as_str(), glyph.as_deref(),
+                *tone, buttons, font_size, click_zones, widget_rect,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_action_row(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    label: &str,
+    glyph: Option<&str>,
+    tone: ActionTone,
+    buttons: &[ActionButton],
+    font_size: f32,
+    click_zones: &mut Vec<ClickZone>,
+    widget_rect: Rect,
+) {
+    let visuals = ui.style().visuals.clone();
+    let bg = match (tone, visuals.dark_mode) {
+        (ActionTone::Normal, true) => Color32::from_rgba_unmultiplied(48, 80, 56, 110),
+        (ActionTone::Normal, false) => Color32::from_rgba_unmultiplied(232, 245, 233, 220),
+        (ActionTone::Warning, true) => Color32::from_rgba_unmultiplied(90, 80, 50, 110),
+        (ActionTone::Warning, false) => Color32::from_rgba_unmultiplied(255, 244, 214, 220),
+        (ActionTone::Conflicted, true) => Color32::from_rgba_unmultiplied(70, 70, 70, 110),
+        (ActionTone::Conflicted, false) => Color32::from_rgba_unmultiplied(225, 225, 225, 220),
+    };
+    let fg = match tone {
+        ActionTone::Conflicted => visuals.weak_text_color(),
+        _ => visuals.text_color(),
+    };
+    painter.rect_filled(rect, 3.0, bg);
+
+    // Label on the left (glyph + text).
+    let label_font = FontId::new(font_size * 0.9, FontFamily::Proportional);
+    let label_text = match glyph {
+        Some(g) if !g.is_empty() => format!("{}  {}", g, label),
+        _ => label.to_string(),
+    };
+    let label_galley = ui.fonts(|f| f.layout_no_wrap(label_text, label_font.clone(), fg));
+    let label_pos = Pos2::new(
+        rect.min.x + 8.0,
+        rect.min.y + (rect.height() - label_galley.size().y) * 0.5,
+    );
+    painter.galley(label_pos, label_galley, fg);
+
+    // Buttons stacked from the right edge inward. Sized tight so the
+    // action row visually reads as a thin strip rather than a chunky
+    // toolbar — the editor body is the focus, this is just an
+    // affordance attached to it.
+    let btn_font = FontId::new(font_size * 0.8, FontFamily::Proportional);
+    let h_pad: f32 = 6.0;
+    let v_pad: f32 = 1.0;
+    let gap: f32 = 3.0;
+    let mut x = rect.max.x - 6.0;
+    for btn in buttons.iter().rev() {
+        let btn_fg_enabled = match btn.style {
+            ActionButtonStyle::Primary | ActionButtonStyle::Danger => Color32::WHITE,
+            ActionButtonStyle::Neutral => visuals.text_color(),
+        };
+        let btn_fg = if btn.enabled { btn_fg_enabled } else { visuals.weak_text_color() };
+        let btn_bg_enabled = match btn.style {
+            ActionButtonStyle::Primary => Color32::from_rgb(0x2f, 0x8f, 0x4d),
+            ActionButtonStyle::Danger => Color32::from_rgb(0xb9, 0x3a, 0x3a),
+            ActionButtonStyle::Neutral => Color32::from_gray(if visuals.dark_mode { 70 } else { 220 }),
+        };
+        let btn_bg = if btn.enabled {
+            btn_bg_enabled
+        } else {
+            Color32::from_gray(if visuals.dark_mode { 60 } else { 200 })
+        };
+        let btn_galley = ui.fonts(|f| f.layout_no_wrap(btn.label.to_string(), btn_font.clone(), btn_fg));
+        let btn_w = btn_galley.size().x + h_pad * 2.0;
+        let btn_h = (btn_galley.size().y + v_pad * 2.0).min(rect.height() - 4.0);
+        let btn_rect = Rect::from_min_max(
+            Pos2::new(x - btn_w, rect.min.y + (rect.height() - btn_h) * 0.5),
+            Pos2::new(x, rect.min.y + (rect.height() + btn_h) * 0.5),
+        );
+        painter.rect_filled(btn_rect, 3.0, btn_bg);
+        painter.galley(
+            Pos2::new(
+                btn_rect.min.x + h_pad,
+                btn_rect.min.y + (btn_rect.height() - btn_galley.size().y) * 0.5,
+            ),
+            btn_galley,
+            btn_fg,
+        );
+        if btn.enabled {
+            click_zones.push(ClickZone {
+                rect: ClickRect {
+                    x_min: btn_rect.min.x - widget_rect.min.x,
+                    y_min: btn_rect.min.y - widget_rect.min.y,
+                    x_max: btn_rect.max.x - widget_rect.min.x,
+                    y_max: btn_rect.max.y - widget_rect.min.y,
+                },
+                action: ClickAction::WidgetClick(btn.id),
+            });
+        }
+        x -= btn_w + gap;
     }
 }
 

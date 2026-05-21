@@ -6,9 +6,8 @@
 //! the standard `EditorWidget`. Toggling diff off reveals just the after-
 //! side text without decorations.
 
-use editor_core::diff::diff_lines;
 use editor_core::{light_default, EditorState};
-use editor_diff::{unified_decorations, unified_decorations_opts};
+use editor_diff::{DiffLayer, DiffOwner};
 use editor_egui::{EditorWidget, PaintCache};
 use editor_md::{
     callout_decorations, fold_decorations, footnote_decorations, frontmatter_fold,
@@ -82,12 +81,20 @@ pub fn show_with(ui: &mut egui::Ui, buf: &mut PreviewBuffer, intraline: bool) {
     let theme = Some(&theme_owned);
 
     buf.view.decorations.clear();
+    // Markdown / fold / frontmatter layers emit Line decorations with
+    // `font_scale` (heading sizing) and `hide: true` (folds), both of
+    // which affect line heights. They MUST go through
+    // `push_with_heights` so the heightmap reserves the right row
+    // sizes — otherwise a heading line renders at 2× scale into a
+    // 1× row and overflows past the top of the row, looking truncated.
+    // (The main buffer panel does this; the diff view was using the
+    // paint-only `push` and dropping the height signal.)
     buf.view
         .decorations
-        .push(markdown_decorations(&buf.editor, theme));
+        .push_with_heights(markdown_decorations(&buf.editor, theme));
     buf.view
         .decorations
-        .push(fold_decorations(&buf.editor, &buf.folds));
+        .push_with_heights(fold_decorations(&buf.editor, &buf.folds));
     buf.view
         .decorations
         .push(wikilink_decorations(&buf.editor, theme, None));
@@ -96,7 +103,7 @@ pub fn show_with(ui: &mut egui::Ui, buf: &mut PreviewBuffer, intraline: bool) {
         .push(callout_decorations(&buf.editor, theme, None));
     buf.view
         .decorations
-        .push(frontmatter_fold(&buf.editor, &buf.folds, theme));
+        .push_with_heights(frontmatter_fold(&buf.editor, &buf.folds, theme));
     buf.view
         .decorations
         .push(transclusion_decorations(&buf.editor, theme, None));
@@ -111,19 +118,16 @@ pub fn show_with(ui: &mut egui::Ui, buf: &mut PreviewBuffer, intraline: bool) {
         .push(mermaid_decorations(&buf.editor, theme, None));
 
     if buf.diff_active {
-        let hunks = diff_lines(&buf.before_text, &buf.after_text);
+        let layer = DiffLayer::from_base_text(
+            buf.before_text.clone(),
+            buf.editor.doc.clone(),
+            DiffOwner::Manual,
+        );
         let line_height = buf.view.line_height.max(18.0);
-        buf.view.decorations.push(unified_decorations_opts(
-            &buf.editor.doc,
-            &buf.before_text,
-            &hunks,
-            line_height,
-            theme,
-            intraline,
-        ));
+        buf.view
+            .decorations
+            .push_with_heights(layer.decorations(line_height, theme, intraline));
     }
-
-    let _ = unified_decorations; // kept re-exported for back-compat callers
 
     EditorWidget::new(&mut buf.editor, &mut buf.view)
         .with_paint_cache(&mut buf.paint_cache)

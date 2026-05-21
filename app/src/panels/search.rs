@@ -377,6 +377,41 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
             egui::TextEdit::singleline(&mut app.panels.search.query)
                 .hint_text("Search vault…"),
         );
+        // Inline mode toggles (per the legacy TS UI's
+        // toggleLexicalBtn/toggleSemanticBtn). Right-click on either still
+        // opens the full options menu for per-mode tuning.
+        let lex_on = app.panels.search.lexical_on;
+        let lex_resp = ui
+            .selectable_label(lex_on, "Lex")
+            .on_hover_text("Lexical: substring / token matches");
+        if lex_resp.clicked() {
+            app.panels.search.lexical_on = !lex_on;
+            persist_search_setting(
+                app,
+                "search.modes.lexical",
+                serde_json::json!(app.panels.search.lexical_on),
+            );
+            run_search = true;
+        }
+        lex_resp.context_menu(|ui| {
+            search_options_menu(ui, app, &mut run_search);
+        });
+        let sem_on = app.panels.search.semantic_on;
+        let sem_resp = ui
+            .selectable_label(sem_on, "Sem")
+            .on_hover_text("Semantic: embedding similarity");
+        if sem_resp.clicked() {
+            app.panels.search.semantic_on = !sem_on;
+            persist_search_setting(
+                app,
+                "search.modes.semantic",
+                serde_json::json!(app.panels.search.semantic_on),
+            );
+            run_search = true;
+        }
+        sem_resp.context_menu(|ui| {
+            search_options_menu(ui, app, &mut run_search);
+        });
         if app.panels.search.focus_query_next_frame {
             app.panels.search.focus_query_next_frame = false;
             resp.request_focus();

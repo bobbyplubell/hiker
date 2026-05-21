@@ -251,6 +251,8 @@ User-authored layer on top of the automatic indexes:
 
   See `trails.md` for the full surface — storage layout, reference shape, side-trail tree, sidebar mode, capture flow, build-as-you-read verbs, draft-trail review, MCP integration, indexer / watcher / trash hooks.
 
+  **Drag-and-drop ingestion (deferred).** Trails should accept items dragged in from outside the trails panel — primarily file rows from the Files panel, and eventually note tabs and search-result cards. The drop target semantics match the in-panel reorder DnD already shipped: dropping onto the top half of a waypoint card inserts the new waypoint as a sibling before it; dropping onto the bottom half nests it as a child; dropping on the head / tail strips lands it at the start / end of the trail. Implementation is deferred — the in-panel reorder lands first; cross-panel ingestion piggybacks on the same drop zones once a uniform "vault path" drag payload is in place across panels. [trails-dnd-ingestion]
+
 
 ## Auto-organization suggestions
 
@@ -370,11 +372,11 @@ Single window, fixed layout:
 
 ### Tab kinds
 
-`TabKind` (in `app/src/tab.rs`) dispatches on the central pane; renderers live under `panels/`. Singletons (Home, Queue, Settings, Graph, PatchReview, Plugins, IndexerDetail, AgentChanges) open-or-focus via `toolbar::open_singleton_tab`.
+`TabKind` (in `app/src/tab.rs`) dispatches on the central pane; renderers live under `panels/`. Singletons (Home, Queue, Settings, Graph, PatchReview, Plugins, IndexerDetail, Changes) open-or-focus via `toolbar::open_singleton_tab`.
 
-- `Buffer { path }` — editor widget. Chrome (version dropdown, diff-vs-disk, view-options wrench, wand-menu) and status bar in `panels/buffer.rs`.
+- `Buffer { path }` — editor widget. Chrome (version dropdown, diff-vs-disk, view-options wrench, wand-menu) and status bar in `panels/buffer/`. When the active buffer's path has pending `edit_note` staging proposals, the panel renders the inline patch-review decorations + per-file pill on top — no separate tab kind, no mode flip.
 - `BufferDiff { path }`, `SnapshotPreview`, `StagingPreview`, `TrashPreview` — read-only review surfaces over the same widget. StagingPreview includes per-hunk review (line numbers, ±2 lines context, partial-apply via byte-range splice).
-- `Home` / `HomeDetail { which }` — vault summary, activity feed with rollback verb, snapshots, per-path history.
+- `Home` / `HomeDetail { which }` — vault summary, snapshots, per-path history (`HomeDetail::ActivityRow`). The dashboard-wide activity widget moved into the unified `Changes` tab.
 - `Queue` / `QueueDetail { task_id }` — task queue with state filter pills, leased-row pulse, worker controls.
 - `IndexerDetail` — model id, status, reindex, progress log with filter pills.
 - `Settings` — scope-aware form (Refresh / Open / Reveal / Reset-to-defaults), raw-TOML fallback.
@@ -382,8 +384,9 @@ Single window, fixed layout:
 - `Graph` — vault-wide note-link force-directed graph (`petgraph` + painter).
 - `ClusterReview { config_json }` — preview-then-persist build flow.
 - `ClusterGraph { tree_id }` — radial dendrogram (color-by-policy, size-by-members, staleness tint).
-- `PatchReview` — staging proposal list with bulk + per-row accept/reject.
-- `Agent { session_id }` / `AgentChanges` — full-tab chat / agent activity feed.
+- `PatchReview` — cross-vault list of pending staging proposals with bulk + per-row accept/reject. Sibling to the in-buffer inline UI on `Buffer` tabs.
+- `Changes` — unified activity / changes feed (replaces the prior `AgentChanges` tab). One filterable view over `core::activity::list` (merges `staging.db` pending + `changes.db` committed) with author / source / op filter chips. The legacy `:agent_changes` persist key maps forward to this tab.
+- `Agent { session_id }` — full-tab chat.
 - `Plugins` — manifest viewer for `<vault>/.hiker/plugins.json`. No host runtime — manifest edits only.
 
 Buffer tabs autosave per vault path; singleton page-kinds persist via a synthetic `:<kind>` key. `bootstrap::restore_tab_state` rehydrates both on vault open; payload-bearing previews (Trash/Snapshot/Staging) drop silently.

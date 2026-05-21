@@ -157,13 +157,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         });
 
     if let Some((proposal_id, target_path)) = to_view {
-        open_singleton(
-            app,
-            TabKind::StagingPreview {
-                proposal_id,
-                target_path,
-            },
-        );
+        open_singleton(app, TabKind::staging_preview(proposal_id, target_path));
     }
     if let Some(id) = to_accept {
         match staging.accept(&id, &app.vault_session.vault, Some(changes.as_ref())) {
@@ -226,11 +220,21 @@ fn fmt_ts_ms(ms: i64) -> String {
 
 fn open_singleton(state: &mut AppState, kind: TabKind) {
     // Match toolbar's open_singleton_tab semantics: by discriminant, except
-    // for StagingPreview which carries a payload — there we keep one tab
-    // per (proposal_id, target_path) pair.
-    if let TabKind::StagingPreview { proposal_id, .. } = &kind {
+    // for staging-proposal previews which carry a payload — there we keep
+    // one tab per proposal_id.
+    if let TabKind::Editor {
+        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+        ..
+    } = &kind
+    {
         if let Some(existing) = state.session.tabs.iter().find(|t| {
-            matches!(&t.kind, TabKind::StagingPreview { proposal_id: pid, .. } if pid == proposal_id)
+            matches!(
+                &t.kind,
+                TabKind::Editor {
+                    buffer: crate::tab::BufferSource::StagingProposal { proposal_id: pid, .. },
+                    ..
+                } if pid == proposal_id
+            )
         }) {
             state.session.active_tab = Some(existing.id);
             return;

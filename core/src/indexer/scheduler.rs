@@ -181,6 +181,20 @@ pub(super) async fn indexer_loop<F>(
                         })
                         .count() as u32;
                     let _ = progress.send(ProgressEvent::ScanComplete { scanned, queued });
+                    // Pre-populate the `pending` set with every Upsert path
+                    // up front so `pending_count()` reflects total work
+                    // remaining throughout the scan, not just the one
+                    // currently in flight. Each `handle_upsert_job`
+                    // call removes its path on completion, so the count
+                    // counts down from N to 0 as the loop progresses.
+                    {
+                        let mut p = pending.lock().unwrap();
+                        for j in &jobs {
+                            if let IndexJob::Upsert { rel_path, .. } = j {
+                                p.insert(rel_path.clone());
+                            }
+                        }
+                    }
                     // Process scan results inline rather than re-enqueueing
                     // through `tx`: the indexer task is both producer and
                     // consumer of that mpsc, so a vault with more than

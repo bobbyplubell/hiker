@@ -274,6 +274,30 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
         self.editor_area.focused_group()
     }
 
+    /// Handle of the active tab inside the focused editor group, if any.
+    /// Hosts use this to detect "user clicked a tab in the strip" by
+    /// snapshotting before [`Self::ui`] and comparing after.
+    pub fn active_handle(&self) -> Option<TabHandle> {
+        let group = self.editor_area.focused_group()?;
+        crate::internal::tree_adapter::active_handle_in_group(
+            &self.editor_area.tree,
+            group.0,
+        )
+    }
+
+    /// Programmatically activate `handle` in its enclosing tab group.
+    /// Hosts call this when navigation logic outside the workbench
+    /// (browser-style back/forward, command palette "jump to tab",
+    /// etc.) needs the active pane to follow without simulating a
+    /// click. Returns `true` if the active selection actually changed.
+    pub fn set_active(&mut self, handle: TabHandle) -> bool {
+        let changed = self.editor_area.set_active(handle);
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
     /// Programmatically split the focused group.
     ///
     /// In v0.1 users obtain splits via the existing drag-to-edge gesture
@@ -439,7 +463,26 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     ) {
         let theme = behavior.theme(&ctx.style());
 
-        // 1) Activity bar — fixed narrow strip on the leading edge.
+        // 1) Status bar — declared FIRST so it claims the full bottom
+        //    strip across the whole viewport before any SidePanel can
+        //    grab its column. egui panels claim space in declaration
+        //    order: a `SidePanel::left` declared first takes the entire
+        //    height from top toolbar to the window bottom, leaving the
+        //    subsequent `TopBottomPanel::bottom` boxed in between the
+        //    side bars (only as wide as the central pane). Putting the
+        //    status bar at the top of this fn makes the side bars stop
+        //    at `status_bar.top` instead — the bar then spans
+        //    activity-bar → secondary-side-bar full width.
+        if self.status_bar.visible {
+            egui::TopBottomPanel::bottom("egui_workbench::status_bar")
+                .resizable(false)
+                .exact_height(22.0)
+                .show(ctx, |ui| {
+                    behavior.status_bar_ui(ui);
+                });
+        }
+
+        // 2) Activity bar — fixed narrow strip on the leading edge.
         if self.activity_bar.is_visible() {
             let activity_panel = match self.activity_bar.side {
                 SideBarSide::Left => egui::SidePanel::left("egui_workbench::activity_bar"),
@@ -480,7 +523,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                 });
         }
 
-        // 2) Primary side bar — activity-driven.
+        // 3) Primary side bar — activity-driven.
         show_side_bar::<Tab, _, _>(
             &mut self.primary_side_bar,
             ctx,
@@ -491,7 +534,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
             SideBarRole::Primary,
         );
 
-        // 3) Secondary side bar — fixed host content, independent of
+        // 4) Secondary side bar — fixed host content, independent of
         //    the active activity.
         show_side_bar::<Tab, _, _>(
             &mut self.secondary_side_bar,
@@ -502,17 +545,6 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
             None,
             SideBarRole::Secondary,
         );
-
-        // 4) Status bar — bottom strip; bottom-most panel so it sits
-        //    below the panel area.
-        if self.status_bar.visible {
-            egui::TopBottomPanel::bottom("egui_workbench::status_bar")
-                .resizable(false)
-                .exact_height(22.0)
-                .show(ctx, |ui| {
-                    behavior.status_bar_ui(ui);
-                });
-        }
 
         // 5) Panel area — bottom-docked tabbed surface.
         //    Auto-hide when empty (SPEC §14.2).
@@ -532,7 +564,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
         }
 
         if panel_visible {
-            let panel_resp = egui::TopBottomPanel::bottom("egui_workbench::panel_area")
+            let panel_id = egui::Id::new("egui_workbench::panel_area");
+            let panel_resp = egui::TopBottomPanel::bottom(panel_id)
                 .resizable(true)
                 .default_height(self.panel_area.height)
                 .min_height(80.0)
@@ -568,13 +601,16 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                 if ui.small_button("x").on_hover_text("Close panel").clicked() {
                     close_panel = true;
                 }
-                let label = if self.panel_area.maximized { "v" } else { "^" };
-                let hint = if self.panel_area.maximized {
-                    "Restore panel size"
+                let (icon, hint) = if self.panel_area.maximized {
+                    (crate::icons::chevron_down(), "Restore panel size")
                 } else {
-                    "Maximize panel"
+                    (crate::icons::chevron_up(), "Maximize panel")
                 };
-                if ui.small_button(label).on_hover_text(hint).clicked() {
+                if ui
+                    .add(egui::Button::image(icon).small())
+                    .on_hover_text(hint)
+                    .clicked()
+                {
                     toggle_max = true;
                 }
             });

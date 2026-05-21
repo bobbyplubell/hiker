@@ -185,6 +185,30 @@ fn write_back_positive_int_persists_as_integer_not_float() {
 }
 
 #[test]
+fn write_back_whole_number_float_persists_as_float() {
+    // Regression: a settings UI commit of `scroll_speed = 3.0` arrives
+    // here as a Number stored as f64. `as_i64()` would happily coerce
+    // it to `3` because it's whole-valued, but writing `editor.
+    // scroll_speed = 3` to TOML then fails strict-load against the
+    // `f32` field on the next reload and the setting reverts to its
+    // default. The TOML must keep the `.0` so the round-trip is stable.
+    let dir = tempdir().unwrap();
+    let cfg = Config::set(
+        SettingsScope::Vault,
+        "editor.scroll_speed",
+        serde_json::json!(3.0),
+        dir.path(),
+    )
+    .unwrap();
+    assert!((cfg.editor.scroll_speed - 3.0).abs() < f32::EPSILON);
+    let raw = fs::read_to_string(dir.path().join(".hiker").join("config.toml")).unwrap();
+    assert!(
+        raw.contains("scroll_speed = 3.0"),
+        "expected `scroll_speed = 3.0` in TOML, got:\n{raw}"
+    );
+}
+
+#[test]
 fn write_back_positive_int_rejects_zero_and_floats() {
     let dir = tempdir().unwrap();
     // Zero is not a positive integer.

@@ -5,11 +5,10 @@
 //! buffer is the active tab.
 
 pub mod agent;
-pub mod agent_changes;
 pub mod buffer;
+pub mod changes;
 pub mod cluster_graph;
 pub mod cluster_review;
-pub mod buffer_diff;
 pub mod backlinks;
 pub mod diff_view;
 pub mod discovery_pane;

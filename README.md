@@ -55,7 +55,7 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 
 ### Editor and vault
 
-- **[implemented]** CodeMirror 6 editor with markdown live preview (cursor-line reveal, fade markers, heading styles, fenced code reveal)
+- **[implemented]** Native Rust editor widget (`editor/`, embedded via `editor-egui`) with tree-sitter syntax highlighting, multi-cursor, undo tree, and markdown live preview (cursor-line reveal, fade markers, heading styles, fenced code reveal)
 - **[implemented]** Three-column layout: file tree, editor, discovery panel; collapsible and resizable sides
 - **[implemented]** Sidebar mode switcher (Files / Clusters / Trails) with persistent per-vault default
 - **[implemented]** File tree with drag-and-drop move, inline rename, context menu, sort options, refresh-on-watcher
@@ -68,7 +68,8 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[implemented]** Note properties tab (identity, file state, index state, chunks, access tracking, changes); trail/cluster membership and live-refresh deferred
 - **[implemented]** Autosave: per-buffer crash-recovery sidecars and tab-state snapshots; silent restoration on vault reopen, no close-prompt modal
 - **[implemented]** Status-bar version dropdown spanning the unified activity feed (current buffer + snapshots + pending agent proposals) with live refresh
-- **[planned]** Status-bar goto-line, help-panel keybind enumeration, in-place frontmatter editing inside the properties tab
+- **[implemented]** Status-bar goto-line popup
+- **[planned]** Help-panel keybind enumeration, in-place frontmatter editing inside the properties tab
 
 ### Index, search, and discovery
 
@@ -128,7 +129,11 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 
 ### Platform
 
-- **[implemented]** egui desktop shell, Rust core with strict module discipline (rusqlite, fastembed, notify each isolated to one module)
+- **[implemented]** egui desktop shell (migrated from the original Tauri + CodeMirror 6 stack to an all-Rust UI). Workspace layout:
+  - `app/` — the eframe binary (`hiker`) wiring panels, vault state, and the MCP runtime
+  - `egui-workbench/` — reusable IDE-style layout crate (activity bar, dockable sides, tabbed editor groups, bottom panel, status bar) built on `egui_tiles`; the desktop shell is built on top of it
+  - `editor/` — in-house editor widget (`editor-core`, `editor-view`, `editor-egui`, `editor-md`, `editor-ts`, `editor-diff`): a CodeMirror-6-class engine in Rust with tree-sitter highlighting, multi-cursor, undo tree, decorations, and markdown live preview
+  - `core/`, `mcp-server/`, `cli/` — vault, index, agent, and MCP runtime crates (rusqlite, fastembed, notify each isolated to one module)
 - **[implemented]** Per-vault settings (TOML, user + vault layered, strict load, write-back preserving comments)
 - **[implemented]** Tracing-based observability with daily-rotating file logs; chunk-boundary editor gutter
 - **[implemented]** Multi-vault open with default-vault auto-open

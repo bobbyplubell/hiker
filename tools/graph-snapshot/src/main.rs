@@ -90,7 +90,7 @@ impl Default for Args {
             strong_gravity: false,
             slow_down: 5.0,
             lin_log: false,
-            outbound_attr: true,
+            outbound_attr: false,
             degree_repulsion: true,
             max_iters: 800,
             theta: 0.9,

@@ -39,6 +39,10 @@ icon!(forward, "forward.svg");
 icon!(folder, "folder.svg");
 icon!(expand, "expand.svg");
 icon!(collapse, "collapse.svg");
+icon!(chevron_up, "chevron_up.svg");
+icon!(chevron_down, "chevron_down.svg");
+icon!(chevron_left, "chevron_left.svg");
+icon!(chevron_right, "chevron_right.svg");
 icon!(x, "x.svg");
 icon!(eye, "eye.svg");
 icon!(wand, "wand.svg");
@@ -53,6 +57,11 @@ icon!(plugin, "plugin.svg");
 icon!(compass, "compass.svg");
 icon!(wrench, "wrench.svg");
 icon!(boot, "boot.svg");
+// `boot.svg` is the legacy squiggly-trail glyph; `trail()` is the
+// preferred name for trail surfaces (sidebar header, editor pill, etc.).
+pub fn trail() -> egui::Image<'static> {
+    boot()
+}
 icon!(walk, "walk.svg");
 icon!(warning, "warning.svg");
 icon!(hourglass, "hourglass.svg");
@@ -67,6 +76,8 @@ icon!(window_maximize, "window_maximize.svg");
 icon!(window_minimize, "window_minimize.svg");
 icon!(info, "info.svg");
 icon!(cluster_tree, "cluster_tree.svg");
+icon!(sidebar_left, "sidebar_left.svg");
+icon!(sidebar_right, "sidebar_right.svg");
 
 // ---- Semantic helpers --------------------------------------------------
 //

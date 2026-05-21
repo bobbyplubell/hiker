@@ -177,17 +177,22 @@ fn row_contents(
     has_children: bool,
     expanded: bool,
 ) {
-    // Chevron / spacer.
-    let chev = if has_children {
-        if expanded { "v" } else { ">" }
+    // Chevron / spacer. Folders that can expand get a clickable SVG
+    // chevron; leaf nodes get a same-width spacer so siblings align.
+    let chev_size = egui::vec2(14.0, 14.0);
+    if has_children {
+        let icon = if expanded {
+            crate::icons::chevron_down()
+        } else {
+            crate::icons::chevron_right()
+        };
+        let chev_btn = egui::ImageButton::new(icon).frame(false);
+        let chev_resp = ui.add_sized(chev_size, chev_btn);
+        if chev_resp.clicked() {
+            toggle_expand(state, &node.id);
+        }
     } else {
-        "  "
-    };
-    let chev_btn = egui::Label::new(egui::RichText::new(chev).monospace().size(12.0))
-        .sense(egui::Sense::click());
-    let chev_resp = ui.add(chev_btn);
-    if chev_resp.clicked() && has_children {
-        toggle_expand(state, &node.id);
+        let (_, _) = ui.allocate_exact_size(chev_size, egui::Sense::hover());
     }
 
     // Glyph by kind.

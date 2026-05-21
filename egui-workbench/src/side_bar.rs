@@ -1,9 +1,4 @@
 //! Side bar — host for activity content. Implements `SPEC.md` §2/§3.
-//!
-//! The side bar is a resizable `egui::SidePanel`. Its width is owned
-//! by the workbench (the `width` field), not by egui — we use the
-//! "pinned-side-panel" pattern to clamp the width after the inner
-//! content lays out, so child widgets never inflate the panel.
 
 use std::hash::Hash;
 
@@ -40,7 +35,7 @@ impl Default for SideBar {
             side: SideBarSide::Left,
             visible: true,
             width: 260.0,
-            min_width: 140.0,
+            min_width: 80.0,
             max_width: 600.0,
         }
     }
@@ -93,29 +88,7 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
         SideBarSide::Right => egui::SidePanel::right(id),
     };
 
-    // Clamp our owned width to the bounds before handing it to egui.
-    // We trust egui to track the width across frames (it persists
-    // panel rects in its data store). Our `bar.width` is the snapshot
-    // mirror used for serialization; we update it from the response
-    // post-show so user drags persist back into our state.
     let clamped = bar.width.clamp(bar.min_width, bar.max_width);
-
-    // Overwrite egui's persisted PanelState every frame. egui's
-    // SidePanel reads PanelState at the top of `show` and uses that as
-    // the panel's width; overwriting here guarantees the panel renders
-    // at the width we want, even if user-resize from a previous frame
-    // landed at an out-of-range value (e.g. a stale layout JSON).
-    ctx.data_mut(|d| {
-        d.insert_persisted(
-            id,
-            egui::containers::panel::PanelState {
-                rect: egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(clamped, 0.0),
-                ),
-            },
-        );
-    });
 
     let response = panel
         .frame(frame)
@@ -130,11 +103,9 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
             // earlier two-`with_layout` approach split the row into
             // two regions that each padded themselves and pushed
             // content to the far right of the panel.
-            let title = match role {
-                SideBarRole::Primary => active_mode
-                    .map(|m| behavior.side_bar_title(m))
-                    .unwrap_or_default(),
-                SideBarRole::Secondary => behavior.secondary_side_bar_title(),
+            let primary_title = match (role, active_mode) {
+                (SideBarRole::Primary, Some(m)) => Some(behavior.side_bar_title(m)),
+                _ => None,
             };
             ui.add_space(2.0);
             // Wrap the header in `ui.horizontal` so it consumes one row
@@ -144,15 +115,45 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
             // vertically while starving the body of space.
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    let menu_response = ui.button("…");
-                    menu_response.context_menu(|ui| {
-                        ui.label("Side bar actions");
-                        ui.separator();
-                        let _ = ui.button("Move to Other Side").clicked();
-                        let _ = ui.button("Hide").clicked();
-                    });
-                    ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.label(title);
+                    let menu_button = ui.button("…");
+                    // The "…" lives inside a `right_to_left` layout
+                    // nested in a `horizontal` row. Without an explicit
+                    // width hint, `Popup::menu` inherits a near-zero
+                    // wrap width from that context and each menu label
+                    // collapses onto its own line, word by word. A
+                    // 180px floor lets standard "Sort by …" / "Refresh
+                    // tree" entries lay out on a single row.
+                    egui::Popup::menu(&menu_button)
+                        .width(180.0)
+                        .show(|ui| match role {
+                            SideBarRole::Primary => {
+                                if let Some(mode) = active_mode {
+                                    behavior.side_bar_actions_menu(ui, mode);
+                                }
+                            }
+                            SideBarRole::Secondary => {
+                                behavior.secondary_side_bar_actions_menu(ui);
+                            }
+                        });
+                    match role {
+                        SideBarRole::Primary => {
+                            if let Some(mode) = active_mode {
+                                behavior.side_bar_action_buttons(ui, mode);
+                            }
+                        }
+                        SideBarRole::Secondary => {
+                            behavior.secondary_side_bar_action_buttons(ui);
+                        }
+                    }
+                    ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| match role {
+                        SideBarRole::Primary => {
+                            if let Some(t) = primary_title {
+                                ui.label(t);
+                            }
+                        }
+                        SideBarRole::Secondary => {
+                            behavior.secondary_side_bar_title_ui(ui);
+                        }
                     });
                 });
             });
@@ -169,12 +170,15 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
             // inner scroll area for the scrollable region. An outer
             // scroll wrap would make `available_height` effectively
             // infinite and break those layouts.
+            let body_rect = ui.available_rect_before_wrap();
+            let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
+            body_ui.set_clip_rect(body_rect);
             match role {
                 SideBarRole::Primary => {
                     if let Some(mode) = active_mode {
-                        behavior.side_bar_ui(ui, mode);
+                        behavior.side_bar_ui(&mut body_ui, mode);
                     } else {
-                        ui.centered_and_justified(|ui| {
+                        body_ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new("No activity selected").weak(),
                             );
@@ -182,17 +186,12 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
                     }
                 }
                 SideBarRole::Secondary => {
-                    behavior.secondary_side_bar_ui(ui);
+                    behavior.secondary_side_bar_ui(&mut body_ui);
                 }
             }
+            ui.advance_cursor_after_rect(body_rect);
         });
 
-    // Always mirror the rendered width back, clamped to bounds. This
-    // captures user drags (the response rect reflects the drag's new
-    // width) while clamping any out-of-range value back into [min,
-    // max]. The PanelState pin above keeps child widgets from
-    // inflating the panel; this post-show read keeps our state
-    // synchronized for serialization.
     let actual = response.response.rect.width();
     let new_width = actual.clamp(bar.min_width, bar.max_width);
     if (new_width - bar.width).abs() > 0.5 {

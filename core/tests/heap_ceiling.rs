@@ -86,12 +86,17 @@ const VAULT_FILES: usize = 256;
 const FILE_BODY_BYTES: usize = 4 * 1024;
 
 /// Hard ceiling on heap bytes *added* by the indexer pass over the
-/// synthetic vault. ~32 MiB headroom accounts for the SQLite store
-/// (which mmap-buffers some pages), tokio runtime tasks, channel
-/// buffers, and our own per-file working memory. The synthetic vault is
-/// ~1 MiB on disk, so an indexer that retained even one file body per
-/// processed note would exceed this many times over.
-const PEAK_CEILING_BYTES: usize = 32 * 1024 * 1024;
+/// synthetic vault. Sized so a regression that retains per-file state
+/// (e.g. forgets to drop file body, or stops trimming a cache) trips
+/// the test within one CI run rather than waiting for production OOM.
+///
+/// Current observed peak on this fixture is ~80 KB; setting the
+/// ceiling at 8 MiB leaves ~100× headroom for unrelated allocator
+/// churn while still catching the "retain one MAX_FILE_BYTES (5 MiB)
+/// body per file" class of bug. Bumping this is intentional friction
+/// — if a real change needs more headroom, prove it's bounded and add
+/// a why-comment.
+const PEAK_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
 fn build_synthetic_vault(root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(root)?;

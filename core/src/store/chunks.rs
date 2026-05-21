@@ -150,14 +150,26 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
 
+        // Compute the byte-weighted mean pool inline so `notes.note_embedding`
+        // is always in sync with the chunks being written. Empty-chunk notes
+        // get NULL — pooling over nothing is undefined and the cluster pass
+        // intentionally excludes them. status: cluster-note-embeddings
+        let pooled_blob: Option<Vec<u8>> = if upsert.chunks.is_empty() {
+            None
+        } else {
+            let weighted: Vec<(Vec<f32>, u64)> = upsert
+                .chunks
+                .iter()
+                .map(|(c, e)| (e.clone(), (c.byte_end - c.byte_start) as u64))
+                .collect();
+            Some(embedding_to_blob(&byte_weighted_mean_pool(&weighted, expected)?))
+        };
+
         // Upsert notes row. Successful upsert clears any prior Skipped flag
         // — the file made it through ingest, so it's no longer skipped.
         tx.execute(
-            // Clears `note_embedding` on every upsert — chunks just
-            // changed, so the cached pool is stale until the next cluster
-            // pass recomputes it. status: cluster-note-embeddings
             "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason, note_embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
              ON CONFLICT(id) DO UPDATE SET
                path = excluded.path,
                content_hash = excluded.content_hash,
@@ -167,7 +179,7 @@ impl Store {
                embedder_version = excluded.embedder_version,
                skipped = 0,
                skip_reason = NULL,
-               note_embedding = NULL",
+               note_embedding = excluded.note_embedding",
             params![
                 upsert.id,
                 upsert.path,
@@ -176,6 +188,7 @@ impl Store {
                 upsert.size,
                 upsert.indexed_at,
                 upsert.embedder_version,
+                pooled_blob,
             ],
         )?;
 

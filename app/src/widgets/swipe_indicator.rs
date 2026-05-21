@@ -106,19 +106,35 @@ pub fn show(ctx: &egui::Context, state: &AppState) {
     };
     painter.rect_filled(bar_rect, 8.0, bar_color);
 
-    // Chevron glyph. Sits on the inner edge (toward the screen center)
-    // so the user reads pill-then-chevron-then-page.
-    let chevron = if going_back { "<" } else { ">" };
+    // Chevron stroke. Sits on the inner edge (toward the screen center)
+    // so the user reads pill-then-chevron-then-page. Drawn as three
+    // line segments instead of a text glyph because egui's bundled
+    // font doesn't ship the unicode chevron glyphs and an SVG asset
+    // at this size would alias visibly — the path stroke renders
+    // crisp at any pixel density.
     let glyph_color = if direction_active {
         egui::Color32::WHITE
     } else {
         egui::Color32::from_gray(180)
     };
-    painter.text(
-        pill_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        chevron,
-        egui::FontId::proportional(40.0),
-        glyph_color,
-    );
+    let cx = pill_rect.center().x;
+    let cy = pill_rect.center().y;
+    let half_h = 14.0;
+    let half_w = 9.0;
+    let stroke = egui::Stroke::new(5.0, glyph_color);
+    let (p0, p1, p2) = if going_back {
+        (
+            egui::pos2(cx + half_w, cy - half_h),
+            egui::pos2(cx - half_w, cy),
+            egui::pos2(cx + half_w, cy + half_h),
+        )
+    } else {
+        (
+            egui::pos2(cx - half_w, cy - half_h),
+            egui::pos2(cx + half_w, cy),
+            egui::pos2(cx - half_w, cy + half_h),
+        )
+    };
+    painter.line_segment([p0, p1], stroke);
+    painter.line_segment([p1, p2], stroke);
 }

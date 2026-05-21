@@ -187,6 +187,10 @@ pub struct ViewState {
     /// Fraction of the viewport (0.0–1.0) of extra empty space allowed below
     /// the last line for scrolling. 0.0 = clamp at the last line. See SPEC §9.18.
     pub scroll_past_end: f32,
+    /// Multiplier applied to scroll-wheel deltas before they reach the
+    /// scroll command. Host sets this from a user config setting; `1.0`
+    /// keeps the egui default speed, `>1.0` scrolls proportionally faster.
+    pub scroll_speed: f32,
     /// Find / find-and-replace panel state. Defaults to closed. See SPEC §9.13.
     pub search: SearchState,
     /// Stack of panels (top / bottom strips) docked around the text area.
@@ -274,6 +278,7 @@ impl Default for ViewState {
             indent_provider: None,
             placeholder: None,
             scroll_past_end: 0.0,
+            scroll_speed: 1.0,
             search: SearchState::default(),
             panels: PanelStack::default(),
             snippet: SnippetState::default(),

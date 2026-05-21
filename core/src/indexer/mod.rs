@@ -262,12 +262,18 @@ impl IndexerHandle {
         v
     }
 
+    /// Count of paths with an in-flight Upsert (queued + processing). Cheap
+    /// — locks the pending set briefly and reads `len()` without copying.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
     pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), IndexerError> {
         self.enqueue(IndexJob::Upsert { rel_path: rel_path.into(), force: false }).await
     }
 
-    pub async fn full_scan(&self) -> Result<(), IndexerError> {
-        self.enqueue(IndexJob::FullScan { force: false }).await
+    pub async fn full_scan(&self, force: bool) -> Result<(), IndexerError> {
+        self.enqueue(IndexJob::FullScan { force }).await
     }
 
     /// Stamp a note's `last_accessed_at` via the indexer's owned writer.

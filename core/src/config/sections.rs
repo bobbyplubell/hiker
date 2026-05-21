@@ -505,11 +505,13 @@ pub struct McpToolsConfig {
     #[serde(default = "no")]
     pub allow_redacted_lookup: bool,
     // status: agent-write-review-mode
-    /// When true, MCP write tools (`write_note`, `set_frontmatter`,
-    /// `apply_tag`, `remove_tag`) route through `core::staging::propose()`
-    /// instead of applying directly. Default false — agents write directly
-    /// + append a changelog row (existing behavior).
-    #[serde(default = "no")]
+    /// When true, MCP write tools (`write_note`, `edit_note`,
+    /// `set_frontmatter`, `apply_tag`, `remove_tag`) route through
+    /// `core::staging::propose()` so the user reviews each change before
+    /// it lands on disk. Default true — the in-buffer patch-review surface
+    /// expects edits as staging proposals; turning this off bypasses the
+    /// review UI and writes straight to disk + changelog.
+    #[serde(default = "yes")]
     pub review_required: bool,
     // Per-tool toggles (status: mcp-tool-toggles). Default true.
     // Reads:
@@ -566,7 +568,7 @@ impl Default for McpToolsConfig {
         Self {
             writes_enabled: true,
             allow_redacted_lookup: false,
-            review_required: false,
+            review_required: true,
             search_notes_enabled: true,
             get_note_enabled: true,
             related_notes_enabled: true,
@@ -752,6 +754,17 @@ pub struct EditorConfig {
     pub intraline_diff: bool,
     #[serde(default = "yes")]
     pub show_minimap: bool,
+    /// When the minimap is hidden, draw a thin auto-hiding scrollbar
+    /// on the right edge of the editor. `hide_scrollbar = true` opts
+    /// out and leaves the editor with no visible scroll affordance.
+    /// Setting this has no effect while the minimap is visible — the
+    /// minimap already acts as the scroll affordance.
+    #[serde(default = "no")]
+    pub hide_scrollbar: bool,
+    /// Multiplier applied to wheel / trackpad scroll deltas in the
+    /// editor body. `1.0` is the egui default; bump for faster scroll.
+    #[serde(default = "default_scroll_speed")]
+    pub scroll_speed: f32,
     #[serde(default)]
     pub minimap: MinimapConfig,
     #[serde(default = "default_tab_size")]
@@ -784,6 +797,8 @@ impl Default for EditorConfig {
             hide_frontmatter: false,
             intraline_diff: false,
             show_minimap: true,
+            hide_scrollbar: false,
+            scroll_speed: default_scroll_speed(),
             minimap: MinimapConfig::default(),
             tab_size: 2,
             font_system: String::new(),
@@ -951,6 +966,10 @@ fn default_batch_size() -> u16 {
 
 fn default_tab_size() -> u8 {
     2
+}
+
+fn default_scroll_speed() -> f32 {
+    2.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

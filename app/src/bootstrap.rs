@@ -37,6 +37,7 @@ use crate::state::{
     VaultSession, VaultSwitchState,
 };
 
+#[allow(clippy::too_many_lines)]
 pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     let root = std::fs::canonicalize(&root)
         .with_context(|| format!("canonicalize vault root: {}", root.display()))?;
@@ -98,7 +99,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     let _router = route_watcher_events(watcher.subscribe(), indexer.job_sender());
 
     // Kick off the initial full scan. Errors are logged but non-fatal.
-    if let Err(err) = indexer.full_scan().await {
+    if let Err(err) = indexer.full_scan(false).await {
         tracing::warn!(error = %err, "indexer: initial full_scan submit failed");
     }
 
@@ -161,8 +162,13 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
 
     // MCP server: start if enabled in settings. Non-fatal on bind error.
     let mcp_cfg = config.read().map(|c| c.mcp.clone()).unwrap_or_default();
+    // Created up-front so it can be both handed to the MCP handler AND
+    // stashed in `Services` for `set_setting` to mirror future changes
+    // into. The same Arc is shared; the handler's `state.tools.read()`
+    // returns whatever value `set_setting` last wrote.
+    let mcp_tools_cfg = Arc::new(std::sync::RwLock::new(mcp_cfg.tools.clone()));
     let mcp: Option<Arc<hiker_mcp::McpServerHandle>> = if mcp_cfg.enabled {
-        let mcp_tools_cfg = Arc::new(std::sync::RwLock::new(mcp_cfg.tools.clone()));
+        let mcp_tools_cfg = mcp_tools_cfg.clone();
         let llm_enabled = config.read().map(|c| c.llm.enabled).unwrap_or(false);
         let deps = hiker_mcp::McpDeps {
             vault: (*vault).clone(),
@@ -223,6 +229,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         audit,
         tasks,
         mcp,
+        mcp_tools_cfg,
     };
     let vault_session = VaultSession {
         vault: vault.clone(),
@@ -294,8 +301,6 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
 }
 
 /// Load the persisted trails list from `<root>/.hiker/trails.json`.
-/// Supports the legacy flat-`Vec<String>` format by migrating into a
-/// single "Recent" trail.
 /// Seed the per-panel UI state for a fresh `AppState`. The search,
 /// related, and backlinks sub-panels each pull a few fields from the
 /// vault config (persisted toggles + collapse flags); everything else
@@ -332,25 +337,6 @@ fn load_trails(root: &std::path::Path) -> Vec<crate::state::Trail> {
     if let Ok(trails) = serde_json::from_slice::<Vec<crate::state::Trail>>(&bytes) {
         return trails;
     }
-    if let Ok(legacy) = serde_json::from_slice::<Vec<String>>(&bytes) {
-        let waypoints: Vec<crate::state::Waypoint> = legacy
-            .into_iter()
-            .map(|p| crate::state::Waypoint {
-                path: p,
-                at_ms: 0,
-                children: Vec::new(),
-                annotation: String::new(),
-            })
-            .collect();
-        return vec![crate::state::Trail {
-            id: "recent-migrated".to_string(),
-            name: crate::state::RECENT_TRAIL.to_string(),
-            waypoints,
-            created_at_ms: 0,
-            last_activated_at_ms: 0,
-            append_under: None,
-        }];
-    }
     Vec::new()
 }
 
@@ -383,7 +369,9 @@ fn restore_tab_state(state: &mut AppState, ts: hiker_core::autosave::TabState) {
             ":patch_review" => Some(TabKind::PatchReview),
             ":plugins" => Some(TabKind::Plugins),
             ":indexer" => Some(TabKind::IndexerDetail),
-            ":agent_changes" => Some(TabKind::AgentChanges),
+            // `:agent_changes` is the legacy persist key; map it forward
+            // to the unified `Changes` tab so old workspaces restore cleanly.
+            ":changes" | ":agent_changes" => Some(TabKind::Changes),
             _ => None,
         };
         let kind = if let Some(k) = singleton_kind {
@@ -405,7 +393,7 @@ fn restore_tab_state(state: &mut AppState, ts: hiker_core::autosave::TabState) {
                     state.session.buffers.insert(path.clone(), buf);
                 }
             }
-            TabKind::Buffer { path: path.clone() }
+            TabKind::vault_buffer(path.clone())
         };
         let id = state.next_tab_id();
         state.session.tabs.push(Tab {

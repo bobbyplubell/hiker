@@ -421,6 +421,25 @@ fn editor_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
             bool_row(ui, app, st, "Hide frontmatter", "editor.hide_frontmatter", e.hide_frontmatter);
             bool_row(ui, app, st, "Intraline diff", "editor.intraline_diff", e.intraline_diff);
             bool_row(ui, app, st, "Show minimap", "editor.show_minimap", e.show_minimap);
+            bool_row(
+                ui,
+                app,
+                st,
+                "Hide editor scrollbar (when minimap is off)",
+                "editor.hide_scrollbar",
+                e.hide_scrollbar,
+            );
+            float_row(
+                ui,
+                app,
+                st,
+                "Scroll speed",
+                "editor.scroll_speed",
+                e.scroll_speed as f64,
+                0.25,
+                10.0,
+                0.05,
+            );
             ui.collapsing("Minimap customization", |ui| {
                 let m = &e.minimap;
                 ui.label(egui::RichText::new("Layout").color(theme::muted()).small());
@@ -630,6 +649,32 @@ fn int_row(
         );
         if (resp.drag_stopped() || resp.lost_focus()) && v != current {
             commit(app, st.scope, key, json_u(v));
+        }
+    });
+}
+
+fn float_row(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    st: &mut SettingsUi,
+    label: &str,
+    key: &str,
+    current: f64,
+    min: f64,
+    max: f64,
+    speed: f64,
+) {
+    let mut v = current;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let resp = ui.add(
+            egui::DragValue::new(&mut v)
+                .range(min..=max)
+                .speed(speed)
+                .max_decimals(2),
+        );
+        if (resp.drag_stopped() || resp.lost_focus()) && (v - current).abs() > f64::EPSILON {
+            commit(app, st.scope, key, json_f(v));
         }
     });
 }

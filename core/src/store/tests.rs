@@ -77,7 +77,7 @@ fn upsert_then_read() {
 }
 
 #[test]
-fn note_embedding_computes_byte_weighted_mean_and_clears_on_upsert() {
+fn note_embedding_computes_byte_weighted_mean_on_upsert() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
 
@@ -107,27 +107,17 @@ fn note_embedding_computes_byte_weighted_mean_and_clears_on_upsert() {
         })
         .unwrap();
 
-    // Fresh upsert leaves note_embedding NULL.
-    assert!(store.note_embedding_for_path("n.md").unwrap().is_none());
-
-    let pooled = store
-        .compute_and_store_note_embedding("n.md")
-        .unwrap()
-        .expect("note has chunks");
-    assert_eq!(pooled.len(), DEFAULT_EMBED_DIM);
-    for v in &pooled {
-        assert!((v - 4.0).abs() < 1e-4, "expected ~4.0, got {v}");
-    }
-
-    // Subsequent reads see the persisted value.
+    // Fresh upsert populates note_embedding inline with the byte-weighted pool.
     let cached = store
         .note_embedding_for_path("n.md")
         .unwrap()
-        .expect("now cached");
+        .expect("populated by upsert");
     assert_eq!(cached.len(), DEFAULT_EMBED_DIM);
-    assert!((cached[0] - 4.0).abs() < 1e-4);
+    for v in &cached {
+        assert!((v - 4.0).abs() < 1e-4, "expected ~4.0, got {v}");
+    }
 
-    // Re-upserting (chunks changed) must clear the pool.
+    // Re-upserting with new chunks refreshes the pool.
     store
         .upsert_note(NoteUpsert {
             id: &id,
@@ -140,7 +130,11 @@ fn note_embedding_computes_byte_weighted_mean_and_clears_on_upsert() {
             chunks: vec![(mk_chunk(0, "x"), vec![2.0f32; DEFAULT_EMBED_DIM])],
         })
         .unwrap();
-    assert!(store.note_embedding_for_path("n.md").unwrap().is_none());
+    let refreshed = store
+        .note_embedding_for_path("n.md")
+        .unwrap()
+        .expect("refreshed by upsert");
+    assert!((refreshed[0] - 2.0).abs() < 1e-4);
 }
 
 #[test]
@@ -159,10 +153,6 @@ fn note_embedding_none_for_empty_note() {
             chunks: vec![],
         })
         .unwrap();
-    let pooled = store
-        .compute_and_store_note_embedding("empty.md")
-        .unwrap();
-    assert!(pooled.is_none());
     assert!(store.note_embedding_for_path("empty.md").unwrap().is_none());
 }
 

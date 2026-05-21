@@ -214,6 +214,44 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
         self.focused_group.map(GroupHandle)
     }
 
+    /// Make `handle` the active tab inside its enclosing `Tabs`
+    /// container and mark that container as the focused group. Hosts
+    /// call this when navigation logic outside the workbench (e.g.
+    /// browser-style back/forward) needs to swing the visible pane
+    /// over to a tab the user didn't click. Returns `true` when the
+    /// active tab actually changed; `false` if the handle is unknown
+    /// or already active.
+    pub fn set_active(&mut self, handle: TabHandle) -> bool {
+        let Some(pane_id) = tree_adapter::find_pane_of(&self.tree, handle) else {
+            return false;
+        };
+        let Some(group_id) = tree_adapter::find_group_of(&self.tree, handle) else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(Tile::Container(Container::Tabs(tabs))) =
+            self.tree.tiles.get_mut(group_id)
+        {
+            if tabs.active != Some(pane_id) {
+                tabs.set_active(pane_id);
+                changed = true;
+            }
+        }
+        self.focused_group = Some(group_id);
+        changed
+    }
+
+    /// Locate the tab payload whose host id (as exposed by the host
+    /// tab type) matches a predicate. Used by [`Workbench::set_active`]
+    /// when the host knows its own id but not the workbench's
+    /// `TabHandle`.
+    pub fn handle_for<F: Fn(&Tab) -> bool>(&self, pred: F) -> Option<TabHandle> {
+        self.entries
+            .iter()
+            .find(|(_, e)| pred(&e.tab))
+            .map(|(h, _)| *h)
+    }
+
     /// Drive one frame of the tabbed area: swap the tree out, run
     /// `egui_tiles` against an [`EditorBehavior`], drain the pending-state
     /// vectors that `tab_ui` populated, apply tab activations, drop
@@ -256,6 +294,28 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
             _mode: PhantomData,
         };
         tree.ui(&mut adapter, ui);
+
+        // egui_tiles' tabs container makes the empty area of the tab
+        // strip a drag handle for the whole container — drag the strip
+        // background to drag the parent Tabs tile into a split. We
+        // don't want that affordance: it triggers on near-misses when
+        // the user just wants to click an empty bit of the strip, and
+        // recombining split groups via that path lands in unintuitive
+        // drop targets. Individual tabs are still draggable for reorder
+        // and split through their own per-tab interaction. Cancel any
+        // drag whose id resolves to a container tile.
+        let dragged_id = ui.ctx().dragged_id();
+        if let Some(dragged) = dragged_id {
+            let tree_id = tree.id();
+            for (tile_id, tile) in tree.tiles.iter() {
+                if matches!(tile, Tile::Container(_))
+                    && tile_id.egui_id(tree_id) == dragged
+                {
+                    ui.ctx().stop_dragging();
+                    break;
+                }
+            }
+        }
 
         let outcome = DriveOutcome {
             dirty: adapter.dirty,
@@ -389,7 +449,23 @@ where
             state: entry.state,
             _marker: PhantomData,
         };
-        self.behavior.pane_ui(ui, &mut entry.tab, ctx);
+        // Inset the pane content by `pane_content_inset` so it sits
+        // visually inside the pane boundary rather than flush against
+        // the tab strip / pane edges (also pulls content out from under
+        // the `paint_on_top_of_tile` focused-group stroke). Tabs that
+        // own their own edge-to-edge surface (`wants_pane_content_inset
+        // -> false`, e.g. a markdown editor that paints its own bg)
+        // skip the inset so the host bg doesn't show as a contrasting
+        // strip around the editor's content area.
+        let inset = if entry.tab.wants_pane_content_inset() {
+            self.theme.pane_content_inset.max(self.theme.focused_group_border_width)
+        } else {
+            0.0
+        };
+        let inset_rect = ui.max_rect().shrink(inset);
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(inset_rect));
+        self.behavior.pane_ui(&mut inner, &mut entry.tab, ctx);
+        ui.allocate_rect(inner.min_rect(), egui::Sense::hover());
         UiResponse::None
     }
 
@@ -738,10 +814,29 @@ where
         ui: &mut egui::Ui,
         tile_id: TileId,
         tabs: &Tabs,
-        _scroll_offset: &mut f32,
+        scroll_offset: &mut f32,
     ) {
+        // Wheel scrolls the tab strip horizontally (without changing the
+        // active tab). egui_tiles' inner horizontal ScrollArea would
+        // otherwise ignore vertical wheel input. We consume the scroll
+        // delta here — before the ScrollArea runs — and bake it into the
+        // offset egui_tiles feeds to that ScrollArea.
+        let tab_bar_rect = ui.max_rect();
+        if ui.rect_contains_pointer(tab_bar_rect) {
+            let delta = ui.input(|i| i.smooth_scroll_delta);
+            let combined = delta.x + delta.y;
+            if combined != 0.0 {
+                *scroll_offset -= combined;
+                ui.input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                });
+            }
+        }
+
         let popup_id = ui.id().with(("workbench_all_tabs", tile_id));
-        let button = ui.small_button("v").on_hover_text("All tabs");
+        let button = ui
+            .add(egui::Button::image(crate::icons::chevron_down()).small())
+            .on_hover_text("All tabs");
         let mut activate: Option<TileId> = None;
         egui::Popup::menu(&button)
             .id(popup_id)

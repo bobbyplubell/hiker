@@ -120,12 +120,15 @@ pub(super) fn version_dropdown(
     match pick {
         Some(Pick::Live) => {}
         Some(Pick::Proposal { id }) => {
-            let kind = TabKind::StagingPreview {
-                proposal_id: id.clone(),
-                target_path: path.to_string(),
-            };
+            let kind = TabKind::staging_preview(id.clone(), path.to_string());
             let existing = app.session.tabs.iter().find(|t| {
-                matches!(&t.kind, TabKind::StagingPreview { proposal_id, .. } if *proposal_id == id)
+                matches!(
+                    &t.kind,
+                    TabKind::Editor {
+                        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                        ..
+                    } if *proposal_id == id
+                )
             }).map(|t| t.id);
             match existing {
                 Some(tab_id) => app.session.active_tab = Some(tab_id),
@@ -138,12 +141,15 @@ pub(super) fn version_dropdown(
         }
         Some(Pick::Snapshot { change_id }) => {
             let cid_for_find = change_id.clone();
-            let kind = TabKind::SnapshotPreview {
-                change_id,
-                path: path.to_string(),
-            };
+            let kind = TabKind::snapshot_preview(path.to_string(), change_id);
             let existing = app.session.tabs.iter().find(|t| {
-                matches!(&t.kind, TabKind::SnapshotPreview { change_id: cid, path: p } if *cid == cid_for_find && p == path)
+                matches!(
+                    &t.kind,
+                    TabKind::Editor {
+                        buffer: crate::tab::BufferSource::Snapshot { change_id: cid, path: p },
+                        ..
+                    } if *cid == cid_for_find && p == path
+                )
             }).map(|t| t.id);
             match existing {
                 Some(tab_id) => app.session.active_tab = Some(tab_id),

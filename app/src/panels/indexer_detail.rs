@@ -39,8 +39,14 @@ pub fn show(
                 ui.label(if s.model_ready { "yes" } else { "loading…" });
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Queued").color(theme::muted()));
-                ui.label(s.queued.to_string());
+                ui.label(egui::RichText::new("Pending").color(theme::muted()));
+                ui.label(
+                    app.vault_session
+                        .services
+                        .indexer
+                        .pending_count()
+                        .to_string(),
+                );
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Total notes").color(theme::muted()));
@@ -72,7 +78,7 @@ pub fn show(
     if reindex_clicked {
         let idx = app.vault_session.services.indexer.clone();
         rt.spawn(async move {
-            if let Err(err) = idx.full_scan().await {
+            if let Err(err) = idx.full_scan(true).await {
                 tracing::warn!(error = %err, "full_scan submit failed");
             }
         });

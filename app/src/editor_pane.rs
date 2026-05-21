@@ -6,16 +6,13 @@
 //! preview-slot rule.
 
 use crate::buffer::Buffer;
-use crate::state::{nav_push, note_visited, AppState, ToastLevel};
+use crate::state::{nav_push, AppState, ToastLevel};
 use crate::tab::{Tab, TabId, TabKind};
 
 /// Open the file at `rel` as a buffer tab. If `sticky`, the tab is created
 /// sticky (Mod-click / "Keep open" / drag); otherwise it lands in the
 /// preview slot, replacing any prior preview tab.
 pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
-    // Trail-tracking: every open_file counts as a "visit" regardless of
-    // whether we end up reusing an existing tab.
-    note_visited(state, rel);
     // Navigation history: skip when we're already navigating via
     // back/forward (the index points at this entry already).
     if !state.session.nav.locked {
@@ -37,7 +34,7 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
         match state.vault_session.vault.read_file_with_hash(rel) {
             Ok((contents, hash)) => {
                 let cfg_guard = state.vault_session.config.read().ok();
-                let buf = Buffer::with_config_and_vault(
+                let mut buf = Buffer::with_config_and_vault(
                     rel.to_string(),
                     contents,
                     hash,
@@ -45,6 +42,15 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
                     Some(state.vault_session.vault.clone()),
                 );
                 drop(cfg_guard);
+                // Apply pending `edit_note` proposals into the live buffer
+                // and snapshot the pre-apply disk text as `agent_base`. The
+                // inline diff overlay then renders `DiffLayer(agent_base,
+                // current, Agent)` so the agent's changes appear as a diff
+                // the user can accept-all / reject-all via the file pill.
+                // Per `patch-review-buffer-hydration`.
+                buf.hydrate_pending_proposals(
+                    state.vault_session.services.staging.as_ref(),
+                );
                 state.session.buffers.insert(rel.to_string(), buf);
             }
             Err(err) => {
@@ -63,7 +69,7 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
             // Swap the preview tab's kind/payload to the new path, keeping
             // the same id so dock positioning stays put.
             if let Some(tab) = state.tab_by_id_mut(prev_id) {
-                tab.kind = TabKind::Buffer { path: rel.to_string() };
+                tab.kind = TabKind::vault_buffer(rel.to_string());
                 tab.sticky = false;
             }
             state.session.active_tab = Some(prev_id);
@@ -76,7 +82,7 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     let tab_id = state.next_tab_id();
     let tab = Tab {
         id: tab_id,
-        kind: TabKind::Buffer { path: rel.to_string() },
+        kind: TabKind::vault_buffer(rel.to_string()),
         sticky,
     };
     state.session.tabs.push(tab);
@@ -87,15 +93,25 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
 }
 
 fn find_buffer_tab(state: &AppState, rel: &str) -> Option<TabId> {
-    state.session.tabs.iter().find_map(|t| match &t.kind {
-        TabKind::Buffer { path } if path == rel => Some(t.id),
-        _ => None,
+    state.session.tabs.iter().find_map(|t| {
+        if t.kind.vault_path() == Some(rel) && t.kind.diff_source().is_none() {
+            Some(t.id)
+        } else {
+            None
+        }
     })
 }
 
 /// Move the navigation cursor by `delta` (-1 = back, +1 = forward) and
 /// re-open the buffer at that position. Sets `nav_locked` while running so
 /// the resulting `open_file` doesn't push a new history entry.
+///
+/// `sticky = false` so back/forward behaves like a single click on the
+/// path: an existing tab is focused as-is, otherwise the preview slot is
+/// reused (or a new preview tab is opened). Previously this passed
+/// `sticky = true`, which silently promoted the target to a sticky tab —
+/// new buffers landed permanently after each Back press and the user
+/// ended up with a strip full of regular tabs instead of preview reuse.
 pub fn nav_go(state: &mut AppState, delta: i32) {
     let Some(idx) = state.session.nav.idx else {
         return;
@@ -108,7 +124,7 @@ pub fn nav_go(state: &mut AppState, delta: i32) {
     let path = state.session.nav.history[next_idx].clone();
     state.session.nav.idx = Some(next_idx);
     state.session.nav.locked = true;
-    open_file(state, &path, /* sticky */ true);
+    open_file(state, &path, /* sticky */ false);
     state.session.nav.locked = false;
 }
 
@@ -137,6 +153,18 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     };
     if !buffer.is_dirty() {
         return Ok(());
+    }
+    // Per `patch-review-hydrate-dehydrate`: refuse to save while there are
+    // unresolved hydrated proposals — accepting each hunk is what writes
+    // the `changes.db` audit row, and bypassing that via Save would skip
+    // the audit. The user must walk the hunks (or Reject all) first.
+    if !buffer.hydrated_proposals.is_empty() {
+        let n = buffer.hydrated_proposals.len();
+        return Err(format!(
+            "{} pending agent {} for this buffer — accept or reject each hunk before saving",
+            n,
+            if n == 1 { "proposal" } else { "proposals" },
+        ));
     }
     let text = buffer.current_text();
     let expected = buffer.loaded_hash.clone();
@@ -274,10 +302,42 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
     }
 
     // If no other tab references this buffer, drop it from memory.
-    if let TabKind::Buffer { path } = &removed.kind {
-        let still_open = state.session.tabs.iter().any(|t| matches!(&t.kind, TabKind::Buffer { path: p } if p == path));
+    if let Some(path) = removed.kind.vault_path().map(|p| p.to_string()) {
+        let still_open =
+            state.session.tabs.iter().any(|t| t.kind.vault_path() == Some(&path));
         if !still_open {
-            state.session.buffers.remove(path);
+            state.session.buffers.remove(&path);
         }
+    }
+
+    // Drop preview buffers for tabs that owned them. The diff / snapshot
+    // panels lazily inserted an `EditorState` (full Rope + history) keyed
+    // by `path` / `path::change_id`; without this they'd accumulate across
+    // the session.
+    if let crate::tab::TabKind::Editor { buffer, .. } = &removed.kind {
+        use crate::tab::BufferSource;
+        match buffer {
+            BufferSource::Vault { path } => {
+                state.panels.preview_buffers.remove(path);
+            }
+            BufferSource::Snapshot { path, change_id } => {
+                let key = format!("{}::{}", path, change_id);
+                state.panels.preview_buffers.remove(&key);
+            }
+            _ => {}
+        }
+    }
+
+    // Drop the cluster-graph state if a ClusterGraph tab closes.
+    // Each graph keeps a petgraph DiGraph + positions Vec which can be
+    // large for big clusters; without this they leak.
+    if let TabKind::ClusterGraph { tree_id } = &removed.kind {
+        state.panels.cluster_graph.remove(tree_id);
+    }
+
+    // Drop the cluster-review pane state — owns a draft tree until the
+    // user persists, keyed by the closed tab's id.
+    if matches!(&removed.kind, TabKind::ClusterReview { .. }) {
+        state.panels.clusters.review_panes.remove(&id);
     }
 }

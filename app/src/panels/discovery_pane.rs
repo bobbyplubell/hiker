@@ -26,14 +26,25 @@ pub(crate) fn collapsible_header(
     expanded: bool,
     count: usize,
 ) -> bool {
-    let glyph = if expanded { "v" } else { ">" };
     let label = if count > 0 {
-        format!("{glyph} {title} ({count})")
+        format!("{title} ({count})")
     } else {
-        format!("{glyph} {title}")
+        title.to_string()
     };
     let resp = ui
-        .scope(|ui| {
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let icon = if expanded {
+                crate::icons::chevron_down()
+            } else {
+                crate::icons::chevron_right()
+            };
+            // Render as a single clickable row spanning the chevron +
+            // title so the user can hit either to toggle. The chevron
+            // is a layout-positioned Image (not an ImageButton) so the
+            // hover/click target is the whole label region — keeps
+            // parity with the legacy text-prefixed glyph.
+            ui.add(icon);
             ui.add(
                 egui::Label::new(egui::RichText::new(label).strong())
                     .sense(egui::Sense::click()),

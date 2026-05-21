@@ -346,7 +346,7 @@ Why a single toolbar slot rather than per-mode banners:
 
 What lands in the slot:
 
-- **Icon-only action buttons** for the mode's verbs: Diff toggle (when applicable, see `diff.md`'s `mode-controls-diff-toggle`), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons. The mode qualifier that names which non-current version is in view sits in the status-bar left region's version dropdown closed-state label (see `status-bar-version-dropdown` above) so the toolbar stays compact and the user's eye finds the context in the same place it finds the file name.
+- **Icon-only action buttons** for the mode's verbs: Diff toggle (see `editor-diff-vs-disk-toggle` below), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons. The mode qualifier that names which non-current version is in view sits in the status-bar left region's version dropdown closed-state label (see `status-bar-version-dropdown` above) so the toolbar stays compact and the user's eye finds the context in the same place it finds the file name.
 
 `renderModeControls()` reads the current buffer state (`buffer.mode.kind`, `isDirty()`, etc.) and the diff-active flag and rebuilds the slot's children. Called on every transition that affects the slot — buffer swap, mode entry/exit, dirty toggling, diff on/off.
 
@@ -354,15 +354,22 @@ Per-mode populators live in `ui/src/main.ts` — `renderSnapshotControls(diffAct
 
 ### Dirty-buffer Diff toggle
 
-A diff toggle lives in the editor toolbar (just right of Save). Always visible; greyed when there's nothing to diff against (no buffer, file not on disk, buffer clean). Click toggles the diff view against the only currently-implemented target — **on-disk** — flipping the editor view between the live editable buffer and a read-only line-level diff (live buffer vs last-loaded content) via the existing `diff-renderer` primitive. The flip is non-destructive: live buffer state is preserved while the diff is shown; toggling back returns the user's cursor + selection. **Right-click opens a target-picker** — a small context menu listing diff targets so future ones (last save, snapshot, staging-review base, etc.) can slot in without splitting the affordance into multiple buttons. v1 lists "Diff against on-disk" (or "Hide diff" while active). [editor-diff-vs-disk-toggle]
+A diff toggle lives in the editor toolbar (just right of Save). Greyed when the buffer is clean *and* no other diff source is selected (nothing to diff against). Click toggles the editor tab's `diff` mode against the current `DiffSource` (see `diff.md` `diff-as-mode` and `diff-source-enum`); the default source is `Disk(path)` — the live buffer vs. last-loaded content. The flip is non-destructive: the buffer's `current` is unchanged, decorations are layered on top; toggling off restores cursor + selection. **Right-click opens a source picker** — a small context menu offering: `Diff against on-disk`, `Show changes…` (submenu of recent `changes.db` rows for this path), and future sources (snapshot, another open buffer). Selecting a source switches the tab's `DiffSource` and turns diff mode on. [editor-diff-vs-disk-toggle, editor-show-changes-menu]
 
-Why this lives here, not in some mutation-specific surface: any time the user has unsaved edits — whether they typed them, a mutation landed in the buffer, or some other in-buffer source — "what did I actually change vs. what's on disk" is a useful question. One feature, one toggle, all dirty-buffer cases covered. The mutation flow consumes this toggle as its review surface; hand-edit-and-diff before saving consumes it too.
+Why this lives here, not in some mutation-specific surface: any time the user wants to compare the buffer against some other version of itself — current vs. disk, current vs. an earlier snapshot, current vs. another open buffer — the same affordance covers it. One toggle, one source picker, every comparison.
 
 Constraints:
 
-- **Hidden when not dirty.** Toggle disappears entirely the moment `isDirty()` flips to false (clean buffer means there's nothing to diff against disk).
-- **Hidden inside other preview modes.** Snapshot / trash / staging modes already populate the slot with their own mode-specific Diff toggle; the dirty-buffer toggle doesn't double up.
-- **Disabled when the file doesn't exist on disk yet** (newly-created buffer the user hasn't saved). Tooltip: "Save first to diff against disk."
+- **Disabled when there's nothing to diff.** Buffer clean *and* `DiffSource` is `Disk(path)` *and* the path exists on disk → toggle is disabled with tooltip "No changes to show."
+- **Newly-created buffer (file not on disk yet).** Toggle is disabled with tooltip "Save first to diff against disk." The source picker still works for non-disk sources (e.g. another open buffer).
+
+### Show changes menu
+
+The right-click context menu on the diff toggle (and the buffer's body, when no selection is active) carries a `Show changes…` entry whose submenu lists recent `changes.db` rows for the active buffer's path, newest first. Selecting a row sets the tab's `DiffSource = ChangesDb(change_id)` and turns diff mode on; the buffer's `current` text stays put, and `agent_base` (if any) is unaffected. [editor-show-changes-menu]
+
+- **Submenu shape.** Up to 20 recent rows. Each row shows timestamp (relative + absolute on hover), op (`saved` / `agent-applied` / `restored` / `import` / etc.), and author. Final row: `Browse all… → ` opens the `home-detail { which: activity-row { path } }` tab filtered to this path (per `vault-home-recent-activity-detail`).
+- **Per-hunk restore.** When the diff source is `ChangesDb(id)`, hunks carry a `Restore this hunk` overlay verb (owner `Snapshot` per `diff.md`'s `diff-layer-owner`). Restore writes the historical text for that hunk's range into `current` and lets the user save through the normal path. Full-snapshot restore stays on the row-level surface (`vault-home-recent-activity-detail`), unchanged.
+- **No URI scheme.** The diff resolves directly through `core::changes::content_at(change_id)`; the editor crate doesn't go through a custom URI provider.
 
 
 ## View options menu
@@ -605,7 +612,7 @@ A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the pa
 
 **Umbrella term: "app pages."** Every non-`buffer` kind below (`home`, `home-detail`, `queue`, `settings`, `properties`, `agent`, `graph`) is collectively an *app page* — a tab that renders an in-app surface rather than user-authored content. "App-page tabs" is the form used where the tab-strip aspect matters; "app pages" is the bare noun. The term replaces the earlier inconsistent "page-kind tabs" / "meta pages" wording. The `TabKind` discriminator on the wire stays per-kind (`home`, `queue`, …) — "app page" is umbrella vocabulary, not a runtime category.
 
-- `buffer` — payload is a vault-relative file path; renders the existing CodeMirror editor for that file. All current tab semantics (preview slot, dirty marker, close guard, autosave participation, tree-click activation, search-result-click activation, navigation-history entries) describe this kind.
+- `buffer` — payload is a vault-relative file path plus an optional `DiffSource` (per `diff.md` `diff-source-enum`). Renders the editor widget for that file; when `diff` is set, layers a `DiffLayer` over the same widget — diff is a mode of this tab, not a separate kind. Snapshot review, trash preview, staging-proposal review, dirty-buffer diff, history diff (right-click → Show changes) are all `buffer` tabs with different `DiffSource` selections. All current tab semantics (preview slot, dirty marker, close guard, autosave participation, tree-click activation, search-result-click activation, navigation-history entries) describe this kind.
 - `agent` — payload is a chat session id; renders the chat surface as the tab's content (per `chat-panel-expand-to-editor`). The discovery-panel's bottom-docked chat region collapses while an agent tab is open since the surface lives in the tab; closing the agent tab restores the docked region.
 - `graph` — payload is the graph view's state (filter set, selection); renders a graph-view canvas (per `design.md`'s graph-view future bullet).
 - `home` — vault home overview (per `vault-home-screen`); renders the home page as the tab's content.

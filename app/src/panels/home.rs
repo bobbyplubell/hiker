@@ -1,14 +1,14 @@
-//! Home tab — vault dashboard. Shows top-level counts, the recent
-//! activity feed, and a snapshots browser.
+//! Home tab — vault dashboard. Shows top-level counts, a snapshots
+//! browser, and a one-click jump into the unified Changes feed (which
+//! now owns the recent-activity surface the home overview used to
+//! render inline).
 #![allow(clippy::items_after_test_module)]
 
 use eframe::egui;
 
-use hiker_core::activity::{ActivityFilter, ActivitySource};
-
 use crate::editor_pane;
 use crate::state::AppState;
-use crate::tab::HomeDetail;
+use crate::tab::{HomeDetail, Tab, TabKind};
 use crate::theme;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
@@ -46,16 +46,25 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
 
     ui.add_space(20.0);
 
-    // Recent activity (top 5) with "See all" → HomeDetail::RecentActivity.
+    // Recent activity used to render inline here; it's now the
+    // dedicated Changes tab (one filterable surface for staged +
+    // committed history). The home page links to it instead of
+    // duplicating the rows.
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Recent activity").strong());
+        ui.label(egui::RichText::new("Activity").strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("See all").clicked() {
-                open_home_detail(app, HomeDetail::RecentActivity);
+            if ui.small_button("Open Changes →").clicked() {
+                open_singleton(app, TabKind::Changes);
             }
         });
     });
-    render_activity(ui, app, 5);
+    ui.label(
+        egui::RichText::new(
+            "Pending agent proposals + committed history live in the Changes tab. Filter by author, source, and op.",
+        )
+        .color(theme::muted())
+        .small(),
+    );
 
     ui.add_space(16.0);
     ui.horizontal(|ui| {
@@ -69,13 +78,27 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     render_snapshots(ui, app, 5);
 }
 
+fn open_singleton(app: &mut AppState, kind: TabKind) {
+    if let Some(existing) = app
+        .session
+        .tabs
+        .iter()
+        .find(|t| std::mem::discriminant(&t.kind) == std::mem::discriminant(&kind))
+    {
+        app.session.active_tab = Some(existing.id);
+        return;
+    }
+    let id = app.next_tab_id();
+    app.session.tabs.push(Tab {
+        id,
+        kind,
+        sticky: true,
+    });
+    app.session.active_tab = Some(id);
+}
+
 pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
     match which {
-        HomeDetail::RecentActivity => {
-            ui.heading("Recent activity");
-            ui.add_space(8.0);
-            render_activity(ui, app, 200);
-        }
         HomeDetail::Snapshots => {
             ui.heading("Snapshots");
             ui.add_space(8.0);
@@ -174,149 +197,10 @@ fn render_path_history(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         });
 }
 
-#[cfg(test)]
-mod matches_source_tests {
-    use super::*;
-
-    #[test]
-    fn reflexive() {
-        assert!(matches_source(ActivitySource::Merged, ActivitySource::Merged));
-        assert!(matches_source(
-            ActivitySource::ChangesOnly,
-            ActivitySource::ChangesOnly
-        ));
-        assert!(matches_source(
-            ActivitySource::StagingOnly,
-            ActivitySource::StagingOnly
-        ));
-    }
-
-    #[test]
-    fn distinct_variants_dont_match() {
-        assert!(!matches_source(
-            ActivitySource::Merged,
-            ActivitySource::ChangesOnly
-        ));
-        assert!(!matches_source(
-            ActivitySource::ChangesOnly,
-            ActivitySource::StagingOnly
-        ));
-    }
-}
-
-fn matches_source(a: ActivitySource, b: ActivitySource) -> bool {
-    matches!(
-        (a, b),
-        (ActivitySource::Merged, ActivitySource::Merged)
-            | (ActivitySource::ChangesOnly, ActivitySource::ChangesOnly)
-            | (ActivitySource::StagingOnly, ActivitySource::StagingOnly)
-    )
-}
-
 /// Count vault notes by walking the indexable set. Cheap for thousands of
 /// files; for huge vaults this could be cached.
 fn note_count(app: &AppState) -> usize {
     app.vault_session.vault.walk_indexable_files("").map(|v| v.len()).unwrap_or(0)
-}
-
-fn render_activity(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
-    let activity = app.vault_session.services.activity.clone();
-    // Filter pills: pick which side of the activity feed to render
-    // (`vault-home-recent-activity-filter-pills`). State lives in the
-    // discovery panel's transient UI struct — small, doesn't need
-    // persistence for v0.
-    let current = app.session.activity_filter;
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Show")
-                .small()
-                .color(theme::muted()),
-        );
-        for (label, val) in [
-            ("All", ActivitySource::Merged),
-            ("User", ActivitySource::ChangesOnly),
-            ("Staging", ActivitySource::StagingOnly),
-        ] {
-            let selected = matches_source(current, val);
-            if ui.selectable_label(selected, label).clicked() {
-                app.session.activity_filter = val;
-            }
-        }
-    });
-    let source = app.session.activity_filter;
-    let filter = ActivityFilter {
-        source,
-        limit,
-        author_pattern: None,
-        since_ms: None,
-    };
-    let items = match activity.list(filter) {
-        Ok(v) => v,
-        Err(err) => {
-            ui.label(
-                egui::RichText::new(format!("activity error: {}", err))
-                    .color(egui::Color32::RED)
-                    .small(),
-            );
-            return;
-        }
-    };
-    if items.is_empty() {
-        ui.label(
-            egui::RichText::new("(no recent activity)")
-                .color(theme::muted())
-                .small(),
-        );
-        return;
-    }
-    egui::ScrollArea::vertical()
-        .id_salt("home-activity")
-        .auto_shrink([false, true])
-        .max_height(220.0)
-        .show(ui, |ui| {
-            for item in items {
-                let ts = format_timestamp(item.timestamp_ms);
-                let label = format!("{}  {}  {}", ts, item.author, item.path);
-                let resp = ui
-                    .selectable_label(false, label)
-                    .on_hover_text(format!(
-                        "{}\n(click: open · right-click: history)",
-                        item.path
-                    ));
-                if resp.clicked() {
-                    editor_pane::open_file(app, &item.path, /* sticky */ false);
-                }
-                let item_path = item.path.clone();
-                let rollback_target: Option<i64> = match &item.payload {
-                    hiker_core::activity::ActivityPayload::Change(c) => Some(c.id),
-                    _ => None,
-                };
-                resp.context_menu(|ui| {
-                    if ui.button("Open note").clicked() {
-                        editor_pane::open_file(app, &item_path, /* sticky */ true);
-                        ui.close();
-                    }
-                    if ui.button("View version history").clicked() {
-                        open_home_detail(
-                            app,
-                            HomeDetail::ActivityRow {
-                                path: item_path.clone(),
-                            },
-                        );
-                        ui.close();
-                    }
-                    // Rollback verb (`vault-home-recent-activity-rollback`).
-                    // Only offered on change rows — staging rows have no
-                    // prior content to roll back to.
-                    if let Some(change_id) = rollback_target
-                        && ui.button("Roll back to previous version").clicked()
-                    {
-                        rollback_change(app, &item_path, change_id);
-                        ui.close();
-                    }
-                });
-            }
-        });
 }
 
 fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
@@ -364,10 +248,7 @@ fn open_snapshot(app: &mut AppState, path: &str, change_id: i64) {
     let id = app.next_tab_id();
     app.session.tabs.push(Tab {
         id,
-        kind: TabKind::SnapshotPreview {
-            path: path.to_string(),
-            change_id: change_id.to_string(),
-        },
+        kind: TabKind::snapshot_preview(path.to_string(), change_id.to_string()),
         sticky: true,
     });
     app.session.active_tab = Some(id);
@@ -378,7 +259,7 @@ fn open_snapshot(app: &mut AppState, path: &str, change_id: i64) {
 /// the prior bytes from `changes.previous_content_for_path`, writes them
 /// to disk via the drift-aware `write_file_checked`, and appends a new
 /// change row stamped with `rolled_back_from`.
-fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
+pub(crate) fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
     use crate::state::ToastLevel;
     let changes = app.vault_session.services.changes.clone();
     let prior = match changes.previous_content_for_path(path, change_id) {
@@ -427,7 +308,7 @@ fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
     app.push_toast(format!("Rolled back {}", path), ToastLevel::Info);
 }
 
-fn open_home_detail(app: &mut AppState, which: HomeDetail) {
+pub(crate) fn open_home_detail(app: &mut AppState, which: HomeDetail) {
     use crate::tab::{Tab, TabKind};
     // De-duplicate: focus an existing detail tab if it matches.
     if let Some(existing) = app.session.tabs.iter().find(|t| {

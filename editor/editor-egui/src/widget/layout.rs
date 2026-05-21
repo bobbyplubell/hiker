@@ -122,9 +122,16 @@ fn segment_galley(
     base_size: f32,
     base_color: Color32,
 ) -> Arc<egui::Galley> {
-    let display = if seg.widget.is_some() {
-        // Tiny label rendered inside the placeholder rect. The advance width
-        // for the segment uses the widget's `measure()` result, not the label.
+    // Widgets that provide custom `display()` text (e.g. the patch-review
+    // intraline `new_str` widget) get measured + laid out as that text;
+    // the painter renders the same galley. Widgets with no display fall
+    // through to the bordered "widget" placeholder.
+    let widget_display = seg.widget.as_ref().and_then(|w| w.display());
+    let owned_text;
+    let display: &str = if let Some(d) = widget_display.as_ref() {
+        owned_text = d.text.clone();
+        owned_text.as_str()
+    } else if seg.widget.is_some() {
         "widget"
     } else if seg.display.is_empty() && seg.is_replacement {
         ""

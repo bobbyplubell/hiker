@@ -579,6 +579,32 @@ pub fn apply_edit(content: &str, edit: &EditPayload) -> Result<String, StagingEr
     Ok(apply_replacements(content, &matches, &edit.new_str))
 }
 
+/// Resolve a patch-edit's `old_str` against `text` and return its unique byte
+/// range. Mirrors `apply_edit`'s anchor-resolution rules — fails identically
+/// when the anchor is missing or non-unique without `replace_all`. With
+/// `replace_all = true` and multiple matches, returns the *first* range; UI
+/// callers that only need to know whether the edit can be applied should
+/// inspect the `Ok` case as "some anchor exists." Used by the in-buffer
+/// patch-review surface to decide where to render decorations per frame.
+pub fn locate_anchor(
+    text: &str,
+    edit: &EditPayload,
+) -> Result<(usize, usize), StagingError> {
+    let matches = find_all_matches(text, &edit.old_str);
+    if matches.is_empty() {
+        return Err(StagingError::AnchorConflict(
+            "anchor_missing: old_str not found".to_string(),
+        ));
+    }
+    if matches.len() > 1 && !edit.replace_all {
+        return Err(StagingError::AnchorConflict(format!(
+            "anchor_not_unique: old_str matches {} ranges",
+            matches.len(),
+        )));
+    }
+    Ok(matches[0])
+}
+
 pub fn find_all_matches(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return Vec::new();

@@ -115,17 +115,32 @@ fn disk_drift_dialog(
             }
         }
         Some(Choice::OpenDiff) => {
-            // Switch the open buffer's tab to the dirty-buffer diff view.
-            // The view itself already exists at `panels::buffer_diff` and
-            // is keyed by buffer path.
-            use crate::tab::{Tab, TabKind};
-            let id = app.next_tab_id();
-            app.session.tabs.push(Tab {
-                id,
-                kind: TabKind::BufferDiff { path: path.clone() },
-                sticky: true,
-            });
-            app.session.active_tab = Some(id);
+            // Open the path in an editor tab with diff-against-disk mode
+            // already on. Diff is a mode of the editor tab (per
+            // `diff-as-mode`); the same tab the user edits in renders the
+            // diff as a decoration layer.
+            use crate::tab::{BufferSource, DiffSource, Tab, TabKind};
+            let p = path.clone();
+            if let Some(existing) = app.session.tabs.iter().position(|t| {
+                matches!(
+                    &t.kind,
+                    TabKind::Editor { buffer: BufferSource::Vault { path: q }, .. } if q == &p
+                )
+            }) {
+                let tab = &mut app.session.tabs[existing];
+                if let TabKind::Editor { diff, .. } = &mut tab.kind {
+                    *diff = Some(DiffSource::Disk { path: p });
+                }
+                app.session.active_tab = Some(tab.id);
+            } else {
+                let id = app.next_tab_id();
+                app.session.tabs.push(Tab {
+                    id,
+                    kind: TabKind::buffer_diff(p),
+                    sticky: true,
+                });
+                app.session.active_tab = Some(id);
+            }
         }
         Some(Choice::Cancel) => {}
         None if !open => {}

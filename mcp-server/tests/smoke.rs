@@ -279,7 +279,14 @@ async fn get_note_missing_returns_1002() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_note_with_wrong_expected_hash_returns_1003() {
-    let b = boot(McpConfig::default()).await;
+    // Direct-write path: expected_hash drift only fires when the tool is
+    // applying directly. Under review_required (the default) the proposal
+    // stages and accept-time does the hash check instead.
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
     std::fs::write(b.td.path().join("a.md"), "original").unwrap();
     let resp = call_tool(&b, "write_note", serde_json::json!({
         "rel_path": "a.md",
@@ -321,7 +328,11 @@ async fn write_tools_disabled_returns_1004() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_note_direct_applies_all_edits_and_writes_once() {
-    let b = boot(McpConfig::default()).await;
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
     std::fs::write(b.td.path().join("a.md"), "hello foo world baz").unwrap();
     let resp = call_tool(&b, "edit_note", serde_json::json!({
         "rel_path": "a.md",
@@ -376,7 +387,11 @@ async fn edit_note_non_unique_anchor_returns_invalid_params() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_note_replace_all_handles_multiple_matches() {
-    let b = boot(McpConfig::default()).await;
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
     std::fs::write(b.td.path().join("a.md"), "foo foo bar").unwrap();
     let resp = call_tool(&b, "edit_note", serde_json::json!({
         "rel_path": "a.md",

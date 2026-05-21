@@ -830,9 +830,13 @@ fn render_cluster_row(
         for _ in 0..indent {
             ui.add_space(12.0);
         }
-        let chevron = if expanded { "v" } else { ">" };
+        let chevron = if expanded {
+            crate::icons::chevron_down()
+        } else {
+            crate::icons::chevron_right()
+        };
         if ui
-            .add(egui::Button::new(chevron).frame(false))
+            .add(egui::ImageButton::new(chevron).frame(false))
             .clicked()
         {
             let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();

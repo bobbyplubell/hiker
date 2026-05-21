@@ -36,12 +36,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str, change_id: &str) 
             }
         };
         let snapshot_text = String::from_utf8_lossy(&snapshot_bytes).into_owned();
-        let current_text = app.vault_session.vault.read_file(path).unwrap_or_default();
-        // For snapshot preview we show the snapshot as the primary
-        // (after) content and diff against the current disk text — the
-        // "what's in this snapshot, compared to today" question is the
-        // useful one for restore decisions.
-        let buf = PreviewBuffer::new(key.clone(), current_text, snapshot_text, true);
+        // "Before" is the content *this change replaced* — the prior row
+        // for the same path. That makes Toggle diff show the change this
+        // row actually introduced, instead of comparing the snapshot to
+        // the current disk (which would be empty for the latest change
+        // and confusing for older ones — the change-this-row-made is the
+        // useful question, restore decisions can still read the snapshot
+        // itself in the no-diff view).
+        let previous_text = changes
+            .previous_content_for_path(path, id_num)
+            .ok()
+            .flatten()
+            .map(|(_id, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let buf = PreviewBuffer::new(key.clone(), previous_text, snapshot_text, true);
         app.panels.preview_buffers.insert(key.clone(), buf);
     }
 

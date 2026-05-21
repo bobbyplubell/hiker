@@ -247,6 +247,20 @@ impl eframe::App for HikerApp {
         {
             crate::profile_scope!("workbench");
             workbench_host::sync_tabs(&mut self.state);
+            // Snapshot the workbench's active tab AFTER `sync_tabs`
+            // pushed `session.active_tab` into the strip. Comparing
+            // against the post-render snapshot lets us distinguish two
+            // cases:
+            //   - User clicked a tab in the workbench strip — the
+            //     workbench's active changes, session.active_tab is
+            //     stale. We push the new active back into session +
+            //     nav history below.
+            //   - User clicked a file in the sidebar — `open_file`
+            //     mutated session.active_tab during render, but the
+            //     workbench's active didn't change this frame. Next
+            //     frame's `sync_tabs` calls `workbench.set_active` to
+            //     pull the strip over.
+            let prev_active_handle = self.state.workbench.active_handle();
             let mut behavior = workbench_host::HikerWbBehavior {
                 app: &mut self.state,
                 rt: &self.runtime,
@@ -259,7 +273,33 @@ impl eframe::App for HikerApp {
             // putting it back.
             let mut wb = std::mem::take(&mut behavior.app.workbench);
             wb.ui(ctx, &mut behavior);
+            let new_active_handle = wb.active_handle();
             behavior.app.workbench = wb;
+            if prev_active_handle != new_active_handle
+                && let Some(handle) = new_active_handle
+                && let Some(tab) = self.state.workbench.editor_area.get(handle)
+            {
+                let tab_id = tab.id;
+                let prev_path = self
+                    .state
+                    .session
+                    .active_tab
+                    .and_then(|id| self.state.tab_by_id(id))
+                    .and_then(|t| t.buffer_path())
+                    .map(|s| s.to_string());
+                let next_path = self
+                    .state
+                    .tab_by_id(tab_id)
+                    .and_then(|t| t.buffer_path())
+                    .map(|s| s.to_string());
+                self.state.session.active_tab = Some(tab_id);
+                if !self.state.session.nav.locked
+                    && let Some(p) = next_path.as_deref()
+                    && prev_path.as_deref() != Some(p)
+                {
+                    crate::state::nav_push(&mut self.state, p);
+                }
+            }
         }
 
         // Command palette overlay (Ctrl+K). Renders after panels so the

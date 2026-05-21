@@ -3,6 +3,11 @@
 //! non-buffer kinds).
 #![allow(clippy::items_after_test_module)]
 
+pub mod diff_overlay;
+pub mod patch_review_pill;
+pub mod show_changes;
+pub mod toolbar_menus;
+
 use std::sync::Arc;
 
 use eframe::egui;
@@ -17,7 +22,7 @@ use editor_md::{
 use editor_view::{
     active_line_decorations, bracket_match_decorations, brackets::DEFAULT_BRACKETS,
     occurrence::occurrence_decorations, special_chars_decorations, trailing_whitespace_decorations,
-    SpecialCharsFlags,
+    ClickAction, SpecialCharsFlags,
 };
 
 use crate::buffer::DecorationCache;
@@ -25,6 +30,7 @@ use crate::editor_pane;
 use crate::icons;
 use crate::state::{AppState, ToastLevel};
 use crate::theme;
+
 
 /// XOR-mix the fold ids in an order-independent way. Cheap and stable for
 /// memoization keys (HashSet iteration order isn't deterministic).
@@ -51,55 +57,131 @@ pub fn show(
     path: &str,
     _rt: &Arc<tokio::runtime::Runtime>,
 ) {
-    // Breathing room between the window-level top strip (where tabs live)
-    // and the buffer's own toolbar so they don't visually collide.
-    ui.add_space(6.0);
-
     // Toolbar across the top of the buffer tab body.
     toolbar(ui, app, path);
 
     // Pending-rewrite banner: thin row that surfaces a write-shaped
-    // proposal targeting this note. Per `patch-review.md:138-148` —
-    // single-line, dismissable inline, click to Accept/Reject/View diff.
+    // proposal targeting this note.
     pending_rewrite_banner(ui, app, path);
+
+    // Build the inline diff overlay once. Drives both the file pill
+    // (counts + Next-hunk + bulk verbs above the editor) and the in-buffer
+    // decorations pushed by `show_editor`. Owner-aware: Agent for
+    // hydrated proposals, Manual / Snapshot / Staging for the dirty-buffer
+    // diff toggle / history viewer / staging-proposal review.
+    let overlay = diff_overlay::compute(app, path);
+    if let Some(ov) = &overlay
+        && matches!(ov.owner, editor_diff::DiffOwner::Agent)
+    {
+        let cursor_byte = current_cursor_byte(app, path);
+        let pill_action = patch_review_pill::show(ui, app, &ov.hunks, cursor_byte);
+        apply_pill_action(app, path, pill_action);
+    }
 
     ui.add_space(4.0);
 
-    // Pin the status bar to the bottom of the pane via a
-    // TopBottomPanel. The previous "manual subtract status-bar height
-    // from available_height + allocate_exact_size" approach overflowed
-    // by `item_spacing.y + 2` pixels because allocate_exact_size adds
-    // egui's automatic item-spacing gap AFTER it returns, and there
-    // was an additional 2-px add_space between the body and the
-    // status bar — neither of which the body-height math accounted for.
-    // The result was the status bar getting pushed past the pane
-    // bottom into the window's edge. TopBottomPanel handles the
-    // geometry exactly: claim the bottom strip from the Ui's
-    // max_rect, body fills the remaining region above.
-    egui::TopBottomPanel::bottom(ui.id().with("buffer-status-bar"))
-        .resizable(false)
-        .show_separator_line(false)
-        .show_inside(ui, |ui| {
-            status_bar(ui, app, path);
-        });
-
-    // The editor body fills whatever the bottom panel didn't claim.
     egui::Frame::default().show(ui, |ui| {
         let body_height = ui.available_height().max(80.0);
         let (rect, _resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), body_height),
             egui::Sense::hover(),
         );
-        // Editor owns its own horizontal scroll (long lines, code
-        // blocks). Register the rect so the swipe-nav handler skips
-        // gestures that originate inside the editor body.
         app.session.nav.swipe_skip_rects.push(rect);
         let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        show_editor(&mut body_ui, app, path);
+        show_editor(&mut body_ui, app, path, overlay);
     });
 }
 
-fn show_editor(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
+/// Snapshot pending patch-review state for `path`. Reads the buffer text
+/// and queries the staging service for *all* proposals targeting this path
+/// (applyable + conflicted) so the inline UI can paint conflicted hunks
+fn current_cursor_byte(app: &AppState, path: &str) -> usize {
+    app.session
+        .buffers
+        .get(path)
+        .map(|b| b.editor.selection.main().head.offset())
+        .unwrap_or(0)
+}
+
+/// Resolve a pill bulk action against the hydrated agent proposals on this
+/// buffer. Accept-all iterates the buffer's `hydrated_proposals` list and
+/// calls `staging.accept` on each (which writes the changes-db audit row
+/// and removes the proposal); Reject-all calls `staging.reject` on each.
+/// After either, the buffer is re-read from disk and re-hydrated to reflect
+/// the post-action state.
+fn apply_pill_action(
+    app: &mut AppState,
+    path: &str,
+    action: patch_review_pill::PillAction,
+) {
+    let proposal_ids: Vec<String> = app
+        .session
+        .buffers
+        .get(path)
+        .map(|b| b.hydrated_proposals.clone())
+        .unwrap_or_default();
+    if action.accept_all && !proposal_ids.is_empty() {
+        let staging = app.vault_session.services.staging.clone();
+        let changes = app.vault_session.services.changes.clone();
+        let (mut ok, mut err) = (0usize, 0usize);
+        for id in &proposal_ids {
+            match staging.accept(id, &app.vault_session.vault, Some(changes.as_ref())) {
+                Ok(_) => ok += 1,
+                Err(_) => err += 1,
+            }
+        }
+        reload_and_rehydrate(app, path);
+        app.push_toast(
+            if err == 0 {
+                format!("Accepted {} hunk{}", ok, if ok == 1 { "" } else { "s" })
+            } else {
+                format!("Accepted {}, {} failed", ok, err)
+            },
+            if err == 0 { ToastLevel::Info } else { ToastLevel::Error },
+        );
+    }
+    if action.reject_all && !proposal_ids.is_empty() {
+        let staging = app.vault_session.services.staging.clone();
+        let mut n = 0usize;
+        for id in &proposal_ids {
+            if staging.reject(id).is_ok() {
+                n += 1;
+            }
+        }
+        reload_and_rehydrate(app, path);
+        app.push_toast(
+            format!("Rejected {} hunk{}", n, if n == 1 { "" } else { "s" }),
+            ToastLevel::Info,
+        );
+    }
+    if let Some(byte) = action.scroll_to_byte
+        && let Some(buffer) = app.session.buffers.get_mut(path)
+    {
+        let line = buffer.editor.doc.byte_to_line(byte);
+        let target_y = buffer.view.height_map.y_at_row_top(line) - 24.0;
+        buffer.view.scroll_y = target_y.max(0.0);
+    }
+}
+
+/// Re-read disk into the buffer and re-apply the buffer-hydration step so
+/// the inline diff layer reflects whatever proposals remain in
+/// `staging.db` after a bulk accept/reject.
+fn reload_and_rehydrate(app: &mut AppState, path: &str) {
+    let _ = editor_pane::reload_from_disk(app, path);
+    let staging = app.vault_session.services.staging.clone();
+    if let Some(buffer) = app.session.buffers.get_mut(path) {
+        buffer.agent_base = None;
+        buffer.hydrated_proposals.clear();
+        buffer.hydrate_pending_proposals(staging.as_ref());
+    }
+}
+
+fn show_editor(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    path: &str,
+    diff: Option<diff_overlay::DiffOverlay>,
+) {
     crate::profile_function!();
     // Cmd-S / Ctrl-S save shortcut at the buffer level. We intercept
     // before the editor consumes the event since the editor doesn't bind
@@ -113,10 +195,22 @@ fn show_editor(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         app.push_toast(format!("Save failed: {}", err), ToastLevel::Error);
     }
 
+    // Read scroll speed up-front so the immutable config borrow doesn't
+    // collide with the mutable buffer borrow below. The view also reads
+    // this each frame so changing the setting takes effect immediately.
+    let scroll_speed = app
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.editor.scroll_speed)
+        .unwrap_or(1.0)
+        .max(0.0);
+
     let Some(buffer) = app.session.buffers.get_mut(path) else {
         ui.label(format!("buffer {} not loaded", path));
         return;
     };
+    buffer.view.scroll_speed = scroll_speed;
 
     // Rebuild decoration layers from current state. Most decoration
     // providers take an Option<&Theme> so they can fall back to a
@@ -274,6 +368,18 @@ fn show_editor(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         });
     }
 
+    // Diff overlay: view zones for removed lines + line backgrounds for
+    // added/modified ranges, computed once at the top of `show`. Pushed
+    // last so the diff stacks above other decoration layers; goes through
+    // `push_with_heights` because the Block entries reserve space in the
+    // line-height map.
+    if let Some(ov) = &diff {
+        buffer
+            .view
+            .decorations
+            .push_with_heights(ov.decorations.clone());
+    }
+
     // Viewport-scoped layers (occurrence highlight, bracket match). Both
     // are cheap to build, but constructing a fresh `RangeSet` every frame
     // flips `view.decorations.signature` (Arc-pointer-based content_id)
@@ -325,10 +431,209 @@ fn show_editor(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         MinimapWidget::new(&buffer.editor, &mut buffer.view)
             .with_options(opts)
             .show(&mut mini_ui);
+    } else if !buffer.hide_scrollbar {
+        // No minimap → draw a thin auto-hiding scrollbar overlay along
+        // the right edge of the editor body. Same affordance role the
+        // file tree gets from `ScrollArea::vertical`, just adapted to
+        // the editor's hand-rolled scroll model (`view.scroll_y`).
+        auto_hide_scrollbar(ui, &mut buffer.view, editor_rect);
     }
+
+    // Pull WidgetClicks for patch-review buttons out of the click buffer
+    // BEFORE fold-toggle handling so the click_map mapping is consumed
+    // here. Other WidgetClick consumers (none today) would chain here too.
+    let widget_clicks: Vec<u64> = buffer
+        .click_buffer
+        .iter()
+        .filter_map(|c| match c {
+            ClickAction::WidgetClick(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    buffer
+        .click_buffer
+        .retain(|c| !matches!(c, ClickAction::WidgetClick(_)));
 
     // Apply fold toggles from this frame's clicks.
     buffer.drain_fold_clicks();
+
+    // Per-hunk overlay-widget click dispatch. The diff overlay maps each
+    // Accept / Reject button id to the proposal(s) it covers; we route
+    // the action through the staging service and then re-hydrate so the
+    // remaining proposals' hunks shift / disappear cleanly.
+    if let Some(ov) = &diff
+        && !widget_clicks.is_empty()
+    {
+        for id in widget_clicks {
+            let Some(action) = ov.click_map.get(&id) else { continue };
+            match action.clone() {
+                diff_overlay::HunkAction::Accept(ids) => handle_hunk_accept(app, path, &ids),
+                diff_overlay::HunkAction::Reject(ids) => handle_hunk_reject(app, path, &ids),
+            }
+        }
+    }
+}
+
+/// Per-hunk Accept: dispatch `staging.accept` on every proposal whose
+/// footprint overlapped the hunk, then reload + re-hydrate so the diff
+/// layer reflects whatever remains.
+fn handle_hunk_accept(app: &mut AppState, path: &str, proposal_ids: &[String]) {
+    let staging = app.vault_session.services.staging.clone();
+    let changes = app.vault_session.services.changes.clone();
+    let (mut ok, mut err) = (0usize, 0usize);
+    for id in proposal_ids {
+        match staging.accept(id, &app.vault_session.vault, Some(changes.as_ref())) {
+            Ok(_) => ok += 1,
+            Err(_) => err += 1,
+        }
+    }
+    reload_and_rehydrate(app, path);
+    app.push_toast(
+        if err == 0 {
+            format!("Accepted {} hunk{}", ok, if ok == 1 { "" } else { "s" })
+        } else {
+            format!("Accepted {}, {} failed", ok, err)
+        },
+        if err == 0 { ToastLevel::Info } else { ToastLevel::Error },
+    );
+}
+
+/// Per-hunk Reject: dispatch `staging.reject` on every covered proposal,
+/// then reload + re-hydrate. Reject doesn't append a `changes.db` row;
+/// the rejected text simply isn't re-applied on the next hydration.
+fn handle_hunk_reject(app: &mut AppState, path: &str, proposal_ids: &[String]) {
+    let staging = app.vault_session.services.staging.clone();
+    let mut n = 0usize;
+    for id in proposal_ids {
+        if staging.reject(id).is_ok() {
+            n += 1;
+        }
+    }
+    reload_and_rehydrate(app, path);
+    app.push_toast(
+        format!("Rejected {} hunk{}", n, if n == 1 { "" } else { "s" }),
+        ToastLevel::Info,
+    );
+}
+
+/// Overlay scrollbar painted along the right edge of the editor when
+/// the minimap is hidden. macOS-style: invisible at rest, fades in
+/// when the pointer is inside the editor or right after a scroll, and
+/// supports click + drag on the thumb to seek `view.scroll_y`.
+///
+/// We can't use `egui::ScrollArea` here because the editor maintains
+/// its own viewport model (`view.scroll_y` + `height_map`) and paints
+/// only the visible band — wrapping it in a `ScrollArea` would force
+/// us to lay out the whole document into a scrollable canvas.
+fn auto_hide_scrollbar(
+    ui: &mut egui::Ui,
+    view: &mut editor_view::view::ViewState,
+    editor_rect: egui::Rect,
+) {
+    let total_h = view.height_map.total_height();
+    let viewport_h = view.height.max(1.0);
+    let max_scroll = (total_h - viewport_h).max(0.0);
+    if max_scroll <= 0.5 {
+        return;
+    }
+
+    let track_w = 10.0;
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(editor_rect.right() - track_w, editor_rect.top()),
+        egui::pos2(editor_rect.right(), editor_rect.bottom()),
+    );
+
+    let id = ui.id().with("editor::auto_scrollbar");
+    let response = ui.interact(track_rect, id, egui::Sense::click_and_drag());
+
+    // Wake the bar on any pointer activity in the editor body (so the
+    // user gets a visual hint while reading) plus the usual scrollbar
+    // interactions and scroll-wheel input.
+    let now = ui.ctx().input(|i| i.time);
+    let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
+    let scroll_just_happened = ui.ctx().input(|i| i.smooth_scroll_delta.y.abs() > 0.0);
+    let pointer_in_editor = pointer_pos.map(|p| editor_rect.contains(p)).unwrap_or(false);
+
+    let activity_id = id.with("last_active");
+    let mut last_active: f64 = ui
+        .ctx()
+        .data(|d| d.get_temp::<f64>(activity_id))
+        .unwrap_or(0.0);
+    if response.hovered()
+        || response.dragged()
+        || pointer_in_editor
+        || scroll_just_happened
+    {
+        last_active = now;
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(activity_id, last_active));
+    }
+
+    // Fade window: solid for `hold`, lerp out over `fade`, then idle.
+    let elapsed = (now - last_active).max(0.0);
+    let hold = 0.8_f64;
+    let fade = 0.6_f64;
+    let alpha = if elapsed < hold {
+        1.0
+    } else if elapsed < hold + fade {
+        1.0 - ((elapsed - hold) / fade) as f32
+    } else {
+        0.0
+    };
+    if alpha <= 0.0 {
+        return;
+    }
+    // Schedule a repaint during the fade so the bar actually animates
+    // away instead of getting stuck at full opacity until the next
+    // input event.
+    if elapsed < hold + fade {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    // Drag interaction: convert pointer delta in track space back to
+    // content space (scale by total_h/track_h) so a full track sweep
+    // covers the full scrollable range.
+    let track_h = track_rect.height();
+    let thumb_min_h = 24.0_f32;
+    let thumb_h = ((viewport_h / total_h) * track_h).max(thumb_min_h);
+    let scroll_range = (track_h - thumb_h).max(1.0);
+    let frac = (view.scroll_y / max_scroll).clamp(0.0, 1.0);
+    let thumb_top = track_rect.top() + frac * scroll_range;
+    let thumb_rect = egui::Rect::from_min_max(
+        egui::pos2(track_rect.left() + 2.0, thumb_top),
+        egui::pos2(track_rect.right() - 2.0, thumb_top + thumb_h),
+    );
+
+    if response.dragged() {
+        let dy = response.drag_delta().y;
+        if dy.abs() > 0.0 {
+            view.scroll_y = (view.scroll_y + dy * (max_scroll / scroll_range))
+                .clamp(0.0, max_scroll);
+        }
+    } else if response.clicked() {
+        // Click on the track outside the thumb → page jump in that
+        // direction. Click on the thumb itself is a no-op (drag handles it).
+        if let Some(p) = pointer_pos
+            && !thumb_rect.contains(p)
+        {
+            let dir = if p.y < thumb_rect.top() { -1.0 } else { 1.0 };
+            view.scroll_y = (view.scroll_y + dir * viewport_h * 0.9).clamp(0.0, max_scroll);
+        }
+    }
+
+    // Paint. Solid grey thumb tinted by hover; the track itself stays
+    // transparent so the editor text underneath shows through when the
+    // bar is partially faded.
+    let hovered = response.hovered() || response.dragged();
+    let base_alpha = if hovered { 220.0 } else { 140.0 };
+    let thumb_alpha = (base_alpha * alpha).round().clamp(0.0, 255.0) as u8;
+    let thumb_color = egui::Color32::from_rgba_unmultiplied(96, 102, 110, thumb_alpha);
+    ui.painter().rect_filled(
+        thumb_rect.shrink2(egui::vec2(0.0, 0.0)),
+        egui::CornerRadius::same(3),
+        thumb_color,
+    );
 }
 
 /// Surface a thin banner whenever there's a pending write-shaped
@@ -409,11 +714,14 @@ fn pending_rewrite_banner(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         let target = prop.target_path.clone();
         let pid_for_build = pid.clone();
         app.find_or_open_tab(
-            |k| matches!(k, TabKind::StagingPreview { proposal_id, .. } if *proposal_id == pid),
-            || TabKind::StagingPreview {
-                proposal_id: pid_for_build,
-                target_path: target,
-            },
+            |k| matches!(
+                k,
+                TabKind::Editor {
+                    buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                    ..
+                } if *proposal_id == pid
+            ),
+            || TabKind::staging_preview(pid_for_build, target),
         );
     }
 }
@@ -437,13 +745,15 @@ fn toolbar(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                     ui.add(icons::current_dot());
                 }
                 ui.separator();
-                if ui
+                let diff_resp = ui
                     .add(egui::Button::image(icons::diff()))
-                    .on_hover_text("User diff vs disk")
-                    .clicked()
-                {
+                    .on_hover_text("Diff vs disk — right-click to show changes\u{2026}");
+                if diff_resp.clicked() {
                     open_diff_vs_disk(app, path);
                 }
+                diff_resp.context_menu(|ui| {
+                    show_changes::show_diff_source_menu(ui, app, path);
+                });
                 // Agent-diff toggle: jump to the staging-preview tab when
                 // a write-shaped proposal is in flight against this note.
                 // Mutually-exclusive with the user-diff button above per
@@ -475,17 +785,20 @@ fn toolbar(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                             let tpath = p.target_path.clone();
                             let pid_for_build = pid.clone();
                             app.find_or_open_tab(
-                                |k| matches!(k, TabKind::StagingPreview { proposal_id, .. } if *proposal_id == pid),
-                                || TabKind::StagingPreview {
-                                    proposal_id: pid_for_build,
-                                    target_path: tpath,
-                                },
+                                |k| matches!(
+                                    k,
+                                    TabKind::Editor {
+                                        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                                        ..
+                                    } if *proposal_id == pid
+                                ),
+                                || TabKind::staging_preview(pid_for_build, tpath),
                             );
                         }
                     }
                 });
-                view_options_menu(ui, app, path);
-                mutations_menu(ui, app, path);
+                toolbar_menus::view_options_menu(ui, app, path);
+                toolbar_menus::mutations_menu(ui, app, path);
 
                 // "Add to trail" pill — legacy `addToTrailPill.ts`,
                 // `trail-add-to-active-from-editor-verb`. Hidden when
@@ -512,19 +825,12 @@ fn add_to_trail_pill(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     if !lower.ends_with(".md") && !lower.ends_with(".txt") {
         return;
     }
-    // Resolve target trail without mutating state: prefer the
-    // explicitly-active trail, else fall back to Recent if it exists.
-    let target_id: Option<String> = app
+    // Pill only surfaces when there's an explicitly-active trail.
+    let Some(trail_id) = app
         .session.active_trail
         .clone()
         .filter(|id| app.session.trails.iter().any(|t| &t.id == id))
-        .or_else(|| {
-            app.session.trails
-                .iter()
-                .find(|t| t.name == crate::state::RECENT_TRAIL)
-                .map(|t| t.id.clone())
-        });
-    let Some(trail_id) = target_id else {
+    else {
         return;
     };
     let trail = match app.session.trails.iter().find(|t| t.id == trail_id) {
@@ -541,10 +847,13 @@ fn add_to_trail_pill(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     } else {
         format!("Add to trail '{}'", trail_name)
     };
-    let resp = ui.add_enabled(!already, egui::Button::new(label));
+    let resp = ui.add_enabled(
+        !already,
+        egui::Button::image_and_text(crate::icons::trail(), label),
+    );
     let resp = resp.on_hover_text(tooltip);
     if resp.clicked() {
-        crate::state::note_visited(app, path);
+        crate::state::trail_append_waypoint(app, path);
         let _ = crate::bootstrap::save_trails(&app.vault_session.vault_root, &app.session.trails);
         app.push_toast(
             format!("Added to '{}'", trail_name),
@@ -565,332 +874,6 @@ fn trail_contains_path(waypoints: &[crate::state::Waypoint], path: &str) -> bool
     false
 }
 
-/// Popup menu offering view toggles. Mirrors the old `ui/src/app/viewMenu.ts`
-/// — flips that map directly onto live editor state apply immediately;
-/// flips for not-yet-wired features (chunk boundaries, intraline diff,
-/// heading breadcrumb) are surfaced as disabled rows so the menu is
-/// feature-complete by shape.
-fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
-    let mut wrap = false;
-    let mut hide_gutter = false;
-    let mut placeholder_special = false;
-    let mut highlight_trailing_ws = false;
-    let mut hide_frontmatter = false;
-    let mut show_minimap = false;
-    if let Some(buffer) = app.session.buffers.get(path) {
-        wrap = buffer.view.wrap_map.enabled();
-        hide_gutter = buffer.view.hide_gutter;
-        placeholder_special = buffer.show_whitespace;
-        highlight_trailing_ws = buffer.highlight_trailing_whitespace;
-        hide_frontmatter = buffer.hide_frontmatter;
-        show_minimap = buffer.show_minimap;
-    }
-    let resp = ui
-        .add(egui::Button::image(icons::eye()))
-        .on_hover_text("View options");
-    egui::Popup::menu(&resp).show(|ui| {
-        if ui.checkbox(&mut wrap, "Word wrap").changed() {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.view.wrap_map.set_enabled(wrap);
-            }
-            persist_view_setting(app, "editor.word_wrap", serde_json::json!(wrap));
-        }
-        let mut show_gutter = !hide_gutter;
-        if ui.checkbox(&mut show_gutter, "Show line numbers").changed() {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.view.hide_gutter = !show_gutter;
-            }
-            persist_view_setting(app, "editor.show_line_numbers", serde_json::json!(show_gutter));
-        }
-        if ui.checkbox(&mut placeholder_special, "Show whitespace").changed() {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.show_whitespace = placeholder_special;
-            }
-            persist_view_setting(
-                app,
-                "editor.show_whitespace",
-                serde_json::json!(placeholder_special),
-            );
-        }
-        if ui
-            .checkbox(&mut highlight_trailing_ws, "Highlight trailing whitespace")
-            .on_hover_text("Paint a red background over trailing spaces/tabs (view-highlight-trailing-whitespace-toggle)")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.highlight_trailing_whitespace = highlight_trailing_ws;
-                buffer.decoration_cache.trailing_ws = None;
-            }
-            persist_view_setting(
-                app,
-                "editor.highlight_trailing_whitespace",
-                serde_json::json!(highlight_trailing_ws),
-            );
-        }
-        if ui
-            .checkbox(&mut show_minimap, "Show minimap")
-            .on_hover_text("Structural minimap strip on the right of the editor")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.show_minimap = show_minimap;
-            }
-            persist_view_setting(app, "editor.show_minimap", serde_json::json!(show_minimap));
-        }
-        if ui.checkbox(&mut hide_frontmatter, "Hide frontmatter").changed() {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.hide_frontmatter = hide_frontmatter;
-            }
-            persist_view_setting(
-                app,
-                "editor.hide_frontmatter",
-                serde_json::json!(hide_frontmatter),
-            );
-        }
-        ui.separator();
-        let mut live_preview = false;
-        let mut chunk_boundaries = false;
-        let mut render_txt_as_md = false;
-        let mut intraline_diff = false;
-        let mut heading_breadcrumb = false;
-        if let Some(buffer) = app.session.buffers.get(path) {
-            live_preview = buffer.live_preview;
-            chunk_boundaries = buffer.chunk_boundaries;
-            render_txt_as_md = buffer.render_txt_as_markdown;
-            intraline_diff = buffer.intraline_diff;
-            heading_breadcrumb = buffer.heading_breadcrumb;
-        }
-        if ui
-            .checkbox(&mut live_preview, "Live preview")
-            .on_hover_text("Inline-render wikilinks, math, callouts (view-live-preview-toggle)")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.live_preview = live_preview;
-                buffer.decoration_cache = DecorationCache::default();
-            }
-            persist_view_setting(app, "editor.live_preview", serde_json::json!(live_preview));
-        }
-        if ui
-            .checkbox(&mut chunk_boundaries, "Show chunk boundaries")
-            .on_hover_text("Visualize how the indexer splits this note (view-show-chunk-boundaries)")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.chunk_boundaries = chunk_boundaries;
-            }
-            persist_view_setting(
-                app,
-                "editor.show_chunk_boundaries",
-                serde_json::json!(chunk_boundaries),
-            );
-        }
-        let is_txt = path
-            .rsplit_once('.')
-            .map(|(_, ext)| ext.eq_ignore_ascii_case("txt"))
-            .unwrap_or(false);
-        ui.add_enabled_ui(is_txt, |ui| {
-            if ui
-                .checkbox(&mut render_txt_as_md, "Render .txt as markdown")
-                .on_hover_text("Apply the markdown live-preview stack to .txt files (view-render-txt-as-markdown-toggle)")
-                .changed()
-            {
-                if let Some(buffer) = app.session.buffers.get_mut(path) {
-                    buffer.render_txt_as_markdown = render_txt_as_md;
-                    // For an open .txt buffer, the live-preview flag
-                    // also flips so the change takes effect immediately.
-                    buffer.live_preview = render_txt_as_md;
-                    buffer.decoration_cache = DecorationCache::default();
-                }
-                persist_view_setting(
-                    app,
-                    "editor.render_txt_as_markdown",
-                    serde_json::json!(render_txt_as_md),
-                );
-            }
-        });
-        if ui
-            .checkbox(&mut intraline_diff, "Intraline diff highlights")
-            .on_hover_text("Color diff changes at character granularity (view-intraline-diff-toggle)")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.intraline_diff = intraline_diff;
-            }
-            persist_view_setting(
-                app,
-                "editor.intraline_diff",
-                serde_json::json!(intraline_diff),
-            );
-        }
-        if ui
-            .checkbox(&mut heading_breadcrumb, "Show heading breadcrumb")
-            .on_hover_text("Display the cursor's heading path in the status bar (view-heading-breadcrumb-toggle)")
-            .changed()
-            && let Some(buffer) = app.session.buffers.get_mut(path)
-        {
-            buffer.heading_breadcrumb = heading_breadcrumb;
-        }
-    });
-}
-
-/// Popup menu offering LLM-backed note mutations. Mirrors the old TS
-/// `mutations` module (`note-mutations-menu`): each pick builds a
-/// `TaskKind::NoteMutation` task and submits it to the shared queue.
-/// A backend worker drains the queue, runs the LLM, and (eventually)
-/// surfaces the rewritten content back via the staging system.
-fn mutations_menu(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
-    let in_flight = mutation_in_flight(app, path);
-    let resp = ui
-        .add_enabled(!in_flight, egui::Button::image(icons::wand()))
-        .on_hover_text(if in_flight {
-            "Mutation in flight — wait for the queued task to finish."
-        } else {
-            "Mutations"
-        });
-    let mut chosen: Option<&'static str> = None;
-    egui::Popup::menu(&resp).show(|ui| {
-        if ui.button("Reformat as markdown").clicked() {
-            chosen = Some("reformat-as-markdown");
-            ui.close();
-        }
-        if ui.button("Summarize").clicked() {
-            chosen = Some("summarize");
-            ui.close();
-        }
-        if ui.button("Auto-tag").clicked() {
-            chosen = Some("auto-tag");
-            ui.close();
-        }
-        if ui.button("Improve clarity").clicked() {
-            chosen = Some("improve-clarity");
-            ui.close();
-        }
-    });
-    if let Some(m) = chosen {
-        submit_mutation(app, path, m);
-    }
-}
-
-/// True when the active task queue already has a `NoteMutation` task
-/// targeting `path` in flight (queued or leased). Mirrors the
-/// `note-mutation-one-in-flight-per-path` rule. Reads the live snapshot
-/// from the shared task queue — `app.session.pending_mutations` is just a
-/// belt-and-suspenders cache that catches the gap between submit and
-/// the first snapshot tick.
-fn mutation_in_flight(app: &AppState, path: &str) -> bool {
-    use hiker_core::tasks::{TaskKind, TaskState};
-    // Read the per-frame snapshot cache (`main::refresh_task_snapshot`)
-    // instead of blocking on `tasks.snapshot()` here.
-    let in_queue = app.ui_cache.task_snapshot.iter().any(|r| {
-        matches!(r.state, TaskState::Queued | TaskState::Leased)
-            && match &r.kind {
-                TaskKind::NoteMutation { source_path, .. } => source_path == path,
-                _ => false,
-            }
-    });
-    in_queue || app.session.pending_mutations.contains(path)
-}
-
-/// Submit a `NoteMutation` task to the queue. We don't yet have an
-/// in-process worker draining the queue here, so the user sees the task
-/// land in the Queue panel and the menu disables until it terminates.
-fn submit_mutation(app: &mut AppState, path: &str, mutation: &str) {
-    use hiker_core::tasks::{Priority, Task, TaskKind, TaskPayload, TaskShape};
-
-    let Some(buffer) = app.session.buffers.get(path) else {
-        return;
-    };
-    let text = buffer.editor.doc.to_string();
-    let kind = TaskKind::NoteMutation {
-        mutation: mutation.to_string(),
-        source_path: path.to_string(),
-    };
-    let prompt = match mutation {
-        "reformat-as-markdown" => "Reformat the following note as clean Markdown.",
-        "summarize" => "Summarize the following note in 2-3 sentences.",
-        "auto-tag" => "Propose 3-7 tags for the following note.",
-        "improve-clarity" => "Rewrite for clarity, preserving meaning.",
-        _ => "Apply the requested mutation.",
-    };
-    let task = Task {
-        id: hiker_core::store::new_id(),
-        kind,
-        priority: Priority::Normal,
-        shape: TaskShape::Direct,
-        payload: TaskPayload {
-            prompt: format!("{prompt}\n\n---\n{text}"),
-            inputs: serde_json::Value::Null,
-        },
-        output_schema: None,
-        submitted_at: std::time::SystemTime::now(),
-        // Include `source_hash_at_submit` so a downstream consumer can
-        // detect mid-flight edits via metadata alone — matches the legacy
-        // mutation submit payload.
-        metadata: serde_json::json!({
-            "source_path": path,
-            "source_hash_at_submit": &buffer.loaded_hash,
-        }),
-    };
-    let path_owned = path.to_string();
-    app.session.pending_mutations.insert(path_owned.clone());
-    // Capture the buffer hash at submit time so the awaiter can refuse to
-    // clobber a buffer the user has edited since submitting.
-    let source_hash_at_submit = buffer.loaded_hash.clone();
-    let mutation_kind = mutation.to_string();
-    let event_tx = app.vault_session.events.mutation_events_tx.clone();
-    let queue = app.vault_session.services.tasks.clone();
-    // Use the host's existing tokio runtime (entered at the top of
-    // every frame via `_rt_guard = self.runtime.enter()`), not a
-    // throwaway one — otherwise the task lands in a queue worker pool
-    // that nothing else can see, and the in-process direct-LLM worker
-    // never picks it up.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            let path_for_await = path_owned.clone();
-            handle.spawn(async move {
-                let h = queue.submit(task).await;
-                let outcome = h.await_outcome().await;
-                let tx = event_tx;
-                    use hiker_core::tasks::TaskOutcome;
-                    let ev = match outcome {
-                        TaskOutcome::Completed { value, .. } => {
-                            let content = match value {
-                                serde_json::Value::String(s) => s,
-                                other => other.to_string(),
-                            };
-                            crate::state::MutationEvent::Applied {
-                                source_path: path_for_await,
-                                mutation: mutation_kind,
-                                content,
-                                source_hash_at_submit,
-                            }
-                        }
-                        TaskOutcome::Failed { error, .. } => {
-                            crate::state::MutationEvent::Failed {
-                                source_path: path_for_await,
-                                mutation: mutation_kind,
-                                error,
-                            }
-                        }
-                        TaskOutcome::Cancelled { .. } => {
-                            crate::state::MutationEvent::Cancelled {
-                                source_path: path_for_await,
-                            }
-                        }
-                    };
-                    let _ = tx.send(ev);
-                });
-            }
-        Err(err) => {
-            tracing::warn!(error = %err, "no tokio runtime; mutation not submitted");
-        }
-    }
-    app.push_toast(
-        format!("Queued mutation '{mutation}' for {path}"),
-        ToastLevel::Info,
-    );
-}
 
 /// Persist a `editor.*` view toggle into vault-scoped settings + swap the
 /// merged copy in `AppState::config` so subsequent buffer opens pick up
@@ -965,24 +948,23 @@ fn persist_view_setting(app: &mut AppState, key: &str, value: serde_json::Value)
 /// "Diff vs disk" — open (or focus) a `BufferDiff` tab that shows a
 /// read-only side-by-side diff between the buffer text and the on-disk
 /// version. The preview tab updates as the user keeps typing.
-fn open_diff_vs_disk(app: &mut AppState, path: &str) {
-    use crate::tab::{Tab, TabKind};
-    // Focus an existing diff tab for this path if one's open.
-    if let Some(existing) = app.session.tabs.iter().find(|t| {
-        matches!(&t.kind, TabKind::BufferDiff { path: p } if p == path)
-    }) {
-        app.session.active_tab = Some(existing.id);
-        return;
+/// Toggle the diff-against-disk overlay on the *active* editor tab —
+/// diff is a mode of the same tab (per `diff-as-mode`), not a separate
+/// tab kind. Press once to layer the disk diff on top of the live buffer;
+/// press again to clear it. The buffer's cursor / selection / scroll
+/// survive both transitions because the buffer text is untouched.
+pub(super) fn open_diff_vs_disk(app: &mut AppState, path: &str) {
+    use crate::tab::{BufferSource, DiffSource, TabKind};
+    let Some(active_id) = app.session.active_tab else { return };
+    let Some(tab) = app.tab_by_id_mut(active_id) else { return };
+    if let TabKind::Editor { buffer: BufferSource::Vault { path: tab_path }, diff } = &mut tab.kind
+        && tab_path == path
+    {
+        *diff = match diff {
+            Some(_) => None,
+            None => Some(DiffSource::Disk { path: path.to_string() }),
+        };
     }
-    let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::BufferDiff {
-            path: path.to_string(),
-        },
-        sticky: true,
-    });
-    app.session.active_tab = Some(id);
 }
 
 // Status-bar version dropdown lives in the sibling `versions` submodule
@@ -1229,7 +1211,7 @@ fn index_diff_decorations(
     RangeSet::from_iter(entries)
 }
 
-fn status_bar(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
+pub(crate) fn status_bar(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     egui::Frame::default()
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {

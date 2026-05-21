@@ -18,9 +18,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::icons;
 use crate::state::{AppState, ToastLevel};
-use crate::theme;
 
 /// Legacy mode discriminant — kept because Settings persists a
 /// `default_sidebar_mode` field. Runtime no longer reads it.
@@ -32,15 +30,15 @@ pub enum SidebarMode {
     Trails,
 }
 
-/// Files panel: toolbar row (new note / refresh / sort menu) + file
-/// tree + trash bin at the bottom.
+/// Files panel: file tree + trash bin at the bottom. The new-note button
+/// and the refresh / sort menu live in the side bar's title row (wired
+/// through `WorkbenchBehavior::side_bar_action_buttons` /
+/// `side_bar_actions_menu`).
 pub fn files_panel(
     ui: &mut egui::Ui,
     state: &mut AppState,
     rt: &Arc<tokio::runtime::Runtime>,
 ) {
-    files_toolbar(ui, state);
-    ui.separator();
     let avail_height = ui.available_height();
     let trash_row_height = 28.0;
     egui::ScrollArea::vertical()
@@ -78,63 +76,7 @@ pub fn trails_panel(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-/// Files panel's internal toolbar: new note + actions (refresh / sort).
-fn files_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::image(icons::check()))
-            .on_hover_text("New note")
-            .clicked()
-        {
-            new_note(state);
-        }
-        let actions_btn = ui
-            .add(egui::Button::image(icons::collapse()))
-            .on_hover_text("Actions");
-        egui::Popup::menu(&actions_btn).show(|ui| {
-            if ui.button("Refresh tree").clicked() {
-                state.session.sidebar.dir_cache.clear();
-                state.push_toast("File tree refreshed", ToastLevel::Info);
-                ui.close();
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Sort by")
-                    .color(theme::muted())
-                    .small(),
-            );
-            use hiker_core::config::TreeSortBy;
-            let cur = state
-                .vault_session
-                .config
-                .read()
-                .ok()
-                .map(|c| c.vault.tree.sort_by)
-                .unwrap_or(TreeSortBy::NameAsc);
-            for (label, val) in [
-                ("Name A -> Z", TreeSortBy::NameAsc),
-                ("Name Z -> A", TreeSortBy::NameDesc),
-                ("Modified (newest)", TreeSortBy::MtimeDesc),
-                ("Modified (oldest)", TreeSortBy::MtimeAsc),
-            ] {
-                let prefix = if cur == val { "* " } else { "  " };
-                if ui.button(format!("{prefix}{label}")).clicked() {
-                    let s = match val {
-                        TreeSortBy::NameAsc => "name_asc",
-                        TreeSortBy::NameDesc => "name_desc",
-                        TreeSortBy::MtimeDesc => "mtime_desc",
-                        TreeSortBy::MtimeAsc => "mtime_asc",
-                    };
-                    persist_tree_sort(state, s);
-                    state.session.sidebar.dir_cache.clear();
-                    ui.close();
-                }
-            }
-        });
-    });
-}
-
-fn persist_tree_sort(state: &mut AppState, sort_str: &str) {
+pub fn persist_tree_sort(state: &mut AppState, sort_str: &str) {
     state.set_setting(
         hiker_core::config::SettingsScope::Vault,
         "vault.tree.sort_by",
@@ -143,7 +85,7 @@ fn persist_tree_sort(state: &mut AppState, sort_str: &str) {
     );
 }
 
-fn new_note(state: &mut AppState) {
+pub fn new_note(state: &mut AppState) {
     let target_dir = state
         .session
         .sidebar

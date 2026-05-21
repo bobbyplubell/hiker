@@ -66,6 +66,7 @@ pub mod theme;
 pub mod workspace;
 
 pub(crate) mod internal;
+pub(crate) mod icons;
 
 pub use activity_bar::{ActivityBadge, ActivityBar, ActivityItem};
 pub use behavior::WorkbenchBehavior;

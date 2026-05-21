@@ -107,6 +107,15 @@ impl Vault {
             } else {
                 format!("{}/{}", rel.trim_end_matches('/'), name)
             };
+            // Skip entries the watcher/indexer ignore (target/,
+            // node_modules/, etc.). Without this, opening a project
+            // root as a vault lets the user expand into a build tree
+            // from the sidebar, which then caches a `DirEntryDto` per
+            // file in `SidebarState.dir_cache` — easily millions of
+            // entries on a Rust monorepo.
+            if crate::watcher::is_ignored(&rel_path) {
+                continue;
+            }
             // mtime: best-effort. A failed metadata/system-time call is not a
             // reason to drop the row — fall back to 0 and let the frontend
             // sort it as the oldest entry.

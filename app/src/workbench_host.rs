@@ -17,7 +17,7 @@ use std::sync::Arc;
 use eframe::egui;
 use egui_workbench::{
     ActivityItem, DocumentTab, OpenTabOptions, TabState, TabUiContext, Workbench,
-    WorkbenchBehavior,
+    WorkbenchBehavior, WorkbenchTheme,
 };
 
 use crate::icons;
@@ -68,7 +68,7 @@ impl HikerMode {
         match self {
             HikerMode::Files => icons::folder(),
             HikerMode::Clusters => icons::cluster_tree(),
-            HikerMode::Trails => icons::walk(),
+            HikerMode::Trails => icons::trail(),
             HikerMode::Search => icons::search(),
             HikerMode::Related => icons::graph(),
             HikerMode::Backlinks => icons::bookmark(),
@@ -85,6 +85,12 @@ pub struct HikerWbTab {
     pub id: TabId,
     pub cached_label: String,
     pub cached_dirty: bool,
+    /// True when the tab body draws its own edge-to-edge surface (the
+    /// markdown editor + its bottom status strip) and shouldn't get the
+    /// workbench's standard pane-content inset. Cached at sync time so
+    /// `DocumentTab::wants_pane_content_inset` can answer without
+    /// reaching back into `AppState`.
+    pub edge_to_edge: bool,
 }
 
 impl DocumentTab for HikerWbTab {
@@ -94,6 +100,9 @@ impl DocumentTab for HikerWbTab {
     fn is_dirty(&self) -> bool {
         self.cached_dirty
     }
+    fn wants_pane_content_inset(&self) -> bool {
+        !self.edge_to_edge
+    }
 }
 
 /// Build a fresh workbench with the default activity (`Files`) selected
@@ -102,6 +111,12 @@ pub fn new_workbench() -> Workbench<HikerWbTab, HikerMode> {
     let mut wb = Workbench::default();
     wb.activity_bar.set_active(Some(HikerMode::Files));
     wb.secondary_side_bar.visible = true;
+    // Global bottom status strip: the editor used to host its own
+    // version dropdown + indexer + Ln/Col row inside the buffer pane;
+    // that strip is gone and `status_bar_ui` below feeds the same info
+    // (plus a default vault row for non-buffer tabs) into the workbench
+    // strip so it spans the full window width.
+    wb.status_bar.visible = true;
     wb
 }
 
@@ -118,6 +133,7 @@ pub fn sync_tabs(app: &mut AppState) {
         dirty: bool,
         state: TabState,
         is_active: bool,
+        edge_to_edge: bool,
     }
     let active_id = app.session.active_tab;
     let preview_id = app.session.preview_tab;
@@ -131,9 +147,7 @@ pub fn sync_tabs(app: &mut AppState) {
                 .and_then(|p| app.session.buffers.get(p))
                 .map(|b| b.is_dirty())
                 .unwrap_or(false);
-            let state = if Some(t.id) == preview_id {
-                TabState::Preview
-            } else if !t.sticky {
+            let state = if Some(t.id) == preview_id || !t.sticky {
                 TabState::Preview
             } else {
                 TabState::Regular
@@ -144,6 +158,7 @@ pub fn sync_tabs(app: &mut AppState) {
                 dirty,
                 state,
                 is_active: Some(t.id) == active_id,
+                edge_to_edge: matches!(t.kind, crate::tab::TabKind::Editor { .. }),
             }
         })
         .collect();
@@ -175,6 +190,7 @@ pub fn sync_tabs(app: &mut AppState) {
                 if let Some(t) = app.workbench.editor_area.get_mut(handle) {
                     t.cached_label = w.label;
                     t.cached_dirty = w.dirty;
+                    t.edge_to_edge = w.edge_to_edge;
                 }
             }
             None => {
@@ -182,6 +198,7 @@ pub fn sync_tabs(app: &mut AppState) {
                     id: w.id,
                     cached_label: w.label,
                     cached_dirty: w.dirty,
+                    edge_to_edge: w.edge_to_edge,
                 };
                 app.workbench.open_tab(
                     tab,
@@ -193,6 +210,20 @@ pub fn sync_tabs(app: &mut AppState) {
                 );
             }
         }
+    }
+
+    // Activation pass: drive the workbench's visible active tab from
+    // `app.session.active_tab`. Without this, browser-style back/
+    // forward (`editor_pane::nav_go`) updates `active_tab` but the
+    // workbench's tab strip stays on whatever the user last clicked —
+    // i.e. the visible pane doesn't actually navigate. The reverse
+    // direction (workbench click → session.active_tab) is handled by
+    // the focus-driven sync in `HikerWbBehavior::pane_ui` callers via
+    // the existing tab-strip event plumbing.
+    if let Some(active) = active_id
+        && let Some(handle) = app.workbench.editor_area.handle_for(|t| t.id == active)
+    {
+        app.workbench.set_active(handle);
     }
 }
 
@@ -217,6 +248,22 @@ impl<'a> WorkbenchBehavior<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
             return;
         };
         render_tab_body(ui, self.app, self.rt, tab.id, kind);
+    }
+
+    fn on_preview_promoted(&mut self, tab: &HikerWbTab) {
+        // egui-workbench promoted this tab from Preview → Regular
+        // (double-click on the tab in the strip, or a "Keep open" menu
+        // action). Mirror the promotion into hiker's per-tab `sticky`
+        // flag and clear the session-level preview slot so the next
+        // non-sticky `open_file` allocates a fresh preview tab instead
+        // of swapping the just-pinned tab's contents.
+        let id = tab.id;
+        if let Some(t) = self.app.tab_by_id_mut(id) {
+            t.sticky = true;
+        }
+        if self.app.session.preview_tab == Some(id) {
+            self.app.session.preview_tab = None;
+        }
     }
 
     fn on_tab_close(&mut self, tab: &HikerWbTab) -> bool {
@@ -260,8 +307,104 @@ impl<'a> WorkbenchBehavior<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
         }
     }
 
-    fn secondary_side_bar_title(&self) -> egui::WidgetText {
-        "Chat".into()
+    fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
+        if matches!(mode, HikerMode::Files)
+            && ui
+                .add(egui::Button::image(crate::icons::plus()).small())
+                .on_hover_text("New note")
+                .clicked()
+        {
+            crate::sidebar::new_note(self.app);
+        }
+    }
+
+    fn side_bar_actions_menu(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
+        if matches!(mode, HikerMode::Files) {
+            if ui.button("Refresh tree").clicked() {
+                self.app.session.sidebar.dir_cache.clear();
+                self.app.push_toast("File tree refreshed", crate::state::ToastLevel::Info);
+                ui.close();
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Sort by")
+                    .color(crate::theme::muted())
+                    .small(),
+            );
+            use hiker_core::config::TreeSortBy;
+            let cur = self
+                .app
+                .vault_session
+                .config
+                .read()
+                .ok()
+                .map(|c| c.vault.tree.sort_by)
+                .unwrap_or(TreeSortBy::NameAsc);
+            for (label, val) in [
+                ("Name A -> Z", TreeSortBy::NameAsc),
+                ("Name Z -> A", TreeSortBy::NameDesc),
+                ("Modified (newest)", TreeSortBy::MtimeDesc),
+                ("Modified (oldest)", TreeSortBy::MtimeAsc),
+            ] {
+                let prefix = if cur == val { "* " } else { "  " };
+                if ui.button(format!("{prefix}{label}")).clicked() {
+                    let s = match val {
+                        TreeSortBy::NameAsc => "name_asc",
+                        TreeSortBy::NameDesc => "name_desc",
+                        TreeSortBy::MtimeDesc => "mtime_desc",
+                        TreeSortBy::MtimeAsc => "mtime_asc",
+                    };
+                    crate::sidebar::persist_tree_sort(self.app, s);
+                    self.app.session.sidebar.dir_cache.clear();
+                    ui.close();
+                }
+            }
+        }
+    }
+
+    fn secondary_side_bar_action_buttons(&mut self, ui: &mut egui::Ui) {
+        let active_id = self.app.session.chat.active.clone();
+        if active_id.is_some()
+            && ui
+                .add(egui::Button::image(crate::icons::trash()).small())
+                .on_hover_text("Delete this session")
+                .clicked()
+            && let Some(id) = active_id.as_deref()
+        {
+            let vault_root = self.app.vault_session.vault_root.clone();
+            if let Err(err) =
+                crate::chat::session::delete(&mut self.app.session.chat, &vault_root, id)
+            {
+                tracing::warn!(error = %err, "chat: delete failed");
+            }
+        }
+        if ui
+            .add(egui::Button::image(crate::icons::plus()).small())
+            .on_hover_text("New session")
+            .clicked()
+        {
+            let vault_root = self.app.vault_session.vault_root.clone();
+            let (model, provider) = self
+                .app
+                .vault_session
+                .config
+                .read()
+                .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
+                .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+            if let Err(err) = crate::chat::session::create_new(
+                &mut self.app.session.chat,
+                &vault_root,
+                &model,
+                &provider,
+            ) {
+                tracing::warn!(error = %err, "chat: create_new failed");
+            }
+        }
+    }
+
+    fn secondary_side_bar_title_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add(crate::icons::chat());
+        crate::chat::render::render_session_picker(ui, self.app);
     }
 
     fn secondary_side_bar_ui(&mut self, ui: &mut egui::Ui) {
@@ -271,6 +414,24 @@ impl<'a> WorkbenchBehavior<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
     }
 
     fn status_bar_ui(&mut self, ui: &mut egui::Ui) {
+        // Active-tab-driven status content: when a Buffer tab is
+        // focused, render the per-buffer version dropdown + indexer
+        // state + Ln:Col / word count row that used to live inside
+        // the editor pane. For any other tab kind, fall back to the
+        // vault-level row (vault name + staging / task counters).
+        // Other panels can grow their own status content the same way
+        // by matching on `TabKind` here.
+        let active_buffer_path = self
+            .app
+            .session
+            .active_tab
+            .and_then(|id| self.app.tab_by_id(id))
+            .and_then(|t| t.kind.vault_path().map(|p| p.to_string()));
+        if let Some(path) = active_buffer_path {
+            crate::panels::buffer::status_bar(ui, self.app, &path);
+            return;
+        }
+
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             let vault = self
                 .app
@@ -293,6 +454,19 @@ impl<'a> WorkbenchBehavior<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
             });
         });
     }
+
+    fn theme(&self, style: &egui::Style) -> WorkbenchTheme {
+        // The default focused-group stroke (2px, `selection.bg_fill` at
+        // ~60% alpha) paints on top of the tile rect — over a light
+        // theme it alpha-blends to a near-white border around every edge
+        // of the central pane and inside the minimap, which the user
+        // reads as stray white padding. Zero out the width to disable
+        // the overlay while keeping the rest of the default theme.
+        WorkbenchTheme {
+            focused_group_border_width: 0.0,
+            ..WorkbenchTheme::from_egui_style(style)
+        }
+    }
 }
 
 /// Render the body of a hiker tab. Routes by `TabKind` to the existing
@@ -306,7 +480,7 @@ fn render_tab_body(
     kind: TabKind,
 ) {
     match kind {
-        TabKind::Buffer { path } => panels::buffer::show(ui, app, &path, rt),
+        TabKind::Editor { buffer, diff } => render_editor_tab(ui, app, rt, buffer, diff),
         TabKind::Home => panels::home::show(ui, app),
         TabKind::HomeDetail { which } => render_home_detail(ui, app, which),
         TabKind::Queue => panels::queue::show(ui, app),
@@ -315,22 +489,10 @@ fn render_tab_body(
         TabKind::Properties { path } => panels::properties::show(ui, app, &path),
         TabKind::Graph => panels::graph::show(ui, app),
         TabKind::Agent { session_id } => panels::agent::show(ui, app, &session_id, rt),
-        TabKind::TrashPreview {
-            trash_path,
-            original_path,
-        } => panels::trash_preview::show(ui, app, &trash_path, &original_path),
-        TabKind::SnapshotPreview { path, change_id } => {
-            panels::snapshot_preview::show(ui, app, &path, &change_id)
-        }
-        TabKind::BufferDiff { path } => panels::buffer_diff::show(ui, app, &path),
-        TabKind::StagingPreview {
-            proposal_id,
-            target_path,
-        } => panels::staging_preview::show(ui, app, &proposal_id, &target_path),
         TabKind::PatchReview => panels::patch_review::show(ui, app),
         TabKind::Plugins => panels::plugins::show(ui, app),
         TabKind::IndexerDetail => panels::indexer_detail::show(ui, app, rt),
-        TabKind::AgentChanges => panels::agent_changes::show(ui, app),
+        TabKind::Changes => panels::changes::show(ui, app),
         TabKind::ClusterReview { config_json } => {
             panels::cluster_review::show(ui, app, tab_id, &config_json)
         }
@@ -340,4 +502,32 @@ fn render_tab_body(
 
 fn render_home_detail(ui: &mut egui::Ui, app: &mut AppState, which: HomeDetail) {
     panels::home::show_detail(ui, app, &which);
+}
+
+/// Dispatch an Editor-kind tab to the appropriate panel renderer based on
+/// the buffer source. Diff is presented by the underlying panel as a mode
+/// of the same editor widget (no separate panel for "diff active").
+fn render_editor_tab(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    rt: &Arc<tokio::runtime::Runtime>,
+    buffer: crate::tab::BufferSource,
+    diff: Option<crate::tab::DiffSource>,
+) {
+    use crate::tab::BufferSource;
+    // Diff (when set) renders as a decoration layer on the same editor
+    // widget — same tab, same cursor / selection — not a separate panel.
+    let _ = diff;
+    match buffer {
+        BufferSource::Vault { path } => panels::buffer::show(ui, app, &path, rt),
+        BufferSource::Snapshot { path, change_id } => {
+            panels::snapshot_preview::show(ui, app, &path, &change_id);
+        }
+        BufferSource::StagingProposal { proposal_id, target_path } => {
+            panels::staging_preview::show(ui, app, &proposal_id, &target_path);
+        }
+        BufferSource::Trash { trash_path, original_path } => {
+            panels::trash_preview::show(ui, app, &trash_path, &original_path);
+        }
+    }
 }

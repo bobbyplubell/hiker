@@ -22,6 +22,12 @@ pub struct WorkbenchTheme {
     pub focused_group_border: Color32,
     /// Width (in points) of the focused editor group border.
     pub focused_group_border_width: f32,
+    /// Inset (in points) applied to the content rect inside each tab
+    /// pane — gives the content a visible breathing margin around its
+    /// edges instead of sitting flush against the tab strip / pane
+    /// boundary. Painted in `panel_fill` so it reads as the same grey
+    /// as the content background.
+    pub pane_content_inset: f32,
     /// Activity bar item width (square).
     pub activity_item_size: f32,
     /// Activity bar total width.
@@ -46,6 +52,7 @@ impl WorkbenchTheme {
             side_bar_bg: visuals.panel_fill,
             focused_group_border: visuals.selection.bg_fill,
             focused_group_border_width: 2.0,
+            pane_content_inset: 8.0,
             activity_item_size: 28.0,
             activity_bar_width: 48.0,
             tab_bar_height: 28.0,

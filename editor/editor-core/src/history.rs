@@ -20,6 +20,19 @@ use crate::transaction::{EditType, Transaction};
 
 const COALESCE_WINDOW: Duration = Duration::from_millis(500);
 
+/// Soft cap on retained revisions. When `record` would push past this,
+/// we compact the tree down to the current head's ancestor chain and
+/// drop every other branch + every ancestor older than `KEEP_RECENT`
+/// steps. Without this cap, a long editing session against a large
+/// buffer accumulates revisions unbounded (each carries forward +
+/// inverse ChangeSets), and `EditorState::apply` deep-clones the
+/// entire revisions Vec per keystroke — a fast path to OOM.
+///
+/// 2000 ≈ ~1 MiB of revision metadata for typical short edits; a
+/// session can still undo back ~`KEEP_RECENT` steps after compaction.
+const MAX_REVISIONS: usize = 2000;
+const KEEP_RECENT: usize = 1000;
+
 #[derive(Clone)]
 struct Revision {
     parent: Option<u32>,
@@ -125,6 +138,60 @@ impl History {
         self.revisions.push(new_rev);
         self.revisions[self.head as usize].last_child = Some(new_idx);
         self.head = new_idx;
+
+        if self.revisions.len() > MAX_REVISIONS {
+            self.compact_to_ancestor_chain();
+        }
+    }
+
+    /// Drop every revision not on the current head's ancestor chain
+    /// and keep only the most recent `KEEP_RECENT` of those. The root
+    /// sentinel survives; the head retains its position relative to the
+    /// retained chain. Called from `record` when revisions exceed
+    /// `MAX_REVISIONS`.
+    ///
+    /// Sibling branches created by undo-then-edit are lost, as is the
+    /// older tail of the linear undo history. The compaction is
+    /// destructive — a user-visible "history was compacted" cue is not
+    /// surfaced here; the alternative is silently growing to OOM.
+    fn compact_to_ancestor_chain(&mut self) {
+        // Collect ancestors of head, head-first.
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = Some(self.head);
+        while let Some(idx) = cur {
+            if idx == 0 {
+                break;
+            }
+            chain.push(idx);
+            cur = self.revisions[idx as usize].parent;
+        }
+        // Keep at most KEEP_RECENT — `chain[0]` is the head (newest),
+        // truncate the tail to drop the oldest.
+        chain.truncate(KEEP_RECENT);
+        // Rebuild revisions: index 0 = root, then chain in chronological
+        // order (oldest first), so parent pointers index lower entries.
+        chain.reverse();
+        let mut new_revisions: Vec<Revision> = Vec::with_capacity(chain.len() + 1);
+        new_revisions.push(Revision::root());
+        let mut new_head: u32 = 0;
+        for (i, old_idx) in chain.iter().enumerate() {
+            let mut rev = self.revisions[*old_idx as usize].clone();
+            let new_idx = (i + 1) as u32;
+            rev.parent = Some(if i == 0 { 0 } else { new_idx - 1 });
+            rev.last_child = if i + 1 < chain.len() {
+                Some(new_idx + 1)
+            } else {
+                None
+            };
+            new_revisions.push(rev);
+            new_head = new_idx;
+        }
+        // Patch root's last_child if we kept any revisions.
+        if !chain.is_empty() {
+            new_revisions[0].last_child = Some(1);
+        }
+        self.revisions = new_revisions;
+        self.head = new_head;
     }
 
     fn should_coalesce(&self, tx: &Transaction, now: Instant) -> bool {

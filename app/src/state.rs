@@ -132,6 +132,12 @@ pub struct Services {
     pub audit: Arc<AgentLog>,
     pub tasks: Arc<TaskQueue>,
     pub mcp: Option<Arc<hiker_mcp::McpServerHandle>>,
+    /// Shared `[mcp.tools]` snapshot the MCP handler reads at dispatch
+    /// time. Created at vault open and mirrored by `set_setting` on
+    /// every config change so settings-panel toggles (review_required,
+    /// per-tool gates) take effect without an MCP restart. Always
+    /// present even when MCP is disabled — keeps the wiring uniform.
+    pub mcp_tools_cfg: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
 }
 
 pub struct VaultEvents {
@@ -204,8 +210,8 @@ pub struct Session {
     pub sidebar: SidebarState,
     pub nav: NavState,
     pub trails: Vec<Trail>,
-    /// Id of the trail that receives `note_visited` appends. `None` =
-    /// the auto-created "Recent" trail.
+    /// Id of the trail that receives manual append-waypoint actions.
+    /// `None` = no active trail; the Add-to-trail verbs hide/disable.
     pub active_trail: Option<String>,
     /// Inline-rename draft for the trails sidebar.
     pub trail_rename: Option<(String, String)>,
@@ -215,8 +221,6 @@ pub struct Session {
     pub chat_discovered: bool,
     /// Last time autosave ticked.
     pub last_autosave_tick: Instant,
-    /// Filter pill selection for the vault-home recent-activity feed.
-    pub activity_filter: hiker_core::activity::ActivitySource,
     /// Paths with a `NoteMutation` task we just submitted. Gates the
     /// wand-icon menu so concurrent mutations don't pile up.
     pub pending_mutations: HashSet<String>,
@@ -246,7 +250,6 @@ impl Default for Session {
             chat: crate::chat::ChatRegistry::new(),
             chat_discovered: false,
             last_autosave_tick: Instant::now(),
-            activity_filter: hiker_core::activity::ActivitySource::Merged,
             pending_mutations: HashSet::new(),
         }
     }
@@ -320,7 +323,6 @@ pub enum MutationEvent {
 
 pub const INDEXER_EVENTS_MAX: usize = 200;
 pub const TRAILS_MAX: usize = 50;
-pub const RECENT_TRAIL: &str = "Recent";
 pub const NAV_MAX: usize = 200;
 
 // ===========================================================================
@@ -357,22 +359,6 @@ pub fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-pub fn ensure_recent_trail(state: &mut AppState) -> String {
-    if let Some(t) = state.session.trails.iter().find(|t| t.name == RECENT_TRAIL) {
-        return t.id.clone();
-    }
-    let id = format!("recent-{}", now_ms_i64());
-    state.session.trails.push(Trail {
-        id: id.clone(),
-        name: RECENT_TRAIL.to_string(),
-        waypoints: Vec::new(),
-        created_at_ms: now_ms_i64(),
-        last_activated_at_ms: now_ms_i64(),
-        append_under: None,
-    });
-    id
 }
 
 pub fn create_trail(state: &mut AppState, name: &str) -> String {
@@ -413,19 +399,14 @@ pub fn nav_can_forward(state: &AppState) -> bool {
     nav.idx.map(|i| i + 1 < nav.history.len()).unwrap_or(false)
 }
 
-pub fn note_visited(state: &mut AppState, path: &str) {
-    let target_id = match state.session.active_trail.clone() {
-        Some(id) if state.session.trails.iter().any(|t| t.id == id) => id,
-        _ => ensure_recent_trail(state),
+/// Manually append `path` as a waypoint of the currently active trail.
+/// No-op when no trail is active. When `append_under` is set, the new
+/// waypoint nests under that cursor; otherwise it lands at the root tail.
+pub fn trail_append_waypoint(state: &mut AppState, path: &str) {
+    let Some(trail_id) = state.session.active_trail.clone() else {
+        return;
     };
-    let is_recent = state
-        .session
-        .trails
-        .iter()
-        .find(|t| t.id == target_id)
-        .map(|t| t.name == RECENT_TRAIL)
-        .unwrap_or(true);
-    let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == target_id) else {
+    let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == trail_id) else {
         return;
     };
     let wp = Waypoint {
@@ -451,23 +432,13 @@ pub fn note_visited(state: &mut AppState, path: &str) {
         trail.append_under = None;
     }
 
-    if is_recent {
-        if let Some(pos) = trail.waypoints.iter().position(|w| w.path == path) {
-            trail.waypoints.remove(pos);
-        }
-        trail.waypoints.insert(0, wp);
-        if trail.waypoints.len() > TRAILS_MAX {
-            trail.waypoints.truncate(TRAILS_MAX);
-        }
-    } else {
-        if trail.waypoints.last().map(|w| w.path == path).unwrap_or(false) {
-            return;
-        }
-        trail.waypoints.push(wp);
-        if trail.waypoints.len() > TRAILS_MAX {
-            let drop = trail.waypoints.len() - TRAILS_MAX;
-            trail.waypoints.drain(0..drop);
-        }
+    if trail.waypoints.last().map(|w| w.path == path).unwrap_or(false) {
+        return;
+    }
+    trail.waypoints.push(wp);
+    if trail.waypoints.len() > TRAILS_MAX {
+        let drop = trail.waypoints.len() - TRAILS_MAX;
+        trail.waypoints.drain(0..drop);
     }
 }
 
@@ -493,6 +464,171 @@ pub fn find_waypoint_mut<'a>(
         }
     }
     None
+}
+
+/// Waypoint drag-and-drop placement target.
+#[derive(Debug, Clone)]
+pub enum MoveOp {
+    /// Insert as a sibling immediately before `target`.
+    Before(String),
+    /// Append as a child of `target`.
+    Child(String),
+    /// Place at the root-level head of the trail.
+    Head,
+    /// Place at the root-level tail of the trail.
+    Tail,
+}
+
+fn take_waypoint(waypoints: &mut Vec<Waypoint>, path: &str) -> Option<Waypoint> {
+    if let Some(pos) = waypoints.iter().position(|w| w.path == path) {
+        return Some(waypoints.remove(pos));
+    }
+    for w in waypoints.iter_mut() {
+        if let Some(taken) = take_waypoint(&mut w.children, path) {
+            return Some(taken);
+        }
+    }
+    None
+}
+
+fn locate_waypoint(
+    waypoints: &[Waypoint],
+    target: &str,
+) -> Option<(Option<String>, usize)> {
+    for (i, w) in waypoints.iter().enumerate() {
+        if w.path == target {
+            return Some((None, i));
+        }
+    }
+    fn descend(w: &Waypoint, target: &str) -> Option<(Option<String>, usize)> {
+        for (i, c) in w.children.iter().enumerate() {
+            if c.path == target {
+                return Some((Some(w.path.clone()), i));
+            }
+            if let Some(found) = descend(c, target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    for w in waypoints {
+        if let Some(found) = descend(w, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// True when `path` is `ancestor` itself or appears anywhere within
+/// `ancestor`'s subtree. Used to reject moves that would cycle.
+fn is_in_subtree(waypoints: &[Waypoint], ancestor: &str, path: &str) -> bool {
+    fn walk(w: &Waypoint, path: &str) -> bool {
+        w.path == path || w.children.iter().any(|c| walk(c, path))
+    }
+    for w in waypoints {
+        if w.path == ancestor {
+            return walk(w, path);
+        }
+        if is_in_subtree(&w.children, ancestor, path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Move waypoint `src` to a new position per `op`. Returns true on
+/// success. No-op (returns false) when the source isn't present or the
+/// move would create a cycle (dropping a node into its own subtree).
+pub fn move_waypoint(
+    waypoints: &mut Vec<Waypoint>,
+    src: &str,
+    op: MoveOp,
+) -> bool {
+    match &op {
+        MoveOp::Before(t) | MoveOp::Child(t) => {
+            if src == t.as_str() || is_in_subtree(waypoints, src, t) {
+                return false;
+            }
+        }
+        MoveOp::Head | MoveOp::Tail => {}
+    }
+    let Some(item) = take_waypoint(waypoints, src) else {
+        return false;
+    };
+    match op {
+        MoveOp::Tail => {
+            waypoints.push(item);
+            true
+        }
+        MoveOp::Head => {
+            waypoints.insert(0, item);
+            true
+        }
+        MoveOp::Child(target) => {
+            if let Some(parent) = find_waypoint_mut(waypoints, &target) {
+                parent.children.push(item);
+                true
+            } else {
+                waypoints.push(item);
+                false
+            }
+        }
+        MoveOp::Before(target) => match locate_waypoint(waypoints, &target) {
+            Some((None, idx)) => {
+                waypoints.insert(idx, item);
+                true
+            }
+            Some((Some(parent_path), idx)) => {
+                if let Some(parent) = find_waypoint_mut(waypoints, &parent_path) {
+                    parent.children.insert(idx, item);
+                    true
+                } else {
+                    waypoints.push(item);
+                    false
+                }
+            }
+            None => {
+                waypoints.push(item);
+                false
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+    fn wp(path: &str, children: Vec<Waypoint>) -> Waypoint {
+        Waypoint { path: path.into(), at_ms: 0, children, annotation: String::new() }
+    }
+    #[test]
+    fn move_to_tail_reorders_root() {
+        let mut v = vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])];
+        assert!(move_waypoint(&mut v, "a", MoveOp::Tail));
+        assert_eq!(v.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+    }
+    #[test]
+    fn move_before_inserts_at_root() {
+        let mut v = vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])];
+        assert!(move_waypoint(&mut v, "c", MoveOp::Before("a".into())));
+        assert_eq!(v.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["c", "a", "b"]);
+    }
+    #[test]
+    fn move_as_child_nests() {
+        let mut v = vec![wp("a", vec![]), wp("b", vec![])];
+        assert!(move_waypoint(&mut v, "b", MoveOp::Child("a".into())));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "a");
+        assert_eq!(v[0].children[0].path, "b");
+    }
+    #[test]
+    fn cycle_drop_into_own_subtree_rejected() {
+        let mut v = vec![wp("a", vec![wp("a1", vec![])])];
+        assert!(!move_waypoint(&mut v, "a", MoveOp::Child("a1".into())));
+        // Untouched.
+        assert_eq!(v[0].path, "a");
+        assert_eq!(v[0].children[0].path, "a1");
+    }
 }
 
 // ===========================================================================
@@ -563,8 +699,8 @@ impl Default for Toolbars {
                     "vault.label",
                     "sep",
                     "spacer",
-                    "panel.toggle.search",
-                    "panel.toggle.files",
+                    "view.toggle_left_sidebar",
+                    "view.toggle_right_sidebar",
                 ]
                 .iter()
                 .map(|s| s.to_string())
@@ -813,6 +949,14 @@ impl AppState {
         let vault_root = self.vault_session.vault_root.clone();
         match hiker_core::config::Config::set(scope, key, value, &vault_root) {
             Ok(new_cfg) => {
+                // Mirror the MCP-tools subtree into the shared RwLock the
+                // MCP handler reads at dispatch time, so toggles like
+                // `mcp.tools.review_required` take effect immediately
+                // (the handler's RwLock is *not* the same as the main
+                // Config; it's a snapshot taken at vault open).
+                if let Ok(mut guard) = self.vault_session.services.mcp_tools_cfg.write() {
+                    *guard = new_cfg.mcp.tools.clone();
+                }
                 if let Ok(mut guard) = self.vault_session.config.write() {
                     *guard = new_cfg;
                 }
@@ -843,6 +987,9 @@ pub fn set_setting_quiet(
         &app.vault_session.vault_root,
     ) {
         Ok(new_cfg) => {
+            if let Ok(mut guard) = app.vault_session.services.mcp_tools_cfg.write() {
+                *guard = new_cfg.mcp.tools.clone();
+            }
             if let Ok(mut guard) = app.vault_session.config.write() {
                 *guard = new_cfg;
             }
@@ -1006,10 +1153,13 @@ pub fn apply_confirm(state: &mut AppState, intent: ConfirmIntent) {
                 );
                 return;
             }
-            if let Ok(fresh) = Config::load(&state.vault_session.vault_root)
-                && let Ok(mut g) = state.vault_session.config.write()
-            {
-                *g = fresh;
+            if let Ok(fresh) = Config::load(&state.vault_session.vault_root) {
+                if let Ok(mut g) = state.vault_session.services.mcp_tools_cfg.write() {
+                    *g = fresh.mcp.tools.clone();
+                }
+                if let Ok(mut g) = state.vault_session.config.write() {
+                    *g = fresh;
+                }
             }
             state.push_toast("Scope reset to defaults", ToastLevel::Info);
         }

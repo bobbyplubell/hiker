@@ -88,6 +88,33 @@ pub struct Buffer {
     /// alongside the editor body. Per-buffer flip; vault default lives in
     /// `editor.show_minimap`.
     pub show_minimap: bool,
+    /// View toggle: when true, suppress the auto-hiding right-edge
+    /// scrollbar that fills in for the minimap when it's hidden. Only
+    /// observed while `show_minimap = false` — when the minimap is on it
+    /// already serves as the scroll affordance. Vault default lives in
+    /// `editor.hide_scrollbar`.
+    pub hide_scrollbar: bool,
+    /// Snapshot of the disk text at the moment any pending `edit_note`
+    /// proposals were hydrated into the live buffer. `None` when no
+    /// proposals applied — the buffer is just plain editing. When `Some`,
+    /// the inline patch-review surface renders `DiffLayer(agent_base,
+    /// current, Agent)` and per-hunk accept/reject mutates these two
+    /// ropes plus removes the contributing proposals from `staging.db`.
+    /// Per `patch-review-buffer-hydration` in `patch-review.md`.
+    pub agent_base: Option<String>,
+    /// IDs of the proposals that were applied to `current` at hydration
+    /// time. Saving the buffer is refused while this is non-empty — the
+    /// user must individually accept or reject every hunk so each accepted
+    /// proposal writes its `changes.db` audit row before its content
+    /// reaches disk. Per `patch-review-hydrate-dehydrate`.
+    pub hydrated_proposals: Vec<String>,
+    /// Byte ranges in `current` that each hydrated proposal's `new_str`
+    /// occupies, recorded as proposals applied (left-to-right) and shifted
+    /// forward as later proposals lengthen / shorten earlier byte
+    /// positions. Used by the per-hunk Accept/Reject widgets to map a
+    /// hunk's byte range back to the proposal(s) that contributed to it.
+    /// One proposal can produce multiple entries when `replace_all=true`.
+    pub hydration_footprints: Vec<(String, std::ops::Range<usize>)>,
 }
 
 /// Slot for one cached decoration provider output.
@@ -243,6 +270,107 @@ impl Buffer {
                 .map(|c| c.editor.intraline_diff)
                 .unwrap_or(false),
             show_minimap: cfg.map(|c| c.editor.show_minimap).unwrap_or(true),
+            hide_scrollbar: cfg.map(|c| c.editor.hide_scrollbar).unwrap_or(false),
+            agent_base: None,
+            hydrated_proposals: Vec::new(),
+            hydration_footprints: Vec::new(),
+        }
+    }
+
+    /// Apply pending `edit_note` proposals targeting this buffer's path,
+    /// snapshotting the pre-apply text as `agent_base`. After this returns,
+    /// `current` reflects "disk + applied proposals" and `hydrated_proposals`
+    /// carries the ids that contributed. Per `patch-review-buffer-hydration`.
+    ///
+    /// Conflicted proposals (where the edit can't apply against the
+    /// partially-applied text) are surfaced separately via the staging
+    /// service's eager-recheck path; this routine just skips them and
+    /// records the successes.
+    pub fn hydrate_pending_proposals(
+        &mut self,
+        staging: &hiker_core::staging::Staging,
+    ) {
+        let filter = hiker_core::staging::StagingFilter {
+            path: Some(self.path.clone()),
+            ..Default::default()
+        };
+        let proposals = match staging.list(&filter) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let mut running = self.loaded_text.clone();
+        let mut applied: Vec<String> = Vec::new();
+        let mut footprints: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+
+        for p in &proposals {
+            if p.action != "edit_note" {
+                continue;
+            }
+            let Some(edit) = p.edit.as_ref() else { continue };
+            let matches = find_all(&running, &edit.old_str);
+            if matches.is_empty()
+                || (matches.len() > 1 && !edit.replace_all)
+            {
+                continue;
+            }
+            let old_len = edit.old_str.len();
+            let new_len = edit.new_str.len();
+            let delta = new_len as isize - old_len as isize;
+
+            // Build the post-apply text in one pass so we can record each
+            // replacement's new byte position before the next match.
+            let mut next = String::with_capacity(
+                (running.len() as isize + delta * matches.len() as isize).max(0) as usize,
+            );
+            let mut cursor = 0usize;
+            let mut new_positions: Vec<std::ops::Range<usize>> = Vec::with_capacity(matches.len());
+            for m_start in &matches {
+                next.push_str(&running[cursor..*m_start]);
+                let new_pos = next.len();
+                next.push_str(&edit.new_str);
+                new_positions.push(new_pos..new_pos + new_len);
+                cursor = m_start + old_len;
+            }
+            next.push_str(&running[cursor..]);
+
+            // Shift earlier footprints forward to reflect the bytes added
+            // (or removed) by every match that lies strictly before them.
+            for (_pid, fp) in footprints.iter_mut() {
+                let shift_start = shift_for_position(fp.start, &matches, old_len, delta);
+                let shift_end = shift_for_position(fp.end, &matches, old_len, delta);
+                fp.start = (fp.start as isize + shift_start) as usize;
+                fp.end = (fp.end as isize + shift_end) as usize;
+            }
+
+            for pos in new_positions {
+                footprints.push((p.id.clone(), pos));
+            }
+            running = next;
+            applied.push(p.id.clone());
+        }
+
+        if !applied.is_empty() {
+            self.agent_base = Some(self.loaded_text.clone());
+            self.hydrated_proposals = applied;
+            self.hydration_footprints = footprints;
+            self.editor.doc = editor_core::Rope::from_str(&running);
+            // loaded_text / loaded_hash deliberately stay as the disk
+            // values so `is_dirty()` flips true while hydrated content is
+            // live in the buffer.
+        }
+    }
+
+    /// Drop a single hydrated proposal id from both the tracker list and
+    /// the footprint table. Called from the per-hunk Accept / Reject
+    /// handlers after the corresponding proposal has been removed from
+    /// `staging.db`.
+    pub fn drop_hydrated_proposal(&mut self, proposal_id: &str) {
+        self.hydrated_proposals.retain(|id| id != proposal_id);
+        self.hydration_footprints.retain(|(id, _)| id != proposal_id);
+        if self.hydrated_proposals.is_empty() {
+            self.agent_base = None;
+            self.hydration_footprints.clear();
         }
     }
 
@@ -327,4 +455,35 @@ impl Buffer {
             }
         });
     }
+}
+
+/// All start positions where `needle` occurs in `haystack`. Mirrors the
+/// staging service's internal `find_all_matches` so hydration's
+/// footprint tracking sees the same positions as `apply_edit`.
+fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let pos = from + rel;
+        out.push(pos);
+        from = pos + needle.len();
+    }
+    out
+}
+
+/// Compute the byte offset to add to an earlier footprint position,
+/// given the list of new-replacement positions in *running* text from
+/// the current proposal. Each match whose end lies at or before `pos`
+/// shifts `pos` by `delta` bytes.
+fn shift_for_position(pos: usize, matches: &[usize], old_len: usize, delta: isize) -> isize {
+    let mut shift = 0isize;
+    for m_start in matches {
+        if *m_start + old_len <= pos {
+            shift += delta;
+        }
+    }
+    shift
 }

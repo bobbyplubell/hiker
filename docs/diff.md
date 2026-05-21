@@ -1,171 +1,119 @@
-# Diff viewer
+# Diff
 
-A read-only rendering primitive that shows the line-level difference between two text buffers. Hosted by the consumer (snapshot preview, dirty-buffer Diff toggle, staging review), surfaced as a toggle button in the editor toolbar's `#mode-controls` slot that flips the CM6 view between "the consumer's primary content" and "the diff."
+A unified diff primitive plus the editor surfaces that consume it. Every diff in hiker — uncommitted-buffer diff, changes.db history, pending agent edits, snapshot review — is the same `DiffLayer` rendered against an editor tab.
 
 The headline decisions:
 
-- **Two buffers in, one diff out.** Inputs are a pair of labeled text buffers. The renderer doesn't know or care where the buffers come from — on-disk current, snapshot blobs, live editor buffers, staging proposals, future surfaces all fit. [diff-viewer-input-shape]
-- **Rendering primitive, hosted by the consumer.** The diff is *not* its own pane state. Each consumer toggles the CM6 view between its primary content (e.g. snapshot blob, live editable buffer, staging proposal) and the diff rendering against the appropriate counterpart. [diff-renderer]
-- **Unified red/green line diff, with optional intraline highlights.** Removed lines red, added lines green, unchanged context grey. v1 paints the whole file with changes inline — `core::diff::compute` emits a single hunk containing every line so the user sees full file context regardless of where the changes are. A View-menu toggle augments the line view with character-level highlights inside paired delete/insert lines (`diff-viewer-intraline`). Hunk grouping with `⋯` separators and click-to-expand context is a deferred follow-up (`diff-viewer-grouped-hunks`); the wire format already accommodates a list of hunks so the consumer entry point is the only thing that grows. Side-by-side is a separate deferred follow-up. [diff-viewer-line-unified]
-- **Mode-specific controls live in the editor toolbar's center slot, not in banners.** Each consumer populates `#mode-controls` with a small text label naming the mode plus icon-only buttons for the mode's actions. The Diff toggle is one such icon button (pressed when diff is active); Restore / Close / Apply / Reject are siblings. No separate banner DOM elements — controls live in the same toolbar that hosts View / Mutations / Discovery toggles. [editor-toolbar-mode-controls, mode-controls-diff-toggle]
+- **One primitive: `DiffLayer { base, current, owner }`.** Two text inputs in; hunks + intraline spans + decoration set out. The renderer is owner-agnostic. Hosted in the editor crate alongside the existing decoration primitives. [diff-layer]
+- **Diff is a mode of the editor tab, not a tab kind.** An editor tab carries an optional `diff: DiffSource`; when set, the tab renders the buffer's `current` text decorated by `DiffLayer(resolve(diff), current)`. Toggle is in the editor toolbar; no separate `BufferDiff` / `SnapshotPreview` / `StagingPreview` / `TrashPreview` tab kinds. [diff-as-mode]
+- **`DiffSource` enumerates where `base` comes from.** `Disk(path)`, `LiveBuffer(doc_id)`, `ChangesDb(change_id)`, `StagingProposal(proposal_id)`, `Trash(trash_path)`, `Empty`. Each variant resolves to a `Rope` directly — no URI scheme indirection. [diff-source-enum]
+- **Owners drive UI affordances, not rendering.** The decoration set is identical across owners; what differs is per-hunk verbs (accept/reject for `Agent` and `Staging`, restore for `Snapshot`, none for `Index` or `Manual`). Verbs ride as overlay widgets on the hunk. [diff-layer-owner]
+- **Computation is pure; rendering is in the editor crate.** `core::diff::compute(before, after)` returns hunks with optional intraline spans. `editor-diff` turns hunks into a `DecorationSet` (line backgrounds, removed-line view zones, intraline marks). Side-by-side layout is a future view option on the same primitive, not a separate tab. [diff-core-module, diff-renderer, diff-viewer-split-view]
 
 
-## Inputs
+## DiffLayer
 
-```ts
-interface DiffInput {
-  before: { label: string; content: string; meta?: object };
-  after:  { label: string; content: string; meta?: object };
+```rust
+pub struct DiffLayer {
+    pub base: Rope,
+    pub current: Rope,
+    pub owner: DiffOwner,
+}
+
+pub enum DiffOwner {
+    Index,     // gutter-only; no inline decorations, no controls
+    Staging,   // per-hunk accept/reject
+    Agent,     // per-hunk accept/reject (same render as Staging; distinct telemetry)
+    Snapshot,  // per-hunk restore (writes that hunk's base text back to disk)
+    Manual,    // no controls (user-initiated diff, e.g. between two snapshots)
 }
 ```
 
-`label` is what the renderer shows in the gutter / chrome to identify each side ("`note.md` · disk" / "`note.md` · buffer"). `meta` is opaque to the renderer; consumers use it for their own bookkeeping (e.g. snapshot id, staging path).
+The layer recomputes hunks each frame from `(base, current)`. Cheap because the inputs are ropes and diff is line-based. No anchor bookkeeping across edits — the diff *is* the state.
 
-A consumer that wants to render a diff calls `renderDiff(view: EditorView, input: DiffInput)` (or equivalent) — the renderer applies the diff doc + line decorations to the CM6 view it's handed. Toggling back to the plain view is the consumer's job (replace the doc with the plain `after.content` again, drop the decorations).
+The decoration set the layer emits:
 
-`actions` and `onClose` are *not* part of the renderer's contract. Each consumer's mode-controls render owns the buttons and lifecycle; the diff is a content lens, not a separate surface.
-
-
-## Computation vs rendering
-
-The split mirrors the rest of hiker's module discipline: domain logic in `core::*`, presentation in `ui/`.
-
-- **`core::diff`** — pure function `compute(before: &str, after: &str) -> DiffResult` returning a list of hunks (each hunk is a list of `{ op: Equal | Insert | Delete, line: String, before_line_no: Option<u32>, after_line_no: Option<u32> }`). Backed by the [`similar`](https://crates.io/crates/similar) crate. Pure: no I/O, no async, no state — just text → diff. Testable in Rust without spinning up the UI. [diff-core-module]
-- **Host command** `compute_diff(before: String, after: String) -> Result<DiffResult>` — thin wrapper over `core::diff::compute`.
-- **CLI parity** — `hiker diff <path> <snapshot-id>` (and `hiker diff <path-a> <path-b>`) calls the same `core::diff::compute`, prints unified-diff output to stdout. Lands when the CLI is fleshed out. [cli-diff]
-- **MCP** — no tool surface in v1. Agents can already retrieve two blobs (`get_note` + `change_content`) and reason over them; an `mcp-tool-diff` would be an optimization, not a capability. Reserved as deferred. [mcp-tool-diff]
+- **Line decorations.** Pale-red background for `base`-only lines (deletion), pale-green for `current`-only lines (insertion), default for equal lines.
+- **View zones.** Removed lines from `base` are injected as phantom lines above their successor in `current` (block decorations that affect line height). Same mechanism the editor already uses for chunk-boundary widgets.
+- **Intraline marks.** For each paired delete/insert line, a second pass emits `Decoration::mark` ranges with saturated red/green over the pale line background. Controlled by the per-vault `view.intraline_diff` toggle. [diff-viewer-intraline]
+- **Gutter markers.** `DiffAdded` / `DiffRemoved` / `DiffModified` glyphs per hunk. The only thing `Index` ownership emits.
+- **Overlay widgets (per hunk).** Owner-driven action buttons positioned at the hunk's first visible line. [diff-layer-hunk-widgets]
 
 
-## Rendering
+## DiffSource
 
-The renderer applies the `DiffResult` to the consumer's CodeMirror 6 `EditorView` with `EditorState.readOnly.of(true)` and line decorations driving the red/green coloring. Reusing CM6 means future syntax-highlighted diffs come for free (the same language compartment the editor already uses).
+```rust
+pub enum DiffSource {
+    Disk(PathBuf),                  // on-disk text at read time
+    LiveBuffer(DocId),              // another open buffer's current rope
+    ChangesDb(ChangeId),            // content_at(change_id) from changes.db
+    StagingProposal(ProposalId),    // proposal's stored before-text
+    Trash(PathBuf),                 // trashed file content
+    Empty,                          // empty rope (for diff-against-nothing)
+}
+```
 
-- **Removed lines** — pale red background, full-width line decoration.
-- **Added lines** — pale green background, full-width line decoration.
-- **Context lines** — default editor background.
+Each variant resolves to a `Rope` synchronously off existing services (`vault.read_file`, `app.buffers.get(doc_id)`, `changes.content_at(id)`, `staging.proposal(id)`, `vault.read_trash(path)`). No async, no caching layer; resolved each time the tab activates or its source is invalidated.
 
-v1 paints the whole file: `core::diff::compute` returns a single hunk containing every line (Equal / Insert / Delete), and the renderer flattens it into one continuous doc with per-line decorations. No `⋯` separators, no click-to-expand, no folding of unchanged regions — the user sees full file context with changes highlighted inline. The renderer's between-hunk `⋯` separator code path is unreachable in v1 by design; it stays in place so the grouped-hunks variant can drop in without UI rework.
+`LiveBuffer` is the "diff against another open buffer" affordance — used by the dirty-buffer toggle (`base = LiveBuffer(self)` is wrong; the dirty-buffer diff is `base = Disk(path), current = live buffer`).
 
-The grouped variant (`diff-viewer-grouped-hunks`) is the deferred follow-up: a separate `compute` entry point in `core::diff` (or an option flag) emits multiple hunks with bounded context (~3 lines of leading/trailing per hunk), and the renderer's `⋯` separators light up between them. Lands when files large enough to make the full-file paint awkward become a real consumer concern, or when the MCP tool surface for diff (`mcp-tool-diff`) wants a more compact representation. Same wire format, same UI primitive, different `compute` call.
-
-Whitespace handling: diff is computed on raw text. A toggle for ignore-whitespace lands when a consumer needs it. Deferred (`diff-viewer-ignore-whitespace`).
-
-Staleness: the diff is computed once when the toggle flips on and is *not* auto-refreshed if `before` or `after`'s underlying source mutates while the toggle stays on (e.g. a `hiker:file-changed` event for the snapshot consumer's path). The user toggles off and back on to recompute. Deliberate non-feature for v1 — preview surfaces are short-lived review interactions, and pinning the diff to its initial inputs avoids surprising re-renders mid-review. If a future consumer needs live re-diffing it can call `renderDiff` again itself; the renderer stays stateless about freshness.
-
-Markdown-rendering coupling: when the diff is shown inside a CM6 view that normally hosts markdown extensions (live preview, hide-frontmatter, etc.), the consumer must reconfigure those extensions to no-ops while the diff is active. The synthesized diff doc isn't markdown — its first `---` line shouldn't collapse under a frontmatter widget, a removed `# heading` shouldn't render as a styled heading, and emphasis markers shouldn't hide on cursor-out. Snapshot preview's `toggleSnapshotDiff` does this for the `livePreview` and `hideFrontmatter` compartments; future consumers follow the same pattern. Chunk-boundary gutters are already gated on read-only buffers and stay quiet for free.
-
-
-## The mode-controls slot and the Diff toggle
-
-The editor toolbar (`panel-toggle-buttons`) reserves a center slot, `#mode-controls`, between two flex spacers. The slot is empty in normal editing; entering a read-only preview mode populates it. [editor-toolbar-mode-controls]
-
-Concretely the slot holds:
-
-- **Icon-only action buttons** matching the existing toolbar-button palette (same line-weight, sizing, hover treatment). Mode-specific verbs land here: Diff toggle, Restore, Apply, Reject, Close — whichever the active consumer exposes. The mode qualifier identifying which non-current version is in view lives in the status-bar left region's version dropdown closed-state label (see `editor.md`'s `status-bar-version-dropdown`) so the toolbar stays compact and the context lives next to the file name.
-
-The Diff toggle is the icon button that flips the CM6 view between the consumer's primary content and the diff rendering: [mode-controls-diff-toggle]
-
-- **Default ("the primary content")** — the consumer's primary content (snapshot blob, live editable buffer, staging proposal, etc.) is shown. Toggle button is unpressed; tooltip "Show diff vs current" (or whichever phrasing fits the consumer).
-- **Toggled on ("the diff")** — the synthesized diff document with red/green line decorations against `before`. Toggle button is pressed; tooltip names the alternate state ("Hide diff").
-
-Pressed/unpressed visual state reflects which view is active. Same affordance shape across consumers so users build muscle memory once.
-
-Consumers that have nothing to diff against (e.g. an `op = "deleted"` activity row, or a newly-created buffer that hasn't been saved to disk yet) omit the Diff toggle entirely — its presence is the signal that "a diff exists for this view." The other action icons (Restore / Apply / Reject / Close) stay regardless of toggle state; the diff is a different lens on the same review, the verbs don't change.
-
-Rebuild discipline: `renderModeControls()` is idempotent — every transition (buffer swap, mode entry/exit, diff on/off) calls it fresh and replaces the slot's children. No incremental DOM updates; same inputs produce the same DOM. Cheap because the slot is tiny.
+`Empty` exists so trash entries — which have no current on-disk counterpart — can open in editor mode with `diff = Some(Empty)` greyed out, rather than special-casing the tab.
 
 
-## Consumers
+## Editor tab integration
 
-### Snapshot preview
+A tab is `Editor { buffer, diff: Option<DiffSource> }` (the only buffer-backed kind; see `editor.md` `tab-kinds`). The renderer:
 
-`snapshot-preview-mode` is the first and reference consumer. The mode-controls slot shows: Diff toggle icon, Restore icon, Close icon. The mode label ("Snapshot preview" or "Diff · snapshot ↔ current" when toggled) lives in the status-bar left region next to the basename. Default view on snapshot open is the snapshot content; toggle flips to diff with `before = snapshot blob`, `after = current on-disk` (read via `read_file_with_hash`). The toggle is hidden for `op = "deleted"` rows (no current content to diff against). [snapshot-preview-diff-toggle]
+1. Mounts the buffer's editor widget against `buffer.current`.
+2. If `diff` is `Some`, resolves the `DiffSource` to a `Rope` `base`, constructs a `DiffLayer { base, current: buffer.current, owner: owner_for(diff) }`, and pushes its decoration set onto the editor's decoration stack.
+3. Renders the toolbar's diff toggle as pressed when `diff.is_some()`. Right-clicking the toggle opens a source picker (per `editor.md` `editor-diff-target-picker`).
 
-### Dirty-buffer Diff toggle
+The buffer's `current` is whatever the buffer normally holds — its rope is unchanged by entering diff mode. Diff is a content lens, not a buffer swap. Cursor and selection survive toggling on and off.
 
-Whenever the active buffer is `isDirty()` and not in any other read-only preview mode, the mode-controls slot shows the Diff toggle alone — no other verbs (Save / Ctrl-Z / Save As are the user's verbs, and they live in the regular editor surface). Default view: the live editable buffer. Toggle: diff with `before = last-loaded content`, `after = live buffer text`. Toggling back returns the user's cursor + selection — flipping to diff doesn't destroy editor state. [editor-diff-vs-disk-toggle]
+`owner_for(diff)` maps:
+- `Disk` / `LiveBuffer` → `Manual` (no per-hunk controls; user is just looking)
+- `ChangesDb` → `Snapshot` (per-hunk restore verb)
+- `StagingProposal` → `Staging` (per-hunk accept/reject)
+- `Trash` → `Manual`
+- `Empty` → `Manual` (diff is empty anyway)
 
-This is the review surface for in-buffer mutations (per `editor.md` Note-mutations menu) — the user reads the post-mutation buffer, optionally toggles to compare against on-disk, then either Saves (accept) or Ctrl-Zs (revert). It's also a generally useful affordance for hand-edits before saving.
+`Agent` ownership is the inline patch-review path described in `patch-review.md`: the diff source isn't a single proposal — it's the buffer's `agent_base` (the disk text at the moment proposals were hydrated). That's not a `DiffSource` variant because it's a property of the buffer itself, not a chosen comparison target.
 
-### Staging review (forward ref)
-
-Staging proposals split by shape:
-
-- **`edit_note` proposals** open inline in *patch-review mode* (per `patch-review.md`). The CM6 view stays on the live file content with span-anchored hunks rendered as widget decorations; per-hunk Accept / Reject buttons sit in the gutter; the mode-controls slot carries Accept-all / Reject-all. The new agent-diff toggle (`patch-review-agent-diff-toggle`) is both the entry and exit affordance and lives in the editor toolbar alongside the existing user-diff toggle (`editor-diff-vs-disk-toggle`). Both toggles share the same diff icon family with corner badges (user / agent); they are mutually exclusive at runtime.
-- **`write_note` proposals** open in *write-note review mode* (per `write-note-review-surface` in `patch-review.md`) — a read-only buffer with the existing diff toggle, framed as "Review rewrite" or "Review new note" in the mode-controls label depending on whether the target path exists. Accept/reject can fire from the calling surface's row (activity detail page, chat card, trails panel, tree context menu, editor toolbar pill) or from the mode-controls slot when the user is reading the proposal.
-
-### Drift-conflict resolution (forward ref)
-
-`drift-conflict-modal` currently offers keep-mine / take-theirs / cancel, with "open diff" explicitly deferred. When that lands, it'll use the same toggle pattern: the modal opens a temporary preview mode with `before = on-disk current`, `after = my buffer`, mode-controls icons = keep mine / take theirs / cancel + the Diff toggle. The third action is the structural change vs the two-action consumers. [diff-viewer-three-way]
-
-### Diff between two snapshots
-
-In the activity detail view, when multi-select lands the user can pick two snapshot rows and click "Diff selected." This *is* a pure-inspection surface (no Restore action makes sense — neither row is "current"), so the mode-controls slot carries just the label, Diff toggle, and Close — no action verbs. Pinned for when the multi-select shape lands. [activity-detail-diff-between-versions]
+Read-only vs editable is independent of diff mode. Snapshot / trash sources mark the buffer read-only (no save path). The dirty-buffer diff and the agent diff leave the buffer editable.
 
 
-## Pane integration
+## Show changes (changes.db browser)
 
-The diff is *not* a separate `#editor-pane` state. Each consumer's preview surface shares the editor's CM6 view and is distinguished by what `#mode-controls` is currently rendering. The pane-state list stays at three: editor / vault home overview / vault home detail. Snapshot preview, staging preview are sub-modes of the editor pane state, identified by buffer-state flags (`buffer.mode.kind`) that drive `renderModeControls()`. The dirty-buffer Diff toggle is *not* a separate sub-mode — it's a content-lens on the regular editor pane state, and toggling it on/off doesn't push history.
+Right-clicking inside an editor buffer opens a context menu whose "Show changes…" entry lists recent `changes.db` rows for the buffer's path, newest first. Selecting a row switches the active tab into diff mode with `diff = Some(ChangesDb(change_id))`. [editor-show-changes-menu]
 
-Navigation history (`navigation-history-stack`) treats entering snapshot preview / staging preview as a content-surface change. Toggling within a preview between plain view and diff view does *not* push history — same as toggling the View menu's options doesn't push, the user is still on the same content surface, just rendered differently.
-
-Dirty-buffer protection: snapshot and staging previews are read-only; entering one from a dirty editor buffer is the same code path as opening a trash preview today (no buffer swap, dirty state preserved on return). The staging-Apply action errors when the source has unsaved edits rather than dropping them. [diff-viewer-respects-dirty-source]
+- **Submenu shape.** Up to N=20 recent rows. Each row shows timestamp (relative + absolute on hover), op, author. Last entry: `Browse all… → ` opens the `history` app page filtered to this path.
+- **No URI scheme.** `DiffSource::ChangesDb` resolves directly through `core::changes::content_at(change_id)`. The editor crate doesn't know about URI providers.
+- **Per-hunk restore.** Hunks carry a `Restore this hunk` verb that writes `base` (the historical text) back into the buffer for that range and saves. Restore-all stays as the existing `restore_snapshot` row-level action on the activity surface. [diff-layer-hunk-widgets]
+- **Read-only on history side.** The displayed diff is `base = historical`, `current = live buffer`. The user can keep editing `current` while a historical diff is shown; the diff updates each frame.
 
 
 ## Module placement
 
-- `core::diff` — pure `compute(before, after) -> DiffResult`; `similar` crate confined to this module, mirroring the `rusqlite-only-in-store` / `fastembed-only-in-embed` pattern. Unit tests live alongside.
-- Host command `compute_diff` — ~10-line wrapper.
-- `ui/src/diff/` — `renderDiff(view, input)` rendering helper + the toggle button component + CM6 line decorations consuming the `DiffResult`. Strings already exist UI-side; the IPC carries the diff *output*, not the inputs round-tripped.
-- Each consumer (snapshot preview, dirty-buffer Diff toggle, patch-review mode, write-note review) owns its own pane wiring and calls `renderDiff` (or, for patch-review, paints widget decorations from the same `DiffResult`) against its own CM6 view when the toggle flips on.
-- CLI: `hiker diff` lives in `cli/`, calls `core::diff::compute` directly, prints unified diff.
+- `core::diff` — pure `compute(before, after) -> DiffResult` with hunks + intraline spans. `similar` crate confined to this module. [diff-core-module]
+- `editor::diff` (editor crate, `editor-diff` module) — `DiffLayer`, `unified_decorations`, intraline mark pass, view-zone construction for removed lines, gutter markers, hunk overlay widgets. Consumes `core::diff` output. [diff-renderer]
+- `app/src/panels/editor/` — the editor tab body. Owns `Editor { buffer, diff }` rendering, the toolbar diff toggle and source picker, the right-click "Show changes" menu, and per-owner hunk-verb dispatch.
+- CLI: `hiker diff <path> [<change-id>]` calls `core::diff::compute` directly and prints a unified diff. [cli-diff]
 
 
-## Diff style (line-level vs intraline)
+## Out of scope
 
-The renderer supports two rendering styles, picked by a View-menu toggle that persists per-vault.
-
-- **Line-level** (default) — what `diff-viewer-line-unified` already describes: removed lines red, added lines green, context grey. No marks within a changed line; the whole line is highlighted as a unit.
-- **Intraline** — same red/green line backgrounds *plus* character-/word-level highlights inside each paired delete/insert run, showing exactly which spans differ within the changed lines. Equal runs inside a changed line pair render with the line's pale background; differing spans get a stronger emphasis (saturated red on the delete side, saturated green on the insert side). Equal lines are unchanged from line-level. [diff-viewer-intraline]
-
-The two styles share the same `DiffInput`, the same `compute_diff` IPC, the same red/green palette, and the same per-line decoration scaffold. Intraline is strictly additive — when the toggle is off, the view is identical to today's `diff-viewer-line-unified`; when on, the same line decorations gain a second decoration layer carrying the in-line character spans.
-
-**Where the char-level computation lives.** A second `core::diff` entry point — `compute_intraline(before_line, after_line) -> Vec<IntralineSpan>` — runs `similar::TextDiff::from_chars` (or `from_words`, see below) over a single paired delete/insert line and returns the equal/insert/delete span tags. The renderer calls it per paired line in the rendered hunk, not over the whole file, so the work scales with "number of changed line pairs," not file size. Pairing rule: a `delete` line followed immediately by an `insert` line in the same hunk is a pair; unpaired deletes or inserts (pure adds or pure removals) get no char-level treatment. [diff-intraline-core-pair]
-
-**Char- vs word-level granularity** is a deferred sub-choice; v1 ships char-level since `similar`'s char algorithm is what we already build on and word-level needs a tokenizer decision (whitespace-only vs unicode word boundaries vs language-aware) that doesn't pay off yet. The wire format reserves space for the choice: `IntralineSpan { op, byte_start_before, byte_end_before, byte_start_after, byte_end_after }` makes either granularity expressible. [diff-intraline-char-level-v1]
-
-**IPC shape.** `compute_diff` grows an optional `intraline: bool` flag (default false). When true, the per-line `DiffLine` rows for paired delete/insert lines carry an `intraline_spans: Option<Vec<IntralineSpan>>` field; unpaired lines and equal lines leave it `None`. Default-false keeps the existing payload shape for callers that don't ask for it (CLI `hiker diff`, future `mcp-tool-diff`). The UI passes `intraline: true` when the View toggle is on. [diff-intraline-ipc-flag]
-
-**Rendering.** The line-level decorations stay where they are (`.cm-diff-add` / `.cm-diff-del`). Intraline spans add a second decoration pass keyed by line + byte offset within line, emitting `Decoration.mark` ranges with `.cm-diff-add-intra` / `.cm-diff-del-intra` classes. CSS gives the intra classes a stronger background tint over the existing pale line background, so the eye reads "this whole line is the changed line; *this* part is what actually changed." Equal-span ranges inside a changed line need no extra mark — they fall back to the line's pale background. [diff-intraline-render-marks]
-
-**Consumer scope.** The toggle changes the rendering style for every consumer that calls `editor.renderDiff`:
-
-- Snapshot preview's `snapshot-preview-diff-toggle` ✓
-- Dirty-buffer (user) diff `editor-diff-vs-disk-toggle` ✓
-- Write-note review's `write-note-review` Diff toggle ✓
-- Any future consumer of the `diff-renderer` primitive ✓
-
-Patch-review's agent-diff toggle (`patch-review-agent-diff-toggle`) is explicitly *not* in scope — that surface renders span-anchored hunks as widget decorations on the live doc rather than calling `renderDiff`, and its rendering is governed by its own slugs in `patch-review.md`. Intraline highlights inside patch-review widgets is a separate question that can be picked up later if a user wants it.
-
-**Toggle live behavior.** Flipping the View toggle while a diff is currently rendered re-runs `renderDiff` with the new flag against the same `before`/`after` so the visible diff updates without exiting the consumer's preview mode. Costs one extra `compute_diff` IPC; cheap since the preview is read-only and there's no debouncing concern.
-
-
-## Out of scope (v1)
-
-- **Side-by-side split view.** Standard alternate rendering; lands when a real user prefers it over unified. [diff-viewer-split-view]
-- **Three-way merge view.** For actual conflict resolution; lands when `drift-conflict-modal`'s diff option is wired. [diff-viewer-three-way]
-- **Image / binary diff.** v1 is text-only.
-- **Export as patch.** "Copy as unified diff" for paste-elsewhere workflows. [diff-viewer-export-patch]
-- **Configurable color scheme.** Theming waits for the broader theme work.
+- **Side-by-side view.** Layout option on `DiffLayer` (two editor widgets sharing the same hunks). Lands when a user prefers it over unified. [diff-viewer-split-view]
+- **Three-way merge.** Three-rope input + merge resolution UI; required by `drift-conflict-modal`'s deferred "open diff" verb. [diff-viewer-three-way]
+- **Image / binary diff.** Text only.
+- **Export as patch.** "Copy as unified diff" affordance. [diff-viewer-export-patch]
+- **MCP diff tool.** Agents reason over two blobs via existing read tools; a dedicated diff tool is an optimization. [mcp-tool-diff]
 
 
 ## Deferred
 
-Slugs registered as `planned`:
-
-- `diff-viewer-split-view` — side-by-side rendering as a toggle option.
-- `diff-viewer-three-way` — third buffer slot for merge / drift-conflict resolution.
-- `diff-viewer-ignore-whitespace` — toggle when a consumer needs it.
-- `diff-viewer-export-patch` — "copy as patch" affordance.
-- `activity-detail-diff-between-versions` — multi-select two snapshot rows + "Diff selected".
-- `staging-review-activity-detail-filter` — "Pending" filter pill on activity detail page; diff toggle reuses `snapshot-preview-diff-toggle` per `settings.md`.
+- `diff-viewer-split-view` — side-by-side layout option on `DiffLayer`.
+- `diff-viewer-three-way` — third rope input for merge resolution.
+- `diff-viewer-ignore-whitespace` — toggle on the compute call.
+- `diff-viewer-export-patch` — "copy as unified diff" affordance.
+- `activity-detail-diff-between-versions` — multi-select two `changes.db` rows + "Diff selected" opens a tab with `diff = Some(ChangesDb(id_a))` against a buffer whose content is `content_at(id_b)`.
+- `mcp-tool-diff` — agent-facing diff IPC.

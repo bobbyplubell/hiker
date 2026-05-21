@@ -94,6 +94,19 @@ pub struct LayoutParams {
 
 impl Default for LayoutParams {
     fn default() -> Self {
+        // `scaling_ratio=100` keeps repulsion strong enough that the
+        // settled graph spans ~100s of world units, which our zoom-defaults
+        // render at reasonable pixel sizes. Dropping it lower collapses
+        // everything onto each other in the panel.
+        //
+        // `outbound_attraction_distribution=false` is the load-bearing
+        // change vs. the prior defaults: with it on, every edge's spring
+        // is divided by the source's mass, so a high-degree hub's pull
+        // on each child is `1/mass` — its leaves don't have a consistent
+        // radius and drift outward into a scrappy blob. With it off,
+        // the spring stiffness is uniform per edge and the leaves
+        // settle into the clean ring around their parent that sigma /
+        // graphology produce.
         Self {
             bound: 5000.0,
             max_iters: 800,
@@ -106,7 +119,7 @@ impl Default for LayoutParams {
             strong_gravity: false,
             slow_down: 5.0,
             lin_log: false,
-            outbound_attraction_distribution: true,
+            outbound_attraction_distribution: false,
             degree_repulsion: true,
         }
     }

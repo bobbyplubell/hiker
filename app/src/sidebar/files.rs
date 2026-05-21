@@ -29,18 +29,40 @@ fn sort_header(ui: &mut egui::Ui, state: &mut AppState) {
     let current = default_sort(&state.vault_session.config);
     let mut new_sort = current;
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Sort")
-                .small()
-                .color(theme::muted()),
-        );
+        // When the sidebar is narrow, drop the "Sort" caption and use
+        // shorter combobox labels so the dropdown stays readable instead
+        // of getting clipped by the panel edge.
+        let compact = ui.available_width() < 180.0;
+        if !compact {
+            ui.label(
+                egui::RichText::new("Sort")
+                    .small()
+                    .color(theme::muted()),
+            );
+        }
         egui::ComboBox::from_id_salt("files-sort-by")
-            .selected_text(sort_label(current))
+            .selected_text(sort_label(current, compact))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut new_sort, TreeSortBy::NameAsc, "Name (A-Z)");
-                ui.selectable_value(&mut new_sort, TreeSortBy::NameDesc, "Name (Z-A)");
-                ui.selectable_value(&mut new_sort, TreeSortBy::MtimeDesc, "Recent");
-                ui.selectable_value(&mut new_sort, TreeSortBy::MtimeAsc, "Oldest");
+                ui.selectable_value(
+                    &mut new_sort,
+                    TreeSortBy::NameAsc,
+                    sort_label(TreeSortBy::NameAsc, compact),
+                );
+                ui.selectable_value(
+                    &mut new_sort,
+                    TreeSortBy::NameDesc,
+                    sort_label(TreeSortBy::NameDesc, compact),
+                );
+                ui.selectable_value(
+                    &mut new_sort,
+                    TreeSortBy::MtimeDesc,
+                    sort_label(TreeSortBy::MtimeDesc, compact),
+                );
+                ui.selectable_value(
+                    &mut new_sort,
+                    TreeSortBy::MtimeAsc,
+                    sort_label(TreeSortBy::MtimeAsc, compact),
+                );
             });
     });
     if new_sort != current {
@@ -76,31 +98,39 @@ mod sort_label_tests {
             TreeSortBy::MtimeDesc,
             TreeSortBy::MtimeAsc,
         ] {
-            let l = sort_label(v);
-            assert!(!l.is_empty(), "missing label for {v:?}");
+            for compact in [false, true] {
+                let l = sort_label(v, compact);
+                assert!(!l.is_empty(), "missing label for {v:?} compact={compact}");
+            }
         }
     }
 
     #[test]
     fn labels_are_distinct() {
-        let labels = [
-            sort_label(TreeSortBy::NameAsc),
-            sort_label(TreeSortBy::NameDesc),
-            sort_label(TreeSortBy::MtimeDesc),
-            sort_label(TreeSortBy::MtimeAsc),
-        ];
-        let set: std::collections::HashSet<&str> = labels.iter().copied().collect();
-        assert_eq!(set.len(), 4, "sort labels collide: {labels:?}");
+        for compact in [false, true] {
+            let labels = [
+                sort_label(TreeSortBy::NameAsc, compact),
+                sort_label(TreeSortBy::NameDesc, compact),
+                sort_label(TreeSortBy::MtimeDesc, compact),
+                sort_label(TreeSortBy::MtimeAsc, compact),
+            ];
+            let set: std::collections::HashSet<&str> = labels.iter().copied().collect();
+            assert_eq!(set.len(), 4, "sort labels collide: {labels:?} compact={compact}");
+        }
     }
 }
 
-fn sort_label(s: hiker_core::config::TreeSortBy) -> &'static str {
+fn sort_label(s: hiker_core::config::TreeSortBy, compact: bool) -> &'static str {
     use hiker_core::config::TreeSortBy;
-    match s {
-        TreeSortBy::NameAsc => "Name (A-Z)",
-        TreeSortBy::NameDesc => "Name (Z-A)",
-        TreeSortBy::MtimeDesc => "Recent",
-        TreeSortBy::MtimeAsc => "Oldest",
+    match (s, compact) {
+        (TreeSortBy::NameAsc, false) => "Name (A-Z)",
+        (TreeSortBy::NameDesc, false) => "Name (Z-A)",
+        (TreeSortBy::MtimeDesc, false) => "Recent",
+        (TreeSortBy::MtimeAsc, false) => "Oldest",
+        (TreeSortBy::NameAsc, true) => "A-Z",
+        (TreeSortBy::NameDesc, true) => "Z-A",
+        (TreeSortBy::MtimeDesc, true) => "New",
+        (TreeSortBy::MtimeAsc, true) => "Old",
     }
 }
 
@@ -126,8 +156,28 @@ fn show_dir(
     rel: &str,
     depth: usize,
 ) {
-    // Ensure this dir is loaded.
+    // Ensure this dir is loaded. Cap the cache so an aggressive
+    // expand-everything session can't grow it without bound — once we
+    // hit `MAX_DIR_CACHE_ENTRIES`, drop the entries the user no longer
+    // has expanded (cheapest correct eviction; the rest get rebuilt on
+    // next render).
+    const MAX_DIR_CACHE_ENTRIES: usize = 512;
     if !state.session.sidebar.dir_cache.contains_key(rel) {
+        if state.session.sidebar.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
+            let expanded = state.session.sidebar.expanded.clone();
+            state
+                .session
+                .sidebar
+                .dir_cache
+                .retain(|k, _| expanded.contains(k) || k.is_empty());
+            // If still over cap (every cached dir is currently
+            // expanded), fall back to a full clear. Re-listing is
+            // cheap; this branch only fires when the user has 500+
+            // dirs expanded simultaneously, which is pathological.
+            if state.session.sidebar.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
+                state.session.sidebar.dir_cache.clear();
+            }
+        }
         match state.vault_session.vault.list_dir(rel, default_sort(&state.vault_session.config)) {
             Ok(entries) => {
                 state.session.sidebar.dir_cache.insert(rel.to_string(), entries);
@@ -162,10 +212,6 @@ fn render_dir_row(
     depth: usize,
 ) {
     let expanded = state.session.sidebar.expanded.contains(&entry.rel_path);
-    // Use the standard BMP triangles (U+25BC / U+25B6) rather than the
-    // "small" variants (U+25BE / U+25B8) — only the standard ones live
-    // in egui's bundled default font; the small variants tofu-render.
-    let chevron = if expanded { "v" } else { ">" };
     // Direct-child file count hint (`count_notes_in` parity). Cached on
     // the same dir_cache the listing renders from, so showing the count
     // is essentially free. Only the first depth is counted — recursing
@@ -176,9 +222,9 @@ fn render_dir_row(
     } else {
         String::new()
     };
-    let label = format!("{} {}{}", chevron, entry.name, count_suffix);
+    let label = format!("{}{}", entry.name, count_suffix);
 
-    let resp = row_button(ui, &label, depth, false);
+    let resp = row_button_with_chevron(ui, &label, depth, false, Some(expanded));
 
     // DnD: folder rows accept dropped paths and move them into this dir.
     let dropped = resp.dnd_release_payload::<String>();
@@ -244,7 +290,10 @@ fn move_into_folder(state: &mut AppState, src: &str, dest_dir: &str) {
         state.session.buffers.insert(dest.clone(), moved);
     }
     for tab in &mut state.session.tabs {
-        if let crate::tab::TabKind::Buffer { path } = &mut tab.kind
+        if let crate::tab::TabKind::Editor {
+            buffer: crate::tab::BufferSource::Vault { path },
+            ..
+        } = &mut tab.kind
             && path == src
         {
             *path = dest.clone();
@@ -356,46 +405,32 @@ fn render_file_row(
             }
             ui.close();
         }
-        // Add-to-trail verb. Legacy parity:
-        // `trail-add-to-active-from-editor-verb` — surfaces the trail
-        // name in the label and uses the recursive membership check so
-        // "Already in 'X'" disables for child waypoints too. Routes
-        // through `note_visited` so the append-cursor semantics agree
-        // with the editor pill and recent-visits flow.
+        // Add-to-trail verb. Surfaces only when an active trail is set;
+        // recursive membership check disables when the path is already a
+        // waypoint at any depth.
+        if let Some(tid) = state
+            .session.active_trail
+            .clone()
+            .filter(|id| state.session.trails.iter().any(|t| &t.id == id))
+            && let Some(trail) = state.session.trails.iter().find(|t| t.id == tid)
         {
-            crate::state::ensure_recent_trail(state);
-            let target = state
-                .session.active_trail
-                .clone()
-                .filter(|id| state.session.trails.iter().any(|t| &t.id == id))
-                .or_else(|| {
-                    state
-                        .session.trails
-                        .iter()
-                        .find(|t| t.name == crate::state::RECENT_TRAIL)
-                        .map(|t| t.id.clone())
-                });
-            if let Some(tid) = target
-                && let Some(trail) = state.session.trails.iter().find(|t| t.id == tid)
-            {
-                let trail_name = trail.name.clone();
-                let already = waypoint_tree_contains(&trail.waypoints, &rel);
-                let label = if already {
-                    format!("Already in '{}'", trail_name)
-                } else {
-                    format!("Add to trail '{}'", trail_name)
-                };
-                let resp = ui.add_enabled(!already, egui::Button::new(label));
-                if resp.clicked() {
-                    let path_for_trail = rel.clone();
-                    crate::state::note_visited(state, &path_for_trail);
-                    let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-                    state.push_toast(
-                        format!("Added {path_for_trail} to '{trail_name}'"),
-                        crate::state::ToastLevel::Info,
-                    );
-                    ui.close();
-                }
+            let trail_name = trail.name.clone();
+            let already = waypoint_tree_contains(&trail.waypoints, &rel);
+            let label = if already {
+                format!("Already in '{}'", trail_name)
+            } else {
+                format!("Add to trail '{}'", trail_name)
+            };
+            let resp = ui.add_enabled(!already, egui::Button::new(label));
+            if resp.clicked() {
+                let path_for_trail = rel.clone();
+                crate::state::trail_append_waypoint(state, &path_for_trail);
+                let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+                state.push_toast(
+                    format!("Added {path_for_trail} to '{trail_name}'"),
+                    crate::state::ToastLevel::Info,
+                );
+                ui.close();
             }
         }
         // "Set as active trail" — only meaningful when this row points at a
@@ -527,7 +562,10 @@ fn commit_rename(state: &mut AppState, from: &str, draft: &str) {
         state.session.buffers.insert(to.clone(), moved);
     }
     for tab in &mut state.session.tabs {
-        if let crate::tab::TabKind::Buffer { path } = &mut tab.kind
+        if let crate::tab::TabKind::Editor {
+            buffer: crate::tab::BufferSource::Vault { path },
+            ..
+        } = &mut tab.kind
             && path == from
         {
             *path = to.clone();
@@ -747,6 +785,21 @@ fn queue_delete_modal(state: &mut AppState, rel: &str) {
 }
 
 fn row_button(ui: &mut egui::Ui, label: &str, depth: usize, active: bool) -> egui::Response {
+    row_button_with_chevron(ui, label, depth, active, None)
+}
+
+/// Like [`row_button`] but renders an SVG chevron in the leading slot.
+/// `Some(true)` = expanded (down chevron), `Some(false)` = collapsed
+/// (right chevron), `None` = no chevron (leaf row). The chevron paints
+/// inside the row's clickable area so the whole row toggles, matching
+/// the legacy behavior where the chevron was a label prefix.
+fn row_button_with_chevron(
+    ui: &mut egui::Ui,
+    label: &str,
+    depth: usize,
+    active: bool,
+    chevron: Option<bool>,
+) -> egui::Response {
     let indent = (depth as f32) * 12.0;
     let row_height = 22.0;
     let total_width = ui.available_width();
@@ -765,6 +818,27 @@ fn row_button(ui: &mut egui::Ui, label: &str, depth: usize, active: bool) -> egu
     if let Some(c) = bg {
         ui.painter().rect_filled(rect, 2.0, c);
     }
+    // Chevron icon (folders only). Painted into a fixed-size leading
+    // slot so the text origin lines up regardless of whether a chevron
+    // is present.
+    let chev_size = 14.0;
+    let chev_slot = 16.0;
+    let text_x_start = rect.min.x + indent + 2.0;
+    if let Some(expanded) = chevron {
+        let chev_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                text_x_start,
+                rect.min.y + (row_height - chev_size) * 0.5,
+            ),
+            egui::vec2(chev_size, chev_size),
+        );
+        let icon = if expanded {
+            crate::icons::chevron_down()
+        } else {
+            crate::icons::chevron_right()
+        };
+        icon.paint_at(ui, chev_rect);
+    }
     // Left-aligned label so siblings line up at depth * 12px regardless
     // of label length. Using a hand-painted galley avoids egui's
     // default-centered Button layout that produced the floating-text
@@ -773,7 +847,7 @@ fn row_button(ui: &mut egui::Ui, label: &str, depth: usize, active: bool) -> egu
     let color = ui.style().visuals.text_color();
     let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font_id, color));
     let text_pos = egui::pos2(
-        rect.min.x + indent + 2.0,
+        text_x_start + if chevron.is_some() { chev_slot } else { 0.0 },
         rect.min.y + (row_height - galley.size().y) * 0.5,
     );
     // Clip to row rect so long names don't paint over neighbouring rows

@@ -67,12 +67,24 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut AppState, trees: &Arc<Trees>) 
             match undo_redo::undo(trees, &tree_id) {
                 Ok((op, entry)) => {
                     state.push_toast(format!("Undid '{op}'"), crate::state::ToastLevel::Info);
-                    state
+                    // Cap per-tree redo stack so cluster history can't
+                    // grow without bound. Each entry holds JSON blobs
+                    // (prior_subtree, absorbed_clusters); leaving them
+                    // uncapped means a long cluster-editing session
+                    // accumulates indefinitely. 32 entries is more than
+                    // any user will redo through interactively.
+                    const REDO_STACK_CAP: usize = 32;
+                    let stack = state
                         .panels.clusters
                         .redo_stacks
                         .entry(tree_id.clone())
-                        .or_default()
-                        .push(entry);
+                        .or_default();
+                    if stack.len() >= REDO_STACK_CAP {
+                        // Drop the oldest (front) so the most recent
+                        // undos stay redoable.
+                        stack.remove(0);
+                    }
+                    stack.push(entry);
                     mark_dirty(state);
                 }
                 Err(undo_redo::UndoError::NothingToUndo) => {

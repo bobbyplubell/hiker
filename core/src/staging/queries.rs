@@ -29,4 +29,17 @@ impl Staging {
         };
         self.list(&filter)
     }
+
+    /// Every proposal — applyable or conflicted — whose `target_path`
+    /// matches `rel`. Used by the in-editor patch-review surface which
+    /// needs to render decorations for conflicted hunks too (greyed
+    /// instead of green/red); the staging-snapshot cache holds only
+    /// applyable rows so we re-query when wider visibility is needed.
+    pub fn list_for_path(&self, rel: &str) -> Result<Vec<Proposal>, StagingError> {
+        let filter = StagingFilter {
+            path: Some(rel.to_string()),
+            ..Default::default()
+        };
+        self.list(&filter)
+    }
 }

@@ -342,38 +342,6 @@ fn wrapped_continuation_bg(state: &EditorState, view: &ViewState, line_idx: usiz
     None
 }
 
-pub(super) fn prewrap_visible(view: &mut ViewState, state: &EditorState) {
-    if !view.wrap_map.enabled() {
-        return;
-    }
-    let total = state.doc.len_lines();
-    // Two-phase strategy: first pass over ALL lines uses cached vline counts
-    // (O(line_count) but O(1) per cached line) to keep `total_visual_lines`
-    // and the height map honest; second pass only recomputes wraps for lines
-    // intersecting the viewport + margin (which is where stale entries from
-    // edits matter, and where character measurement is hot).
-    //
-    // Initial population (cold cache): walk all lines once so the height map
-    // gets a valid total. After that, only the visible band recomputes.
-    let cold = view.wrap_map.peek(0).is_none();
-    let visible = view.visible_lines();
-    let margin = 32usize;
-    let scope_start = visible.start.saturating_sub(margin);
-    let scope_end = (visible.end + margin).min(total);
-
-    if cold {
-        for line in 0..total {
-            let text = state.doc.line_str(line);
-            view.wrap_map.get_or_compute(line, |_| text.clone());
-        }
-        return;
-    }
-    for line in scope_start..scope_end {
-        let text = state.doc.line_str(line);
-        view.wrap_map.get_or_compute(line, |_| text.clone());
-    }
-}
-
 fn paint_line_bgs(
     ctx: &PaintCtx<'_>,
     state: &EditorState,

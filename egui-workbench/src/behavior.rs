@@ -62,6 +62,31 @@ pub trait WorkbenchBehavior<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static>
         egui::WidgetText::default()
     }
 
+    /// Custom rendering for the secondary side bar's title slot. Default
+    /// just labels `secondary_side_bar_title()`. Override to draw an
+    /// icon or other rich content in place of the text.
+    fn secondary_side_bar_title_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(self.secondary_side_bar_title());
+    }
+
+    /// Extra buttons rendered next to the "…" menu in the primary side
+    /// bar's title row. Mode-specific (e.g. "new note" for a file panel).
+    fn side_bar_action_buttons(&mut self, _ui: &mut egui::Ui, _mode: &Mode) {}
+
+    /// Contents of the popup that opens from the primary side bar's "…"
+    /// button. Mode-specific (e.g. refresh / sort menu for a file panel).
+    /// Default surfaces nothing extra; the workbench still appends its
+    /// own "Move to Other Side" / "Hide" items after.
+    fn side_bar_actions_menu(&mut self, _ui: &mut egui::Ui, _mode: &Mode) {}
+
+    /// Extra buttons rendered next to the "…" menu in the secondary side
+    /// bar's title row.
+    fn secondary_side_bar_action_buttons(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Contents of the popup that opens from the secondary side bar's
+    /// "…" button.
+    fn secondary_side_bar_actions_menu(&mut self, _ui: &mut egui::Ui) {}
+
     // === Activity bar ===
 
     /// The activities to render, in order. Default is empty (hidden bar

@@ -59,6 +59,8 @@ enum ValueType {
     MinimapMinBarWidth,
     /// Bar vertical gap (tenths of a pixel): `0..=20`.
     MinimapBarGap,
+    /// Editor scroll-wheel multiplier: `0.25..=10.0`.
+    ScrollSpeed,
 }
 
 const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -72,6 +74,8 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.hide_frontmatter",       ty: ValueType::Bool },
     EligibleKey { path: "editor.intraline_diff",         ty: ValueType::Bool },
     EligibleKey { path: "editor.show_minimap",           ty: ValueType::Bool },
+    EligibleKey { path: "editor.hide_scrollbar",         ty: ValueType::Bool },
+    EligibleKey { path: "editor.scroll_speed",           ty: ValueType::ScrollSpeed },
     EligibleKey { path: "editor.minimap.width",                ty: ValueType::MinimapWidth },
     EligibleKey { path: "editor.minimap.bar_padding_left",     ty: ValueType::MinimapPad },
     EligibleKey { path: "editor.minimap.bar_padding_right",    ty: ValueType::MinimapPad },
@@ -366,6 +370,10 @@ pub(super) fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Re
             .as_u64()
             .map(|u| u <= 20)
             .unwrap_or(false),
+        (ValueType::ScrollSpeed, J::Number(n)) => n
+            .as_f64()
+            .map(|f| (0.25..=10.0).contains(&f))
+            .unwrap_or(false),
         _ => false,
     };
     if !ok {
@@ -429,15 +437,24 @@ fn json_to_toml_item(value: &serde_json::Value) -> toml_edit::Item {
         J::Bool(b) => toml_edit::value(*b),
         J::String(s) => toml_edit::value(s.as_str()),
         J::Number(n) => {
-            // Try integer before float — `serde_json::Number::as_f64`
-            // succeeds for both shapes, and routing every integer
-            // through the float branch would write `4096.0` to TOML
-            // and then fail strict-load against `u32` fields. JSON
-            // produced by JS for an integer (no decimal point) parses
-            // here with `as_i64() = Some(_)`, so this branch wins for
-            // PositiveInt rows; floats (e.g. `vault.chat_height = 0.3`)
-            // fall through to the float branch as before.
-            if let Some(i) = n.as_i64() {
+            // Branch on the Number's *stored* type rather than what it
+            // can be coerced to. `as_i64()` succeeds for any whole-number
+            // f64 (e.g. 3.0 → Some(3)), and writing `editor.scroll_speed
+            // = 3` to TOML then fails strict-load back into an `f32`
+            // field — the field reverts to its serde-default. `is_f64()`
+            // reflects whether the caller constructed the Number via
+            // `from_f64` (a float-typed setting like `scroll_speed`,
+            // `chat_height`, `min_similarity`) and routes it to the
+            // float branch regardless of whole-ness. Integer-typed
+            // settings (`PositiveInt`, ports, etc.) use `json_u` which
+            // builds the Number from u64 and lands in the integer branch.
+            if n.is_f64() {
+                if let Some(f) = n.as_f64() {
+                    toml_edit::value(f)
+                } else {
+                    toml_edit::Item::None
+                }
+            } else if let Some(i) = n.as_i64() {
                 toml_edit::value(i)
             } else if let Some(f) = n.as_f64() {
                 toml_edit::value(f)
