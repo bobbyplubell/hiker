@@ -348,7 +348,7 @@ Draft trail-docs live at `<vault>/.hiker/trails/drafts/<trail-id>.md` (parallel 
 
 ### Review surface
 
-Draft trails are reviewed inline from two surfaces: the trails panel itself, and the activity detail page (per `settings.md`'s staging review section). [trail-draft-review-surface]
+Draft trails are reviewed inline from two surfaces: the trails panel itself, and the activity detail page (per `settings.md`'s pending change review section). [trail-draft-review-surface]
 
 **Trails panel.** When the active trail is a draft, a muted banner row appears below the header (same visual weight as the append-cursor hint):
 

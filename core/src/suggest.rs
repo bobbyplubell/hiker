@@ -16,11 +16,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::HikerError;
+use crate::errors::HikerError;
 use crate::frontmatter;
-use crate::staging::{ProposalInput, Staging, StagingError, ACTION_MOVE_NOTE};
+use crate::staging::error::Error as StagingError;
+use crate::staging::types::{ProposalInput, ACTION_MOVE_NOTE};
+use crate::staging::Staging;
 use crate::store::Store;
-use crate::trees::{EditableNode, NodeKind, NodePolicy, Trees, TreesError};
+use crate::trees::types::{EditableNode, NodeKind, NodePolicy, Db, Error as TreesError};
 use crate::vault::Vault;
 
 /// Stable string the cluster-editor surface uses for `Proposal.action` on
@@ -84,7 +86,7 @@ pub struct ApplyOutcome {
 /// cluster name) so the surface ships before the full
 /// member-set-Jaccard helper lands.
 pub fn apply_tree(
-    trees: &Trees,
+    trees: &Db,
     tree_id: &str,
     vault: &Vault,
     store: &Store,
@@ -164,7 +166,7 @@ pub fn apply_tree(
                     "tree_member_fingerprint": fingerprint,
                 });
                 let id = staging
-                    .propose(ProposalInput {
+                    .propose(&ProposalInput {
                         surface: SURFACE_CLUSTER_EDITOR.into(),
                         action: action.into(),
                         target_path: target,
@@ -172,7 +174,7 @@ pub fn apply_tree(
                         metadata: Some(metadata),
                         ..Default::default()
                     })
-                    .map_err(staging_to_hiker)?;
+                    .map_err(|e| staging_to_hiker(&e))?;
                 out.staged_ids.push(id);
                 out.moves += 1;
             }
@@ -215,7 +217,7 @@ pub fn apply_tree(
                     "tree_member_fingerprint": fingerprint,
                 });
                 let id = staging
-                    .propose(ProposalInput {
+                    .propose(&ProposalInput {
                         surface: SURFACE_CLUSTER_EDITOR.into(),
                         action: action.into(),
                         target_path: rel,
@@ -224,7 +226,7 @@ pub fn apply_tree(
                         metadata: Some(metadata),
                         ..Default::default()
                     })
-                    .map_err(staging_to_hiker)?;
+                    .map_err(|e| staging_to_hiker(&e))?;
                 out.staged_ids.push(id);
                 out.tags += 1;
             }
@@ -264,14 +266,14 @@ pub fn resolve_effective_policy(
 /// status: suggestions-rejection-history
 pub fn compute_fingerprint(parent_name: &str, note_path: &str, action: &str) -> String {
     let raw = format!("{parent_name}\x00{note_path}\x00{action}");
-    crate::hash::hash_str(&raw)
+    crate::hash_string(&raw)
 }
 
 pub(crate) fn merge_tag_into_frontmatter(
     source: &str,
     tag_field: &str,
     slug: &str,
-) -> Result<String, frontmatter::FrontmatterError> {
+) -> Result<String, frontmatter::Error> {
     use serde_yml::Value as Yaml;
     let split = frontmatter::split(source);
     let body = split.body.to_string();
@@ -324,7 +326,7 @@ fn insert_tag_at_path(node: &mut serde_yml::Value, path: &[&str], slug: &str) {
     insert_tag_at_path(child, &path[1..], slug);
 }
 
-fn staging_to_hiker(e: StagingError) -> HikerError {
+fn staging_to_hiker(e: &StagingError) -> HikerError {
     HikerError::Io(e.to_string())
 }
 
@@ -454,8 +456,8 @@ pub struct StageTagArgs<'a> {
 }
 
 pub fn stage_moves(
-    trees: &Trees,
-    args: StageMoveArgs<'_>,
+    trees: &Db,
+    args: &StageMoveArgs<'_>,
     store: &Store,
     staging: &Staging,
 ) -> Result<Vec<String>, HikerError> {
@@ -493,7 +495,7 @@ pub fn stage_moves(
             "stage_kind": "multi-select-move",
         });
         let id = staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: SURFACE_CLUSTER_EDITOR.into(),
                 action: ACTION_MOVE_NOTE.into(),
                 target_path: target,
@@ -501,15 +503,15 @@ pub fn stage_moves(
                 metadata: Some(metadata),
                 ..Default::default()
             })
-            .map_err(staging_to_hiker)?;
+            .map_err(|e| staging_to_hiker(&e))?;
         ids.push(id);
     }
     Ok(ids)
 }
 
 pub fn stage_tags(
-    trees: &Trees,
-    args: StageTagArgs<'_>,
+    trees: &Db,
+    args: &StageTagArgs<'_>,
     vault: &Vault,
     store: &Store,
     staging: &Staging,
@@ -548,7 +550,7 @@ pub fn stage_tags(
             "tag_field": DEFAULT_TAG_FIELD,
         });
         let id = staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: SURFACE_CLUSTER_EDITOR.into(),
                 action: ACTION_APPLY_TAG.into(),
                 target_path: rel,
@@ -557,7 +559,7 @@ pub fn stage_tags(
                 metadata: Some(metadata),
                 ..Default::default()
             })
-            .map_err(staging_to_hiker)?;
+            .map_err(|e| staging_to_hiker(&e))?;
         ids.push(id);
     }
     Ok(ids)
@@ -652,7 +654,7 @@ pub struct TriageOutcome {
 ///   handler reads these from `core::store`);
 /// - the saved tree id (the worker is dispatched against one tree at a
 ///   time);
-/// - per-tree handles to `Trees` and `Staging`;
+/// - per-tree handles to `Db` and `Staging`;
 /// - the resolved `TriageOpts`.
 pub struct TriageInput<'a> {
     pub tree_id: &'a str,
@@ -668,15 +670,15 @@ pub struct TriageInput<'a> {
 /// `build_tree_view` below.
 struct LoadedTreeView<'a> {
     root_id: String,
-    by_id: HashMap<String, &'a crate::trees::EditableNode>,
-    nodes: HashMap<String, crate::cluster::ClusterNode>,
+    by_id: HashMap<String, &'a crate::trees::types::EditableNode>,
+    nodes: HashMap<String, crate::cluster::Node>,
 }
 
 impl<'a> crate::cluster::TreeView for LoadedTreeView<'a> {
     fn root(&self) -> &crate::cluster::NodeId {
         &self.root_id
     }
-    fn get(&self, id: &crate::cluster::NodeId) -> Option<&crate::cluster::ClusterNode> {
+    fn get(&self, id: &crate::cluster::NodeId) -> Option<&crate::cluster::Node> {
         self.nodes.get(id)
     }
 }
@@ -686,65 +688,16 @@ impl<'a> crate::cluster::TreeView for LoadedTreeView<'a> {
 /// clusters and outlier buckets only). Children are derived from
 /// `parent_id` so the in-memory shape lines up with what
 /// `place_beam_descent` expects.
-fn build_tree_view<'a>(
-    nodes: &'a [crate::trees::EditableNode],
-) -> Option<LoadedTreeView<'a>> {
-    let by_id: HashMap<String, &crate::trees::EditableNode> =
-        nodes.iter().map(|n| (n.id.clone(), n)).collect();
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for n in nodes {
-        if let Some(p) = &n.parent {
-            children.entry(p.clone()).or_default().push(n.id.clone());
-        }
-    }
-    let root = nodes.iter().find(|n| n.parent.is_none())?;
-    let mut view_nodes: HashMap<String, crate::cluster::ClusterNode> = HashMap::new();
-    for n in nodes {
-        let centroid = n.centroid.clone().unwrap_or_default();
-        let children_ids = children
-            .get(&n.id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|cid| {
-                // Only include children with centroids in the traversable
-                // beam set — leaves stick to their parent cluster and are
-                // matched by the cluster's own centroid (the spec calls
-                // for descent to leaves at the *cluster* level — a leaf
-                // here means a centroid-bearing terminal cluster).
-                by_id
-                    .get(cid)
-                    .and_then(|c| c.centroid.as_ref())
-                    .map(|c| !c.is_empty())
-                    .unwrap_or(false)
-            })
-            .collect();
-        view_nodes.insert(
-            n.id.clone(),
-            crate::cluster::ClusterNode {
-                id: n.id.clone(),
-                centroid,
-                children: children_ids,
-            },
-        );
-    }
-    Some(LoadedTreeView {
-        root_id: root.id.clone(),
-        by_id,
-        nodes: view_nodes,
-    })
-}
-
 /// Run the triage classifier for one note against one saved tree.
 ///
 /// status: triage-classifier-engine
 /// status: cluster-editor-triage-via-staging
 pub fn triage_match(
-    trees: &Trees,
+    trees: &Db,
     vault: &Vault,
     store: &Store,
     staging: &Staging,
-    input: TriageInput<'_>,
+    input: &TriageInput<'_>,
 ) -> Result<TriageOutcome, HikerError> {
     let mut outcome = TriageOutcome {
         tree_id: input.tree_id.to_string(),
@@ -777,15 +730,63 @@ pub fn triage_match(
         outcome.skip_reason = Some("empty-tree");
         return Ok(outcome);
     }
-    let view = match build_tree_view(&nodes) {
-        Some(v) => v,
-        None => {
-            outcome.skip_reason = Some("tree-has-no-root");
-            return Ok(outcome);
+    let view = {
+        let by_id: HashMap<String, &crate::trees::types::EditableNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for n in &nodes {
+            if let Some(p) = &n.parent {
+                children.entry(p.clone()).or_default().push(n.id.clone());
+            }
+        }
+        let root = nodes.iter().find(|n| n.parent.is_none());
+        match root {
+            None => {
+                outcome.skip_reason = Some("tree-has-no-root");
+                return Ok(outcome);
+            }
+            Some(root) => {
+                let mut view_nodes: HashMap<String, crate::cluster::Node> = HashMap::new();
+                for n in &nodes {
+                    let centroid = n.centroid.clone().unwrap_or_default();
+                    let children_ids = children
+                        .get(&n.id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|cid| {
+                            // Only include children with centroids in the
+                            // traversable beam set — leaves stick to their
+                            // parent cluster and are matched by the cluster's
+                            // own centroid (the spec calls for descent to
+                            // leaves at the *cluster* level — a leaf here
+                            // means a centroid-bearing terminal cluster).
+                            by_id
+                                .get(cid)
+                                .and_then(|c| c.centroid.as_ref())
+                                .map(|c| !c.is_empty())
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    view_nodes.insert(
+                        n.id.clone(),
+                        crate::cluster::Node {
+                            id: n.id.clone(),
+                            centroid,
+                            children: children_ids,
+                        },
+                    );
+                }
+                LoadedTreeView {
+                    root_id: root.id.clone(),
+                    by_id,
+                    nodes: view_nodes,
+                }
+            }
         }
     };
 
-    let placement = match crate::cluster::place_beam_descent(
+    let placement = match crate::cluster::tree::place_beam_descent(
         input.embedding,
         &view,
         input.opts.beam_width,
@@ -801,7 +802,7 @@ pub fn triage_match(
     outcome.margin = placement.margin;
 
     // Walk up from the matched node to resolve the effective policy.
-    let by_id_owned: HashMap<String, crate::trees::EditableNode> = nodes
+    let by_id_owned: HashMap<String, crate::trees::types::EditableNode> = nodes
         .iter()
         .cloned()
         .map(|n| (n.id.clone(), n))
@@ -859,7 +860,7 @@ pub fn triage_match(
                 },
             });
             let id = staging
-                .propose(ProposalInput {
+                .propose(&ProposalInput {
                     surface: SURFACE_TRIAGE.into(),
                     action: ACTION_MOVE_NOTE.into(),
                     target_path: target,
@@ -867,7 +868,7 @@ pub fn triage_match(
                     metadata: Some(metadata),
                     ..Default::default()
                 })
-                .map_err(staging_to_hiker)?;
+                .map_err(|e| staging_to_hiker(&e))?;
             outcome.staged_id = Some(id);
         }
         NodePolicy::Tag {
@@ -901,7 +902,7 @@ pub fn triage_match(
                 },
             });
             let id = staging
-                .propose(ProposalInput {
+                .propose(&ProposalInput {
                     surface: SURFACE_TRIAGE.into(),
                     action: ACTION_APPLY_TAG.into(),
                     target_path: input.source_path.to_string(),
@@ -910,7 +911,7 @@ pub fn triage_match(
                     metadata: Some(metadata),
                     ..Default::default()
                 })
-                .map_err(staging_to_hiker)?;
+                .map_err(|e| staging_to_hiker(&e))?;
             outcome.staged_id = Some(id);
         }
     }
@@ -926,7 +927,7 @@ pub fn triage_match(
 /// inputs that `triage_all_saved_trees` needs. Kept private to this
 /// module; the public surface is the function below.
 pub struct TriageBatch<'a> {
-    pub trees: &'a Trees,
+    pub trees: &'a Db,
     pub vault: &'a Vault,
     pub store: &'a Store,
     pub staging: &'a Staging,
@@ -943,7 +944,7 @@ pub struct TriageBatch<'a> {
 ///
 /// status: cluster-editor-triage-on-save
 pub fn triage_all_saved_trees(
-    batch: TriageBatch<'_>,
+    batch: &TriageBatch<'_>,
 ) -> Result<Vec<TriageOutcome>, HikerError> {
     let rows = batch
         .trees
@@ -973,7 +974,7 @@ pub fn triage_all_saved_trees(
             batch.vault,
             batch.store,
             batch.staging,
-            TriageInput {
+            &TriageInput {
                 tree_id: &row.id,
                 note_id: batch.note_id,
                 source_path: batch.source_path,
@@ -990,11 +991,11 @@ pub fn triage_all_saved_trees(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trees::{NodeInsert, NodeKind, NodePolicy, TreeInsert, Trees};
+    use crate::trees::types::{NodeInsert, NodeKind, NodePolicy, TreeInsert, Db};
     use tempfile::TempDir;
 
-    fn mk_tree(td: &TempDir) -> (Trees, String) {
-        let trees = Trees::open(td.path()).unwrap();
+    fn mk_tree(td: &TempDir) -> (Db, String) {
+        let trees = Db::open(td.path()).unwrap();
         let id = trees
             .insert_tree(TreeInsert {
                 id: Some("t".into()),
@@ -1029,7 +1030,7 @@ mod tests {
     fn cluster(id: &str, parent: Option<&str>, policy: Option<NodePolicy>) -> NodeInsert {
         NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind: NodeKind::Cluster,
             note_id: None,
             name: id.into(),
@@ -1115,7 +1116,7 @@ mod tests {
     // status: suggestions-apply-cmd
     //
     // End-to-end smoke for `apply_tree`: build a tree in tempfile-backed
-    // `Trees` / `Store` / `Vault` / `Staging`, attach a `Tag` policy on one
+    // `Db` / `Store` / `Vault` / `Staging`, attach a `Tag` policy on one
     // cluster + a `Move` policy on another, run `apply_tree`, and verify
     // both rows land in `staging.db` with the right surface / action /
     // metadata. Asserts the tree's `state` is *not* advanced by the core
@@ -1123,8 +1124,10 @@ mod tests {
     // every emitted row resolves.
     #[test]
     fn apply_tree_emits_tag_and_move_rows_with_expected_metadata() {
-        use crate::staging::{Staging, StagingFilter, ACTION_MOVE_NOTE};
-        use crate::store::{NoteUpsert, Store};
+        use crate::staging::types::{Filter, ACTION_MOVE_NOTE};
+use crate::staging::Staging;
+        use crate::store::dto::NoteUpsert;
+use crate::store::Store;
         use crate::vault::Vault;
 
         let td = TempDir::new().unwrap();
@@ -1141,7 +1144,7 @@ mod tests {
 
         // Index the two notes so `path_for_id` returns the expected rels.
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: "note-a",
                 path: "a.md",
                 content_hash: "h-a",
@@ -1153,7 +1156,7 @@ mod tests {
             })
             .unwrap();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: "note-b",
                 path: "inbox/b.md",
                 content_hash: "h-b",
@@ -1210,7 +1213,7 @@ mod tests {
 
         // Pull the staged rows back and bucket by action.
         let rows = staging
-            .list(&StagingFilter {
+            .list(&Filter {
                 surface: Some(SURFACE_CLUSTER_EDITOR.into()),
                 ..Default::default()
             })
@@ -1263,9 +1266,11 @@ mod tests {
     // rule.
     #[test]
     fn triage_emits_move_row_with_triage_surface() {
-        use crate::cluster::l2_normalize;
-        use crate::staging::{Staging, StagingFilter};
-        use crate::store::{NoteUpsert, Store};
+        use crate::cluster::algo::l2_normalize;
+        use crate::staging::types::Filter;
+use crate::staging::Staging;
+        use crate::store::dto::NoteUpsert;
+use crate::store::Store;
         use crate::vault::Vault;
 
         let td = TempDir::new().unwrap();
@@ -1275,7 +1280,7 @@ mod tests {
         let mut store = Store::open(td.path()).unwrap();
         let staging = Staging::open(td.path()).unwrap();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: "note-n",
                 path: "inbox/n.md",
                 content_hash: "h",
@@ -1308,12 +1313,7 @@ mod tests {
             .unwrap();
 
         let opts = TriageOpts::default();
-        let outcome = triage_match(
-            &trees,
-            &vault,
-            &store,
-            &staging,
-            TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
                 tree_id: &tid,
                 note_id: "note-n",
                 source_path: "inbox/n.md",
@@ -1326,7 +1326,7 @@ mod tests {
         assert!(outcome.staged_id.is_some(), "expected a staging row");
         assert_eq!(outcome.matched_node_id.as_deref(), Some("a"));
         let rows = staging
-            .list(&StagingFilter {
+            .list(&Filter {
                 surface: Some(SURFACE_TRIAGE.into()),
                 ..Default::default()
             })
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn triage_drops_match_outside_scope() {
-        use crate::cluster::l2_normalize;
+        use crate::cluster::algo::l2_normalize;
         use crate::staging::Staging;
         use crate::store::Store;
         use crate::vault::Vault;
@@ -1371,12 +1371,7 @@ mod tests {
             scope: "inbox/".into(),
             ..Default::default()
         };
-        let outcome = triage_match(
-            &trees,
-            &vault,
-            &store,
-            &staging,
-            TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
                 tree_id: &tid,
                 note_id: "x",
                 source_path: "research/r.md",
@@ -1392,7 +1387,7 @@ mod tests {
 
     #[test]
     fn triage_agent_author_forces_pending() {
-        use crate::cluster::l2_normalize;
+        use crate::cluster::algo::l2_normalize;
         use crate::staging::Staging;
         use crate::store::Store;
         use crate::vault::Vault;
@@ -1418,12 +1413,7 @@ mod tests {
         trees.insert_nodes(&tid, &[root, a]).unwrap();
 
         let opts = TriageOpts::default();
-        let outcome = triage_match(
-            &trees,
-            &vault,
-            &store,
-            &staging,
-            TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
                 tree_id: &tid,
                 note_id: "g",
                 source_path: "inbox/g.md",

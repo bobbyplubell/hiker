@@ -1,10 +1,16 @@
-use super::*;
+use rusqlite::{params, OptionalExtension};
+
+use super::error::Error;
+use super::dto::{
+    new_id, title_from_path, NoteProperties, NoteRow, RecentNote, VaultStats,
+};
+use super::Store;
 
 impl Store {
     /// Look up the stable id for a path, or None if the note has never been
     /// indexed. Reads from `path_ids`; valid even after a rename has updated
     /// `notes.path` (the old path still resolves to the same id).
-    pub fn id_for_path(&self, rel_path: &str) -> Result<Option<String>, StoreError> {
+    pub fn id_for_path(&self, rel_path: &str) -> Result<Option<String>, Error> {
         let id = self
             .conn
             .query_row(
@@ -17,7 +23,7 @@ impl Store {
     }
 
     /// Fetch the note row for a given path, or None if not indexed.
-    pub fn get_note_by_path(&self, rel_path: &str) -> Result<Option<NoteRow>, StoreError> {
+    pub fn get_note_by_path(&self, rel_path: &str) -> Result<Option<NoteRow>, Error> {
         let row = self
             .conn
             .query_row(
@@ -25,7 +31,20 @@ impl Store {
                         skipped, skip_reason, last_accessed_at
                  FROM notes WHERE path = ?1",
                 params![rel_path],
-                map_note_row,
+                |row| {
+                    Ok(NoteRow {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        content_hash: row.get(2)?,
+                        mtime: row.get(3)?,
+                        size: row.get(4)?,
+                        indexed_at: row.get(5)?,
+                        embedder_version: row.get(6)?,
+                        skipped: row.get::<_, i64>(7)? != 0,
+                        skip_reason: row.get(8)?,
+                        last_accessed_at: row.get(9)?,
+                    })
+                },
             )
             .optional()?;
         Ok(row)
@@ -35,7 +54,7 @@ impl Store {
     /// `skipped` (unsupported extension, oversize, etc.). Used by the
     /// file-tree row renderer to badge skipped files without firing a
     /// per-row `get_note_by_path` query on every frame.
-    pub fn list_skipped_paths(&self) -> Result<Vec<String>, StoreError> {
+    pub fn list_skipped_paths(&self) -> Result<Vec<String>, Error> {
         let mut stmt = self
             .conn
             .prepare("SELECT path FROM notes WHERE skipped = 1")?;
@@ -48,7 +67,7 @@ impl Store {
     }
 
     /// Total count of indexed notes.
-    pub fn count_notes(&self) -> Result<u32, StoreError> {
+    pub fn count_notes(&self) -> Result<u32, Error> {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))?;
@@ -61,7 +80,7 @@ impl Store {
     /// vault-walk concern the home page skips for v1).
     ///
     /// status: vault-home-stats-widget
-    pub fn vault_stats(&self) -> Result<VaultStats, StoreError> {
+    pub fn vault_stats(&self) -> Result<VaultStats, Error> {
         let total_notes: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM notes",
             [],
@@ -93,7 +112,7 @@ impl Store {
     pub fn recent_notes_by_mtime(
         &self,
         limit: usize,
-    ) -> Result<Vec<RecentNote>, StoreError> {
+    ) -> Result<Vec<RecentNote>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT path, mtime, last_accessed_at
              FROM notes
@@ -124,7 +143,7 @@ impl Store {
     pub fn recent_notes_by_access(
         &self,
         limit: usize,
-    ) -> Result<Vec<RecentNote>, StoreError> {
+    ) -> Result<Vec<RecentNote>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT path, mtime, last_accessed_at
              FROM notes
@@ -156,7 +175,7 @@ impl Store {
     pub fn note_properties(
         &self,
         rel_path: &str,
-    ) -> Result<Option<NoteProperties>, StoreError> {
+    ) -> Result<Option<NoteProperties>, Error> {
         let row = self.conn.query_row(
             "SELECT n.id, n.content_hash, n.mtime, n.size, n.indexed_at,
                     n.embedder_version, n.skipped, n.skip_reason,
@@ -168,7 +187,7 @@ impl Store {
                 let extension = std::path::Path::new(rel_path)
                     .extension()
                     .and_then(|e| e.to_str())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 let note_id: Option<String> = row.get(0)?;
                 let content_hash: Option<String> = row.get(1)?;
                 let mtime: Option<i64> = row.get(2)?;
@@ -230,7 +249,7 @@ impl Store {
         &mut self,
         rel_path: &str,
         ts: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, Error> {
         let updated = self.conn.execute(
             "UPDATE notes SET last_accessed_at = ?1 WHERE path = ?2",
             params![ts, rel_path],
@@ -240,7 +259,7 @@ impl Store {
 
     /// All indexed paths. Used by the full-scan walker to detect notes whose
     /// files have vanished from disk.
-    pub fn all_note_paths(&self) -> Result<Vec<String>, StoreError> {
+    pub fn all_note_paths(&self) -> Result<Vec<String>, Error> {
         let mut stmt = self.conn.prepare("SELECT path FROM notes")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -260,7 +279,7 @@ impl Store {
         reason: &str,
         mtime: i64,
         size: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
 
         // Reuse an existing id for this path if we have one, else mint a new
@@ -318,7 +337,7 @@ impl Store {
     /// Delete a note by id. Cascades through `chunks`; `chunk_vecs` cleaned
     /// up explicitly. `path_ids` for this id are removed too — a deleted
     /// note no longer has a stable path mapping.
-    pub fn delete_note(&mut self, note_id: &str) -> Result<(), StoreError> {
+    pub fn delete_note(&mut self, note_id: &str) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
         let chunk_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
@@ -341,7 +360,7 @@ impl Store {
     pub fn delete_notes_by_paths(
         &mut self,
         rel_paths: &[String],
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, Error> {
         let tx = self.conn.transaction()?;
         let mut removed = 0;
         for rel in rel_paths {
@@ -378,7 +397,7 @@ impl Store {
     pub fn rename_notes_by_paths(
         &mut self,
         renames: &[(String, String)],
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, Error> {
         let tx = self.conn.transaction()?;
         let mut updated = 0;
         for (old, new) in renames {
@@ -408,14 +427,14 @@ impl Store {
     /// Rename: update `notes.path` and add a new `path_ids` row for the new
     /// path. Old path_ids row is removed so search by old path returns None.
     /// Content unchanged — chunks stay valid.
-    pub fn rename_note(&mut self, note_id: &str, new_path: &str) -> Result<(), StoreError> {
+    pub fn rename_note(&mut self, note_id: &str, new_path: &str) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
         let updated = tx.execute(
             "UPDATE notes SET path = ?1 WHERE id = ?2",
             params![new_path, note_id],
         )?;
         if updated == 0 {
-            return Err(StoreError::NotFound(note_id.to_string()));
+            return Err(Error::NotFound(note_id.to_string()));
         }
         tx.execute("DELETE FROM path_ids WHERE id = ?1", params![note_id])?;
         tx.execute(
@@ -432,7 +451,7 @@ impl Store {
     /// at most one live row per id under normal operation).
     ///
     /// status: trail-reference-resolution
-    pub fn path_for_id(&self, note_id: &str) -> Result<Option<String>, StoreError> {
+    pub fn path_for_id(&self, note_id: &str) -> Result<Option<String>, Error> {
         let path = self
             .conn
             .query_row(

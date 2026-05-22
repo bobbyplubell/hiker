@@ -1,11 +1,13 @@
 //! Visual integration tests for the panel framework + search panel UI.
 //! SPEC §9.21 + §9.13.
 
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_view::{Panel, PanelKind, PanelPlacement, ViewState};
-
-fn harness_size() -> egui::Vec2 {
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::panels::Panel;
+use editor_view::panels::PanelKind;
+use editor_view::panels::PanelPlacement;
+use editor_view::viewport::ViewState;
+const fn harness_size() -> egui::Vec2 {
     egui::vec2(800.0, 600.0)
 }
 

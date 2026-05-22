@@ -46,7 +46,7 @@ pub const SCHEMA_VERSION: i32 = 2;
 const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, Error)]
-pub enum ChangesError {
+pub enum Error {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
@@ -149,22 +149,13 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             ChangeOp::Created => "created",
             ChangeOp::Modified => "modified",
             ChangeOp::Deleted => "deleted",
             ChangeOp::Renamed => "renamed",
         }
-    }
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "created" => ChangeOp::Created,
-            "modified" => ChangeOp::Modified,
-            "deleted" => ChangeOp::Deleted,
-            "renamed" => ChangeOp::Renamed,
-            _ => return None,
-        })
     }
 }
 
@@ -199,14 +190,82 @@ impl Changes {
     /// Open or create the changelog db. Idempotent; fails loud on schema
     /// version mismatch (no migration in v3 — the bump from no-such-table to
     /// v1 is handled by `ensure_schema` on first open).
-    pub fn open(vault_root: &Path) -> Result<Self, ChangesError> {
+    pub fn open(vault_root: &Path) -> Result<Self, Error> {
         let db_path = vault_root.join(".hiker").join("changes.db");
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(&db_path)?;
-        configure(&conn)?;
-        ensure_schema(&mut conn)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+
+        let user_version: i32 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // status: changes-content-zstd
+        // v1 → v2: re-encode every existing `content` BLOB with zstd. Pre-bump
+        // rows held raw bytes; post-bump rows hold a zstd frame. One-shot
+        // migration in a single transaction so a mid-run crash rolls back to v1
+        // and the next open retries.
+        if user_version == 1 {
+            tracing::info!("changes: migrating v1 → v2 (zstd-encoding content blobs)");
+            let tx = conn.transaction()?;
+            let pairs: Vec<(i64, Vec<u8>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, content FROM changes WHERE content IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut count: usize = 0;
+            {
+                let mut update = tx.prepare("UPDATE changes SET content = ?1 WHERE id = ?2")?;
+                for (id, raw) in pairs {
+                    let encoded = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL)?;
+                    update.execute(params![encoded, id])?;
+                    count += 1;
+                }
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            tracing::info!(
+                rows = count,
+                schema_version = SCHEMA_VERSION,
+                "changes: migration complete",
+            );
+        } else if user_version != 0 && user_version != SCHEMA_VERSION {
+            return Err(Error::VersionMismatch {
+                found: user_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                op TEXT NOT NULL,
+                author TEXT NOT NULL,
+                content_hash TEXT,
+                content BLOB,
+                rename_from TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS changes_path_ts ON changes(path, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS changes_author_ts ON changes(author, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS changes_ts ON changes(timestamp DESC);
+            "#,
+        )?;
+        if user_version == 0 {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tracing::info!(
+                schema_version = SCHEMA_VERSION,
+                "changes: created changelog db schema",
+            );
+        }
         let (appended_tx, _) = broadcast::channel(64);
         Ok(Self {
             conn: Mutex::new(conn),
@@ -222,12 +281,12 @@ impl Changes {
     /// Lock the connection mutex and run `f` against the shared connection.
     /// Standardizes the lock + poisoning-error mapping that every SQL call
     /// site used to spell inline; lock poisoning surfaces as
-    /// `ChangesError::Poisoned` rather than panicking.
+    /// `Error::Poisoned` rather than panicking.
     fn with_conn<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, ChangesError>,
-    ) -> Result<R, ChangesError> {
-        let conn = self.conn.lock().map_err(|_| ChangesError::Poisoned)?;
+        f: impl FnOnce(&Connection) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let conn = self.conn.lock().map_err(|_| Error::Poisoned)?;
         f(&conn)
     }
 
@@ -246,7 +305,7 @@ impl Changes {
     /// don't have a prior row to roll back to. The fix is a lazy baseline
     /// — snapshot the *pre-mutation* state once, on the first append for
     /// the path, then proceed normally. See `ensure_baseline`.
-    pub fn has_any_for_path(&self, path: &str) -> Result<bool, ChangesError> {
+    pub fn has_any_for_path(&self, path: &str) -> Result<bool, Error> {
         let n: i64 = self.with_conn(|conn| {
             Ok(conn.query_row(
                 "SELECT COUNT(*) FROM changes WHERE path = ?1 LIMIT 1",
@@ -275,7 +334,7 @@ impl Changes {
         author: &str,
         content: &[u8],
         content_hash: &str,
-    ) -> Result<bool, ChangesError> {
+    ) -> Result<bool, Error> {
         if self.has_any_for_path(path)? {
             return Ok(false);
         }
@@ -291,10 +350,13 @@ impl Changes {
         Ok(true)
     }
 
-    pub fn append(&self, append: ChangeAppend<'_>) -> Result<i64, ChangesError> {
+    pub fn append(&self, append: ChangeAppend<'_>) -> Result<i64, Error> {
         let metadata_str = serde_json::to_string(&append.metadata)
-            .map_err(|e| ChangesError::MetadataJson(e.to_string()))?;
-        let ts = now_ms();
+            .map_err(|e| Error::MetadataJson(e.to_string()))?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         // status: changes-content-zstd
         // Encode the content blob at append time. Deleted rows pass content=None
         // and stay NULL; everything else (including empty bodies) goes through
@@ -330,8 +392,8 @@ impl Changes {
             path: append.path.to_string(),
             op: append.op,
             author: append.author.to_string(),
-            content_hash: append.content_hash.map(|s| s.to_string()),
-            rename_from: append.rename_from.map(|s| s.to_string()),
+            content_hash: append.content_hash.map(std::string::ToString::to_string),
+            rename_from: append.rename_from.map(std::string::ToString::to_string),
             metadata: append.metadata,
             // A freshly appended row is by definition the current state for
             // its path. Re-fetches via `recent` will compute this from SQL.
@@ -342,7 +404,7 @@ impl Changes {
     }
 
     /// Most recent N rows across the whole vault, descending by id.
-    pub fn recent(&self, limit: usize) -> Result<Vec<ChangeRow>, ChangesError> {
+    pub fn recent(&self, limit: usize) -> Result<Vec<ChangeRow>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(LIST_SQL_BY_ID)?;
             let rows = stmt
@@ -358,7 +420,7 @@ impl Changes {
         &self,
         author_pattern: &str,
         limit: usize,
-    ) -> Result<Vec<ChangeRow>, ChangesError> {
+    ) -> Result<Vec<ChangeRow>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(LIST_SQL_BY_AUTHOR)?;
             let rows = stmt
@@ -375,7 +437,7 @@ impl Changes {
         &self,
         path: &str,
         limit: usize,
-    ) -> Result<Vec<ChangeRow>, ChangesError> {
+    ) -> Result<Vec<ChangeRow>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(LIST_SQL_BY_PATH)?;
             let rows = stmt
@@ -388,7 +450,7 @@ impl Changes {
     // status: note-properties-tab-content
     /// Count of changes rows for a single path. Used by the
     /// `hiker_core::store::note_properties` response (changes section).
-    pub fn count_for_path(&self, path: &str) -> Result<i64, ChangesError> {
+    pub fn count_for_path(&self, path: &str) -> Result<i64, Error> {
         self.with_conn(|conn| {
             Ok(conn.query_row(
                 "SELECT COUNT(*) FROM changes WHERE path = ?1",
@@ -402,7 +464,7 @@ impl Changes {
     /// `op='deleted'` rows (which carry no content) and for unknown ids.
     /// status: changes-content-zstd — decodes the stored zstd frame
     /// transparently; consumers see plaintext bytes.
-    pub fn content_at(&self, change_id: i64) -> Result<Option<Vec<u8>>, ChangesError> {
+    pub fn content_at(&self, change_id: i64) -> Result<Option<Vec<u8>>, Error> {
         let row = self.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -438,7 +500,7 @@ impl Changes {
         &self,
         path: &str,
         before_id: i64,
-    ) -> Result<Option<(i64, Vec<u8>)>, ChangesError> {
+    ) -> Result<Option<(i64, Vec<u8>)>, Error> {
         let row = self.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -469,7 +531,7 @@ impl Changes {
     /// path is fully gone (per spec). Returns the number of rows dropped.
     ///
     /// status: changes-retention
-    pub fn gc(&self, keep_per_pair: i32) -> Result<usize, ChangesError> {
+    pub fn gc(&self, keep_per_pair: i32) -> Result<usize, Error> {
         if keep_per_pair < 0 {
             return Ok(0);
         }
@@ -501,7 +563,7 @@ impl Changes {
 
     /// Total row count. Cheap; used by the home-page recent-activity widget
     /// to decide whether to render at all (hidden when empty).
-    pub fn count(&self) -> Result<i64, ChangesError> {
+    pub fn count(&self) -> Result<i64, Error> {
         self.with_conn(|conn| {
             Ok(conn.query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))?)
         })
@@ -539,7 +601,13 @@ const LIST_SQL_BY_PATH: &str = "
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
     let op_str: String = row.get(3)?;
-    let op = ChangeOp::parse(&op_str).unwrap_or(ChangeOp::Modified);
+    let op = match op_str.as_str() {
+        "created" => ChangeOp::Created,
+        "modified" => ChangeOp::Modified,
+        "deleted" => ChangeOp::Deleted,
+        "renamed" => ChangeOp::Renamed,
+        _ => ChangeOp::Modified,
+    };
     let metadata_str: String = row.get(7)?;
     let metadata = serde_json::from_str(&metadata_str).unwrap_or(serde_json::json!({}));
     let is_current: i64 = row.get(8).unwrap_or(0);
@@ -559,111 +627,19 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
     })
 }
 
-fn configure(conn: &Connection) -> Result<(), ChangesError> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    Ok(())
-}
-
-fn ensure_schema(conn: &mut Connection) -> Result<(), ChangesError> {
-    let user_version: i32 =
-        conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    // status: changes-content-zstd
-    // v1 → v2: re-encode every existing `content` BLOB with zstd. Pre-bump
-    // rows held raw bytes; post-bump rows hold a zstd frame. One-shot
-    // migration in a single transaction so a mid-run crash rolls back to v1
-    // and the next open retries.
-    if user_version == 1 {
-        migrate_v1_to_v2(conn)?;
-    } else if user_version != 0 && user_version != SCHEMA_VERSION {
-        return Err(ChangesError::VersionMismatch {
-            found: user_version,
-            expected: SCHEMA_VERSION,
-        });
-    }
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS changes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            path TEXT NOT NULL,
-            op TEXT NOT NULL,
-            author TEXT NOT NULL,
-            content_hash TEXT,
-            content BLOB,
-            rename_from TEXT,
-            metadata TEXT NOT NULL DEFAULT '{}'
-        );
-        CREATE INDEX IF NOT EXISTS changes_path_ts ON changes(path, timestamp DESC);
-        CREATE INDEX IF NOT EXISTS changes_author_ts ON changes(author, timestamp DESC);
-        CREATE INDEX IF NOT EXISTS changes_ts ON changes(timestamp DESC);
-        "#,
-    )?;
-    if user_version == 0 {
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tracing::info!(
-            schema_version = SCHEMA_VERSION,
-            "changes: created changelog db schema",
-        );
-    }
-    Ok(())
-}
-
-/// In-place v1 → v2 migration: walk every row with non-NULL content,
-/// re-encode the raw bytes with zstd, write back, bump `user_version`.
-/// Whole pass in one transaction so a crash rolls back atomically.
-fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), ChangesError> {
-    tracing::info!("changes: migrating v1 → v2 (zstd-encoding content blobs)");
-    let tx = conn.transaction()?;
-    let pairs: Vec<(i64, Vec<u8>)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, content FROM changes WHERE content IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    let mut count: usize = 0;
-    {
-        let mut update = tx.prepare("UPDATE changes SET content = ?1 WHERE id = ?2")?;
-        for (id, raw) in pairs {
-            let encoded = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL)?;
-            update.execute(params![encoded, id])?;
-            count += 1;
-        }
-    }
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    tx.commit()?;
-    tracing::info!(
-        rows = count,
-        schema_version = SCHEMA_VERSION,
-        "changes: migration complete",
-    );
-    Ok(())
-}
-
 /// Decode a stored zstd frame to plaintext. Failures surface as
-/// `ChangesError::Corrupt` carrying the row id + content_hash so the
+/// `Error::Corrupt` carrying the row id + content_hash so the
 /// caller can correlate against the activity feed without re-reading.
 fn decode_blob(
     id: i64,
     content_hash: &Option<String>,
     blob: &[u8],
-) -> Result<Vec<u8>, ChangesError> {
-    zstd::decode_all(blob).map_err(|e| ChangesError::Corrupt {
+) -> Result<Vec<u8>, Error> {
+    zstd::decode_all(blob).map_err(|e| Error::Corrupt {
         id,
         content_hash: content_hash.clone(),
         message: e.to_string(),
     })
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -965,7 +941,7 @@ mod tests {
             path: "a.md",
             op: ChangeOp::Created,
             author: "user",
-            content_hash: Some(&crate::hash_str("")),
+            content_hash: Some(&crate::hash_string("")),
             content: Some(&[]),
             rename_from: None,
             metadata: serde_json::json!({}),
@@ -1046,7 +1022,7 @@ mod tests {
         conn.pragma_update(None, "user_version", 99).unwrap();
         drop(conn);
         match Changes::open(dir.path()) {
-            Err(ChangesError::VersionMismatch { found, expected }) => {
+            Err(Error::VersionMismatch { found, expected }) => {
                 assert_eq!(found, 99);
                 assert_eq!(expected, SCHEMA_VERSION);
             }

@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 
-use editor_core::{Decoration, EditorState, Selection};
-use editor_md::{
-    callout_decorations, frontmatter_fold, wikilink_decorations, FRONTMATTER_FOLD_ID,
-};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::Selection;
+use editor_md::admonitions::callout_decorations;
+use editor_md::meta::frontmatter_fold;
+use editor_md::links::wikilink_decorations;
+use editor_md::meta::FRONTMATTER_FOLD_ID;
 #[test]
 fn wikilink_with_alias_emits_replace_and_mark_when_cursor_off_line() {
     let src = "first line\nsee [[Target Page|the page]] later\n";

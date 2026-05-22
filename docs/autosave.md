@@ -11,7 +11,7 @@ The headline decisions:
 - **Storage lives at `vault/.hiker/autosave/`.** Per-vault. One `<id>.md` per dirty buffer plus an `index.json` carrying the path↔id map, per-entry content hash, and an authoritative tab-state snapshot. [autosave-store-layout]
 - **Recovery surfaces only buffers that genuinely have unsaved deltas.** On vault open, `autosave_recover()` returns entries whose autosaved `content_hash` differs from the live on-disk hash for the same path. Matches drop silently — they're stale snapshots from the last clean session. [autosave-recover-cmd]
 - **Both tab state and buffer recovery restore silently.** Reopening tabs is the quality-of-life baseline; recovered buffers ride the same shape — each one auto-opens as a sticky tab carrying the autosaved content, dirty against disk, so the user sees the unsaved work and decides whether to save or revert via the normal save / discard surfaces. No prompt at vault open. [autosave-tab-state-silent-restore, autosave-recovery-auto-restore]
-- **Not in `changes.db`.** The two stores have different lifecycles (autosave: ephemeral, GC'd on save; changes: durable, retention-bounded), different consumers, and conflating them would inflate changelog row counts by orders of magnitude.
+- **Not in the op log.** The two stores have different lifecycles (autosave: ephemeral, GC'd on save; op log: durable, retention-bounded), different consumers, and conflating them would inflate the op log by orders of magnitude. Autosave is in-flight per-keystroke buffer state; the op log is committed edit history.
 
 
 ## Storage layout
@@ -161,7 +161,7 @@ Tab state restore lifts the prior posture of `multi-buffer-in-memory-only` — o
 
 ## Vault swap
 
-Closing a vault flushes the in-memory autosave state — clearing each handled path and pushing the final tab state — and then the new vault's `core::autosave` opens fresh against its own `.hiker/autosave/` directory. No cross-vault leakage; each vault's autosave state is local to that vault, exactly like `changes.db` and `index.db`. [autosave-vault-swap-clears]
+Closing a vault flushes the in-memory autosave state — clearing each handled path and pushing the final tab state — and then the new vault's `core::autosave` opens fresh against its own `.hiker/autosave/` directory. No cross-vault leakage; each vault's autosave state is local to that vault, exactly like the op log and `index.db`. [autosave-vault-swap-clears]
 
 
 ## Backup classification
@@ -181,7 +181,7 @@ Autosave is on by default with a fixed 5s tick. No `[autosave]` config section i
 
 ## Out of scope
 
-- **Per-buffer history.** NPP shape is one snapshot per buffer overwritten in place. Multiple snapshots per buffer would re-invent `changes.db` for in-flight content; if a future workflow wants per-keystroke timeline replay, it'd build on `changes.db` (which already has per-row content) rather than autosave.
+- **Per-buffer history.** NPP shape is one snapshot per buffer overwritten in place. Multiple snapshots per buffer would re-invent the op log for in-flight content; if a future workflow wants per-keystroke timeline replay, it'd build on the op log (which already records every accepted op) rather than autosave.
 - **Compression.** Autosave files are markdown at personal-vault scale, written briefly, read once. zstd would save bytes but adds an encode step in the hot tick path for no measured win. `changes.md`'s `changes-content-zstd` lives where compression actually pays off (long retention, many rows).
 - **Cross-device autosave sync.** Autosave is per-machine crash recovery, not a device-handoff feature. The future sync layer in `design.md` syncs *committed* writes (saved files); in-flight uncommitted content stays local. This deliberately matches every other editor's posture.
 - **Per-keystroke continuous flush.** 5s tick + on-blur flush is the right ergonomic floor; flushing every keystroke would bury the disk for negligible recovery improvement.
@@ -194,5 +194,5 @@ Autosave is on by default with a fixed 5s tick. No `[autosave]` config section i
 - `editor.md` "Multi-buffer model" — `multi-buffer-in-memory-only` is restated here in terms of "in-memory plus tab-state snapshot." The autosave layer is the persistence mechanism behind that restatement.
 - `editor.md` "Save UX" — the deferred "Future: autosave on idle / on blur" entry is now this spec, with the explicit shift from "write through to the user's file on idle" to "write a sidecar shadow copy for crash recovery." The user-file save path is unchanged.
 - `watcher.md` `watcher-ignore-hardcoded` — autosave writes don't reach the watcher because `.hiker/` is hard-coded ignored.
-- `changes.md` — separate store, separate lifecycle. Autosave never writes a `changes.db` row; saving a recovered buffer routes through the existing save path, which writes one as usual.
+- `op-log.md` / `changes.md` — separate store, separate lifecycle. Autosave never appends to the op log; saving a recovered buffer routes through the existing save path, which appends accepted ops as usual.
 - `design.md` "Sync / backup" — autosave directory falls into the regenerable bucket; the `index.json` is durable but trivial.

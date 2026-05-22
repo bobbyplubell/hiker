@@ -25,19 +25,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::HikerError;
+use crate::errors::HikerError;
 
 mod io;
 mod patch;
-mod sections;
+pub mod sections;
 
-pub use sections::*;
-
-use io::{
-    atomic_write, deep_merge, display_path, read_or_create, read_or_create_doc,
-    read_or_create_minimal, read_or_create_minimal_doc,
+use sections::{
+    AcpConfig, EditorConfig, IndexingConfig, LlmConfig, McpConfig, SearchConfig, StagingConfig,
+    SuggestionsConfig, TasksConfig, TrailsConfig, VaultConfig,
 };
-use patch::{apply_patch, eligible_key, validate_value};
+
+use io::{atomic_write, deep_merge, display_path, write_defaults};
+use patch::EligibleKey;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -97,7 +97,7 @@ pub struct Config {
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
     #[serde(default)]
-    pub ui: UiConfig,
+    pub ui: Ui,
 }
 
 /// UI-layer preferences. Currently just the custom-titlebar toggle;
@@ -105,14 +105,14 @@ pub struct Config {
 /// `Config` means changes persist via the standard `Config::set` path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UiConfig {
+pub struct Ui {
     /// When true, the app draws its own titlebar (drag region + window
     /// controls) and asks eframe to hide native chrome.
     #[serde(default)]
     pub custom_titlebar: bool,
 }
 
-fn default_schema_version() -> u32 {
+const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
 }
 
@@ -131,7 +131,7 @@ impl Default for Config {
             acp: AcpConfig::default(),
             staging: StagingConfig::default(),
             suggestions: SuggestionsConfig::default(),
-            ui: UiConfig::default(),
+            ui: Ui::default(),
         }
     }
 }
@@ -147,12 +147,12 @@ pub enum SettingsScope {
 /// Resolved file paths for the two TOMLs. `user` is `None` when the
 /// platform config dir can't be resolved (rare — sandboxed test envs).
 #[derive(Debug, Clone)]
-pub struct ConfigPaths {
+pub struct Paths {
     pub user: Option<PathBuf>,
     pub vault: PathBuf,
 }
 
-impl ConfigPaths {
+impl Paths {
     pub fn resolve(vault_root: &Path) -> Self {
         let user = directories::ProjectDirs::from("", "", "hiker")
             .map(|p| p.config_dir().join("config.toml"));
@@ -188,7 +188,7 @@ impl Config {
             .get("vault")
             .and_then(|v| v.get("default"))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
+            .map(std::string::ToString::to_string))
     }
 
     /// Read a single file (user or vault TOML) without merging or
@@ -200,7 +200,7 @@ impl Config {
     ///
     /// status: settings-pane-scope-toggle
     pub fn read_file_only(scope: SettingsScope, vault_root: &Path) -> Result<Self, HikerError> {
-        let paths = ConfigPaths::resolve(vault_root);
+        let paths = Paths::resolve(vault_root);
         let path = match scope {
             SettingsScope::User => match paths.user.as_ref() {
                 Some(p) => p.clone(),
@@ -223,17 +223,68 @@ impl Config {
     /// the current defaults if missing. Strict: any unknown key, type
     /// mismatch, or schema-version mismatch aborts with a clear error.
     pub fn load(vault_root: &Path) -> Result<Self, HikerError> {
-        let paths = ConfigPaths::resolve(vault_root);
+        let paths = Paths::resolve(vault_root);
 
         // User file: best-effort. If we couldn't resolve the platform config
         // dir, treat it as empty rather than failing — vault TOML can still
         // carry everything the user needs.
         let user_doc = match paths.user.as_ref() {
-            Some(p) => Some(read_or_create(p, &Self::default())?),
+            Some(p) => Some({
+                if p.exists() {
+                    let raw = fs::read_to_string(p).map_err(|e| {
+                        tracing::error!(file = %p.display(), error = %e, "settings read failed");
+                        HikerError::Config(format!("read {}: {e}", p.display()))
+                    })?;
+                    toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
+                        tracing::error!(
+                            file = %p.display(),
+                            error = %e,
+                            "settings parse failed",
+                        );
+                        HikerError::Config(format!("parse {}: {e}", p.display()))
+                    })?
+                } else {
+                    write_defaults(p, &Self::default())?;
+                    toml::Value::try_from(Self::default()).expect("Config serializes cleanly")
+                }
+            }),
             None => None,
         };
 
-        let vault_doc = read_or_create_minimal(&paths.vault)?;
+        let vault_doc = {
+            let path = &paths.vault;
+            if path.exists() {
+                let raw = fs::read_to_string(path).map_err(|e| {
+                    tracing::error!(file = %path.display(), error = %e, "settings read failed");
+                    HikerError::Config(format!("read {}: {e}", path.display()))
+                })?;
+                toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
+                    tracing::error!(
+                        file = %path.display(),
+                        error = %e,
+                        "settings parse failed",
+                    );
+                    HikerError::Config(format!("parse {}: {e}", path.display()))
+                })?
+            } else {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        HikerError::Config(format!("mkdir {}: {e}", parent.display()))
+                    })?;
+                }
+                let header = format!(
+                    "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
+                     # This file was auto-generated. Add per-vault overrides here;\n\
+                     # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
+                );
+                let body = format!("schema_version = {SCHEMA_VERSION}\n");
+                let bytes = format!("{header}{body}");
+                atomic_write(path, bytes.as_bytes())?;
+                let mut map = toml::map::Map::new();
+                map.insert("schema_version".into(), toml::Value::Integer(SCHEMA_VERSION as i64));
+                toml::Value::Table(map)
+            }
+        };
 
         // Deep-merge user under vault (vault wins per-key). Tables recurse;
         // arrays and scalars replace.
@@ -315,13 +366,31 @@ impl Config {
     pub fn set(
         scope: SettingsScope,
         key: &str,
-        value: serde_json::Value,
+        value: &serde_json::Value,
         vault_root: &Path,
     ) -> Result<Self, HikerError> {
-        let allowed = eligible_key(scope, key)?;
-        validate_value(&allowed, &value)?;
+        use patch::{ELIGIBLE_USER, ELIGIBLE_VAULT, Patcher};
+        let table = match scope {
+            SettingsScope::User => ELIGIBLE_USER,
+            SettingsScope::Vault => ELIGIBLE_VAULT,
+        };
+        let allowed: EligibleKey = table
+            .iter()
+            .copied()
+            .find(|k| k.path == key)
+            .ok_or_else(|| {
+                HikerError::Config(format!(
+                    "setting `{key}` is not user-mutable in v1 (scope: {scope:?})"
+                ))
+            })?;
+        if !allowed.validate(value) {
+            return Err(HikerError::Config(format!(
+                "setting `{}` got invalid value `{value}`",
+                allowed.path
+            )));
+        }
 
-        let paths = ConfigPaths::resolve(vault_root);
+        let paths = Paths::resolve(vault_root);
         let target = match scope {
             SettingsScope::User => paths
                 .user
@@ -335,10 +404,41 @@ impl Config {
         // writes we seed only schema_version to avoid auto-created defaults
         // silently overriding user settings (e.g. LLM provider backend).
         let mut doc = match scope {
-            SettingsScope::User => read_or_create_doc(&target, &Self::default())?,
-            SettingsScope::Vault => read_or_create_minimal_doc(&target)?,
+            SettingsScope::User => {
+                if !target.exists() {
+                    write_defaults(&target, &Self::default())?;
+                }
+                let raw = fs::read_to_string(&target).map_err(|e| {
+                    HikerError::Config(format!("read {}: {e}", target.display()))
+                })?;
+                raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                    HikerError::Config(format!("parse {}: {e}", target.display()))
+                })?
+            }
+            SettingsScope::Vault => {
+                if !target.exists() {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            HikerError::Config(format!("mkdir {}: {e}", parent.display()))
+                        })?;
+                    }
+                    let header = format!(
+                        "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
+                         # This file was auto-generated. Add per-vault overrides here;\n\
+                         # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
+                    );
+                    let body = format!("schema_version = {SCHEMA_VERSION}\n");
+                    atomic_write(&target, format!("{header}{body}").as_bytes())?;
+                }
+                let raw = fs::read_to_string(&target).map_err(|e| {
+                    HikerError::Config(format!("read {}: {e}", target.display()))
+                })?;
+                raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                    HikerError::Config(format!("parse {}: {e}", target.display()))
+                })?
+            }
         };
-        apply_patch(&mut doc, key, &value);
+        Patcher { doc: &mut doc }.set(key, value);
         atomic_write(&target, doc.to_string().as_bytes())?;
 
         // Reload through the normal path so the returned Config reflects

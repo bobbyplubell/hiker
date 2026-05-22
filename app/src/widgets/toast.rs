@@ -9,7 +9,9 @@ use crate::state::{AppState, ToastLevel};
 
 const TOAST_TTL: Duration = Duration::from_secs(5);
 
-pub fn show(ctx: &egui::Context, app: &mut AppState) {
+impl AppState {
+    pub fn toast_overlay(&mut self, ctx: &egui::Context) {
+    let app = self;
     let now = Instant::now();
     app.toasts
         .retain(|t| now.saturating_duration_since(t.created_at) < TOAST_TTL);
@@ -69,5 +71,6 @@ pub fn show(ctx: &egui::Context, app: &mut AppState) {
         if let Some(undo) = toast.undo {
             (undo.action)(app);
         }
+    }
     }
 }

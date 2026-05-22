@@ -3,6 +3,10 @@ references/
 target/
 node_modules/
 dist/
+# Exception: the site's GitHub Pages build output is tracked so it can be
+# published from the repo (see site/build.sh).
+!site/dist/
+!site/dist/**
 ui/src-tauri/gen/
 scratch/
 .venv/

@@ -1,3 +1,10 @@
+//! `hiker-core` is the engine behind hiker: it owns the vault index store,
+//! the chunker and embedding pipeline, semantic and lexical search, the
+//! change-staging and trails subsystems, note clustering, and the agent /
+//! LLM plumbing. Everything that touches the SQLite index, the filesystem
+//! vault, or model inference lives here so the CLI, MCP server, and desktop
+//! app share one implementation.
+
 pub mod acp;
 pub mod activity;
 pub mod agent;
@@ -9,9 +16,8 @@ pub mod cluster;
 pub mod config;
 pub mod diff;
 pub mod embed;
-pub mod error;
+pub mod errors;
 pub mod frontmatter;
-pub mod hash;
 pub mod indexer;
 pub mod llm;
 pub mod observability;
@@ -32,9 +38,14 @@ pub mod watcher;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
-pub use error::HikerError;
-pub use hash::hash_str;
-pub use vault::{DirEntryDto, EntryKind, Vault};
+/// Stable content hash for a string, rendered as lowercase hex. Used
+/// crate-wide as the canonical note/content fingerprint (index dedupe,
+/// staging conflict detection, change tracking) and re-exported to the
+/// app and CLI so every layer hashes content the same way.
+pub fn hash_string(s: &str) -> String {
+    blake3::hash(s.as_bytes()).to_hex().to_string()
+}
+
 
 /// Context block the frontend pre-resolves and sends alongside a chat
 /// turn. Shared between the HTTP/ACP adapter and the basic agent loop.

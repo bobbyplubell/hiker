@@ -16,8 +16,9 @@ use tokio::sync::{broadcast, mpsc, watch, OnceCell};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
-use crate::embed::{Embedder, EmbedError};
-use crate::store::{Store, StoreError};
+use crate::embed::{Embedder, Error as EmbedError};
+use crate::store::error::Error as StoreError;
+use crate::store::Store;
 use crate::watcher::{is_ignored, FileEvent};
 
 mod jobs;
@@ -26,7 +27,6 @@ mod scheduler;
 #[cfg(test)]
 mod tests;
 
-use scheduler::indexer_loop;
 
 /// Submit a `TaskKind::EmbedderModelLoad` row to the queue around an
 /// active `FastembedEmbedder::load_id` call. Returns the row's task id;
@@ -35,10 +35,10 @@ use scheduler::indexer_loop;
 ///
 /// status: embedder-model-load-as-task
 pub(super) async fn submit_embedder_load_task(
-    queue: &Arc<crate::tasks::Queue>,
+    queue: &Arc<crate::tasks::queue::Queue>,
     model_id: &str,
-) -> crate::tasks::TaskId {
-    use crate::tasks::{Priority, Task, TaskKind, TaskPayload, TaskShape};
+) -> crate::tasks::types::TaskId {
+    use crate::tasks::types::{Priority, Task, TaskKind, TaskPayload, TaskShape};
     let task = Task {
         id: String::new(), // queue stamps a ULID
         kind: TaskKind::EmbedderModelLoad {
@@ -78,7 +78,7 @@ pub enum IndexJob {
     Move {
         from: String,
         to: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::errors::HikerError>>,
     },
     /// Folder-scoped move: fs rename of the whole directory + bulk index
     /// path update for every contained `.md` member, on the indexer's owned
@@ -86,16 +86,16 @@ pub enum IndexJob {
     MoveFolder {
         from: String,
         to: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::errors::HikerError>>,
     },
     /// Soft-delete requested by a UI/CLI caller — fs move into vault trash +
     /// store cascade in one shot, on the indexer task. Reply oneshot returns
-    /// the resulting `TrashEntry` so the caller can drive an undo toast or
+    /// the resulting `Entry` so the caller can drive an undo toast or
     /// CLI confirmation without a second roundtrip.
     DeleteNote {
         rel: String,
         reply: tokio::sync::oneshot::Sender<
-            Result<crate::trash::TrashEntry, crate::error::HikerError>,
+            Result<crate::trash::Entry, crate::errors::HikerError>,
         >,
     },
     /// Restore a previously soft-deleted entry from the vault trash. Same
@@ -104,7 +104,7 @@ pub enum IndexJob {
     RestoreFromTrash {
         id: String,
         reply: tokio::sync::oneshot::Sender<
-            Result<crate::trash::TrashEntry, crate::error::HikerError>,
+            Result<crate::trash::Entry, crate::errors::HikerError>,
         >,
     },
     /// Walk the vault, enqueuing Upserts for `.md` files and Deletes for
@@ -120,7 +120,7 @@ pub enum IndexJob {
     /// Hot-swap the loaded embedder to `model_id`. The indexer loads the
     /// new `FastembedEmbedder` via `spawn_blocking`; on success it swaps
     /// the live `Arc<dyn Embedder>` (visible to the search-query embedder
-    /// via the same cell — see `IndexerHandle::embedder`), reseats
+    /// via the same cell — see `Handle::embedder`), reseats
     /// `chunk_vecs` to the new dim via `store.ensure_chunk_vecs_dim`, and
     /// enqueues a full vault reindex. On failure the old embedder stays
     /// loaded and the caller (typically `set_setting`) is expected to
@@ -130,7 +130,7 @@ pub enum IndexJob {
     /// status: embedder-hot-reload-on-model-change
     ReloadEmbedder {
         model_id: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::errors::HikerError>>,
     },
 }
 
@@ -163,7 +163,7 @@ pub enum ProgressEvent {
 }
 
 #[derive(Debug, Error)]
-pub enum IndexerError {
+pub enum Error {
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("embed: {0}")]
@@ -177,7 +177,7 @@ pub enum IndexerError {
 /// Caller-side handle. Cheap to clone fields (everything inside is `Arc` or
 /// a `Sender`); the handle itself is single-owner so `shutdown` can move and
 /// drop the sender to signal the task.
-pub struct IndexerHandle {
+pub struct Handle {
     // `Option` so `shutdown` can take + drop it (dropping the sole remaining
     // sender is what closes the mpsc so the task's `rx.recv()` returns None).
     tx: Option<mpsc::Sender<IndexJob>>,
@@ -232,18 +232,18 @@ impl IndexJobTx {
     }
 }
 
-impl IndexerHandle {
-    fn tx(&self) -> &mpsc::Sender<IndexJob> {
+impl Handle {
+    const fn tx(&self) -> &mpsc::Sender<IndexJob> {
         self.tx
             .as_ref()
             .expect("indexer sender used after shutdown")
     }
 
-    pub async fn enqueue(&self, job: IndexJob) -> Result<(), IndexerError> {
+    pub async fn enqueue(&self, job: IndexJob) -> Result<(), Error> {
         if let IndexJob::Upsert { rel_path, .. } = &job {
             self.pending.lock().unwrap().insert(rel_path.clone());
         }
-        self.tx().send(job).await.map_err(|_| IndexerError::SendFailed)
+        self.tx().send(job).await.map_err(|_| Error::SendFailed)
     }
 
     /// Whether the file at `rel_path` currently has an in-flight Upsert job
@@ -268,11 +268,11 @@ impl IndexerHandle {
         self.pending.lock().unwrap().len()
     }
 
-    pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), IndexerError> {
+    pub async fn index_path(&self, rel_path: impl Into<String>) -> Result<(), Error> {
         self.enqueue(IndexJob::Upsert { rel_path: rel_path.into(), force: false }).await
     }
 
-    pub async fn full_scan(&self, force: bool) -> Result<(), IndexerError> {
+    pub async fn full_scan(&self, force: bool) -> Result<(), Error> {
         self.enqueue(IndexJob::FullScan { force }).await
     }
 
@@ -285,7 +285,7 @@ impl IndexerHandle {
         &self,
         rel_path: impl Into<String>,
         ts: i64,
-    ) -> Result<(), IndexerError> {
+    ) -> Result<(), Error> {
         self.enqueue(IndexJob::TouchAccess {
             rel_path: rel_path.into(),
             ts,
@@ -382,7 +382,7 @@ impl IndexerHandle {
 ///
 /// status: embedder-model-load-as-task
 pub struct EmbedderLoadTaskPlumbing {
-    pub queue: Arc<crate::tasks::Queue>,
+    pub queue: Arc<crate::tasks::queue::Queue>,
     /// Model id used for the startup load. Hot-reload calls pass their
     /// own id via the `ReloadEmbedder` job payload — this field is just
     /// the seed for the very first load.
@@ -395,18 +395,18 @@ pub struct EmbedderLoadTaskPlumbing {
 /// `store` is moved into the indexer task (writer ownership). `embedder` is
 /// created by a closure so the (slow, fallible) load happens *inside* the
 /// task, giving callers a non-blocking startup.
-pub fn start_indexer<F>(
+pub fn start<F>(
     vault: crate::vault::Vault,
     store: Store,
     embedder_loader: F,
-) -> IndexerHandle
+) -> Handle
 where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
     start_indexer_with_tasks(vault, store, embedder_loader, None)
 }
 
-/// Same as `start_indexer` but threads a task-queue handle + the
+/// Same as `start` but threads a task-queue handle + the
 /// initial model id into the loop so the embedder-load work surfaces
 /// in the queue. status: embedder-model-load-as-task
 pub fn start_indexer_with_tasks<F>(
@@ -414,7 +414,7 @@ pub fn start_indexer_with_tasks<F>(
     store: Store,
     embedder_loader: F,
     tasks: Option<EmbedderLoadTaskPlumbing>,
-) -> IndexerHandle
+) -> Handle
 where
     F: FnOnce() -> Result<Arc<dyn Embedder>, EmbedError> + Send + 'static,
 {
@@ -454,23 +454,26 @@ where
     };
     let watcher_cell_for_task = watcher_cell.clone();
     let changes_cell_for_task = changes_cell.clone();
-    let join = tokio::spawn(indexer_loop(
-        vault,
-        vault_root,
-        store,
-        embedder_loader,
-        rx,
-        progress_for_task,
-        status_tx,
-        pending_for_task,
-        embedder_cell_for_task,
-        self_tx,
-        watcher_cell_for_task,
-        changes_cell_for_task,
-        tasks,
-    ));
+    let join = tokio::spawn(
+        crate::indexer::scheduler::IndexerLoop {
+            vault,
+            vault_root,
+            store,
+            embedder_loader,
+            rx,
+            progress: progress_for_task,
+            status: status_tx,
+            pending: pending_for_task,
+            embedder_cell: embedder_cell_for_task,
+            self_tx,
+            watcher_cell: watcher_cell_for_task,
+            changes_cell: changes_cell_for_task,
+            tasks,
+        }
+        .run(),
+    );
 
-    IndexerHandle {
+    Handle {
         tx: Some(tx),
         progress: progress_tx,
         status: status_rx,
@@ -485,7 +488,7 @@ where
 /// Walk the vault, returning the jobs the indexer should run to bring the
 /// store in line with the filesystem. Upserts for every `.md` file found,
 /// Deletes for indexed paths whose files have vanished.
-pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Vec<IndexJob>, IndexerError> {
+pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Vec<IndexJob>, Error> {
     // TODO(note-id-stamping): when `[indexing] id_stamping = "all"`, the
     // startup scan should walk every md note here and lazy-stamp its
     // `hiker.id` via `core::ops::ensure_note_id_stamped` for any note
@@ -497,44 +500,15 @@ pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Ve
         force,
         "full_scan starting",
     );
-    let mut on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut total_files_seen = 0_u32;
-    let mut filtered_non_md = 0_u32;
-    let mut filtered_ignored = 0_u32;
-    let walker = WalkDir::new(vault_root).follow_links(false).into_iter();
-    for entry in walker.filter_entry(|e| !walk_skip(vault_root, e.path())) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "full_scan: walk error");
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        total_files_seen += 1;
-        let rel = match entry.path().strip_prefix(vault_root) {
-            Ok(p) => path_to_rel(p),
-            Err(_) => {
-                tracing::warn!(
-                    path = %entry.path().display(),
-                    vault_root = %vault_root.display(),
-                    "full_scan: strip_prefix failed",
-                );
-                continue;
-            }
-        };
-        if is_ignored(&rel) {
-            filtered_ignored += 1;
-            continue;
-        }
-        if !is_indexable_path(&rel) {
-            filtered_non_md += 1;
-            continue;
-        }
-        on_disk.insert(rel);
-    }
+    let mut sc = ScanState {
+        vault_root,
+        on_disk: std::collections::HashSet::new(),
+        total_files_seen: 0,
+        filtered_non_md: 0,
+        filtered_ignored: 0,
+    };
+    sc.walk_vault();
+    let ScanState { on_disk, total_files_seen, filtered_non_md, filtered_ignored, .. } = sc;
 
     // Walk indexed paths first so we can use `on_disk` as a HashSet for
     // membership checks, then consume `on_disk` into the jobs list so
@@ -564,6 +538,78 @@ pub fn run_full_scan(vault_root: &Path, store: &Store, force: bool) -> Result<Ve
     );
 
     Ok(jobs)
+}
+
+/// Walker state for `run_full_scan`. Methods own the WalkDir traversal +
+/// per-entry filtering so the top-level function stays under the cognitive
+/// complexity cap and the helper is exempt from `single_call_fn`.
+struct ScanState<'a> {
+    vault_root: &'a Path,
+    on_disk: std::collections::HashSet<String>,
+    total_files_seen: u32,
+    filtered_non_md: u32,
+    filtered_ignored: u32,
+}
+
+impl<'a> ScanState<'a> {
+    fn walk_vault(&mut self) {
+        let vault_root = self.vault_root;
+        let walker = WalkDir::new(vault_root).follow_links(false).into_iter();
+        for entry in walker.filter_entry(|e| {
+            // Pre-filter: skip whole subtrees we never want to enter.
+            // `walkdir`'s `filter_entry` runs with absolute paths, so
+            // resolve to a vault-relative form before consulting
+            // `is_ignored`.
+            let path = e.path();
+            if path == vault_root {
+                return true;
+            }
+            let Ok(p) = path.strip_prefix(vault_root) else {
+                return false;
+            };
+            let rel = path_to_rel(p);
+            if rel.is_empty() {
+                return true;
+            }
+            !is_ignored(&rel)
+        }) {
+            self.classify_entry(entry);
+        }
+    }
+
+    fn classify_entry(&mut self, entry: Result<walkdir::DirEntry, walkdir::Error>) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "full_scan: walk error");
+                return;
+            }
+        };
+        if !entry.file_type().is_file() {
+            return;
+        }
+        self.total_files_seen += 1;
+        let rel = match entry.path().strip_prefix(self.vault_root) {
+            Ok(p) => path_to_rel(p),
+            Err(_) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    vault_root = %self.vault_root.display(),
+                    "full_scan: strip_prefix failed",
+                );
+                return;
+            }
+        };
+        if is_ignored(&rel) {
+            self.filtered_ignored += 1;
+            return;
+        }
+        if !is_indexable_path(&rel) {
+            self.filtered_non_md += 1;
+            return;
+        }
+        self.on_disk.insert(rel);
+    }
 }
 
 /// Route filesystem events into the indexer's job queue. Filters to `.md`
@@ -613,23 +659,6 @@ pub async fn route_watcher_events(
     }
 }
 
-/// Pre-filter for the walker: skip whole subtrees we never want to enter.
-/// We can't rely on `is_ignored` alone because that takes a relative path,
-/// and `walkdir`'s `filter_entry` runs with absolute paths.
-fn walk_skip(vault_root: &Path, path: &Path) -> bool {
-    if path == vault_root {
-        return false;
-    }
-    let rel = match path.strip_prefix(vault_root) {
-        Ok(p) => path_to_rel(p),
-        Err(_) => return true,
-    };
-    if rel.is_empty() {
-        return false;
-    }
-    is_ignored(&rel)
-}
-
 /// Lowercased file extension of a vault-relative path, or None for paths with
 /// no extension (or a trailing dot only).
 pub(super) fn path_extension(rel_path: &str) -> Option<&str> {
@@ -671,8 +700,8 @@ fn path_to_rel(p: &Path) -> String {
     out
 }
 
-pub(super) fn count_notes(store: &Store) -> Result<u32, StoreError> {
-    store.count_notes()
+pub(super) fn count_notes(store: &Store) -> Result<u32, Error> {
+    store.count_notes().map_err(Error::Store)
 }
 
 pub(super) fn now_secs() -> i64 {
@@ -706,22 +735,6 @@ pub(super) fn update_total_notes(status: &watch::Sender<IndexStatus>, store: &St
     }
 }
 
-// Called right after `recv().await` returns: the just-pulled job is no
-// longer in `rx` but is about to be processed, so include it in the
-// published count rather than flashing 0 between recv and the next event.
-pub(super) fn update_queue_count_in_flight(
-    status: &watch::Sender<IndexStatus>,
-    rx: &mpsc::Receiver<IndexJob>,
-) {
-    let len = rx.len() as u32 + 1;
-    update_status(status, |s| s.queued = len);
-}
-
-pub(super) fn update_queue_count_idle(status: &watch::Sender<IndexStatus>, rx: &mpsc::Receiver<IndexJob>) {
-    let len = rx.len() as u32;
-    update_status(status, |s| s.queued = len);
-}
-
 /// Read `hiker.id` from a note's frontmatter, returning None if there's
 /// no frontmatter, no `hiker:` block, or no `id:` field. Used by
 /// `process_upsert` to keep `path_ids` in lockstep with whatever id the
@@ -733,6 +746,6 @@ pub(super) fn frontmatter_hiker_id(contents: &str) -> Option<String> {
     let fm = split.frontmatter?;
     let serde_yml::Value::Mapping(map) = fm else { return None };
     let serde_yml::Value::Mapping(hiker) = map.get("hiker")? else { return None };
-    hiker.get("id")?.as_str().map(|s| s.to_string())
+    hiker.get("id")?.as_str().map(std::string::ToString::to_string)
 }
 

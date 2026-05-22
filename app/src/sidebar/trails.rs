@@ -4,7 +4,6 @@
 //! inline annotation editing); the single in-sidebar editing verbs are
 //! the per-card "Remove waypoint" and "Append from here" context-menu
 //! entries plus the overflow menu (New / Rename / Delete).
-#![allow(clippy::items_after_test_module)]
 
 use eframe::egui;
 
@@ -12,59 +11,66 @@ use crate::editor_pane;
 use crate::state::{create_trail, AppState, Waypoint};
 use crate::theme;
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+/// Deferred mutations collected while rendering the waypoint forest.
+/// Rendering only borrows `&AppState`; each picked verb lands here and is
+/// applied against `&mut AppState` after the render pass, dodging the
+/// mutable-borrow overlap that one-shot closures would otherwise hit.
+#[derive(Default)]
+struct TrailActions {
+    open: Option<String>,
+    remove: Option<String>,
+    set_append: Option<String>,
+    toggle_expand: Option<String>,
+    toggle_side: Option<String>,
+    start_annot: Option<String>,
+    save_annot: Option<(String, String)>,
+    cancel_annot: bool,
+    update_annot: Option<String>,
+    move_op: Option<(String, crate::state::MoveOp)>,
+}
+
+/// Render context for the trails sidebar. Bundles `ui` + `state` so the
+/// per-row helpers are `&mut self` methods (exempt from
+/// `single_call_fn`) instead of free functions threading the same refs.
+/// Construct with `TrailsView { ui, state }` and call `render`.
+pub(crate) struct TrailsView<'a> {
+    pub(crate) ui: &'a mut egui::Ui,
+    pub(crate) state: &'a mut AppState,
+}
+
+impl TrailsView<'_> {
+pub(crate) fn render(&mut self) {
     // Pick a visible trail: prefer the active one, else fall back to the
     // first trail. When no trails exist, surface a "New trail" prompt and
     // bail — the header/cursor rows have nothing to render.
-    let visible_id = state
-        .session.active_trail
+    let visible_id = self
+        .state.session.active_trail
         .clone()
-        .filter(|id| state.session.trails.iter().any(|t| &t.id == id))
-        .or_else(|| state.session.trails.first().map(|t| t.id.clone()));
+        .filter(|id| self.state.session.trails.iter().any(|t| &t.id == id))
+        .or_else(|| self.state.session.trails.first().map(|t| t.id.clone()));
     let Some(visible_id) = visible_id else {
-        ui.horizontal(|ui| {
-            ui.add(crate::icons::trail()).on_hover_text("Trails");
-            ui.label(
-                egui::RichText::new("No trails yet")
-                    .color(theme::muted())
-                    .small(),
-            );
-        });
-        ui.add_space(8.0);
-        if ui.button("New trail").clicked() {
-            let name = format!("Trail {}", state.session.trails.len() + 1);
-            let id = create_trail(state, &name);
-            state.session.active_trail = Some(id);
-            let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-        }
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Tip: with a trail active, use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb in the file tree to add waypoints.")
-                .color(theme::muted())
-                .italics()
-                .small(),
-        );
+        self.render_empty_state();
         return;
     };
 
-    if state.panels.trails_ui.all_trails_picker_open {
-        render_all_trails_picker(ui.ctx(), state, &visible_id);
+    if self.state.panels.trails_ui.all_trails_picker_open {
+        self.render_all_trails_picker(&visible_id);
     }
 
-    header_row(ui, state, &visible_id);
-    rename_row(ui, state, &visible_id);
-    cursor_hint_row(ui, state, &visible_id);
+    self.header_row(&visible_id);
+    self.rename_row(&visible_id);
+    self.cursor_hint_row(&visible_id);
 
-    ui.separator();
+    self.ui.separator();
 
-    let snapshot = state
-        .session.trails
+    let snapshot = self
+        .state.session.trails
         .iter()
         .find(|t| t.id == visible_id)
         .map(|t| (t.name.clone(), t.waypoints.clone(), t.append_under.clone()))
         .unwrap_or_default();
 
-    ui.label(
+    self.ui.label(
         egui::RichText::new(format!(
             "{} ({} waypoint{})",
             snapshot.0,
@@ -76,8 +82,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     );
 
     if snapshot.1.is_empty() {
-        ui.add_space(8.0);
-        ui.label(
+        self.ui.add_space(8.0);
+        self.ui.label(
             egui::RichText::new("Empty trail - use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb to add waypoints.")
                 .color(theme::muted())
                 .italics()
@@ -86,50 +92,64 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    let cursor_path: Option<String> = state
-        .session.active_tab
-        .and_then(|id| state.tab_by_id(id))
+    let cursor_path: Option<String> = self
+        .state.session.active_tab
+        .and_then(|id| self.state.tab_by_id(id))
         .and_then(|t| t.buffer_path().map(str::to_string));
 
-    let mut to_open: Option<String> = None;
-    let mut to_remove: Option<String> = None;
-    let mut to_set_append: Option<String> = None;
-    let mut to_toggle_expand: Option<String> = None;
-    let mut to_toggle_side: Option<String> = None;
-    let mut to_start_annot: Option<String> = None;
-    let mut to_save_annot: Option<(String, String)> = None;
-    let mut to_cancel_annot: bool = false;
-    let mut to_update_annot: Option<String> = None;
-    let mut to_move: Option<(String, crate::state::MoveOp)> = None;
+    let mut actions = TrailActions::default();
     // "Drop here for start of trail" zone above the first card.
-    head_drop_zone(ui, &mut to_move);
-    render_waypoints(
-        ui,
-        state,
+    self.head_drop_zone(&mut actions);
+    self.render_waypoints(
         &snapshot.1,
         cursor_path.as_deref(),
         snapshot.2.as_deref(),
         &mut Vec::new(),
-        &mut to_open,
-        &mut to_remove,
-        &mut to_set_append,
-        &mut to_toggle_expand,
-        &mut to_toggle_side,
-        &mut to_start_annot,
-        &mut to_save_annot,
-        &mut to_cancel_annot,
-        &mut to_update_annot,
-        &mut to_move,
-        /*is_root=*/ true,
+        &mut actions,
     );
     // "Drop here for end of trail" zone below the last card.
-    tail_drop_zone(ui, &mut to_move);
-    if let Some((src, op)) = to_move {
+    self.tail_drop_zone(&mut actions);
+    self.apply_actions(&visible_id, actions);
+}
+
+/// Empty-trails fallback: trail icon + "New trail" prompt + usage tip.
+fn render_empty_state(&mut self) {
+    let state = &mut *self.state;
+    self.ui.horizontal(|ui| {
+        ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
+        ui.label(
+            egui::RichText::new("No trails yet")
+                .color(theme::muted())
+                .small(),
+        );
+    });
+    self.ui.add_space(8.0);
+    if self.ui.button("New trail").clicked() {
+        let name = format!("Trail {}", state.session.trails.len() + 1);
+        let id = create_trail(state, &name);
+        state.session.active_trail = Some(id);
+        let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+    }
+    self.ui.add_space(8.0);
+    self.ui.label(
+        egui::RichText::new("Tip: with a trail active, use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb in the file tree to add waypoints.")
+            .color(theme::muted())
+            .italics()
+            .small(),
+    );
+}
+
+/// Apply the deferred verbs collected during a render pass against the
+/// trail identified by `visible_id`, persisting where the verb mutates
+/// the trail forest.
+fn apply_actions(&mut self, visible_id: &str, actions: TrailActions) {
+    let state = &mut *self.state;
+    if let Some((src, op)) = actions.move_op {
         if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id) {
             // Resetting the append cursor whenever it might dangle is
             // simpler than tracking subtree moves precisely.
             trail.append_under = None;
-            if crate::state::move_waypoint(&mut trail.waypoints, &src, op) {
+            if trail.move_waypoint(&src, op) {
                 let _ = crate::bootstrap::save_trails(
                     &state.vault_session.vault_root,
                     &state.session.trails,
@@ -137,13 +157,43 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
     }
-    if let Some(path) = to_open {
+    if let Some(path) = actions.open {
         editor_pane::open_file(state, &path, false);
     }
-    if let Some(path) = to_remove {
-        prompt_remove_waypoint(state, visible_id.clone(), path);
+    if let Some(path) = actions.remove {
+        // Mirrors the legacy `removeWaypoint` flow: compute the cascade
+        // size and raise a danger-styled confirm modal; the actual drop
+        // happens in the modal's confirm handler.
+        let total = state
+            .session.trails
+            .iter()
+            .find(|t| t.id == visible_id)
+            .map(|t| descendant_count(&t.waypoints, &path))
+            .unwrap_or(0);
+        let sides = total.saturating_sub(1);
+        let body = if sides > 0 {
+            format!(
+                "Remove this waypoint and {} side-trail waypoint{}? The trail entry is dropped - the underlying notes stay on disk.",
+                sides,
+                if sides == 1 { "" } else { "s" },
+            )
+        } else {
+            "Remove this waypoint? The trail entry is dropped - the underlying note stays on disk."
+                .to_string()
+        };
+        state.session.modal = Some(crate::state::Modal::Confirm {
+            title: "Remove waypoint".to_string(),
+            body,
+            confirm_label: "Remove".to_string(),
+            cancel_label: "Cancel".to_string(),
+            danger: true,
+            intent: crate::state::ConfirmIntent::DeleteTrailWaypoint {
+                trail_id: visible_id.to_string(),
+                path,
+            },
+        });
     }
-    if let Some(path) = to_set_append {
+    if let Some(path) = actions.set_append {
         if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id) {
             trail.append_under = Some(path.clone());
         }
@@ -153,19 +203,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             crate::state::ToastLevel::Info,
         );
     }
-    if let Some(path) = to_toggle_expand {
+    if let Some(path) = actions.toggle_expand {
         if state.panels.trails_ui.expanded_path.as_deref() == Some(&path) {
             state.panels.trails_ui.expanded_path = None;
         } else {
             state.panels.trails_ui.expanded_path = Some(path);
         }
     }
-    if let Some(path) = to_toggle_side {
+    if let Some(path) = actions.toggle_side {
         if !state.panels.trails_ui.side_trail_collapsed.remove(&path) {
             state.panels.trails_ui.side_trail_collapsed.insert(path);
         }
     }
-    if let Some(path) = to_start_annot {
+    if let Some(path) = actions.start_annot {
         let cur = state
             .session.trails
             .iter()
@@ -174,15 +224,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             .unwrap_or_default();
         state.panels.trails_ui.annotation_edit = Some((path, cur));
     }
-    if let Some(text) = to_update_annot
+    if let Some(text) = actions.update_annot
         && let Some((_, draft)) = state.panels.trails_ui.annotation_edit.as_mut()
     {
         *draft = text;
     }
-    if to_cancel_annot {
+    if actions.cancel_annot {
         state.panels.trails_ui.annotation_edit = None;
     }
-    if let Some((path, body)) = to_save_annot {
+    if let Some((path, body)) = actions.save_annot {
         if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id)
             && let Some(wp) = crate::state::find_waypoint_mut(&mut trail.waypoints, &path)
         {
@@ -193,7 +243,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
+fn header_row(&mut self, visible_id: &str) {
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
     let visible_name = state
         .session.trails
         .iter()
@@ -204,7 +256,7 @@ fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
     let mut open_trail_doc: Option<String> = None;
 
     ui.horizontal(|ui| {
-        ui.add(crate::icons::trail()).on_hover_text("Trails");
+        ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
 
         // Dropdown button - popover with "None"-like behavior replaced
         // by the always-present "Recent" trail (the new app's stand-in
@@ -262,7 +314,7 @@ fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
         // the trail-doc. The new app generates the doc on demand under
         // `.hiker/trails/<slug>.md`.
         let head_btn = ui
-            .add(egui::Button::image(crate::icons::compass()))
+            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Compass)))
             .on_hover_text("Open trail-doc");
         if head_btn.clicked() {
             open_trail_doc = Some(visible_id.to_string());
@@ -276,9 +328,9 @@ fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
             .map(|t| !t.waypoints.is_empty())
             .unwrap_or(false);
         let (icon, tip) = if state.panels.trails_ui.expand_all {
-            (crate::icons::chevron_down(), "Collapse all")
+            (crate::icons::ICONS.image(crate::icons::Icon::ChevronDown), "Collapse all")
         } else {
-            (crate::icons::chevron_right(), "Expand all")
+            (crate::icons::ICONS.image(crate::icons::Icon::ChevronRight), "Expand all")
         };
         ui.add_enabled_ui(has_waypoints, |ui| {
             if ui
@@ -298,7 +350,7 @@ fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
         // affordance so users can still manage trails without opening
         // the editor.
         let overflow = ui
-            .add(egui::Button::image(crate::icons::menu()))
+            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Menu)))
             .on_hover_text("Trail actions");
         egui::Popup::menu(&overflow).show(|ui| {
             if ui.button("New trail").clicked() {
@@ -331,81 +383,7 @@ fn header_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
     });
 
     if let Some(id) = open_trail_doc {
-        write_and_open_trail_doc(state, &id);
-    }
-}
-
-/// Slug a trail name into a filesystem-safe stem: lowercase, collapse
-/// non-alphanumeric runs into a single `-`, trim leading/trailing `-`.
-fn slug(name: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in name.chars() {
-        if ch.is_alphanumeric() {
-            out.extend(ch.to_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-/// Regenerate `.hiker/trails/<slug>.md` from the trail's current
-/// waypoint forest and open it in the editor. Legacy parity for the
-/// trail-head verb - in the new app the JSON is authoritative, so the
-/// doc is overwritten each open.
-fn write_and_open_trail_doc(state: &mut AppState, trail_id: &str) {
-    let Some(trail) = state.session.trails.iter().find(|t| t.id == trail_id) else {
-        return;
-    };
-    let stem = slug(&trail.name);
-    let stem = if stem.is_empty() {
-        trail_id.to_string()
-    } else {
-        stem
-    };
-    let rel = format!(".hiker/trails/{}.md", stem);
-    let mut body = String::new();
-    body.push_str(&format!("# {}\n\n", trail.name));
-    if trail.waypoints.is_empty() {
-        body.push_str("_(no waypoints yet)_\n");
-    } else {
-        write_trail_doc_section(&mut body, &trail.waypoints, &mut Vec::new());
-    }
-    let abs = state.vault_session.vault_root.join(&rel);
-    if let Some(parent) = abs.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(&abs, body).is_err() {
-        state.push_toast("Failed to write trail-doc", crate::state::ToastLevel::Error);
-        return;
-    }
-    state.session.sidebar.dir_cache.remove(".hiker/trails");
-    state.session.sidebar.dir_cache.remove(".hiker");
-    crate::editor_pane::open_file(state, &rel, false);
-}
-
-fn write_trail_doc_section(out: &mut String, waypoints: &[Waypoint], ordinal: &mut Vec<usize>) {
-    for (idx, wp) in waypoints.iter().enumerate() {
-        ordinal.push(idx + 1);
-        let tree = ordinal
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        let base = wp.path.rsplit('/').next().unwrap_or(wp.path.as_str());
-        out.push_str(&format!("- **{}** [[{}|{}]]\n", tree, wp.path, base));
-        for line in wp.annotation.lines() {
-            if !line.trim().is_empty() {
-                out.push_str(&format!("  > {}\n", line));
-            }
-        }
-        if !wp.children.is_empty() {
-            write_trail_doc_section(out, &wp.children, ordinal);
-        }
-        ordinal.pop();
+        self.write_and_open_trail_doc(&id);
     }
 }
 
@@ -413,7 +391,9 @@ fn write_trail_doc_section(out: &mut String, waypoints: &[Waypoint], ordinal: &m
 /// trail in the vault, with a search box. Legacy `openAllTrailsPicker`
 /// equivalent; useful when the dropdown's recent cap hides the trail
 /// the user wants.
-fn render_all_trails_picker(ctx: &egui::Context, state: &mut AppState, visible_id: &str) {
+fn render_all_trails_picker(&mut self, visible_id: &str) {
+    let ctx = self.ui.ctx().clone();
+    let state = &mut *self.state;
     let mut open = true;
     let mut to_activate: Option<String> = None;
     let mut close_after = false;
@@ -423,7 +403,7 @@ fn render_all_trails_picker(ctx: &egui::Context, state: &mut AppState, visible_i
         .resizable(true)
         .default_width(320.0)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
-        .show(ctx, |ui| {
+        .show(&ctx, |ui| {
             ui.label(
                 egui::RichText::new(format!("{} trail{}", state.session.trails.len(),
                     if state.session.trails.len() == 1 { "" } else { "s" }))
@@ -458,19 +438,9 @@ fn render_all_trails_picker(ctx: &egui::Context, state: &mut AppState, visible_i
     }
 }
 
-fn activate_trail(state: &mut AppState, id: &str) {
-    state.session.active_trail = Some(id.to_string());
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    if let Some(t) = state.session.trails.iter_mut().find(|t| t.id == id) {
-        t.last_activated_at_ms = now_ms;
-    }
-    let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-}
-
-fn rename_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
+fn rename_row(&mut self, visible_id: &str) {
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
     let Some((rename_id, _)) = state.session.trail_rename.clone() else {
         return;
     };
@@ -503,7 +473,9 @@ fn rename_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
     });
 }
 
-fn cursor_hint_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
+fn cursor_hint_row(&mut self, visible_id: &str) {
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
     let (under, exists) = state
         .session.trails
         .iter()
@@ -547,6 +519,130 @@ fn cursor_hint_row(ui: &mut egui::Ui, state: &mut AppState, visible_id: &str) {
     });
 }
 
+fn render_waypoints(
+    &mut self,
+    waypoints: &[Waypoint],
+    cursor_path: Option<&str>,
+    append_under: Option<&str>,
+    ordinal: &mut Vec<usize>,
+    actions: &mut TrailActions,
+) {
+    let state: &AppState = self.state;
+    let mut wv = WaypointView { ui: self.ui, state };
+    wv.forest(waypoints, cursor_path, append_under, ordinal, actions);
+}
+
+/// Regenerate `.hiker/trails/<slug>.md` from the trail's current
+/// waypoint forest and open it in the editor. Legacy parity for the
+/// trail-head verb - in the new app the JSON is authoritative, so the
+/// doc is overwritten each open.
+fn write_and_open_trail_doc(&mut self, trail_id: &str) {
+    let state = &mut *self.state;
+    let Some(trail) = state.session.trails.iter().find(|t| t.id == trail_id) else {
+        return;
+    };
+    // Slug the trail name into a filesystem-safe stem: lowercase,
+    // collapse non-alphanumeric runs to a single `-`, trim edge dashes.
+    let mut stem = String::new();
+    let mut last_dash = false;
+    for ch in trail.name.chars() {
+        if ch.is_alphanumeric() {
+            stem.extend(ch.to_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            stem.push('-');
+            last_dash = true;
+        }
+    }
+    let stem = stem.trim_matches('-').to_string();
+    let stem = if stem.is_empty() {
+        trail_id.to_string()
+    } else {
+        stem
+    };
+    let rel = format!(".hiker/trails/{}.md", stem);
+    let mut body = String::new();
+    body.push_str(&format!("# {}\n\n", trail.name));
+    if trail.waypoints.is_empty() {
+        body.push_str("_(no waypoints yet)_\n");
+    } else {
+        write_trail_doc_section(&mut body, &trail.waypoints, &mut Vec::new());
+    }
+    let abs = state.vault_session.vault_root.join(&rel);
+    if let Some(parent) = abs.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&abs, body).is_err() {
+        state.push_toast("Failed to write trail-doc", crate::state::ToastLevel::Error);
+        return;
+    }
+    state.session.sidebar.dir_cache.remove(".hiker/trails");
+    state.session.sidebar.dir_cache.remove(".hiker");
+    crate::editor_pane::open_file(state, &rel, false);
+}
+
+/// Drop strip above the first waypoint — releasing a dragged card here
+/// makes it the new head of the trail.
+fn head_drop_zone(&mut self, actions: &mut TrailActions) {
+    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 2));
+    let (_, payload) = self.ui.dnd_drop_zone::<String, _>(frame, |ui| {
+        ui.allocate_response(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+    });
+    if let Some(src) = payload {
+        actions.move_op = Some(((*src).clone(), crate::state::MoveOp::Head));
+    }
+}
+
+/// Drop strip below the last waypoint — releasing a dragged card here
+/// makes it the new tail of the trail.
+fn tail_drop_zone(&mut self, actions: &mut TrailActions) {
+    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 4));
+    let (_, payload) = self.ui.dnd_drop_zone::<String, _>(frame, |ui| {
+        ui.allocate_response(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+    });
+    if let Some(src) = payload {
+        actions.move_op = Some(((*src).clone(), crate::state::MoveOp::Tail));
+    }
+}
+
+}
+
+// ===== free helpers =====
+
+fn write_trail_doc_section(out: &mut String, waypoints: &[Waypoint], ordinal: &mut Vec<usize>) {
+    for (idx, wp) in waypoints.iter().enumerate() {
+        ordinal.push(idx + 1);
+        let tree = ordinal
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        let base = wp.path.rsplit('/').next().unwrap_or(wp.path.as_str());
+        out.push_str(&format!("- **{}** [[{}|{}]]\n", tree, wp.path, base));
+        for line in wp.annotation.lines() {
+            if !line.trim().is_empty() {
+                out.push_str(&format!("  > {}\n", line));
+            }
+        }
+        if !wp.children.is_empty() {
+            write_trail_doc_section(out, &wp.children, ordinal);
+        }
+        ordinal.pop();
+    }
+}
+
+fn activate_trail(state: &mut AppState, id: &str) {
+    state.session.active_trail = Some(id.to_string());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Some(t) = state.session.trails.iter_mut().find(|t| t.id == id) {
+        t.last_activated_at_ms = now_ms;
+    }
+    let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+}
+
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -563,108 +659,385 @@ fn find_waypoint<'a>(waypoints: &'a [Waypoint], path: &str) -> Option<&'a Waypoi
     None
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_waypoints(
-    ui: &mut egui::Ui,
-    state: &AppState,
-    waypoints: &[Waypoint],
-    cursor_path: Option<&str>,
-    append_under: Option<&str>,
-    ordinal: &mut Vec<usize>,
-    to_open: &mut Option<String>,
-    to_remove: &mut Option<String>,
-    to_set_append: &mut Option<String>,
-    to_toggle_expand: &mut Option<String>,
-    to_toggle_side: &mut Option<String>,
-    to_start_annot: &mut Option<String>,
-    to_save_annot: &mut Option<(String, String)>,
-    to_cancel_annot: &mut bool,
-    to_update_annot: &mut Option<String>,
-    to_move: &mut Option<(String, crate::state::MoveOp)>,
-    _is_root: bool,
-) {
-    for (idx, wp) in waypoints.iter().enumerate() {
-        ordinal.push(idx + 1);
-        let tree_path = ordinal
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        render_single_waypoint(
-            ui,
-            state,
-            wp,
-            &tree_path,
-            cursor_path,
-            append_under,
-            to_open,
-            to_remove,
-            to_set_append,
-            to_toggle_expand,
-            to_toggle_side,
-            to_start_annot,
-            to_save_annot,
-            to_cancel_annot,
-            to_update_annot,
-            to_move,
-        );
-        let side_collapsed = state.panels.trails_ui.side_trail_collapsed.contains(&wp.path);
-        if !wp.children.is_empty() && !side_collapsed {
-            ui.indent(("trail-children", &wp.path), |ui| {
-                ui.add_space(2.0);
-                render_waypoints(
-                    ui,
-                    state,
-                    &wp.children,
-                    cursor_path,
-                    append_under,
-                    ordinal,
-                    to_open,
-                    to_remove,
-                    to_set_append,
-                    to_toggle_expand,
-                    to_toggle_side,
-                    to_start_annot,
-                    to_save_annot,
-                    to_cancel_annot,
-                    to_update_annot,
-                    to_move,
-                    /*is_root=*/ false,
-                );
-            });
+/// Read-only render context for the waypoint forest. Rendering only
+/// reads `AppState` (a shared ref), so the recursive forest walk can
+/// freely re-borrow `state` inside `ui.indent` closures while writing
+/// picked verbs into `TrailActions`. The per-card helpers are `&mut
+/// self` methods, exempt from `single_call_fn`.
+struct WaypointView<'a> {
+    ui: &'a mut egui::Ui,
+    state: &'a AppState,
+}
+
+impl WaypointView<'_> {
+    /// Walk a sibling list, rendering each card and recursing into any
+    /// expanded side-trail children one indent deeper.
+    fn forest(
+        &mut self,
+        waypoints: &[Waypoint],
+        cursor_path: Option<&str>,
+        append_under: Option<&str>,
+        ordinal: &mut Vec<usize>,
+        actions: &mut TrailActions,
+    ) {
+        for (idx, wp) in waypoints.iter().enumerate() {
+            ordinal.push(idx + 1);
+            let tree_path = ordinal
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            self.single(wp, &tree_path, cursor_path, append_under, actions);
+            let side_collapsed =
+                self.state.panels.trails_ui.side_trail_collapsed.contains(&wp.path);
+            if !wp.children.is_empty() && !side_collapsed {
+                let state = self.state;
+                self.ui.indent(("trail-children", &wp.path), |ui| {
+                    ui.add_space(2.0);
+                    let mut child = WaypointView { ui, state };
+                    child.forest(&wp.children, cursor_path, append_under, ordinal, actions);
+                });
+            }
+            ordinal.pop();
         }
-        ordinal.pop();
+    }
+
+    /// Per-waypoint card: drag-drop frame, header row, expanded body, and
+    /// context menu. Each sub-piece is its own method so the orchestrator
+    /// stays readable and under the line budget.
+    fn single(
+        &mut self,
+        wp: &Waypoint,
+        tree_path: &str,
+        cursor_path: Option<&str>,
+        append_under: Option<&str>,
+        actions: &mut TrailActions,
+    ) {
+        let base = basename(&wp.path);
+        let exists = self.state.vault_session.vault_root.join(&wp.path).exists();
+        let is_cursor = append_under == Some(wp.path.as_str());
+        let is_active_tab = cursor_path == Some(wp.path.as_str());
+        let expanded = self.state.panels.trails_ui.expand_all
+            || self.state.panels.trails_ui.expanded_path.as_deref() == Some(wp.path.as_str());
+
+        let (fill, stroke_color) = if !exists {
+            (
+                egui::Color32::from_rgb(0x3a, 0x36, 0x36),
+                egui::Color32::from_rgb(0xb9, 0x6a, 0x6a),
+            )
+        } else if is_cursor {
+            (theme::active_bg(), theme::accent())
+        } else {
+            (theme::active_bg(), theme::divider())
+        };
+
+        let card_frame = egui::Frame::default()
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, stroke_color))
+            .inner_margin(egui::Margin::symmetric(6, 4));
+        let drag_id = self.ui.make_persistent_id(("trail-wp-drag", &wp.path));
+        let card = CardCtx { wp, tree_path, base, exists, is_cursor, is_active_tab, expanded };
+        let state = self.state;
+        let (zone_resp, drop_payload) =
+            self.ui.dnd_drop_zone::<String, _>(card_frame, |ui| {
+                let drag = ui.dnd_drag_source(drag_id, wp.path.clone(), |ui| {
+                    let mut row = WaypointView { ui, state };
+                    row.card_header(&card, actions);
+                    row.card_body(&card, actions);
+                });
+                drag.response
+            });
+        let drag_resp = zone_resp.inner;
+        self.resolve_drop(wp, &drag_resp, drop_payload, exists, actions);
+        self.waypoint_context_menu(wp, &drag_resp, exists, is_cursor, actions);
+        self.ui.add_space(2.0);
+    }
+
+    /// Header row of a card: collapse chevron, ordinal, cursor/active
+    /// markers, file/warning icon, title, and the expand chevron.
+    fn card_header(&mut self, card: &CardCtx, actions: &mut TrailActions) {
+        let wp = card.wp;
+        let state = self.state;
+        self.ui.horizontal(|ui| {
+            // Side-trail collapse chevron (only when has children).
+            if !wp.children.is_empty() {
+                let side_collapsed =
+                    state.panels.trails_ui.side_trail_collapsed.contains(&wp.path);
+                let (icon, tip) = if side_collapsed {
+                    (crate::icons::ICONS.image(crate::icons::Icon::ChevronRight), "Expand side trail")
+                } else {
+                    (crate::icons::ICONS.image(crate::icons::Icon::ChevronDown), "Collapse side trail")
+                };
+                if ui
+                    .add(egui::Button::image(icon).small())
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    actions.toggle_side = Some(wp.path.clone());
+                }
+            }
+
+            // Sequence ordinal (legacy `tree_path`).
+            ui.label(
+                egui::RichText::new(card.tree_path)
+                    .color(theme::muted())
+                    .small()
+                    .monospace(),
+            );
+
+            // Append-cursor / active-tab indicator.
+            if card.is_cursor {
+                ui.add(crate::icons::ICONS.image(crate::icons::Icon::Walk).tint(theme::accent()))
+                    .on_hover_text("Append cursor - new visits land here");
+            } else if card.is_active_tab {
+                ui.add(crate::icons::ICONS.image(crate::icons::Icon::Dot).tint(theme::muted()))
+                    .on_hover_text("Currently open");
+            }
+
+            // File / warning icon.
+            if card.exists {
+                ui.add(crate::icons::ICONS.image(crate::icons::Icon::File));
+            } else {
+                ui.add(crate::icons::ICONS.image(crate::icons::Icon::Warning).tint(theme::muted()));
+            }
+
+            // Basename (strong).
+            let title_text = if card.exists {
+                egui::RichText::new(card.base).strong()
+            } else {
+                egui::RichText::new(card.base)
+                    .strong()
+                    .color(theme::muted())
+                    .strikethrough()
+            };
+            ui.add(egui::Label::new(title_text).truncate())
+                .on_hover_text(&wp.path);
+
+            if !card.exists {
+                ui.label(
+                    egui::RichText::new("broken reference")
+                        .color(egui::Color32::from_rgb(0xb9, 0x6a, 0x6a))
+                        .small()
+                        .italics(),
+                );
+            }
+
+            // Right-edge expand chevron.
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let icon = if card.expanded {
+                        crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
+                    } else {
+                        crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
+                    };
+                    if ui.add(egui::Button::image(icon).small()).clicked() {
+                        actions.toggle_expand = Some(wp.path.clone());
+                    }
+                },
+            );
+        });
+    }
+
+    /// Below-header content: collapsed snippet, or (when expanded) the
+    /// parent path, timestamp, annotation editor/text, and action row.
+    fn card_body(&mut self, card: &CardCtx, actions: &mut TrailActions) {
+        let wp = card.wp;
+        let state = self.state;
+        if !card.expanded {
+            let snippet = self.first_non_empty_line(&wp.annotation);
+            if !snippet.is_empty() {
+                self.ui.label(
+                    egui::RichText::new(snippet)
+                        .color(theme::muted())
+                        .small(),
+                );
+            }
+            return;
+        }
+        self.ui.add_space(2.0);
+        if let Some((parent, _)) = wp.path.rsplit_once('/') {
+            self.ui.label(
+                egui::RichText::new(parent)
+                    .color(theme::muted())
+                    .small()
+                    .monospace(),
+            );
+        }
+        if wp.at_ms > 0 {
+            let ts = self.format_ts(wp.at_ms);
+            self.ui.label(
+                egui::RichText::new(ts)
+                    .color(theme::muted())
+                    .small(),
+            );
+        }
+        self.ui.add_space(2.0);
+
+        // Annotation body - inline editor when this waypoint is the
+        // current annotation-edit target, else a paragraph / placeholder.
+        let editing = state
+            .panels.trails_ui
+            .annotation_edit
+            .as_ref()
+            .map(|(p, _)| p == &wp.path)
+            .unwrap_or(false);
+        if editing {
+            let mut draft = state
+                .panels.trails_ui
+                .annotation_edit
+                .as_ref()
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
+            let resp = self.ui.add(
+                egui::TextEdit::multiline(&mut draft)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Annotation (markdown)"),
+            );
+            if resp.changed() {
+                actions.update_annot = Some(draft.clone());
+            }
+            let escape = self.ui.input(|i| i.key_pressed(egui::Key::Escape));
+            self.ui.horizontal(|ui| {
+                if ui.small_button("Save").clicked() {
+                    actions.save_annot = Some((wp.path.clone(), draft.clone()));
+                }
+                if ui.small_button("Cancel").clicked() || escape {
+                    actions.cancel_annot = true;
+                }
+            });
+        } else if wp.annotation.trim().is_empty() {
+            self.ui.label(
+                egui::RichText::new("(no annotation)")
+                    .color(theme::muted())
+                    .small()
+                    .italics(),
+            );
+        } else {
+            self.ui.label(egui::RichText::new(&wp.annotation).small());
+        }
+
+        self.ui.horizontal(|ui| {
+            if card.exists && ui.small_button("Open").clicked() {
+                actions.open = Some(wp.path.clone());
+            }
+            if !editing && ui.small_button("Edit annotation").clicked() {
+                actions.start_annot = Some(wp.path.clone());
+            }
+            if card.exists && !card.is_cursor && ui.small_button("Append here").clicked() {
+                actions.set_append = Some(wp.path.clone());
+            }
+        });
+    }
+
+    /// Resolve a card's drop payload + whole-frame click into open/move
+    /// verbs. Top-half drops reorder before the card; bottom-half drops
+    /// nest under it. Self-drops are ignored.
+    fn resolve_drop(
+        &mut self,
+        wp: &Waypoint,
+        drag_resp: &egui::Response,
+        drop_payload: Option<std::sync::Arc<String>>,
+        exists: bool,
+        actions: &mut TrailActions,
+    ) {
+        if let Some(src) = drop_payload {
+            let card_rect = drag_resp.rect;
+            let pointer_y = self.ui
+                .input(|i| i.pointer.interact_pos())
+                .map(|p| p.y)
+                .unwrap_or(card_rect.center().y);
+            let op = if pointer_y < card_rect.center().y {
+                crate::state::MoveOp::Before(wp.path.clone())
+            } else {
+                crate::state::MoveOp::Child(wp.path.clone())
+            };
+            if (*src) != wp.path {
+                actions.move_op = Some(((*src).clone(), op));
+            }
+        }
+        if exists && drag_resp.clicked() {
+            actions.open = Some(wp.path.clone());
+        }
+    }
+
+    /// Right-click verbs: Open, Remove, Append-from-here / reset cursor.
+    fn waypoint_context_menu(
+        &mut self,
+        wp: &Waypoint,
+        drag_resp: &egui::Response,
+        exists: bool,
+        is_cursor: bool,
+        actions: &mut TrailActions,
+    ) {
+        drag_resp.context_menu(|ui| {
+            if exists && ui.button("Open").clicked() {
+                actions.open = Some(wp.path.clone());
+                ui.close();
+            }
+            if ui.button("Remove from trail").clicked() {
+                actions.remove = Some(wp.path.clone());
+                ui.close();
+            }
+            ui.add_enabled_ui(exists && !is_cursor, |ui| {
+                if ui.button("Append from here").clicked() {
+                    actions.set_append = Some(wp.path.clone());
+                    ui.close();
+                }
+            });
+            if is_cursor && ui.button("Reset append cursor").clicked() {
+                actions.set_append = None;
+                // Cursor reset routes through the hint-row button; the
+                // context menu surface keeps the verb discoverable per
+                // `trail-reset-cursor-verb`.
+                ui.close();
+            }
+        });
+    }
+
+    /// First non-empty, trimmed line of `s` (collapsed-card snippet).
+    fn first_non_empty_line(&self, s: &str) -> String {
+        for raw in s.lines() {
+            let line = raw.trim();
+            if !line.is_empty() {
+                return line.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Coarse "visited Xm ago" relative timestamp from epoch millis. We
+    /// avoid pulling in chrono for a muted footnote.
+    fn format_ts(&self, ms: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let delta = (now - ms).max(0) / 1000;
+        if delta < 60 {
+            format!("visited {}s ago", delta)
+        } else if delta < 3600 {
+            format!("visited {}m ago", delta / 60)
+        } else if delta < 86400 {
+            format!("visited {}h ago", delta / 3600)
+        } else {
+            format!("visited {}d ago", delta / 86400)
+        }
     }
 }
 
-/// Drop strip above the first waypoint — releasing a dragged card here
-/// makes it the new head of the trail.
-fn head_drop_zone(ui: &mut egui::Ui, to_move: &mut Option<(String, crate::state::MoveOp)>) {
-    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 2));
-    let (_, payload) = ui.dnd_drop_zone::<String, _>(frame, |ui| {
-        ui.allocate_response(
-            egui::vec2(ui.available_width(), 6.0),
-            egui::Sense::hover(),
-        );
-    });
-    if let Some(src) = payload {
-        *to_move = Some(((*src).clone(), crate::state::MoveOp::Head));
-    }
-}
-
-/// Drop strip below the last waypoint — releasing a dragged card here
-/// makes it the new tail of the trail.
-fn tail_drop_zone(ui: &mut egui::Ui, to_move: &mut Option<(String, crate::state::MoveOp)>) {
-    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 4));
-    let (_, payload) = ui.dnd_drop_zone::<String, _>(frame, |ui| {
-        ui.allocate_response(
-            egui::vec2(ui.available_width(), 12.0),
-            egui::Sense::hover(),
-        );
-    });
-    if let Some(src) = payload {
-        *to_move = Some(((*src).clone(), crate::state::MoveOp::Tail));
-    }
+/// Precomputed per-card flags + display strings, threaded into the card
+/// sub-render methods so each takes a single struct rather than a long
+/// argument list.
+struct CardCtx<'a> {
+    wp: &'a Waypoint,
+    tree_path: &'a str,
+    base: &'a str,
+    exists: bool,
+    is_cursor: bool,
+    is_active_tab: bool,
+    expanded: bool,
 }
 
 /// Count of waypoints rooted at `path` (inclusive). 1 = leaf,
@@ -689,63 +1062,22 @@ fn descendant_count(waypoints: &[Waypoint], path: &str) -> usize {
 /// Mirrors the legacy `removeWaypoint` flow: fetch the cascade size,
 /// show a danger-styled confirm modal with side-trail count, and on
 /// approval drop the waypoint + toast with the cascaded count.
-fn prompt_remove_waypoint(state: &mut AppState, trail_id: String, path: String) {
-    let total = state
-        .session.trails
-        .iter()
-        .find(|t| t.id == trail_id)
-        .map(|t| descendant_count(&t.waypoints, &path))
-        .unwrap_or(0);
-    let sides = total.saturating_sub(1);
-    let body = if sides > 0 {
-        format!(
-            "Remove this waypoint and {} side-trail waypoint{}? The trail entry is dropped - the underlying notes stay on disk.",
-            sides,
-            if sides == 1 { "" } else { "s" },
-        )
-    } else {
-        "Remove this waypoint? The trail entry is dropped - the underlying note stays on disk."
-            .to_string()
-    };
-    state.session.modal = Some(crate::state::Modal::Confirm {
-        title: "Remove waypoint".to_string(),
-        body,
-        confirm_label: "Remove".to_string(),
-        cancel_label: "Cancel".to_string(),
-        danger: true,
-        intent: crate::state::ConfirmIntent::DeleteTrailWaypoint {
-            trail_id,
-            path,
-        },
-    });
-}
-
-#[allow(dead_code)] // used by tests below; keep for forthcoming UI surface
-fn subtree_size(waypoints: &[Waypoint]) -> usize {
-    waypoints
-        .iter()
-        .map(|w| 1 + subtree_size(&w.children))
-        .sum()
-}
-
-#[allow(dead_code)] // used by tests below; keep for forthcoming UI surface
-fn remove_waypoint_recursive(waypoints: &mut Vec<Waypoint>, path: &str) -> bool {
-    if let Some(pos) = waypoints.iter().position(|w| w.path == path) {
-        waypoints.remove(pos);
-        return true;
-    }
-    for child in waypoints.iter_mut() {
-        if remove_waypoint_recursive(&mut child.children, path) {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod remove_tests {
-    use super::*;
     use crate::state::Waypoint;
+
+    fn remove_waypoint_recursive(waypoints: &mut Vec<Waypoint>, path: &str) -> bool {
+        if let Some(pos) = waypoints.iter().position(|w| w.path == path) {
+            waypoints.remove(pos);
+            return true;
+        }
+        for child in waypoints.iter_mut() {
+            if remove_waypoint_recursive(&mut child.children, path) {
+                return true;
+            }
+        }
+        false
+    }
 
     fn wp(path: &str, children: Vec<Waypoint>) -> Waypoint {
         Waypoint {
@@ -784,306 +1116,3 @@ mod remove_tests {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn render_single_waypoint(
-    ui: &mut egui::Ui,
-    state: &AppState,
-    wp: &Waypoint,
-    tree_path: &str,
-    cursor_path: Option<&str>,
-    append_under: Option<&str>,
-    to_open: &mut Option<String>,
-    to_remove: &mut Option<String>,
-    to_set_append: &mut Option<String>,
-    to_toggle_expand: &mut Option<String>,
-    to_toggle_side: &mut Option<String>,
-    to_start_annot: &mut Option<String>,
-    to_save_annot: &mut Option<(String, String)>,
-    to_cancel_annot: &mut bool,
-    to_update_annot: &mut Option<String>,
-    to_move: &mut Option<(String, crate::state::MoveOp)>,
-) {
-    let base = basename(&wp.path);
-    let exists = state.vault_session.vault_root.join(&wp.path).exists();
-    let is_cursor = append_under == Some(wp.path.as_str());
-    let is_active_tab = cursor_path == Some(wp.path.as_str());
-    let expanded = state.panels.trails_ui.expand_all
-        || state.panels.trails_ui.expanded_path.as_deref() == Some(wp.path.as_str());
-
-    let (fill, stroke_color) = if !exists {
-        (
-            egui::Color32::from_rgb(0x3a, 0x36, 0x36),
-            egui::Color32::from_rgb(0xb9, 0x6a, 0x6a),
-        )
-    } else if is_cursor {
-        (theme::active_bg(), theme::accent())
-    } else {
-        (theme::active_bg(), theme::divider())
-    };
-
-    let card_frame = egui::Frame::default()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke_color))
-        .inner_margin(egui::Margin::symmetric(6, 4));
-    let drag_id = ui.make_persistent_id(("trail-wp-drag", &wp.path));
-    let (zone_resp, drop_payload) = ui.dnd_drop_zone::<String, _>(card_frame, |ui| {
-        let drag = ui.dnd_drag_source(drag_id, wp.path.clone(), |ui| {
-            ui.horizontal(|ui| {
-                // Side-trail collapse chevron (only when has children).
-                if !wp.children.is_empty() {
-                    let side_collapsed =
-                        state.panels.trails_ui.side_trail_collapsed.contains(&wp.path);
-                    let (icon, tip) = if side_collapsed {
-                        (crate::icons::chevron_right(), "Expand side trail")
-                    } else {
-                        (crate::icons::chevron_down(), "Collapse side trail")
-                    };
-                    if ui
-                        .add(egui::Button::image(icon).small())
-                        .on_hover_text(tip)
-                        .clicked()
-                    {
-                        *to_toggle_side = Some(wp.path.clone());
-                    }
-                }
-
-                // Sequence ordinal (legacy `tree_path`).
-                ui.label(
-                    egui::RichText::new(tree_path)
-                        .color(theme::muted())
-                        .small()
-                        .monospace(),
-                );
-
-                // Append-cursor indicator.
-                if is_cursor {
-                    ui.add(crate::icons::walk().tint(theme::accent()))
-                        .on_hover_text("Append cursor - new visits land here");
-                } else if is_active_tab {
-                    ui.add(crate::icons::dot().tint(theme::muted()))
-                        .on_hover_text("Currently open");
-                }
-
-                // File / warning icon.
-                if exists {
-                    ui.add(crate::icons::file());
-                } else {
-                    ui.add(crate::icons::warning().tint(theme::muted()));
-                }
-
-                // Basename (strong).
-                let title_text = if exists {
-                    egui::RichText::new(base).strong()
-                } else {
-                    egui::RichText::new(base)
-                        .strong()
-                        .color(theme::muted())
-                        .strikethrough()
-                };
-                ui.add(egui::Label::new(title_text).truncate())
-                    .on_hover_text(&wp.path);
-
-                if !exists {
-                    ui.label(
-                        egui::RichText::new("broken reference")
-                            .color(egui::Color32::from_rgb(0xb9, 0x6a, 0x6a))
-                            .small()
-                            .italics(),
-                    );
-                }
-
-                // Right-edge expand chevron.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let icon = if expanded {
-                            crate::icons::chevron_down()
-                        } else {
-                            crate::icons::chevron_right()
-                        };
-                        if ui.add(egui::Button::image(icon).small()).clicked() {
-                            *to_toggle_expand = Some(wp.path.clone());
-                        }
-                    },
-                );
-            });
-
-            // Collapsed-card snippet: first non-empty line of the
-            // annotation, dimmed and small. Legacy `firstNonEmptyLine`.
-            if !expanded {
-                let snippet = first_non_empty_line(&wp.annotation);
-                if !snippet.is_empty() {
-                    ui.label(
-                        egui::RichText::new(snippet)
-                            .color(theme::muted())
-                            .small(),
-                    );
-                }
-            }
-
-            if expanded {
-                ui.add_space(2.0);
-                if let Some((parent, _)) = wp.path.rsplit_once('/') {
-                    ui.label(
-                        egui::RichText::new(parent)
-                            .color(theme::muted())
-                            .small()
-                            .monospace(),
-                    );
-                }
-                if wp.at_ms > 0 {
-                    ui.label(
-                        egui::RichText::new(format_ts(wp.at_ms))
-                            .color(theme::muted())
-                            .small(),
-                    );
-                }
-                ui.add_space(2.0);
-
-                // Annotation body - inline editor when this waypoint is
-                // the current annotation-edit target, otherwise rendered
-                // as a wrapped paragraph (or muted placeholder when
-                // empty). Legacy `waypoint-card-body` + "edit
-                // annotation" verb.
-                let editing = state
-                    .panels.trails_ui
-                    .annotation_edit
-                    .as_ref()
-                    .map(|(p, _)| p == &wp.path)
-                    .unwrap_or(false);
-                if editing {
-                    let mut draft = state
-                        .panels.trails_ui
-                        .annotation_edit
-                        .as_ref()
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_default();
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut draft)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Annotation (markdown)"),
-                    );
-                    if resp.changed() {
-                        *to_update_annot = Some(draft.clone());
-                    }
-                    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Save").clicked() {
-                            *to_save_annot = Some((wp.path.clone(), draft.clone()));
-                        }
-                        if ui.small_button("Cancel").clicked() || escape {
-                            *to_cancel_annot = true;
-                        }
-                    });
-                } else if wp.annotation.trim().is_empty() {
-                    ui.label(
-                        egui::RichText::new("(no annotation)")
-                            .color(theme::muted())
-                            .small()
-                            .italics(),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(&wp.annotation).small(),
-                    );
-                }
-
-                ui.horizontal(|ui| {
-                    if exists && ui.small_button("Open").clicked() {
-                        *to_open = Some(wp.path.clone());
-                    }
-                    if !editing && ui.small_button("Edit annotation").clicked() {
-                        *to_start_annot = Some(wp.path.clone());
-                    }
-                    if exists && !is_cursor && ui.small_button("Append here").clicked() {
-                        *to_set_append = Some(wp.path.clone());
-                    }
-                });
-            }
-        });
-        drag.response
-    });
-    let drag_resp = zone_resp.inner;
-
-    // Resolve the drop payload to a move op: drops in the top half of
-    // the card become "sibling before me", drops in the bottom half
-    // become "append as my child". Equal hitboxes so reorder vs. nest
-    // are both easy to land. Self-drops are ignored.
-    if let Some(src) = drop_payload {
-        let card_rect = drag_resp.rect;
-        let pointer_y = ui
-            .input(|i| i.pointer.interact_pos())
-            .map(|p| p.y)
-            .unwrap_or(card_rect.center().y);
-        let op = if pointer_y < card_rect.center().y {
-            crate::state::MoveOp::Before(wp.path.clone())
-        } else {
-            crate::state::MoveOp::Child(wp.path.clone())
-        };
-        if (*src) != wp.path {
-            *to_move = Some(((*src).clone(), op));
-        }
-    }
-
-    // Whole-frame click: open the file if it exists and the click
-    // didn't land on one of the interactive buttons inside.
-    if exists && drag_resp.clicked() {
-        *to_open = Some(wp.path.clone());
-    }
-    drag_resp.context_menu(|ui| {
-        if exists && ui.button("Open").clicked() {
-            *to_open = Some(wp.path.clone());
-            ui.close();
-        }
-        if ui.button("Remove from trail").clicked() {
-            *to_remove = Some(wp.path.clone());
-            ui.close();
-        }
-        let already_cursor = is_cursor;
-        ui.add_enabled_ui(exists && !already_cursor, |ui| {
-            if ui.button("Append from here").clicked() {
-                *to_set_append = Some(wp.path.clone());
-                ui.close();
-            }
-        });
-        if already_cursor && ui.button("Reset append cursor").clicked() {
-            *to_set_append = None;
-            // Cursor reset routes through the hint-row button; the
-            // context menu surface keeps the verb discoverable per
-            // `trail-reset-cursor-verb`.
-            ui.close();
-        }
-    });
-
-    ui.add_space(2.0);
-}
-
-fn first_non_empty_line(s: &str) -> String {
-    for raw in s.lines() {
-        let line = raw.trim();
-        if !line.is_empty() {
-            return line.to_string();
-        }
-    }
-    String::new()
-}
-
-fn format_ts(ms: i64) -> String {
-    // Coarse human-readable timestamp: seconds-since-epoch is fine for a
-    // muted footnote ("visited 12m ago"). We avoid pulling in chrono.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let delta = (now - ms).max(0) / 1000;
-    if delta < 60 {
-        format!("visited {}s ago", delta)
-    } else if delta < 3600 {
-        format!("visited {}m ago", delta / 60)
-    } else if delta < 86400 {
-        format!("visited {}h ago", delta / 3600)
-    } else {
-        format!("visited {}d ago", delta / 86400)
-    }
-}

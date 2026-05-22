@@ -6,10 +6,10 @@
 //! assert headlessly; this test exercises the code path and confirms no
 //! panic / no harness failure when the state is active.
 
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_view::view::{DragState, ViewState};
-
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::viewport::DragState;
+use editor_view::viewport::ViewState;
 #[test]
 fn drop_indicator_renders_without_panic() {
     let mut state = EditorState::new("hello world\nsecond line\n");

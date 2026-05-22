@@ -20,4 +20,3 @@ pub mod send;
 pub mod session;
 pub mod state;
 
-pub use state::ChatRegistry;

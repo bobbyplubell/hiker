@@ -1,7 +1,15 @@
 //! Integration test: feeding diagnostics through `diagnostic_decorations`
 //! produces both `Mark` (underline) and `Line` (gutter marker) decorations.
 
-use editor_core::{Decoration, Diagnostic, GutterMarker, Rope, Severity};
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Diagnostic;
+
+use editor_core::decoration::GutterMarker;
+
+use editor_core::rope::Rope;
+
+use editor_core::decoration::Severity;
 use editor_view::diagnostics::diagnostic_decorations;
 use smol_str::SmolStr;
 

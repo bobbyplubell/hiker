@@ -12,10 +12,10 @@ use crate::chat::state::{ChatRegistry, ChatRole, ChatSession, ChatTurn, ToolCard
 /// `ChatSession` per file. Called once after `bootstrap::open_vault`
 /// so the picker shows historic sessions.
 pub fn discover(reg: &mut ChatRegistry, vault_root: &Path) {
-    let infos = match sessions::list_sessions(vault_root) {
+    let infos = match sessions::list(vault_root) {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(error = %err, "chat: list_sessions failed");
+            tracing::warn!(error = %err, "chat: list failed");
             return;
         }
     };
@@ -27,7 +27,7 @@ pub fn discover(reg: &mut ChatRegistry, vault_root: &Path) {
         let turns = sessions::parse_session(&info.abs_path).unwrap_or_default();
         let preview = turns
             .first()
-            .map(|t| short_preview(&t.user, 60))
+            .map(|t| reg.short_preview(&t.user, 60))
             .unwrap_or_else(|| "(empty session)".to_string());
         // Build the LLM-facing history (Vec<Message>) up front so the
         // session resumes with full tool-call alternation. We keep it
@@ -137,7 +137,7 @@ pub fn delete(reg: &mut ChatRegistry, vault_root: &Path, id: &str) -> std::io::R
     {
         vault_root.join(&s.rel_path)
     } else {
-        let infos = sessions::list_sessions(vault_root)?;
+        let infos = sessions::list(vault_root)?;
         let Some(info) = infos.into_iter().find(|i| i.id.0 == id) else {
             reg.forget(id);
             return Ok(());
@@ -157,11 +157,3 @@ pub fn set_active(reg: &mut ChatRegistry, id: &str) {
     }
 }
 
-fn short_preview(s: &str, max: usize) -> String {
-    let one_line: String = s.lines().next().unwrap_or("").chars().take(max).collect();
-    if one_line.chars().count() < s.chars().count() {
-        format!("{one_line}…")
-    } else {
-        one_line
-    }
-}

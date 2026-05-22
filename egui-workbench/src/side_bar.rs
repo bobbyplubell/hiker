@@ -4,14 +4,14 @@ use std::hash::Hash;
 
 use egui::{Frame, Layout};
 
-use crate::behavior::WorkbenchBehavior;
-use crate::tab::DocumentTab;
-use crate::theme::WorkbenchTheme;
+use crate::behavior::Host;
+use crate::tab::Document;
+use crate::theme::Palette;
 
 /// Which edge a side bar lives on. Default `Left`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SideBarSide {
+pub enum Side {
     #[default]
     Left,
     Right,
@@ -20,7 +20,7 @@ pub enum SideBarSide {
 /// One side bar instance. The workbench owns two of these: a primary
 /// and an optional secondary (rendered on the opposite side).
 pub struct SideBar {
-    pub side: SideBarSide,
+    pub side: Side,
     pub visible: bool,
     pub width: f32,
     /// Lower bound on the user-resizable width.
@@ -32,7 +32,7 @@ pub struct SideBar {
 impl Default for SideBar {
     fn default() -> Self {
         Self {
-            side: SideBarSide::Left,
+            side: Side::Left,
             visible: true,
             width: 260.0,
             min_width: 80.0,
@@ -42,20 +42,20 @@ impl Default for SideBar {
 }
 
 impl SideBar {
-    pub fn new(side: SideBarSide) -> Self {
+    pub fn new(side: Side) -> Self {
         Self { side, ..Self::default() }
     }
 
-    pub fn toggle(&mut self) {
+    pub const fn toggle(&mut self) {
         self.visible = !self.visible;
     }
 }
 
 /// Which side bar role is being rendered. The primary side bar's
 /// content is driven by the activity bar's active mode (so
-/// [`WorkbenchBehavior::side_bar_ui`] gets called). The secondary side
+/// [`Host::side_bar_ui`] gets called). The secondary side
 /// bar has fixed host content via
-/// [`WorkbenchBehavior::secondary_side_bar_ui`] — it's not coupled to
+/// [`Host::secondary_side_bar_ui`] — it's not coupled to
 /// the active activity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SideBarRole {
@@ -69,14 +69,14 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
     bar: &mut SideBar,
     ctx: &egui::Context,
     panel_id: impl Into<egui::Id>,
-    theme: &WorkbenchTheme,
+    theme: &Palette,
     behavior: &mut B,
     active_mode: Option<&Mode>,
     role: SideBarRole,
 ) where
-    Tab: DocumentTab,
+    Tab: Document,
     Mode: Clone + Eq + Hash + 'static,
-    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+    B: Host<Tab, Mode> + ?Sized,
 {
     if !bar.visible {
         return;
@@ -84,8 +84,8 @@ pub(crate) fn show_side_bar<Tab, Mode, B>(
     let id = panel_id.into();
     let frame = Frame::side_top_panel(&ctx.style()).fill(theme.side_bar_bg);
     let panel = match bar.side {
-        SideBarSide::Left => egui::SidePanel::left(id),
-        SideBarSide::Right => egui::SidePanel::right(id),
+        Side::Left => egui::SidePanel::left(id),
+        Side::Right => egui::SidePanel::right(id),
     };
 
     let clamped = bar.width.clamp(bar.min_width, bar.max_width);

@@ -47,7 +47,7 @@ pub struct AgentLog {
 /// redacted-or-not input, etc.). Empty optionals are skipped on the
 /// wire so daily files stay readable.
 #[derive(Serialize)]
-pub struct AuditEntry<'a> {
+pub struct Entry<'a> {
     /// Spec-defined surface: `core::llm`, `core::agent`, `core::acp`,
     /// or `mcp-tool-call`. New surfaces should be added to this doc
     /// comment when they land.
@@ -78,7 +78,7 @@ fn is_null(v: &serde_json::Value) -> bool {
 }
 
 impl AgentLog {
-    pub fn new(dir: PathBuf, log_full_content: bool) -> Self {
+    pub const fn new(dir: PathBuf, log_full_content: bool) -> Self {
         Self {
             dir,
             log_full_content,
@@ -88,7 +88,7 @@ impl AgentLog {
 
     /// Whether the writer is configured to keep full prompt / response
     /// text. Callers consult this before stuffing a body into `details`.
-    pub fn log_full_content(&self) -> bool {
+    pub const fn log_full_content(&self) -> bool {
         self.log_full_content
     }
 
@@ -102,7 +102,7 @@ impl AgentLog {
     /// to the caller, since the underlying call already succeeded or
     /// already failed for its own reasons; observability is a side
     /// concern.
-    pub fn record(&self, entry: &AuditEntry<'_>) {
+    pub fn record(&self, entry: &Entry<'_>) {
         let now = OffsetDateTime::now_utc();
         let date = format!(
             "{:04}-{:02}-{:02}",
@@ -111,24 +111,37 @@ impl AgentLog {
             now.day()
         );
         let timestamp = now.format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string());
+        let Some(line) = self.serialize_line(timestamp, entry) else {
+            return;
+        };
+        self.append_line(&date, &line);
+    }
 
-        // Wrap entry in a small envelope so the timestamp lands first
-        // in the JSON object — readability concern when grep'ing files.
+    /// Wrap an entry in a small envelope (so the timestamp lands first
+    /// in the JSON object — readability concern when grep'ing files)
+    /// and serialise. Returns `None` and logs a warning on failure so
+    /// `record` can early-return without expanding its branch budget.
+    fn serialize_line(&self, timestamp: String, entry: &Entry<'_>) -> Option<String> {
         #[derive(Serialize)]
         struct Envelope<'a> {
             timestamp: String,
             #[serde(flatten)]
-            entry: &'a AuditEntry<'a>,
+            entry: &'a Entry<'a>,
         }
         let envelope = Envelope { timestamp, entry };
-        let line = match serde_json::to_string(&envelope) {
-            Ok(s) => s,
+        match serde_json::to_string(&envelope) {
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!(error = %e, "audit: serialize failed");
-                return;
+                None
             }
-        };
+        }
+    }
 
+    /// Append `line` (already JSON-encoded, no trailing newline) to
+    /// `<dir>/<date>.jsonl`, creating the directory if needed.
+    /// Best-effort: any IO failure is logged and swallowed.
+    fn append_line(&self, date: &str, line: &str) {
         let _guard = self.inner.lock().expect("audit mutex poisoned");
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
             tracing::warn!(error = %e, dir = %self.dir.display(), "audit: mkdir failed");
@@ -168,7 +181,7 @@ mod tests {
     fn record_writes_jsonl_with_expected_fields() {
         let dir = tempdir().unwrap();
         let log = AgentLog::new(dir.path().to_path_buf(), false);
-        log.record(&AuditEntry {
+        log.record(&Entry {
             surface: "core::agent",
             feature: "chat_system",
             status: "ok",
@@ -195,7 +208,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = AgentLog::new(dir.path().to_path_buf(), false);
         for i in 0..3 {
-            log.record(&AuditEntry {
+            log.record(&Entry {
                 surface: "core::agent",
                 feature: "chat_system",
                 status: "ok",

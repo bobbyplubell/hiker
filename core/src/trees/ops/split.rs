@@ -1,4 +1,4 @@
-//! cluster-op-split (`Trees::split_cluster`).
+//! cluster-op-split (`Db::split_cluster`).
 //!
 //! Layer-straddle note (per the refactor brief's cleanup item #2): the
 //! recursive Split algorithm appears in two places —
@@ -15,7 +15,11 @@
 //! duplication. Left as-is — flagged here for any future revisit.
 
 use super::super::types::{
-    EditableNode, NodeInsert, NodeKind, SplitOutcome, Trees, TreesError,
+    EditableNode, NodeInsert, NodeKind, SplitOutcome, Db, Error,
+};
+use crate::cluster::{
+    algo::{mean_normalize, ninetieth_percentile_distance, partition, partition_leiden},
+    Algorithm, NoteInput, Params, OUTLIER_LABEL,
 };
 
 /// Borrow-bundle of the invariants that stay fixed across every
@@ -26,12 +30,12 @@ use super::super::types::{
 /// accumulator threaded separately.
 pub(in crate::trees) struct SplitRecursionCtx<'a> {
     pub tree_id: &'a str,
-    pub params: &'a crate::cluster::ClusterParams,
+    pub params: &'a Params,
     pub embeddings_for_leaf: &'a dyn Fn(&str) -> Option<Vec<f32>>,
     pub max_depth: u8,
 }
 
-impl Trees {
+impl Db {
     // ── cluster-op-split ───────────────────────────────────────────────
     //
     // status: cluster-op-split
@@ -49,15 +53,15 @@ impl Trees {
     //
     // Module discipline: this method takes a closure to fetch leaf
     // embeddings rather than importing `core::store`, mirroring the
-    // existing `Trees::*` shape. The caller wires up the resolver.
+    // existing `Db::*` shape. The caller wires up the resolver.
     pub fn split_cluster(
         &self,
         tree_id: &str,
         target_node_id: Option<&str>,
-        params: &crate::cluster::ClusterParams,
+        params: &Params,
         embeddings_for_leaf: &dyn Fn(&str) -> Option<Vec<f32>>,
-        virtual_root_inputs: Option<&[crate::cluster::NoteInput]>,
-    ) -> Result<SplitOutcome, TreesError> {
+        virtual_root_inputs: Option<&[NoteInput]>,
+    ) -> Result<SplitOutcome, Error> {
         const MAX_RECURSION_LEVELS: u8 = 16;
         let mut outcome = SplitOutcome {
             new_clusters: Vec::new(),
@@ -85,11 +89,11 @@ impl Trees {
         &self,
         ctx: &SplitRecursionCtx<'_>,
         target_node_id: Option<&str>,
-        virtual_root_inputs: Option<&[crate::cluster::NoteInput]>,
+        virtual_root_inputs: Option<&[NoteInput]>,
         is_top_level: bool,
         depth: u8,
         outcome: &mut SplitOutcome,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         let tree_id = ctx.tree_id;
         let params = ctx.params;
         let embeddings_for_leaf = ctx.embeddings_for_leaf;
@@ -146,7 +150,7 @@ impl Trees {
                 }
             }
             (None, None) => {
-                return Err(TreesError::TreeNotFound(
+                return Err(Error::TreeNotFound(
                     "split_cluster: virtual-root target requires virtual_root_inputs".to_string(),
                 ));
             }
@@ -160,7 +164,7 @@ impl Trees {
             if !is_top_level {
                 return Ok(());
             }
-            return Err(TreesError::TreeNotFound(format!(
+            return Err(Error::TreeNotFound(format!(
                 "split_cluster: not enough members ({}) to split (need >= 4)",
                 embeddings.len()
             )));
@@ -170,21 +174,21 @@ impl Trees {
         //    call per the build recipe; sub-recursive calls use the normal
         //    `resolution`.
         let assignments = match params.algorithm {
-            crate::cluster::ClusterAlgorithm::Leiden => {
+            Algorithm::Leiden => {
                 let mut leiden_lvl = params.leiden.clone();
                 if is_top_level {
                     leiden_lvl.resolution = params.leiden.top_level_resolution;
                 }
                 let upper = embeddings.len().saturating_sub(1).max(1) as u32;
                 leiden_lvl.k_nearest = leiden_lvl.k_nearest.min(upper);
-                crate::cluster::partition_leiden(&embeddings, &leiden_lvl).map_err(|e| {
-                    TreesError::TreeNotFound(format!("split_cluster leiden: {e}"))
+                partition_leiden(&embeddings, &leiden_lvl).map_err(|e| {
+                    Error::TreeNotFound(format!("split_cluster leiden: {e}"))
                 })?
             }
             _ => {
                 let min_size = (embeddings.len() / 4).max(2);
-                crate::cluster::partition(&embeddings, min_size, None).map_err(|e| {
-                    TreesError::TreeNotFound(format!("split_cluster hdbscan: {e}"))
+                partition(&embeddings, min_size, None).map_err(|e| {
+                    Error::TreeNotFound(format!("split_cluster hdbscan: {e}"))
                 })?
             }
         };
@@ -192,7 +196,7 @@ impl Trees {
             std::collections::BTreeMap::new();
         let mut branch_outliers: Vec<String> = Vec::new();
         for a in &assignments {
-            if a.cluster_label == crate::cluster::OUTLIER_LABEL {
+            if a.cluster_label == OUTLIER_LABEL {
                 branch_outliers.push(leaf_note_refs[a.point_index].clone());
                 continue;
             }
@@ -204,7 +208,7 @@ impl Trees {
             if !is_top_level {
                 return Ok(());
             }
-            return Err(TreesError::TreeNotFound(
+            return Err(Error::TreeNotFound(
                 "split_cluster: produced fewer than 2 clusters".into(),
             ));
         }
@@ -229,8 +233,8 @@ impl Trees {
             let new_id = format!("{id_prefix}-{label}");
             // Compute centroid + radius from the member embeddings.
             let refs: Vec<&[f32]> = idxs.iter().map(|&i| embeddings[i].as_slice()).collect();
-            let centroid = crate::cluster::mean_normalize(&refs);
-            let radius = crate::cluster::ninetieth_percentile_distance(&centroid, &refs);
+            let centroid = mean_normalize(&refs);
+            let radius = ninetieth_percentile_distance(&centroid, &refs);
             // Placeholder name; the spec calls for LLM-named children via
             // a separate Summarize sweep, which is `cluster-op-summarize-sweep`.
             let name = format!("Cluster {}", label.max(0));
@@ -248,7 +252,7 @@ impl Trees {
                 confidence: 0.5,
                 summary_membership_churn: 0,
             };
-            self.insert_single_node(tree_id, insert)?;
+            self.insert_single_node(tree_id, &insert)?;
             // Only reparent existing leaf rows on real-node targets.
             if target_node_id.is_some() {
                 for &i in &idxs {

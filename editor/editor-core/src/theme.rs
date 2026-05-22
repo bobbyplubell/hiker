@@ -20,7 +20,7 @@ use crate::decoration::Color;
 
 /// Palette of general-purpose UI colors used by editor widgets and gutters.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThemePalette {
+pub struct Palette {
     pub bg: Color,
     pub fg: Color,
     pub accent: Color,
@@ -73,7 +73,7 @@ pub struct MarkdownColors {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Theme {
     pub name: SmolStr,
-    pub palette: ThemePalette,
+    pub palette: Palette,
     /// Syntax-tag → color map. Tags are unconstrained strings (e.g. `"keyword"`,
     /// `"string"`, `"comment.line"`); hosts and language extensions agree on the
     /// keys. Themes without an entry for a tag should fall back to
@@ -98,7 +98,7 @@ pub fn light_default() -> Theme {
 
     Theme {
         name: SmolStr::from("light_default"),
-        palette: ThemePalette {
+        palette: Palette {
             bg: Color::rgb(255, 255, 255),
             fg: Color::rgb(40, 40, 40),
             accent: Color::rgb(0, 120, 215),
@@ -156,7 +156,7 @@ pub fn dark_default() -> Theme {
 
     Theme {
         name: SmolStr::from("dark_default"),
-        palette: ThemePalette {
+        palette: Palette {
             bg: Color::rgb(30, 30, 30),
             fg: Color::rgb(212, 212, 212),
             accent: Color::rgb(86, 156, 214),

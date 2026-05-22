@@ -347,7 +347,7 @@ A timed-out tool task is dropped (its tokio handle cancelled) so resources don't
 
 The agent path covers interactive features. Background and fan-out features have intentionally different UI shapes since their concerns aren't streaming text — the shapes are pinned here so they don't accidentally diverge.
 
-- **Fan-out, background, and note-mutation features** route through `core::tasks` (per `task-queue.md`). The queue's `QueueEvent` channel + the home-page Task queue widget are the user-visible progress surface; per-feature toasts and bespoke event enums are out. Single-note mutations land in the active editor buffer as a single CM6 transaction (per `editor.md`'s Note-mutations menu); batch mutations and agent writes route to staging review (per `settings.md`'s Staging review).
+- **Fan-out, background, and note-mutation features** route through `core::tasks` (per `task-queue.md`). The queue's `QueueEvent` channel + the home-page Task queue widget are the user-visible progress surface; per-feature toasts and bespoke event enums are out. Single-note mutations land in the active editor buffer as a single CM6 transaction (per `editor.md`'s Note-mutations menu); batch mutations and agent writes produce pending ops reviewed per `settings.md`'s Pending change review.
 
 ### Audit log integration
 

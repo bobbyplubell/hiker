@@ -1,5 +1,15 @@
-use super::*;
+use rusqlite::params;
+
+use super::Staging;
+use crate::changes::{ChangeOp, Changes};
+use crate::hash_string;
+use crate::staging::patch::{apply_edit, EditPayload};
+use crate::staging::error::Error;
+use crate::staging::types::{
+    ConflictReason, EditProposalInput, Filter, ProposalInput, ProposalState, ACTION_MOVE_NOTE,
+};
 use crate::test_helpers::test_staging as staged;
+use crate::vault::Vault;
 use tempfile::tempdir;
 
 /// status: staging-action-move-note
@@ -7,7 +17,7 @@ use tempfile::tempdir;
 fn propose_move_note_persists_source_path_and_recheck_flips_on_drift() {
     let (_dir, s) = staged();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "triage".into(),
             action: ACTION_MOVE_NOTE.into(),
             target_path: "research/embeddings/voyage.md".into(),
@@ -19,7 +29,7 @@ fn propose_move_note_persists_source_path_and_recheck_flips_on_drift() {
         })
         .unwrap();
 
-    let list = s.list(&StagingFilter::default()).unwrap();
+    let list = s.list(&Filter::default()).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, id);
     assert_eq!(list[0].action, ACTION_MOVE_NOTE);
@@ -46,7 +56,7 @@ fn propose_move_note_persists_source_path_and_recheck_flips_on_drift() {
 fn propose_returns_id_and_appears_in_list() {
     let (_dir, s) = staged();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/test.md".into(),
@@ -58,7 +68,7 @@ fn propose_returns_id_and_appears_in_list() {
         })
         .unwrap();
     assert!(!id.is_empty());
-    let list = s.list(&StagingFilter::default()).unwrap();
+    let list = s.list(&Filter::default()).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, id);
     assert_eq!(list[0].surface, "mcp-tool-call");
@@ -68,7 +78,7 @@ fn propose_returns_id_and_appears_in_list() {
 #[test]
 fn propose_without_content_has_no_hash() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "trails".into(),
         action: "waypoint_add".into(),
         target_path: "notes/raptor.md".into(),
@@ -79,7 +89,7 @@ fn propose_without_content_has_no_hash() {
         source_path: None,
     })
     .unwrap();
-    let list = s.list(&StagingFilter::default()).unwrap();
+    let list = s.list(&Filter::default()).unwrap();
     assert_eq!(list.len(), 1);
     assert!(list[0].content_hash.is_none());
 }
@@ -87,7 +97,7 @@ fn propose_without_content_has_no_hash() {
 #[test]
 fn list_filters_by_path() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/a.md".into(),
@@ -98,7 +108,7 @@ fn list_filters_by_path() {
         source_path: None,
     })
     .unwrap();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/b.md".into(),
@@ -111,7 +121,7 @@ fn list_filters_by_path() {
     .unwrap();
 
     let filtered = s
-        .list(&StagingFilter {
+        .list(&Filter {
             path: Some("notes/a.md".into()),
             ..Default::default()
         })
@@ -123,7 +133,7 @@ fn list_filters_by_path() {
 #[test]
 fn list_filters_by_surface() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/a.md".into(),
@@ -134,7 +144,7 @@ fn list_filters_by_surface() {
         source_path: None,
     })
     .unwrap();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "background-llm".into(),
         action: "write_note".into(),
         target_path: "notes/b.md".into(),
@@ -147,7 +157,7 @@ fn list_filters_by_surface() {
     .unwrap();
 
     let filtered = s
-        .list(&StagingFilter {
+        .list(&Filter {
             surface: Some("background-llm".into()),
             ..Default::default()
         })
@@ -159,7 +169,7 @@ fn list_filters_by_surface() {
 #[test]
 fn list_filters_by_trail_id() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "trails".into(),
         action: "trail_create".into(),
         target_path: "trails/new-trail.md".into(),
@@ -170,7 +180,7 @@ fn list_filters_by_trail_id() {
         source_path: None,
     })
     .unwrap();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "trails".into(),
         action: "waypoint_add".into(),
         target_path: "notes/x.md".into(),
@@ -183,7 +193,7 @@ fn list_filters_by_trail_id() {
     .unwrap();
 
     let filtered = s
-        .list(&StagingFilter {
+        .list(&Filter {
             trail_id: Some("t1".into()),
             ..Default::default()
         })
@@ -195,7 +205,7 @@ fn list_filters_by_trail_id() {
 #[test]
 fn list_filters_by_session_id_from_metadata() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/a.md".into(),
@@ -206,7 +216,7 @@ fn list_filters_by_session_id_from_metadata() {
         source_path: None,
     })
     .unwrap();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/b.md".into(),
@@ -219,7 +229,7 @@ fn list_filters_by_session_id_from_metadata() {
     .unwrap();
 
     let filtered = s
-        .list(&StagingFilter {
+        .list(&Filter {
             session_id: Some("s1".into()),
             ..Default::default()
         })
@@ -232,7 +242,7 @@ fn list_filters_by_session_id_from_metadata() {
 fn count_returns_filtered_total() {
     let (_dir, s) = staged();
     for i in 0..5 {
-        s.propose(ProposalInput {
+        s.propose(&ProposalInput {
             surface: "batch-mutation".into(),
             action: "write_note".into(),
             target_path: format!("notes/{i}.md"),
@@ -244,9 +254,9 @@ fn count_returns_filtered_total() {
         })
         .unwrap();
     }
-    assert_eq!(s.count(&StagingFilter::default()).unwrap(), 5);
+    assert_eq!(s.count(&Filter::default()).unwrap(), 5);
     assert_eq!(
-        s.count(&StagingFilter {
+        s.count(&Filter {
             path: Some("notes/0.md".into()),
             ..Default::default()
         })
@@ -254,7 +264,7 @@ fn count_returns_filtered_total() {
         1
     );
     assert_eq!(
-        s.count(&StagingFilter {
+        s.count(&Filter {
             surface: Some("nonexistent".into()),
             ..Default::default()
         })
@@ -270,7 +280,7 @@ fn accept_writes_content_and_removes_from_pending() {
     vault.write_file("notes/a.md", "original").unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -290,7 +300,7 @@ fn accept_writes_content_and_removes_from_pending() {
     let (disk_content, _) = vault.read_file_with_hash("notes/a.md").unwrap();
     assert_eq!(disk_content, "proposed");
 
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 }
 
 /// status: staging-action-move-note
@@ -303,7 +313,7 @@ fn accept_move_note_renames_on_disk_and_records_renamed_change() {
     std::fs::create_dir_all(dir.path().join("research/embeddings")).unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "triage".into(),
             action: ACTION_MOVE_NOTE.into(),
             target_path: "research/embeddings/voyage.md".into(),
@@ -325,7 +335,7 @@ fn accept_move_note_renames_on_disk_and_records_renamed_change() {
         .path()
         .join("research/embeddings/voyage.md")
         .exists());
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 
     // changes log captured the move with rename_from set.
     let rows = changes.history_for_path("research/embeddings/voyage.md", 10).unwrap();
@@ -342,7 +352,7 @@ fn accept_move_note_errors_when_source_missing() {
     let (dir, s) = staged();
     let vault = Vault::open(dir.path()).unwrap();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "triage".into(),
             action: ACTION_MOVE_NOTE.into(),
             target_path: "research/x.md".into(),
@@ -368,7 +378,7 @@ fn accept_move_note_errors_when_target_occupied() {
     vault.write_file("a.md", "a").unwrap();
     vault.write_file("b.md", "b").unwrap();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "triage".into(),
             action: ACTION_MOVE_NOTE.into(),
             target_path: "b.md".into(),
@@ -389,7 +399,7 @@ fn accept_metadata_only_removes_without_write() {
     let (_dir, s) = staged();
     let vault = Vault::open(_dir.path()).unwrap();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "trails".into(),
             action: "waypoint_add".into(),
             target_path: "notes/x.md".into(),
@@ -404,14 +414,14 @@ fn accept_metadata_only_removes_without_write() {
     let outcome = s.accept(&id, &vault, None).unwrap();
     assert_eq!(outcome.proposal_id, id);
     assert!(outcome.new_hash.is_empty());
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 }
 
 #[test]
 fn reject_removes_row() {
     let (_dir, s) = staged();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -424,14 +434,14 @@ fn reject_removes_row() {
         .unwrap();
 
     s.reject(&id).unwrap();
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 }
 
 #[test]
 fn reject_nonexistent_returns_error() {
     let (_dir, s) = staged();
     match s.reject("nonexistent") {
-        Err(StagingError::ProposalNotFound(_)) => {}
+        Err(Error::ProposalNotFound(_)) => {}
         other => panic!("expected ProposalNotFound, got {other:?}"),
     }
 }
@@ -441,7 +451,7 @@ fn accept_nonexistent_returns_error() {
     let (_dir, s) = staged();
     let vault = Vault::open(_dir.path()).unwrap();
     match s.accept("nonexistent", &vault, None) {
-        Err(StagingError::ProposalNotFound(_)) => {}
+        Err(Error::ProposalNotFound(_)) => {}
         other => panic!("expected ProposalNotFound, got {other:?}"),
     }
 }
@@ -453,7 +463,7 @@ fn accept_all_batches_successes_and_skips_failures() {
     vault.write_file("notes/a.md", "orig-a").unwrap();
     vault.write_file("notes/b.md", "orig-b").unwrap();
 
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/a.md".into(),
@@ -464,7 +474,7 @@ fn accept_all_batches_successes_and_skips_failures() {
         source_path: None,
     })
     .unwrap();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/b.md".into(),
@@ -477,17 +487,17 @@ fn accept_all_batches_successes_and_skips_failures() {
     .unwrap();
 
     let outcomes = s
-        .accept_all(&StagingFilter::default(), &vault, None)
+        .accept_all(&Filter::default(), &vault, None)
         .unwrap();
     assert_eq!(outcomes.len(), 2);
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 }
 
 #[test]
 fn gc_removes_old_proposals() {
     let (_dir, s) = staged();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/old.md".into(),
@@ -509,13 +519,13 @@ fn gc_removes_old_proposals() {
     }
     let removed = s.gc(1).unwrap();
     assert_eq!(removed, 1);
-    assert!(s.list(&StagingFilter::default()).unwrap().is_empty());
+    assert!(s.list(&Filter::default()).unwrap().is_empty());
 }
 
 #[test]
 fn gc_keeps_recent_proposals() {
     let (_dir, s) = staged();
-    s.propose(ProposalInput {
+    s.propose(&ProposalInput {
         surface: "mcp-tool-call".into(),
         action: "write_note".into(),
         target_path: "notes/recent.md".into(),
@@ -528,7 +538,7 @@ fn gc_keeps_recent_proposals() {
     .unwrap();
     let removed = s.gc(30).unwrap();
     assert_eq!(removed, 0);
-    assert_eq!(s.list(&StagingFilter::default()).unwrap().len(), 1);
+    assert_eq!(s.list(&Filter::default()).unwrap().len(), 1);
 }
 
 #[test]
@@ -540,7 +550,7 @@ fn propose_then_accept_with_changes_log() {
     let changes = Changes::open(dir.path()).unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -565,12 +575,12 @@ fn propose_then_accept_with_changes_log() {
         Some(id.as_str())
     );
     assert_eq!(meta.get("action").and_then(|v| v.as_str()), Some("write_note"));
-    assert_eq!(meta.get("reviewed").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(meta.get("reviewed").and_then(serde_json::Value::as_bool), Some(true));
     assert_eq!(rows[0].author, "user");
 
     let baseline_meta = &rows[1].metadata;
     assert_eq!(
-        baseline_meta.get("baseline").and_then(|v| v.as_bool()),
+        baseline_meta.get("baseline").and_then(serde_json::Value::as_bool),
         Some(true)
     );
     assert_eq!(rows[1].author, "user");
@@ -585,7 +595,7 @@ fn accept_full_write_snapshots_baseline_for_existing_file() {
     let changes = Changes::open(dir.path()).unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -606,7 +616,7 @@ fn accept_full_write_snapshots_baseline_for_existing_file() {
         .find(|r| {
             r.metadata
                 .get("baseline")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         })
         .expect("baseline row should be present");
@@ -626,7 +636,7 @@ fn accept_edit_snapshots_baseline_for_existing_file() {
     let changes = Changes::open(dir.path()).unwrap();
 
     let batch = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -648,7 +658,7 @@ fn accept_edit_snapshots_baseline_for_existing_file() {
         .find(|r| {
             r.metadata
                 .get("baseline")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         })
         .expect("baseline row should be present");
@@ -666,7 +676,7 @@ fn accept_with_nulled_content_returns_missing_content() {
     vault.write_file("notes/a.md", "original").unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -688,7 +698,7 @@ fn accept_with_nulled_content_returns_missing_content() {
     }
 
     match s.accept(&id, &vault, None) {
-        Err(StagingError::MissingContent(_)) => {}
+        Err(Error::MissingContent(_)) => {}
         other => panic!("expected MissingContent, got {other:?}"),
     }
 }
@@ -700,7 +710,7 @@ fn accept_with_tampered_content_detects_integrity_failure() {
     vault.write_file("notes/a.md", "original").unwrap();
 
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -713,7 +723,7 @@ fn accept_with_tampered_content_detects_integrity_failure() {
         .unwrap();
     // Swap the BLOB for a different (but valid zstd) frame so the
     // decoded hash no longer matches the stored content_hash.
-    let tampered = zstd::encode_all(&b"tampered"[..], ZSTD_LEVEL).unwrap();
+    let tampered = zstd::encode_all(&b"tampered"[..], super::types::ZSTD_LEVEL).unwrap();
     {
         let conn = s.conn.lock().unwrap();
         conn.execute(
@@ -724,7 +734,7 @@ fn accept_with_tampered_content_detects_integrity_failure() {
     }
 
     match s.accept(&id, &vault, None) {
-        Err(StagingError::DiskDrift { .. }) => {}
+        Err(Error::DiskDrift { .. }) => {}
         other => panic!("expected DiskDrift, got {other:?}"),
     }
 }
@@ -737,7 +747,7 @@ fn accept_create_action_works_when_file_does_not_exist() {
 
     let proposed = "# New note";
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/new.md".into(),
@@ -787,9 +797,9 @@ fn propose_batch_assigns_shared_batch_id_and_per_edit_payloads() {
             source_hash: None,
         },
     ];
-    let outcome = s.propose_batch(inputs).unwrap();
+    let outcome = s.propose_batch(&inputs).unwrap();
     assert_eq!(outcome.ids.len(), 2);
-    let list = s.list(&StagingFilter::default()).unwrap();
+    let list = s.list(&Filter::default()).unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].batch_id.as_deref(), Some(outcome.batch_id.as_str()));
     assert_eq!(list[1].batch_id.as_deref(), Some(outcome.batch_id.as_str()));
@@ -803,7 +813,7 @@ fn accept_edit_row_reanchors_against_current_disk() {
     let vault = Vault::open(_dir.path()).unwrap();
     vault.write_file("notes/a.md", "hello foo world").unwrap();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -830,7 +840,7 @@ fn accept_edit_row_returns_anchor_conflict_when_old_str_missing() {
     let vault = Vault::open(dir.path()).unwrap();
     vault.write_file("notes/a.md", "hello world").unwrap();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -846,7 +856,7 @@ fn accept_edit_row_returns_anchor_conflict_when_old_str_missing() {
         .unwrap();
     let id = &outcome.ids[0];
     match s.accept(id, &vault, None) {
-        Err(StagingError::AnchorConflict(_)) => {}
+        Err(Error::AnchorConflict(_)) => {}
         other => panic!("expected AnchorConflict, got {other:?}"),
     }
 }
@@ -875,7 +885,7 @@ fn apply_edit_rejects_multiple_matches_without_replace_all() {
             replace_all: false,
         },
     );
-    assert!(matches!(res, Err(StagingError::AnchorConflict(_))));
+    assert!(matches!(res, Err(Error::AnchorConflict(_))));
 }
 
 #[test]
@@ -898,7 +908,7 @@ fn apply_edit_replace_all_swaps_every_match() {
 fn recheck_edit_row_stays_applyable_when_anchor_still_unique() {
     let (_dir, s) = staged();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -915,7 +925,7 @@ fn recheck_edit_row_stays_applyable_when_anchor_still_unique() {
     let id = &outcome.ids[0];
     let st = s.recheck(id, Some("hello foo world")).unwrap();
     assert_eq!(st.new_state, ProposalState::Applyable);
-    let p = &s.list(&StagingFilter::default()).unwrap()[0];
+    let p = &s.list(&Filter::default()).unwrap()[0];
     assert_eq!(p.state, ProposalState::Applyable);
     assert!(p.conflict_reason.is_none());
 }
@@ -924,7 +934,7 @@ fn recheck_edit_row_stays_applyable_when_anchor_still_unique() {
 fn recheck_edit_row_flips_to_anchor_missing() {
     let (_dir, s) = staged();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -941,7 +951,7 @@ fn recheck_edit_row_flips_to_anchor_missing() {
     let id = &outcome.ids[0];
     let st = s.recheck(id, Some("nothing here")).unwrap();
     assert_eq!(st.new_state, ProposalState::Conflicted);
-    let p = &s.list(&StagingFilter::default()).unwrap()[0];
+    let p = &s.list(&Filter::default()).unwrap()[0];
     assert_eq!(p.conflict_reason, Some(ConflictReason::AnchorMissing));
 }
 
@@ -949,7 +959,7 @@ fn recheck_edit_row_flips_to_anchor_missing() {
 fn recheck_edit_row_flips_to_anchor_not_unique() {
     let (_dir, s) = staged();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -966,7 +976,7 @@ fn recheck_edit_row_flips_to_anchor_not_unique() {
     let id = &outcome.ids[0];
     let st = s.recheck(id, Some("foo and foo again")).unwrap();
     assert_eq!(st.new_state, ProposalState::Conflicted);
-    let p = &s.list(&StagingFilter::default()).unwrap()[0];
+    let p = &s.list(&Filter::default()).unwrap()[0];
     assert_eq!(p.conflict_reason, Some(ConflictReason::AnchorNotUnique));
 }
 
@@ -974,7 +984,7 @@ fn recheck_edit_row_flips_to_anchor_not_unique() {
 fn recheck_edit_row_target_missing_when_disk_none() {
     let (_dir, s) = staged();
     let outcome = s
-        .propose_batch(vec![EditProposalInput {
+        .propose_batch(&[EditProposalInput {
             surface: "mcp-tool-call".into(),
             action: "edit_note".into(),
             target_path: "notes/a.md".into(),
@@ -991,7 +1001,7 @@ fn recheck_edit_row_target_missing_when_disk_none() {
     let id = &outcome.ids[0];
     let st = s.recheck(id, None).unwrap();
     assert_eq!(st.new_state, ProposalState::Conflicted);
-    let p = &s.list(&StagingFilter::default()).unwrap()[0];
+    let p = &s.list(&Filter::default()).unwrap()[0];
     assert_eq!(p.conflict_reason, Some(ConflictReason::TargetMissing));
 }
 
@@ -999,9 +1009,9 @@ fn recheck_edit_row_target_missing_when_disk_none() {
 fn recheck_write_row_applyable_when_hash_unchanged() {
     let (_dir, s) = staged();
     let propose_time = "original content";
-    let source = hash_str(propose_time);
+    let source = hash_string(propose_time);
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -1019,9 +1029,9 @@ fn recheck_write_row_applyable_when_hash_unchanged() {
 #[test]
 fn recheck_write_row_flips_on_hash_changed() {
     let (_dir, s) = staged();
-    let source = hash_str("original");
+    let source = hash_string("original");
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
@@ -1034,7 +1044,7 @@ fn recheck_write_row_flips_on_hash_changed() {
         .unwrap();
     let st = s.recheck(&id, Some("drifted")).unwrap();
     assert_eq!(st.new_state, ProposalState::Conflicted);
-    let p = &s.list(&StagingFilter::default()).unwrap()[0];
+    let p = &s.list(&Filter::default()).unwrap()[0];
     assert_eq!(p.conflict_reason, Some(ConflictReason::HashChanged));
 }
 
@@ -1042,7 +1052,7 @@ fn recheck_write_row_flips_on_hash_changed() {
 fn recheck_create_row_applyable_while_target_absent() {
     let (_dir, s) = staged();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/new.md".into(),
@@ -1064,14 +1074,14 @@ fn recheck_transition_broadcasts_changed_event() {
     let (_dir, s) = staged();
     let mut rx = s.subscribe();
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
             trail_id: None,
             content: Some("proposed".into()),
             metadata: None,
-            source_hash: Some(hash_str("original")),
+            source_hash: Some(hash_string("original")),
             source_path: None,
         })
         .unwrap();
@@ -1091,39 +1101,39 @@ fn recheck_transition_broadcasts_changed_event() {
 fn list_filters_by_state() {
     let (_dir, s) = staged();
     let id_a = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),
             trail_id: None,
             content: Some("a".into()),
             metadata: None,
-            source_hash: Some(hash_str("orig")),
+            source_hash: Some(hash_string("orig")),
             source_path: None,
         })
         .unwrap();
     let _id_b = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/b.md".into(),
             trail_id: None,
             content: Some("b".into()),
             metadata: None,
-            source_hash: Some(hash_str("orig")),
+            source_hash: Some(hash_string("orig")),
             source_path: None,
         })
         .unwrap();
     s.recheck(&id_a, Some("drifted")).unwrap();
     let applyable = s
-        .list(&StagingFilter {
+        .list(&Filter {
             state: Some(ProposalState::Applyable),
             ..Default::default()
         })
         .unwrap();
     assert_eq!(applyable.len(), 1);
     let conflicted = s
-        .list(&StagingFilter {
+        .list(&Filter {
             state: Some(ProposalState::Conflicted),
             ..Default::default()
         })
@@ -1137,7 +1147,7 @@ fn content_round_trips_through_zstd() {
     let (_dir, s) = staged();
     let body = "# Big note\n\n".repeat(50);
     let id = s
-        .propose(ProposalInput {
+        .propose(&ProposalInput {
             surface: "mcp-tool-call".into(),
             action: "write_note".into(),
             target_path: "notes/a.md".into(),

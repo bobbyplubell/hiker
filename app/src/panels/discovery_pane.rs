@@ -35,9 +35,9 @@ pub(crate) fn collapsible_header(
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let icon = if expanded {
-                crate::icons::chevron_down()
+                crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
             } else {
-                crate::icons::chevron_right()
+                crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
             };
             // Render as a single clickable row spanning the chevron +
             // title so the user can hit either to toggle. The chevron

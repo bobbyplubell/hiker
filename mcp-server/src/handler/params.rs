@@ -1,11 +1,80 @@
-//! Parameter / DTO types for the MCP tool surface, plus their `Serialize`
-//! impls (used by the audit log) and any `JsonSchema` / `From` conversions.
-//! Inbound `Deserialize` comes from the derive; outbound `Serialize` is
-//! hand-rolled so the `Deserialize` derive stays scoped to JSON-RPC parsing.
+//! Parameter / DTO types for the MCP tool surface, plus the cross-cutting
+//! helpers every tool handler shares: the `HikerError` -> MCP error
+//! translation, the structured-result wrapper, the audit status/error
+//! extractors, and the agent client id. These live together because they
+//! are the handler module's shared vocabulary — the param structs carry
+//! their hand-rolled `Serialize` impls (used by the audit log) alongside
+//! the `JsonSchema` / `From` conversions. Inbound `Deserialize` comes from
+//! the derive; outbound `Serialize` is hand-rolled so the `Deserialize`
+//! derive stays scoped to JSON-RPC parsing.
 
-use hiker_core::tasks::{Priority as TaskPriority, TaskShape as TaskShapeKind, TaskState};
+use hiker_core::errors::HikerError;
+use hiker_core::tasks::types::{Priority as TaskPriority, TaskShape as TaskShapeKind, TaskState};
+use rmcp::model::{CallToolResult, ErrorCode, ErrorData};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+// ---------- shared handler helpers ----------
+
+/// Identifier stamped into changelog rows + frontmatter provenance for any
+/// agent-driven write. v3 uses a fixed value; spec leaves room to extract a
+/// per-connection name from the rmcp `clientInfo` later.
+pub(crate) const CLIENT_ID: &str = "mcp";
+
+pub(crate) fn hiker_err(
+    code: ErrorCode,
+    msg: impl Into<std::borrow::Cow<'static, str>>,
+) -> ErrorData {
+    ErrorData::new(code, msg, None)
+}
+
+/// Map `HikerError` to MCP error codes per `mcp-error-model`. Hiker-specific
+/// positive codes 1001–1005; standard JSON-RPC `-32602` for invalid params.
+pub(crate) fn translate_hiker_err(e: HikerError) -> ErrorData {
+    match e {
+        HikerError::NotFound(p) => hiker_err(ErrorCode(1002), format!("note not found: {p}")),
+        HikerError::DiskDrift { expected, found } => hiker_err(
+            ErrorCode(1003),
+            format!("drift: file changed since load (expected {expected}, found {found})"),
+        ),
+        HikerError::PathEscape(p) => {
+            ErrorData::invalid_params(format!("path escapes vault: {p}"), None)
+        }
+        HikerError::AlreadyExists(p) => {
+            ErrorData::invalid_params(format!("already exists: {p}"), None)
+        }
+        HikerError::NotUtf8(msg) => ErrorData::invalid_params(format!("not utf-8: {msg}"), None),
+        HikerError::Config(msg) => ErrorData::internal_error(format!("config: {msg}"), None),
+        HikerError::Io(msg) => {
+            // ENOENT bubbles up as Io from read_file; surface that as 1002 so
+            // agents see a consistent "note not found" code rather than a
+            // generic internal error.
+            if msg.contains("No such file or directory") || msg.contains("not found") {
+                hiker_err(ErrorCode(1002), msg)
+            } else {
+                ErrorData::internal_error(msg, None)
+            }
+        }
+    }
+}
+
+pub(crate) fn structured(v: serde_json::Value) -> CallToolResult {
+    CallToolResult::structured(v)
+}
+
+pub(crate) const fn audit_status(r: &Result<CallToolResult, ErrorData>) -> &'static str {
+    match r {
+        Ok(_) => "ok",
+        Err(_) => "error",
+    }
+}
+
+pub(crate) fn audit_err(r: &Result<CallToolResult, ErrorData>) -> Option<String> {
+    match r {
+        Ok(_) => None,
+        Err(e) => Some(e.message.to_string()),
+    }
+}
 
 // ---------- parameter types ----------
 
@@ -17,12 +86,12 @@ pub struct SearchModesParam {
     pub lexical: bool,
 }
 
-pub(super) fn yes() -> bool {
+pub(super) const fn yes() -> bool {
     true
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchNotesParams {
+pub struct SearchNotes {
     /// Free-text query. Empty queries return empty buckets without erroring.
     pub query: String,
     /// Optional toggles for which backends to run. Both default on for
@@ -45,7 +114,7 @@ pub enum NoteDetail {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetNoteParams {
+pub struct GetNote {
     /// Vault-relative path of the note to fetch.
     pub rel_path: String,
     /// Progressive disclosure level. Default `full` for explicit fetches.
@@ -54,14 +123,14 @@ pub struct GetNoteParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RelatedNotesParams {
+pub struct RelatedNotes {
     pub rel_path: String,
     #[serde(default)]
     pub top_k: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct WriteNoteParams {
+pub struct WriteNote {
     pub rel_path: String,
     pub content: String,
     /// If provided, the write is drift-aware: errors `1003 drift` when the
@@ -84,13 +153,13 @@ pub struct EditSpec {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditNoteParams {
+pub struct EditNote {
     pub rel_path: String,
     pub edits: Vec<EditSpec>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SetFrontmatterParams {
+pub struct SetFrontmatter {
     pub rel_path: String,
     /// Object whose fields are deep-merged into the note's frontmatter.
     /// Typed as `Map` (rather than `Value`) so the JSON schema advertises
@@ -100,7 +169,7 @@ pub struct SetFrontmatterParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ApplyTagParams {
+pub struct ApplyTag {
     pub rel_path: String,
     pub tag: String,
 }
@@ -140,7 +209,7 @@ impl From<ShapeParam> for TaskShapeKind {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct TaskCheckoutParams {
+pub struct TaskCheckout {
     /// Filter by `TaskKind` variant name (e.g. `auto_tag`).
     #[serde(default)]
     pub types: Option<Vec<String>>,
@@ -154,14 +223,14 @@ pub struct TaskCheckoutParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TaskSubmitParams {
+pub struct TaskSubmit {
     pub task_id: String,
     pub value: serde_json::Value,
 }
 
-impl JsonSchema for TaskSubmitParams {
+impl JsonSchema for TaskSubmit {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        "TaskSubmitParams".into()
+        "TaskSubmit".into()
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let mut schema = schemars::Schema::default();
@@ -194,13 +263,13 @@ impl JsonSchema for TaskSubmitParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct TaskFailParams {
+pub struct TaskFail {
     pub task_id: String,
     pub error: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct TaskHeartbeatParams {
+pub struct TaskHeartbeat {
     pub task_id: String,
 }
 
@@ -227,7 +296,7 @@ impl From<TaskStateParam> for TaskState {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct TaskListParams {
+pub struct TaskList {
     #[serde(default)]
     pub states: Option<Vec<TaskStateParam>>,
     #[serde(default)]
@@ -308,10 +377,10 @@ impl Serialize for SearchModesParam {
         serde::ser::SerializeStruct::end(m)
     }
 }
-impl Serialize for SearchNotesParams {
+impl Serialize for SearchNotes {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("SearchNotesParams", 3)?;
+        let mut m = s.serialize_struct("SearchNotes", 3)?;
         m.serialize_field("query", &self.query)?;
         m.serialize_field("modes", &self.modes)?;
         m.serialize_field("top_k", &self.top_k)?;
@@ -327,38 +396,38 @@ impl Serialize for NoteDetail {
         })
     }
 }
-impl Serialize for GetNoteParams {
+impl Serialize for GetNote {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("GetNoteParams", 2)?;
+        let mut m = s.serialize_struct("GetNote", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("detail", &self.detail)?;
         m.end()
     }
 }
-impl Serialize for RelatedNotesParams {
+impl Serialize for RelatedNotes {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("RelatedNotesParams", 2)?;
+        let mut m = s.serialize_struct("RelatedNotes", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("top_k", &self.top_k)?;
         m.end()
     }
 }
-impl Serialize for WriteNoteParams {
+impl Serialize for WriteNote {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("WriteNoteParams", 3)?;
+        let mut m = s.serialize_struct("WriteNote", 3)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("content", &self.content)?;
         m.serialize_field("expected_hash", &self.expected_hash)?;
         m.end()
     }
 }
-impl Serialize for SetFrontmatterParams {
+impl Serialize for SetFrontmatter {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("SetFrontmatterParams", 2)?;
+        let mut m = s.serialize_struct("SetFrontmatter", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("fields", &serde_json::Value::Object(self.fields.clone()))?;
         m.end()
@@ -392,10 +461,10 @@ impl Serialize for TaskStateParam {
         })
     }
 }
-impl Serialize for TaskCheckoutParams {
+impl Serialize for TaskCheckout {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("TaskCheckoutParams", 4)?;
+        let mut m = s.serialize_struct("TaskCheckout", 4)?;
         m.serialize_field("types", &self.types)?;
         m.serialize_field("shapes", &self.shapes)?;
         m.serialize_field("min_priority", &self.min_priority)?;
@@ -403,36 +472,36 @@ impl Serialize for TaskCheckoutParams {
         m.end()
     }
 }
-impl Serialize for TaskSubmitParams {
+impl Serialize for TaskSubmit {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("TaskSubmitParams", 2)?;
+        let mut m = s.serialize_struct("TaskSubmit", 2)?;
         m.serialize_field("task_id", &self.task_id)?;
         m.serialize_field("value", &self.value)?;
         m.end()
     }
 }
-impl Serialize for TaskFailParams {
+impl Serialize for TaskFail {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("TaskFailParams", 2)?;
+        let mut m = s.serialize_struct("TaskFail", 2)?;
         m.serialize_field("task_id", &self.task_id)?;
         m.serialize_field("error", &self.error)?;
         m.end()
     }
 }
-impl Serialize for TaskHeartbeatParams {
+impl Serialize for TaskHeartbeat {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("TaskHeartbeatParams", 1)?;
+        let mut m = s.serialize_struct("TaskHeartbeat", 1)?;
         m.serialize_field("task_id", &self.task_id)?;
         m.end()
     }
 }
-impl Serialize for TaskListParams {
+impl Serialize for TaskList {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("TaskListParams", 2)?;
+        let mut m = s.serialize_struct("TaskList", 2)?;
         m.serialize_field("states", &self.states)?;
         m.serialize_field("types", &self.types)?;
         m.end()
@@ -448,19 +517,19 @@ impl Serialize for EditSpec {
         m.end()
     }
 }
-impl Serialize for EditNoteParams {
+impl Serialize for EditNote {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("EditNoteParams", 2)?;
+        let mut m = s.serialize_struct("EditNote", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("edits", &self.edits)?;
         m.end()
     }
 }
-impl Serialize for ApplyTagParams {
+impl Serialize for ApplyTag {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = s.serialize_struct("ApplyTagParams", 2)?;
+        let mut m = s.serialize_struct("ApplyTag", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("tag", &self.tag)?;
         m.end()

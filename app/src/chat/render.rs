@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::chat::{session, state};
+use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole};
 use crate::state::AppState;
 use crate::theme;
@@ -40,38 +40,50 @@ pub fn show(
     layout: Layout,
     rt: &Arc<tokio::runtime::Runtime>,
 ) {
+    Chat { app, rt }.show(ui, session_id, layout);
+}
+
+/// Per-frame chat render context. Bundles the mutable `AppState` borrow
+/// with the tokio runtime handle so the render/action helpers can be
+/// `&mut self` methods on a single receiver.
+struct Chat<'a> {
+    app: &'a mut AppState,
+    rt: &'a Arc<tokio::runtime::Runtime>,
+}
+
+impl Chat<'_> {
+    fn show(&mut self, ui: &mut egui::Ui, session_id: Option<&str>, layout: Layout) {
     // 1) Fold in any pending reply-task events from this frame.
-    state::pump_events(&mut app.session.chat);
+    self.app.session.chat.pump_events();
 
     // 2) Override active pointer if the tab specified one. Lazy-load
     //    historic sessions on first view in case discovery didn't run
     //    yet (e.g. tab restored from a saved layout).
     if let Some(id) = session_id
-        && app.session.chat.sessions.contains_key(id)
+        && self.app.session.chat.sessions.contains_key(id)
     {
-        app.session.chat.active = Some(id.to_string());
+        self.app.session.chat.active = Some(id.to_string());
     }
 
     match layout {
-        Layout::FullTab => render_full_tab(ui, app, rt, /*show_header=*/ true, /*show_header_buttons=*/ true),
+        Layout::FullTab => self.render_full_tab(ui, /*show_header=*/ true, /*show_header_buttons=*/ true),
         // SideBar variant has its picker + buttons hoisted into the
-        // side bar's chrome title row (see `render_session_picker` +
+        // side bar's chrome title row (see `session_picker` +
         // `secondary_side_bar_action_buttons`), so the body skips the
         // header strip entirely.
-        Layout::SideBar => render_full_tab(ui, app, rt, /*show_header=*/ false, /*show_header_buttons=*/ false),
-        Layout::Docked => render_docked(ui, app, rt),
+        Layout::SideBar => self.render_full_tab(ui, /*show_header=*/ false, /*show_header_buttons=*/ false),
+        Layout::Docked => self.render_docked(ui),
     }
-}
+    }
 
-fn render_full_tab(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-    show_header: bool,
-    show_header_buttons: bool,
-) {
+    fn render_full_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        show_header: bool,
+        show_header_buttons: bool,
+    ) {
     if show_header {
-        header(ui, app, /*full=*/ true, show_header_buttons);
+        self.header(ui, /*full=*/ true, show_header_buttons);
         ui.separator();
     }
 
@@ -90,31 +102,32 @@ fn render_full_tab(
             egui::Sense::hover(),
         );
         let mut transcript_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        transcript(&mut transcript_ui, app);
+        self.transcript(&mut transcript_ui);
     }
 
     ui.separator();
-    composer(ui, app, rt, /*multiline=*/ true);
-}
+    self.composer(ui, /*multiline=*/ true);
+    }
 
-fn render_docked(ui: &mut egui::Ui, app: &mut AppState, rt: &Arc<tokio::runtime::Runtime>) {
+    fn render_docked(&mut self, ui: &mut egui::Ui) {
     egui::Frame::default()
         .fill(theme::active_bg())
         .stroke(egui::Stroke::new(1.0, theme::divider()))
         .inner_margin(6.0)
         .show(ui, |ui| {
-            header(ui, app, /*full=*/ false, /*show_header_buttons=*/ true);
+            self.header(ui, /*full=*/ false, /*show_header_buttons=*/ true);
             ui.add_space(2.0);
             egui::ScrollArea::vertical()
                 .max_height(180.0)
                 .auto_shrink([false, false])
-                .show(ui, |ui| transcript(ui, app));
+                .show(ui, |ui| self.transcript(ui));
             ui.add_space(2.0);
-            composer(ui, app, rt, /*multiline=*/ false);
+            self.composer(ui, /*multiline=*/ false);
         });
-}
+    }
 
-fn header(ui: &mut egui::Ui, app: &mut AppState, full: bool, show_buttons: bool) {
+    fn header(&mut self, ui: &mut egui::Ui, full: bool, show_buttons: bool) {
+    let app = &mut *self.app;
     // Layout right-to-left so the +/trash buttons stay pinned to the
     // right edge and the picker shrinks to fill the leftover slot.
     // A left-to-right horizontal with a fixed-width ComboBox + trailing
@@ -131,14 +144,14 @@ fn header(ui: &mut egui::Ui, app: &mut AppState, full: bool, show_buttons: bool)
             if show_buttons {
                 if active_id.is_some()
                     && ui
-                        .add(egui::Button::image(crate::icons::trash()).small())
+                        .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Trash)).small())
                         .on_hover_text("Delete this session")
                         .clicked()
                 {
                     delete = active_id.clone();
                 }
                 if ui
-                    .add(egui::Button::image(crate::icons::plus()).small())
+                    .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)).small())
                     .on_hover_text("New session")
                     .clicked()
                 {
@@ -203,46 +216,49 @@ fn header(ui: &mut egui::Ui, app: &mut AppState, full: bool, show_buttons: bool)
             tracing::warn!(error = %err, "chat: delete failed");
         }
     }
+    }
 }
 
-/// Standalone session picker — the same combobox `header` builds,
-/// but rendered into an arbitrary ui so it can sit in the secondary
-/// side bar's chrome title row alongside the +/trash buttons that
-/// `secondary_side_bar_action_buttons` already places there.
-pub fn render_session_picker(ui: &mut egui::Ui, app: &mut AppState) {
-    let active_id = app.session.chat.active.clone();
-    let active_label = active_label_for(&app.session.chat, active_id.as_deref());
-    let mut switch_to: Option<String> = None;
+impl AppState {
+    /// Standalone session picker — the same combobox `Chat::header` builds,
+    /// but rendered into an arbitrary ui so it can sit in the secondary
+    /// side bar's chrome title row alongside the +/trash buttons that
+    /// `secondary_side_bar_action_buttons` already places there.
+    pub fn chat_session_picker(&mut self, ui: &mut egui::Ui) {
+        let active_id = self.session.chat.active.clone();
+        let active_label = active_label_for(&self.session.chat, active_id.as_deref());
+        let mut switch_to: Option<String> = None;
 
-    let picker_width = ui.available_width().min(280.0).max(0.0);
-    egui::ComboBox::from_id_salt("chat_picker_sidebar_title")
-        .selected_text(active_label)
-        .width(picker_width)
-        .show_ui(ui, |ui| {
-            let mut rows: Vec<(String, String, i64)> = app
-                .session.chat
-                .sessions
-                .values()
-                .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
-                .collect();
-            rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-            if rows.is_empty() {
-                ui.label(
-                    egui::RichText::new("(no sessions yet)")
-                        .color(theme::muted())
-                        .small(),
-                );
-            }
-            for (id, preview, _mtime) in rows {
-                let selected = active_id.as_deref() == Some(id.as_str());
-                if ui.selectable_label(selected, &preview).clicked() {
-                    switch_to = Some(id);
+        let picker_width = ui.available_width().min(280.0).max(0.0);
+        egui::ComboBox::from_id_salt("chat_picker_sidebar_title")
+            .selected_text(active_label)
+            .width(picker_width)
+            .show_ui(ui, |ui| {
+                let mut rows: Vec<(String, String, i64)> = self
+                    .session.chat
+                    .sessions
+                    .values()
+                    .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
+                    .collect();
+                rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+                if rows.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(no sessions yet)")
+                            .color(theme::muted())
+                            .small(),
+                    );
                 }
-            }
-        });
+                for (id, preview, _mtime) in rows {
+                    let selected = active_id.as_deref() == Some(id.as_str());
+                    if ui.selectable_label(selected, &preview).clicked() {
+                        switch_to = Some(id);
+                    }
+                }
+            });
 
-    if let Some(id) = switch_to {
-        session::set_active(&mut app.session.chat, &id);
+        if let Some(id) = switch_to {
+            session::set_active(&mut self.session.chat, &id);
+        }
     }
 }
 
@@ -253,8 +269,9 @@ fn active_label_for(reg: &ChatRegistry, id: Option<&str>) -> String {
     }
 }
 
-fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
-    let Some(s) = app.session.chat.active_session() else {
+impl Chat<'_> {
+    fn transcript(&mut self, ui: &mut egui::Ui) {
+    let Some(s) = self.app.session.chat.active_session() else {
         ui.label(
             egui::RichText::new("(no session — press + or start typing)")
                 .color(theme::muted())
@@ -272,7 +289,8 @@ fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
     // review tab, the activity widget) it disappears from staging.db
     // and the cached snapshot shrinks, so the stale buttons on old tool
     // cards vanish on the next frame without any per-card bookkeeping.
-    let live_proposal_ids: std::collections::HashSet<String> = app
+    let live_proposal_ids: std::collections::HashSet<String> = self
+        .app
         .ui_cache
         .staging_snapshot
         .iter()
@@ -286,15 +304,15 @@ fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
         .show(ui, |ui| {
             for (turn_idx, turn) in turns.iter().enumerate() {
                 if let Some(tool) = &turn.tool {
-                    if let Some(a) = render_tool_card(ui, tool, turn_idx, &live_proposal_ids) {
+                    if let Some(a) = tool.render_card(ui, turn_idx, &live_proposal_ids) {
                         card_action = Some(a);
                     }
-                } else if let Some(target) = render_turn(ui, turn.role, &turn.text) {
+                } else if let Some(target) = self.render_turn(ui, turn.role, &turn.text) {
                     link_clicked = Some(target);
                 }
             }
             if !streaming.is_empty()
-                && let Some(target) = render_turn(ui, ChatRole::Assistant, &streaming)
+                && let Some(target) = self.render_turn(ui, ChatRole::Assistant, &streaming)
             {
                 link_clicked = Some(target);
             }
@@ -332,18 +350,19 @@ fn transcript(ui: &mut egui::Ui, app: &mut AppState) {
     // route through the live `Staging`; open-target hands off to the
     // tab-open machinery via `controllers::open_file`.
     if let Some(action) = card_action {
-        apply_tool_card_action(app, action);
+        self.apply_tool_card_action(action);
     }
     if let Some(target) = link_clicked {
-        let rel = resolve_wikilink_target(app, &target);
-        crate::editor_pane::open_file(app, &rel, /*sticky=*/ true);
+        let rel = self.resolve_wikilink_target(&target);
+        crate::editor_pane::open_file(self.app, &rel, /*sticky=*/ true);
     }
-}
+    }
 
-/// Resolve a wikilink target like `Some Note` or `notes/foo` into a
-/// vault-relative path. Falls back to the literal `target.md` when no
-/// indexed match exists.
-fn resolve_wikilink_target(app: &AppState, target: &str) -> String {
+    /// Resolve a wikilink target like `Some Note` or `notes/foo` into a
+    /// vault-relative path. Falls back to the literal `target.md` when no
+    /// indexed match exists.
+    fn resolve_wikilink_target(&self, target: &str) -> String {
+    let app = &*self.app;
     let direct = if target.ends_with(".md") {
         target.to_string()
     } else {
@@ -366,7 +385,8 @@ fn resolve_wikilink_target(app: &AppState, target: &str) -> String {
     direct
 }
 
-fn apply_tool_card_action(app: &mut AppState, action: ToolCardAction) {
+    fn apply_tool_card_action(&mut self, action: ToolCardAction) {
+    let app = &mut *self.app;
     use crate::state::ToastLevel;
     match action {
         ToolCardAction::AcceptStaging { proposal_id } => {
@@ -401,6 +421,7 @@ fn apply_tool_card_action(app: &mut AppState, action: ToolCardAction) {
             crate::editor_pane::open_file(app, &rel_path, /*sticky=*/ true);
         }
     }
+    }
 }
 
 /// Action requested from a tool card's review buttons. Bubbles up to the
@@ -413,16 +434,18 @@ pub enum ToolCardAction {
     OpenTarget { rel_path: String },
 }
 
-fn render_tool_card(
+impl crate::chat::state::ToolCard {
+    fn render_card(
+    &self,
     ui: &mut egui::Ui,
-    tool: &crate::chat::state::ToolCard,
     turn_idx: usize,
     live_proposal_ids: &std::collections::HashSet<String>,
 ) -> Option<ToolCardAction> {
+    let tool = self;
     let mut action: Option<ToolCardAction> = None;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.add(crate::icons::wrench().tint(theme::warn()));
+        ui.add(crate::icons::ICONS.image(crate::icons::Icon::Wrench).tint(theme::warn()));
         ui.label(
             egui::RichText::new("Tool")
                 .color(theme::warn())
@@ -493,9 +516,9 @@ fn render_tool_card(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(if open {
-                    crate::icons::chevron_down()
+                    crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
                 } else {
-                    crate::icons::chevron_right()
+                    crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
                 });
                 ui.label(egui::RichText::new("details").color(theme::muted()));
                 ui.add_space(ui.available_width());
@@ -580,7 +603,7 @@ fn render_tool_card(
                         ui.label(
                             egui::RichText::new(format!(
                                 "proposal {}",
-                                short_id(sid)
+                                &sid[..sid.len().min(8)]
                             ))
                             .color(theme::muted())
                             .small()
@@ -589,7 +612,7 @@ fn render_tool_card(
                         if ui
                             .add(
                                 egui::Button::image_and_text(
-                                    crate::icons::primary_check(),
+                                    crate::icons::ICONS.primary_check(),
                                     egui::RichText::new("Accept")
                                         .color(egui::Color32::WHITE)
                                         .small(),
@@ -605,7 +628,7 @@ fn render_tool_card(
                         if ui
                             .add(
                                 egui::Button::image_and_text(
-                                    crate::icons::primary_cross(),
+                                    crate::icons::ICONS.primary_cross(),
                                     egui::RichText::new("Reject")
                                         .color(egui::Color32::WHITE)
                                         .small(),
@@ -654,16 +677,14 @@ fn render_tool_card(
     }
     }
     action
+    }
 }
 
-fn short_id(id: &str) -> &str {
-    &id[..id.len().min(8)]
-}
-
+impl Chat<'_> {
 /// Render a single transcript turn. Returns `Some(target)` when the user
 /// clicked a `[[wikilink]]` inside the bubble — the caller hands that off
 /// to the file-open routing (`chat-panel-note-link-render`).
-fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
+fn render_turn(&self, ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
     let mut clicked_link: Option<String> = None;
     let (label, color) = match role {
         ChatRole::User => ("You", theme::accent()),
@@ -695,11 +716,11 @@ fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> 
             .inner_margin(8.0)
             .show(ui, |ui| {
                 ui.set_max_width(bubble_width);
-                for chunk in split_code_fences(text) {
+                for chunk in self.split_code_fences(text) {
                     match chunk {
                         Chunk::Text(t) => {
                             ui.horizontal_wrapped(|ui| {
-                                for part in split_wikilinks(t) {
+                                for part in self.split_wikilinks(t) {
                                     match part {
                                         TextPart::Plain(s) if !s.is_empty() => {
                                             ui.label(egui::RichText::new(s));
@@ -745,6 +766,7 @@ fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> 
     });
     clicked_link
 }
+}
 
 enum Chunk<'a> {
     Text(&'a str),
@@ -757,10 +779,11 @@ enum TextPart<'a> {
     Link(&'a str),
 }
 
+impl Chat<'_> {
 /// Split a plain-text chunk on `[[wikilink]]` markers. The link target is
 /// the substring before any pipe (matching the `wikilink_target_aliases`
 /// resolution rules). Lone `[` or unterminated `[[` is preserved as text.
-fn split_wikilinks(s: &str) -> Vec<TextPart<'_>> {
+fn split_wikilinks<'a>(&self, s: &'a str) -> Vec<TextPart<'a>> {
     let mut out: Vec<TextPart<'_>> = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -799,7 +822,7 @@ fn split_wikilinks(s: &str) -> Vec<TextPart<'_>> {
 /// blocks pick up monospace styling without a full parser. Inline
 /// styling (bold/italic/links) is left for the real markdown
 /// renderer.
-fn split_code_fences(s: &str) -> Vec<Chunk<'_>> {
+fn split_code_fences<'a>(&self, s: &'a str) -> Vec<Chunk<'a>> {
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(start) = rest.find("```") {
@@ -823,6 +846,7 @@ fn split_code_fences(s: &str) -> Vec<Chunk<'_>> {
     }
     out
 }
+}
 
 #[cfg(test)]
 mod at_mention_tests {
@@ -830,18 +854,18 @@ mod at_mention_tests {
 
     #[test]
     fn detects_bare_at() {
-        assert_eq!(active_at_mention("@"), Some((0, "".to_string())));
+        assert_eq!("@".active_at_mention(), Some((0, "".to_string())));
     }
 
     #[test]
     fn detects_at_with_query() {
-        assert_eq!(active_at_mention("@notes/f"), Some((0, "notes/f".to_string())));
+        assert_eq!("@notes/f".active_at_mention(), Some((0, "notes/f".to_string())));
     }
 
     #[test]
     fn detects_at_after_whitespace() {
         assert_eq!(
-            active_at_mention("hi there @notes"),
+            "hi there @notes".active_at_mention(),
             Some((9, "notes".to_string()))
         );
     }
@@ -849,13 +873,13 @@ mod at_mention_tests {
     #[test]
     fn skips_email_like_at() {
         // `@` not preceded by whitespace shouldn't trigger.
-        assert_eq!(active_at_mention("name@example"), None);
+        assert_eq!("name@example".active_at_mention(), None);
     }
 
     #[test]
     fn no_match_when_whitespace_after_at() {
         // Trailing whitespace breaks the in-flight token.
-        assert_eq!(active_at_mention("@notes hello "), None);
+        assert_eq!("@notes hello ".active_at_mention(), None);
     }
 }
 
@@ -865,10 +889,12 @@ mod at_mention_tests {
 ///
 /// This is a deliberately cheap pre-check so the heavier suggestion fetch
 /// only runs when an `@` is genuinely in flight.
+impl Chat<'_> {
 /// Pull the active buffer's current selection out as a String. Returns
 /// `None` when no buffer is focused, when the focused tab isn't a buffer,
 /// or when the selection is empty (caret with no range).
-fn active_buffer_selection(app: &AppState) -> Option<String> {
+fn active_buffer_selection(&self) -> Option<String> {
+    let app = &*self.app;
     let path = app
         .session.active_tab
         .and_then(|id| app.tab_by_id(id))
@@ -884,29 +910,46 @@ fn active_buffer_selection(app: &AppState) -> Option<String> {
     Some(buffer.editor.doc.slice(start..end).to_string())
 }
 
-fn active_at_mention(text: &str) -> Option<(usize, String)> {
-    // Walk back from the end finding the last `@` not preceded by an
-    // alphanumeric — bail out on whitespace before that.
-    let bytes = text.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 {
-        let c = bytes[i - 1] as char;
-        if c.is_whitespace() {
-            return None;
-        }
-        if c == '@' {
-            // `@` must be at the start of the input or follow whitespace
-            // so we don't catch email-like substrings.
-            let prev_is_ws = i == 1 || (bytes[i - 2] as char).is_whitespace();
-            if !prev_is_ws {
+}
+
+/// Cheap `@<query>` mention scan over the trailing token of a draft.
+/// A trait on `str` so the sole render call site and the unit tests share
+/// one implementation without a free helper.
+trait AtMentionScan {
+    /// If the cursor-trailing token looks like a partial `@<query>`
+    /// mention (no whitespace between `@` and the end), return the byte
+    /// offset of the `@` plus the captured query. Otherwise `None`.
+    ///
+    /// A deliberately cheap pre-check so the heavier suggestion fetch only
+    /// runs when an `@` is genuinely in flight.
+    fn active_at_mention(&self) -> Option<(usize, String)>;
+}
+
+impl AtMentionScan for str {
+    fn active_at_mention(&self) -> Option<(usize, String)> {
+        // Walk back from the end finding the last `@` not preceded by an
+        // alphanumeric — bail out on whitespace before that.
+        let bytes = self.as_bytes();
+        let mut i = bytes.len();
+        while i > 0 {
+            let c = bytes[i - 1] as char;
+            if c.is_whitespace() {
                 return None;
             }
-            let query = text[i..].to_string();
-            return Some((i - 1, query));
+            if c == '@' {
+                // `@` must be at the start of the input or follow
+                // whitespace so we don't catch email-like substrings.
+                let prev_is_ws = i == 1 || (bytes[i - 2] as char).is_whitespace();
+                if !prev_is_ws {
+                    return None;
+                }
+                let query = self[i..].to_string();
+                return Some((i - 1, query));
+            }
+            i -= 1;
         }
-        i -= 1;
+        None
     }
-    None
 }
 
 /// Walk the vault root for `.md` paths whose basename (or full path)
@@ -1027,12 +1070,18 @@ fn mention_suggestions(app: &AppState, query: &str, cap: usize) -> Vec<String> {
     out
 }
 
+impl Chat<'_> {
 fn composer(
+    &mut self,
     ui: &mut egui::Ui,
-    app: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
     multiline: bool,
 ) {
+    // "Quote selection" source — read the active buffer's selection up
+    // front so the borrow doesn't overlap the `&mut self.app` reborrow
+    // taken for the composer body.
+    let selection_text = self.active_buffer_selection();
+    let rt = self.rt;
+    let app = &mut *self.app;
     let active_id = app.session.chat.active.clone().unwrap_or_else(|| "_none".to_string());
     // Clone draft into a local so we can hand &mut to the TextEdit and
     // still read app immutably below for @-mention suggestions. The clone
@@ -1086,14 +1135,13 @@ fn composer(
         // buffer's current text selection into the draft as a fenced
         // quote so the assistant sees exactly what the user is looking
         // at. Disabled when there's no selection or no active buffer.
-        let selection_text = active_buffer_selection(app);
         let has_selection = selection_text
             .as_deref()
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         if has_selection
             && ui
-                .add(egui::Button::image_and_text(crate::icons::plus(), "selection"))
+                .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Plus), "selection"))
                 .on_hover_text("Insert the editor's current selection as quoted context")
                 .clicked()
             && let Some(sel) = selection_text
@@ -1176,20 +1224,20 @@ fn composer(
         //      click never had a chance to register because the popup
         //      closure stopped being called.
         let mention_popup_id = ui.make_persistent_id("chat::mention_popup");
-        let mention_state = active_at_mention(&draft);
+        let mention_state = draft.active_at_mention();
         if let Some((_, ref query)) = mention_state {
             let has_any = !mention_suggestions(app, query, 1).is_empty();
             if has_any {
-                ui.memory_mut(|m| m.open_popup(mention_popup_id));
+                egui::Popup::open_id(ui.ctx(), mention_popup_id);
             } else {
                 // No matches — close the popup (don't leave a stale
                 // floating frame from a previous prefix).
-                if ui.memory(|m| m.is_popup_open(mention_popup_id)) {
-                    ui.memory_mut(|m| m.close_popup(mention_popup_id));
+                if egui::Popup::is_id_open(ui.ctx(), mention_popup_id) {
+                    egui::Popup::close_id(ui.ctx(), mention_popup_id);
                 }
             }
-        } else if ui.memory(|m| m.is_popup_open(mention_popup_id)) {
-            ui.memory_mut(|m| m.close_popup(mention_popup_id));
+        } else if egui::Popup::is_id_open(ui.ctx(), mention_popup_id) {
+            egui::Popup::close_id(ui.ctx(), mention_popup_id);
         }
 
         if let Some((prefix_start, query)) = mention_state {
@@ -1218,7 +1266,7 @@ fn composer(
                                 &draft[prefix_start + 1 + query.len()..],
                             );
                             draft = new_draft;
-                            ui.memory_mut(|m| m.close_popup(mention_popup_id));
+                            egui::Popup::close_id(ui.ctx(), mention_popup_id);
                         }
                     }
                 });
@@ -1251,13 +1299,12 @@ fn composer(
             let vault_root = app.vault_session.vault_root.clone();
             let config = app.vault_session.config.clone();
             let mcp_handler = app.vault_session.services.mcp.as_ref().map(|h| h.agent_handler());
-            crate::chat::send::send_message(
-                &mut app.session.chat,
+            app.session.chat.send(
                 &vault_root,
                 rt,
                 config,
-                mcp_handler,
-                text,
+                &mcp_handler,
+                &text,
             );
             // Force an immediate repaint so the next frame picks up
             // `s.pending = true` and the composer flips from Send to
@@ -1268,5 +1315,6 @@ fn composer(
             // never gets a chance to show.
             ui.ctx().request_repaint();
         }
+    }
     }
 }

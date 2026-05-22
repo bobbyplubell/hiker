@@ -19,17 +19,19 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::bootstrap;
-use crate::state::AppState;
-use crate::tabs;
 
-/// Build a tokio runtime + open a tempdir-backed vault. Returns the
-/// runtime as an `Arc` (the app keeps it that way) and a constructed
-/// `AppState`. Disable MCP and the LLM worker via the config so the
-/// test doesn't bind a real port or try to talk to a network endpoint.
-fn open_temp_vault() -> (Arc<tokio::runtime::Runtime>, AppState) {
+/// Drive `tabs::body` (the egui_dock central area) for a few frames in
+/// a headless kittest harness. This catches the kind of "second-frame
+/// panic" that bit us when the stray-tab enforcement tried to
+/// `move_tab` into a `Node::Empty` destination.
+#[test]
+fn dock_body_runs_clean_for_three_frames() {
+    // Build a tokio runtime + open a tempdir-backed vault (inlined here —
+    // the only caller — so it doesn't trip `single_call_fn`). MCP + the
+    // LLM worker are disabled via config so the test doesn't bind a real
+    // port or hit the network.
     let tmpdir = tempfile::tempdir().expect("create tempdir");
     let vault_root = tmpdir.path().to_path_buf();
-    // Write a minimal hiker config that disables MCP + LLM. The path is
     // <vault>/.hiker/config.toml per `hiker_core::config::Config::load`.
     let hiker_dir = vault_root.join(".hiker");
     std::fs::create_dir_all(&hiker_dir).unwrap();
@@ -46,30 +48,20 @@ enabled = false
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let state = runtime
+    let mut state = runtime
         .block_on(async { bootstrap::open_vault(vault_root).await })
         .expect("open vault");
-    // Keep the tempdir alive for the duration of the test by leaking it.
-    // The test runs to completion in seconds; the dir gets cleaned up by
-    // the OS afterwards. Holding it across the move into the closure is
+    // Keep the tempdir alive for the test by leaking it; the OS cleans it
+    // up afterwards. Holding it across the move into the closure below is
     // awkward otherwise.
     std::mem::forget(tmpdir);
-    (Arc::new(runtime), state)
-}
-
-/// Drive `tabs::body` (the egui_dock central area) for a few frames in
-/// a headless kittest harness. This catches the kind of "second-frame
-/// panic" that bit us when the stray-tab enforcement tried to
-/// `move_tab` into a `Node::Empty` destination.
-#[test]
-fn dock_body_runs_clean_for_three_frames() {
-    let (runtime, mut state) = open_temp_vault();
+    let runtime = Arc::new(runtime);
     let _guard = runtime.enter();
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1400.0, 900.0))
         .build(|ctx: &egui::Context| {
-            tabs::body(ctx, &mut state, &runtime);
+            state.dock_body(ctx, &runtime);
         });
 
     // Three frames is enough to exercise: (1) initial reconcile that
@@ -109,7 +101,10 @@ fn enforce_buffer_tabs_in_center_moves_stray() {
     {
         tabs.add_child(stray);
     }
-    crate::layout::enforce_buffer_tabs_in_center(&mut bundle.tree, bundle.center_tile);
+    {
+        use crate::layout::DockTreeExt as _;
+        bundle.tree.enforce_buffer_tabs_in_center(bundle.center_tile);
+    }
     let parent = bundle.tree.tiles.parent_of(stray);
     assert_eq!(
         parent,

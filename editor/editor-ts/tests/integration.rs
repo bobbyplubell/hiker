@@ -7,9 +7,17 @@
 //! is wired with its corresponding `tree-sitter-<lang>` dep, add a real
 //! parse test guarded by `#[cfg(feature = "lang-json")]` (or similar).
 
-use editor_core::{ChangeSet, EditorState, Rope, light_default};
-use editor_ts::{TsLanguage, TsState, changeset_to_edits, parse, reparse, ts_decorations};
+use editor_core::change::Set as ChangeSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::rope::Rope;
 
+use editor_core::theme::light_default;
+use editor_ts::parsing::TsLanguage;
+use editor_ts::parsing::TsState;
+use editor_ts::parsing::changeset_to_edits;
+use editor_ts::parsing::parse;
+use editor_ts::parsing::reparse;
+use editor_ts::highlight::ts_decorations;
 #[test]
 fn public_api_surface_exists() {
     // Type-level assertions only — make sure the function signatures
@@ -18,7 +26,7 @@ fn public_api_surface_exists() {
     // compile-time check expressed as `let _: fn(...) -> ...`.
     let _: fn(&TsLanguage, &str) -> TsState = parse;
     let _: fn(&TsLanguage, &str, &TsState, &[tree_sitter::InputEdit]) -> TsState = reparse;
-    let _: fn(&EditorState, &TsState, Option<&editor_core::Theme>) -> editor_core::DecorationSet =
+    let _: fn(&EditorState, &TsState, Option<&editor_core::theme::Theme>) -> editor_core::decoration::Set =
         ts_decorations;
 }
 
@@ -50,6 +58,6 @@ fn theme_is_consumable_by_ts_decorations_signature() {
 #[test]
 fn end_to_end_parse_and_highlight() {
     // Placeholder for the real test, kept here so wiring it later is a
-    // one-liner: instantiate `editor_ts::languages::json()`, parse a JSON
+    // one-liner: `editor_ts::languages::bundle(Language::Json)`, parse a JSON
     // doc, and assert that `ts_decorations` produces at least one Mark.
 }

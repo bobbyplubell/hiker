@@ -2,9 +2,9 @@
 //! note's containing folder changes.
 
 use super::super::storage::params;
-use super::super::types::{NodeInsert, NodeKind, Trees, TreesError};
+use super::super::types::{NodeInsert, NodeKind, Db, Error};
 
-impl Trees {
+impl Db {
     /// Live-update a FromFolders tree to reflect a vault rename. Per
     /// `cluster-build-from-folders-live-update`: the leaf with `note_id =
     /// note_id` (if present in this tree) is re-parented under the folder
@@ -26,7 +26,7 @@ impl Trees {
         tree_id: &str,
         note_id: &str,
         new_folder: &str,
-    ) -> Result<bool, TreesError> {
+    ) -> Result<bool, Error> {
         // Locate the leaf by note_id within this tree. Scan once over the
         // full node list — trees.db tables are small per-tree.
         let nodes = self.list_nodes(tree_id)?;
@@ -70,7 +70,7 @@ impl Trees {
             };
             self.insert_single_node(
                 tree_id,
-                NodeInsert {
+                &NodeInsert {
                     node_id: new_folder_cluster_id.clone(),
                     parent_id: root_id.clone(),
                     kind: NodeKind::Cluster,

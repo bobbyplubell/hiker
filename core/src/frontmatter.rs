@@ -128,7 +128,7 @@ fn json_to_yaml(v: serde_json::Value) -> YamlValue {
 /// Re-assemble a file from a (possibly empty) frontmatter mapping + body.
 /// Empty mapping serializes to no frontmatter at all so we don't add a
 /// useless `---\n---\n` block when the patch left the map empty.
-pub fn assemble(frontmatter: &YamlValue, body: &str) -> Result<String, FrontmatterError> {
+pub fn assemble(frontmatter: &YamlValue, body: &str) -> Result<String, Error> {
     let is_empty = match frontmatter {
         YamlValue::Mapping(m) => m.is_empty(),
         YamlValue::Null => true,
@@ -138,7 +138,7 @@ pub fn assemble(frontmatter: &YamlValue, body: &str) -> Result<String, Frontmatt
         return Ok(body.to_string());
     }
     let yaml = serde_yml::to_string(frontmatter)
-        .map_err(|e| FrontmatterError::Serialize(e.to_string()))?;
+        .map_err(|e| Error::Serialize(e.to_string()))?;
     let yaml = yaml.trim_end_matches('\n');
     Ok(format!("---\n{yaml}\n---\n{body}"))
 }
@@ -150,7 +150,7 @@ pub fn assemble(frontmatter: &YamlValue, body: &str) -> Result<String, Frontmatt
 pub fn merge_agent_patch(
     source: &str,
     patch: serde_json::Value,
-) -> Result<String, FrontmatterError> {
+) -> Result<String, Error> {
     let split_view = split(source);
     let mut fm = match split_view.frontmatter {
         Some(v) => v,
@@ -165,29 +165,26 @@ pub fn merge_agent_patch(
     if let serde_json::Value::Object(_) = patch {
         merge_json_into_yaml(&mut fm, patch);
     } else if !matches!(patch, serde_json::Value::Null) {
-        return Err(FrontmatterError::PatchNotMap);
+        return Err(Error::PatchNotMap);
     }
 
     // Stamp hiker.author. Adapter is responsible for any provenance fields.
-    stamp_agent_author(&mut fm);
+    if let YamlValue::Mapping(map) = &mut fm {
+        let key = YamlValue::String("hiker".into());
+        let entry = map.entry(key).or_insert_with(|| YamlValue::Mapping(Default::default()));
+        if let YamlValue::Mapping(hm) = entry {
+            hm.insert(
+                YamlValue::String("author".into()),
+                YamlValue::String("agent-authored".into()),
+            );
+        }
+    }
 
     assemble(&fm, split_view.body)
 }
 
-fn stamp_agent_author(fm: &mut YamlValue) {
-    let YamlValue::Mapping(map) = fm else { return };
-    let key = YamlValue::String("hiker".into());
-    let entry = map.entry(key).or_insert_with(|| YamlValue::Mapping(Default::default()));
-    if let YamlValue::Mapping(hm) = entry {
-        hm.insert(
-            YamlValue::String("author".into()),
-            YamlValue::String("agent-authored".into()),
-        );
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
-pub enum FrontmatterError {
+pub enum Error {
     #[error("frontmatter patch must be a JSON object")]
     PatchNotMap,
     #[error("serialize frontmatter: {0}")]

@@ -2,8 +2,17 @@
 //! strictly inside a `Decoration::Replace` (or a `Mark` with `atomic = true`)
 //! range must snap to the appropriate boundary instead.
 
-use editor_core::{Decoration, DecorationSet, EditorState, MarkStyle, RangeSet, Selection};
-use editor_view::motion::{self, Direction};
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::decoration::MarkStyle;
+
+use editor_core::rangeset::RangeSet;
+
+use editor_core::selection::Selection;
+use editor_view::motion;
+use editor_view::motion::Direction;
 use smol_str::SmolStr;
 
 #[test]
@@ -15,7 +24,7 @@ fn move_char_right_skips_replace_range() {
     let mut state = EditorState::new(text);
     // Place cursor just before '['.
     state = state.apply(
-        editor_core::Transaction::new(editor_core::ChangeSet::empty(state.doc.len_bytes()))
+        editor_core::transaction::Transaction::new(editor_core::change::Set::empty(state.doc.len_bytes()))
             .with_selection(Selection::single(3)),
     );
 
@@ -36,7 +45,7 @@ fn move_char_left_skips_into_replace_range() {
     let mut state = EditorState::new(text);
     // Place cursor just after ']'.
     state = state.apply(
-        editor_core::Transaction::new(editor_core::ChangeSet::empty(state.doc.len_bytes()))
+        editor_core::transaction::Transaction::new(editor_core::change::Set::empty(state.doc.len_bytes()))
             .with_selection(Selection::single(8)),
     );
 
@@ -56,7 +65,7 @@ fn atomic_mark_is_respected() {
     let text = "abc[ZZZ]xyz";
     let mut state = EditorState::new(text);
     state = state.apply(
-        editor_core::Transaction::new(editor_core::ChangeSet::empty(state.doc.len_bytes()))
+        editor_core::transaction::Transaction::new(editor_core::change::Set::empty(state.doc.len_bytes()))
             .with_selection(Selection::single(3)),
     );
 
@@ -73,7 +82,7 @@ fn non_atomic_mark_does_not_snap() {
     let text = "abc[ZZZ]xyz";
     let mut state = EditorState::new(text);
     state = state.apply(
-        editor_core::Transaction::new(editor_core::ChangeSet::empty(state.doc.len_bytes()))
+        editor_core::transaction::Transaction::new(editor_core::change::Set::empty(state.doc.len_bytes()))
             .with_selection(Selection::single(3)),
     );
 

@@ -31,7 +31,7 @@ const INDEX_NAME: &str = "index.json";
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
-pub enum AutosaveError {
+pub enum Error {
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("json: {0}")]
@@ -113,7 +113,7 @@ pub struct Autosave {
 }
 
 impl Autosave {
-    pub fn open(vault_root: &Path) -> Result<Self, AutosaveError> {
+    pub fn open(vault_root: &Path) -> Result<Self, Error> {
         let dir = vault_root.join(".hiker").join(AUTOSAVE_DIRNAME);
         fs::create_dir_all(&dir)?;
         let me = Self {
@@ -125,7 +125,7 @@ impl Autosave {
         // version, fail loud (mirrors `store-version-fail-loud`).
         match me.read_index_for_version_check()? {
             Some(v) if v != SCHEMA_VERSION => {
-                return Err(AutosaveError::VersionMismatch {
+                return Err(Error::VersionMismatch {
                     found: v,
                     expected: SCHEMA_VERSION,
                 });
@@ -143,7 +143,7 @@ impl Autosave {
         self.dir.join(INDEX_NAME)
     }
 
-    fn read_index_for_version_check(&self) -> Result<Option<u32>, AutosaveError> {
+    fn read_index_for_version_check(&self) -> Result<Option<u32>, Error> {
         let p = self.index_path();
         if !p.exists() {
             return Ok(None);
@@ -160,7 +160,7 @@ impl Autosave {
         Ok(Some(v.version))
     }
 
-    fn read_index(&self) -> Result<IndexFile, AutosaveError> {
+    fn read_index(&self) -> Result<IndexFile, Error> {
         let p = self.index_path();
         if !p.exists() {
             return Ok(IndexFile::default());
@@ -173,7 +173,7 @@ impl Autosave {
         Ok(parsed)
     }
 
-    fn write_index_atomic(&self, idx: &IndexFile) -> Result<(), AutosaveError> {
+    fn write_index_atomic(&self, idx: &IndexFile) -> Result<(), Error> {
         let p = self.index_path();
         let tmp = p.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(idx)?;
@@ -191,7 +191,7 @@ impl Autosave {
         path: &str,
         contents: &[u8],
         buffer_hash: &str,
-    ) -> Result<(), AutosaveError> {
+    ) -> Result<(), Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         let mut idx = self.read_index()?;
         let now = now_ms();
@@ -216,7 +216,7 @@ impl Autosave {
     }
 
     /// Drop the sidecar for `path`. No-op when no entry exists.
-    pub fn clear(&self, path: &str) -> Result<(), AutosaveError> {
+    pub fn clear(&self, path: &str) -> Result<(), Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         let mut idx = self.read_index()?;
         if let Some(entry) = idx.entries.remove(path) {
@@ -229,7 +229,7 @@ impl Autosave {
         Ok(())
     }
 
-    pub fn save_tab_state(&self, mut state: TabState) -> Result<(), AutosaveError> {
+    pub fn save_tab_state(&self, mut state: TabState) -> Result<(), Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         let mut idx = self.read_index()?;
         if state.saved_at_ms == 0 {
@@ -240,7 +240,7 @@ impl Autosave {
         Ok(())
     }
 
-    pub fn load_tab_state(&self) -> Result<Option<TabState>, AutosaveError> {
+    pub fn load_tab_state(&self) -> Result<Option<TabState>, Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         let idx = self.read_index()?;
         Ok(idx.tab_state)
@@ -251,7 +251,7 @@ impl Autosave {
     /// last clean session), and return the genuine deltas. Matches are
     /// removed from the index file as a side effect so the next
     /// `recover()` doesn't re-do the work.
-    pub fn recover(&self) -> Result<Vec<RecoveredEntry>, AutosaveError> {
+    pub fn recover(&self) -> Result<Vec<RecoveredEntry>, Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         let mut idx = self.read_index()?;
         let mut out: Vec<RecoveredEntry> = Vec::new();
@@ -304,7 +304,7 @@ impl Autosave {
     /// `clear`; the separate verb mirrors the spec's recovery-modal API
     /// so the frontend can keep "Discard" / "successful save → clear"
     /// as distinct call sites.
-    pub fn discard(&self, path: &str) -> Result<(), AutosaveError> {
+    pub fn discard(&self, path: &str) -> Result<(), Error> {
         self.clear(path)
     }
 
@@ -314,7 +314,7 @@ impl Autosave {
     /// during swap, etc.).
     ///
     /// status: autosave-vault-swap-clears
-    pub fn vault_swap_reset(&self) -> Result<(), AutosaveError> {
+    pub fn vault_swap_reset(&self) -> Result<(), Error> {
         let _g = self.lock.lock().expect("autosave lock poisoned");
         if !self.dir.exists() {
             return Ok(());
@@ -329,7 +329,7 @@ impl Autosave {
         Ok(())
     }
 
-    fn live_disk_hash(&self, rel_path: &str) -> Result<Option<String>, AutosaveError> {
+    fn live_disk_hash(&self, rel_path: &str) -> Result<Option<String>, Error> {
         let abs = self.vault_root.join(rel_path);
         match fs::read(&abs) {
             Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
@@ -503,7 +503,7 @@ mod tests {
         });
         std::fs::write(a.index_path(), raw.to_string()).unwrap();
         match Autosave::open(dir.path()) {
-            Err(AutosaveError::VersionMismatch { found, expected }) => {
+            Err(Error::VersionMismatch { found, expected }) => {
                 assert_eq!(found, 99);
                 assert_eq!(expected, SCHEMA_VERSION);
             }

@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 
-use hiker_core::audit::{AgentLog, AuditEntry};
+use hiker_core::audit::{AgentLog, Entry};
 
-pub struct AuditLog {
+pub struct Log {
     inner: Arc<AgentLog>,
     log_full_input: bool,
 }
 
-impl AuditLog {
-    pub fn new(inner: Arc<AgentLog>, log_full_input: bool) -> Self {
+impl Log {
+    pub const fn new(inner: Arc<AgentLog>, log_full_input: bool) -> Self {
         Self {
             inner,
             log_full_input,
@@ -36,9 +36,9 @@ impl AuditLog {
         let masked = if self.log_full_input {
             input.clone()
         } else {
-            redact_for_audit(input)
+            self.redact_for_audit(input)
         };
-        self.inner.record(&AuditEntry {
+        self.inner.record(&Entry {
             surface: "mcp-tool-call",
             feature: tool,
             status,
@@ -50,28 +50,31 @@ impl AuditLog {
     }
 }
 
-/// When `log_full_input` is off, redact obvious bulk fields. We keep
-/// short identifying fields (`rel_path`, `top_k`, `query`'s length) so
-/// debugging stays useful without persisting note bodies.
-fn redact_for_audit(input: &serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::Object(map) = input else {
-        return input.clone();
-    };
-    let mut out = serde_json::Map::with_capacity(map.len());
-    for (k, v) in map {
-        let masked = match (k.as_str(), v) {
-            ("content", serde_json::Value::String(s)) => {
-                serde_json::json!({"redacted": true, "len": s.len()})
-            }
-            ("query", serde_json::Value::String(s)) => {
-                serde_json::json!({"redacted": true, "len": s.len()})
-            }
-            ("fields", serde_json::Value::Object(_)) => {
-                serde_json::json!({"redacted": true})
-            }
-            _ => v.clone(),
+impl Log {
+    /// When `log_full_input` is off, redact obvious bulk fields. We
+    /// keep short identifying fields (`rel_path`, `top_k`, `query`'s
+    /// length) so debugging stays useful without persisting note
+    /// bodies.
+    fn redact_for_audit(&self, input: &serde_json::Value) -> serde_json::Value {
+        let serde_json::Value::Object(map) = input else {
+            return input.clone();
         };
-        out.insert(k.clone(), masked);
+        let mut out = serde_json::Map::with_capacity(map.len());
+        for (k, v) in map {
+            let masked = match (k.as_str(), v) {
+                ("content", serde_json::Value::String(s)) => {
+                    serde_json::json!({"redacted": true, "len": s.len()})
+                }
+                ("query", serde_json::Value::String(s)) => {
+                    serde_json::json!({"redacted": true, "len": s.len()})
+                }
+                ("fields", serde_json::Value::Object(_)) => {
+                    serde_json::json!({"redacted": true})
+                }
+                _ => v.clone(),
+            };
+            out.insert(k.clone(), masked);
+        }
+        serde_json::Value::Object(out)
     }
-    serde_json::Value::Object(out)
 }

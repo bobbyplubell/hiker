@@ -35,7 +35,7 @@ pub enum LinePair {
 
 /// Char-level intraline diff result for one Modified pair.
 #[derive(Clone, Debug, Default)]
-pub struct CharDiff {
+pub struct Char {
     /// Char-level insertions: byte ranges into the *right* line.
     pub inserts: Vec<std::ops::Range<usize>>,
     /// Char-level deletions: byte ranges into the *left* line.
@@ -131,7 +131,7 @@ fn first_match_index(needle: &str, hay: &[&str], from: usize, threshold: f32) ->
 /// Compute a char-level diff between two single lines, returning the byte
 /// ranges of inserts (into `right`) and deletes (into `left`), plus the
 /// similarity ratio.
-pub fn char_diff(left: &str, right: &str) -> CharDiff {
+pub fn chars(left: &str, right: &str) -> Char {
     let diff = TextDiff::from_chars(left, right);
     let mut inserts: Vec<std::ops::Range<usize>> = Vec::new();
     let mut deletes: Vec<std::ops::Range<usize>> = Vec::new();
@@ -162,10 +162,10 @@ pub fn char_diff(left: &str, right: &str) -> CharDiff {
     }
     if let Some(r) = cur_ins { inserts.push(r); }
     if let Some(r) = cur_del { deletes.push(r); }
-    CharDiff { inserts, deletes, similarity: diff.ratio() }
+    Char { inserts, deletes, similarity: diff.ratio() }
 }
 
-pub fn diff_lines(left: &str, right: &str) -> Vec<Hunk> {
+pub fn lines(left: &str, right: &str) -> Vec<Hunk> {
     let diff = TextDiff::from_lines(left, right);
     let mut hunks: Vec<Hunk> = Vec::new();
     let (mut li, mut ri) = (0usize, 0usize);
@@ -179,7 +179,53 @@ pub fn diff_lines(left: &str, right: &str) -> Vec<Hunk> {
                  pending_right_text: &mut String| {
         if let Some(mut h) = pending.take() {
             if h.kind == HunkKind::Modified {
-                h.intraline = word_diff(pending_left_text, pending_right_text);
+                let wdiff = TextDiff::from_words(
+                    pending_left_text.as_str(),
+                    pending_right_text.as_str(),
+                );
+                let mut out: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> = Vec::new();
+                let (mut wli, mut wri) = (0usize, 0usize);
+                let mut left_run: Option<std::ops::Range<usize>> = None;
+                let mut right_run: Option<std::ops::Range<usize>> = None;
+                let emit =
+                    |out: &mut Vec<_>,
+                     left_run: &mut Option<std::ops::Range<usize>>,
+                     right_run: &mut Option<std::ops::Range<usize>>| {
+                        if let (Some(l), Some(r)) = (left_run.clone(), right_run.clone()) {
+                            out.push((l, r));
+                            *left_run = None;
+                            *right_run = None;
+                        }
+                    };
+                for change in wdiff.iter_all_changes() {
+                    let word = change.value();
+                    let wlen = word.len();
+                    match change.tag() {
+                        ChangeTag::Equal => {
+                            emit(&mut out, &mut left_run, &mut right_run);
+                            wli += wlen;
+                            wri += wlen;
+                        }
+                        ChangeTag::Delete => {
+                            let r = left_run.get_or_insert(wli..wli);
+                            r.end = wli + wlen;
+                            if right_run.is_none() {
+                                right_run = Some(wri..wri);
+                            }
+                            wli += wlen;
+                        }
+                        ChangeTag::Insert => {
+                            let r = right_run.get_or_insert(wri..wri);
+                            r.end = wri + wlen;
+                            if left_run.is_none() {
+                                left_run = Some(wli..wli);
+                            }
+                            wri += wlen;
+                        }
+                    }
+                }
+                emit(&mut out, &mut left_run, &mut right_run);
+                h.intraline = out;
             }
             hunks.push(h);
             pending_left_text.clear();
@@ -250,61 +296,13 @@ pub fn diff_lines(left: &str, right: &str) -> Vec<Hunk> {
     merged
 }
 
-fn word_diff(left: &str, right: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let diff = TextDiff::from_words(left, right);
-    let mut out = Vec::new();
-    let (mut li, mut ri) = (0usize, 0usize);
-    let mut left_run: Option<std::ops::Range<usize>> = None;
-    let mut right_run: Option<std::ops::Range<usize>> = None;
-
-    let emit = |out: &mut Vec<_>,
-                left_run: &mut Option<std::ops::Range<usize>>,
-                right_run: &mut Option<std::ops::Range<usize>>| {
-        if let (Some(l), Some(r)) = (left_run.clone(), right_run.clone()) {
-            out.push((l, r));
-            *left_run = None;
-            *right_run = None;
-        }
-    };
-
-    for change in diff.iter_all_changes() {
-        let word = change.value();
-        let wlen = word.len();
-        match change.tag() {
-            ChangeTag::Equal => {
-                emit(&mut out, &mut left_run, &mut right_run);
-                li += wlen;
-                ri += wlen;
-            }
-            ChangeTag::Delete => {
-                let r = left_run.get_or_insert(li..li);
-                r.end = li + wlen;
-                if right_run.is_none() {
-                    right_run = Some(ri..ri);
-                }
-                li += wlen;
-            }
-            ChangeTag::Insert => {
-                let r = right_run.get_or_insert(ri..ri);
-                r.end = ri + wlen;
-                if left_run.is_none() {
-                    left_run = Some(li..li);
-                }
-                ri += wlen;
-            }
-        }
-    }
-    emit(&mut out, &mut left_run, &mut right_run);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn equal_lines_only_context() {
-        let h = diff_lines("a\nb\nc\n", "a\nb\nc\n");
+        let h = lines("a\nb\nc\n", "a\nb\nc\n");
         assert!(h.iter().all(|h| h.kind == HunkKind::Context));
         // After merging, all-equal collapses to a single Context hunk.
         assert_eq!(h.len(), 1);
@@ -313,19 +311,19 @@ mod tests {
 
     #[test]
     fn pure_add() {
-        let h = diff_lines("a\nb\n", "a\nb\nc\n");
+        let h = lines("a\nb\n", "a\nb\nc\n");
         assert!(h.iter().any(|h| h.kind == HunkKind::Added));
     }
 
     #[test]
     fn pure_remove() {
-        let h = diff_lines("a\nb\nc\n", "a\nb\n");
+        let h = lines("a\nb\nc\n", "a\nb\n");
         assert!(h.iter().any(|h| h.kind == HunkKind::Removed));
     }
 
     #[test]
     fn modified_with_intraline() {
-        let h = diff_lines("hello world\n", "hello rust\n");
+        let h = lines("hello world\n", "hello rust\n");
         let m = h.iter().find(|h| h.kind == HunkKind::Modified).unwrap();
         assert!(!m.intraline.is_empty());
     }
@@ -366,7 +364,7 @@ mod tests {
 
     #[test]
     fn char_diff_inserts() {
-        let cd = char_diff("hello", "hello world");
+        let cd = chars("hello", "hello world");
         let total_insert: usize = cd.inserts.iter().map(|r| r.end - r.start).sum();
         assert_eq!(total_insert, 6); // " world"
     }

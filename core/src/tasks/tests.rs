@@ -1,11 +1,12 @@
 use std::time::{Duration, SystemTime};
 
-use super::queue::{validate_against_schema, Queue, WorkerPreferenceCfg};
+use super::queue::{validate_against_schema, Queue};
+use crate::config::sections::WorkerPreferenceCfg;
 use super::types::{
     CancelReason, McpClientVia, Priority, QueueError, Task, TaskKind, TaskOutcome, TaskPayload,
     TaskShape,
 };
-use crate::config::TasksConfig;
+use crate::config::sections::TasksConfig;
 
 fn task(kind: TaskKind, priority: Priority, shape: TaskShape) -> Task {
     Task {

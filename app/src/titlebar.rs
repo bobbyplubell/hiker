@@ -8,7 +8,8 @@ use crate::icons;
 use crate::state::AppState;
 use crate::theme;
 
-pub fn show(ctx: &egui::Context, _state: &mut AppState) {
+impl AppState {
+    pub fn titlebar(&mut self, ctx: &egui::Context) {
     egui::TopBottomPanel::top("custom-titlebar")
         .exact_height(28.0)
         .frame(
@@ -26,14 +27,14 @@ pub fn show(ctx: &egui::Context, _state: &mut AppState) {
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         if ui
-                            .add(egui::Button::image(icons::window_close()))
+                            .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::WindowClose)))
                             .on_hover_text("Close")
                             .clicked()
                         {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                         if ui
-                            .add(egui::Button::image(icons::window_maximize()))
+                            .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::WindowMaximize)))
                             .on_hover_text("Maximize")
                             .clicked()
                         {
@@ -45,7 +46,7 @@ pub fn show(ctx: &egui::Context, _state: &mut AppState) {
                             );
                         }
                         if ui
-                            .add(egui::Button::image(icons::window_minimize()))
+                            .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::WindowMinimize)))
                             .on_hover_text("Minimize")
                             .clicked()
                         {
@@ -68,4 +69,5 @@ pub fn show(ctx: &egui::Context, _state: &mut AppState) {
                 );
             });
         });
+    }
 }

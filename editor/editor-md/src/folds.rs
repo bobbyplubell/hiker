@@ -7,9 +7,15 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use editor_core::{
-    Decoration, DecorationSet, EditorState, FoldChevron, LineStyle, RangeSet,
-};
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::decoration::FoldChevron;
+
+use editor_core::decoration::LineStyle;
+
+use editor_core::rangeset::RangeSet;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Default-empty: hosts treat membership as "this id is collapsed".
@@ -64,7 +70,15 @@ pub fn fold_regions(state: &EditorState) -> Vec<FoldRegion> {
     for (event, byte_range) in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                in_heading = Some((line_of(byte_range.start), level_to_u8(level), String::new()));
+                let lvl = match level {
+                    HeadingLevel::H1 => 1u8,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                in_heading = Some((line_of(byte_range.start), lvl, String::new()));
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some(h) = in_heading.take() {
@@ -149,23 +163,21 @@ pub fn fold_regions(state: &EditorState) -> Vec<FoldRegion> {
     }
 
     // Disambiguate IDs that collide (two headings with identical text).
-    deduplicate_ids(&mut regions);
-    regions
-}
-
-fn deduplicate_ids(regions: &mut [FoldRegion]) {
-    let mut seen: HashMap<u64, u32> = HashMap::new();
-    for r in regions.iter_mut() {
-        let entry = seen.entry(r.id).or_insert(0);
-        if *entry > 0 {
-            // Mix in occurrence index for uniqueness.
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            r.id.hash(&mut h);
-            (*entry as u64).hash(&mut h);
-            r.id = h.finish();
+    {
+        let mut seen: HashMap<u64, u32> = HashMap::new();
+        for r in regions.iter_mut() {
+            let entry = seen.entry(r.id).or_insert(0);
+            if *entry > 0 {
+                // Mix in occurrence index for uniqueness.
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                r.id.hash(&mut h);
+                (*entry as u64).hash(&mut h);
+                r.id = h.finish();
+            }
+            *entry += 1;
         }
-        *entry += 1;
     }
+    regions
 }
 
 /// Produce a DecorationSet that:
@@ -229,13 +241,3 @@ fn fold_id(kind: FoldKind, text: &str) -> u64 {
     h.finish()
 }
 
-fn level_to_u8(l: HeadingLevel) -> u8 {
-    match l {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}

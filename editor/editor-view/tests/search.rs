@@ -1,11 +1,14 @@
 //! Tests for the search engine + state + decoration provider.
 //! SPEC §9.13, IMPLEMENTATION §16.6.4.
 
-use editor_core::{Decoration, EditorState};
-use editor_view::search::{
-    replace_all, run_search, search_decorations, SearchFlags, SearchState,
-};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_view::find::replace_all;
+use editor_view::find::run_search;
+use editor_view::find::search_decorations;
+use editor_view::find::SearchFlags;
+use editor_view::find::SearchState;
 #[test]
 fn plain_substring_search_finds_all_matches() {
     let state = EditorState::new("foo bar foo baz foo");

@@ -9,8 +9,8 @@
 //! - [`parse`] does a full parse; [`reparse`] performs an incremental
 //!   reparse given a previous state and a list of `tree_sitter::InputEdit`s.
 //! - [`ts_decorations`] consumes a `TsState` and emits a
-//!   `DecorationSet` of [`editor_core::Decoration::Mark`]s colored via the
-//!   active [`editor_core::Theme`]'s `tokens` map.
+//!   `DecorationSet` of [`editor_core::decoration::Decoration::Mark`]s colored via the
+//!   active [`editor_core::theme::Theme`]'s `tokens` map.
 //!
 //! # Language parsers are deferred
 //!
@@ -23,8 +23,8 @@
 //!
 //! 1. Add `tree-sitter-rust = "…"` (or similar) to their own `Cargo.toml`.
 //! 2. Enable the matching feature on `editor-ts`.
-//! 3. Uncomment the bundle in `languages.rs` to use the upstream grammar +
-//!    its bundled `highlights.scm`.
+//! 3. Fill in the matching arm of [`languages::bundle`] to use the upstream
+//!    grammar + its bundled `highlights.scm`.
 //!
 //! Hosts that prefer a fully bespoke setup can also build a `TsLanguage`
 //! by hand: combine any `tree_sitter::Language` with whatever query text
@@ -40,9 +40,6 @@
 //! crate scopes a per-language `TsState` to that range. That wiring lives
 //! in `editor-md` and is not yet implemented.
 
-pub mod state;
+pub mod parsing;
 pub mod highlight;
 pub mod languages;
-
-pub use highlight::ts_decorations;
-pub use state::{TsLanguage, TsState, changeset_to_edits, parse, reparse};

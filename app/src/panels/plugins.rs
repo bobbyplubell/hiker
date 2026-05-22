@@ -34,13 +34,6 @@ fn manifest_path(app: &AppState) -> PathBuf {
     app.vault_session.vault_root.join(".hiker/plugins.json")
 }
 
-fn load(app: &AppState) -> PluginsFile {
-    std::fs::read(manifest_path(app))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
 fn save(app: &AppState, file: &PluginsFile) -> std::io::Result<()> {
     let path = manifest_path(app);
     if let Some(parent) = path.parent()
@@ -57,8 +50,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Plugins");
     ui.add_space(4.0);
 
-    let mut file = load(app);
+    // Load the manifest (defaults to empty when absent / unparseable).
     let manifest = manifest_path(app);
+    let mut file: PluginsFile = std::fs::read(&manifest)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
     ui.label(
         egui::RichText::new(format!("Manifest: {}", manifest.display()))
             .color(theme::muted())

@@ -1,21 +1,34 @@
-//! `EditorWidget`: drop-in egui widget for an EditorState + ViewState pair.
+//! `Widget`: drop-in egui widget for an EditorState + ViewState pair.
 
 use std::sync::Arc;
 
-use editor_core::{
-    BlockDeco, BlockSide, Color, Decoration, EditorState,
-    InlineWidget, LineStyle, MarkStyle,
-};
-use editor_view::command::{self, Action};
-use editor_view::view::{DragState, MeasureCache};
-use editor_view::{
-    ClickAction, ClickRect, ClickZone, InputEvent, Panel, PanelKind, PanelPlacement, ViewState,
-};
+use editor_core::decoration::BlockDeco;
 
+use editor_core::decoration::BlockSide;
+
+use editor_core::decoration::Color;
+
+use editor_core::decoration::Decoration;
+
+use editor_core::state::Editor as EditorState;
+use editor_core::decoration::InlineWidget;
+
+use editor_core::decoration::LineStyle;
+
+use editor_view::command;
+use editor_view::command::Action;
+use editor_view::viewport::DragState;
+use editor_view::viewport::MeasureCache;
+use editor_view::viewport::ClickAction;
+use editor_view::viewport::ClickRect;
+use editor_view::viewport::ClickZone;
+use editor_view::events::InputEvent;
+use editor_view::viewport::ViewState;
 mod blocks;
+mod layout;
 mod search_panel;
-use blocks::paint_block_zone;
-use search_panel::{refresh_search_matches, sync_search_panel};
+use blocks::{BlockPaint, BlockZone};
+use layout::{LineLayout, LineLayoutBuilder, LineMeasured};
 
 /// Per-frame snapshot of the inputs that feed the measure pass. Compared
 /// against `ViewState::measure_cache` to decide whether geometry needs to be
@@ -33,7 +46,7 @@ struct ViewUpdate {
 
 /// Per-(buffer-line, vline-index) cached layout result. Lives across frames;
 /// owned by the host via `PaintCache` and passed into the widget through
-/// `EditorWidget::with_paint_cache`. Invalidated per-entry when any of
+/// `Widget::with_paint_cache`. Invalidated per-entry when any of
 /// `(text_hash, doc_id, sel_line, layers_sig, metrics)` changes for that
 /// entry. Entries unreferenced for several frames are evicted.
 struct CachedRow {
@@ -49,7 +62,7 @@ struct CachedRow {
 
 /// Per-widget paint cache. The host stores one of these alongside its
 /// `EditorState` + `ViewState` (e.g. on a `Buffer` struct) and passes a
-/// `&mut` into the widget via `EditorWidget::with_paint_cache`. When no
+/// `&mut` into the widget via `Widget::with_paint_cache`. When no
 /// external cache is provided, `show` falls back to a transient one that
 /// lives only for the duration of the call — fine for one-shot renders
 /// (tests, previews) but loses cross-frame reuse.
@@ -65,14 +78,6 @@ impl PaintCache {
         let cutoff = self.frame.saturating_sub(max_age);
         self.entries.retain(|_, e| e.last_used_frame >= cutoff);
     }
-}
-
-/// Cheap deterministic hash of a string slice.
-fn hash_str(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
 }
 
 /// Stable fingerprint over the metrics that, if changed, invalidate the
@@ -94,13 +99,9 @@ fn compute_metrics_fingerprint(view: &ViewState) -> u64 {
     }
     acc
 }
-use egui::{
-    epaint::text::{LayoutJob, TextFormat},
-    Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke,
-};
-use smol_str::SmolStr;
+use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke};
 
-pub struct EditorWidget<'a> {
+pub struct Widget<'a> {
     pub state: &'a mut EditorState,
     pub view: &'a mut ViewState,
     pub clicks_out: Option<&'a mut Vec<ClickAction>>,
@@ -112,15 +113,15 @@ pub struct EditorWidget<'a> {
     pub paint_cache: Option<&'a mut PaintCache>,
 }
 
-impl<'a> EditorWidget<'a> {
-    pub fn new(state: &'a mut EditorState, view: &'a mut ViewState) -> Self {
+impl<'a> Widget<'a> {
+    pub const fn new(state: &'a mut EditorState, view: &'a mut ViewState) -> Self {
         Self { state, view, clicks_out: None, paint_cache: None }
     }
 
     /// Configure a sink that receives any `ClickAction`s the widget produced
     /// this frame (e.g. an Expander toggle). The host pops them after `show`
     /// returns and applies them to its fold / region state.
-    pub fn with_click_sink(mut self, sink: &'a mut Vec<ClickAction>) -> Self {
+    pub const fn with_click_sink(mut self, sink: &'a mut Vec<ClickAction>) -> Self {
         self.clicks_out = Some(sink);
         self
     }
@@ -128,7 +129,7 @@ impl<'a> EditorWidget<'a> {
     /// Plug in a host-owned `PaintCache` so per-line galleys survive
     /// across frames. Without this the widget reuses nothing — every
     /// paint rebuilds every line layout.
-    pub fn with_paint_cache(mut self, cache: &'a mut PaintCache) -> Self {
+    pub const fn with_paint_cache(mut self, cache: &'a mut PaintCache) -> Self {
         self.paint_cache = Some(cache);
         self
     }
@@ -137,7 +138,7 @@ impl<'a> EditorWidget<'a> {
         // Phase 0: layout — claim screen space and compute the text rect.
         let desired = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
-        sync_search_panel(self.view);
+        self.sync_search_panel();
         let (top_h, bottom_h) = self.view.panels.heights();
         let text_rect = Rect::from_min_max(
             Pos2::new(rect.min.x, rect.min.y + top_h),
@@ -161,14 +162,19 @@ impl<'a> EditorWidget<'a> {
         // `&mut PaintCache` via `with_paint_cache`; tests/previews and
         // legacy call sites get a fresh cache per frame.
         let mut fallback_cache = PaintCache::default();
-        let cache: &mut PaintCache = match self.paint_cache.as_deref_mut() {
+        // Temporarily detach the host cache so we can call `self.paint(...)`
+        // without holding two mutable borrows of `self` (the cache field
+        // and the method receiver).
+        let mut host_cache = self.paint_cache.take();
+        let cache: &mut PaintCache = match host_cache.as_deref_mut() {
             Some(c) => c,
             None => &mut fallback_cache,
         };
-        paint(ui, self.state, self.view, cache, text_rect, has_focus);
+        self.paint(ui, cache, text_rect, has_focus);
+        self.paint_cache = host_cache;
         crate::tooltip::paint_tooltips(ui, self.view, self.state, text_rect);
         crate::completion::paint_completion_popup(ui, self.view, self.state, text_rect);
-        refresh_search_matches(self.state, self.view);
+        self.refresh_search_matches();
         crate::panel::paint_panels(ui, self.view, rect, top_h, bottom_h);
         response
     }
@@ -231,7 +237,7 @@ impl<'a> EditorWidget<'a> {
         // the very first click on an unfocused widget is what grants focus,
         // and dropping that click breaks selection start. Keyboard events
         // remain focus-gated.
-        let mods = ui.input(|i| editor_view::Modifiers {
+        let mods = ui.input(|i| editor_view::events::Modifiers {
             ctrl: i.modifiers.ctrl,
             alt: i.modifiers.alt,
             shift: i.modifiers.shift,
@@ -307,8 +313,8 @@ impl<'a> EditorWidget<'a> {
         // visible band.
         self.view.sync_to(self.state);
         self.view.wrap_map.ensure_capacity(self.state.doc.len_lines());
-        prewrap_visible(self.view, self.state);
-        apply_line_height_decorations(self.view, self.state);
+        self.prewrap_visible();
+        self.apply_line_height_decorations();
 
         // Viewport may have shifted as a result of the geometry rebuild
         // (heights changing under us). Re-read for the cache snapshot.
@@ -335,7 +341,10 @@ impl<'a> EditorWidget<'a> {
     }
 }
 
-fn apply_line_height_decorations(view: &mut ViewState, state: &EditorState) {
+impl<'a> Widget<'a> {
+fn apply_line_height_decorations(&mut self) {
+    let view = &mut *self.view;
+    let state = &*self.state;
     let base = view.line_height;
     let total_lines = state.doc.len_lines();
     // O(K) reset over existing overrides rather than O(N) over every
@@ -401,9 +410,38 @@ fn apply_line_height_decorations(view: &mut ViewState, state: &EditorState) {
     }
     view.height_map.recompute();
 }
+}
+
+/// Geometry + byte extent of one painted row (a buffer line, or one
+/// visual row of a wrapped line). Threaded through the per-row paint
+/// helpers so they share a single cohesive descriptor instead of four
+/// loose positional args. `Copy` so it passes by value cheaply.
+#[derive(Clone, Copy)]
+struct RowSpan {
+    line_idx: usize,
+    byte_start: usize,
+    byte_end: usize,
+    top_y: f32,
+    height: f32,
+}
+
+/// Geometry of one inline segment's placeholder box: its horizontal
+/// extent (`x`, `width`), the row band it sits in (`top_y`, `height`),
+/// and the baseline `label_y` for any text drawn inside. `Copy`.
+#[derive(Clone, Copy)]
+struct SegSpan {
+    x: f32,
+    width: f32,
+    top_y: f32,
+    height: f32,
+    label_y: f32,
+}
 
 struct PaintCtx<'a> {
     ui: &'a mut egui::Ui,
+    state: &'a EditorState,
+    view: &'a mut ViewState,
+    cache: &'a mut PaintCache,
     painter: egui::Painter,
     rect: Rect,
     text_origin_x: f32,
@@ -416,10 +454,10 @@ struct PaintCtx<'a> {
     has_focus: bool,
 }
 
+impl<'a> Widget<'a> {
 fn paint(
+    &mut self,
     ui: &mut egui::Ui,
-    state: &EditorState,
-    view: &mut ViewState,
     cache: &mut PaintCache,
     rect: Rect,
     has_focus: bool,
@@ -436,11 +474,11 @@ fn paint(
 
     // Placeholder text: when the doc is empty and a placeholder is set, paint
     // it dimmed at the text origin and return early. See SPEC §9.12.
-    if state.doc.is_empty() {
-        if let Some(placeholder) = view.placeholder.clone() {
+    if self.state.doc.is_empty() {
+        if let Some(placeholder) = self.view.placeholder.clone() {
             let text_origin_x =
-                rect.left() + if view.hide_gutter { 4.0 } else { view.gutter_width };
-            let font_id = FontId::new(view.font_size, FontFamily::Monospace);
+                rect.left() + if self.view.hide_gutter { 4.0 } else { self.view.gutter_width };
+            let font_id = FontId::new(self.view.font_size, FontFamily::Monospace);
             let dim = visuals.weak_text_color();
             painter.text(
                 Pos2::new(text_origin_x, rect.top()),
@@ -461,13 +499,24 @@ fn paint(
     } else {
         Color::rgba(120, 120, 140, 45)
     };
+    let text_origin_x = rect.left() + if self.view.hide_gutter { 4.0 } else { self.view.gutter_width };
+    let base_font_id = FontId::new(self.view.font_size, FontFamily::Monospace);
+    let selection_color = {
+        let s = visuals.selection.bg_fill;
+        Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), 110)
+    };
+    let text_color = visuals.text_color();
+    let cursor_color = visuals.text_color();
+    let gutter_color = visuals.weak_text_color();
     let mut ctx = PaintCtx {
         ui,
+        state: &*self.state,
+        view: &mut *self.view,
+        cache,
         painter,
         rect,
-        text_origin_x: rect.left() + if view.hide_gutter { 4.0 } else { view.gutter_width },
-        base_font_id: FontId::new(view.font_size, FontFamily::Monospace),
-        text_color: visuals.text_color(),
+        text_origin_x,
+        base_font_id,
         // egui's `visuals.selection.bg_fill` is opaque and tuned for
         // filling button shapes — used directly here it would obscure
         // the glyphs underneath. We want a translucent tint instead.
@@ -476,29 +525,18 @@ fn paint(
         // dropping it to ~50% of an already-dark color on a dark
         // background made the selection visually disappear. Build a
         // fixed-alpha overlay from the theme accent instead.
-        selection_color: {
-            let s = visuals.selection.bg_fill;
-            Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), 110)
-        },
-        cursor_color: visuals.text_color(),
-        gutter_color: visuals.weak_text_color(),
+        text_color,
+        selection_color,
+        cursor_color,
+        gutter_color,
         hatched_default,
         has_focus,
     };
 
-    for line_idx in view.visible_lines() {
-        if line_idx >= state.doc.len_lines() {
-            break;
-        }
-        paint_visible_line(&mut ctx, state, view, cache, line_idx);
-    }
+    ctx.paint_lines();
 
-    if let DragState::DraggingSelection { drop_caret } = view.drag {
-        paint_drop_caret(&mut ctx, state, view, drop_caret);
-    }
-
-    if !view.hide_gutter {
-        let sep_x = rect.left() + view.gutter_width - 2.0;
+    if !ctx.view.hide_gutter {
+        let sep_x = rect.left() + ctx.view.gutter_width - 2.0;
         ctx.painter.line_segment(
             [Pos2::new(sep_x, rect.top()), Pos2::new(sep_x, rect.bottom())],
             Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.3)),
@@ -508,226 +546,273 @@ fn paint(
         ctx.ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
-
-/// Paint a thin vertical "drop indicator" caret at `drop_caret` (byte
-/// offset). Used during text drag-and-drop to show where a release would
-/// insert the dragged text. SPEC §9.19.
-fn paint_drop_caret(
-    ctx: &mut PaintCtx<'_>,
-    state: &EditorState,
-    view: &ViewState,
-    drop_caret: usize,
-) {
-    if state.doc.len_lines() == 0 {
-        return;
-    }
-    let clamped = drop_caret.min(state.doc.len_bytes());
-    let line = state.doc.byte_to_line(clamped);
-    if line >= state.doc.len_lines() {
-        return;
-    }
-    let row_top_y = ctx.rect.top() + view.line_top_y(line);
-    let above_h = view.height_map.block_above(line);
-    let text_top_y = row_top_y + above_h;
-    let row_h = view.height_map.text_height(line).max(view.line_height);
-
-    let line_start = state.doc.line_to_byte(line);
-    let line_text = state.doc.line_str(line);
-    let local = clamped.saturating_sub(line_start).min(line_text.len());
-    let prefix = &line_text[..local];
-    let font_id = ctx.base_font_id.clone();
-    let galley = ctx
-        .ui
-        .fonts(|f| f.layout_no_wrap(prefix.to_string(), font_id, Color32::WHITE));
-    let x = ctx.text_origin_x + galley.size().x;
-
-    let color = Color32::from_rgb(0, 150, 200);
-    let r = Rect::from_min_max(
-        Pos2::new(x - 0.75, text_top_y),
-        Pos2::new(x + 0.75, text_top_y + row_h),
-    );
-    ctx.painter.rect_filled(r, 0.0, color);
 }
 
-fn paint_visible_line(ctx: &mut PaintCtx<'_>, state: &EditorState, view: &mut ViewState, cache: &mut PaintCache, line_idx: usize) {
-    let row_top_y = ctx.rect.top() + view.line_top_y(line_idx);
-    let above_h = view.height_map.block_above(line_idx);
-    let below_h = view.height_map.block_below(line_idx);
-    let line_top_y = row_top_y + above_h;
-    let row_height = view.row_height(line_idx);
-    let line_text = state.doc.line_str(line_idx);
-    let line_byte_start = state.doc.line_to_byte(line_idx);
-    let line_byte_end = line_byte_start + line_text.len();
-    let is_hidden = view.height_map.text_height(line_idx) <= 0.5;
-
-    if above_h > 0.0 {
-        let zone_rect = Rect::from_min_max(
-            Pos2::new(ctx.rect.left(), row_top_y),
-            Pos2::new(ctx.rect.right(), row_top_y + above_h),
-        );
-        paint_block_zone(
-            ctx.ui, &ctx.painter, &view.decorations.layers,
-            line_byte_start, line_byte_end, BlockSide::Above,
-            zone_rect, view.font_size, view.line_height,
-            ctx.text_origin_x, ctx.hatched_default,
-            &mut view.click_zones, ctx.rect,
-        );
-    }
-
-    if !is_hidden {
-        let vlines: Vec<(usize, usize)> = if view.wrap_map.enabled() {
-            view.wrap_map
-                .peek(line_idx)
-                .map(|w| w.vlines.iter().map(|(s, e)| (*s as usize, *e as usize)).collect())
-                .unwrap_or_else(|| vec![(0usize, line_text.len())])
-        } else {
-            vec![(0usize, line_text.len())]
-        };
-        let vline_count = vlines.len().max(1) as f32;
-        // For scaled lines (markdown headings) the heightmap allocates
-        // `scale * line_height` vertical space. Each vline gets an equal
-        // share so the gutter number + segment text center inside the
-        // line's actual extent rather than hugging the top.
-        let row_h = (view.height_map.text_height(line_idx) / vline_count)
-            .max(view.line_height);
-        for (vi, (vs, ve)) in vlines.iter().enumerate() {
-            let vline_top_y = line_top_y + (vi as f32) * row_h;
-            let vline_byte_start = line_byte_start + *vs;
-            let vline_byte_end = line_byte_start + *ve;
-            let vline_text = &line_text[*vs..*ve];
-            let is_first_vline = vi == 0;
-            paint_text_row(
-                ctx, state, view, cache, line_idx, vline_text,
-                vline_byte_start, vline_byte_end, vline_top_y, row_h, is_first_vline,
-            );
+impl<'a> PaintCtx<'a> {
+    fn paint_lines(&mut self) {
+        for line_idx in self.view.visible_lines() {
+            if line_idx >= self.state.doc.len_lines() {
+                break;
+            }
+            self.paint_visible_line(line_idx);
+        }
+        if let DragState::DraggingSelection { drop_caret } = self.view.drag {
+            self.paint_drop_caret(drop_caret);
         }
     }
 
-    if below_h > 0.0 {
-        let zone_top = if is_hidden { line_top_y } else { line_top_y + row_height };
-        let zone_rect = Rect::from_min_max(
-            Pos2::new(ctx.rect.left(), zone_top),
-            Pos2::new(ctx.rect.right(), zone_top + below_h),
-        );
-        paint_block_zone(
-            ctx.ui, &ctx.painter, &view.decorations.layers,
-            line_byte_start, line_byte_end, BlockSide::Below,
-            zone_rect, view.font_size, view.line_height,
-            ctx.text_origin_x, ctx.hatched_default,
-            &mut view.click_zones, ctx.rect,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_text_row(
-    ctx: &mut PaintCtx<'_>,
-    state: &EditorState,
-    view: &mut ViewState,
-    cache: &mut PaintCache,
-    line_idx: usize,
-    vline_text: &str,
-    vline_byte_start: usize,
-    vline_byte_end: usize,
-    vline_top_y: f32,
-    row_h: f32,
-    is_first_vline: bool,
-) {
-    // Fingerprint inputs that, if any changes, invalidate the cached layout
-    // for this row. text_hash catches in-place edits to a same-length line;
-    // doc_id catches buffer mutations; sel_line catches cursor-on-line
-    // reveal decorations; layers_sig catches changed decoration sets;
-    // metrics catches font/size/width changes.
-    let text_hash = hash_str(vline_text);
-    let doc_id = state.doc.content_id() as u64;
-    let sel_line = state
-        .doc
-        .byte_to_line(state.selection.main().head.offset().min(state.doc.len_bytes()))
-        as u64;
-    let layers_sig = view.decorations.signature;
-    let metrics = compute_metrics_fingerprint(view);
-    let key = (line_idx, vline_byte_start);
-
-    // Cache lookup. On a hit we clone the stored layout/measured (cheap —
-    // galleys are Arc<Galley>, segments hold SmolStr + Arc<dyn InlineWidget>).
-    let frame = cache.frame;
-    let hit = cache
-        .entries
-        .get(&key)
-        .filter(|e| {
-            e.text_hash == text_hash
-                && e.doc_id == doc_id
-                && e.sel_line == sel_line
-                && e.layers_sig == layers_sig
-                && e.metrics == metrics
-        })
-        .map(|e| (e.layout.clone(), e.measured.clone()));
-
-    let (layout, measured) = if let Some((l, m)) = hit {
-        if let Some(entry) = cache.entries.get_mut(&key) {
-            entry.last_used_frame = frame;
+    /// Paint a thin vertical "drop indicator" caret at `drop_caret` (byte
+    /// offset). Used during text drag-and-drop to show where a release would
+    /// insert the dragged text. SPEC §9.19.
+    fn paint_drop_caret(&mut self, drop_caret: usize) {
+        if self.state.doc.len_lines() == 0 {
+            return;
         }
-        (l, m)
-    } else {
-        // Build fresh.
-        let layout = build_line_layout(
-            vline_text, vline_byte_start, &view.decorations.layers,
-            view.font_size, ctx.text_color,
-        );
-        let measured = layout.measure(ctx.ui);
-        cache.entries.insert(
-            key,
-            CachedRow {
-                last_used_frame: cache.frame,
-                text_hash,
-                doc_id,
-                sel_line,
-                layers_sig,
-                metrics,
-                layout: layout.clone(),
-                measured: measured.clone(),
-            },
-        );
-        (layout, measured)
-    };
-
-    if is_first_vline {
-        paint_line_bgs(ctx, state, view, line_idx, vline_byte_start, vline_byte_end, vline_top_y, row_h);
-        if !view.hide_gutter {
-            paint_gutter(ctx, view, line_idx, vline_byte_start, vline_byte_end, vline_top_y, row_h);
+        let clamped = drop_caret.min(self.state.doc.len_bytes());
+        let line = self.state.doc.byte_to_line(clamped);
+        if line >= self.state.doc.len_lines() {
+            return;
         }
-    } else if let Some(bg) = wrapped_continuation_bg(state, view, line_idx) {
+        let row_top_y = self.rect.top() + self.view.line_top_y(line);
+        let above_h = self.view.height_map.block_above(line);
+        let text_top_y = row_top_y + above_h;
+        let row_h = self.view.height_map.text_height(line).max(self.view.line_height);
+
+        let line_start = self.state.doc.line_to_byte(line);
+        let line_text = self.state.doc.line_str(line);
+        let local = clamped.saturating_sub(line_start).min(line_text.len());
+        let prefix = &line_text[..local];
+        let font_id = self.base_font_id.clone();
+        let galley = self
+            .ui
+            .fonts(|f| f.layout_no_wrap(prefix.to_string(), font_id, Color32::WHITE));
+        let x = self.text_origin_x + galley.size().x;
+
+        let color = Color32::from_rgb(0, 150, 200);
         let r = Rect::from_min_max(
-            Pos2::new(ctx.rect.left(), vline_top_y),
-            Pos2::new(ctx.rect.right(), vline_top_y + row_h),
+            Pos2::new(x - 0.75, text_top_y),
+            Pos2::new(x + 0.75, text_top_y + row_h),
         );
-        ctx.painter.rect_filled(r, 0.0, bg);
+        self.painter.rect_filled(r, 0.0, color);
     }
-    paint_selections(
-        ctx, state, view, line_idx, vline_byte_start, vline_byte_end,
-        vline_top_y, row_h, &measured, vline_text.len(),
-    );
-    paint_segments(ctx, &layout, &measured, vline_top_y, row_h, &mut view.click_zones);
-    paint_cursors(ctx, state, vline_byte_start, vline_byte_end, vline_top_y, row_h, &measured);
-}
 
-/// If the buffer line has a Line bg, continuation vlines (wrap rows after the
-/// first) should also paint that bg so the highlight runs through.
-fn wrapped_continuation_bg(state: &EditorState, view: &ViewState, line_idx: usize) -> Option<Color32> {
-    let line_byte_start = state.doc.line_to_byte(line_idx);
-    for layer in &view.decorations.layers {
-        for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_start + 1) {
-            if let Decoration::Line(LineStyle { bg: Some(c), .. }) = deco {
-                if state.doc.byte_to_line(range.start) == line_idx {
-                    return Some(to_egui_color(*c));
+    fn paint_visible_line(&mut self, line_idx: usize) {
+        let row_top_y = self.rect.top() + self.view.line_top_y(line_idx);
+        let above_h = self.view.height_map.block_above(line_idx);
+        let below_h = self.view.height_map.block_below(line_idx);
+        let line_top_y = row_top_y + above_h;
+        let row_height = self.view.row_height(line_idx);
+        let line_text = self.state.doc.line_str(line_idx);
+        let line_byte_start = self.state.doc.line_to_byte(line_idx);
+        let line_byte_end = line_byte_start + line_text.len();
+        let is_hidden = self.view.height_map.text_height(line_idx) <= 0.5;
+
+        if above_h > 0.0 {
+            let zone_rect = Rect::from_min_max(
+                Pos2::new(self.rect.left(), row_top_y),
+                Pos2::new(self.rect.right(), row_top_y + above_h),
+            );
+            BlockPaint {
+                ui: &*self.ui,
+                painter: &self.painter,
+                font_size: self.view.font_size,
+                line_height: self.view.line_height,
+                text_origin_x: self.text_origin_x,
+                hatched_default: self.hatched_default,
+                click_zones: &mut self.view.click_zones,
+                widget_rect: self.rect,
+            }
+            .paint_zone(&BlockZone {
+                layers: &self.view.decorations.layers,
+                line_byte_start,
+                line_byte_end,
+                side: BlockSide::Above,
+                rect: zone_rect,
+            });
+        }
+
+        if !is_hidden {
+            let vlines: Vec<(usize, usize)> = if self.view.wrap_map.enabled() {
+                self.view.wrap_map
+                    .peek(line_idx)
+                    .map(|w| w.vlines.iter().map(|(s, e)| (*s as usize, *e as usize)).collect())
+                    .unwrap_or_else(|| vec![(0usize, line_text.len())])
+            } else {
+                vec![(0usize, line_text.len())]
+            };
+            let vline_count = vlines.len().max(1) as f32;
+            // For scaled lines (markdown headings) the heightmap allocates
+            // `scale * line_height` vertical space. Each vline gets an equal
+            // share so the gutter number + segment text center inside the
+            // line's actual extent rather than hugging the top.
+            let row_h = (self.view.height_map.text_height(line_idx) / vline_count)
+                .max(self.view.line_height);
+            for (vi, (vs, ve)) in vlines.iter().enumerate() {
+                let vline_top_y = line_top_y + (vi as f32) * row_h;
+                let vline_byte_start = line_byte_start + *vs;
+                let vline_byte_end = line_byte_start + *ve;
+                let vline_text = line_text[*vs..*ve].to_string();
+                let is_first_vline = vi == 0;
+                self.paint_text_row(
+                    RowSpan {
+                        line_idx,
+                        byte_start: vline_byte_start,
+                        byte_end: vline_byte_end,
+                        top_y: vline_top_y,
+                        height: row_h,
+                    },
+                    &vline_text,
+                    is_first_vline,
+                );
+            }
+        }
+
+        if below_h > 0.0 {
+            let zone_top = if is_hidden { line_top_y } else { line_top_y + row_height };
+            let zone_rect = Rect::from_min_max(
+                Pos2::new(self.rect.left(), zone_top),
+                Pos2::new(self.rect.right(), zone_top + below_h),
+            );
+            BlockPaint {
+                ui: &*self.ui,
+                painter: &self.painter,
+                font_size: self.view.font_size,
+                line_height: self.view.line_height,
+                text_origin_x: self.text_origin_x,
+                hatched_default: self.hatched_default,
+                click_zones: &mut self.view.click_zones,
+                widget_rect: self.rect,
+            }
+            .paint_zone(&BlockZone {
+                layers: &self.view.decorations.layers,
+                line_byte_start,
+                line_byte_end,
+                side: BlockSide::Below,
+                rect: zone_rect,
+            });
+        }
+    }
+
+    fn paint_text_row(
+        &mut self,
+        span: RowSpan,
+        vline_text: &str,
+        is_first_vline: bool,
+    ) {
+        let RowSpan {
+            line_idx,
+            byte_start: vline_byte_start,
+            top_y: vline_top_y,
+            height: row_h,
+            ..
+        } = span;
+        // Fingerprint inputs that, if any changes, invalidate the cached layout
+        // for this row. text_hash catches in-place edits to a same-length line;
+        // doc_id catches buffer mutations; sel_line catches cursor-on-line
+        // reveal decorations; layers_sig catches changed decoration sets;
+        // metrics catches font/size/width changes.
+        let text_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            vline_text.hash(&mut h);
+            h.finish()
+        };
+        let doc_id = self.state.doc.content_id() as u64;
+        let sel_line = self.state
+            .doc
+            .byte_to_line(self.state.selection.main().head.offset().min(self.state.doc.len_bytes()))
+            as u64;
+        let layers_sig = self.view.decorations.signature;
+        let metrics = compute_metrics_fingerprint(self.view);
+        let key = (line_idx, vline_byte_start);
+
+        // Cache lookup. On a hit we clone the stored layout/measured (cheap —
+        // galleys are Arc<Galley>, segments hold SmolStr + Arc<dyn InlineWidget>).
+        let frame = self.cache.frame;
+        let hit = self.cache
+            .entries
+            .get(&key)
+            .filter(|e| {
+                e.text_hash == text_hash
+                    && e.doc_id == doc_id
+                    && e.sel_line == sel_line
+                    && e.layers_sig == layers_sig
+                    && e.metrics == metrics
+            })
+            .map(|e| (e.layout.clone(), e.measured.clone()));
+
+        let (layout, measured) = if let Some((l, m)) = hit {
+            if let Some(entry) = self.cache.entries.get_mut(&key) {
+                entry.last_used_frame = frame;
+            }
+            (l, m)
+        } else {
+            // Build fresh.
+            let layout = LineLayoutBuilder {
+                line_text: vline_text,
+                line_byte_start: vline_byte_start,
+                line_byte_end: vline_byte_start + vline_text.len(),
+                events: Vec::new(),
+                trailing_widgets: Vec::new(),
+                base_font_size: self.view.font_size,
+                base_color: self.text_color,
+            }
+            .build(&self.view.decorations.layers);
+            let measured = layout.measure(self.ui);
+            self.cache.entries.insert(
+                key,
+                CachedRow {
+                    last_used_frame: self.cache.frame,
+                    text_hash,
+                    doc_id,
+                    sel_line,
+                    layers_sig,
+                    metrics,
+                    layout: layout.clone(),
+                    measured: measured.clone(),
+                },
+            );
+            (layout, measured)
+        };
+
+        if is_first_vline {
+            self.paint_line_bgs(span);
+            if !self.view.hide_gutter {
+                self.paint_gutter(span);
+            }
+        } else if let Some(bg) = self.wrapped_continuation_bg(line_idx) {
+            let r = Rect::from_min_max(
+                Pos2::new(self.rect.left(), vline_top_y),
+                Pos2::new(self.rect.right(), vline_top_y + row_h),
+            );
+            self.painter.rect_filled(r, 0.0, bg);
+        }
+        self.paint_selections(span, &measured, vline_text.len());
+        self.paint_segments(&layout, &measured, vline_top_y, row_h);
+        self.paint_cursors(span, &measured);
+    }
+
+    /// If the buffer line has a Line bg, continuation vlines (wrap rows after the
+    /// first) should also paint that bg so the highlight runs through.
+    fn wrapped_continuation_bg(&self, line_idx: usize) -> Option<Color32> {
+        let line_byte_start = self.state.doc.line_to_byte(line_idx);
+        for layer in &self.view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_start + 1) {
+                if let Decoration::Line(LineStyle { bg: Some(c), .. }) = deco {
+                    if self.state.doc.byte_to_line(range.start) == line_idx {
+                        return Some(to_egui_color(*c));
+                    }
                 }
             }
         }
+        None
     }
-    None
 }
 
-fn prewrap_visible(view: &mut ViewState, state: &EditorState) {
+impl<'a> Widget<'a> {
+fn prewrap_visible(&mut self) {
+    let view = &mut *self.view;
+    let state = &*self.state;
     if !view.wrap_map.enabled() {
         return;
     }
@@ -756,726 +841,307 @@ fn prewrap_visible(view: &mut ViewState, state: &EditorState) {
     // then iterate with a mutable borrow of `view.wrap_map` — the two
     // fields are disjoint but the borrow checker can't see that across
     // the per-line closure without a separate scoped collection.
+    // Compute per-line scales inline. Each line's scale is the max
+    // `font_scale` of any Mark decoration covering it; defaults to 1.0
+    // and probes one byte past EOL so marks anchored at the line break
+    // still register (range queries are half-open).
+    let total_lines = state.doc.len_lines();
     let scales: Vec<f32> = (0..total)
-        .map(|line| line_font_scale(view, state, line))
+        .map(|line| {
+            if line >= total_lines {
+                return 1.0_f32;
+            }
+            let start = state.doc.line_to_byte(line);
+            let end = if line + 1 < total_lines {
+                state.doc.line_to_byte(line + 1)
+            } else {
+                state.doc.len_bytes()
+            };
+            let probe_end = end.max(start + 1);
+            let mut max_scale: f32 = 1.0;
+            for layer in &view.decorations.layers {
+                for (_range, deco) in layer.iter_overlapping(start..probe_end) {
+                    if let Decoration::Mark(ms) = deco
+                        && let Some(s) = ms.font_scale
+                        && s > max_scale
+                    {
+                        max_scale = s;
+                    }
+                }
+            }
+            max_scale
+        })
         .collect();
     for line in 0..total {
         let text = state.doc.line_str(line);
         view.wrap_map.get_or_compute(line, |_| text.clone(), scales[line]);
     }
 }
-
-/// Max `font_scale` of any `Mark` decoration covering `line`. Used by the
-/// soft-wrap calc so heading-scaled lines break at the right visual
-/// column. Returns `1.0` when no scaled mark covers the line, which is
-/// the unmodified base behavior.
-fn line_font_scale(view: &ViewState, state: &EditorState, line: usize) -> f32 {
-    use editor_core::Decoration;
-    let total_lines = state.doc.len_lines();
-    if line >= total_lines {
-        return 1.0;
-    }
-    let start = state.doc.line_to_byte(line);
-    let end = if line + 1 < total_lines {
-        state.doc.line_to_byte(line + 1)
-    } else {
-        state.doc.len_bytes()
-    };
-    // Empty line: nothing to scale, but probe one byte forward so a
-    // mark anchored exactly at the line break still registers (range
-    // queries are half-open).
-    let probe_end = end.max(start + 1);
-    let mut max_scale: f32 = 1.0;
-    for layer in &view.decorations.layers {
-        for (_range, deco) in layer.iter_overlapping(start..probe_end) {
-            if let Decoration::Mark(ms) = deco
-                && let Some(s) = ms.font_scale
-                && s > max_scale
-            {
-                max_scale = s;
-            }
-        }
-    }
-    max_scale
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_line_bgs(
-    ctx: &PaintCtx<'_>,
-    state: &EditorState,
-    view: &ViewState,
-    line_idx: usize,
-    line_byte_start: usize,
-    line_byte_end: usize,
-    line_top_y: f32,
-    row_height: f32,
-) {
-    for layer in &view.decorations.layers {
-        for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_end + 1) {
-            if let Decoration::Line(LineStyle { bg: Some(c), .. }) = deco {
-                if state.doc.byte_to_line(range.start) == line_idx {
-                    let r = Rect::from_min_max(
-                        Pos2::new(ctx.rect.left(), line_top_y),
-                        Pos2::new(ctx.rect.right(), line_top_y + row_height),
-                    );
-                    ctx.painter.rect_filled(r, 0.0, to_egui_color(*c));
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_selections(
-    ctx: &PaintCtx<'_>,
-    state: &EditorState,
-    view: &ViewState,
-    line_idx: usize,
-    line_byte_start: usize,
-    line_byte_end: usize,
-    line_top_y: f32,
-    row_height: f32,
-    measured: &LineMeasured,
-    line_text_len: usize,
-) {
-    for r in state.selection.ranges() {
-        let (s, e) = (r.start(), r.end());
-        if e < line_byte_start || s > line_byte_end {
-            continue;
-        }
-        let local_start = s.saturating_sub(line_byte_start);
-        let local_end = (e - line_byte_start).min(line_text_len);
-        if !r.is_empty() {
-            let x_start = measured.x_at_buffer_offset(local_start);
-            let x_end = measured.x_at_buffer_offset(local_end);
-            let sel = Rect::from_min_max(
-                Pos2::new(ctx.text_origin_x + x_start, line_top_y),
-                Pos2::new(ctx.text_origin_x + x_end, line_top_y + row_height),
-            );
-            ctx.painter.rect_filled(sel, 0.0, ctx.selection_color);
-        }
-        if e > line_byte_end && line_idx + 1 < state.doc.len_lines() {
-            let x_end = measured.total_width;
-            let extra = Rect::from_min_max(
-                Pos2::new(ctx.text_origin_x + x_end, line_top_y),
-                Pos2::new(ctx.text_origin_x + x_end + view.font_size * 0.5, line_top_y + row_height),
-            );
-            ctx.painter.rect_filled(extra, 0.0, ctx.selection_color);
-        }
-    }
-}
-
-fn paint_gutter(
-    ctx: &PaintCtx<'_>,
-    view: &mut ViewState,
-    line_idx: usize,
-    line_byte_start: usize,
-    line_byte_end: usize,
-    line_top_y: f32,
-    row_height: f32,
-) {
-    let num = (line_idx + 1).to_string();
-    let num_galley = ctx
-        .ui
-        .fonts(|f| f.layout_no_wrap(num, ctx.base_font_id.clone(), ctx.gutter_color));
-    let num_x = ctx.rect.left() + view.gutter_width - num_galley.size().x - 6.0;
-    let num_y = line_top_y + (row_height - num_galley.size().y) * 0.5;
-    ctx.painter
-        .galley(Pos2::new(num_x, num_y), num_galley, ctx.gutter_color);
-
-    if let Some(ch) = collect_fold_chevron(&view.decorations.layers, line_byte_start, line_byte_end) {
-        // Draw chevron as a small filled triangle via Painter::add(Shape::convex_polygon)
-        // — Unicode triangle glyphs aren't reliably present in egui's bundled
-        // fonts (would render as the missing-glyph box).
-        let size = ctx.base_font_id.size * 0.42;
-        let cx = ctx.rect.left() + 9.0;
-        let cy = line_top_y + row_height * 0.5;
-        let points = if ch.collapsed {
-            // ▶ — points right
-            vec![
-                Pos2::new(cx - size * 0.5, cy - size * 0.6),
-                Pos2::new(cx - size * 0.5, cy + size * 0.6),
-                Pos2::new(cx + size * 0.6, cy),
-            ]
-        } else {
-            // ▼ — points down
-            vec![
-                Pos2::new(cx - size * 0.6, cy - size * 0.4),
-                Pos2::new(cx + size * 0.6, cy - size * 0.4),
-                Pos2::new(cx, cy + size * 0.6),
-            ]
-        };
-        ctx.painter.add(egui::Shape::convex_polygon(
-            points,
-            ctx.gutter_color,
-            Stroke::NONE,
-        ));
-        view.click_zones.push(ClickZone {
-            rect: ClickRect {
-                x_min: 0.0,
-                y_min: line_top_y - ctx.rect.min.y,
-                x_max: 18.0,
-                y_max: line_top_y - ctx.rect.min.y + row_height,
-            },
-            action: ClickAction::ToggleFold(ch.id),
-        });
-    }
-}
-
-fn paint_segments(
-    ctx: &PaintCtx<'_>,
-    layout: &LineLayout,
-    measured: &LineMeasured,
-    line_top_y: f32,
-    row_height: f32,
-    click_zones: &mut Vec<ClickZone>,
-) {
-    for (idx, seg) in layout.segments.iter().enumerate() {
-        let g = &measured.galleys[idx];
-        let seg_x = ctx.text_origin_x + measured.x_starts[idx];
-        let seg_w = measured.seg_widths[idx];
-        let seg_y = line_top_y + (row_height - g.size().y) * 0.5;
-        let fg = seg.style.fg.map(to_egui_color).unwrap_or(ctx.text_color);
-
-        if let Some(widget) = &seg.widget {
-            paint_inline_widget_placeholder(
-                ctx, widget, seg_x, line_top_y, seg_w, row_height,
-                g, seg_y, click_zones,
-            );
-            continue;
-        }
-
-        if let Some(bg) = seg.style.bg {
-            let bg_rect = Rect::from_min_max(
-                Pos2::new(seg_x, line_top_y),
-                Pos2::new(seg_x + seg_w, line_top_y + row_height),
-            );
-            ctx.painter.rect_filled(bg_rect, 0.0, to_egui_color(bg));
-        }
-        ctx.painter.galley(Pos2::new(seg_x, seg_y), g.clone(), fg);
-        if seg.style.bold {
-            ctx.painter.galley(Pos2::new(seg_x + 0.5, seg_y), g.clone(), fg);
-        }
-        if seg.style.underline {
-            let y = seg_y + g.size().y * 0.92;
-            ctx.painter.line_segment(
-                [Pos2::new(seg_x, y), Pos2::new(seg_x + seg_w, y)],
-                Stroke::new(1.0, fg),
-            );
-        }
-        if seg.style.strikethrough {
-            let y = seg_y + g.size().y * 0.5;
-            ctx.painter.line_segment(
-                [Pos2::new(seg_x, y), Pos2::new(seg_x + seg_w, y)],
-                Stroke::new(1.0, fg),
-            );
-        }
-    }
-}
-
-/// v1 placeholder render for an inline widget decoration: a styled rect of
-/// the widget's measured size plus a tiny "widget" label. Real per-widget
-/// painting is deferred to a future trait method.
-#[allow(clippy::too_many_arguments)]
-fn paint_inline_widget_placeholder(
-    ctx: &PaintCtx<'_>,
-    widget: &Arc<dyn InlineWidget>,
-    seg_x: f32,
-    line_top_y: f32,
-    seg_w: f32,
-    row_height: f32,
-    label_galley: &Arc<egui::Galley>,
-    label_y: f32,
-    click_zones: &mut Vec<ClickZone>,
-) {
-    let visuals = ctx.ui.style().visuals.clone();
-    let rect = Rect::from_min_max(
-        Pos2::new(seg_x, line_top_y),
-        Pos2::new(seg_x + seg_w, line_top_y + row_height),
-    );
-
-    if let Some(display) = widget.display() {
-        // Textual variant — host wants this widget to read as ordinary
-        // inline text with a colored background (patch-review intraline
-        // insertion, future inline diagnostics, etc.). Skip the bordered
-        // placeholder entirely and just paint a bg fill + the galley.
-        if let Some(bg) = display.bg {
-            ctx.painter.rect_filled(rect, 0.0, to_egui_color(bg));
-        }
-        let fg = display
-            .fg
-            .map(to_egui_color)
-            .unwrap_or_else(|| visuals.text_color());
-        ctx.painter
-            .galley(Pos2::new(seg_x, label_y), label_galley.clone(), fg);
-        if display.strikethrough {
-            let mid_y = line_top_y + row_height * 0.5;
-            ctx.painter.line_segment(
-                [Pos2::new(seg_x, mid_y), Pos2::new(seg_x + seg_w, mid_y)],
-                Stroke::new(1.0, fg),
-            );
-        }
-    } else {
-        let bg = if visuals.dark_mode {
-            Color32::from_rgba_unmultiplied(70, 80, 110, 80)
-        } else {
-            Color32::from_rgba_unmultiplied(210, 220, 240, 220)
-        };
-        let border = visuals.weak_text_color().gamma_multiply(0.5);
-        ctx.painter.rect_filled(rect, 3.0, bg);
-        ctx.painter
-            .rect_stroke(rect, 3.0, Stroke::new(0.5, border), egui::StrokeKind::Inside);
-        ctx.painter
-            .galley(Pos2::new(seg_x + 2.0, label_y), label_galley.clone(), border);
-    }
-
-    if widget.handles_click() {
-        click_zones.push(ClickZone {
-            rect: ClickRect {
-                x_min: seg_x - ctx.rect.min.x,
-                y_min: line_top_y - ctx.rect.min.y,
-                x_max: seg_x + seg_w - ctx.rect.min.x,
-                y_max: line_top_y + row_height - ctx.rect.min.y,
-            },
-            action: ClickAction::WidgetClick(widget.widget_id()),
-        });
-    }
-}
-
-fn paint_cursors(
-    ctx: &PaintCtx<'_>,
-    state: &EditorState,
-    line_byte_start: usize,
-    line_byte_end: usize,
-    line_top_y: f32,
-    row_height: f32,
-    measured: &LineMeasured,
-) {
-    for r in state.selection.ranges() {
-        let head = r.head.offset();
-        if head < line_byte_start || head > line_byte_end {
-            continue;
-        }
-        let local = head - line_byte_start;
-        let x = measured.x_at_buffer_offset(local);
-        let cursor_rect = Rect::from_min_max(
-            Pos2::new(ctx.text_origin_x + x - 0.5, line_top_y),
-            Pos2::new(ctx.text_origin_x + x + 1.0, line_top_y + row_height),
-        );
-        let color = if ctx.has_focus { ctx.cursor_color } else { ctx.gutter_color };
-        ctx.painter.rect_filled(cursor_rect, 0.0, color);
-    }
-}
-
-/// A single visual line built from buffer text + overlapping decorations.
-#[derive(Clone)]
-struct LineLayout {
-    segments: Vec<Segment>,
-    base_font_size: f32,
-    base_color: Color32,
-}
-
-#[derive(Clone)]
-struct Segment {
-    display: SmolStr,
-    buffer_range: std::ops::Range<usize>,
-    style: MarkStyle,
-    is_replacement: bool,
-    /// When present, this segment renders an inline widget placeholder of the
-    /// widget's measured size rather than text. v1 limitation: the egui
-    /// adapter does not call into the widget for painting; instead it draws a
-    /// styled rect with a small "widget" label.
-    widget: Option<Arc<dyn InlineWidget>>,
-}
-
-/// Per-segment measured galleys + x positions for one frame.
-#[derive(Clone)]
-struct LineMeasured {
-    galleys: Vec<Arc<egui::Galley>>,
-    x_starts: Vec<f32>,
-    /// Width used to advance for this segment; equals galley width for text,
-    /// or the widget's measured width for inline-widget segments.
-    seg_widths: Vec<f32>,
-    total_width: f32,
-    /// Mirrors `LineLayout::segments[i].buffer_range.start - line_start`.
-    seg_buffer_starts: Vec<usize>,
-    seg_buffer_ends: Vec<usize>,
-    seg_is_replacement: Vec<bool>,
-}
-
-impl LineMeasured {
-    fn x_at_buffer_offset(&self, line_local_byte: usize) -> f32 {
-        for (i, &start) in self.seg_buffer_starts.iter().enumerate() {
-            let end = self.seg_buffer_ends[i];
-            if line_local_byte < start {
-                return self.x_starts[i];
-            }
-            if line_local_byte <= end {
-                let seg_x = self.x_starts[i];
-                if self.seg_is_replacement[i] {
-                    if line_local_byte == end {
-                        return seg_x + self.seg_widths[i];
+impl<'a> PaintCtx<'a> {
+    fn paint_line_bgs(&self, span: RowSpan) {
+        let RowSpan { line_idx, byte_start: line_byte_start, byte_end: line_byte_end, top_y: line_top_y, height: row_height } = span;
+        for layer in &self.view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_end + 1) {
+                if let Decoration::Line(LineStyle { bg: Some(c), .. }) = deco {
+                    if self.state.doc.byte_to_line(range.start) == line_idx {
+                        let r = Rect::from_min_max(
+                            Pos2::new(self.rect.left(), line_top_y),
+                            Pos2::new(self.rect.right(), line_top_y + row_height),
+                        );
+                        self.painter.rect_filled(r, 0.0, to_egui_color(*c));
                     }
-                    return seg_x;
-                }
-                // Walk display chars to find x within the galley.
-                let g = &self.galleys[i];
-                let display = g.text();
-                let local_in_seg = line_local_byte - start;
-                let safe = local_in_seg.min(display.len());
-                let char_idx = display[..safe].chars().count();
-                let ccursor = egui::text::CCursor::new(char_idx);
-                return seg_x + g.pos_from_cursor(ccursor).min.x;
-            }
-        }
-        self.total_width
-    }
-}
-
-impl LineLayout {
-    fn measure(&self, ui: &egui::Ui) -> LineMeasured {
-        let mut galleys = Vec::with_capacity(self.segments.len());
-        let mut x_starts = Vec::with_capacity(self.segments.len());
-        let mut seg_widths = Vec::with_capacity(self.segments.len());
-        let mut seg_buffer_starts = Vec::with_capacity(self.segments.len());
-        let mut seg_buffer_ends = Vec::with_capacity(self.segments.len());
-        let mut seg_is_replacement = Vec::with_capacity(self.segments.len());
-        let base = self.line_base();
-        let mut x = 0.0f32;
-        for seg in &self.segments {
-            let g = segment_galley(ui, seg, self.base_font_size, self.base_color);
-            let w = if let Some(widget) = &seg.widget {
-                widget.measure(self.base_font_size).0.max(g.size().x)
-            } else {
-                g.size().x
-            };
-            x_starts.push(x);
-            seg_widths.push(w);
-            x += w;
-            galleys.push(g);
-            seg_buffer_starts.push(seg.buffer_range.start - base);
-            seg_buffer_ends.push(seg.buffer_range.end - base);
-            seg_is_replacement.push(seg.is_replacement);
-        }
-        LineMeasured {
-            galleys,
-            x_starts,
-            seg_widths,
-            total_width: x,
-            seg_buffer_starts,
-            seg_buffer_ends,
-            seg_is_replacement,
-        }
-    }
-
-    fn line_base(&self) -> usize {
-        self.segments.first().map(|s| s.buffer_range.start).unwrap_or(0)
-    }
-}
-
-fn segment_galley(
-    ui: &egui::Ui,
-    seg: &Segment,
-    base_size: f32,
-    base_color: Color32,
-) -> Arc<egui::Galley> {
-    let display = if seg.widget.is_some() {
-        // Tiny label rendered inside the placeholder rect. The advance width
-        // for the segment uses the widget's `measure()` result, not the label.
-        "widget"
-    } else if seg.display.is_empty() && seg.is_replacement {
-        ""
-    } else if seg.display.is_empty() {
-        " "
-    } else {
-        seg.display.as_str()
-    };
-    let format = format_for(&seg.style, base_size, base_color);
-    let mut job = LayoutJob::single_section(display.to_string(), format);
-    job.wrap.max_width = f32::INFINITY;
-    ui.fonts(|f| f.layout_job(job))
-}
-
-fn build_line_layout(
-    line_text: &str,
-    line_byte_start: usize,
-    layers: &[editor_core::DecorationSet],
-    base_font_size: f32,
-    base_color: Color32,
-) -> LineLayout {
-    let line_byte_end = line_byte_start + line_text.len();
-    let mut events: Vec<DecoEvent> = Vec::new();
-    // End-of-line widgets: an `InlineWidget` decoration anchored at
-    // `line_byte_end..line_byte_end+1` (the newline / EOF byte) clips
-    // to an empty range under the normal interior path, so it gets
-    // dropped. Collect them here and append a trailing segment after
-    // the main segment-build loop so they render at the end of the
-    // line. Patch-review's intraline `new_str` widget uses this path.
-    let mut trailing_widgets: Vec<Arc<dyn InlineWidget>> = Vec::new();
-    for layer in layers {
-        for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_end + 1) {
-            if let Decoration::InlineWidget { widget, .. } = deco {
-                if range.start == line_byte_end {
-                    trailing_widgets.push(widget.clone());
-                    continue;
                 }
             }
-            let clipped = range.start.max(line_byte_start)..range.end.min(line_byte_end);
-            if clipped.start >= clipped.end {
+        }
+    }
+
+    fn paint_selections(
+        &self,
+        span: RowSpan,
+        measured: &LineMeasured,
+        line_text_len: usize,
+    ) {
+        let RowSpan { line_idx, byte_start: line_byte_start, byte_end: line_byte_end, top_y: line_top_y, height: row_height } = span;
+        for r in self.state.selection.ranges() {
+            let (s, e) = (r.start(), r.end());
+            if e < line_byte_start || s > line_byte_end {
                 continue;
             }
-            match deco {
-                Decoration::Mark(style) => events.push(DecoEvent::Mark(clipped, style.clone())),
-                Decoration::Replace { display } => {
-                    events.push(DecoEvent::Replace(clipped, display.clone()))
-                }
-                Decoration::InlineWidget { widget, .. } => {
-                    events.push(DecoEvent::Widget(clipped, widget.clone()))
-                }
-                Decoration::Line(_) | Decoration::Block(_) | Decoration::BlockWidget { .. } => {}
+            let local_start = s.saturating_sub(line_byte_start);
+            let local_end = (e - line_byte_start).min(line_text_len);
+            if !r.is_empty() {
+                let x_start = measured.x_at_buffer_offset(local_start);
+                let x_end = measured.x_at_buffer_offset(local_end);
+                let sel = Rect::from_min_max(
+                    Pos2::new(self.text_origin_x + x_start, line_top_y),
+                    Pos2::new(self.text_origin_x + x_end, line_top_y + row_height),
+                );
+                self.painter.rect_filled(sel, 0.0, self.selection_color);
+            }
+            if e > line_byte_end && line_idx + 1 < self.state.doc.len_lines() {
+                let x_end = measured.total_width;
+                let extra = Rect::from_min_max(
+                    Pos2::new(self.text_origin_x + x_end, line_top_y),
+                    Pos2::new(self.text_origin_x + x_end + self.view.font_size * 0.5, line_top_y + row_height),
+                );
+                self.painter.rect_filled(extra, 0.0, self.selection_color);
             }
         }
     }
 
-    // Snap a line-local byte index to the nearest valid char boundary at or
-    // before it. Decoration ranges occasionally land mid-codepoint when they
-    // outlive a buffer edit (the markdown parse is async) — slicing on those
-    // raw indices panics on multi-byte chars like em-dash.
-    let snap = |mut b: usize| -> usize {
-        if b > line_text.len() {
-            b = line_text.len();
-        }
-        while b > 0 && !line_text.is_char_boundary(b) {
-            b -= 1;
-        }
-        b
-    };
+    fn paint_gutter(&mut self, span: RowSpan) {
+        let RowSpan { line_idx, byte_start: line_byte_start, byte_end: line_byte_end, top_y: line_top_y, height: row_height } = span;
+        let num = (line_idx + 1).to_string();
+        let num_galley = self
+            .ui
+            .fonts(|f| f.layout_no_wrap(num, self.base_font_id.clone(), self.gutter_color));
+        let num_x = self.rect.left() + self.view.gutter_width - num_galley.size().x - 6.0;
+        let num_y = line_top_y + (row_height - num_galley.size().y) * 0.5;
+        self.painter
+            .galley(Pos2::new(num_x, num_y), num_galley, self.gutter_color);
 
-    let mut boundaries: Vec<usize> = vec![0, line_text.len()];
-    for ev in &events {
-        match ev {
-            DecoEvent::Mark(r, _)
-            | DecoEvent::Replace(r, _)
-            | DecoEvent::Widget(r, _) => {
-                boundaries.push(snap(r.start.saturating_sub(line_byte_start)));
-                boundaries.push(snap(r.end.saturating_sub(line_byte_start)));
-            }
+        if let Some(ch) = self.collect_fold_chevron(line_byte_start, line_byte_end) {
+            // Draw chevron as a small filled triangle via Painter::add(Shape::convex_polygon)
+            // — Unicode triangle glyphs aren't reliably present in egui's bundled
+            // fonts (would render as the missing-glyph box).
+            let size = self.base_font_id.size * 0.42;
+            let cx = self.rect.left() + 9.0;
+            let cy = line_top_y + row_height * 0.5;
+            let points = if ch.collapsed {
+                // ▶ — points right
+                vec![
+                    Pos2::new(cx - size * 0.5, cy - size * 0.6),
+                    Pos2::new(cx - size * 0.5, cy + size * 0.6),
+                    Pos2::new(cx + size * 0.6, cy),
+                ]
+            } else {
+                // ▼ — points down
+                vec![
+                    Pos2::new(cx - size * 0.6, cy - size * 0.4),
+                    Pos2::new(cx + size * 0.6, cy - size * 0.4),
+                    Pos2::new(cx, cy + size * 0.6),
+                ]
+            };
+            self.painter.add(egui::Shape::convex_polygon(
+                points,
+                self.gutter_color,
+                Stroke::NONE,
+            ));
+            self.view.click_zones.push(ClickZone {
+                rect: ClickRect {
+                    x_min: 0.0,
+                    y_min: line_top_y - self.rect.min.y,
+                    x_max: 18.0,
+                    y_max: line_top_y - self.rect.min.y + row_height,
+                },
+                action: ClickAction::ToggleFold(ch.id),
+            });
         }
     }
-    boundaries.sort();
-    boundaries.dedup();
 
-    let style_at = |start: usize,
-                    end: usize|
-     -> (
-        MarkStyle,
-        Option<Option<SmolStr>>,
-        Option<Arc<dyn InlineWidget>>,
+    fn paint_segments(
+        &mut self,
+        layout: &LineLayout,
+        measured: &LineMeasured,
+        line_top_y: f32,
+        row_height: f32,
     ) {
-        let abs_start = line_byte_start + start;
-        let abs_end = line_byte_start + end;
-        let mut merged = MarkStyle::default();
-        let mut replacement: Option<Option<SmolStr>> = None;
-        let mut widget: Option<Arc<dyn InlineWidget>> = None;
-        for ev in &events {
-            match ev {
-                DecoEvent::Mark(r, s) if r.start <= abs_start && r.end >= abs_end => {
-                    merge_mark(&mut merged, s);
-                }
-                DecoEvent::Replace(r, disp) if r.start <= abs_start && r.end >= abs_end => {
-                    replacement = Some(disp.clone());
-                }
-                DecoEvent::Widget(r, w) if r.start <= abs_start && r.end >= abs_end => {
-                    widget = Some(w.clone());
-                }
-                _ => {}
+        for (idx, seg) in layout.segments.iter().enumerate() {
+            let g = &measured.galleys[idx];
+            let seg_x = self.text_origin_x + measured.x_starts[idx];
+            let seg_w = measured.seg_widths[idx];
+            let seg_y = line_top_y + (row_height - g.size().y) * 0.5;
+            let fg = seg.style.fg.map(to_egui_color).unwrap_or(self.text_color);
+
+            if let Some(widget) = &seg.widget {
+                let widget = widget.clone();
+                let g_clone = g.clone();
+                self.paint_inline_widget_placeholder(
+                    &widget,
+                    SegSpan {
+                        x: seg_x,
+                        width: seg_w,
+                        top_y: line_top_y,
+                        height: row_height,
+                        label_y: seg_y,
+                    },
+                    &g_clone,
+                );
+                continue;
+            }
+
+            if let Some(bg) = seg.style.bg {
+                let bg_rect = Rect::from_min_max(
+                    Pos2::new(seg_x, line_top_y),
+                    Pos2::new(seg_x + seg_w, line_top_y + row_height),
+                );
+                self.painter.rect_filled(bg_rect, 0.0, to_egui_color(bg));
+            }
+            self.painter.galley(Pos2::new(seg_x, seg_y), g.clone(), fg);
+            if seg.style.bold {
+                self.painter.galley(Pos2::new(seg_x + 0.5, seg_y), g.clone(), fg);
+            }
+            if seg.style.underline {
+                let y = seg_y + g.size().y * 0.92;
+                self.painter.line_segment(
+                    [Pos2::new(seg_x, y), Pos2::new(seg_x + seg_w, y)],
+                    Stroke::new(1.0, fg),
+                );
+            }
+            if seg.style.strikethrough {
+                let y = seg_y + g.size().y * 0.5;
+                self.painter.line_segment(
+                    [Pos2::new(seg_x, y), Pos2::new(seg_x + seg_w, y)],
+                    Stroke::new(1.0, fg),
+                );
             }
         }
-        (merged, replacement, widget)
-    };
-
-    // Collect line-local Replace AND Widget ranges; each becomes ONE
-    // consolidated segment so an interior Mark doesn't subdivide and duplicate
-    // either the Replace display or the widget placeholder.
-    enum Atomic {
-        Replace(Option<SmolStr>),
-        Widget(Arc<dyn InlineWidget>),
     }
-    let mut atomic_ranges: Vec<(usize, usize, Atomic)> = Vec::new();
-    for ev in &events {
-        match ev {
-            DecoEvent::Replace(r, disp) => atomic_ranges.push((
-                snap(r.start.saturating_sub(line_byte_start)),
-                snap(r.end.saturating_sub(line_byte_start)),
-                Atomic::Replace(disp.clone()),
-            )),
-            DecoEvent::Widget(r, w) => atomic_ranges.push((
-                snap(r.start.saturating_sub(line_byte_start)),
-                snap(r.end.saturating_sub(line_byte_start)),
-                Atomic::Widget(w.clone()),
-            )),
-            DecoEvent::Mark(_, _) => {}
-        }
-    }
-    atomic_ranges.sort_by_key(|(s, _, _)| *s);
 
-    // Marks-overlapping-range helper: union of all Mark styles whose range
-    // intersects [s, e). Used for both Replace consolidated segments and
-    // normal text segments.
-    let marks_for = |s: usize, e: usize| -> MarkStyle {
-        let abs_s = line_byte_start + s;
-        let abs_e = line_byte_start + e;
-        let mut merged = MarkStyle::default();
-        for ev in &events {
-            if let DecoEvent::Mark(r, m) = ev {
-                if r.end > abs_s && r.start < abs_e {
-                    merge_mark(&mut merged, m);
-                }
+    /// v1 placeholder render for an inline widget decoration: a styled rect of
+    /// the widget's measured size plus a tiny "widget" label. Real per-widget
+    /// painting is deferred to a future trait method.
+    fn paint_inline_widget_placeholder(
+        &mut self,
+        widget: &Arc<dyn InlineWidget>,
+        span: SegSpan,
+        label_galley: &Arc<egui::Galley>,
+    ) {
+        let SegSpan { x: seg_x, width: seg_w, top_y: line_top_y, height: row_height, label_y } = span;
+        let visuals = self.ui.style().visuals.clone();
+        let rect = Rect::from_min_max(
+            Pos2::new(seg_x, line_top_y),
+            Pos2::new(seg_x + seg_w, line_top_y + row_height),
+        );
+
+        if let Some(display) = widget.display() {
+            // Textual variant — host wants this widget to read as ordinary
+            // inline text with a colored background (patch-review intraline
+            // insertion, future inline diagnostics, etc.). Skip the bordered
+            // placeholder entirely and just paint a bg fill + the galley.
+            if let Some(bg) = display.bg {
+                self.painter.rect_filled(rect, 0.0, to_egui_color(bg));
             }
-        }
-        merged
-    };
-
-    let mut segments = Vec::with_capacity(boundaries.len());
-    let mut cursor: usize = 0;
-    let line_len = line_text.len();
-
-    while cursor < line_len {
-        // 1. If cursor is inside an atomic (Replace or Widget) range, emit ONE
-        //    consolidated segment.
-        if let Some(idx) = atomic_ranges.iter().position(|(s, e, _)| cursor >= *s && cursor < *e)
-        {
-            let (rs, re, ref atom) = atomic_ranges[idx];
-            let style = marks_for(rs, re);
-            match atom {
-                Atomic::Replace(disp) => segments.push(Segment {
-                    display: disp.clone().unwrap_or_default(),
-                    buffer_range: (line_byte_start + rs)..(line_byte_start + re),
-                    style,
-                    is_replacement: true,
-                    widget: None,
-                }),
-                Atomic::Widget(w) => segments.push(Segment {
-                    display: SmolStr::default(),
-                    buffer_range: (line_byte_start + rs)..(line_byte_start + re),
-                    style,
-                    is_replacement: true,
-                    widget: Some(w.clone()),
-                }),
+            let fg = display
+                .fg
+                .map(to_egui_color)
+                .unwrap_or_else(|| visuals.text_color());
+            self.painter
+                .galley(Pos2::new(seg_x, label_y), label_galley.clone(), fg);
+            if display.strikethrough {
+                let mid_y = line_top_y + row_height * 0.5;
+                self.painter.line_segment(
+                    [Pos2::new(seg_x, mid_y), Pos2::new(seg_x + seg_w, mid_y)],
+                    Stroke::new(1.0, fg),
+                );
             }
-            cursor = re;
-            continue;
+        } else {
+            let bg = if visuals.dark_mode {
+                Color32::from_rgba_unmultiplied(70, 80, 110, 80)
+            } else {
+                Color32::from_rgba_unmultiplied(210, 220, 240, 220)
+            };
+            let border = visuals.weak_text_color().gamma_multiply(0.5);
+            self.painter.rect_filled(rect, 3.0, bg);
+            self.painter
+                .rect_stroke(rect, 3.0, Stroke::new(0.5, border), egui::StrokeKind::Inside);
+            self.painter
+                .galley(Pos2::new(seg_x + 2.0, label_y), label_galley.clone(), border);
         }
 
-        // 2. Find the next break: either the next atomic-range start, the next
-        //    Mark boundary, or end of line.
-        let mut seg_end = line_len;
-        for (rs, _, _) in &atomic_ranges {
-            if *rs > cursor && *rs < seg_end {
-                seg_end = *rs;
+        if widget.handles_click() {
+            self.view.click_zones.push(ClickZone {
+                rect: ClickRect {
+                    x_min: seg_x - self.rect.min.x,
+                    y_min: line_top_y - self.rect.min.y,
+                    x_max: seg_x + seg_w - self.rect.min.x,
+                    y_max: line_top_y + row_height - self.rect.min.y,
+                },
+                action: ClickAction::WidgetClick(widget.widget_id()),
+            });
+        }
+    }
+
+    fn paint_cursors(&self, span: RowSpan, measured: &LineMeasured) {
+        let RowSpan { byte_start: line_byte_start, byte_end: line_byte_end, top_y: line_top_y, height: row_height, .. } = span;
+        for r in self.state.selection.ranges() {
+            let head = r.head.offset();
+            if head < line_byte_start || head > line_byte_end {
+                continue;
             }
+            let local = head - line_byte_start;
+            let x = measured.x_at_buffer_offset(local);
+            let cursor_rect = Rect::from_min_max(
+                Pos2::new(self.text_origin_x + x - 0.5, line_top_y),
+                Pos2::new(self.text_origin_x + x + 1.0, line_top_y + row_height),
+            );
+            let color = if self.has_focus { self.cursor_color } else { self.gutter_color };
+            self.painter.rect_filled(cursor_rect, 0.0, color);
         }
-        for b in &boundaries {
-            if *b > cursor && *b < seg_end {
-                seg_end = *b;
-            }
-        }
-        if seg_end <= cursor {
-            cursor += 1;
-            continue;
-        }
-        let (style, _, _) = style_at(cursor, seg_end);
-        let slice = &line_text[cursor..seg_end];
-        segments.push(Segment {
-            display: SmolStr::from(slice),
-            buffer_range: (line_byte_start + cursor)..(line_byte_start + seg_end),
-            style,
-            is_replacement: false,
-            widget: None,
-        });
-        cursor = seg_end;
-    }
-    if segments.is_empty() {
-        segments.push(Segment {
-            display: SmolStr::default(),
-            buffer_range: line_byte_start..line_byte_start,
-            style: MarkStyle::default(),
-            is_replacement: false,
-            widget: None,
-        });
-    }
-    // Trailing widgets anchored past the line's last byte (see comment
-    // at event-collection above). Zero-width buffer range so cursor
-    // motion still treats the line as ending at line_byte_end.
-    for w in trailing_widgets {
-        segments.push(Segment {
-            display: SmolStr::default(),
-            buffer_range: line_byte_end..line_byte_end,
-            style: MarkStyle::default(),
-            is_replacement: true,
-            widget: Some(w),
-        });
-    }
-    LineLayout { segments, base_font_size, base_color }
-}
-
-enum DecoEvent {
-    Mark(std::ops::Range<usize>, MarkStyle),
-    Replace(std::ops::Range<usize>, Option<SmolStr>),
-    Widget(std::ops::Range<usize>, Arc<dyn InlineWidget>),
-}
-
-fn merge_mark(dst: &mut MarkStyle, src: &MarkStyle) {
-    if src.bold { dst.bold = true; }
-    if src.italic { dst.italic = true; }
-    if src.strikethrough { dst.strikethrough = true; }
-    if src.underline { dst.underline = true; }
-    if src.monospace { dst.monospace = true; }
-    if src.fg.is_some() { dst.fg = src.fg; }
-    if src.bg.is_some() { dst.bg = src.bg; }
-    if src.font_scale.is_some() { dst.font_scale = src.font_scale; }
-}
-
-fn format_for(style: &MarkStyle, base_size: f32, base_color: Color32) -> TextFormat {
-    let size = base_size * style.font_scale.unwrap_or(1.0);
-    // `style.monospace` is the *signal* that this run is code-shaped.
-    // Both branches resolve to `Monospace` for now because the wrap
-    // calculator below uses monospace `char_width` and mixing
-    // proportional runs into a monospace wrap budget produces visible
-    // misalignment. Custom font families (per `editor.font_*` settings)
-    // are loaded at startup via `egui::Context::set_fonts` and routed
-    // through here once that lands.
-    // Both branches resolve to Monospace for now (see comment above).
-    let _ = style.monospace;
-    let family = FontFamily::Monospace;
-    let fg = style.fg.map(to_egui_color).unwrap_or(base_color);
-    TextFormat {
-        font_id: FontId::new(size, family),
-        color: fg,
-        italics: style.italic,
-        // We draw bg/underline/strike manually in the painter so they pick up
-        // the segment's measured width, not the glyph rect.
-        ..Default::default()
     }
 }
 
-fn collect_fold_chevron(
-    layers: &[editor_core::DecorationSet],
-    line_start: usize,
-    line_end: usize,
-) -> Option<editor_core::FoldChevron> {
-    for layer in layers {
-        for (range, deco) in layer.iter_overlapping(line_start..line_end + 1) {
-            if let Decoration::Line(ls) = deco {
-                if range.start == line_start {
-                    if let Some(ch) = ls.fold_chevron {
-                        return Some(ch);
+impl<'a> PaintCtx<'a> {
+    fn collect_fold_chevron(
+        &self,
+        line_start: usize,
+        line_end: usize,
+    ) -> Option<editor_core::decoration::FoldChevron> {
+        for layer in &self.view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(line_start..line_end + 1) {
+                if let Decoration::Line(ls) = deco {
+                    if range.start == line_start {
+                        if let Some(ch) = ls.fold_chevron {
+                            return Some(ch);
+                        }
                     }
                 }
             }
         }
+        None
     }
-    None
 }
 
 fn to_egui_color(c: Color) -> Color32 {

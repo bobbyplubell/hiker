@@ -47,13 +47,13 @@ enum Node<T: Item> {
 }
 
 impl<T: Item> Node<T> {
-    fn summary(&self) -> &T::Summary {
+    const fn summary(&self) -> &T::Summary {
         match self {
             Node::Leaf { summary, .. } | Node::Inner { summary, .. } => summary,
         }
     }
 
-    fn height(&self) -> u8 {
+    const fn height(&self) -> u8 {
         match self {
             Node::Leaf { .. } => 0,
             Node::Inner { height, .. } => *height,
@@ -98,17 +98,45 @@ impl<T: Item> SumTree<T> {
             || matches!(&*self.root, Node::Inner { children, .. } if children.is_empty())
     }
 
-    pub fn from_items(items: Vec<T>) -> Self {
+    pub fn from_items(items: &[T]) -> Self {
         if items.is_empty() {
             return Self::new();
         }
+        let mut nodes: Vec<Arc<Node<T>>> = items
+            .chunks(LEAF_CAP)
+            .map(|chunk| {
+                let mut summary = T::Summary::default();
+                for item in chunk {
+                    summary.add(&item.summarize());
+                }
+                let items: SmallVec<[T; LEAF_CAP]> = chunk.iter().cloned().collect();
+                Arc::new(Node::Leaf { items, summary })
+            })
+            .collect();
+
+        let mut height = 1u8;
+        while nodes.len() > 1 {
+            nodes = nodes
+                .chunks(BRANCH_CAP)
+                .map(|chunk| {
+                    let mut summary = T::Summary::default();
+                    for child in chunk {
+                        summary.add(child.summary());
+                    }
+                    let children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> =
+                        chunk.iter().cloned().collect();
+                    Arc::new(Node::Inner { children, summary, height })
+                })
+                .collect();
+            height += 1;
+        }
         Self {
-            root: build_balanced(items),
+            root: nodes.into_iter().next().unwrap(),
         }
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter::new(&self.root)
+        Iter { stack: vec![(&self.root, 0)] }
     }
 
     /// Persistent O(log n) concat. Walks down the spine of the taller tree
@@ -136,7 +164,7 @@ impl<T: Item> SumTree<T> {
     /// In other words: the split splits at an item boundary, with items going
     /// to the left tree until adding the next item would push the accumulated
     /// dim past `target`.
-    pub fn split<D, F>(self, target: D, target_dim: F) -> (Self, Self)
+    pub fn split<D, F>(self, target: &D, target_dim: F) -> (Self, Self)
     where
         D: PartialOrd + Clone,
         F: Fn(&T::Summary) -> D + Copy,
@@ -145,11 +173,11 @@ impl<T: Item> SumTree<T> {
             return (Self::new(), Self::new());
         }
         let total = target_dim(self.root.summary());
-        if total <= target {
+        if PartialOrd::le(&total, target) {
             // The whole tree fits in the left side.
             return (self, Self::new());
         }
-        let (left, right) = split_node(self.root, target, target_dim, T::Summary::default());
+        let (left, right) = split_node(&self.root, target, target_dim, T::Summary::default());
         (
             Self { root: collapse_singleton_root(left) },
             Self { root: collapse_singleton_root(right) },
@@ -162,7 +190,7 @@ impl<T: Item> SumTree<T> {
     ///
     /// If no such item exists (target is past the end), `item` is `None` and
     /// `before` is the full tree summary.
-    pub fn seek<D, F>(&self, target: D, target_dim: F) -> Seek<'_, T>
+    pub fn seek<D, F>(&self, target: &D, target_dim: F) -> Seek<'_, T>
     where
         D: PartialOrd,
         F: Fn(&T::Summary) -> D,
@@ -176,7 +204,7 @@ impl<T: Item> SumTree<T> {
                     for child in children {
                         let mut probe = acc.clone();
                         probe.add(child.summary());
-                        if target_dim(&probe) > target {
+                        if PartialOrd::gt(&target_dim(&probe), target) {
                             node = child;
                             descended = true;
                             break;
@@ -192,7 +220,7 @@ impl<T: Item> SumTree<T> {
                         let s = item.summarize();
                         let mut probe = acc.clone();
                         probe.add(&s);
-                        if target_dim(&probe) > target {
+                        if PartialOrd::gt(&target_dim(&probe), target) {
                             return Seek { item: Some(item), before: acc };
                         }
                         acc = probe;
@@ -209,63 +237,21 @@ pub struct Seek<'a, T: Item> {
     pub before: T::Summary,
 }
 
-fn build_balanced<T: Item>(items: Vec<T>) -> Arc<Node<T>> {
-    debug_assert!(!items.is_empty());
-    let mut nodes: Vec<Arc<Node<T>>> = items
-        .chunks(LEAF_CAP)
-        .map(|chunk| {
-            let mut summary = T::Summary::default();
-            for item in chunk {
-                summary.add(&item.summarize());
-            }
-            let items: SmallVec<[T; LEAF_CAP]> = chunk.iter().cloned().collect();
-            Arc::new(Node::Leaf { items, summary })
-        })
-        .collect();
-
-    let mut height = 1u8;
-    while nodes.len() > 1 {
-        nodes = nodes
-            .chunks(BRANCH_CAP)
-            .map(|chunk| {
-                let mut summary = T::Summary::default();
-                for child in chunk {
-                    summary.add(child.summary());
-                }
-                let children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = chunk.iter().cloned().collect();
-                Arc::new(Node::Inner { children, summary, height })
-            })
-            .collect();
-        height += 1;
-    }
-    nodes.into_iter().next().unwrap()
-}
-
-fn summarize_items<T: Item>(items: &[T]) -> T::Summary {
-    let mut s = T::Summary::default();
-    for item in items {
-        s.add(&item.summarize());
-    }
-    s
-}
-
-fn summarize_children<T: Item>(children: &[Arc<Node<T>>]) -> T::Summary {
-    let mut s = T::Summary::default();
-    for c in children {
-        s.add(c.summary());
-    }
-    s
-}
-
 fn make_leaf<T: Item>(items: SmallVec<[T; LEAF_CAP]>) -> Arc<Node<T>> {
-    let summary = summarize_items(&items);
+    let mut summary = T::Summary::default();
+    for item in &items {
+        summary.add(&item.summarize());
+    }
     Arc::new(Node::Leaf { items, summary })
 }
 
-fn make_inner<T: Item>(children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]>, height: u8) -> Arc<Node<T>> {
+fn new_branch<T: Item>(children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]>, height: u8) -> Arc<Node<T>> {
     debug_assert!(!children.is_empty());
     debug_assert!(height >= 1);
-    let summary = summarize_children(&children);
+    let mut summary = T::Summary::default();
+    for c in &children {
+        summary.add(c.summary());
+    }
     Arc::new(Node::Inner { children, summary, height })
 }
 
@@ -287,8 +273,8 @@ fn collapse_singleton_root<T: Item>(mut root: Arc<Node<T>>) -> Arc<Node<T>> {
 /// (including empty children); callers must collapse single-child roots and
 /// trust that descendants stay invariant.
 fn split_node<T: Item, D, F>(
-    node: Arc<Node<T>>,
-    target: D,
+    node: &Arc<Node<T>>,
+    target: &D,
     target_dim: F,
     acc_before: T::Summary,
 ) -> (Arc<Node<T>>, Arc<Node<T>>)
@@ -296,14 +282,14 @@ where
     D: PartialOrd + Clone,
     F: Fn(&T::Summary) -> D + Copy,
 {
-    match &*node {
+    match &**node {
         Node::Leaf { items, .. } => {
             let mut acc = acc_before;
             let mut split_at = items.len();
             for (i, item) in items.iter().enumerate() {
                 let mut probe = acc.clone();
                 probe.add(&item.summarize());
-                if target_dim(&probe) > target {
+                if PartialOrd::gt(&target_dim(&probe), target) {
                     split_at = i;
                     break;
                 }
@@ -321,7 +307,7 @@ where
             for (i, child) in children.iter().enumerate() {
                 let mut probe = acc.clone();
                 probe.add(child.summary());
-                if target_dim(&probe) > target {
+                if PartialOrd::gt(&target_dim(&probe), target) {
                     child_i = i;
                     split_acc = acc.clone();
                     break;
@@ -332,7 +318,7 @@ where
                 // Whole node goes left (shouldn't happen if total > target,
                 // but handle defensively).
                 let empty: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                let left = node.clone();
+                let left = Arc::clone(node);
                 let right = if height == 1 {
                     make_leaf(SmallVec::new())
                 } else {
@@ -356,7 +342,7 @@ where
                 return (left, right);
             }
             let (child_left, child_right) =
-                split_node(children[child_i].clone(), target, target_dim, split_acc);
+                split_node(&children[child_i], target, target_dim, split_acc);
 
             let mut left_children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
             for c in &children[..child_i] {
@@ -383,12 +369,12 @@ where
             let left = if left_children.is_empty() {
                 make_empty_at_height(height)
             } else {
-                make_inner(left_children, height)
+                new_branch(left_children, height)
             };
             let right = if right_children.is_empty() {
                 make_empty_at_height(height)
             } else {
-                make_inner(right_children, height)
+                new_branch(right_children, height)
             };
             (left, right)
         }
@@ -442,7 +428,7 @@ fn concat_nodes<T: Item>(left: Arc<Node<T>>, right: Arc<Node<T>>) -> Arc<Node<T>
                     let mut children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
                     children.push(left);
                     children.push(right);
-                    make_inner(children, 1)
+                    new_branch(children, 1)
                 }
             }
             (
@@ -452,161 +438,141 @@ fn concat_nodes<T: Item>(left: Arc<Node<T>>, right: Arc<Node<T>>) -> Arc<Node<T>
                 if l_ch.len() + r_ch.len() <= BRANCH_CAP {
                     let mut children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = l_ch.clone();
                     children.extend(r_ch.iter().cloned());
-                    make_inner(children, h_l)
+                    new_branch(children, h_l)
                 } else {
                     let mut children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
                     children.push(left);
                     children.push(right);
-                    make_inner(children, h_l + 1)
+                    new_branch(children, h_l + 1)
                 }
             }
             _ => unreachable!("nodes at the same height must be both leaf or both inner"),
         }
     } else if h_l > h_r {
-        // Append `right` into the right spine of `left`.
-        append_into_right_spine(left, right)
+        merge_into_spine(Side::Right, &left, right)
     } else {
-        prepend_into_left_spine(left, right)
+        merge_into_spine(Side::Left, &right, left)
     }
 }
 
-fn append_into_right_spine<T: Item>(left: Arc<Node<T>>, right: Arc<Node<T>>) -> Arc<Node<T>> {
-    // Precondition: left.height() > right.height(), left is Inner.
-    match &*left {
-        Node::Inner { children: l_children, height, .. } => {
-            let height = *height;
-            let last = l_children.last().unwrap().clone();
-            let merged = concat_nodes(last, right);
-            // If merged still fits at this height (height-1 == h_l - 1), we
-            // can swap the last child. Otherwise it grew by one and we need
-            // to push a new child / split.
-            let merged_h = merged.height();
-            let mut new_children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-            for c in &l_children[..l_children.len() - 1] {
-                new_children.push(c.clone());
-            }
-            if merged_h == height - 1 {
-                new_children.push(merged);
-                make_inner(new_children, height)
-            } else if merged_h == height {
-                // The recursive concat returned a node of our height. Split
-                // its children across us: we already have l_children[..-1];
-                // append merged's children.
-                match &*merged {
-                    Node::Inner { children: m_ch, .. } => {
-                        if new_children.len() + m_ch.len() <= BRANCH_CAP {
-                            for c in m_ch {
-                                new_children.push(c.clone());
-                            }
-                            make_inner(new_children, height)
-                        } else {
-                            // Overflow — produce two siblings under a new
-                            // parent.
-                            let mut all: Vec<Arc<Node<T>>> = new_children.into_iter().collect();
-                            for c in m_ch {
-                                all.push(c.clone());
-                            }
-                            let mid = all.len() / 2;
-                            let mut left_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            let mut right_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            for (i, c) in all.into_iter().enumerate() {
-                                if i < mid {
-                                    left_c.push(c);
-                                } else {
-                                    right_c.push(c);
-                                }
-                            }
-                            let l = make_inner(left_c, height);
-                            let r = make_inner(right_c, height);
-                            let mut parent: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            parent.push(l);
-                            parent.push(r);
-                            make_inner(parent, height + 1)
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                unreachable!(
-                    "concat_nodes returned unexpected height {} (parent h={})",
-                    merged_h, height
-                );
-            }
-        }
-        Node::Leaf { .. } => unreachable!("left must be taller than right"),
-    }
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Side {
+    /// Taller tree is on the left; merge the smaller tree into its right spine.
+    Right,
+    /// Taller tree is on the right; merge the smaller tree into its left spine.
+    Left,
 }
 
-fn prepend_into_left_spine<T: Item>(left: Arc<Node<T>>, right: Arc<Node<T>>) -> Arc<Node<T>> {
-    // Mirror of append_into_right_spine: right.height() > left.height().
-    match &*right {
-        Node::Inner { children: r_children, height, .. } => {
-            let height = *height;
-            let first = r_children.first().unwrap().clone();
-            let merged = concat_nodes(left, first);
-            let merged_h = merged.height();
-            let mut new_children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-            if merged_h == height - 1 {
+/// Merge `small` into the spine of `tall` (which must be strictly taller).
+/// `side` says which spine of `tall` to descend.
+fn merge_into_spine<T: Item>(
+    side: Side,
+    tall: &Node<T>,
+    small: Arc<Node<T>>,
+) -> Arc<Node<T>> {
+    let tall_children = match tall {
+        Node::Inner { children, .. } => children.clone(),
+        Node::Leaf { .. } => unreachable!("tall must be strictly taller than small"),
+    };
+    let height = match tall {
+        Node::Inner { height, .. } => *height,
+        Node::Leaf { .. } => unreachable!(),
+    };
+
+    // Pick the spine child to recurse into.
+    let (spine_idx, rest): (usize, Vec<Arc<Node<T>>>) = match side {
+        Side::Right => {
+            let idx = tall_children.len() - 1;
+            (idx, tall_children[..idx].to_vec())
+        }
+        Side::Left => (0, tall_children[1..].to_vec()),
+    };
+    let spine_child = tall_children[spine_idx].clone();
+
+    let merged = match side {
+        Side::Right => concat_nodes(spine_child, small),
+        Side::Left => concat_nodes(small, spine_child),
+    };
+    let merged_h = merged.height();
+
+    // Assemble new children for this level.
+    let mut new_children: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
+    let extend_with_rest = |dst: &mut SmallVec<[Arc<Node<T>>; BRANCH_CAP]>| {
+        for c in &rest {
+            dst.push(c.clone());
+        }
+    };
+
+    if merged_h == height - 1 {
+        match side {
+            Side::Right => {
+                extend_with_rest(&mut new_children);
                 new_children.push(merged);
-                for c in &r_children[1..] {
-                    new_children.push(c.clone());
-                }
-                make_inner(new_children, height)
-            } else if merged_h == height {
-                match &*merged {
-                    Node::Inner { children: m_ch, .. } => {
-                        for c in m_ch {
-                            new_children.push(c.clone());
-                        }
-                        if new_children.len() + (r_children.len() - 1) <= BRANCH_CAP {
-                            for c in &r_children[1..] {
-                                new_children.push(c.clone());
-                            }
-                            make_inner(new_children, height)
-                        } else {
-                            let mut all: Vec<Arc<Node<T>>> = new_children.into_iter().collect();
-                            for c in &r_children[1..] {
-                                all.push(c.clone());
-                            }
-                            let mid = all.len() / 2;
-                            let mut left_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            let mut right_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            for (i, c) in all.into_iter().enumerate() {
-                                if i < mid {
-                                    left_c.push(c);
-                                } else {
-                                    right_c.push(c);
-                                }
-                            }
-                            let l = make_inner(left_c, height);
-                            let r = make_inner(right_c, height);
-                            let mut parent: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
-                            parent.push(l);
-                            parent.push(r);
-                            make_inner(parent, height + 1)
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                unreachable!(
-                    "concat_nodes returned unexpected height {} (parent h={})",
-                    merged_h, height
-                );
+            }
+            Side::Left => {
+                new_children.push(merged);
+                extend_with_rest(&mut new_children);
             }
         }
-        Node::Leaf { .. } => unreachable!("right must be taller than left"),
+        new_branch(new_children, height)
+    } else if merged_h == height {
+        let m_ch = match &*merged {
+            Node::Inner { children, .. } => children.clone(),
+            _ => unreachable!(),
+        };
+        // Combine rest + m_ch in the correct order for the side.
+        let mut combined: Vec<Arc<Node<T>>> = Vec::new();
+        match side {
+            Side::Right => {
+                for c in &rest {
+                    combined.push(c.clone());
+                }
+                for c in &m_ch {
+                    combined.push(c.clone());
+                }
+            }
+            Side::Left => {
+                for c in &m_ch {
+                    combined.push(c.clone());
+                }
+                for c in &rest {
+                    combined.push(c.clone());
+                }
+            }
+        }
+        if combined.len() <= BRANCH_CAP {
+            for c in combined {
+                new_children.push(c);
+            }
+            new_branch(new_children, height)
+        } else {
+            let mid = combined.len() / 2;
+            let mut left_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
+            let mut right_c: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
+            for (i, c) in combined.into_iter().enumerate() {
+                if i < mid {
+                    left_c.push(c);
+                } else {
+                    right_c.push(c);
+                }
+            }
+            let l = new_branch(left_c, height);
+            let r = new_branch(right_c, height);
+            let mut parent: SmallVec<[Arc<Node<T>>; BRANCH_CAP]> = SmallVec::new();
+            parent.push(l);
+            parent.push(r);
+            new_branch(parent, height + 1)
+        }
+    } else {
+        unreachable!(
+            "concat_nodes returned unexpected height {} (parent h={})",
+            merged_h, height
+        );
     }
 }
 
 pub struct Iter<'a, T: Item> {
     stack: Vec<(&'a Node<T>, usize)>,
-}
-
-impl<'a, T: Item> Iter<'a, T> {
-    fn new(root: &'a Node<T>) -> Self {
-        Self { stack: vec![(root, 0)] }
-    }
 }
 
 impl<'a, T: Item> Iterator for Iter<'a, T> {
@@ -674,7 +640,7 @@ mod tests {
     #[test]
     fn build_and_summarize() {
         let items: Vec<Num> = (0..100).map(Num).collect();
-        let t = SumTree::from_items(items);
+        let t = SumTree::from_items(&items);
         assert_eq!(t.summary().count, 100);
         assert_eq!(t.summary().sum, (0..100u64).sum());
     }
@@ -682,7 +648,7 @@ mod tests {
     #[test]
     fn iter_round_trip() {
         let items: Vec<Num> = (0..255).map(Num).collect();
-        let t = SumTree::from_items(items.clone());
+        let t = SumTree::from_items(&items);
         let collected: Vec<Num> = t.iter().cloned().collect();
         assert_eq!(collected, items);
     }
@@ -690,8 +656,8 @@ mod tests {
     #[test]
     fn seek_by_count() {
         let items: Vec<Num> = (0..50).map(Num).collect();
-        let t = SumTree::from_items(items);
-        let s = t.seek(10u32, |s| s.count);
+        let t = SumTree::from_items(&items);
+        let s = t.seek(&10u32, |s| s.count);
         assert_eq!(s.item, Some(&Num(10)));
         assert_eq!(s.before.count, 10);
     }
@@ -699,16 +665,16 @@ mod tests {
     #[test]
     fn seek_past_end() {
         let items: Vec<Num> = (0..5).map(Num).collect();
-        let t = SumTree::from_items(items);
-        let s = t.seek(100u32, |s| s.count);
+        let t = SumTree::from_items(&items);
+        let s = t.seek(&100u32, |s| s.count);
         assert!(s.item.is_none());
         assert_eq!(s.before.count, 5);
     }
 
     #[test]
     fn concat() {
-        let a = SumTree::from_items((0..30).map(Num).collect());
-        let b = SumTree::from_items((30..60).map(Num).collect());
+        let a = SumTree::from_items(&(0..30).map(Num).collect::<Vec<_>>());
+        let b = SumTree::from_items(&(30..60).map(Num).collect::<Vec<_>>());
         let c = a.concat(b);
         assert_eq!(c.summary().count, 60);
         let v: Vec<u32> = c.iter().map(|n| n.0).collect();
@@ -717,7 +683,7 @@ mod tests {
 
     #[test]
     fn persistent_clone_is_cheap() {
-        let t = SumTree::from_items((0..1000).map(Num).collect());
+        let t = SumTree::from_items(&(0..1000).map(Num).collect::<Vec<_>>());
         let t2 = t.clone();
         assert!(Arc::ptr_eq(&t.root, &t2.root));
     }
@@ -725,8 +691,8 @@ mod tests {
     #[test]
     fn split_at_boundary() {
         let items: Vec<Num> = (0..100).map(Num).collect();
-        let t = SumTree::from_items(items.clone());
-        let (l, r) = t.split(40u32, |s| s.count);
+        let t = SumTree::from_items(&items);
+        let (l, r) = t.split(&40u32, |s| s.count);
         let lv: Vec<u32> = l.iter().map(|n| n.0).collect();
         let rv: Vec<u32> = r.iter().map(|n| n.0).collect();
         assert_eq!(lv, (0..40).collect::<Vec<_>>());
@@ -738,9 +704,9 @@ mod tests {
     #[test]
     fn split_concat_round_trip() {
         let items: Vec<Num> = (0..500).map(Num).collect();
-        let t = SumTree::from_items(items.clone());
+        let t = SumTree::from_items(&items);
         for &at in &[0u32, 1, 7, 8, 9, 15, 16, 17, 100, 250, 400, 499, 500] {
-            let (l, r) = t.clone().split(at, |s| s.count);
+            let (l, r) = t.clone().split(&at, |s| s.count);
             assert_eq!(l.summary().count, at.min(500));
             let merged = l.concat(r);
             let v: Vec<u32> = merged.iter().map(|n| n.0).collect();
@@ -750,22 +716,22 @@ mod tests {
 
     #[test]
     fn split_empty_left() {
-        let t = SumTree::from_items((0..20).map(Num).collect::<Vec<_>>());
-        let (l, r) = t.split(0u32, |s| s.count);
+        let t = SumTree::from_items(&(0..20).map(Num).collect::<Vec<_>>());
+        let (l, r) = t.split(&0u32, |s| s.count);
         assert_eq!(l.summary().count, 0);
         assert_eq!(r.summary().count, 20);
     }
 
     #[test]
     fn concat_unequal_heights() {
-        let small = SumTree::from_items((0..3).map(Num).collect::<Vec<_>>());
-        let big = SumTree::from_items((3..1000).map(Num).collect::<Vec<_>>());
+        let small = SumTree::from_items(&(0..3).map(Num).collect::<Vec<_>>());
+        let big = SumTree::from_items(&(3..1000).map(Num).collect::<Vec<_>>());
         let c = small.concat(big);
         let v: Vec<u32> = c.iter().map(|n| n.0).collect();
         assert_eq!(v, (0..1000).collect::<Vec<_>>());
 
-        let big2 = SumTree::from_items((0..1000).map(Num).collect::<Vec<_>>());
-        let small2 = SumTree::from_items((1000..1005).map(Num).collect::<Vec<_>>());
+        let big2 = SumTree::from_items(&(0..1000).map(Num).collect::<Vec<_>>());
+        let small2 = SumTree::from_items(&(1000..1005).map(Num).collect::<Vec<_>>());
         let c2 = big2.concat(small2);
         let v2: Vec<u32> = c2.iter().map(|n| n.0).collect();
         assert_eq!(v2, (0..1005).collect::<Vec<_>>());
@@ -776,9 +742,9 @@ mod tests {
         // After a split, the original tree's clone must still be valid and
         // equal to before.
         let items: Vec<Num> = (0..1000).map(Num).collect();
-        let t = SumTree::from_items(items.clone());
+        let t = SumTree::from_items(&items);
         let t2 = t.clone();
-        let (_l, _r) = t.split(500u32, |s| s.count);
+        let (_l, _r) = t.split(&500u32, |s| s.count);
         // t2 unchanged
         let v: Vec<u32> = t2.iter().map(|n| n.0).collect();
         assert_eq!(v, items.iter().map(|n| n.0).collect::<Vec<_>>());

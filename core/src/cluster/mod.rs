@@ -11,9 +11,9 @@
 //!   `partition_leiden`, `l2_normalize`, `cosine_similarity`,
 //!   `mean_normalize`, `ninetieth_percentile_distance`.
 //! - `tree`   — online placement: `place_beam_descent` over `TreeView`.
-//! - `build`  — offline build pipeline + persistence: `build_tree`,
-//!   `build_and_persist`, `rebuild_and_persist`,
-//!   `build_tree_structural`, plus the divisive top-down
+//! - `build`  — offline build pipeline + persistence: `tree`,
+//!   `persist`, `rebuild_and_persist`,
+//!   `tree_structural`, plus the divisive top-down
 //!   recipe and the FromFolders alternative.
 //!
 //! status: cluster-module-discipline
@@ -31,15 +31,6 @@ pub mod tree;
 #[cfg(test)]
 mod tests;
 
-pub use algo::{
-    cosine_similarity, l2_normalize, mean_normalize, ninetieth_percentile_distance, partition,
-    partition_leiden,
-};
-pub use build::{
-    build_and_persist, build_tree, build_tree_structural, build_tree_structural_streaming,
-    rebuild_and_persist, result_to_node_inserts_pub, NoopSummarizer,
-};
-pub use tree::place_beam_descent;
 
 /// Outlier sentinel used by HDBSCAN's flat-cluster output. Matches the
 /// classic sklearn `-1` convention so callers reading the spec see what
@@ -49,13 +40,13 @@ pub const OUTLIER_LABEL: i32 = -1;
 /// One row from the cluster output: index into the caller's embeddings
 /// slice → cluster label. `OUTLIER_LABEL` (-1) flags a noise point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterAssignment {
+pub struct Assignment {
     pub point_index: usize,
     pub cluster_label: i32,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ClusterError {
+pub enum Error {
     #[error("embeddings is empty")]
     Empty,
     #[error("inconsistent embedding dimensions: row 0 is {expected}, row {row} is {got}")]
@@ -143,7 +134,7 @@ pub fn plan_sample_merge(
 
 /// Stable per-node id. Per `clustering.md`'s `cluster-tree-output`,
 /// cluster ids are ephemeral within a run but stable enough to address
-/// nodes inside a saved tree. Trees this module places into are
+/// nodes inside a saved tree. Db this module places into are
 /// persisted by `core::trees`; we stay agnostic to the storage shape
 /// and just take owned strings.
 pub type NodeId = String;
@@ -154,7 +145,7 @@ pub type NodeId = String;
 /// the consumer walks the tree, so this module keeps both behind an
 /// untyped string list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterNode {
+pub struct Node {
     pub id: NodeId,
     /// Mean of member embeddings, L2-normalized so cosine similarity
     /// against a normalized query reduces to a dot product.
@@ -182,22 +173,22 @@ pub struct PlacementMatch {
 /// free of trees.db assumptions.
 pub trait TreeView {
     fn root(&self) -> &NodeId;
-    fn get(&self, id: &NodeId) -> Option<&ClusterNode>;
+    fn get(&self, id: &NodeId) -> Option<&Node>;
 }
 
-/// In-memory `TreeView` impl over a flat `HashMap<NodeId, ClusterNode>`.
+/// In-memory `TreeView` impl over a flat `HashMap<NodeId, Node>`.
 /// Convenient for tests and for callers that already have the tree in
 /// memory; persistent stores plug their own `TreeView` in.
 pub struct InMemoryTree {
     pub root: NodeId,
-    pub nodes: std::collections::HashMap<NodeId, ClusterNode>,
+    pub nodes: std::collections::HashMap<NodeId, Node>,
 }
 
 impl TreeView for InMemoryTree {
     fn root(&self) -> &NodeId {
         &self.root
     }
-    fn get(&self, id: &NodeId) -> Option<&ClusterNode> {
+    fn get(&self, id: &NodeId) -> Option<&Node> {
         self.nodes.get(id)
     }
 }
@@ -206,7 +197,7 @@ impl TreeView for InMemoryTree {
 //
 // Everything below is the offline batch build side. The placement
 // classifier above is the online cheap path; the two share the same
-// `ClusterNode` shape for tree traversal but the build pipeline produces
+// `Node` shape for tree traversal but the build pipeline produces
 // the richer `BuiltClusterNode` (with names, summaries, confidence)
 // described in `clustering.md` §"Output: what suggestions consume".
 //
@@ -225,10 +216,10 @@ impl TreeView for InMemoryTree {
 
 /// Per `cluster-algorithm-selectable`. `Gmm` is reserved for the future
 /// linfa-clustering swap; for now the producer falls back to `Hdbscan`
-/// with a warning when a vault picks it (see `build_tree`).
+/// with a warning when a vault picks it (see `tree`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ClusterAlgorithm {
+pub enum Algorithm {
     #[default]
     Hdbscan,
     Gmm,
@@ -281,11 +272,11 @@ pub struct LeidenParams {
     pub top_level_resolution: f32,
 }
 
-fn default_leiden_resolution() -> f32 {
+const fn default_leiden_resolution() -> f32 {
     1.0
 }
 
-fn default_leiden_top_resolution() -> f32 {
+const fn default_leiden_top_resolution() -> f32 {
     0.3
 }
 
@@ -303,7 +294,7 @@ impl Default for LeidenParams {
 }
 
 /// Per `cluster-build-scope`. Caller-resolved into a `Vec<NoteRef>` by
-/// the producer before `build_tree` runs; this type is what gets stored
+/// the producer before `tree` runs; this type is what gets stored
 /// on `cluster_trees.scope` so triage knows the eligible set.
 ///
 /// Each variant carries an optional `source_types` filter (per
@@ -387,13 +378,13 @@ pub enum SummarizeMode {
 
 /// RAPTOR-shape build parameters. Per `cluster-build-params`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterParams {
-    pub algorithm: ClusterAlgorithm,
+pub struct Params {
+    pub algorithm: Algorithm,
     pub min_cluster_size: u32,
     /// `None` → defaults to `min_cluster_size` at runtime.
     pub min_samples: Option<u32>,
     /// Legacy termination knob from the pre-ops-framework build pipeline.
-    /// Replaced by the per-branch recursion checks on `Trees::split_cluster`
+    /// Replaced by the per-branch recursion checks on `Db::split_cluster`
     /// (`recurse` + `leaf_min_size` + `leaf_cohesion_threshold`). Kept
     /// deserializable so persisted `cluster_trees.method` JSON from before
     /// the ops-framework migration round-trips; `skip_serializing` so new
@@ -416,7 +407,7 @@ pub struct ClusterParams {
     /// disclosure (`cluster-review-tab-disable-recursion`).
     #[serde(default)]
     pub disable_recursion: bool,
-    /// When `true`, `Trees::split_cluster` recursively re-splits each
+    /// When `true`, `Db::split_cluster` recursively re-splits each
     /// newly-produced child that exceeds `leaf_min_size` and whose
     /// 90th-percentile cohesion radius exceeds `leaf_cohesion_threshold`.
     /// Default `false` — direct user-driven splits stop after one level;
@@ -424,30 +415,30 @@ pub struct ClusterParams {
     /// branch until cohesion is reached. Per `cluster-op-split`.
     #[serde(default)]
     pub recurse: bool,
-    /// Recursion guard for `Trees::split_cluster`: children with fewer
+    /// Recursion guard for `Db::split_cluster`: children with fewer
     /// than this many members are not re-split. Default 5; matches the
     /// HDBSCAN `min_cluster_size` posture.
     #[serde(default = "default_leaf_min_size")]
     pub leaf_min_size: u32,
-    /// Recursion guard for `Trees::split_cluster`: children whose
+    /// Recursion guard for `Db::split_cluster`: children whose
     /// 90th-percentile cosine distance to centroid is at or below this
     /// value are considered tight enough and not re-split. Default 0.15.
     #[serde(default = "default_leaf_cohesion_threshold")]
     pub leaf_cohesion_threshold: f32,
 }
 
-fn default_leaf_min_size() -> u32 {
+const fn default_leaf_min_size() -> u32 {
     5
 }
 
-fn default_leaf_cohesion_threshold() -> f32 {
+const fn default_leaf_cohesion_threshold() -> f32 {
     0.15
 }
 
-impl Default for ClusterParams {
+impl Default for Params {
     fn default() -> Self {
         Self {
-            algorithm: ClusterAlgorithm::Hdbscan,
+            algorithm: Algorithm::Hdbscan,
             min_cluster_size: 5,
             min_samples: None,
             min_clusters_to_recurse: 4,
@@ -487,11 +478,11 @@ impl Default for FolderDeriveParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum BuildMethod {
-    Cluster { params: ClusterParams },
+    Cluster { params: Params },
     FromFolders { params: FolderDeriveParams },
 }
 
-/// One member of an input set handed to `build_tree`. Carries the note's
+/// One member of an input set handed to `tree`. Carries the note's
 /// id, embedding, and the strings the summarizer feeds the prompt with.
 /// The `folder` field is consulted only by the FromFolders method.
 #[derive(Debug, Clone)]
@@ -503,9 +494,9 @@ pub struct NoteInput {
     pub embedding: Vec<f32>,
 }
 
-/// Rich build-output node, matching the `ClusterNode` shape spec'd in
+/// Rich build-output node, matching the `Node` shape spec'd in
 /// `clustering.md` §"Output". This is the offline batch-build product;
-/// the smaller `ClusterNode` above is the placement-classifier view.
+/// the smaller `Node` above is the placement-classifier view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltClusterNode {
     pub id: NodeId,
@@ -525,7 +516,7 @@ pub struct BuiltClusterNode {
     pub confidence: f32,
 }
 
-/// Output of `build_tree`. Per `clustering.md` §"Output: what suggestions
+/// Output of `tree`. Per `clustering.md` §"Output: what suggestions
 /// consume". `levels[0]` is the leaf clusters (over notes); `levels.last()`
 /// is the root level. `outliers` holds unplaced note ids when
 /// `include_outliers = true`.
@@ -582,7 +573,7 @@ pub enum BuildError {
     #[error("clustering didn't separate the inputs: {found} notes resolved into fewer than 2 clusters. Try lowering min_cluster_size or include outliers.")]
     VaultTooSmall { found: usize },
     #[error("cluster: {0}")]
-    Cluster(#[from] ClusterError),
+    Cluster(#[from] Error),
     #[error("summarizer: {0}")]
     Summarizer(String),
     /// The producer signalled cancellation via the shared atomic the
@@ -601,7 +592,7 @@ pub enum BuildError {
 /// else in the build pipeline.
 ///
 /// status: cluster-build-progress-stream
-pub type ClusterId = NodeId;
+pub type Id = NodeId;
 
 /// Phase indicator emitted on the build progress stream. Consumers
 /// render this verbatim in the review tab's progress row (per
@@ -652,7 +643,7 @@ pub enum BuildEvent {
     /// (cache by `parent` id until the parent arrives).
     ClusterDiscovered {
         node: BuiltClusterNode,
-        parent: Option<ClusterId>,
+        parent: Option<Id>,
     },
     /// Terminal: the full tree is ready. Following events are not emitted.
     Done { tree: BuiltClusterTree },
@@ -666,7 +657,7 @@ pub enum BuildEvent {
 }
 
 /// LLM-backed summarizer. Renders the `cluster_summarize` prompt with the
-/// cluster's member titles + summaries, calls `LlmClient::chat`, and
+/// cluster's member titles + summaries, calls `Client::chat`, and
 /// parses the JSON response into `SummaryOutput`.
 ///
 /// The `Summarizer` trait is sync; `chat` is async. We bridge by spinning
@@ -677,13 +668,13 @@ pub enum BuildEvent {
 ///
 /// status: cluster-summarize-llm
 pub struct LlmSummarizer {
-    client: std::sync::Arc<dyn crate::llm::LlmClient>,
+    client: std::sync::Arc<dyn crate::llm::Client>,
     prompt_template: String,
 }
 
 impl LlmSummarizer {
     pub fn new(
-        client: std::sync::Arc<dyn crate::llm::LlmClient>,
+        client: std::sync::Arc<dyn crate::llm::Client>,
         prompt_template: String,
     ) -> Self {
         Self { client, prompt_template }
@@ -736,37 +727,33 @@ impl Summarizer for LlmSummarizer {
             .recv()
             .map_err(|e| BuildError::Summarizer(format!("llm thread: {e}")))?
             .map_err(BuildError::Summarizer)?;
-        parse_summary_json(&resp)
+        // The model is asked to return a bare JSON object, but providers
+        // sometimes wrap it in prose or a ```json fence. Locate the first
+        // `{` and the matching final `}` and parse that slice.
+        let start = resp
+            .find('{')
+            .ok_or_else(|| BuildError::Summarizer(format!("no JSON object in response: {resp:?}")))?;
+        let end = resp
+            .rfind('}')
+            .ok_or_else(|| BuildError::Summarizer(format!("unterminated JSON in response: {resp:?}")))?;
+        if end < start {
+            return Err(BuildError::Summarizer(format!("malformed JSON in response: {resp:?}")));
+        }
+        let slice = &resp[start..=end];
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            name: String,
+            summary: String,
+            #[serde(default)]
+            confidence: Option<f32>,
+        }
+        let raw: Raw = serde_json::from_str(slice)
+            .map_err(|e| BuildError::Summarizer(format!("parse JSON {slice:?}: {e}")))?;
+        let confidence = raw.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
+        Ok(SummaryOutput {
+            name: raw.name,
+            summary: raw.summary,
+            confidence,
+        })
     }
-}
-
-fn parse_summary_json(resp: &str) -> Result<SummaryOutput, BuildError> {
-    // The model is asked to return a bare JSON object, but providers
-    // sometimes wrap it in prose or a ```json fence. Locate the first
-    // `{` and the matching final `}` and parse that slice.
-    let start = resp
-        .find('{')
-        .ok_or_else(|| BuildError::Summarizer(format!("no JSON object in response: {resp:?}")))?;
-    let end = resp
-        .rfind('}')
-        .ok_or_else(|| BuildError::Summarizer(format!("unterminated JSON in response: {resp:?}")))?;
-    if end < start {
-        return Err(BuildError::Summarizer(format!("malformed JSON in response: {resp:?}")));
-    }
-    let slice = &resp[start..=end];
-    #[derive(serde::Deserialize)]
-    struct Raw {
-        name: String,
-        summary: String,
-        #[serde(default)]
-        confidence: Option<f32>,
-    }
-    let raw: Raw = serde_json::from_str(slice)
-        .map_err(|e| BuildError::Summarizer(format!("parse JSON {slice:?}: {e}")))?;
-    let confidence = raw.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
-    Ok(SummaryOutput {
-        name: raw.name,
-        summary: raw.summary,
-        confidence,
-    })
 }

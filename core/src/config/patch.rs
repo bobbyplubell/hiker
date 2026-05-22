@@ -1,20 +1,189 @@
 //! Eligible-key allowlist + write-back patch helpers for `Config::set`.
 
-use crate::error::HikerError;
-
-use super::SettingsScope;
-
 /// One node of the eligible-key set: dotted path + expected JSON-side type.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EligibleKey {
     /// Dotted path, e.g. `"editor.live_preview"`. The first component is
     /// the section, then leaf or sub-table.
     pub(super) path: &'static str,
-    ty: ValueType,
+    pub(super) ty: ValueType,
+}
+
+impl EligibleKey {
+    pub(super) const fn ty(&self) -> ValueType {
+        self.ty
+    }
+
+    /// Type-check a candidate JSON value against this key's `ValueType`,
+    /// applying the same range/enum constraints the UI controls enforce.
+    /// Returns `true` when the value is a legal write for this key.
+    pub(super) fn validate(&self, value: &serde_json::Value) -> bool {
+        use serde_json::Value as J;
+        match (self.ty(), value) {
+            (ValueType::Bool, J::Bool(_)) => true,
+            (ValueType::String, J::String(_)) => true,
+            (ValueType::String, J::Null) => true,
+            (ValueType::StringArray, J::Array(arr)) => arr.iter().all(serde_json::Value::is_string),
+            (ValueType::TreeSortBy, J::String(s)) => matches!(
+                s.as_str(),
+                "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc"
+            ),
+            (ValueType::SidebarMode, J::String(s)) => {
+                matches!(s.as_str(), "files" | "clusters" | "trails")
+            }
+            (ValueType::UnitFraction, J::Number(n)) => n
+                .as_f64()
+                .map(|f| (0.0..=1.0).contains(&f))
+                .unwrap_or(false),
+            (ValueType::PositiveInt, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u >= 1 && u <= u32::MAX as u64)
+                .unwrap_or(false),
+            (ValueType::NonNegativeInt, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u <= u32::MAX as u64)
+                .unwrap_or(false),
+            (ValueType::WorkerPreference, J::String(s)) => {
+                matches!(s.as_str(), "auto" | "internal" | "external")
+            }
+            (ValueType::Port, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u <= u16::MAX as u64)
+                .unwrap_or(false),
+            (ValueType::SemanticMinSim, J::Number(n)) => n
+                .as_f64()
+                .map(|f| (0.0..=0.95).contains(&f))
+                .unwrap_or(false),
+            (ValueType::SemanticTopK, J::Number(n)) => n
+                .as_u64()
+                .map(|u| (5..=100).contains(&u))
+                .unwrap_or(false),
+            (ValueType::RecencyBias, J::String(s)) => {
+                matches!(s.as_str(), "off" | "mild" | "strong")
+            }
+            (ValueType::IdStamping, J::String(s)) => {
+                matches!(s.as_str(), "all" | "lazy")
+            }
+            (ValueType::EmbedderModel, J::String(s)) => crate::embed::is_known_model(s),
+            (ValueType::HexColor, J::String(s)) => {
+                let bytes = s.as_bytes();
+                matches!(bytes.first(), Some(b'#'))
+                    && {
+                        let hex = &bytes[1..];
+                        (hex.len() == 6 || hex.len() == 8)
+                            && hex.iter().all(u8::is_ascii_hexdigit)
+                    }
+            }
+            (ValueType::MinimapWidth, J::Number(n)) => n
+                .as_u64()
+                .map(|u| (16..=300).contains(&u))
+                .unwrap_or(false),
+            (ValueType::MinimapPad, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u <= 24)
+                .unwrap_or(false),
+            (ValueType::MinimapRadius, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u <= 6)
+                .unwrap_or(false),
+            (ValueType::MinimapMinBarWidth, J::Number(n)) => n
+                .as_u64()
+                .map(|u| (1..=12).contains(&u))
+                .unwrap_or(false),
+            (ValueType::MinimapBarGap, J::Number(n)) => n
+                .as_u64()
+                .map(|u| u <= 20)
+                .unwrap_or(false),
+            (ValueType::ScrollSpeed, J::Number(n)) => n
+                .as_f64()
+                .map(|f| (0.25..=10.0).contains(&f))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+/// In-place writer for a single dotted-key leaf in a parsed TOML document.
+/// Owns the borrowed `DocumentMut` so `Config::set` can hand off the
+/// JSON→TOML conversion and table-walking as method calls (which keeps
+/// `set` small and the helpers cohesive in this module).
+pub(super) struct Patcher<'a> {
+    pub(super) doc: &'a mut toml_edit::DocumentMut,
+}
+
+impl Patcher<'_> {
+    /// Ensure `slot` is a `Table` then insert `(name, item)` into it,
+    /// replacing a non-table slot with a fresh table first.
+    fn insert_into_table(slot: &mut toml_edit::Item, name: &str, item: toml_edit::Item) {
+        match slot {
+            toml_edit::Item::Table(t) => {
+                t.insert(name, item);
+            }
+            _ => {
+                *slot = toml_edit::Item::Table(toml_edit::Table::new());
+                if let toml_edit::Item::Table(t) = slot {
+                    t.insert(name, item);
+                }
+            }
+        }
+    }
+
+    /// Write `value` at dotted `key`, creating intermediate tables as
+    /// needed so the leaf lands in the right `[section.sub]` table.
+    pub(super) fn set(&mut self, key: &str, value: &serde_json::Value) {
+        use serde_json::Value as J;
+        let item = match value {
+            J::Bool(b) => toml_edit::value(*b),
+            J::String(s) => toml_edit::value(s.as_str()),
+            J::Number(n) => {
+                if n.is_f64() {
+                    if let Some(f) = n.as_f64() {
+                        toml_edit::value(f)
+                    } else {
+                        toml_edit::Item::None
+                    }
+                } else if let Some(i) = n.as_i64() {
+                    toml_edit::value(i)
+                } else if let Some(f) = n.as_f64() {
+                    toml_edit::value(f)
+                } else {
+                    toml_edit::Item::None
+                }
+            }
+            J::Null => toml_edit::Item::None,
+            J::Array(arr) => {
+                let mut a = toml_edit::Array::new();
+                for v in arr {
+                    if let J::String(s) = v {
+                        a.push(s.as_str());
+                    }
+                }
+                toml_edit::value(a)
+            }
+            J::Object(_) => toml_edit::Item::None,
+        };
+        let parts: Vec<&str> = key.split('.').collect();
+        let mut cursor: &mut toml_edit::Item = self.doc.as_item_mut();
+        for part in &parts[..parts.len() - 1] {
+            let needs_replace = !matches!(cursor.get(part), Some(toml_edit::Item::Table(_)));
+            if needs_replace {
+                Self::insert_into_table(
+                    cursor,
+                    part,
+                    toml_edit::Item::Table(toml_edit::Table::new()),
+                );
+            }
+            cursor = cursor
+                .get_mut(part)
+                .expect("intermediate slot was just ensured to be a Table");
+        }
+        let leaf = parts[parts.len() - 1];
+        Self::insert_into_table(cursor, leaf, item);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ValueType {
+pub(super) enum ValueType {
     Bool,
     String,
     StringArray,
@@ -63,7 +232,7 @@ enum ValueType {
     ScrollSpeed,
 }
 
-const ELIGIBLE_VAULT: &[EligibleKey] = &[
+pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.render_txt_as_markdown", ty: ValueType::Bool },
     EligibleKey { path: "editor.live_preview",           ty: ValueType::Bool },
     EligibleKey { path: "editor.word_wrap",              ty: ValueType::Bool },
@@ -201,7 +370,7 @@ const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
-const ELIGIBLE_USER: &[EligibleKey] = &[
+pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "vault.recent",  ty: ValueType::StringArray },
     EligibleKey { path: "vault.default", ty: ValueType::String },
     // status: embedder-model-selectable
@@ -269,214 +438,3 @@ const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
-fn is_hex_color(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if !matches!(bytes.first(), Some(b'#')) {
-        return false;
-    }
-    let hex = &bytes[1..];
-    if !(hex.len() == 6 || hex.len() == 8) {
-        return false;
-    }
-    hex.iter().all(|b| b.is_ascii_hexdigit())
-}
-
-pub(super) fn eligible_key(scope: SettingsScope, key: &str) -> Result<EligibleKey, HikerError> {
-    let table = match scope {
-        SettingsScope::User => ELIGIBLE_USER,
-        SettingsScope::Vault => ELIGIBLE_VAULT,
-    };
-    table
-        .iter()
-        .copied()
-        .find(|k| k.path == key)
-        .ok_or_else(|| {
-            HikerError::Config(format!(
-                "setting `{key}` is not user-mutable in v1 (scope: {scope:?})"
-            ))
-        })
-}
-
-pub(super) fn validate_value(key: &EligibleKey, value: &serde_json::Value) -> Result<(), HikerError> {
-    use serde_json::Value as J;
-    let ok = match (key.ty, value) {
-        (ValueType::Bool, J::Bool(_)) => true,
-        (ValueType::String, J::String(_)) => true,
-        (ValueType::String, J::Null) => true,
-        (ValueType::StringArray, J::Array(arr)) => arr.iter().all(|v| v.is_string()),
-        (ValueType::TreeSortBy, J::String(s)) => matches!(
-            s.as_str(),
-            "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc"
-        ),
-        (ValueType::SidebarMode, J::String(s)) => {
-            matches!(s.as_str(), "files" | "clusters" | "trails")
-        }
-        (ValueType::UnitFraction, J::Number(n)) => n
-            .as_f64()
-            .map(|f| (0.0..=1.0).contains(&f))
-            .unwrap_or(false),
-        // Positive integer that fits u32. JSON.stringify on a JS
-        // number-without-fraction parses back as an integer, so
-        // `as_u64` returns Some only for true integer values; floats
-        // are rejected, which is what we want for `max_tokens` etc.
-        (ValueType::PositiveInt, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u >= 1 && u <= u32::MAX as u64)
-            .unwrap_or(false),
-        (ValueType::NonNegativeInt, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u <= u32::MAX as u64)
-            .unwrap_or(false),
-        (ValueType::WorkerPreference, J::String(s)) => {
-            matches!(s.as_str(), "auto" | "internal" | "external")
-        }
-        (ValueType::Port, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u <= u16::MAX as u64)
-            .unwrap_or(false),
-        (ValueType::SemanticMinSim, J::Number(n)) => n
-            .as_f64()
-            .map(|f| (0.0..=0.95).contains(&f))
-            .unwrap_or(false),
-        (ValueType::SemanticTopK, J::Number(n)) => n
-            .as_u64()
-            .map(|u| (5..=100).contains(&u))
-            .unwrap_or(false),
-        (ValueType::RecencyBias, J::String(s)) => {
-            matches!(s.as_str(), "off" | "mild" | "strong")
-        }
-        (ValueType::IdStamping, J::String(s)) => {
-            matches!(s.as_str(), "all" | "lazy")
-        }
-        (ValueType::EmbedderModel, J::String(s)) => crate::embed::is_known_model(s),
-        (ValueType::HexColor, J::String(s)) => is_hex_color(s),
-        (ValueType::MinimapWidth, J::Number(n)) => n
-            .as_u64()
-            .map(|u| (16..=300).contains(&u))
-            .unwrap_or(false),
-        (ValueType::MinimapPad, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u <= 24)
-            .unwrap_or(false),
-        (ValueType::MinimapRadius, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u <= 6)
-            .unwrap_or(false),
-        (ValueType::MinimapMinBarWidth, J::Number(n)) => n
-            .as_u64()
-            .map(|u| (1..=12).contains(&u))
-            .unwrap_or(false),
-        (ValueType::MinimapBarGap, J::Number(n)) => n
-            .as_u64()
-            .map(|u| u <= 20)
-            .unwrap_or(false),
-        (ValueType::ScrollSpeed, J::Number(n)) => n
-            .as_f64()
-            .map(|f| (0.25..=10.0).contains(&f))
-            .unwrap_or(false),
-        _ => false,
-    };
-    if !ok {
-        return Err(HikerError::Config(format!(
-            "setting `{}` got invalid value `{value}`",
-            key.path
-        )));
-    }
-    Ok(())
-}
-
-/// Patch `doc` so the dotted-path key resolves to `value`. Creates any
-/// intermediate tables that don't exist.
-pub(super) fn apply_patch(doc: &mut toml_edit::DocumentMut, key: &str, value: &serde_json::Value) {
-    let parts: Vec<&str> = key.split('.').collect();
-    let item = json_to_toml_item(value);
-
-    // Walk to the parent table, creating intermediate tables as we go.
-    let mut cursor: &mut toml_edit::Item = doc.as_item_mut();
-    for part in &parts[..parts.len() - 1] {
-        // If the slot is missing or not a table, replace with an empty table.
-        let needs_replace = !matches!(cursor.get(part), Some(toml_edit::Item::Table(_)));
-        if needs_replace {
-            // `cursor` here may be the root document or a sub-table.
-            match cursor {
-                toml_edit::Item::Table(t) => {
-                    t.insert(part, toml_edit::Item::Table(toml_edit::Table::new()));
-                }
-                _ => {
-                    // The parent isn't a table — replace it wholesale.
-                    *cursor = toml_edit::Item::Table(toml_edit::Table::new());
-                    if let toml_edit::Item::Table(t) = cursor {
-                        t.insert(part, toml_edit::Item::Table(toml_edit::Table::new()));
-                    }
-                }
-            }
-        }
-        cursor = cursor
-            .get_mut(part)
-            .expect("intermediate slot was just ensured to be a Table");
-    }
-
-    let leaf = parts[parts.len() - 1];
-    match cursor {
-        toml_edit::Item::Table(t) => {
-            t.insert(leaf, item);
-        }
-        _ => {
-            // Same fallback as above: ensure the parent is a table.
-            *cursor = toml_edit::Item::Table(toml_edit::Table::new());
-            if let toml_edit::Item::Table(t) = cursor {
-                t.insert(leaf, item);
-            }
-        }
-    }
-}
-
-fn json_to_toml_item(value: &serde_json::Value) -> toml_edit::Item {
-    use serde_json::Value as J;
-    match value {
-        J::Bool(b) => toml_edit::value(*b),
-        J::String(s) => toml_edit::value(s.as_str()),
-        J::Number(n) => {
-            // Branch on the Number's *stored* type rather than what it
-            // can be coerced to. `as_i64()` succeeds for any whole-number
-            // f64 (e.g. 3.0 → Some(3)), and writing `editor.scroll_speed
-            // = 3` to TOML then fails strict-load back into an `f32`
-            // field — the field reverts to its serde-default. `is_f64()`
-            // reflects whether the caller constructed the Number via
-            // `from_f64` (a float-typed setting like `scroll_speed`,
-            // `chat_height`, `min_similarity`) and routes it to the
-            // float branch regardless of whole-ness. Integer-typed
-            // settings (`PositiveInt`, ports, etc.) use `json_u` which
-            // builds the Number from u64 and lands in the integer branch.
-            if n.is_f64() {
-                if let Some(f) = n.as_f64() {
-                    toml_edit::value(f)
-                } else {
-                    toml_edit::Item::None
-                }
-            } else if let Some(i) = n.as_i64() {
-                toml_edit::value(i)
-            } else if let Some(f) = n.as_f64() {
-                toml_edit::value(f)
-            } else {
-                toml_edit::Item::None
-            }
-        }
-        J::Null => toml_edit::Item::None,
-        J::Array(arr) => {
-            let mut a = toml_edit::Array::new();
-            for v in arr {
-                if let J::String(s) = v {
-                    a.push(s.as_str());
-                }
-            }
-            toml_edit::value(a)
-        }
-        J::Object(_) => {
-            // validate_value rejects this for our eligible-key set, so this
-            // branch is unreachable in practice. Falling back to None keeps
-            // the function total without panicking.
-            toml_edit::Item::None
-        }
-    }
-}

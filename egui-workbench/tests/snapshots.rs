@@ -9,16 +9,21 @@
 //! 3. CI runs `cargo test -p egui_workbench --test snapshots -- --ignored`
 //!    to diff against the committed baselines.
 
-use egui_workbench::{
-    DocumentTab, OpenTabOptions, TabUiContext, Workbench, WorkbenchBehavior,
-};
+use egui_workbench::tab::Document;
 
+use egui_workbench::workspace::OpenTabOptions;
+
+use egui_workbench::tab::UiContext;
+
+use egui_workbench::workspace::Workbench;
+
+use egui_workbench::behavior::Host;
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SnapTab {
     title: String,
 }
 
-impl DocumentTab for SnapTab {
+impl Document for SnapTab {
     fn title(&self) -> egui::WidgetText {
         self.title.clone().into()
     }
@@ -31,8 +36,8 @@ enum SnapMode {
 
 struct SnapBehavior;
 
-impl WorkbenchBehavior<SnapTab, SnapMode> for SnapBehavior {
-    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut SnapTab, _ctx: TabUiContext<'_>) {
+impl Host<SnapTab, SnapMode> for SnapBehavior {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut SnapTab, _ctx: UiContext<'_>) {
         ui.label(&tab.title);
     }
     fn side_bar_ui(&mut self, ui: &mut egui::Ui, _mode: &SnapMode) {
@@ -78,11 +83,11 @@ fn with_panel_area_open_snapshot() {
     run_and_snapshot("with_panel_area_open", |wb| {
         wb.open_panel_tab(
             SnapTab { title: "Terminal".into() },
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
         wb.open_panel_tab(
             SnapTab { title: "Output".into() },
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
     });
 }

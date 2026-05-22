@@ -4,8 +4,10 @@
 //! one [`CompletionItem`] per known page name. The replacement range covers
 //! the text between `[[` and the caret so committing extends the link.
 
-use editor_core::EditorState;
-use editor_view::{CompletionItem, CompletionKind, CompletionSource};
+use editor_core::state::Editor as EditorState;
+use editor_view::autocomplete::CompletionItem;
+use editor_view::autocomplete::CompletionKind;
+use editor_view::autocomplete::CompletionSource;
 use smol_str::SmolStr;
 
 /// Static set of known wiki page names. Hosts wanting live page discovery can
@@ -15,7 +17,7 @@ pub struct WikilinkSource {
 }
 
 impl WikilinkSource {
-    pub fn new(pages: Vec<SmolStr>) -> Self {
+    pub const fn new(pages: Vec<SmolStr>) -> Self {
         Self { pages }
     }
 }

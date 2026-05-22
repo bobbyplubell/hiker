@@ -8,15 +8,72 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use egui::Frame;
+use egui_tiles::TileId;
 
-use crate::activity_bar::{ActivityBar, show_activity_bar};
-use crate::behavior::WorkbenchBehavior;
+use crate::activity_bar::ActivityBar;
+use crate::behavior::Host;
 use crate::editor_area::EditorArea;
-use crate::handle::{GroupHandle, TabHandle};
 use crate::panel_area::PanelArea;
-use crate::side_bar::{SideBar, SideBarRole, SideBarSide, show_side_bar};
-use crate::status_bar::StatusBar;
-use crate::tab::{DocumentTab, TabState};
+use crate::side_bar::{SideBar, SideBarRole, Side, show_side_bar};
+use crate::tab::{Document, State};
+
+/// Stable identifier for a tab payload inside a [`Workbench`].
+///
+/// Allocated monotonically by [`Workbench::next_handle`]; only reused after
+/// the referenced tab has been removed from both the editor tree and the
+/// panel tree. Survives across tree reorderings, splits, and moves between
+/// groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TabId(pub u64);
+
+impl TabId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identifier for an editor group: an `egui_tiles::TileId` referring to a
+/// `Tabs` container in either the editor tree or the panel tree.
+///
+/// Note: unlike [`TabId`], this is not guaranteed stable across full layout
+/// reloads (deserializing a layout allocates fresh `TileId`s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GroupId(pub TileId);
+
+/// Status bar — thin horizontal strip with appendable cells. See `DESIGN.md`.
+/// Phase E will populate the cell rendering; Phase C gives hosts a place to
+/// draw via `Host::status_bar_ui`.
+pub struct StatusBar {
+    pub visible: bool,
+}
+
+impl Default for StatusBar {
+    fn default() -> Self {
+        Self { visible: true }
+    }
+}
+
+/// Build a 14×14 image from a static SVG byte blob for built-in workbench
+/// chrome (the panel maximise/minimise toggle, etc.). `uri` must be a stable,
+/// per-asset `bytes://…` key so egui caches the decoded texture across frames.
+///
+/// `egui_extras::install_image_loaders` must be called by the host before any
+/// of these render — the workbench example sets that up once at startup.
+pub(crate) fn chrome_icon(uri: &'static str, bytes: &'static [u8]) -> egui::Image<'static> {
+    egui::Image::new(egui::ImageSource::Bytes {
+        uri: uri.into(),
+        bytes: egui::load::Bytes::Static(bytes),
+    })
+    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+}
+
+/// The "collapse / restore panel size" chevron used by the panel-area toggle
+/// and the editor-area "all tabs" dropdown trigger.
+pub(crate) fn chevron_down() -> egui::Image<'static> {
+    static BYTES: &[u8] = include_bytes!("../assets/chevron_down.svg");
+    chrome_icon("bytes://egui_workbench-icon-chevron_down.svg", BYTES)
+}
 
 /// Which direction a new editor-group split runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +93,14 @@ pub enum GroupTarget {
     /// Create a new group by splitting the focused one.
     NewSplit(SplitDir),
     /// Open in the named group.
-    Specific(GroupHandle),
+    Specific(GroupId),
 }
 
 /// Options for [`Workbench::open_tab`].
 #[derive(Clone, Debug)]
 pub struct OpenTabOptions {
     /// State (Regular / Preview / Pinned). Default Regular.
-    pub state: TabState,
+    pub state: State,
     /// Focus the newly opened tab. Default `true`.
     pub focus: bool,
     /// Target group. Default `Focused`.
@@ -53,7 +110,7 @@ pub struct OpenTabOptions {
 impl Default for OpenTabOptions {
     fn default() -> Self {
         Self {
-            state: TabState::Regular,
+            state: State::Regular,
             focus: true,
             group: GroupTarget::Focused,
         }
@@ -61,7 +118,7 @@ impl Default for OpenTabOptions {
 }
 
 /// The single entry point a host uses to embed a workbench.
-pub struct Workbench<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> {
+pub struct Workbench<Tab: Document, Mode: Clone + Eq + Hash + 'static> {
     pub activity_bar: ActivityBar<Mode>,
     pub primary_side_bar: SideBar,
     pub secondary_side_bar: SideBar,
@@ -75,13 +132,13 @@ pub struct Workbench<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> {
     _mode: PhantomData<Mode>,
 }
 
-impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Default for Workbench<Tab, Mode> {
+impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Default for Workbench<Tab, Mode> {
     fn default() -> Self {
         Self {
             activity_bar: ActivityBar::default(),
-            primary_side_bar: SideBar::new(SideBarSide::Left),
+            primary_side_bar: SideBar::new(Side::Left),
             secondary_side_bar: SideBar {
-                side: SideBarSide::Right,
+                side: Side::Right,
                 visible: false,
                 ..SideBar::default()
             },
@@ -95,28 +152,28 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Default for Workbench<
     }
 }
 
-impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
+impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Open a tab with the given options. Returns the stable handle.
     ///
-    /// Preview replacement: when `opts.state == TabState::Preview`, the
+    /// Preview replacement: when `opts.state == State::Preview`, the
     /// target editor group's existing Preview tab (if any) is closed
     /// first. This enforces the "single ephemeral preview per group"
     /// semantics — the same one previously-typed file inhabits the
     /// preview slot until you explicitly promote it.
-    pub fn open_tab(&mut self, tab: Tab, opts: OpenTabOptions) -> TabHandle {
+    pub fn open_tab(&mut self, tab: Tab, opts: &OpenTabOptions) -> TabId {
         // Preview replacement.
-        if opts.state == TabState::Preview
+        if opts.state == State::Preview
             && let Some(group) = self.editor_area.focused_group
             && let Some(existing) = self.editor_area.preview_handle_in_group(group)
         {
             self.editor_area.remove_tab(existing);
             self.editor_area.entries.remove(&existing);
         }
-        let handle = TabHandle(self.next_handle);
+        let handle = TabId(self.next_handle);
         self.next_handle = self.next_handle.saturating_add(1);
         // Phase C ignores `group == NewSplit / Specific` — both fall back
         // to "open in focused group". Phase D wires the split path.
@@ -129,8 +186,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
 
     /// Open a tab in the bottom panel area. Same semantics as
     /// [`Self::open_tab`] but targets the panel tree.
-    pub fn open_panel_tab(&mut self, tab: Tab, opts: OpenTabOptions) -> TabHandle {
-        let handle = TabHandle(self.next_handle);
+    pub fn open_panel_tab(&mut self, tab: Tab, opts: &OpenTabOptions) -> TabId {
+        let handle = TabId(self.next_handle);
         self.next_handle = self.next_handle.saturating_add(1);
         let _ = opts.group;
         self.panel_area.inner.insert_tab(handle, tab, opts.state, opts.focus);
@@ -142,8 +199,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Flip a tab's pinned/regular state.
-    pub fn pin_tab(&mut self, handle: TabHandle, pinned: bool) {
-        let target = if pinned { TabState::Pinned } else { TabState::Regular };
+    pub fn pin_tab(&mut self, handle: TabId, pinned: bool) {
+        let target = if pinned { State::Pinned } else { State::Regular };
         if self.editor_area.entries.contains_key(&handle) {
             self.editor_area.set_state(handle, target);
         } else if self.panel_area.inner.entries.contains_key(&handle) {
@@ -153,36 +210,36 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Toggle a tab between Pinned and Regular.
-    pub fn toggle_pin(&mut self, handle: TabHandle) {
+    pub fn toggle_pin(&mut self, handle: TabId) {
         let current = self
             .editor_area
             .state(handle)
             .or_else(|| self.panel_area.state(handle));
-        let next = !matches!(current, Some(TabState::Pinned));
+        let next = !matches!(current, Some(State::Pinned));
         self.pin_tab(handle, next);
     }
 
     /// Promote a Preview tab to Regular.
-    pub fn promote_preview(&mut self, handle: TabHandle) {
+    pub fn promote_preview(&mut self, handle: TabId) {
         if let Some(state) = self.editor_area.state(handle)
-            && state == TabState::Preview
+            && state == State::Preview
         {
-            self.editor_area.set_state(handle, TabState::Regular);
+            self.editor_area.set_state(handle, State::Regular);
             self.dirty = true;
         } else if let Some(state) = self.panel_area.state(handle)
-            && state == TabState::Preview
+            && state == State::Preview
         {
-            self.panel_area.inner.set_state(handle, TabState::Regular);
+            self.panel_area.inner.set_state(handle, State::Regular);
             self.dirty = true;
         }
     }
 
     fn promote_preview_with(
         &mut self,
-        handle: TabHandle,
-        behavior: &mut impl WorkbenchBehavior<Tab, Mode>,
+        handle: TabId,
+        behavior: &mut impl Host<Tab, Mode>,
     ) {
-        let was_preview = self.editor_area.state(handle) == Some(TabState::Preview);
+        let was_preview = self.editor_area.state(handle) == Some(State::Preview);
         self.promote_preview(handle);
         if was_preview
             && let Some(tab) = self.editor_area.entries.get(&handle).map(|e| &e.tab)
@@ -193,7 +250,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
 
     /// Close every tab in `handle`'s group except `handle` itself and
     /// any pinned tabs.
-    pub fn close_others(&mut self, except: TabHandle) {
+    pub fn close_others(&mut self, except: TabId) {
         let Some(group) = crate::internal::tree_adapter::find_group_of(
             &self.editor_area.tree,
             except,
@@ -205,7 +262,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
             if h == except {
                 continue;
             }
-            if self.editor_area.state(h) == Some(TabState::Pinned) {
+            if self.editor_area.state(h) == Some(State::Pinned) {
                 continue;
             }
             self.editor_area.remove_tab(h);
@@ -216,7 +273,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
 
     /// Close every tab in `handle`'s group that appears strictly to the
     /// right of `handle`. Skips pinned tabs.
-    pub fn close_to_right(&mut self, after: TabHandle) {
+    pub fn close_to_right(&mut self, after: TabId) {
         let Some(group) = crate::internal::tree_adapter::find_group_of(
             &self.editor_area.tree,
             after,
@@ -232,7 +289,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                 }
                 continue;
             }
-            if self.editor_area.state(h) == Some(TabState::Pinned) {
+            if self.editor_area.state(h) == Some(State::Pinned) {
                 continue;
             }
             self.editor_area.remove_tab(h);
@@ -245,7 +302,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     pub fn close_all(&mut self) {
         let handles = crate::internal::tree_adapter::all_handles(&self.editor_area.tree);
         for h in handles {
-            if self.editor_area.state(h) == Some(TabState::Pinned) {
+            if self.editor_area.state(h) == Some(State::Pinned) {
                 continue;
             }
             self.editor_area.remove_tab(h);
@@ -255,8 +312,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Close the tab with the given handle. Returns `true` if a tab was
-    /// removed. Bypasses [`WorkbenchBehavior::on_tab_close`].
-    pub fn close_tab(&mut self, handle: TabHandle) -> bool {
+    /// removed. Bypasses [`Host::on_tab_close`].
+    pub fn close_tab(&mut self, handle: TabId) -> bool {
         let removed = self.editor_area.remove_tab(handle);
         if removed {
             self.dirty = true;
@@ -265,19 +322,19 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Iterate over open tabs in the editor area.
-    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabHandle, &Tab)> {
+    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabId, &Tab)> {
         self.editor_area.iter_tabs()
     }
 
     /// Currently focused editor group, if any.
-    pub fn focused_group(&self) -> Option<GroupHandle> {
+    pub fn focused_group(&self) -> Option<GroupId> {
         self.editor_area.focused_group()
     }
 
     /// Handle of the active tab inside the focused editor group, if any.
     /// Hosts use this to detect "user clicked a tab in the strip" by
     /// snapshotting before [`Self::ui`] and comparing after.
-    pub fn active_handle(&self) -> Option<TabHandle> {
+    pub fn active_handle(&self) -> Option<TabId> {
         let group = self.editor_area.focused_group()?;
         crate::internal::tree_adapter::active_handle_in_group(
             &self.editor_area.tree,
@@ -290,7 +347,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     /// (browser-style back/forward, command palette "jump to tab",
     /// etc.) needs the active pane to follow without simulating a
     /// click. Returns `true` if the active selection actually changed.
-    pub fn set_active(&mut self, handle: TabHandle) -> bool {
+    pub fn set_active(&mut self, handle: TabId) -> bool {
         let changed = self.editor_area.set_active(handle);
         if changed {
             self.dirty = true;
@@ -303,31 +360,31 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     /// In v0.1 users obtain splits via the existing drag-to-edge gesture
     /// supplied by `egui_tiles`. The programmatic command form is
     /// deferred to v0.2 — see CHANGELOG.md.
-    pub fn split_active_group(&mut self, _dir: SplitDir) {
+    pub const fn split_active_group(&mut self, _dir: SplitDir) {
         // Deferred to v0.2 (see CHANGELOG). Drag-to-edge already works.
     }
 
     /// Toggle whether the primary side bar is visible.
-    pub fn toggle_primary_side_bar(&mut self) {
+    pub const fn toggle_primary_side_bar(&mut self) {
         self.primary_side_bar.toggle();
     }
 
     /// Toggle whether the secondary side bar is visible.
-    pub fn toggle_secondary_side_bar(&mut self) {
+    pub const fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar.toggle();
     }
 
     /// Toggle whether the panel area is visible.
-    pub fn toggle_panel_area(&mut self) {
+    pub const fn toggle_panel_area(&mut self) {
         self.panel_area.toggle();
     }
 
     /// Set which edge the primary side bar lives on.
-    pub fn set_side_bar_side(&mut self, side: SideBarSide) {
+    pub const fn set_side_bar_side(&mut self, side: Side) {
         self.primary_side_bar.side = side;
         self.secondary_side_bar.side = match side {
-            SideBarSide::Left => SideBarSide::Right,
-            SideBarSide::Right => SideBarSide::Left,
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
         };
         self.activity_bar.side = side;
     }
@@ -340,12 +397,37 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     // (`Ctrl+1` for the first group, etc.).
 
     /// Editor-group tiles in left-to-right, top-to-bottom traversal
-    /// order. Used by [`Self::focus_group`] and friends.
-    fn group_traversal(&self) -> Vec<GroupHandle> {
-        crate::internal::tree_adapter::groups_in_order(&self.editor_area.tree)
-            .into_iter()
-            .map(GroupHandle)
-            .collect()
+    /// order. Used by [`Self::focus_group`] and friends. Containers
+    /// are visited in the order their children appear in the parent
+    /// (so left-to-right for `Horizontal`, top-to-bottom for
+    /// `Vertical`), giving stable group indices across frames.
+    fn group_traversal(&self) -> Vec<GroupId> {
+        fn walk<P>(
+            tree: &egui_tiles::Tree<P>,
+            id: egui_tiles::TileId,
+            out: &mut Vec<egui_tiles::TileId>,
+        ) {
+            match tree.tiles.get(id) {
+                Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(_))) => out.push(id),
+                Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(lin))) => {
+                    for child in &lin.children {
+                        walk(tree, *child, out);
+                    }
+                }
+                Some(egui_tiles::Tile::Container(egui_tiles::Container::Grid(grid))) => {
+                    for child in grid.children() {
+                        walk(tree, *child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let tree = &self.editor_area.tree;
+        let mut out = Vec::new();
+        if let Some(root) = tree.root {
+            walk(tree, root, &mut out);
+        }
+        out.into_iter().map(GroupId).collect()
     }
 
     /// Focus the Nth editor group in left-to-right, top-to-bottom
@@ -422,9 +504,9 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Close the currently active tab in the focused group, honouring
-    /// the host's [`WorkbenchBehavior::on_tab_close`] veto.
+    /// the host's [`Host::on_tab_close`] veto.
     /// Suggested chord: `Ctrl+W`.
-    pub fn close_active(&mut self, behavior: &mut impl WorkbenchBehavior<Tab, Mode>) {
+    pub fn close_active(&mut self, behavior: &mut impl Host<Tab, Mode>) {
         let Some(group) = self.editor_area.focused_group else { return };
         let Some(handle) = crate::internal::tree_adapter::active_handle_in_group(
             &self.editor_area.tree,
@@ -444,13 +526,13 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     }
 
     /// Has the layout changed since the last `clear_dirty` call?
-    pub fn is_dirty(&self) -> bool {
+    pub const fn is_dirty(&self) -> bool {
         self.dirty
     }
 
     /// Clear the "layout changed" flag. Hosts call this after they've
     /// persisted the latest layout to storage.
-    pub fn clear_dirty(&mut self) {
+    pub const fn clear_dirty(&mut self) {
         self.dirty = false;
     }
 
@@ -459,7 +541,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
-        behavior: &mut impl WorkbenchBehavior<Tab, Mode>,
+        behavior: &mut impl Host<Tab, Mode>,
     ) {
         let theme = behavior.theme(&ctx.style());
 
@@ -485,8 +567,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
         // 2) Activity bar — fixed narrow strip on the leading edge.
         if self.activity_bar.is_visible() {
             let activity_panel = match self.activity_bar.side {
-                SideBarSide::Left => egui::SidePanel::left("egui_workbench::activity_bar"),
-                SideBarSide::Right => egui::SidePanel::right("egui_workbench::activity_bar"),
+                Side::Left => egui::SidePanel::left("egui_workbench::activity_bar"),
+                Side::Right => egui::SidePanel::right("egui_workbench::activity_bar"),
             };
             activity_panel
                 .resizable(false)
@@ -502,12 +584,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                         .inner_margin(0),
                 )
                 .show(ctx, |ui| {
-                    let resp = show_activity_bar::<Tab, _, _>(
-                        &mut self.activity_bar,
-                        ui,
-                        &theme,
-                        behavior,
-                    );
+                    let resp = self.activity_bar.show::<Tab, _>(ui, &theme, behavior);
                     if let Some(mode) = resp.clicked {
                         // Click semantics: same activity already active
                         // → toggle side bar visibility; otherwise →
@@ -590,8 +667,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     fn show_panel_area(
         &mut self,
         ui: &mut egui::Ui,
-        behavior: &mut impl WorkbenchBehavior<Tab, Mode>,
-        theme: &crate::WorkbenchTheme,
+        behavior: &mut impl Host<Tab, Mode>,
+        theme: &crate::theme::Palette,
     ) {
         // Top-right controls: maximize toggle + close.
         let mut toggle_max = false;
@@ -602,9 +679,17 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                     close_panel = true;
                 }
                 let (icon, hint) = if self.panel_area.maximized {
-                    (crate::icons::chevron_down(), "Restore panel size")
+                    (chevron_down(), "Restore panel size")
                 } else {
-                    (crate::icons::chevron_up(), "Maximize panel")
+                    // `chevron_up` has a single call site, so it stays inline
+                    // here rather than as a named helper (which would trip
+                    // `clippy::single_call_fn`).
+                    static UP_BYTES: &[u8] = include_bytes!("../assets/chevron_up.svg");
+                    let up = chrome_icon(
+                        "bytes://egui_workbench-icon-chevron_up.svg",
+                        UP_BYTES,
+                    );
+                    (up, "Maximize panel")
                 };
                 if ui
                     .add(egui::Button::image(icon).small())
@@ -648,8 +733,8 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     fn show_editor_area(
         &mut self,
         ui: &mut egui::Ui,
-        behavior: &mut impl WorkbenchBehavior<Tab, Mode>,
-        theme: &crate::WorkbenchTheme,
+        behavior: &mut impl Host<Tab, Mode>,
+        theme: &crate::theme::Palette,
     ) {
         // Empty state: no tabs across no groups.
         if self.editor_area.entries.is_empty() {
@@ -677,7 +762,7 @@ impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     fn apply_drive_outcome(
         &mut self,
         outcome: crate::editor_area::DriveOutcome,
-        behavior: &mut impl WorkbenchBehavior<Tab, Mode>,
+        behavior: &mut impl Host<Tab, Mode>,
         panel: bool,
     ) {
         for handle in outcome.pending_pin_toggles {

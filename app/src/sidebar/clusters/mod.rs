@@ -1,6 +1,6 @@
 //! Cluster-trees sidebar body. Tree picker + hierarchical node list with
 //! expand/collapse, inline rename, drag-and-drop reparenting, and
-//! note-row click → editor preview. Backed by `hiker_core::trees::Trees`.
+//! note-row click → editor preview. Backed by `hiker_core::trees::types::Db`.
 //!
 //! Scope: list/select trees, browse nodes, rename / drop / promote,
 //! reorder via DnD, open notes, build (via cluster_review tab),
@@ -8,41 +8,48 @@
 //! stage-moves + stage-tags into the staging queue, undo/redo, graph
 //! view, advanced params. Save-as-triage isn't ported yet.
 
-mod forms;
-mod menus;
-mod rows;
-mod toolbar;
-mod undo_redo;
+mod tree;
 
 use std::sync::Arc;
 
 use eframe::egui;
-use hiker_core::trees::Trees;
+use hiker_core::trees::types::Db;
 
 use crate::state::AppState;
 use crate::theme;
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState, _rt: &Arc<tokio::runtime::Runtime>) {
-    let trees = state.vault_session.services.trees.clone();
+/// Shared per-frame context for the cluster sidebar. Bundles the mutable
+/// `AppState` borrow with the `trees` handle (cloned once at the top of
+/// `show`) so the render/mutation helpers across this module's files can
+/// be `&mut self` methods on one receiver instead of wide free functions.
+pub(super) struct ClusterCtx<'a> {
+    pub(super) state: &'a mut AppState,
+    pub(super) trees: &'a Arc<Db>,
+}
 
-    hydrate_if_needed(state, &trees);
+impl AppState {
+    pub fn clusters_panel(&mut self, ui: &mut egui::Ui) {
+    let trees = self.vault_session.services.trees.clone();
+    let mut cx = ClusterCtx { state: self, trees: &trees };
 
-    header(ui, state);
+    cx.hydrate_if_needed();
+
+    cx.header(ui);
     ui.add_space(4.0);
-    tree_picker(ui, state);
-    toolbar::show(ui, state, &trees);
+    cx.tree_picker(ui);
+    cx.toolbar(ui);
     ui.separator();
 
     // Summary-edit modal popover. Lives at panel scope so the row
     // renderer can keep its allocate_exact_size shape and not contend
     // with a variable-height inline editor.
-    forms::summary_edit_inline(ui, state, &trees);
-    forms::policy_editors_inline(ui, state, &trees);
-    forms::stage_forms_inline(ui, state, &trees);
+    cx.summary_edit_inline(ui);
+    cx.policy_editors_inline(ui);
+    cx.stage_forms_inline(ui);
 
-    if let Some(tree_id) = state.panels.clusters.selected_tree.clone() {
-        render_selected_tree(ui, state, &trees, &tree_id);
-    } else if state.panels.clusters.trees.is_empty() {
+    if let Some(tree_id) = cx.state.panels.clusters.selected_tree.clone() {
+        cx.render_selected_tree(ui, &tree_id);
+    } else if cx.state.panels.clusters.trees.is_empty() {
         empty_message(
             ui,
             "No trees yet. \"Suggest reorganization\" will build one (stub).",
@@ -50,9 +57,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, _rt: &Arc<tokio::runtime::R
     } else {
         empty_message(ui, "Select a tree above.");
     }
+    }
 }
 
-fn advanced_params_popover(ui: &mut egui::Ui, state: &mut AppState) {
+impl ClusterCtx<'_> {
+fn advanced_params_popover(&mut self, ui: &mut egui::Ui) {
+    let state = &mut *self.state;
     egui::Frame::default()
         .fill(theme::active_bg())
         .stroke(egui::Stroke::new(1.0, theme::divider()))
@@ -92,15 +102,16 @@ fn advanced_params_popover(ui: &mut egui::Ui, state: &mut AppState) {
         });
     ui.separator();
 }
+}
 
 /// LLM-rename every cluster node whose name hasn't been user-edited.
 #[allow(dead_code)]
 // TODO: re-expose once the cluster review panel adds a "regenerate names" button.
-pub(crate) fn regenerate_names_pub(state: &mut AppState, trees: &Arc<Trees>, tree_id: &str) {
+pub(crate) fn regenerate_names_pub(state: &mut AppState, trees: &Arc<Db>, tree_id: &str) {
     regenerate_names(state, trees, tree_id);
 }
 
-fn regenerate_names(state: &mut AppState, trees: &Arc<Trees>, tree_id: &str) {
+fn regenerate_names(state: &mut AppState, trees: &Arc<Db>, tree_id: &str) {
     if state.panels.clusters.llm_job_in_flight {
         state.push_toast(
             "A naming run is already in flight",
@@ -115,7 +126,7 @@ fn regenerate_names(state: &mut AppState, trees: &Arc<Trees>, tree_id: &str) {
     let targets: Vec<(String, String)> = nodes
         .iter()
         .filter(|n| {
-            matches!(n.kind, hiker_core::trees::NodeKind::Cluster) && !n.user_edited_name
+            matches!(n.kind, hiker_core::trees::types::NodeKind::Cluster) && !n.user_edited_name
         })
         .map(|n| (n.id.clone(), n.summary.clone()))
         .collect();
@@ -171,10 +182,10 @@ fn regenerate_names(state: &mut AppState, trees: &Arc<Trees>, tree_id: &str) {
     );
 }
 
-/// Construct an `Arc<dyn LlmClient>` from current settings, pushing an
+/// Construct an `Arc<dyn Client>` from current settings, pushing an
 /// error toast if the LLM is disabled or the client failed to build.
 /// Returns `None` in either failure case; callers should early-return.
-fn build_llm_client(state: &mut AppState) -> Option<Arc<dyn hiker_core::llm::LlmClient>> {
+fn build_llm_client(state: &mut AppState) -> Option<Arc<dyn hiker_core::llm::Client>> {
     use hiker_core::llm::GraniteLlmClient;
     let llm_cfg = state
         .vault_session
@@ -190,7 +201,7 @@ fn build_llm_client(state: &mut AppState) -> Option<Arc<dyn hiker_core::llm::Llm
         return None;
     }
     match GraniteLlmClient::from_config(&llm_cfg) {
-        Ok(c) => Some(Arc::new(c) as Arc<dyn hiker_core::llm::LlmClient>),
+        Ok(c) => Some(Arc::new(c) as Arc<dyn hiker_core::llm::Client>),
         Err(err) => {
             state.push_toast(
                 format!("LLM client error: {err}"),
@@ -204,7 +215,9 @@ fn build_llm_client(state: &mut AppState) -> Option<Arc<dyn hiker_core::llm::Llm
 /// Poll the in-flight LLM naming task's result channel; on completion
 /// clear the gate, surface a summary toast, and mark the tree dirty so
 /// the new names land in the UI.
-pub(crate) fn poll_llm_job(state: &mut AppState) {
+impl AppState {
+pub(crate) fn poll_cluster_llm_job(&mut self) {
+    let state = self;
     let Some(mut rx) = state.panels.clusters.llm_job_rx.take() else {
         return;
     };
@@ -229,16 +242,17 @@ pub(crate) fn poll_llm_job(state: &mut AppState) {
         }
     }
 }
+}
 
 fn collect_member_titles(
-    nodes: &[hiker_core::trees::EditableNode],
+    nodes: &[hiker_core::trees::types::EditableNode],
     cluster_id: &str,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![cluster_id.to_string()];
     while let Some(id) = stack.pop() {
         for n in nodes.iter().filter(|n| n.parent.as_deref() == Some(id.as_str())) {
-            if matches!(n.kind, hiker_core::trees::NodeKind::Leaf) {
+            if matches!(n.kind, hiker_core::trees::types::NodeKind::Leaf) {
                 out.push(n.name.clone());
             } else {
                 stack.push(n.id.clone());
@@ -253,32 +267,34 @@ fn collect_member_titles(
 }
 
 /// Semantic re-split of a subtree. Pulls leaf embeddings from the read
-/// store, hands them to `Trees::split_cluster`, then optionally regenerates
+/// store, hands them to `Db::split_cluster`, then optionally regenerates
 /// names on the new sub-clusters via the LLM.
+impl ClusterCtx<'_> {
 pub(crate) fn recluster_subtree(
-    state: &mut AppState,
-    trees: &Arc<Trees>,
+    &mut self,
     tree_id: &str,
     target_node_id: Option<&str>,
 ) {
+    let state = &mut *self.state;
+    let trees = self.trees;
     let store_mutex = state.vault_session.services.read_store.clone();
     let p = state.panels.clusters.advanced_params.clone();
     let algorithm = if p.use_leiden {
-        hiker_core::cluster::ClusterAlgorithm::Leiden
+        hiker_core::cluster::Algorithm::Leiden
     } else {
-        hiker_core::cluster::ClusterAlgorithm::Hdbscan
+        hiker_core::cluster::Algorithm::Hdbscan
     };
     let leiden = hiker_core::cluster::LeidenParams {
         k_nearest: p.k_nearest as u32,
         ..hiker_core::cluster::LeidenParams::default()
     };
-    let params = hiker_core::cluster::ClusterParams {
+    let params = hiker_core::cluster::Params {
         min_cluster_size: p.min_cluster_size as u32,
         min_samples: Some(p.min_samples as u32),
         algorithm,
         leiden,
         summarize: hiker_core::cluster::SummarizeMode::None,
-        ..hiker_core::cluster::ClusterParams::default()
+        ..hiker_core::cluster::Params::default()
     };
     let resolver = |leaf_id: &str| -> Option<Vec<f32>> {
         let store = store_mutex.lock().ok()?;
@@ -301,13 +317,14 @@ pub(crate) fn recluster_subtree(
         ),
     }
 }
+}
 
 /// LLM-summarize a focused subset of clusters. Pairs of (name, summary)
-/// land via `Trees::auto_set_name_summary` so user-edited rows are
+/// land via `Db::auto_set_name_summary` so user-edited rows are
 /// preserved.
 pub(crate) fn summarize_subset(
     state: &mut AppState,
-    trees: &Arc<Trees>,
+    trees: &Arc<Db>,
     tree_id: &str,
     node_ids: &[String],
 ) {
@@ -328,7 +345,7 @@ pub(crate) fn summarize_subset(
         .iter()
         .filter_map(|nid| {
             let n = nodes.iter().find(|x| &x.id == nid)?;
-            if !matches!(n.kind, hiker_core::trees::NodeKind::Cluster) {
+            if !matches!(n.kind, hiker_core::trees::types::NodeKind::Cluster) {
                 return None;
             }
             Some((n.id.clone(), n.name.clone()))
@@ -382,7 +399,9 @@ pub(crate) fn summarize_subset(
     );
 }
 
-fn header(ui: &mut egui::Ui, state: &mut AppState) {
+impl ClusterCtx<'_> {
+fn header(&mut self, ui: &mut egui::Ui) {
+    let state = &mut *self.state;
     // Single entry point per `cluster-editor-new-tree-action` — the
     // review tab is the surface where the user picks algorithm (Cluster
     // partitioners or From folders), tunes params, runs the structural
@@ -407,14 +426,12 @@ fn header(ui: &mut egui::Ui, state: &mut AppState) {
     }
     if new_tree_clicked {
         // status: cluster-editor-new-tree-action
-        crate::panels::cluster_review::open(
-            state,
-            crate::panels::cluster_review::ReviewConfig::default(),
-        );
+        crate::panels::cluster_review::ReviewConfig::default().open(state);
     }
 }
 
-fn tree_picker(ui: &mut egui::Ui, state: &mut AppState) {
+fn tree_picker(&mut self, ui: &mut egui::Ui) {
+    let state = &mut *self.state;
     let trees = &state.panels.clusters.trees;
     let selected_label = state
         .panels.clusters
@@ -448,19 +465,20 @@ fn tree_picker(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_selected_tree(
+    &mut self,
     ui: &mut egui::Ui,
-    state: &mut AppState,
-    trees: &Arc<Trees>,
     tree_id: &str,
 ) {
-    if state.panels.clusters.nodes.is_empty() {
+    if self.state.panels.clusters.nodes.is_empty() {
         empty_message(ui, "This tree has no nodes.");
         return;
     }
-    rows::show_tree(ui, state, trees, tree_id);
+    self.show_tree(ui, tree_id);
 }
 
-fn hydrate_if_needed(state: &mut AppState, trees: &Arc<Trees>) {
+fn hydrate_if_needed(&mut self) {
+    let state = &mut *self.state;
+    let trees = self.trees;
     if !state.panels.clusters.loaded {
         match trees.list_trees() {
             Ok(rows) => {
@@ -501,6 +519,7 @@ fn hydrate_if_needed(state: &mut AppState, trees: &Arc<Trees>) {
         state.panels.clusters.dirty = false;
     }
 }
+}
 
 fn empty_message(ui: &mut egui::Ui, msg: &str) {
     ui.add_space(20.0);
@@ -508,6 +527,296 @@ fn empty_message(ui: &mut egui::Ui, msg: &str) {
 }
 
 /// Re-list trees + nodes from disk on the next frame.
-pub(crate) fn mark_dirty(state: &mut AppState) {
+pub(crate) const fn mark_dirty(state: &mut AppState) {
     state.panels.clusters.dirty = true;
+}
+
+// ── Inline modal-style editors ────────────────────────────────────────
+// Edit-summary, tag-policy + move-policy, and stage-moves + stage-tags
+// target prompts. Each renders only when its corresponding
+// `state.panels.clusters.editing_*` slot is `Some(...)` — clicking the
+// triggering row or toolbar button populates the slot, and the form
+// clears it on Save/Cancel. They sit at panel scope (invoked from
+// `clusters_panel` above) so the row renderer can keep its fixed-height
+// shape and not contend with a variable-height inline editor.
+impl ClusterCtx<'_> {
+pub(super) fn summary_edit_inline(
+    &mut self,
+    ui: &mut egui::Ui,
+) {
+    let Some((node_id, mut draft)) = self.state.panels.clusters.editing_summary.clone() else {
+        return;
+    };
+    let Some(tree_id) = self.state.panels.clusters.selected_tree.clone() else {
+        return;
+    };
+    let target_name = self.state
+        .panels.clusters
+        .nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| node_id.clone());
+    let trees = self.trees;
+    let state = &mut *self.state;
+    egui::Frame::default()
+        .fill(theme::active_bg())
+        .stroke(egui::Stroke::new(1.0, theme::divider()))
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Edit summary · {target_name}")).small().strong(),
+            );
+            let resp = ui.add(
+                egui::TextEdit::multiline(&mut draft)
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    match trees.set_summary(&tree_id, &node_id, draft.trim()) {
+                        Ok(()) => mark_dirty(state),
+                        Err(err) => state.push_toast(
+                            format!("Set summary failed: {err}"),
+                            crate::state::ToastLevel::Error,
+                        ),
+                    }
+                    state.panels.clusters.editing_summary = None;
+                    return;
+                }
+                if ui.button("Cancel").clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)))
+                {
+                    state.panels.clusters.editing_summary = None;
+                    return;
+                }
+                state.panels.clusters.editing_summary = Some((node_id.clone(), draft.clone()));
+            });
+        });
+    ui.separator();
+}
+
+pub(super) fn policy_editors_inline(
+    &mut self,
+    ui: &mut egui::Ui,
+) {
+    let Some(tree_id) = self.state.panels.clusters.selected_tree.clone() else {
+        return;
+    };
+    let trees = self.trees;
+    let state = &mut *self.state;
+    if let Some((node_id, mut slug, mut require_review)) =
+        state.panels.clusters.editing_tag_policy.clone()
+    {
+        egui::Frame::default()
+            .fill(theme::active_bg())
+            .stroke(egui::Stroke::new(1.0, theme::divider()))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Tag policy").strong().small());
+                ui.horizontal(|ui| {
+                    ui.label("Slug");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slug)
+                            .hint_text("e.g. project-x")
+                            .desired_width(160.0),
+                    );
+                });
+                ui.checkbox(&mut require_review, "Require review before apply");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() && !slug.trim().is_empty() {
+                        let policy = hiker_core::trees::types::NodePolicy::Tag {
+                            slug: slug.trim().to_string(),
+                            require_review,
+                        };
+                        if let Err(err) = trees.set_policy(&tree_id, &node_id, Some(&policy)) {
+                            state.push_toast(
+                                format!("Set tag policy failed: {err}"),
+                                crate::state::ToastLevel::Error,
+                            );
+                        } else {
+                            mark_dirty(state);
+                        }
+                        state.panels.clusters.editing_tag_policy = None;
+                        return;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.panels.clusters.editing_tag_policy = None;
+                        return;
+                    }
+                    state.panels.clusters.editing_tag_policy =
+                        Some((node_id.clone(), slug.clone(), require_review));
+                });
+            });
+        ui.separator();
+    }
+    if let Some((node_id, mut folder, mut require_review)) =
+        state.panels.clusters.editing_move_policy.clone()
+    {
+        egui::Frame::default()
+            .fill(theme::active_bg())
+            .stroke(egui::Stroke::new(1.0, theme::divider()))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Move policy").strong().small());
+                ui.horizontal(|ui| {
+                    ui.label("Folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut folder)
+                            .hint_text("e.g. archive/old")
+                            .desired_width(200.0),
+                    );
+                });
+                ui.checkbox(&mut require_review, "Require review before apply");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() && !folder.trim().is_empty() {
+                        let policy = hiker_core::trees::types::NodePolicy::Move {
+                            folder: folder.trim().to_string(),
+                            require_review,
+                        };
+                        if let Err(err) = trees.set_policy(&tree_id, &node_id, Some(&policy)) {
+                            state.push_toast(
+                                format!("Set move policy failed: {err}"),
+                                crate::state::ToastLevel::Error,
+                            );
+                        } else {
+                            mark_dirty(state);
+                        }
+                        state.panels.clusters.editing_move_policy = None;
+                        return;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.panels.clusters.editing_move_policy = None;
+                        return;
+                    }
+                    state.panels.clusters.editing_move_policy =
+                        Some((node_id.clone(), folder.clone(), require_review));
+                });
+            });
+        ui.separator();
+    }
+}
+
+pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
+    let trees = self.trees;
+    let state = &mut *self.state;
+    let Some(tree_id) = state.panels.clusters.selected_tree.clone() else {
+        return;
+    };
+    if let Some(mut target) = state.panels.clusters.editing_stage_move_target.clone() {
+        let selected: Vec<String> = state.panels.clusters.selected_nodes.iter().cloned().collect();
+        egui::Frame::default()
+            .fill(theme::active_bg())
+            .stroke(egui::Stroke::new(1.0, theme::divider()))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Stage moves · {} selected",
+                        selected.len()
+                    ))
+                    .strong()
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Target folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut target)
+                            .hint_text("e.g. archive/projects")
+                            .desired_width(220.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Stage").clicked() && !target.trim().is_empty() {
+                        let store_mutex = state.vault_session.services.read_store.clone();
+                        let staging = state.vault_session.services.staging.clone();
+                        if let Ok(store) = store_mutex.lock() {
+                            let args = hiker_core::suggest::StageMoveArgs {
+                                tree_id: &tree_id,
+                                node_ids: &selected,
+                                target_folder: target.trim(),
+                            };
+                            match hiker_core::suggest::stage_moves(trees, &args, &store, &staging) {
+                                Ok(ids) => state.push_toast(
+                                    format!("Staged {} moves", ids.len()),
+                                    crate::state::ToastLevel::Info,
+                                ),
+                                Err(err) => state.push_toast(
+                                    format!("Stage moves failed: {err}"),
+                                    crate::state::ToastLevel::Error,
+                                ),
+                            }
+                        }
+                        state.panels.clusters.editing_stage_move_target = None;
+                        return;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.panels.clusters.editing_stage_move_target = None;
+                        return;
+                    }
+                    state.panels.clusters.editing_stage_move_target = Some(target.clone());
+                });
+            });
+        ui.separator();
+    }
+    if let Some(mut slug) = state.panels.clusters.editing_stage_tag_slug.clone() {
+        let selected: Vec<String> = state.panels.clusters.selected_nodes.iter().cloned().collect();
+        egui::Frame::default()
+            .fill(theme::active_bg())
+            .stroke(egui::Stroke::new(1.0, theme::divider()))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Stage tags · {} selected", selected.len()))
+                        .strong()
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Tag slug");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slug)
+                            .hint_text("e.g. project-x")
+                            .desired_width(220.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Stage").clicked() && !slug.trim().is_empty() {
+                        let store_mutex = state.vault_session.services.read_store.clone();
+                        let staging = state.vault_session.services.staging.clone();
+                        if let Ok(store) = store_mutex.lock() {
+                            let args = hiker_core::suggest::StageTagArgs {
+                                tree_id: &tree_id,
+                                node_ids: &selected,
+                                tag_slug: slug.trim(),
+                            };
+                            match hiker_core::suggest::stage_tags(
+                                trees,
+                                &args,
+                                &state.vault_session.vault,
+                                &store,
+                                &staging,
+                            ) {
+                                Ok(ids) => state.push_toast(
+                                    format!("Staged {} tags", ids.len()),
+                                    crate::state::ToastLevel::Info,
+                                ),
+                                Err(err) => state.push_toast(
+                                    format!("Stage tags failed: {err}"),
+                                    crate::state::ToastLevel::Error,
+                                ),
+                            }
+                        }
+                        state.panels.clusters.editing_stage_tag_slug = None;
+                        return;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.panels.clusters.editing_stage_tag_slug = None;
+                        return;
+                    }
+                    state.panels.clusters.editing_stage_tag_slug = Some(slug.clone());
+                });
+            });
+        ui.separator();
+    }
+}
 }

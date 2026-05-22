@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{NoopSummarizer, build_cluster_tree_inner, build_from_folders};
+use super::{NoopSummarizer, build_cluster_tree, build_from_folders};
 use crate::cluster::{
-    BuildError, BuildEvent, BuildMethod, BuildScope, BuiltClusterNode, BuiltClusterTree, ClusterId,
+    BuildError, BuildEvent, BuildMethod, BuiltClusterNode, BuiltClusterTree, Id,
     NoteInput, Phase, SummarizeMode,
 };
 
@@ -29,43 +29,16 @@ pub(super) const PARTITION_CHECK_INTERVAL: u32 = 64;
 
 /// Streaming context threaded through the recursive build.
 pub(in crate::cluster) struct StreamCtx {
-    tx: Option<tokio::sync::mpsc::Sender<BuildEvent>>,
-    cancel: Arc<AtomicBool>,
+    pub(super) tx: Option<tokio::sync::mpsc::Sender<BuildEvent>>,
+    pub(super) cancel: Arc<AtomicBool>,
     pub(super) items_processed: u32,
     pub(super) clusters_found: u32,
     pub(super) outliers: u32,
-    partition_loop_counter: u32,
-    max_partition_level_emitted: i32,
+    pub(super) partition_loop_counter: u32,
+    pub(super) max_partition_level_emitted: i32,
 }
 
 impl StreamCtx {
-    /// No-op context: never cancels, drops every emission. Used by the
-    /// blocking entry points so the recursive build's signature stays
-    /// uniform between blocking and streaming callers.
-    pub(super) fn noop() -> Self {
-        Self {
-            tx: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            items_processed: 0,
-            clusters_found: 0,
-            outliers: 0,
-            partition_loop_counter: 0,
-            max_partition_level_emitted: -1,
-        }
-    }
-
-    fn streaming(tx: tokio::sync::mpsc::Sender<BuildEvent>, cancel: Arc<AtomicBool>) -> Self {
-        Self {
-            tx: Some(tx),
-            cancel,
-            items_processed: 0,
-            clusters_found: 0,
-            outliers: 0,
-            partition_loop_counter: 0,
-            max_partition_level_emitted: -1,
-        }
-    }
-
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -112,7 +85,7 @@ impl StreamCtx {
         }
     }
 
-    pub(super) fn emit_cluster(&mut self, node: BuiltClusterNode, parent: Option<ClusterId>) {
+    pub(super) fn emit_cluster(&mut self, node: BuiltClusterNode, parent: Option<Id>) {
         self.clusters_found = self.clusters_found.saturating_add(1);
         self.emit(BuildEvent::ClusterDiscovered { node, parent });
     }
@@ -121,7 +94,6 @@ impl StreamCtx {
 /// Async entry — spawns the structural pass on `spawn_blocking` and
 /// returns the join handle + an mpsc receiver the producer drains.
 pub fn build_tree_structural_streaming(
-    scope: BuildScope,
     method: BuildMethod,
     notes: Vec<NoteInput>,
     cancel: Arc<AtomicBool>,
@@ -142,7 +114,15 @@ pub fn build_tree_structural_streaming(
             }
         };
 
-        let mut sctx = StreamCtx::streaming(tx.clone(), cancel.clone());
+        let mut sctx = StreamCtx {
+            tx: Some(tx.clone()),
+            cancel: cancel.clone(),
+            items_processed: 0,
+            clusters_found: 0,
+            outliers: 0,
+            partition_loop_counter: 0,
+            max_partition_level_emitted: -1,
+        };
         sctx.emit_phase(Phase::LoadingEmbeddings);
         sctx.emit_counters();
 
@@ -160,7 +140,7 @@ pub fn build_tree_structural_streaming(
 
         let result: Result<BuiltClusterTree, BuildError> = match &forced_method {
             BuildMethod::Cluster { params } => {
-                build_cluster_tree_inner(&notes, params, &NoopSummarizer, &mut sctx)
+                build_cluster_tree(&notes, params, &NoopSummarizer, &mut sctx)
             }
             BuildMethod::FromFolders { params } => {
                 if sctx.check_cancel().is_err() {
@@ -188,7 +168,6 @@ pub fn build_tree_structural_streaming(
                     }
                 }
                 let _ = forced_method;
-                let _ = scope;
                 sctx.emit(BuildEvent::Done { tree });
             }
             Err(BuildError::Cancelled) => {

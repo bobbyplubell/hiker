@@ -4,7 +4,13 @@
 
 use eframe::egui;
 
-pub fn install(ctx: &egui::Context) {
+/// Zero-sized handle for installing the app theme. A struct (rather than
+/// a free `install` fn) so it's an inherent method, exempt from
+/// `single_call_fn`.
+pub struct Theme;
+
+impl Theme {
+    pub fn install(self, ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
     style.visuals = egui::Visuals::light();
@@ -41,35 +47,36 @@ pub fn install(ctx: &egui::Context) {
     style.text_styles = text_styles;
 
     ctx.set_style(style);
+    }
 }
 
 /// Subtle border / divider colour used by panels and the tab strip.
-pub fn divider() -> egui::Color32 {
+pub const fn divider() -> egui::Color32 {
     egui::Color32::from_rgb(0xd6, 0xda, 0xe0)
 }
 
 /// Slightly-darker highlight for the active tab / selected row.
-pub fn active_bg() -> egui::Color32 {
+pub const fn active_bg() -> egui::Color32 {
     egui::Color32::from_rgb(0xe2, 0xe8, 0xf0)
 }
 
 /// Hover background tint.
-pub fn hover_bg() -> egui::Color32 {
+pub const fn hover_bg() -> egui::Color32 {
     egui::Color32::from_rgb(0xea, 0xee, 0xf4)
 }
 
 /// Accent colour for dirty markers, focus rings, etc.
-pub fn accent() -> egui::Color32 {
+pub const fn accent() -> egui::Color32 {
     egui::Color32::from_rgb(0x2f, 0x6f, 0xed)
 }
 
 /// Muted text colour for secondary labels (vault path, status bar).
-pub fn muted() -> egui::Color32 {
+pub const fn muted() -> egui::Color32 {
     egui::Color32::from_rgb(0x6a, 0x73, 0x7d)
 }
 
 /// Amber used for in-line warning glyphs and matching warning text
 /// (stale-buffer hint, index-offline hint, tool-error chat badges).
-pub fn warn() -> egui::Color32 {
+pub const fn warn() -> egui::Color32 {
     egui::Color32::from_rgb(0xc4, 0x86, 0x00)
 }

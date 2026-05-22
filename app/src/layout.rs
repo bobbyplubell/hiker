@@ -50,27 +50,36 @@ struct LayoutFileRef<'a> {
     right_tile: TileId,
 }
 
-/// Forwards-compat dispatch on `version`. v1 was egui_dock; we drop it
-/// and let the caller fall back to factory defaults. v2 is identity.
-fn migrate(value: serde_json::Value) -> Option<LayoutFile> {
-    let version = value
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    match version {
-        2 => serde_json::from_value::<LayoutFile>(value).ok(),
-        1 => {
-            tracing::info!(
-                "layout: v1 (egui_dock) schema detected, regenerating from defaults"
-            );
-            None
-        }
-        other => {
-            tracing::warn!(
-                version = other,
-                "layout: unknown schema version; ignoring file",
-            );
-            None
+/// Newtype around a deserialised layout JSON blob so the migration
+/// dispatch can hang off it as a method (single-call free fns get
+/// flagged by `clippy::single_call_fn`; methods don't).
+struct LayoutBlob(serde_json::Value);
+
+impl LayoutBlob {
+    /// Forwards-compat dispatch on `version`. v1 was egui_dock; we
+    /// drop it and let the caller fall back to factory defaults. v2 is
+    /// identity.
+    fn migrate(self) -> Option<LayoutFile> {
+        let value = self.0;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        match version {
+            2 => serde_json::from_value::<LayoutFile>(value).ok(),
+            1 => {
+                tracing::info!(
+                    "layout: v1 (egui_dock) schema detected, regenerating from defaults"
+                );
+                None
+            }
+            other => {
+                tracing::warn!(
+                    version = other,
+                    "layout: unknown schema version; ignoring file",
+                );
+                None
+            }
         }
     }
 }
@@ -130,28 +139,70 @@ pub fn default_dock() -> DockBundle {
     }
 }
 
-/// Walk a deserialised tree and pick the Tabs container that should
-/// play "center": the first one that holds zero `DockTab::Panel(_)`
-/// children. Falls back to any Tabs container if no panel-free one
-/// exists.
-fn detect_center_tile(tree: &Tree<DockTab>) -> Option<TileId> {
-    let mut first_tabs: Option<TileId> = None;
-    for (id, tile) in tree.tiles.iter() {
-        let Tile::Container(Container::Tabs(tabs)) = tile else { continue };
-        if first_tabs.is_none() {
-            first_tabs = Some(*id);
+/// Extension trait that hangs the deserialise-time / reconcile-time
+/// helpers off `Tree<DockTab>` directly. Trait methods with `&self` are
+/// exempt from `clippy::single_call_fn` even when only one caller
+/// materializes them.
+pub trait DockTreeExt {
+    fn detect_center_tile(&self) -> Option<TileId>;
+    fn enforce_buffer_tabs_in_center(&mut self, center_tile: TileId);
+}
+
+impl DockTreeExt for Tree<DockTab> {
+    /// Walk the tree and pick the Tabs container that should play
+    /// "center": the first one that holds zero `DockTab::Panel(_)`
+    /// children. Falls back to any Tabs container if no panel-free one
+    /// exists.
+    fn detect_center_tile(&self) -> Option<TileId> {
+        let tree = self;
+        let mut first_tabs: Option<TileId> = None;
+        for (id, tile) in tree.tiles.iter() {
+            let Tile::Container(Container::Tabs(tabs)) = tile else { continue };
+            if first_tabs.is_none() {
+                first_tabs = Some(*id);
+            }
+            let has_panel = tabs.children.iter().any(|c| {
+                matches!(
+                    tree.tiles.get(*c),
+                    Some(Tile::Pane(DockTab::Panel(_))),
+                )
+            });
+            if !has_panel {
+                return Some(*id);
+            }
         }
-        let has_panel = tabs.children.iter().any(|c| {
-            matches!(
-                tree.tiles.get(*c),
-                Some(Tile::Pane(DockTab::Panel(_))),
-            )
-        });
-        if !has_panel {
-            return Some(*id);
+        first_tabs
+    }
+
+    /// Move every `DockTab::Tab(_)` pane currently NOT under
+    /// `center_tile` into it. The center tile must be a Tabs container;
+    /// if it isn't (e.g. user nuked it), no-op (the next reconcile will
+    /// rebuild).
+    fn enforce_buffer_tabs_in_center(&mut self, center_tile: TileId) {
+        let Some(Tile::Container(Container::Tabs(_))) = self.tiles.get(center_tile)
+        else {
+            return;
+        };
+        // Collect strays first to avoid mutating while iterating.
+        let strays: Vec<TileId> = self
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| match tile {
+                Tile::Pane(DockTab::Tab(_)) => {
+                    let parent = self.tiles.parent_of(*id);
+                    if parent != Some(center_tile) {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        for stray in strays {
+            self.move_tile_to_container(stray, center_tile, usize::MAX, false);
         }
     }
-    first_tabs
 }
 
 /// Pick a Tabs container that hosts a panel whose `default_side` matches
@@ -196,7 +247,7 @@ pub fn user_profiles_dir() -> PathBuf {
 
 // ---- Load / save --------------------------------------------------------
 
-fn read_layout_at(path: &Path) -> Option<LayoutFile> {
+pub(crate) fn read_layout_at(path: &Path) -> Option<LayoutFile> {
     let bytes = std::fs::read(path).ok()?;
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -205,7 +256,7 @@ fn read_layout_at(path: &Path) -> Option<LayoutFile> {
             return None;
         }
     };
-    migrate(value)
+    LayoutBlob(value).migrate()
 }
 
 /// Resolve the layout to use on bootstrap. Tries the vault override
@@ -223,13 +274,15 @@ pub fn load_for_vault(vault_root: &Path) -> DockBundle {
 /// Run the post-deserialise fixups: make sure every registered panel is
 /// present somewhere (adding missing ones to their default side), drop
 /// unknown panels, and re-confirm the center/left/right tile ids.
-fn finalize_loaded(lf: LayoutFile) -> DockBundle {
+pub(crate) fn finalize_loaded(lf: LayoutFile) -> DockBundle {
     let LayoutFile { dock, center_tile, left_tile, right_tile, .. } = lf;
     let mut bundle = DockBundle { tree: dock, center_tile, left_tile, right_tile };
     // Re-validate the side-tile ids against the loaded tree; if any are
     // stale (e.g. user manually edited the file) fall back to heuristic.
     if bundle.tree.tiles.get(bundle.center_tile).is_none() {
-        bundle.center_tile = detect_center_tile(&bundle.tree)
+        bundle.center_tile = bundle
+            .tree
+            .detect_center_tile()
             .unwrap_or(bundle.center_tile);
     }
     if bundle.tree.tiles.get(bundle.left_tile).is_none() {
@@ -240,14 +293,16 @@ fn finalize_loaded(lf: LayoutFile) -> DockBundle {
         bundle.right_tile = detect_side_tile(&bundle.tree, PanelSide::Right)
             .unwrap_or(bundle.center_tile);
     }
-    ensure_all_panels_present(&mut bundle);
+    bundle.ensure_all_panels_present();
     bundle
 }
 
+impl DockBundle {
 /// Insert any registered panel that's missing from the tree at its
 /// default side. Drops `Panel` entries whose id no longer matches a
 /// registered panel (downgrade case).
-fn ensure_all_panels_present(bundle: &mut DockBundle) {
+fn ensure_all_panels_present(&mut self) {
+    let bundle = self;
     let reg = PanelRegistry::all();
     // 1. Drop unknown panels (panes only).
     let stale: Vec<TileId> = bundle
@@ -297,6 +352,7 @@ fn ensure_all_panels_present(bundle: &mut DockBundle) {
         }
     }
 }
+}
 
 // ---- Serialisation helpers ---------------------------------------------
 
@@ -311,49 +367,38 @@ fn serialize(bundle: &DockBundle) -> serde_json::Result<String> {
     serde_json::to_string_pretty(&lf)
 }
 
-/// Write the dock to `<vault>/.hiker/layout.json`. Best-effort.
-pub fn save_for_vault(
-    vault_root: &Path,
-    bundle: &DockBundle,
-) -> std::io::Result<()> {
-    let path = vault_layout_path(vault_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+impl DockBundle {
+    /// Write the dock to `<vault>/.hiker/layout.json`. Best-effort.
+    pub fn save_for_vault(&self, vault_root: &Path) -> std::io::Result<()> {
+        let path = vault_layout_path(vault_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serialize(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, body)
     }
-    let body = serialize(bundle)
-        .map_err(std::io::Error::other)?;
-    std::fs::write(path, body)
-}
 
-/// Copy the per-vault layout to the user's default location.
-pub fn save_user_default(bundle: &DockBundle) -> std::io::Result<()> {
-    let path = user_default_layout_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    /// Copy the per-vault layout to the user's default location.
+    pub fn save_user_default(&self) -> std::io::Result<()> {
+        let path = user_default_layout_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serialize(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, body)
     }
-    let body = serialize(bundle)
-        .map_err(std::io::Error::other)?;
-    std::fs::write(path, body)
-}
 
-/// Save the current dock as a named profile under
-/// `~/.config/hiker/layouts/<name>.json`.
-pub fn save_profile(
-    name: &str,
-    bundle: &DockBundle,
-) -> std::io::Result<PathBuf> {
-    let dir = user_profiles_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{name}.json"));
-    let body = serialize(bundle)
-        .map_err(std::io::Error::other)?;
-    std::fs::write(&path, body)?;
-    Ok(path)
-}
+    /// Save the current dock as a named profile under
+    /// `~/.config/hiker/layouts/<name>.json`.
+    pub fn save_profile(&self, name: &str) -> std::io::Result<PathBuf> {
+        let dir = user_profiles_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{name}.json"));
+        let body = serialize(self).map_err(std::io::Error::other)?;
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
 
-pub fn load_profile(name: &str) -> Option<DockBundle> {
-    let path = user_profiles_dir().join(format!("{name}.json"));
-    read_layout_at(&path).map(finalize_loaded)
 }
 
 #[allow(dead_code)]
@@ -405,34 +450,6 @@ pub fn find_tab_tile(tree: &Tree<DockTab>, tab_id: crate::tab::TabId) -> Option<
     None
 }
 
-/// Move every `DockTab::Tab(_)` pane currently NOT under `center_tile`
-/// into it. The center tile must be a Tabs container; if it isn't
-/// (e.g. user nuked it), no-op (the next reconcile will rebuild).
-pub fn enforce_buffer_tabs_in_center(
-    tree: &mut Tree<DockTab>,
-    center_tile: TileId,
-) {
-    let Some(Tile::Container(Container::Tabs(_))) = tree.tiles.get(center_tile)
-    else {
-        return;
-    };
-    // Collect strays first to avoid mutating while iterating.
-    let strays: Vec<TileId> = tree
-        .tiles
-        .iter()
-        .filter_map(|(id, tile)| match tile {
-            Tile::Pane(DockTab::Tab(_)) => {
-                let parent = tree.tiles.parent_of(*id);
-                if parent != Some(center_tile) {
-                    Some(*id)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect();
-    for id in strays {
-        tree.move_tile_to_container(id, center_tile, usize::MAX, false);
-    }
-}
+// `enforce_buffer_tabs_in_center` is now a method on `Tree<DockTab>`
+// via the `DockTreeExt` trait above. Callers say
+// `tree.enforce_buffer_tabs_in_center(center_tile)`.

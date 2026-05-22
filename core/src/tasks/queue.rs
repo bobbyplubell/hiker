@@ -10,16 +10,14 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
 use crate::agent::StopSignal;
-use crate::config::TasksConfig;
+use crate::config::sections::TasksConfig;
 
 use super::types::{
     CancelReason, McpClientVia, Priority, QueueError, QueueEvent, Task, TaskDetails, TaskHandle,
     TaskId, TaskOutcome, TaskRecord, TaskShape, TaskState, WorkerKind,
 };
 
-/// Mirror of the TOML `[tasks] worker_preference` enum. Lives in
-/// `core::config`; re-exported here so the queue can match on it.
-pub use crate::config::WorkerPreferenceCfg;
+use crate::config::sections::WorkerPreferenceCfg;
 
 /// Internal record carrying everything the queue needs to drive a task
 /// through its lifecycle.
@@ -229,7 +227,25 @@ impl Queue {
     /// then submitted_at asc.
     pub async fn snapshot(&self) -> Vec<TaskRecord> {
         let state = self.inner.state.lock().await;
-        let mut rows: Vec<TaskRecord> = state.slots.values().map(slot_to_record).collect();
+        let mut rows: Vec<TaskRecord> = state
+            .slots
+            .values()
+            .map(|slot| TaskRecord {
+                id: slot.task.id.clone(),
+                kind: slot.task.kind.clone(),
+                kind_summary: slot.task.kind.metadata_oneliner(),
+                priority: slot.task.priority,
+                shape: slot.task.shape,
+                state: slot.state,
+                submitted_at_ms: ms_since_epoch(slot.task.submitted_at),
+                lease_expires_at_ms: slot
+                    .lease
+                    .as_ref()
+                    .map(|l| ms_since_epoch(l.expires_at)),
+                worker: slot.last_worker.clone(),
+                finished_at_ms: slot.finished_at.map(ms_since_epoch),
+            })
+            .collect();
         rows.sort_by(|a, b| {
             b.priority
                 .rank()
@@ -661,20 +677,6 @@ impl Queue {
     }
 }
 
-pub(super) fn slot_to_record(slot: &Slot) -> TaskRecord {
-    TaskRecord {
-        id: slot.task.id.clone(),
-        kind: slot.task.kind.clone(),
-        kind_summary: slot.task.kind.metadata_oneliner(),
-        priority: slot.task.priority,
-        shape: slot.task.shape,
-        state: slot.state,
-        submitted_at_ms: ms_since_epoch(slot.task.submitted_at),
-        lease_expires_at_ms: slot.lease.as_ref().map(|l| ms_since_epoch(l.expires_at)),
-        worker: slot.last_worker.clone(),
-        finished_at_ms: slot.finished_at.map(ms_since_epoch),
-    }
-}
 
 pub(super) fn ms_since_epoch(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)

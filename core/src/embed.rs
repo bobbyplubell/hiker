@@ -25,7 +25,7 @@ pub const DEFAULT_MODEL_ID: &str = "bge-small-en-v1.5";
 pub const EMBEDDER_VERSION: &str = DEFAULT_MODEL_ID;
 
 #[derive(Debug, Error)]
-pub enum EmbedError {
+pub enum Error {
     #[error("no platform data dir available")]
     NoDataDir,
     #[error("unknown embedder model id: {0}")]
@@ -58,7 +58,7 @@ pub trait Embedder: Send + Sync {
     /// Embed a batch of texts. Synchronous and CPU-bound — wrap in
     /// `tokio::task::spawn_blocking` from async contexts. Empty input returns
     /// an empty vec without invoking the model.
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error>;
 }
 
 /// Static registry of the supported fastembed models. Mirrors the spec table
@@ -73,7 +73,7 @@ const KNOWN_MODELS: &[(&str, EmbeddingModel, usize)] = &[
 
 /// Resolve a model id (e.g. `"bge-small-en-v1.5"`) to its fastembed variant
 /// and output dim. Returns `None` for unknown ids — callers convert that
-/// into `EmbedError::UnknownModel` or `HikerError::Config` as appropriate.
+/// into `Error::UnknownModel` or `HikerError::Config` as appropriate.
 pub fn resolve_model(id: &str) -> Option<(EmbeddingModel, usize)> {
     KNOWN_MODELS
         .iter()
@@ -117,12 +117,12 @@ impl FastembedEmbedder {
     /// Resolve the platform-appropriate model cache directory and load the
     /// default model. Synchronous; multi-second on a cold cache. Wrap in
     /// `spawn_blocking` from async code.
-    pub fn load() -> Result<Self, EmbedError> {
+    pub fn load() -> Result<Self, Error> {
         Self::load_id(DEFAULT_MODEL_ID)
     }
 
     /// Load a specific model by id (one of `KNOWN_MODELS`).
-    pub fn load_id(model_id: &str) -> Result<Self, EmbedError> {
+    pub fn load_id(model_id: &str) -> Result<Self, Error> {
         let dir = default_model_dir()?;
         Self::load_in(&dir, model_id)
     }
@@ -130,16 +130,16 @@ impl FastembedEmbedder {
     /// Same as `load_id` but with an explicit model cache directory. Useful
     /// for tests and for callers that want the location overridden via
     /// settings.
-    pub fn load_in(model_dir: &Path, model_id: &str) -> Result<Self, EmbedError> {
+    pub fn load_in(model_dir: &Path, model_id: &str) -> Result<Self, Error> {
         let (variant, expected_dim) = resolve_model(model_id)
-            .ok_or_else(|| EmbedError::UnknownModel(model_id.to_string()))?;
+            .ok_or_else(|| Error::UnknownModel(model_id.to_string()))?;
         std::fs::create_dir_all(model_dir)?;
         let inner = TextEmbedding::try_new(
             TextInitOptions::new(variant)
                 .with_cache_dir(model_dir.to_path_buf())
                 .with_show_download_progress(true),
         )
-        .map_err(|e| EmbedError::Load(e.to_string()))?;
+        .map_err(|e| Error::Load(format!("{e:#}")))?;
         let me = Self {
             inner: Mutex::new(inner),
             model_id: model_id.to_string(),
@@ -152,11 +152,11 @@ impl FastembedEmbedder {
             let mut guard = me.inner.lock().expect("embedder mutex poisoned");
             guard
                 .embed(vec!["dimension probe"], None)
-                .map_err(|e| EmbedError::Embed(e.to_string()))?
+                .map_err(|e| Error::Embed(e.to_string()))?
         };
-        let got = probe.first().map(|v| v.len()).unwrap_or(0);
+        let got = probe.first().map(std::vec::Vec::len).unwrap_or(0);
         if got != expected_dim {
-            return Err(EmbedError::DimMismatch {
+            return Err(Error::DimMismatch {
                 got,
                 expected: expected_dim,
             });
@@ -178,21 +178,21 @@ impl Embedder for FastembedEmbedder {
         self.dim
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         // fastembed wants `impl AsRef<[S]>`-shaped input; collect to Vec<&str>.
-        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = texts.iter().map(std::string::String::as_str).collect();
         let out = {
             let mut guard = self.inner.lock().expect("embedder mutex poisoned");
             guard
                 .embed(refs, None)
-                .map_err(|e| EmbedError::Embed(e.to_string()))?
+                .map_err(|e| Error::Embed(e.to_string()))?
         };
         for v in &out {
             if v.len() != self.dim {
-                return Err(EmbedError::DimMismatch {
+                return Err(Error::DimMismatch {
                     got: v.len(),
                     expected: self.dim,
                 });
@@ -204,10 +204,22 @@ impl Embedder for FastembedEmbedder {
 
 /// Resolve the platform model dir: `~/.local/share/hiker/models/` on Linux,
 /// `~/Library/Application Support/com.hiker.Hiker/models/` on macOS,
-/// `%APPDATA%\hiker\hiker\data\models\` on Windows. See docs/index.md.
-pub fn default_model_dir() -> Result<PathBuf, EmbedError> {
+/// `%LOCALAPPDATA%\hiker\models\` on Windows. See docs/index.md.
+///
+/// Windows uses a deliberately shallow path (skipping the `hiker\hiker\data\`
+/// nesting `directories::ProjectDirs` produces) so the full huggingface cache
+/// layout — `models--<org>--<name>\snapshots\<40-char sha>\onnx\model.onnx` —
+/// stays under the 260-char MAX_PATH limit without requiring long-path
+/// support to be enabled at the OS level.
+pub fn default_model_dir() -> Result<PathBuf, Error> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(local).join("hiker").join("models"));
+        }
+    }
     let dirs = directories::ProjectDirs::from("com", "hiker", "Hiker")
-        .ok_or(EmbedError::NoDataDir)?;
+        .ok_or(Error::NoDataDir)?;
     Ok(dirs.data_dir().join("models"))
 }
 
@@ -244,7 +256,7 @@ impl Embedder for MockEmbedder {
         self.dim
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
         let mut out = Vec::with_capacity(texts.len());
         for t in texts {
             let h = blake3::hash(t.as_bytes());

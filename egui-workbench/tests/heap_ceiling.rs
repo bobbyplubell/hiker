@@ -11,10 +11,15 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use egui_workbench::{
-    DocumentTab, OpenTabOptions, TabUiContext, Workbench, WorkbenchBehavior,
-};
+use egui_workbench::tab::Document;
 
+use egui_workbench::workspace::OpenTabOptions;
+
+use egui_workbench::tab::UiContext;
+
+use egui_workbench::workspace::Workbench;
+
+use egui_workbench::behavior::Host;
 // ---- Counting allocator -------------------------------------------------
 
 struct CountingAllocator;
@@ -57,9 +62,6 @@ fn cur() -> usize {
 fn pk() -> usize {
     PEAK.load(Ordering::Relaxed)
 }
-fn reset_peak_to_current() {
-    PEAK.store(cur(), Ordering::Relaxed);
-}
 
 // ---- Fixture ------------------------------------------------------------
 
@@ -68,7 +70,7 @@ struct Tab {
     title: String,
 }
 
-impl DocumentTab for Tab {
+impl Document for Tab {
     fn title(&self) -> egui::WidgetText {
         self.title.clone().into()
     }
@@ -81,8 +83,8 @@ enum Mode {
 }
 
 struct Behavior;
-impl WorkbenchBehavior<Tab, Mode> for Behavior {
-    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _ctx: TabUiContext<'_>) {
+impl Host<Tab, Mode> for Behavior {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _ctx: UiContext<'_>) {
         ui.label(&tab.title);
     }
     fn side_bar_ui(&mut self, ui: &mut egui::Ui, _mode: &Mode) {
@@ -91,15 +93,15 @@ impl WorkbenchBehavior<Tab, Mode> for Behavior {
     fn secondary_side_bar_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("secondary body");
     }
-    fn activity_items(&self) -> Vec<egui_workbench::ActivityItem<Mode>> {
+    fn activity_items(&self) -> Vec<egui_workbench::activity_bar::Item<Mode>> {
         vec![
-            egui_workbench::ActivityItem {
+            egui_workbench::activity_bar::Item {
                 mode: Mode::Files,
                 icon: None,
                 label: "Files".into(),
                 badge: None,
             },
-            egui_workbench::ActivityItem {
+            egui_workbench::activity_bar::Item {
                 mode: Mode::Search,
                 icon: None,
                 label: "Search".into(),
@@ -129,7 +131,7 @@ fn workbench_steady_state_stays_under_ceiling() {
             Tab {
                 title: format!("tab-{i}"),
             },
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
     }
 
@@ -149,7 +151,7 @@ fn workbench_steady_state_stays_under_ceiling() {
 
     // Reset peak to current after warmup, then measure the 500-frame
     // steady-state phase.
-    reset_peak_to_current();
+    PEAK.store(cur(), Ordering::Relaxed);
     let baseline = cur();
     let baseline_peak = pk();
 

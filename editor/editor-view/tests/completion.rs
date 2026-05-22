@@ -2,11 +2,15 @@
 
 use std::sync::Arc;
 
-use editor_core::{EditorState, Selection};
-use editor_view::command::{self, Action};
-use editor_view::{
-    CompletionItem, CompletionKind, CompletionSource, InputEvent, ViewState,
-};
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::Selection;
+use editor_view::command;
+use editor_view::command::Action;
+use editor_view::autocomplete::CompletionItem;
+use editor_view::autocomplete::CompletionKind;
+use editor_view::autocomplete::CompletionSource;
+use editor_view::events::InputEvent;
+use editor_view::viewport::ViewState;
 use smol_str::SmolStr;
 
 struct FakeSource;
@@ -75,9 +79,9 @@ fn escape_closes_popup() {
     drive(
         &mut state,
         &mut view,
-        &InputEvent::Key(editor_view::KeyEvent {
-            key: editor_view::Key::Named(editor_view::NamedKey::Escape),
-            mods: editor_view::Modifiers::default(),
+        &InputEvent::Key(editor_view::events::KeyEvent {
+            key: editor_view::events::Key::Named(editor_view::events::NamedKey::Escape),
+            mods: editor_view::events::Modifiers::default(),
             repeat: false,
         }),
     );

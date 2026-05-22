@@ -24,25 +24,28 @@ use eframe::egui;
 use egui_tiles::{Behavior, Container, EditAction, SimplificationOptions, Tile, TileId, Tiles, UiResponse};
 
 use crate::editor_pane;
-use crate::layout;
+use crate::layout::DockTreeExt as _;
 use crate::panels;
 use crate::panels_registry::PanelRegistry;
 use crate::state::{AppState, Modal};
 use crate::tab::{DockTab, TabId, TabKind};
 use crate::theme;
 
+impl AppState {
 /// Format the tab's label text: name + dirty dot, italicised when the
 /// tab is the preview slot.
-fn render_label(app: &AppState, tab: &crate::tab::Tab, is_preview: bool) -> egui::WidgetText {
-    finalize_label(app, tab.label(), tab.buffer_path(), is_preview)
+fn render_label(&self, tab: &crate::tab::Tab, is_preview: bool) -> egui::WidgetText {
+    let app = self;
+    app.finalize_label(tab.label(), tab.buffer_path(), is_preview)
 }
 
 fn finalize_label(
-    app: &AppState,
+    &self,
     mut text: String,
     path: Option<&str>,
     is_preview: bool,
 ) -> egui::WidgetText {
+    let app = self;
     if let Some(p) = path
         && let Some(buf) = app.session.buffers.get(p)
         && buf.is_dirty()
@@ -55,6 +58,7 @@ fn finalize_label(
     }
     egui::WidgetText::from(rich)
 }
+}
 
 /// Close a tab; if the underlying buffer is dirty, surface the dirty-close
 /// modal instead of closing immediately.
@@ -62,7 +66,7 @@ pub fn close_tab_with_dirty_guard(app: &mut AppState, tab_id: TabId) {
     let dirty_path = app
         .tab_by_id(tab_id)
         .and_then(|t| t.buffer_path().map(str::to_string))
-        .filter(|p| app.session.buffers.get(p).map(|b| b.is_dirty()).unwrap_or(false));
+        .filter(|p| app.session.buffers.get(p).map(super::buffer::Buffer::is_dirty).unwrap_or(false));
     if let Some(path) = dirty_path {
         app.session.modal = Some(Modal::DirtyClose { path, tab_id });
     } else {
@@ -74,7 +78,9 @@ pub fn close_tab_with_dirty_guard(app: &mut AppState, tab_id: TabId) {
 /// has been collapsed away, pick a new one via the same heuristic the
 /// loader uses, falling back to creating a fresh Tabs tile if nothing
 /// suitable exists.
-fn ensure_center_tile(app: &mut AppState) -> TileId {
+impl AppState {
+fn ensure_center_tile(&mut self) -> TileId {
+    let app = self;
     let current = app.session.center_tile;
     if matches!(
         app.session.dock.tiles.get(current),
@@ -110,6 +116,7 @@ fn ensure_center_tile(app: &mut AppState) -> TileId {
     app.session.center_tile = id;
     id
 }
+}
 
 /// Bring the dock arrangement back in sync with `app.session.tabs`:
 ///   - Push any TabId present in `session.tabs` but missing from `dock`
@@ -118,7 +125,9 @@ fn ensure_center_tile(app: &mut AppState) -> TileId {
 ///
 /// Panels in the dock are NOT touched — their lifecycle is owned by
 /// the layout loader + `panel.toggle.*` actions.
-pub fn reconcile_dock(app: &mut AppState) {
+impl AppState {
+pub fn reconcile_dock(&mut self) {
+    let app = self;
     let want: Vec<TabId> = app.session.tabs.iter().map(|t| t.id).collect();
     let have: std::collections::HashSet<TabId> = app
         .session
@@ -136,7 +145,7 @@ pub fn reconcile_dock(app: &mut AppState) {
         if have.contains(id) {
             continue;
         }
-        let center = ensure_center_tile(app);
+        let center = app.ensure_center_tile();
         let pane_id = app
             .session
             .dock
@@ -176,11 +185,14 @@ pub fn reconcile_dock(app: &mut AppState) {
         });
     }
 }
+}
 
+impl AppState {
 /// Record current `TileId` for every panel currently in the dock. Used
 /// by `panel.toggle.*` so re-toggling drops the panel back where the
 /// user last had it.
-fn record_panel_locations(app: &mut AppState) {
+fn record_panel_locations(&mut self) {
+    let app = self;
     app.session.panel_locations.clear();
     for (id, tile) in app.session.dock.tiles.iter() {
         if let Tile::Pane(DockTab::Panel(panel_id)) = tile {
@@ -196,7 +208,8 @@ fn record_panel_locations(app: &mut AppState) {
 
 /// Pull the currently-active leaf pane's TabId, if any. Used to sync
 /// `session.active_tab` after the user clicks a tab.
-fn active_tab_in_center(app: &AppState) -> Option<TabId> {
+fn active_tab_in_center(&self) -> Option<TabId> {
+    let app = self;
     let center = app.session.center_tile;
     let Tile::Container(Container::Tabs(tabs)) = app.session.dock.tiles.get(center)?
     else {
@@ -207,6 +220,7 @@ fn active_tab_in_center(app: &AppState) -> Option<TabId> {
         Tile::Pane(DockTab::Tab(id)) => Some(*id),
         _ => None,
     }
+}
 }
 
 struct HikerBehavior<'a> {
@@ -244,7 +258,7 @@ impl<'a> Behavior<DockTab> for HikerBehavior<'a> {
                     return egui::WidgetText::from("(missing)");
                 };
                 let is_preview = self.app.session.preview_tab == Some(*id);
-                render_label(self.app, &t, is_preview)
+                self.app.render_label(&t, is_preview)
             }
             DockTab::Panel(panel_id) => {
                 let title = PanelRegistry::all()
@@ -316,22 +330,13 @@ impl<'a> HikerBehavior<'a> {
         match kind {
             TabKind::Editor { buffer, diff } => {
                 use crate::tab::BufferSource;
-                // Diff renders as a decoration layer on the same editor
-                // widget via `diff_overlay::compute`; not a separate panel.
                 let _ = diff;
-                match buffer {
-                    BufferSource::Vault { path } => {
-                        panels::buffer::show(ui, self.app, &path, self.rt)
-                    }
-                    BufferSource::Snapshot { path, change_id } => {
-                        panels::snapshot_preview::show(ui, self.app, &path, &change_id)
-                    }
-                    BufferSource::StagingProposal { proposal_id, target_path } => {
-                        panels::staging_preview::show(ui, self.app, &proposal_id, &target_path)
-                    }
-                    BufferSource::Trash { trash_path, original_path } => {
-                        panels::trash_preview::show(ui, self.app, &trash_path, &original_path)
-                    }
+                let key = match &buffer {
+                    BufferSource::Vault { path } => Some(path.clone()),
+                    _ => crate::editor_pane::ensure_readonly_buffer_loaded(self.app, &buffer),
+                };
+                if let Some(k) = key {
+                    panels::buffer::show(ui, self.app, &k, self.rt);
                 }
             }
             TabKind::Home => panels::home::show(ui, self.app),
@@ -363,8 +368,10 @@ impl<'a> HikerBehavior<'a> {
 /// Central pane: render the tile tree. The tree is owned by
 /// `Session::dock`; we swap it out into a local for the render call so
 /// the `Behavior` impl can hold `&mut AppState`.
-pub fn body(ctx: &egui::Context, app: &mut AppState, rt: &Arc<tokio::runtime::Runtime>) {
-    reconcile_dock(app);
+impl AppState {
+pub fn dock_body(&mut self, ctx: &egui::Context, rt: &Arc<tokio::runtime::Runtime>) {
+    let app = self;
+    app.reconcile_dock();
     egui::CentralPanel::default()
         .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(0))
         .show(ctx, |ui| {
@@ -396,11 +403,11 @@ pub fn body(ctx: &egui::Context, app: &mut AppState, rt: &Arc<tokio::runtime::Ru
             // center_tile gets bounced back. Mirror image: any
             // DockTab::Panel ending up in the center is left where it
             // is (less common, and disruptive to fix automatically).
-            layout::enforce_buffer_tabs_in_center(&mut dock, app.session.center_tile);
+            dock.enforce_buffer_tabs_in_center(app.session.center_tile);
             app.session.dock = dock;
 
             // Sync focused tab back to `session.active_tab`.
-            if let Some(new_active) = active_tab_in_center(app)
+            if let Some(new_active) = app.active_tab_in_center()
                 && app.session.active_tab != Some(new_active)
             {
                 app.session.active_tab = Some(new_active);
@@ -408,11 +415,12 @@ pub fn body(ctx: &egui::Context, app: &mut AppState, rt: &Arc<tokio::runtime::Ru
                     && let Some(path) = app
                         .tab_by_id(new_active)
                         .and_then(|t| t.buffer_path())
-                        .map(|s| s.to_string())
+                        .map(std::string::ToString::to_string)
                 {
                     crate::state::nav_push(app, &path);
                 }
             }
-            record_panel_locations(app);
+            app.record_panel_locations();
         });
+}
 }

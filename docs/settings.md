@@ -177,27 +177,27 @@ Stub. The full schema lives in `index.md`'s embedder section (`embedder-config-s
 Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables routing the chat panel through an external ACP agent instead of the basic agent loop. Shape: `agent` (registry id, "bundled" alias for the basic loop, or "none" for disable mode). Loader lands with `core::acp` itself.
 
 
-## Staging review
+## Pending change review
 
-Some writes shouldn't land directly: the user didn't author the bytes (agent writes), or the user can't watch them all happen at once (batch mutations). Hiker stages these in `vault/.hiker/staging/` and exposes accept/reject inline on every surface that cares — the chat card where the proposal originated, the trails panel for draft-trail proposals, the file tree for per-file proposals, the editor toolbar when the open file has a pending proposal, and the activity detail page as the central review surface. No dedicated staging editor sub-mode — accept/reject lives alongside the content it affects.
+Some writes shouldn't land directly on disk: the user didn't author the bytes (agent writes), or the user can't watch them all happen at once (batch mutations). These writes land as `status=pending` ops in the op log (per `op-log.md`) until the user accepts. Accept/reject lives inline on every surface that cares — the chat card where the proposal originated, the trails panel for draft-trail proposals, the file tree for per-file proposals, the editor toolbar when the open file has a pending op, and the activity detail page as the central review surface. No dedicated staging editor sub-mode — accept/reject lives alongside the content it affects.
 
-Two flows feed staging:
+Two flows produce pending ops:
 
-- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on routes the writes to staging instead of applying directly. [agent-write-review-mode]
-- **Batch mutations (always staged)** — multi-note mutation actions (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks per `task-queue.md`; the user can't watch N buffers, so each result lands in staging unconditionally. Single-note user-initiated mutations stay in-buffer per `editor.md`'s Note-mutations menu — staging is for the multi-note case.
+- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on makes the produced ops enter the log as `status=pending` instead of `status=accepted`. [agent-write-review-mode]
+- **Batch mutations (always pending)** — multi-note mutation actions (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks per `task-queue.md`; the user can't watch N buffers, so each result lands as pending unconditionally. Single-note user-initiated mutations stay in-buffer per `editor.md`'s Note-mutations menu.
 
 The headline decisions:
 
-- **Agent-write review is off by default; opt-in per write surface.** Existing behavior — agent writes apply directly + append a `core::changes` row — stays the default. Users who want a checkpoint in the loop flip the flag per surface (MCP / background features). [agent-write-review-mode]
-- **Proposed writes live in `vault/.hiker/staging.db`** — a SQLite database, same module-discipline pattern as `core::changes`'s `changes.db` and `core::store`'s `index.db`. Each pending proposal is one row carrying its metadata + body content as a BLOB column (zstd-compressed, same encoding as `changes-content-zstd`). No per-proposal sidecar files. Source on disk is unchanged until Accept. Watcher's `.hiker/` ignore covers the file for free. [staging-dir, staging-sqlite-store]
-- **`edit_note` proposals split per edit; `write_note` proposals stay whole-file.** Every span in an `edit_note` call lands as its own atomic proposal row, sharing a `batch_id` so consumers can group them visually but accept/reject each independently. `write_note`, `set_frontmatter`, and `apply_tag` produce one proposal per call. [staging-per-edit-proposals]
-- **`move_note` is a first-class action.** Triage and the cluster editor's one-off Stage move verb emit `action = "move_note"` proposals. These rows carry both `source_path` and `target_path` so accept can call `core::vault::move_note(source, target)` and recheck can detect drift on either side (source moved out from under, target now occupied). Same `surface = "triage"` / `surface = "cluster-editor"` provenance as the rest of the proposal types. [staging-action-move-note]
-- **Pending proposals carry a derived state.** `applyable` (default) or `conflicted`. The state is re-derived on every file change event for the target path; when an anchor is lost or hash drifts past propose-time, the proposal flips to conflicted and `hiker:staging-changed` fires. Conflicted proposals stay visible (Reject still works); Accept is disabled. [staging-proposal-state, staging-drift-eager-recheck]
-- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the unified `Changes` tab. `edit_note`-shaped proposals render directly in the live editable buffer as inline decorations + per-file pill — no mode flip, no toolbar toggle (see `patch-review.md`). `write_note`-shaped proposals open via the existing read-only-buffer-with-diff-toggle pattern, framed as "Review rewrite" / "Review new note" in the mode-controls label (per `write-note-review-surface`).
-- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the existing author-class pills) that shows all pending proposals across all sources. Each row carries [Accept] [Reject]. An [Accept all (N)] button at the top batch-approves. [staging-review-activity-detail-filter]
-- **Proposals are queryable by surface-specific filters.** `core::staging::list()` accepts an optional filter (`by_path`, `by_trail_id`, `by_surface`, `by_session_id`) so each surface pulls only its relevant proposals. [staging-review-filtering]
-- **MCP write responses are honest about staging.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "staged"` plus the staging id so the agent can describe the outcome accurately. [staging-review-pending-response]
-- **Accept navigates to the target note as a preview tab.** After a successful individual accept (not batch), the UI opens the affected note at its `target_path` in an editor tab with `preview: true`, replacing any existing preview slot. If the file is already open as a sticky tab, the existing tab is activated and its buffer reloaded from disk. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
+- **Pending ops live in a per-document queue, not a separate staging database.** Agent ops are serialized Yrs updates in `<doc-id>.pending` (per `op-log-pending-queue`); accept applies them to the document's `accepted` CRDT state, reject discards them. Closing the app and reopening reconstitutes pending ops naturally — the queue is on disk. [op-log-pending-survives-restart]
+- **Agent-write review is off by default; opt-in per write surface.** Existing behavior — agent ops enter as `status=accepted` and reach disk immediately — stays the default. Users who want a checkpoint in the loop flip the per-surface `review_required` flag. [agent-write-review-mode]
+- **`edit_note` calls emit multiple `Replace` ops sharing a `batch_id`** so consumers can group them visually but accept/reject each independently. `write_note`, `set_frontmatter`, and `apply_tag` emit one op per call (whole-document `Replace`, `SetFrontmatter`, and `SetFrontmatter`-on-tags respectively). Op shapes specced in `op-log-op-shape`.
+- **`move_note` and `rename` flow through dedicated op kinds** per `op-log-op-shape` (`Rename` for path moves; the indexer logic that calls `core::vault::move_note` is unchanged from the prior design). Triage and the cluster editor's one-off Stage move verb emit `Rename` ops with `author = "auto:triage"` / `"auto:cluster-editor"` respectively.
+- **Drifted ops** (an anchor's `old_str` no longer resolves uniquely against the accepted materialization) surface with Accept disabled, Reject active. See `patch-review.md` for the inline drift surface. [op-log-status-states]
+- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the unified `Changes` tab. Hunk-shaped pending ops render directly in the live editable buffer as inline decorations + per-file pill (see `patch-review.md`). Whole-file pending ops open via the existing read-only-buffer-with-diff-toggle pattern, framed as "Review rewrite" / "Review new note" in the mode-controls label (per `write-note-review-surface`).
+- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the existing author-class pills) that shows all pending ops across all sources. Each row carries [Accept] [Reject]. An [Accept all (N)] button at the top batch-approves. [staging-review-activity-detail-filter]
+- **Pending ops are queryable by surface-specific filters.** `core::oplog::query()` accepts a filter (`by_path`, `by_trail_id`, `by_surface`, `by_session_id`, `status`) so each surface pulls only its relevant ops.
+- **MCP write responses are honest about pending.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "pending"` plus the op id so the agent can describe the outcome accurately. [staging-review-pending-response]
+- **Accept navigates to the target note as a preview tab.** After a successful individual accept (not batch), the UI opens the affected note at its target path in an editor tab with `preview: true`. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
 
 ### Review surfaces
 
@@ -314,136 +314,49 @@ No green/red. All Accept/Reject use the existing muted token system and the same
 
 ### Storage
 
-```
-.hiker/staging.db   # SQLite — one table `proposals`, schema below
-```
+Accepted state lives in `.hiker/oplog/<doc-id>.yrs` (the document's Yrs CRDT state); pending ops queue separately in `<doc-id>.pending` as serialized Yrs updates paired with side-table metadata. Storage layout, op shapes, drift detection, and the two-doc model are all specced in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-two-doc-model`, `op-log-status-states`). The `[staging]` config section is replaced by `[op-log]` per `op-log-config-section`.
 
-Single table `proposals` with these columns (one row per pending proposal):
+There is no separate staging database, no `staging.db` schema, no proposal table. Pending ops are queryable via `core::oplog::query({ status: Pending, ... })` — the same query surface every other consumer reads.
 
-```
-id                TEXT PRIMARY KEY   -- ULID
-surface           TEXT NOT NULL      -- "mcp-tool-call" | "chat" | "batch-mutation" | "trails" | ...
-action            TEXT NOT NULL      -- "write_note" | "edit_note" | "set_frontmatter" | "apply_tag" | "move_note"
-target_path       TEXT NOT NULL      -- for move_note: destination path
-source_path       TEXT               -- present only for move_note rows; NULL otherwise
-trail_id          TEXT
-content_hash      TEXT               -- blake3 of decompressed content; NULL when no body (e.g. waypoint-add metadata-only proposals)
-content           BLOB               -- zstd-compressed body bytes (level 3, same as changes-content-zstd); NULL when content_hash is NULL
-created_at_ms     INTEGER NOT NULL
-batch_id          TEXT               -- groups N rows from one originating tool call (currently only edit_note)
-edit_old_str      TEXT               -- present for edit_note rows
-edit_new_str      TEXT               -- present for edit_note rows
-edit_replace_all  INTEGER            -- 0/1; present for edit_note rows
-state             TEXT NOT NULL      -- "applyable" | "conflicted" (default "applyable")
-conflict_reason   TEXT               -- "anchor_missing" | "anchor_not_unique" | "hash_changed" | "target_missing" | "source_missing" | "target_occupied"
-source_hash       TEXT               -- propose-time disk hash; consumed by recheck
-metadata          TEXT               -- opaque JSON (client_id, session_id, amended_at_ms, amend_count, etc.)
-amended_at_ms     INTEGER            -- last amend timestamp; NULL if never amended (per mcp-tool-amend-pending-proposal)
-amend_count       INTEGER NOT NULL DEFAULT 0
-```
+### Lifecycle of a pending op
 
-Indexes: `(target_path)`, `(source_path)`, `(surface)`, `(state)`, `(batch_id)`, `(created_at_ms)` — supporting `StagingFilter` paths without table scans. `(source_path)` exists so opening a note that's the *source* of a pending `move_note` proposal still surfaces the row; `core::staging::list_for_path(rel)` unions `target_path = rel` and `source_path = rel` results. WAL mode + `synchronous=NORMAL`, mirroring `store-wal-mode` / `changes-store-file`.
+1. **Producer emits an op via `core::ops`.**
+    - **Agent path** — `mcp-tool-write-note` / `mcp-tool-edit-note` / a background feature emits ops via `core::ops::agent_*`. When `review_required` is on for the producer, the ops queue in `<doc-id>.pending` instead of applying to `accepted`. `edit_note` queues N `Replace` ops sharing a `batch_id`; `write_note` queues a single whole-document `Replace`; `set_frontmatter` and `apply_tag` queue `SetFrontmatter` ops (per `op-log-op-shape`). Validation (anchor uniqueness, no textual overlap, anchors resolve against pre-application content) happens once at the producer per `mcp-edit-note-validation`.
+    - **Batch mutation path** — each fanned-out task in `core::tasks` queues its result op on completion.
+2. **`OpLog::stage_pending` writes the op to `<doc-id>.pending`** and broadcasts `hiker:oplog-changed`. The pending op is now durable across restarts.
+3. **All active surfaces refresh on the next frame.** Chat cards, trails panel, tree row indicators, in-buffer hunks, write-note pending banner, Changes tab. They read pending ops via `core::oplog::query` filtered to their relevant scope.
+4. **Drift detection.** Every op that advances `accepted` re-derives drift for the outstanding pending ops: hiker tries to apply each queued Yrs update to a clone of current `accepted`. A `Replace` whose `AnchorHint` no longer resolves uniquely (per `op-log-op-shape`) is drifted, surfaced as `(M drifted)` in the file pill (per `patch-review.md`). Drift is a derived signal, not a status — recomputed from the queue on demand.
+5. **User accepts from any surface** → `core::ops::flip_op_status(op_ids, Accepted)` applies the queued Yrs updates to `accepted`, writes their `op_metadata` rows, and re-runs save-to-disk per `op-log-atomic-write`. Reject → `flip_op_status(op_ids, Rejected)` drops them from the queue and writes a rejected audit row. Accepted ops join the synced CRDT state; rejected ops never reach `accepted`.
+6. **Auto-reject on drift.** When `[op-log] auto_reject_on_drift = true`, an op that becomes drifted is rejected automatically with `metadata.auto_rejected_reason` set. Per `op-log-config-section`.
+7. **Retention.** Accepted-op metadata GCs per `[op-log] metadata_retention_days`; rejected audit rows GC per `[op-log] rejected_retention_days`. Pending ops are never auto-GC'd — they sit in the queue until the user resolves them.
 
-Why `source_path` is a column rather than a metadata JSON field: it's the primary key for the source-folder safety check (per `suggestions.md`'s bounded-auto rule), it's indexed for path-keyed surface queries, and it's the closest analogue to `target_path` (already a column for the same reasons). Both stay first-class. Metadata stays for genuinely opaque per-row fields (client_id, session_id, confidence, tree_id).
+### `core::oplog` module
 
-Accept reads `content` (decompresses), drift-checks against source (for `edit_note` rows, re-resolves the anchor against current disk per `staging-drift-eager-recheck`; for `move_note` rows, verifies `source_path` still exists and `target_path` is still free), writes the target file (or calls `core::vault::move_note(source, target)` for `move_note` rows — same code path the apply mechanic in `suggestions-apply-cmd` uses), appends a `core::changes` row, deletes the staging row. Reject deletes the row, no changelog row. The accept-write-then-delete sequence is not a single cross-DB transaction (staging.db and changes.db are separate files); the failure mode is the same one the JSON+sidecar shape had — staging row deleted, changes append fails → orphaned changelog entry; staging row deleted, target write fails → user can re-issue from the agent. Worth a one-shot retry on changes append before logging the orphan; out of scope for the storage migration itself. [staging-retention]
+The substrate API lives in `core::oplog` per `op-log.md`'s "Module placement." Producer-facing helpers (`agent_write_note`, `agent_edit_note`, `agent_set_frontmatter`, `agent_apply_tag`, `flip_op_status`) live in `core::ops`. UI surfaces call `core::oplog::query(filter)` with their relevant filter, not the producer helpers.
 
-`state` defaults to `applyable`; flips to `conflicted` with a populated `conflict_reason` when re-anchoring fails. `batch_id` groups proposals that came from one originating tool call (currently only `edit_note`). The `edit_*` columns carry the patch payload for `edit_note` proposals (NULL for full-file proposals).
-
-GC on vault open: proposals older than `[staging] retention_days` discarded (default 14) via a single `DELETE FROM proposals WHERE created_at_ms < ?`. The retention window is configurable via `staging-config-section`.
-
-Schema version stamped via `pragma user_version` per the established pattern; fail-loud on mismatch per `store-version-fail-loud`. Pre-1.0 policy: no migration code — schema bumps are handled by deleting `.hiker/staging.db`. [staging-sqlite-store]
-
-### Lifecycle of a staged proposal
-
-1. The producer writes to `core::staging::propose()`:
-    - **Agent path** — `mcp-tool-write-note` / `mcp-tool-edit-note` (or a background feature) sees `review_required = true` and calls `core::staging::propose(action, target_path, payload, metadata)` instead of writing directly. `edit_note` calls split into N proposals via `propose_batch(...)`, one per edit, sharing a generated `batch_id`. Validation (anchor uniqueness, no textual overlap, anchors resolve against pre-application content) happens once at the MCP layer per `mcp-edit-note-validation`; the split-and-stage step trusts the validated input.
-    - **Batch mutation path** — each fanned-out task in `core::tasks` calls `core::staging::propose()` on completion.
-2. One `INSERT` into `staging.db`'s `proposals` table carries the metadata, the zstd-compressed body in the `content` column, the propose-time `source_hash`, and (for `edit_note` rows) the `edit_*` patch fields and shared `batch_id`. No sidecar files; everything for the proposal is in the row.
-3. The staging service's broadcast channel fires. All active surfaces (chat cards, trails panel, tree row indicators, in-buffer patch-review decorations + file pill, write-note pending banner, Changes tab) refresh on the next frame (the staging snapshot is polled every ~200ms by the background poller and read each frame from `ui_cache.staging_snapshot`).
-4. While the proposal is pending, every `hiker:file-changed` and `hiker:changes-appended` event for the target path triggers `Staging::recheck(id)`. For `edit_note` rows: re-resolve `edit.old_str` against current disk; if it still matches uniquely, state stays `applyable`. Otherwise flip to `conflicted` with the appropriate `conflict_reason` (`anchor_missing`, `anchor_not_unique`, `target_missing`), broadcast `hiker:staging-changed`. For `write_note` rows: compare `content_hash` against propose-time hash; mismatch flips to `conflicted` with `conflict_reason = "hash_changed"`. For `move_note` rows: verify `source_path` still exists (`conflict_reason = "source_missing"` on miss) and `target_path` is still free (`conflict_reason = "target_occupied"` on collision). [staging-drift-eager-recheck]
-5. User accepts from any surface → `core::staging::accept(id)` re-runs the same anchor / hash check as the source-of-truth safety net, drift-checked writes to source, appends `core::changes` row with `metadata.staging_proposal_id` + `metadata.action` + `metadata.batch_id` (when present), deletes the staging row. Reject → `core::staging::reject(id)` deletes the row, no changelog row. Accept on a `conflicted` proposal returns the conflict reason without modifying disk.
-6. When `[staging] auto_reject_on_conflict = true`, the `applyable → conflicted` transition immediately invokes `reject(id)` with `metadata.auto_rejected_reason = <conflict_reason>`. The proposal disappears from every surface; only future transitions take this path (a flag flip doesn't retroactively reject already-conflicted proposals). [staging-auto-reject-on-conflict]
-7. Stale proposals (older than `[staging] retention_days`) GC on vault open.
-
-The staging dir does *not* count as part of `core::changes` history — proposals that never apply leave no trace beyond the GC log line and the JSONL agent-log entry. Only accepted writes hit the changelog.
-
-### `core::staging` module
-
-```rust
-Staging::open(vault_root) -> Staging
-
-Staging::propose(input: ProposalInput) -> ProposalId
-// ProposalInput { surface, action, target_path, trail_id, content, edit?, metadata }
-// edit: Option<EditPayload { old_str, new_str, replace_all }>
-
-Staging::propose_batch(inputs: Vec<ProposalInput>) -> Vec<ProposalId>
-// shared batch_id stamped into each proposal's metadata; used by edit_note
-
-Staging::accept(id, vault, changes) -> AcceptOutcome
-// drift-checked write (or re-anchored patch apply for edit_note rows) + core::changes row + cleanup
-// returns AcceptOutcome::Conflicted { reason } when re-check fails at accept time
-
-Staging::reject(id)
-// delete staging files, no changelog row
-
-Staging::accept_all(filter, vault, changes) -> Vec<AcceptOutcome>
-
-Staging::list(filter) -> Vec<Proposal>
-// filter: StagingFilter { path, trail_id, surface, session_id, state? }
-
-Staging::count(filter) -> u32
-
-Staging::recheck(id, current_disk_content?) -> ProposalState
-// re-resolve anchor (edit_note) or hash (write_note) against current disk; persists state + reason
-
-Staging::gc(retention_days)
-```
-
-Events: `hiker:staging-changed` broadcast on propose / accept / reject / state-transition so all surfaces stay in sync.
+Event: `hiker:oplog-changed` broadcasts on every append / status-flip so all surfaces stay in sync.
 
 ### Where the config keys live
 
-Two kinds of keys: per-surface gates (in their owning sections), and staging-level behavior (in the new `[staging]` section below).
+Two kinds of keys: per-surface gates (in their owning sections), and log-level behavior (in the `[op-log]` section specced in `op-log.md`).
 
-- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every successful tool-write routes through staging instead of writing directly; this is the path the inline patch-review UI expects. Turning it off bypasses review entirely. Exposed as a bool toggle in the MCP settings UI section alongside the per-tool toggles. Live-applied (the MCP handler reads from `Services::mcp_tools_cfg` which `set_setting` mirrors on every config write).
-- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section. When true, debounced background features write to staging instead of mutating frontmatter directly. Exposed as a bool toggle in the LLM settings UI section's background subsection.
+- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every MCP tool-write enters the log as `status=Pending` instead of `Accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section alongside the per-tool toggles.
+- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section. When true, debounced background features emit pending ops instead of mutating frontmatter directly.
 
-Batch mutations don't have a `review_required` flag — they always stage.
+Batch mutations don't have a `review_required` flag — they always emit pending ops.
 
-### `[staging]` config section [staging-config-section]
-
-Staging-level behavior that applies regardless of which producer staged a proposal. Both keys are eligible for user and vault scope; vault wins per the standard merge rule.
-
-```toml
-[staging]
-auto_reject_on_conflict = false   # default: keep conflicted proposals visible
-retention_days = 14               # GC age threshold
-```
-
-| Key | Type | Default | Scope | Notes |
-| --- | ---- | ------- | ----- | ----- |
-| `auto_reject_on_conflict` | bool | `false` | user + vault | When `true`, the `applyable → conflicted` state transition immediately calls `reject(id)` with `metadata.auto_rejected_reason` set. Live-applied — flipping it on doesn't retroactively reject already-conflicted proposals; flipping it off doesn't resurrect already-rejected proposals. [staging-auto-reject-on-conflict] |
-| `retention_days` | u32 | `14` | user + vault | GC age threshold consumed by `Staging::gc` on vault open. Lifts the previously-hardcoded value. |
-
-The section is added to the strict-load schema (`#[serde(deny_unknown_fields)]` per `settings-strict-load`) and the eligible-key set on both scopes so `set_setting` accepts writes. The settings UI grows a "Staging" section card with bool / int rows for both keys; live-applied (no restart). [staging-config-section]
-
-### Module placement
-
-- `core::staging` — `Staging` struct, `Staging::propose / propose_batch / accept / reject / list / count / recheck / gc`. Pure, no host imports. All `.hiker/staging/` filesystem touches confined here.
-- `core::ops::agent_write_note` (and frontmatter / tag wrappers) branch on the loaded `Config`'s review flag and route to `core::staging::propose` when set.
-- UI: activity detail page filter + inline accept/reject, chat tool-call card buttons, trails panel banner + proposed rows, tree context menu + dot indicator, editor toolbar pill. Each surface calls `core::staging::list(filter)` with its relevant filter.
-- MCP server response shapes extend per `staging-review-pending-response`.
+Log-level behavior (`auto_reject_on_drift`, `metadata_retention_days`, `rejected_retention_days`) lives in `[op-log]` per `op-log-config-section`.
 
 ### Forward refs
 
-- `diff.md` — the diff toggle already works in snapshot preview mode; staging reuses it for `write_note` proposals. `edit_note` proposals open in patch-review mode per `patch-review.md`.
-- `patch-review.md` — owns the inline per-hunk accept/reject surface for `edit_note` proposals (in-buffer decorations + file pill) plus the write-note review surface for whole-file proposals.
-- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` is the producer of per-edit proposals.
+- `op-log.md` — the substrate; storage, op shape, status states, materialization, drift, config section.
+- `diff.md` — the diff primitive used for whole-file and per-hunk review.
+- `patch-review.md` — owns the inline per-hunk accept/reject surface for `Replace`-shaped pending ops plus the write-note review surface for whole-file pending ops.
+- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` is the producer of per-edit `Replace` ops.
 - `llm.md` `[llm.background]` config gets `review_required`.
-- `task-queue.md` — batch mutation fan-out producers call `core::staging::propose` on completion.
-- `trails.md` — draft trail review hooks into the staging surfaces described here.
-- `core::changes` — sees only accepted writes; `metadata` column carries `staging_proposal_id` for traceability.
+- `task-queue.md` — batch mutation fan-out producers append pending ops on completion.
+- `trails.md` — draft trail review hooks into the surfaces described here.
+- `changes.md` — accepted ops surface via the unified activity feed; `metadata.agent_op_id` carries the originating op for traceability.
 
 
 ## Settings UI shell
@@ -563,8 +476,10 @@ Selected in-app UI changes persist by writing back to the appropriate TOML file.
 - `[vault].recent` — written by the Open Vault flow (push-to-front, dedupe, cap at ~10 entries). User-scope.
 - `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. User + vault scope. Live-applied.
 - `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features write to staging. User + vault scope. Live-applied.
-- `[staging].auto_reject_on_conflict` — bool toggle in the Staging settings section. When on, proposals that transition to `conflicted` auto-reject. User + vault scope. Live-applied. [staging-auto-reject-on-conflict]
-- `[staging].retention_days` — int (>0) in the Staging settings section. Sets GC age threshold; lifts the previously-hardcoded 14-day value. User + vault scope. Live-applied (next vault open picks up the new threshold).
+- `[op-log].auto_reject_on_drift` — bool toggle in the Op-log settings section. When on, pending ops that become drifted auto-flip to `rejected`. User + vault scope. Live-applied. Per `op-log-config-section`.
+- `[op-log].metadata_retention_days` — int (>0) in the Op-log settings section. GC age threshold for accepted-op metadata rows (the Yrs Doc content lives indefinitely). User + vault scope. Live-applied.
+- `[op-log].rejected_retention_days` — int (>0) in the Op-log settings section. GC age threshold for rejected ops (defaults shorter than accepted retention). User + vault scope. Live-applied.
+- `[op-log].review_required` — bool toggle. Default policy for agent-authored ops. Surface-specific overrides win. User + vault scope. Live-applied.
 
 Single command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
 

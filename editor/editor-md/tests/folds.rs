@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 
-use editor_core::{Decoration, EditorState};
-use editor_md::{fold_decorations, fold_regions, FoldKind};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_md::folds::fold_decorations;
+use editor_md::folds::fold_regions;
+use editor_md::folds::FoldKind;
 #[test]
 fn heading_creates_fold_region() {
     let state = EditorState::new("# Title\n\nbody line 1\nbody line 2\n");

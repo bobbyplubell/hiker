@@ -1,8 +1,11 @@
 //! Integration tests for auto-pair transform (SPEC §9.8).
 
-use editor_core::{EditorState, SelRange, Selection};
-use editor_view::autopair::{autopair_transform, DEFAULT_PAIRS};
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::SelRange;
 
+use editor_core::selection::Selection;
+use editor_view::pairs::autopair_transform;
+use editor_view::pairs::DEFAULT_PAIRS;
 #[test]
 fn typing_open_paren_at_empty_cursor_inserts_pair() {
     let state = EditorState::new("");
@@ -78,7 +81,7 @@ fn multi_cursor_autopair() {
 
 #[test]
 fn typing_close_after_autopair_skips_instead_of_doubling() {
-    use editor_view::autopair::autopair_skip;
+    use editor_view::pairs::autopair_skip;
     let mut state = EditorState::new("");
     state.selection = Selection::single(0);
     let tx = autopair_transform(&state, "(").expect("autopair fires");
@@ -93,14 +96,14 @@ fn typing_close_after_autopair_skips_instead_of_doubling() {
 
 #[test]
 fn skip_does_not_fire_for_non_close_chars() {
-    use editor_view::autopair::autopair_skip;
+    use editor_view::pairs::autopair_skip;
     let state = EditorState::new("()");
     assert!(autopair_skip(&state, Some(2), "x").is_none());
 }
 
 #[test]
 fn skip_does_not_fire_without_marker() {
-    use editor_view::autopair::autopair_skip;
+    use editor_view::pairs::autopair_skip;
     let state = EditorState::new("()");
     assert!(autopair_skip(&state, None, ")").is_none());
 }

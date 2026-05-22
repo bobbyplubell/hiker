@@ -125,7 +125,7 @@ pub struct ChatRegistry {
     /// session keeps its draft when the user flips between them.
     pub drafts: HashMap<String, String>,
     /// Per-session stop signal for an in-flight turn. Inserted by
-    /// `send::send_message` before spawning, removed when the reply
+    /// `send::send` before spawning, removed when the reply
     /// finishes/errors. Drives the chat panel's Stop button
     /// (`chat-panel-stop-button`).
     pub stop_signals: HashMap<String, StopSignal>,
@@ -175,45 +175,49 @@ mod sniff_tests {
 
     #[test]
     fn target_path_from_args_handles_common_shapes() {
+        let reg = ChatRegistry::default();
         assert_eq!(
-            sniff_target_path_from_args(r#"{"path":"notes/foo.md","content":"x"}"#),
+            reg.sniff_target_path_from_args(r#"{"path":"notes/foo.md","content":"x"}"#),
             Some("notes/foo.md".to_string()),
         );
-        assert_eq!(sniff_target_path_from_args(""), None);
-        assert_eq!(sniff_target_path_from_args("not json"), None);
+        assert_eq!(reg.sniff_target_path_from_args(""), None);
+        assert_eq!(reg.sniff_target_path_from_args("not json"), None);
         // Tools without a path field (search_notes etc.) return None.
         assert_eq!(
-            sniff_target_path_from_args(r#"{"q":"hiker","k":5}"#),
+            reg.sniff_target_path_from_args(r#"{"q":"hiker","k":5}"#),
             None,
         );
     }
 
     #[test]
     fn target_path_from_result_prefers_target_path_field() {
+        let reg = ChatRegistry::default();
         assert_eq!(
-            sniff_target_path_from_result(
+            reg.sniff_target_path_from_result(
                 r#"{"status":"staged","staging_id":"01H","target_path":"a/b.md"}"#
             ),
             Some("a/b.md".to_string()),
         );
         // Falls back to `path` when `target_path` is absent.
         assert_eq!(
-            sniff_target_path_from_result(r#"{"path":"c/d.md"}"#),
+            reg.sniff_target_path_from_result(r#"{"path":"c/d.md"}"#),
             Some("c/d.md".to_string()),
         );
-        assert_eq!(sniff_target_path_from_result(""), None);
+        assert_eq!(reg.sniff_target_path_from_result(""), None);
     }
 
     #[test]
     fn staging_ids_single() {
+        let reg = ChatRegistry::default();
         let v =
-            sniff_staging_ids(r#"{"status":"staged","staging_id":"01HXAB"}"#);
+            reg.sniff_staging_ids(r#"{"status":"staged","staging_id":"01HXAB"}"#);
         assert_eq!(v, vec!["01HXAB".to_string()]);
     }
 
     #[test]
     fn staging_ids_multiple_for_edit_note() {
-        let v = sniff_staging_ids(
+        let reg = ChatRegistry::default();
+        let v = reg.sniff_staging_ids(
             r#"{"status":"staged","staging_ids":["01A","01B","01C"]}"#,
         );
         assert_eq!(v, vec!["01A".to_string(), "01B".to_string(), "01C".to_string()]);
@@ -221,46 +225,48 @@ mod sniff_tests {
 
     #[test]
     fn staging_ids_empty_when_not_staged() {
+        let reg = ChatRegistry::default();
         // status: "written" means the write went straight to disk; no
         // proposal id should surface in the chat card.
-        assert!(sniff_staging_ids(r#"{"status":"written"}"#).is_empty());
-        assert!(sniff_staging_ids(r#"{"hits":[]}"#).is_empty());
-        assert!(sniff_staging_ids("garbage").is_empty());
+        assert!(reg.sniff_staging_ids(r#"{"status":"written"}"#).is_empty());
+        assert!(reg.sniff_staging_ids(r#"{"hits":[]}"#).is_empty());
+        assert!(reg.sniff_staging_ids("garbage").is_empty());
     }
 }
 
+impl ChatRegistry {
 /// Pull a vault-relative path out of a tool-call arguments JSON blob.
 /// Every write/edit tool param shape (per
 /// `mcp-server/src/handler/params.rs`) keys the target by `path`, so a
 /// flat lookup is enough. Returns `None` when the JSON is unreadable or
 /// the field is absent (read-only tools like `search_notes` don't carry
 /// one).
-fn sniff_target_path_from_args(args_json: &str) -> Option<String> {
+fn sniff_target_path_from_args(&self, args_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
     v.get("path")
         .and_then(|p| p.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// Variant that reads from a tool *result* payload — used as a fallback
 /// when the args weren't available (e.g. tool-call-complete arrived
 /// without args streamed). The handler shapes use `target_path` on
 /// proposal responses and `path` on most others.
-fn sniff_target_path_from_result(result_json: &str) -> Option<String> {
+fn sniff_target_path_from_result(&self, result_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(result_json).ok()?;
     if let Some(s) = v.get("target_path").and_then(|p| p.as_str()) {
         return Some(s.to_string());
     }
     v.get("path")
         .and_then(|p| p.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// Extract staging proposal IDs from a write-shaped tool result. Looks
 /// for both `staging_id` (single, used by write_note / set_frontmatter
 /// / apply_tag / remove_tag) and `staging_ids` (array, used by
 /// edit_note when each patch hunk stages independently).
-fn sniff_staging_ids(result_json: &str) -> Vec<String> {
+fn sniff_staging_ids(&self, result_json: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(result_json) else {
         return out;
@@ -285,7 +291,8 @@ fn sniff_staging_ids(result_json: &str) -> Vec<String> {
 /// matching session. Called once per frame from the panel renderers
 /// before drawing — keeps the immediate-mode loop the canonical place
 /// where session state mutates.
-pub fn pump_events(reg: &mut ChatRegistry) {
+pub fn pump_events(&mut self) {
+    let reg = self;
     let mut events: Vec<ChatEvent> = Vec::new();
     if let Ok(mut rx) = reg.rx.lock() {
         while let Ok(ev) = rx.try_recv() {
@@ -326,8 +333,8 @@ pub fn pump_events(reg: &mut ChatRegistry) {
                 }
             }
             ChatEvent::ToolCall { session_id, name, args } => {
+                let target_path = reg.sniff_target_path_from_args(&args);
                 if let Some(s) = reg.sessions.get_mut(&session_id) {
-                    let target_path = sniff_target_path_from_args(&args);
                     s.turns.push(ChatTurn {
                         role: ChatRole::Tool,
                         text: String::new(),
@@ -343,9 +350,9 @@ pub fn pump_events(reg: &mut ChatRegistry) {
                 }
             }
             ChatEvent::ToolResult { session_id, name, ok, result } => {
+                let staging_ids = reg.sniff_staging_ids(&result);
+                let result_target = reg.sniff_target_path_from_result(&result);
                 if let Some(s) = reg.sessions.get_mut(&session_id) {
-                    let staging_ids = sniff_staging_ids(&result);
-                    let result_target = sniff_target_path_from_result(&result);
                     // Find the most-recent in-flight tool card matching
                     // `name` and fold the result in. Falls back to a new
                     // turn if we missed the call event.
@@ -384,4 +391,5 @@ pub fn pump_events(reg: &mut ChatRegistry) {
             }
         }
     }
+}
 }

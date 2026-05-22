@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::TreeSortBy;
-use crate::error::HikerError;
-use crate::hash::hash_str;
+use crate::config::sections::TreeSortBy;
+use crate::errors::HikerError;
+use crate::hash_string;
 use crate::store::Store;
-use crate::trash::{Trash, TrashEntry};
+use crate::trash::{Trash, Entry};
 use crate::watcher::Watcher;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,13 +58,53 @@ impl Vault {
             }
         }
         let candidate = self.root.join(rel_path);
-        let normalized = normalize(&candidate);
+        // Normalize by collapsing `..` / `.` components without touching
+        // the disk. We deliberately don't `canonicalize` here — that would
+        // follow symlinks, which is the very thing the next check rejects.
+        let normalized = {
+            let mut out = PathBuf::new();
+            for comp in candidate.components() {
+                use std::path::Component::*;
+                match comp {
+                    ParentDir => {
+                        out.pop();
+                    }
+                    CurDir => {}
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            out
+        };
         if !normalized.starts_with(&self.root) {
             return Err(HikerError::PathEscape(rel.to_string()));
         }
         // `starts_with` only checks logical components; a symlink anywhere
-        // in the chain could still let fs::write follow it outside the vault.
-        ensure_no_symlink_components(&self.root, &normalized)?;
+        // in the chain could still let fs::write follow it outside the
+        // vault. Reject any path whose existing ancestors include a
+        // symlink. Components that don't exist yet (typical for
+        // create_note) are fine — we only check what's currently on disk.
+        let mut current = PathBuf::new();
+        for comp in normalized.components() {
+            current.push(comp);
+            // The vault root itself was canonicalized at Vault::open, so
+            // it can't be a symlink. Skip checking ancestors above the
+            // root for the same reason.
+            if !current.starts_with(&self.root) || current == self.root {
+                continue;
+            }
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(HikerError::PathEscape(format!(
+                        "symlink in path: {}",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                // Component doesn't exist yet — fine, the rest of the
+                // path can't exist either, so stop walking.
+                Err(_) => break,
+            }
+        }
         Ok(normalized)
     }
 
@@ -131,10 +171,24 @@ impl Vault {
                 .unwrap_or(0);
             out.push(DirEntryDto { name, rel_path, kind, mtime });
         }
-        out.sort_by(|a, b| match (&a.kind, &b.kind) {
-            (EntryKind::Dir, EntryKind::File) => std::cmp::Ordering::Less,
-            (EntryKind::File, EntryKind::Dir) => std::cmp::Ordering::Greater,
-            _ => compare_entries(a, b, sort_by),
+        out.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            match (&a.kind, &b.kind) {
+                (EntryKind::Dir, EntryKind::File) => Ordering::Less,
+                (EntryKind::File, EntryKind::Dir) => Ordering::Greater,
+                _ => match sort_by {
+                    TreeSortBy::NameAsc => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    TreeSortBy::NameDesc => b.name.to_lowercase().cmp(&a.name.to_lowercase()),
+                    TreeSortBy::MtimeDesc => match b.mtime.cmp(&a.mtime) {
+                        Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        o => o,
+                    },
+                    TreeSortBy::MtimeAsc => match a.mtime.cmp(&b.mtime) {
+                        Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        o => o,
+                    },
+                },
+            }
         });
         Ok(out)
     }
@@ -147,7 +201,7 @@ impl Vault {
 
     pub fn read_file_with_hash(&self, rel: &str) -> Result<(String, String), HikerError> {
         let contents = self.read_file(rel)?;
-        let hash = hash_str(&contents);
+        let hash = hash_string(&contents);
         Ok((contents, hash))
     }
 
@@ -171,7 +225,7 @@ impl Vault {
             Ok(bytes) => {
                 let on_disk = String::from_utf8(bytes)
                     .map_err(|e| HikerError::NotUtf8(e.to_string()))?;
-                let found = hash_str(&on_disk);
+                let found = hash_string(&on_disk);
                 if found != expected_hash {
                     return Err(HikerError::DiskDrift {
                         expected: expected_hash.to_string(),
@@ -193,7 +247,7 @@ impl Vault {
             fs::create_dir_all(parent)?;
         }
         fs::write(&abs, contents)?;
-        Ok(hash_str(contents))
+        Ok(hash_string(contents))
     }
 
     /// Walk a vault subtree for `.md` files and return their vault-relative
@@ -487,7 +541,7 @@ pub fn delete_note(
     watcher: Option<&Watcher>,
     trash: &Trash,
     rel: &str,
-) -> Result<TrashEntry, HikerError> {
+) -> Result<Entry, HikerError> {
     let abs = vault.resolve(rel)?;
     let meta = match fs::symlink_metadata(&abs) {
         Ok(m) => m,
@@ -498,90 +552,72 @@ pub fn delete_note(
     };
 
     if meta.is_dir() {
-        delete_folder(vault, store, watcher, trash, rel)
+        // Folder soft-delete: move the whole subtree to trash, then
+        // batch-drop every `.md` member from the index. Rollback on
+        // store failure restores the folder verbatim.
+        if let Some(w) = watcher {
+            w.suppress(rel);
+        }
+        let entry = trash.move_folder_in(vault.root(), rel)?;
+        if let Some(w) = watcher {
+            w.suppress(rel);
+            if let Some(members) = &entry.members {
+                for m in members {
+                    w.suppress(m.clone());
+                }
+            }
+        }
+        let members = entry.members.clone().unwrap_or_default();
+        if let Err(e) = store.delete_notes_by_paths(&members) {
+            // Best-effort rollback: rename the folder back to its
+            // original path so disk and index don't disagree.
+            let from = trash.dir().join(&entry.trashed_name);
+            let to = vault.root().join(&entry.original_path);
+            let _ = fs::rename(from, to);
+            return Err(HikerError::Io(e.to_string()));
+        }
+        trash.append(&entry)?;
+        Ok(entry)
     } else if meta.is_file() {
-        delete_file(vault, store, watcher, trash, rel)
+        // Single-file soft-delete: move the file to trash, drop its
+        // matching index row (if any), then append a manifest entry so
+        // it shows up in the Trash panel and is `restore_note`-able.
+        if let Some(w) = watcher {
+            w.suppress(rel);
+        }
+        let entry = trash.move_file_in(vault.root(), rel)?;
+        if let Some(w) = watcher {
+            // Re-suppress so the TTL window starts close to when notify
+            // surfaces its events post-rename.
+            w.suppress(rel);
+        }
+        // Index cleanup. Non-indexed files (e.g. `.md` files we haven't
+        // ingested yet, or non-md files) just have nothing to remove.
+        let id_opt = match store.id_for_path(rel) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = rollback_file(vault, trash, &entry);
+                return Err(HikerError::Io(e.to_string()));
+            }
+        };
+        if let Some(id) = id_opt
+            && let Err(e) = store.delete_note(&id)
+        {
+            let _ = rollback_file(vault, trash, &entry);
+            return Err(HikerError::Io(e.to_string()));
+        }
+        // Manifest write failed after the file is already in trash and
+        // the index is updated. Rolling back the index would require
+        // re-ingest; leaving the file in trash without a manifest entry
+        // leaves it unrestorable. Surface the error — the file is still
+        // recoverable by hand from `.hiker/trash/`.
+        trash.append(&entry)?;
+        Ok(entry)
     } else {
         // Symlinks, fifos, etc. — vault::resolve already rejects symlink
         // ancestors, so this should be unreachable in practice.
         Err(HikerError::NotFound(format!("unsupported file type: {rel}")))
     }
-}
-
-fn delete_file(
-    vault: &Vault,
-    store: &mut Store,
-    watcher: Option<&Watcher>,
-    trash: &Trash,
-    rel: &str,
-) -> Result<TrashEntry, HikerError> {
-    if let Some(w) = watcher {
-        w.suppress(rel);
-    }
-
-    let entry = trash.move_file_in(vault.root(), rel)?;
-
-    if let Some(w) = watcher {
-        // Re-suppress so the TTL window starts close to when notify
-        // surfaces its events post-rename.
-        w.suppress(rel);
-    }
-
-    // Index cleanup. Non-indexed files (e.g. `.md` files we haven't gotten
-    // around to ingesting yet, or non-md files) just have nothing to remove.
-    let id_opt = match store.id_for_path(rel) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = rollback_file(vault, trash, &entry);
-            return Err(HikerError::Io(e.to_string()));
-        }
-    };
-    if let Some(id) = id_opt
-        && let Err(e) = store.delete_note(&id)
-    {
-        let _ = rollback_file(vault, trash, &entry);
-        return Err(HikerError::Io(e.to_string()));
-    }
-
-    // Manifest write failed after the file is already in trash and the
-    // index is updated. Rolling back the index would require re-ingest;
-    // leaving the file in trash without a manifest entry leaves it
-    // unrestorable. Surface the error — the file is still recoverable
-    // by hand from `.hiker/trash/`.
-    trash.append(&entry)?;
-    Ok(entry)
-}
-
-fn delete_folder(
-    vault: &Vault,
-    store: &mut Store,
-    watcher: Option<&Watcher>,
-    trash: &Trash,
-    rel: &str,
-) -> Result<TrashEntry, HikerError> {
-    if let Some(w) = watcher {
-        w.suppress(rel);
-    }
-
-    let entry = trash.move_folder_in(vault.root(), rel)?;
-
-    if let Some(w) = watcher {
-        w.suppress(rel);
-        if let Some(members) = &entry.members {
-            for m in members {
-                w.suppress(m.clone());
-            }
-        }
-    }
-
-    let members = entry.members.clone().unwrap_or_default();
-    if let Err(e) = store.delete_notes_by_paths(&members) {
-        let _ = rollback_folder(vault, trash, &entry);
-        return Err(HikerError::Io(e.to_string()));
-    }
-
-    trash.append(&entry)?;
-    Ok(entry)
 }
 
 /// Restore a previously soft-deleted note (or folder) from the vault trash.
@@ -606,7 +642,7 @@ pub fn restore_note(
     watcher: Option<&Watcher>,
     trash: &Trash,
     id: &str,
-) -> Result<TrashEntry, HikerError> {
+) -> Result<Entry, HikerError> {
     let entry = trash
         .find(id)?
         .ok_or_else(|| HikerError::NotFound(format!("trash entry: {id}")))?;
@@ -654,24 +690,19 @@ pub fn restore_note(
     Ok(entry)
 }
 
-fn rollback_file(vault: &Vault, trash: &Trash, entry: &TrashEntry) -> Result<(), HikerError> {
+fn rollback_file(vault: &Vault, trash: &Trash, entry: &Entry) -> Result<(), HikerError> {
     let from = trash.dir().join(&entry.trashed_name);
     let to = vault.root().join(&entry.original_path);
     fs::rename(from, to)?;
     Ok(())
 }
 
-fn rollback_folder(vault: &Vault, trash: &Trash, entry: &TrashEntry) -> Result<(), HikerError> {
-    let from = trash.dir().join(&entry.trashed_name);
-    let to = vault.root().join(&entry.original_path);
-    fs::rename(from, to)?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{new_id, NoteUpsert, Store};
+    use crate::store::dto::{new_id, NoteUpsert};
+use crate::store::Store;
     use crate::test_helpers;
     use tempfile::tempdir;
 
@@ -715,7 +746,7 @@ mod tests {
 
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path: "from.md",
                 content_hash: "h",
@@ -774,7 +805,7 @@ mod tests {
     fn upsert_stub(store: &mut Store, path: &str) -> String {
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path,
                 content_hash: "h",
@@ -1023,7 +1054,7 @@ mod tests {
         let deleted = delete_note(&vault, &mut store, None, &trash, "proj").unwrap();
 
         let restored = restore_note(&vault, None, &trash, &deleted.id).unwrap();
-        assert_eq!(restored.kind, crate::trash::TrashKind::Folder);
+        assert_eq!(restored.kind, crate::trash::Kind::Folder);
         assert!(dir.path().join("proj/a.md").exists());
         assert!(dir.path().join("proj/sub/b.md").exists());
         assert!(trash.find(&deleted.id).unwrap().is_none());
@@ -1081,62 +1112,3 @@ mod tests {
     }
 }
 
-/// Reject any path whose existing ancestors include a symlink. Components
-/// that don't exist yet (typical for create_note) are fine — we only check
-/// what's currently on disk.
-fn compare_entries(a: &DirEntryDto, b: &DirEntryDto, sort_by: TreeSortBy) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match sort_by {
-        TreeSortBy::NameAsc => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        TreeSortBy::NameDesc => b.name.to_lowercase().cmp(&a.name.to_lowercase()),
-        TreeSortBy::MtimeDesc => match b.mtime.cmp(&a.mtime) {
-            Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            o => o,
-        },
-        TreeSortBy::MtimeAsc => match a.mtime.cmp(&b.mtime) {
-            Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            o => o,
-        },
-    }
-}
-
-fn ensure_no_symlink_components(root: &Path, candidate: &Path) -> Result<(), HikerError> {
-    let mut current = PathBuf::new();
-    for comp in candidate.components() {
-        current.push(comp);
-        // The vault root itself was canonicalized at Vault::open, so it
-        // can't be a symlink at this point. Skip checking ancestors above
-        // the root for the same reason.
-        if !current.starts_with(root) || current == root {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(HikerError::PathEscape(format!(
-                    "symlink in path: {}",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            // Component doesn't exist yet — fine, the rest of the path
-            // can't exist either, so stop walking.
-            Err(_) => break,
-        }
-    }
-    Ok(())
-}
-
-fn normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        use std::path::Component::*;
-        match comp {
-            ParentDir => {
-                out.pop();
-            }
-            CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}

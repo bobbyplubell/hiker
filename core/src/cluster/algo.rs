@@ -10,7 +10,7 @@ use single_clustering::community_search::leiden::{LeidenConfig, LeidenOptimizer}
 use single_clustering::network::CSRNetwork;
 use single_clustering::network::grouping::VectorGrouping;
 
-use super::{ClusterAssignment, ClusterError, LeidenParams, OUTLIER_LABEL};
+use super::{Assignment, Error, LeidenParams, OUTLIER_LABEL};
 
 /// HDBSCAN over a slice of pre-normalized embeddings. The crate operates
 /// on Euclidean distance by default — we L2-normalize once on entry so
@@ -20,20 +20,20 @@ use super::{ClusterAssignment, ClusterError, LeidenParams, OUTLIER_LABEL};
 ///
 /// `min_samples = None` defaults to `min_cluster_size` per `clustering.md`.
 ///
-/// Returns one `ClusterAssignment` per input point; order matches the
+/// Returns one `Assignment` per input point; order matches the
 /// input slice. Outliers carry `cluster_label = OUTLIER_LABEL`.
 pub fn partition(
     embeddings: &[Vec<f32>],
     min_cluster_size: usize,
     min_samples: Option<usize>,
-) -> Result<Vec<ClusterAssignment>, ClusterError> {
+) -> Result<Vec<Assignment>, Error> {
     if embeddings.is_empty() {
-        return Err(ClusterError::Empty);
+        return Err(Error::Empty);
     }
     let dim = embeddings[0].len();
     for (i, row) in embeddings.iter().enumerate() {
         if row.len() != dim {
-            return Err(ClusterError::DimMismatch {
+            return Err(Error::DimMismatch {
                 row: i,
                 expected: dim,
                 got: row.len(),
@@ -49,9 +49,9 @@ pub fn partition(
     // and let the caller treat the result as "nothing to cluster."
     let effective_min_samples = min_samples.unwrap_or(min_cluster_size);
     if n < min_cluster_size || n < effective_min_samples {
-        let mut out: Vec<ClusterAssignment> = Vec::with_capacity(n);
+        let mut out: Vec<Assignment> = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(ClusterAssignment {
+            out.push(Assignment {
                 point_index: i,
                 cluster_label: OUTLIER_LABEL,
             });
@@ -82,7 +82,7 @@ pub fn partition(
     let (clusters, outliers, _outlier_scores) = hdb.fit(&arr, None);
 
     let mut out = vec![
-        ClusterAssignment {
+        Assignment {
             point_index: 0,
             cluster_label: OUTLIER_LABEL,
         };
@@ -124,20 +124,20 @@ pub fn partition(
 ///    per node. Communities smaller than `min_cluster_size` are flagged
 ///    as outliers.
 ///
-/// Returns one `ClusterAssignment` per input point, in input order.
+/// Returns one `Assignment` per input point, in input order.
 /// `cluster_label = OUTLIER_LABEL` for noise points (small communities
 /// or — when the input is below the partition guard — every point).
 pub fn partition_leiden(
     embeddings: &[Vec<f32>],
     leiden: &LeidenParams,
-) -> Result<Vec<ClusterAssignment>, ClusterError> {
+) -> Result<Vec<Assignment>, Error> {
     if embeddings.is_empty() {
-        return Err(ClusterError::Empty);
+        return Err(Error::Empty);
     }
     let dim = embeddings[0].len();
     for (i, row) in embeddings.iter().enumerate() {
         if row.len() != dim {
-            return Err(ClusterError::DimMismatch {
+            return Err(Error::DimMismatch {
                 row: i,
                 expected: dim,
                 got: row.len(),
@@ -146,8 +146,8 @@ pub fn partition_leiden(
     }
 
     let n = embeddings.len();
-    let mut out: Vec<ClusterAssignment> = (0..n)
-        .map(|i| ClusterAssignment {
+    let mut out: Vec<Assignment> = (0..n)
+        .map(|i| Assignment {
             point_index: i,
             cluster_label: OUTLIER_LABEL,
         })
@@ -214,7 +214,7 @@ pub fn partition_leiden(
         RBConfigurationPartition::with_resolution(network, resolution);
     optimizer
         .optimize_single_partition(&mut partition, None)
-        .map_err(|e| ClusterError::Leiden(e.to_string()))?;
+        .map_err(|e| Error::Leiden(e.to_string()))?;
 
     // Group nodes by membership; communities below the size floor stay
     // OUTLIER_LABEL. Densify the surviving community ids so consumers
@@ -305,7 +305,7 @@ pub fn mean_normalize(rows: &[&[f32]]) -> Vec<f32> {
 
 /// 90th-percentile cosine distance from `centroid` to each row in `rows`.
 /// Used as the cohesion / "radius" signal across the build pipeline and
-/// by `Trees::split_cluster`'s `leaf_cohesion_threshold` recursion guard.
+/// by `Db::split_cluster`'s `leaf_cohesion_threshold` recursion guard.
 pub fn ninetieth_percentile_distance(centroid: &[f32], rows: &[&[f32]]) -> f32 {
     if rows.is_empty() {
         return 0.0;

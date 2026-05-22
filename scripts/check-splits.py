@@ -10,8 +10,8 @@ across siblings. This script detects the *symptoms* of that game.
 It is paired with the clippy invocation in `scripts/check.sh`, which
 enforces lints that target the same antipattern from a different angle
 (`wildcard_imports`, `module_inception`, `module_name_repetitions`,
-`pub_use`, `cognitive_complexity`, `single_call_fn`,
-`unnecessary_wraps`, `needless_pass_by_value`).
+`pub_use`, `cognitive_complexity`, `unnecessary_wraps`,
+`needless_pass_by_value`).
 
 What this Python pass checks (all hard caps, no allowlist):
 

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>workbench site</title>
+    <!-- wasm-opt is run manually in build.sh (needs explicit feature flags
+         for the bulk-memory ops modern rustc emits), so disable it here. -->
+    
+<script type="module">
+import init, * as bindings from './site-c2c94eb158343114.js';
+const wasm = await init({ module_or_path: './site-c2c94eb158343114_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #1e1e1e;
+      }
+      canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  <link rel="modulepreload" href="./site-c2c94eb158343114.js" crossorigin="anonymous" integrity="sha384-mTpjLIlgkUIYhR1pDKQDoq/RvlSNH/mwvlJUjfuX6QYPHnsK6EluXoejN+PLBRe3"><link rel="preload" href="./site-c2c94eb158343114_bg.wasm" crossorigin="anonymous" integrity="sha384-qazaSdqYjmnyAXN/A88lyQncod/fsLhRllL6Q41L+aEg5QSyQwdYFeFwcX5ufbMT" as="fetch" type="application/wasm"></head>
+  <body>
+    <canvas id="the_canvas_id"></canvas>
+  </body>
+</html>

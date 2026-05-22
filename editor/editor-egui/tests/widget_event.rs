@@ -5,10 +5,15 @@
 
 use std::sync::Arc;
 
-use editor_core::{Decoration, EditorState, InlineWidget, RangeSet};
-use editor_egui::EditorWidget;
-use editor_view::{ClickAction, ViewState};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_core::decoration::InlineWidget;
+
+use editor_core::rangeset::RangeSet;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::viewport::ClickAction;
+use editor_view::viewport::ViewState;
 /// Minimal widget impl used only by this test. Returns a stable id and reports
 /// `handles_click() == true` so the painter registers a click zone.
 struct TestWidget {

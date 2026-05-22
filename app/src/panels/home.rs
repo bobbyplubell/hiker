@@ -21,7 +21,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.add_space(16.0);
 
     // Stats grid: live counts from indexer + a cheap walk for note count.
-    let total_notes = note_count(app);
+    // The walk is cheap for thousands of files; cache for huge vaults.
+    let total_notes = app
+        .vault_session
+        .vault
+        .walk_indexable_files("")
+        .map(|v| v.len())
+        .unwrap_or(0);
     let (model_ready, queued, indexed) = {
         let s = app.vault_session.services.indexer.status();
         (s.model_ready, s.queued, s.total_notes)
@@ -54,7 +60,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         ui.label(egui::RichText::new("Activity").strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("Open Changes →").clicked() {
-                open_singleton(app, TabKind::Changes);
+                app.open_singleton(TabKind::Changes);
             }
         });
     });
@@ -78,23 +84,25 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     render_snapshots(ui, app, 5);
 }
 
-fn open_singleton(app: &mut AppState, kind: TabKind) {
-    if let Some(existing) = app
-        .session
-        .tabs
-        .iter()
-        .find(|t| std::mem::discriminant(&t.kind) == std::mem::discriminant(&kind))
-    {
-        app.session.active_tab = Some(existing.id);
-        return;
+impl AppState {
+    fn open_singleton(&mut self, kind: TabKind) {
+        if let Some(existing) = self
+            .session
+            .tabs
+            .iter()
+            .find(|t| std::mem::discriminant(&t.kind) == std::mem::discriminant(&kind))
+        {
+            self.session.active_tab = Some(existing.id);
+            return;
+        }
+        let id = self.next_tab_id();
+        self.session.tabs.push(Tab {
+            id,
+            kind,
+            sticky: true,
+        });
+        self.session.active_tab = Some(id);
     }
-    let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind,
-        sticky: true,
-    });
-    app.session.active_tab = Some(id);
 }
 
 pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
@@ -107,15 +115,17 @@ pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
         HomeDetail::ActivityRow { path } => {
             ui.heading(format!("History · {path}"));
             ui.add_space(8.0);
-            render_path_history(ui, app, path);
+            app.render_path_history(ui, path);
         }
     }
 }
 
-/// Render every changes-log entry touching `path`, newest-first. Each
-/// row shows timestamp, author, action, and the content hash so the
-/// user can see what changed between versions.
-fn render_path_history(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
+impl AppState {
+    /// Render every changes-log entry touching `path`, newest-first. Each
+    /// row shows timestamp, author, action, and the content hash so the
+    /// user can see what changed between versions.
+    fn render_path_history(&mut self, ui: &mut egui::Ui, path: &str) {
+    let app = self;
     let changes = app.vault_session.services.changes.clone();
     let rows = match changes.history_for_path(path, 200) {
         Ok(v) => v,
@@ -195,12 +205,7 @@ fn render_path_history(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                 ui.add_space(2.0);
             }
         });
-}
-
-/// Count vault notes by walking the indexable set. Cheap for thousands of
-/// files; for huge vaults this could be cached.
-fn note_count(app: &AppState) -> usize {
-    app.vault_session.vault.walk_indexable_files("").map(|v| v.len()).unwrap_or(0)
+    }
 }
 
 fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
@@ -237,21 +242,23 @@ fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
                     .on_hover_text("Open snapshot preview")
                     .clicked()
                 {
-                    open_snapshot(app, &row.path, row.id);
+                    app.open_snapshot(&row.path, row.id);
                 }
             }
         });
 }
 
-fn open_snapshot(app: &mut AppState, path: &str, change_id: i64) {
-    use crate::tab::{Tab, TabKind};
-    let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::snapshot_preview(path.to_string(), change_id.to_string()),
-        sticky: true,
-    });
-    app.session.active_tab = Some(id);
+impl AppState {
+    fn open_snapshot(&mut self, path: &str, change_id: i64) {
+        use crate::tab::{Tab, TabKind};
+        let id = self.next_tab_id();
+        self.session.tabs.push(Tab {
+            id,
+            kind: TabKind::snapshot_preview(path.to_string(), change_id.to_string()),
+            sticky: true,
+        });
+        self.session.active_tab = Some(id);
+    }
 }
 
 /// Roll a file back to the content of the most recent change before
@@ -259,8 +266,10 @@ fn open_snapshot(app: &mut AppState, path: &str, change_id: i64) {
 /// the prior bytes from `changes.previous_content_for_path`, writes them
 /// to disk via the drift-aware `write_file_checked`, and appends a new
 /// change row stamped with `rolled_back_from`.
-pub(crate) fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
+impl AppState {
+    pub(crate) fn rollback_change(&mut self, path: &str, change_id: i64) {
     use crate::state::ToastLevel;
+    let app = self;
     let changes = app.vault_session.services.changes.clone();
     let prior = match changes.previous_content_for_path(path, change_id) {
         Ok(Some(p)) => p,
@@ -284,7 +293,7 @@ pub(crate) fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
         }
     };
     let current_hash = match app.vault_session.vault.read_file(path) {
-        Ok(text) => hiker_core::hash_str(&text),
+        Ok(text) => hiker_core::hash_string(&text),
         Err(_) => String::new(),
     };
     let new_hash = match app.vault_session.vault.write_file_checked(path, &current_hash, &prior_content) {
@@ -306,6 +315,7 @@ pub(crate) fn rollback_change(app: &mut AppState, path: &str, change_id: i64) {
         tracing::warn!(error = %err, "rollback: append changes row failed");
     }
     app.push_toast(format!("Rolled back {}", path), ToastLevel::Info);
+    }
 }
 
 pub(crate) fn open_home_detail(app: &mut AppState, which: HomeDetail) {

@@ -6,8 +6,10 @@
 
 use std::sync::Arc;
 
-use editor_core::EditorState;
-use editor_view::completion::{CompletionItem, CompletionKind, CompletionSource};
+use editor_core::state::Editor;
+use editor_view::autocomplete::CompletionItem;
+use editor_view::autocomplete::CompletionKind;
+use editor_view::autocomplete::CompletionSource;
 use hiker_core::vault::Vault;
 use smol_str::SmolStr;
 
@@ -23,7 +25,7 @@ impl CompletionSource for WikilinkSource {
         &['[']
     }
 
-    fn matches(&self, state: &EditorState, pos: usize) -> Vec<CompletionItem> {
+    fn matches(&self, state: &Editor, pos: usize) -> Vec<CompletionItem> {
         // Look backwards for the most recent `[[` opener on the same line.
         let doc = state.doc.to_string();
         let bytes = doc.as_bytes();
@@ -73,7 +75,7 @@ impl CompletionSource for WikilinkSource {
                 .unwrap_or(rel)
                 .trim_end_matches(".md");
             let bn_lower = basename.to_lowercase();
-            let score = score_basename(&bn_lower, &needle);
+            let score = self.score_basename(&bn_lower, &needle);
             if score <= 0 && !needle.is_empty() {
                 continue;
             }
@@ -94,7 +96,8 @@ impl CompletionSource for WikilinkSource {
     }
 }
 
-fn score_basename(name: &str, needle: &str) -> i32 {
+impl WikilinkSource {
+    fn score_basename(&self, name: &str, needle: &str) -> i32 {
     if needle.is_empty() {
         return 1;
     }
@@ -118,4 +121,5 @@ fn score_basename(name: &str, needle: &str) -> i32 {
         }
     }
     if next.is_none() { 50 } else { 0 }
+    }
 }

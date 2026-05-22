@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::anchor::{Anchor, Bias};
-use crate::change::ChangeSet;
+use crate::change::Set;
 
 #[derive(Clone, Debug)]
 pub struct RangeSet<T: Clone> {
@@ -135,7 +135,7 @@ impl<T: Clone> RangeSet<T> {
 
     /// Map all entries through `changes`. Entries whose range fully collapses
     /// (start == end after mapping) are dropped.
-    pub fn map(&self, changes: &ChangeSet) -> Self {
+    pub fn map(&self, changes: &Set) -> Self {
         let mut out: Vec<Entry<T>> = Vec::with_capacity(self.entries.len());
         for e in self.entries.iter() {
             let start = e.start.map(changes);
@@ -183,7 +183,7 @@ mod tests {
     fn map_through_insert() {
         let s = RangeSet::<u32>::from_iter([(0..3, 1), (5..10, 2)]);
         // Insert 2 chars at position 4
-        let c = ChangeSet::of(15, [(4..4, "xx".to_string())]);
+        let c = Set::of(15, [(4..4, "xx".to_string())]);
         let s2 = s.map(&c);
         let collected: Vec<_> = s2.iter_all().collect();
         assert_eq!(collected.len(), 2);
@@ -195,7 +195,7 @@ mod tests {
     fn map_collapse_drops_entry() {
         let s = RangeSet::<u32>::from_iter([(2..5, 1)]);
         // Delete the entire range
-        let c = ChangeSet::of(10, [(2..5, String::new())]);
+        let c = Set::of(10, [(2..5, String::new())]);
         let s2 = s.map(&c);
         assert!(s2.is_empty());
     }

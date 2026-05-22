@@ -5,7 +5,7 @@
 
 use eframe::egui;
 
-use hiker_core::tasks::{TaskKind, TaskRecord, TaskState};
+use hiker_core::tasks::types::{TaskKind, TaskRecord, TaskState};
 
 use crate::editor_pane;
 use crate::state::AppState;
@@ -19,14 +19,24 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     // in-process direct-LLM worker, an external rmcp client, or `Auto`
     // which prefers external when one is attached). Spec: `tasks_md`
     // `task-queue-row-pulsing-leased` + `[tasks]` settings.
-    worker_controls(ui, app);
+    View { ui, app }.worker_controls();
     ui.add_space(8.0);
 
     // ----- Background task queue (mutations, agent tools, etc.) -----
     // Read the per-frame snapshot cache populated in
     // `main::refresh_task_snapshot`; avoids blocking the UI thread here.
     let task_snapshot: Vec<TaskRecord> = app.ui_cache.task_snapshot.clone();
-    let (queued, leased, completed, failed, cancelled) = count_states(&task_snapshot);
+    let (mut queued, mut leased, mut completed, mut failed, mut cancelled) =
+        (0usize, 0, 0, 0, 0);
+    for r in &task_snapshot {
+        match r.state {
+            TaskState::Queued => queued += 1,
+            TaskState::Leased => leased += 1,
+            TaskState::Completed => completed += 1,
+            TaskState::Failed => failed += 1,
+            TaskState::Cancelled => cancelled += 1,
+        }
+    }
     egui::Grid::new("task-queue-stats")
         .num_columns(2)
         .spacing([16.0, 4.0])
@@ -108,7 +118,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                     if matches!(r.state, TaskState::Leased) {
                         any_leased = true;
                     }
-                    task_row(ui, app, r);
+                    View { ui, app }.task_row(r);
                 }
                 // Leased-row pulse animation (`task-queue-row-pulsing-leased`):
                 // request a steady repaint while any task is in flight so the
@@ -199,26 +209,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     }
 }
 
-fn count_states(rows: &[TaskRecord]) -> (usize, usize, usize, usize, usize) {
-    let mut q = 0;
-    let mut l = 0;
-    let mut c = 0;
-    let mut f = 0;
-    let mut x = 0;
-    for r in rows {
-        match r.state {
-            TaskState::Queued => q += 1,
-            TaskState::Leased => l += 1,
-            TaskState::Completed => c += 1,
-            TaskState::Failed => f += 1,
-            TaskState::Cancelled => x += 1,
-        }
-    }
-    (q, l, c, f, x)
-}
-
 /// Order rows by liveness: in-flight first, queued next, then terminal.
-fn state_rank(s: TaskState) -> u8 {
+const fn state_rank(s: TaskState) -> u8 {
     match s {
         TaskState::Leased => 0,
         TaskState::Queued => 1,
@@ -228,18 +220,25 @@ fn state_rank(s: TaskState) -> u8 {
     }
 }
 
-fn state_label(s: TaskState) -> (&'static str, egui::Color32) {
-    match s {
+/// Per-frame render context for the task-queue panel. Bundling `ui` +
+/// `app` lets the per-row / worker-control render steps be inherent
+/// methods rather than single-use free functions.
+struct View<'a> {
+    ui: &'a mut egui::Ui,
+    app: &'a mut AppState,
+}
+
+impl View<'_> {
+    fn task_row(&mut self, r: &TaskRecord) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
+    let (label, color) = match r.state {
         TaskState::Queued => ("queued", theme::muted()),
         TaskState::Leased => ("running", egui::Color32::from_rgb(0x1f, 0x70, 0x4c)),
         TaskState::Completed => ("done", theme::muted()),
         TaskState::Failed => ("failed", egui::Color32::RED),
         TaskState::Cancelled => ("cancelled", theme::muted()),
-    }
-}
-
-fn task_row(ui: &mut egui::Ui, app: &mut AppState, r: &TaskRecord) {
-    let (label, color) = state_label(r.state);
+    };
     // Leased rows pulse so the user can see motion. Modulate alpha on a
     // ~1.5s sine via egui's time. Non-leased rows stay flat.
     let display_color = if matches!(r.state, TaskState::Leased) {
@@ -286,14 +285,16 @@ fn task_row(ui: &mut egui::Ui, app: &mut AppState, r: &TaskRecord) {
             }
         }
     });
-}
+    }
 
-/// Worker-preference + direct-worker.enabled toggles. Spec calls these
-/// out per `task-queue.md` — letting users opt out of the in-app direct
-/// worker (so background work only fires when an external rmcp client is
-/// draining) or force-prefer one side of the routing.
-fn worker_controls(ui: &mut egui::Ui, app: &mut AppState) {
-    use hiker_core::config::WorkerPreferenceCfg;
+    /// Worker-preference + direct-worker.enabled toggles. Spec calls these
+    /// out per `task-queue.md` — letting users opt out of the in-app direct
+    /// worker (so background work only fires when an external rmcp client is
+    /// draining) or force-prefer one side of the routing.
+    fn worker_controls(&mut self) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
+    use hiker_core::config::sections::WorkerPreferenceCfg;
     let cfg_snap = app
         .vault_session.config
         .read()
@@ -330,7 +331,7 @@ fn worker_controls(ui: &mut egui::Ui, app: &mut AppState) {
             persist_tasks_setting(
                 app,
                 "tasks.worker_preference",
-                serde_json::json!(bias_str),
+                &serde_json::json!(bias_str),
             );
         }
     });
@@ -345,16 +346,17 @@ fn worker_controls(ui: &mut egui::Ui, app: &mut AppState) {
             persist_tasks_setting(
                 app,
                 "tasks.direct_worker.enabled",
-                serde_json::json!(enabled),
+                &serde_json::json!(enabled),
             );
         }
     });
+    }
 }
 
 fn persist_tasks_setting(
     app: &AppState,
     key: &str,
-    value: serde_json::Value,
+    value: &serde_json::Value,
 ) {
     crate::state::set_setting_quiet(
         app,

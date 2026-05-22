@@ -1,6 +1,14 @@
 //! Cursor motion. Pure functions over state → new selection.
 
-use editor_core::{Decoration, DecorationSet, EditorState, Rope, SelRange, Selection};
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::rope::Rope;
+
+use editor_core::selection::SelRange;
+
+use editor_core::selection::Selection;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +53,7 @@ pub fn move_vertical_wrapped(
     dir: Direction,
     extend: bool,
     page_lines: usize,
-    wrap: Option<&crate::wrap::WrapMap>,
+    wrap: Option<&crate::wrapping::WrapMap>,
 ) -> Selection {
     debug_assert!(matches!(dir, Direction::Up | Direction::Down));
     let step = page_lines.max(1) as isize;
@@ -114,7 +122,27 @@ pub fn move_vertical_wrapped(
 
         let tgt_line = (tgt_line.max(0) as usize).min(state.doc.len_lines().saturating_sub(1));
         let tgt_vline = tgt_vline.max(0) as usize;
-        let new_head = head_at_vline(state, wrap, tgt_line, tgt_vline, goal_col as usize);
+        let new_head = {
+            let line_start = state.doc.line_to_byte(tgt_line);
+            let line_len = state.doc.line_len_bytes(tgt_line);
+            let (vstart, vend) = wrap
+                .and_then(|w| w.peek(tgt_line))
+                .map(|w| {
+                    let i = tgt_vline.min(w.visual_count().saturating_sub(1));
+                    w.vline_range(i)
+                })
+                .unwrap_or((0, line_len));
+            let max_col = vend.saturating_sub(vstart);
+            let col = (goal_col as usize).min(max_col);
+            let mut nh = line_start + vstart + col;
+            while nh > line_start + vstart
+                && nh < state.doc.len_bytes()
+                && (state.doc.byte_at(nh) & 0b1100_0000) == 0b1000_0000
+            {
+                nh -= 1;
+            }
+            nh
+        };
 
         let new_anchor = if extend { r.anchor.offset() } else { new_head };
         let mut nr = SelRange::new(new_anchor, new_head);
@@ -122,31 +150,6 @@ pub fn move_vertical_wrapped(
         new_ranges.push(nr);
     }
     Selection::from_ranges(new_ranges, state.selection.main_index())
-}
-
-fn head_at_vline(
-    state: &EditorState,
-    wrap: Option<&crate::wrap::WrapMap>,
-    tgt_line: usize,
-    tgt_vline: usize,
-    goal_col: usize,
-) -> usize {
-    let line_start = state.doc.line_to_byte(tgt_line);
-    let line_len = state.doc.line_len_bytes(tgt_line);
-    let (vstart, vend) = wrap
-        .and_then(|w| w.peek(tgt_line))
-        .map(|w| {
-            let i = tgt_vline.min(w.visual_count().saturating_sub(1));
-            w.vline_range(i)
-        })
-        .unwrap_or((0, line_len));
-    let max_col = vend.saturating_sub(vstart);
-    let col = goal_col.min(max_col);
-    let mut new_head = line_start + vstart + col;
-    while new_head > line_start + vstart && !is_char_boundary_in_rope(&state.doc, new_head) {
-        new_head -= 1;
-    }
-    new_head
 }
 
 pub fn move_line_edge(state: &EditorState, end: bool, extend: bool) -> Selection {
@@ -186,14 +189,34 @@ pub fn move_word(
                     let prev = line - 1;
                     doc.line_to_byte(prev) + doc.line_len_bytes(prev)
                 } else {
-                    line_start + word_step_left(&line_text, local)
+                    line_start + {
+                        let mut iter = line_text.unicode_word_indices().rev();
+                        let mut last: Option<usize> = None;
+                        for (i, _) in iter.by_ref() {
+                            if i < local {
+                                last = Some(i);
+                                break;
+                            }
+                        }
+                        last.unwrap_or(0)
+                    }
                 }
             }
             Direction::Right => {
                 if local == line_text.len() && line + 1 < doc.len_lines() {
                     doc.line_to_byte(line + 1)
                 } else {
-                    line_start + word_step_right(&line_text, local)
+                    line_start + {
+                        let mut end_pos = line_text.len();
+                        for (i, w) in line_text.unicode_word_indices() {
+                            let e = i + w.len();
+                            if e > local {
+                                end_pos = e;
+                                break;
+                            }
+                        }
+                        end_pos
+                    }
                 }
             }
             _ => head,
@@ -222,25 +245,6 @@ fn map_heads<F: Fn(&Rope, usize, usize) -> usize>(
     Selection::from_ranges(new_ranges, state.selection.main_index())
 }
 
-fn is_char_boundary_in_rope(doc: &Rope, byte: usize) -> bool {
-    if byte == 0 || byte >= doc.len_bytes() {
-        return true;
-    }
-    (doc.byte_at(byte) & 0b1100_0000) != 0b1000_0000
-}
-
-fn word_step_left(text: &str, pos: usize) -> usize {
-    let mut iter = text.unicode_word_indices().rev();
-    let mut last: Option<usize> = None;
-    for (i, _) in iter.by_ref() {
-        if i < pos {
-            last = Some(i);
-            break;
-        }
-    }
-    last.unwrap_or(0)
-}
-
 /// If `pos` falls strictly inside an atomic decoration range in any layer,
 /// snap to the boundary of that range in the direction of motion. Ranges are
 /// atomic when they are `Decoration::Replace` or `Decoration::Mark` with
@@ -259,7 +263,12 @@ pub fn skip_atomic_ranges(
         let mut snapped: Option<usize> = None;
         for layer in layers {
             for (range, deco) in layer.iter_all() {
-                if !is_atomic(deco) {
+                let atomic = match deco {
+                    Decoration::Replace { .. } => true,
+                    Decoration::Mark(style) => style.atomic,
+                    _ => false,
+                };
+                if !atomic {
                     continue;
                 }
                 if range.start >= range.end {
@@ -288,20 +297,3 @@ pub fn skip_atomic_ranges(
     cur
 }
 
-fn is_atomic(deco: &Decoration) -> bool {
-    match deco {
-        Decoration::Replace { .. } => true,
-        Decoration::Mark(style) => style.atomic,
-        _ => false,
-    }
-}
-
-fn word_step_right(text: &str, pos: usize) -> usize {
-    for (i, w) in text.unicode_word_indices() {
-        let end = i + w.len();
-        if end > pos {
-            return end;
-        }
-    }
-    text.len()
-}

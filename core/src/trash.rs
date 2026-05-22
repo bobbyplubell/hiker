@@ -14,20 +14,20 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use crate::error::HikerError;
+use crate::errors::HikerError;
 
 const TRASH_DIRNAME: &str = "trash";
 const MANIFEST_NAME: &str = "manifest.yaml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TrashKind {
+pub enum Kind {
     File,
     Folder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrashEntry {
+pub struct Entry {
     pub id: String,
     /// Vault-relative path the file/folder lived at before deletion.
     pub original_path: String,
@@ -39,7 +39,7 @@ pub struct TrashEntry {
     pub original_mtime: i64,
     /// Unix seconds.
     pub deleted_at: i64,
-    pub kind: TrashKind,
+    pub kind: Kind,
     /// For folders: vault-relative paths of `.md` files that were inside, in
     /// walk order. Used by future restore + as documentation of what got
     /// removed from the index. None for files.
@@ -53,12 +53,12 @@ pub struct TrashEntry {
 /// but no manifest row); the UI uses `trashed_name` as the durable
 /// identifier in that case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrashListItem {
+pub struct ListItem {
     pub id: Option<String>,
     pub trashed_name: String,
     pub original_path: Option<String>,
     pub deleted_at: i64,
-    pub kind: TrashKind,
+    pub kind: Kind,
     /// Member count for folders, when known. `None` means either "this is a
     /// file" (the UI infers from `kind`) or "we can't tell" (orphan folder).
     pub member_count: Option<usize>,
@@ -68,7 +68,7 @@ pub struct TrashListItem {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
-    entries: Vec<TrashEntry>,
+    entries: Vec<Entry>,
 }
 
 pub struct Trash {
@@ -102,7 +102,7 @@ impl Trash {
     /// returns) appending the returned entry via `append`. Returning the
     /// entry without writing it lets the caller bundle the manifest write
     /// with its store update.
-    pub fn move_file_in(&self, vault_root: &Path, rel: &str) -> Result<TrashEntry, HikerError> {
+    pub fn move_file_in(&self, vault_root: &Path, rel: &str) -> Result<Entry, HikerError> {
         self.ensure_dir()?;
         let src = vault_root.join(rel);
         let meta = fs::metadata(&src)?;
@@ -118,13 +118,13 @@ impl Trash {
         let trashed_name = pick_unique_name(&self.dir, &timestamp_prefix(now), &basename)?;
         let dest = self.dir.join(&trashed_name);
         fs::rename(&src, &dest)?;
-        Ok(TrashEntry {
-            id: crate::store::new_id(),
+        Ok(Entry {
+            id: crate::store::dto::new_id(),
             original_path: rel.to_string(),
             trashed_name,
             original_mtime,
             deleted_at: now.unix_timestamp(),
-            kind: TrashKind::File,
+            kind: Kind::File,
             members: None,
         })
     }
@@ -136,7 +136,7 @@ impl Trash {
         &self,
         vault_root: &Path,
         rel: &str,
-    ) -> Result<TrashEntry, HikerError> {
+    ) -> Result<Entry, HikerError> {
         self.ensure_dir()?;
         let src = vault_root.join(rel);
         let meta = fs::metadata(&src)?;
@@ -177,31 +177,31 @@ impl Trash {
 
         fs::rename(&src, &dest)?;
 
-        Ok(TrashEntry {
-            id: crate::store::new_id(),
+        Ok(Entry {
+            id: crate::store::dto::new_id(),
             original_path: rel.to_string(),
             trashed_name,
             original_mtime,
             deleted_at: now.unix_timestamp(),
-            kind: TrashKind::Folder,
+            kind: Kind::Folder,
             members: Some(members),
         })
     }
 
     /// Append an entry to the manifest. Atomic via tmp+rename so a crash
     /// mid-write can't truncate the existing list.
-    pub fn append(&self, entry: &TrashEntry) -> Result<(), HikerError> {
+    pub fn append(&self, entry: &Entry) -> Result<(), HikerError> {
         self.ensure_dir()?;
         let mut manifest = self.read_manifest()?;
         manifest.entries.push(entry.clone());
         self.write_manifest(&manifest)
     }
 
-    pub fn list(&self) -> Result<Vec<TrashEntry>, HikerError> {
+    pub fn list(&self) -> Result<Vec<Entry>, HikerError> {
         Ok(self.read_manifest()?.entries)
     }
 
-    pub fn find(&self, id: &str) -> Result<Option<TrashEntry>, HikerError> {
+    pub fn find(&self, id: &str) -> Result<Option<Entry>, HikerError> {
         Ok(self.list()?.into_iter().find(|e| e.id == id))
     }
 
@@ -209,7 +209,7 @@ impl Trash {
     /// if no entry matched. Does not touch the on-disk trash files — callers
     /// are expected to either move the file out (restore) or delete it
     /// separately (empty would just blow away the whole dir).
-    pub fn remove(&self, id: &str) -> Result<Option<TrashEntry>, HikerError> {
+    pub fn remove(&self, id: &str) -> Result<Option<Entry>, HikerError> {
         let mut manifest = self.read_manifest()?;
         let pos = manifest.entries.iter().position(|e| e.id == id);
         let Some(pos) = pos else { return Ok(None) };
@@ -219,23 +219,23 @@ impl Trash {
     }
 
     /// Absolute on-disk path of a trashed entry.
-    pub fn entry_path(&self, entry: &TrashEntry) -> PathBuf {
+    pub fn entry_path(&self, entry: &Entry) -> PathBuf {
         self.dir.join(&entry.trashed_name)
     }
 
-    /// Walk the trash dir and produce one `TrashListItem` per top-level
+    /// Walk the trash dir and produce one `ListItem` per top-level
     /// entry, joining against the manifest where a row is present and
     /// marking entries without one as orphaned. Disk is the source of truth
     /// — entries dropped in by hand or whose manifest row got corrupted
     /// still appear so the user can clean them up.
     ///
     /// status: tree-trash-disk-listing
-    pub fn list_from_disk(&self) -> Result<Vec<TrashListItem>, HikerError> {
+    pub fn list_from_disk(&self) -> Result<Vec<ListItem>, HikerError> {
         if !self.dir.exists() {
             return Ok(Vec::new());
         }
         let manifest = self.read_manifest()?;
-        let by_name: std::collections::HashMap<&str, &TrashEntry> = manifest
+        let by_name: std::collections::HashMap<&str, &Entry> = manifest
             .entries
             .iter()
             .map(|e| (e.trashed_name.as_str(), e))
@@ -251,20 +251,20 @@ impl Trash {
             }
             let ft = entry.file_type()?;
             let kind = if ft.is_dir() {
-                TrashKind::Folder
+                Kind::Folder
             } else if ft.is_file() {
-                TrashKind::File
+                Kind::File
             } else {
                 continue;
             };
             let item = match by_name.get(name.as_str()) {
-                Some(m) => TrashListItem {
+                Some(m) => ListItem {
                     id: Some(m.id.clone()),
                     trashed_name: name,
                     original_path: Some(m.original_path.clone()),
                     deleted_at: m.deleted_at,
                     kind,
-                    member_count: m.members.as_ref().map(|v| v.len()),
+                    member_count: m.members.as_ref().map(std::vec::Vec::len),
                     orphaned: false,
                 },
                 None => {
@@ -276,7 +276,7 @@ impl Trash {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    TrashListItem {
+                    ListItem {
                         id: None,
                         trashed_name: name,
                         original_path: None,
@@ -369,7 +369,12 @@ fn pick_unique_name(
     if !dir.join(&first).exists() {
         return Ok(first);
     }
-    let (stem, ext) = split_ext(basename);
+    let (stem, ext) = match basename.rfind('.') {
+        // Don't split a leading-dot dotfile like `.gitignore` — treat the
+        // whole thing as the stem.
+        Some(i) if i > 0 => (&basename[..i], Some(&basename[i + 1..])),
+        _ => (basename, None),
+    };
     for n in 2..1000 {
         let candidate = match ext {
             Some(e) => format!("{ts_prefix}_{stem}_{n}.{e}"),
@@ -382,15 +387,6 @@ fn pick_unique_name(
     Err(HikerError::AlreadyExists(format!(
         "trash: too many collisions for {basename}"
     )))
-}
-
-fn split_ext(name: &str) -> (&str, Option<&str>) {
-    match name.rfind('.') {
-        // Don't split a leading-dot dotfile like `.gitignore` — treat the
-        // whole thing as the stem.
-        Some(i) if i > 0 => (&name[..i], Some(&name[i + 1..])),
-        _ => (name, None),
-    }
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
@@ -413,7 +409,7 @@ mod tests {
         let trash = Trash::open(vault.path());
         let entry = trash.move_file_in(vault.path(), "a.md").unwrap();
         assert_eq!(entry.original_path, "a.md");
-        assert_eq!(entry.kind, TrashKind::File);
+        assert_eq!(entry.kind, Kind::File);
         assert!(entry.members.is_none());
         assert!(entry.trashed_name.ends_with("_a.md"));
         assert!(!vault.path().join("a.md").exists());
@@ -459,7 +455,7 @@ mod tests {
         fs::write(vault.path().join("proj/sub/c.txt"), b"c").unwrap();
         let trash = Trash::open(vault.path());
         let entry = trash.move_folder_in(vault.path(), "proj").unwrap();
-        assert_eq!(entry.kind, TrashKind::Folder);
+        assert_eq!(entry.kind, Kind::Folder);
         let mut members = entry.members.clone().unwrap();
         members.sort();
         assert_eq!(members, vec!["proj/a.md".to_string(), "proj/sub/b.md".to_string()]);
@@ -498,7 +494,7 @@ mod tests {
 
         let items = trash.list_from_disk().unwrap();
         assert_eq!(items.len(), 3);
-        let by_name: std::collections::HashMap<&str, &TrashListItem> =
+        let by_name: std::collections::HashMap<&str, &ListItem> =
             items.iter().map(|i| (i.trashed_name.as_str(), i)).collect();
         let it1 = by_name[e1.trashed_name.as_str()];
         assert!(!it1.orphaned);
@@ -535,9 +531,15 @@ mod tests {
 
     #[test]
     fn split_ext_handles_dotfiles_and_extless() {
-        assert_eq!(split_ext("a.md"), ("a", Some("md")));
-        assert_eq!(split_ext("a"), ("a", None));
-        assert_eq!(split_ext(".gitignore"), (".gitignore", None));
-        assert_eq!(split_ext("a.tar.gz"), ("a.tar", Some("gz")));
+        fn split(name: &str) -> (&str, Option<&str>) {
+            match name.rfind('.') {
+                Some(i) if i > 0 => (&name[..i], Some(&name[i + 1..])),
+                _ => (name, None),
+            }
+        }
+        assert_eq!(split("a.md"), ("a", Some("md")));
+        assert_eq!(split("a"), ("a", None));
+        assert_eq!(split(".gitignore"), (".gitignore", None));
+        assert_eq!(split("a.tar.gz"), ("a.tar", Some("gz")));
     }
 }

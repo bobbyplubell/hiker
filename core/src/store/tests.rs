@@ -1,4 +1,9 @@
-use super::*;
+use rusqlite::{params, Connection};
+
+use super::{Store, DEFAULT_EMBED_DIM, SCHEMA_VERSION};
+use crate::chunker::Chunk;
+use crate::store::error::Error;
+use crate::store::dto::{new_id, NoteUpsert, WaypointRow};
 use crate::test_helpers::test_store as fresh_store;
 use tempfile::tempdir;
 
@@ -35,7 +40,7 @@ fn version_mismatch_fails_loud() {
     conn.pragma_update(None, "user_version", 99).unwrap();
     drop(conn);
     match Store::open(dir.path()) {
-        Err(StoreError::VersionMismatch { found, expected }) => {
+        Err(Error::VersionMismatch { found, expected }) => {
             assert_eq!(found, 99);
             assert_eq!(expected, SCHEMA_VERSION);
         }
@@ -49,7 +54,7 @@ fn upsert_then_read() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "alpha.md",
             content_hash: "abc",
@@ -95,7 +100,7 @@ fn note_embedding_computes_byte_weighted_mean_on_upsert() {
     let e1 = vec![5.0f32; DEFAULT_EMBED_DIM];
 
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "n.md",
             content_hash: "h1",
@@ -119,7 +124,7 @@ fn note_embedding_computes_byte_weighted_mean_on_upsert() {
 
     // Re-upserting with new chunks refreshes the pool.
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "n.md",
             content_hash: "h2",
@@ -142,7 +147,7 @@ fn note_embedding_none_for_empty_note() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "empty.md",
             content_hash: "h",
@@ -161,7 +166,7 @@ fn upsert_replaces_chunks() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "a.md",
             content_hash: "v1",
@@ -179,7 +184,7 @@ fn upsert_replaces_chunks() {
 
     // Re-upsert with fewer, different chunks. Old ones must vanish.
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "a.md",
             content_hash: "v2",
@@ -212,7 +217,7 @@ fn delete_note_cascades() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "x.md",
             content_hash: "h",
@@ -241,7 +246,7 @@ fn rename_preserves_id_and_chunks() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "old.md",
             content_hash: "h",
@@ -277,7 +282,7 @@ fn knn_finds_nearest_and_excludes_self() {
     // a's chunks are seeded near 0.0; b's near 0.0 too (so b is "close"
     // to a); c is far away at seed 100.0.
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_a,
             path: "a.md",
             content_hash: "h",
@@ -289,7 +294,7 @@ fn knn_finds_nearest_and_excludes_self() {
         })
         .unwrap();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_b,
             path: "b.md",
             content_hash: "h",
@@ -301,7 +306,7 @@ fn knn_finds_nearest_and_excludes_self() {
         })
         .unwrap();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_c,
             path: "c.md",
             content_hash: "h",
@@ -339,7 +344,7 @@ fn related_notes_aggregates_by_note() {
 
     // Source has two chunks at seeds 0 and 1.
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_src,
             path: "src.md",
             content_hash: "h",
@@ -357,7 +362,7 @@ fn related_notes_aggregates_by_note() {
     // "near" has one chunk close to source seed 0; one far away. The
     // aggregation should pick the closer one as its representative.
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_near,
             path: "near.md",
             content_hash: "h",
@@ -373,7 +378,7 @@ fn related_notes_aggregates_by_note() {
         .unwrap();
 
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_far,
             path: "far.md",
             content_hash: "h",
@@ -410,7 +415,7 @@ fn embed_dim_mismatch_rejected() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     let bad = vec![0.0_f32; DEFAULT_EMBED_DIM - 1];
-    let res = store.upsert_note(NoteUpsert {
+    let res = store.upsert_note(&NoteUpsert {
         id: &id,
         path: "x.md",
         content_hash: "h",
@@ -420,14 +425,14 @@ fn embed_dim_mismatch_rejected() {
         embedder_version: "t",
         chunks: vec![(mk_chunk(0, "t"), bad)],
     });
-    assert!(matches!(res, Err(StoreError::EmbedDim { .. })));
+    assert!(matches!(res, Err(Error::EmbedDim { .. })));
 }
 
 #[test]
 fn knn_dim_mismatch_rejected() {
     let (_dir, store) = fresh_store();
     let res = store.knn_chunks(&[0.0; 10], 5, None);
-    assert!(matches!(res, Err(StoreError::EmbedDim { .. })));
+    assert!(matches!(res, Err(Error::EmbedDim { .. })));
 }
 
 #[test]
@@ -443,7 +448,7 @@ fn at_autocomplete_orders_by_recency_and_filters_by_basename() {
     ] {
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path,
                 content_hash: "h",
@@ -599,7 +604,7 @@ fn path_for_id_round_trip_through_upsert_and_rename() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "alpha.md",
             content_hash: "h",

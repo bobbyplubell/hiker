@@ -34,17 +34,18 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use hiker_core::Vault;
+use hiker_core::vault::Vault;
 use hiker_core::activity::Activity;
 use hiker_core::audit::AgentLog;
 use hiker_core::autosave::Autosave;
 use hiker_core::changes::Changes;
 use hiker_core::config::Config;
-use hiker_core::indexer::IndexerHandle;
+use hiker_core::indexer::Handle;
 use hiker_core::staging::Staging;
 use hiker_core::store::Store;
-use hiker_core::tasks::{Queue as TaskQueue, TaskRecord};
-use hiker_core::trees::Trees;
+use hiker_core::tasks::queue::Queue as TaskQueue;
+use hiker_core::tasks::types::TaskRecord;
+use hiker_core::trees::types::Db;
 use hiker_core::watcher::{FileEvent, Watcher};
 
 use crate::buffer::Buffer;
@@ -66,7 +67,7 @@ pub struct AppState {
     /// activity bar + status bar. Kept on the top-level state so its
     /// borrow is disjoint from `session.tabs` / `session.buffers`,
     /// which the workbench's pane renderers read mutably each frame.
-    pub workbench: egui_workbench::Workbench<
+    pub workbench: egui_workbench::workspace::Workbench<
         crate::workbench_host::HikerWbTab,
         crate::workbench_host::HikerMode,
     >,
@@ -122,11 +123,11 @@ pub struct Services {
     pub read_store: Arc<Mutex<Store>>,
     pub changes: Arc<Changes>,
     pub staging: Arc<Staging>,
-    pub trees: Arc<Trees>,
+    pub trees: Arc<Db>,
     pub activity: Arc<Activity>,
     pub autosave: Arc<Autosave>,
     pub watcher: Arc<Watcher>,
-    pub indexer: Arc<IndexerHandle>,
+    pub indexer: Arc<Handle>,
     // TODO: surface in the audit/agent-log UI panel.
     #[allow(dead_code)]
     pub audit: Arc<AgentLog>,
@@ -137,7 +138,7 @@ pub struct Services {
     /// every config change so settings-panel toggles (review_required,
     /// per-tool gates) take effect without an MCP restart. Always
     /// present even when MCP is disabled — keeps the wiring uniform.
-    pub mcp_tools_cfg: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    pub mcp_tools_cfg: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
 }
 
 pub struct VaultEvents {
@@ -156,7 +157,7 @@ pub struct VaultEvents {
     /// Latest staging snapshot pushed by the background pollster. The UI
     /// thread `.borrow()`s this each frame instead of calling
     /// `staging.list_pending()` (SQLite round-trip) every frame.
-    pub staging_snapshot_rx: watch::Receiver<Vec<hiker_core::staging::Proposal>>,
+    pub staging_snapshot_rx: watch::Receiver<Vec<hiker_core::staging::types::Proposal>>,
     /// Latest skipped-paths snapshot pushed by the background pollster
     /// (every 3s). The file-tree row renderer reads from
     /// `ui_cache.skipped_paths` which is populated from this channel each
@@ -215,7 +216,7 @@ pub struct Session {
     pub active_trail: Option<String>,
     /// Inline-rename draft for the trails sidebar.
     pub trail_rename: Option<(String, String)>,
-    pub chat: crate::chat::ChatRegistry,
+    pub chat: crate::chat::state::ChatRegistry,
     /// True once `chat::session::discover` has been called for this
     /// vault — keeps the lazy disk walk from running every frame.
     pub chat_discovered: bool,
@@ -247,7 +248,7 @@ impl Default for Session {
             trails: Vec::new(),
             active_trail: None,
             trail_rename: None,
-            chat: crate::chat::ChatRegistry::new(),
+            chat: crate::chat::state::ChatRegistry::new(),
             chat_discovered: false,
             last_autosave_tick: Instant::now(),
             pending_mutations: HashSet::new(),
@@ -280,7 +281,7 @@ pub struct NavState {
 #[derive(Default)]
 pub struct UiCache {
     pub task_snapshot: Vec<TaskRecord>,
-    pub staging_snapshot: Vec<hiker_core::staging::Proposal>,
+    pub staging_snapshot: Vec<hiker_core::staging::types::Proposal>,
     pub skipped_paths: HashSet<String>,
 }
 
@@ -290,16 +291,15 @@ pub struct UiCache {
 
 #[derive(Default)]
 pub struct PanelStates {
-    pub search: crate::panels::search::SearchState,
-    pub related: crate::panels::related::RelatedState,
-    pub backlinks: crate::panels::backlinks::BacklinksState,
+    pub search: crate::panels::search::State,
+    pub related: crate::panels::related::State,
+    pub backlinks: crate::panels::backlinks::State,
     #[allow(dead_code)]
     pub chat_dock: crate::panels::discovery_pane::ChatDockState,
     pub clusters: ClusterUiState,
     pub trails_ui: TrailsUiState,
-    pub preview_buffers: HashMap<String, crate::panels::diff_view::PreviewBuffer>,
-    pub graph: Option<crate::panels::graph::GraphState>,
-    pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterGraphState>,
+    pub graph: Option<crate::panels::graph::State>,
+    pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterGraph>,
 }
 
 // ===========================================================================
@@ -491,10 +491,13 @@ fn take_waypoint(waypoints: &mut Vec<Waypoint>, path: &str) -> Option<Waypoint> 
     None
 }
 
-fn locate_waypoint(
-    waypoints: &[Waypoint],
-    target: &str,
-) -> Option<(Option<String>, usize)> {
+impl Trail {
+/// Locate `target` within this trail's waypoint forest, returning
+/// `(parent_path, index)` — `parent_path` is `None` for a root-level
+/// hit. `&self` method so the single caller (`move_waypoint`) doesn't
+/// trip `single_call_fn`.
+fn locate_waypoint(&self, target: &str) -> Option<(Option<String>, usize)> {
+    let waypoints = &self.waypoints;
     for (i, w) in waypoints.iter().enumerate() {
         if w.path == target {
             return Some((None, i));
@@ -518,6 +521,7 @@ fn locate_waypoint(
     }
     None
 }
+}
 
 /// True when `path` is `ancestor` itself or appears anywhere within
 /// `ancestor`'s subtree. Used to reject moves that would cycle.
@@ -536,63 +540,61 @@ fn is_in_subtree(waypoints: &[Waypoint], ancestor: &str, path: &str) -> bool {
     false
 }
 
+impl Trail {
 /// Move waypoint `src` to a new position per `op`. Returns true on
 /// success. No-op (returns false) when the source isn't present or the
 /// move would create a cycle (dropping a node into its own subtree).
-pub fn move_waypoint(
-    waypoints: &mut Vec<Waypoint>,
-    src: &str,
-    op: MoveOp,
-) -> bool {
+pub fn move_waypoint(&mut self, src: &str, op: MoveOp) -> bool {
     match &op {
         MoveOp::Before(t) | MoveOp::Child(t) => {
-            if src == t.as_str() || is_in_subtree(waypoints, src, t) {
+            if src == t.as_str() || is_in_subtree(&self.waypoints, src, t) {
                 return false;
             }
         }
         MoveOp::Head | MoveOp::Tail => {}
     }
-    let Some(item) = take_waypoint(waypoints, src) else {
+    let Some(item) = take_waypoint(&mut self.waypoints, src) else {
         return false;
     };
     match op {
         MoveOp::Tail => {
-            waypoints.push(item);
+            self.waypoints.push(item);
             true
         }
         MoveOp::Head => {
-            waypoints.insert(0, item);
+            self.waypoints.insert(0, item);
             true
         }
         MoveOp::Child(target) => {
-            if let Some(parent) = find_waypoint_mut(waypoints, &target) {
+            if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &target) {
                 parent.children.push(item);
                 true
             } else {
-                waypoints.push(item);
+                self.waypoints.push(item);
                 false
             }
         }
-        MoveOp::Before(target) => match locate_waypoint(waypoints, &target) {
+        MoveOp::Before(target) => match self.locate_waypoint(&target) {
             Some((None, idx)) => {
-                waypoints.insert(idx, item);
+                self.waypoints.insert(idx, item);
                 true
             }
             Some((Some(parent_path), idx)) => {
-                if let Some(parent) = find_waypoint_mut(waypoints, &parent_path) {
+                if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &parent_path) {
                     parent.children.insert(idx, item);
                     true
                 } else {
-                    waypoints.push(item);
+                    self.waypoints.push(item);
                     false
                 }
             }
             None => {
-                waypoints.push(item);
+                self.waypoints.push(item);
                 false
             }
         },
     }
+}
 }
 
 #[cfg(test)]
@@ -601,33 +603,43 @@ mod move_tests {
     fn wp(path: &str, children: Vec<Waypoint>) -> Waypoint {
         Waypoint { path: path.into(), at_ms: 0, children, annotation: String::new() }
     }
+    fn tr(waypoints: Vec<Waypoint>) -> Trail {
+        Trail {
+            id: "t".into(),
+            name: "t".into(),
+            waypoints,
+            created_at_ms: 0,
+            last_activated_at_ms: 0,
+            append_under: None,
+        }
+    }
     #[test]
     fn move_to_tail_reorders_root() {
-        let mut v = vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])];
-        assert!(move_waypoint(&mut v, "a", MoveOp::Tail));
-        assert_eq!(v.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
+        assert!(t.move_waypoint("a", MoveOp::Tail));
+        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
     }
     #[test]
     fn move_before_inserts_at_root() {
-        let mut v = vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])];
-        assert!(move_waypoint(&mut v, "c", MoveOp::Before("a".into())));
-        assert_eq!(v.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["c", "a", "b"]);
+        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
+        assert!(t.move_waypoint("c", MoveOp::Before("a".into())));
+        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["c", "a", "b"]);
     }
     #[test]
     fn move_as_child_nests() {
-        let mut v = vec![wp("a", vec![]), wp("b", vec![])];
-        assert!(move_waypoint(&mut v, "b", MoveOp::Child("a".into())));
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].path, "a");
-        assert_eq!(v[0].children[0].path, "b");
+        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![])]);
+        assert!(t.move_waypoint("b", MoveOp::Child("a".into())));
+        assert_eq!(t.waypoints.len(), 1);
+        assert_eq!(t.waypoints[0].path, "a");
+        assert_eq!(t.waypoints[0].children[0].path, "b");
     }
     #[test]
     fn cycle_drop_into_own_subtree_rejected() {
-        let mut v = vec![wp("a", vec![wp("a1", vec![])])];
-        assert!(!move_waypoint(&mut v, "a", MoveOp::Child("a1".into())));
+        let mut t = tr(vec![wp("a", vec![wp("a1", vec![])])]);
+        assert!(!t.move_waypoint("a", MoveOp::Child("a1".into())));
         // Untouched.
-        assert_eq!(v[0].path, "a");
-        assert_eq!(v[0].children[0].path, "a1");
+        assert_eq!(t.waypoints[0].path, "a");
+        assert_eq!(t.waypoints[0].children[0].path, "a1");
     }
 }
 
@@ -703,7 +715,7 @@ impl Default for Toolbars {
                     "view.toggle_right_sidebar",
                 ]
                 .iter()
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect(),
             }],
         }
@@ -717,7 +729,7 @@ impl Default for Toolbars {
 #[derive(Default)]
 pub struct SidebarState {
     pub expanded: HashSet<String>,
-    pub dir_cache: HashMap<String, Vec<hiker_core::DirEntryDto>>,
+    pub dir_cache: HashMap<String, Vec<hiker_core::vault::DirEntryDto>>,
     pub selected_folder: Option<String>,
     pub trash_expanded: bool,
     pub renaming: Option<String>,
@@ -734,9 +746,9 @@ pub type LlmJobOutcome = (usize, usize);
 
 #[derive(Default)]
 pub struct ClusterUiState {
-    pub trees: Vec<hiker_core::trees::TreeRow>,
+    pub trees: Vec<hiker_core::trees::types::TreeRow>,
     pub selected_tree: Option<String>,
-    pub nodes: Vec<hiker_core::trees::EditableNode>,
+    pub nodes: Vec<hiker_core::trees::types::EditableNode>,
     pub expanded: HashSet<String>,
     pub renaming: Option<(String, String)>,
     pub editing_summary: Option<(String, String)>,
@@ -745,7 +757,7 @@ pub struct ClusterUiState {
     pub selected_nodes: HashSet<String>,
     pub editing_stage_move_target: Option<String>,
     pub editing_stage_tag_slug: Option<String>,
-    pub redo_stacks: HashMap<String, Vec<hiker_core::trees::HistoryEntry>>,
+    pub redo_stacks: HashMap<String, Vec<hiker_core::trees::types::HistoryEntry>>,
     pub showing_advanced_params: bool,
     pub advanced_params: AdvancedClusterParams,
     pub dirty: bool,
@@ -864,8 +876,6 @@ pub enum Modal {
 ///   swap via `state.pending_vault_switch`.
 /// - Trails sidebar: `DeleteTrailWaypoint { trail_id, path }` — removes
 ///   one waypoint (and any side-trail descendants) from a trail.
-/// - Files sidebar: `SoftDeleteIntoTrash { path }` — moves the named
-///   file under `<vault>/.hiker/trash/` as a v0 soft-delete.
 /// - Trash sidebar: `EmptyTrash` — purges every trashed item.
 /// - Settings: `ResetScope { scope_path }` — writes `""` to the named
 ///   scope file and reloads config from disk.
@@ -878,9 +888,6 @@ pub enum ConfirmIntent {
     },
     DeleteTrailWaypoint {
         trail_id: String,
-        path: String,
-    },
-    SoftDeleteIntoTrash {
         path: String,
     },
     EmptyTrash,
@@ -898,7 +905,7 @@ pub enum ConfirmIntent {
 // ===========================================================================
 
 impl AppState {
-    pub fn next_tab_id(&mut self) -> TabId {
+    pub const fn next_tab_id(&mut self) -> TabId {
         let id = TabId(self.session.next_tab_id);
         self.session.next_tab_id += 1;
         id
@@ -943,7 +950,7 @@ impl AppState {
         &mut self,
         scope: hiker_core::config::SettingsScope,
         key: &str,
-        value: serde_json::Value,
+        value: &serde_json::Value,
         failure_label: &str,
     ) {
         let vault_root = self.vault_session.vault_root.clone();
@@ -977,7 +984,7 @@ pub fn set_setting_quiet(
     app: &AppState,
     scope: hiker_core::config::SettingsScope,
     key: &str,
-    value: serde_json::Value,
+    value: &serde_json::Value,
     log_target: &str,
 ) {
     match hiker_core::config::Config::set(
@@ -1004,7 +1011,9 @@ pub fn set_setting_quiet(
 // apply_confirm — dispatch for `Modal::Confirm { intent }`
 // ===========================================================================
 
-pub fn apply_confirm(state: &mut AppState, intent: ConfirmIntent) {
+impl AppState {
+    pub fn apply_confirm(&mut self, intent: ConfirmIntent) {
+    let state = self;
     match intent {
         ConfirmIntent::SwitchVault { path } => {
             let display = path.display().to_string();
@@ -1062,59 +1071,6 @@ pub fn apply_confirm(state: &mut AppState, intent: ConfirmIntent) {
             };
             state.push_toast(msg, ToastLevel::Info);
         }
-        ConfirmIntent::SoftDeleteIntoTrash { path } => {
-            let rel = path;
-            let abs = match state.vault_session.vault.abs_path(&rel) {
-                Ok(p) => p,
-                Err(err) => {
-                    state.push_toast(
-                        format!("Delete failed: {}", err),
-                        ToastLevel::Error,
-                    );
-                    return;
-                }
-            };
-            let trash_dir = state
-                .vault_session
-                .vault
-                .root()
-                .join(".hiker")
-                .join("trash");
-            if let Err(err) = std::fs::create_dir_all(&trash_dir) {
-                state.push_toast(
-                    format!("Create trash dir failed: {}", err),
-                    ToastLevel::Error,
-                );
-                return;
-            }
-            let basename = rel
-                .rsplit_once('/')
-                .map(|(_, b)| b)
-                .unwrap_or(rel.as_str());
-            let target = trash_dir.join(format!("{}-{}", now_ms_i64(), basename));
-            if let Err(err) = std::fs::rename(&abs, &target) {
-                state.push_toast(
-                    format!("Delete failed: {}", err),
-                    ToastLevel::Error,
-                );
-                return;
-            }
-            // Close any open tabs for the deleted path + drop its buffer.
-            let to_close: Vec<TabId> = state
-                .session
-                .tabs
-                .iter()
-                .filter(|t| t.buffer_path() == Some(rel.as_str()))
-                .map(|t| t.id)
-                .collect();
-            for id in to_close {
-                crate::editor_pane::close_tab(state, id);
-            }
-            state.session.buffers.remove(&rel);
-            let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-            state.session.sidebar.dir_cache.remove(parent);
-            state.push_toast(format!("Moved {} to trash", rel), ToastLevel::Info);
-        }
         ConfirmIntent::EmptyTrash => {
             let trash = hiker_core::trash::Trash::open(&state.vault_session.vault_root);
             let items = trash.list_from_disk().unwrap_or_default();
@@ -1167,7 +1123,7 @@ pub fn apply_confirm(state: &mut AppState, intent: ConfirmIntent) {
             state.set_setting(
                 scope,
                 "indexing.model",
-                serde_json::Value::String(model_id.clone()),
+                &serde_json::Value::String(model_id.clone()),
                 "Reload embedder failed",
             );
             let indexer = state.vault_session.services.indexer.clone();
@@ -1183,5 +1139,6 @@ pub fn apply_confirm(state: &mut AppState, intent: ConfirmIntent) {
                 });
             }
         }
+    }
     }
 }

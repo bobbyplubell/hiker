@@ -21,7 +21,7 @@ pub enum Priority {
 }
 
 impl Priority {
-    pub(super) fn rank(self) -> u8 {
+    pub(super) const fn rank(self) -> u8 {
         match self {
             Priority::High => 2,
             Priority::Normal => 1,
@@ -97,7 +97,7 @@ pub enum TaskKind {
     /// or failed when the underlying `spawn_blocking` load returns.
     /// status: embedder-model-load-as-task
     EmbedderModelLoad { model_id: String },
-    /// Umbrella coordinator task for a Summarize sweep (`Trees::summarize`).
+    /// Umbrella coordinator task for a Summarize sweep (`Db::summarize`).
     /// Submitted at `Priority::High` ahead of the per-cluster
     /// `RaptorSummarize` fan-out so the queue page shows one row covering
     /// the whole sweep; the per-cluster tasks each carry their own row.
@@ -114,7 +114,7 @@ pub enum TaskKind {
 
 impl TaskKind {
     /// Stable string used in audit-log `feature` and home-widget rendering.
-    pub fn variant_name(&self) -> &'static str {
+    pub const fn variant_name(&self) -> &'static str {
         match self {
             TaskKind::NoteMutation { .. } => "note_mutation",
             TaskKind::RaptorSummarize { .. } => "raptor_summarize",

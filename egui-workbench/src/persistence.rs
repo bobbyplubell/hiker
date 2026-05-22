@@ -17,25 +17,25 @@ use std::hash::Hash;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::handle::TabHandle;
-use crate::side_bar::SideBarSide;
-use crate::tab::{DocumentTab, TabEntry, TabState};
+use crate::workspace::TabId;
+use crate::side_bar::Side;
+use crate::tab::{Document, TabEntry, State};
 use crate::workspace::Workbench;
 
 /// Trait marker for tabs that can be persisted via [`WorkbenchLayout`].
 ///
-/// Blanket implementation: anything that is `DocumentTab + Serialize +
+/// Blanket implementation: anything that is `Document + Serialize +
 /// DeserializeOwned` automatically qualifies. Hosts opt in by adding
 /// the `serde` derives to their tab type.
-pub trait PersistableTab: DocumentTab + Serialize + DeserializeOwned {}
-impl<T: DocumentTab + Serialize + DeserializeOwned> PersistableTab for T {}
+pub trait PersistableTab: Document + Serialize + DeserializeOwned {}
+impl<T: Document + Serialize + DeserializeOwned> PersistableTab for T {}
 
 /// Snapshot of a tab's persisted state. The payload is the host's tab
 /// serialised to JSON so the schema stays type-erased.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TabEntryDto {
     pub handle: u64,
-    pub state: TabState,
+    pub state: State,
     pub payload: serde_json::Value,
 }
 
@@ -130,13 +130,13 @@ pub struct TreeDto {
 
 /// Versioned, serialisable snapshot of the full workbench layout.
 ///
-/// Round-trippable through JSON. Trees use the workbench-owned
+/// Round-trippable through JSON. Db use the workbench-owned
 /// [`TreeDto`]; tab payloads are stored as `serde_json::Value` so the
 /// schema does not depend on the host's tab type at compile time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkbenchLayout {
     pub version: u32,
-    pub primary_side: SideBarSide,
+    pub primary_side: Side,
     pub side_bar_visible: bool,
     pub side_bar_width: f32,
     pub secondary_side_bar_visible: bool,
@@ -156,7 +156,7 @@ impl Default for WorkbenchLayout {
     fn default() -> Self {
         Self {
             version: 1,
-            primary_side: SideBarSide::Left,
+            primary_side: Side::Left,
             side_bar_visible: true,
             side_bar_width: 260.0,
             secondary_side_bar_visible: false,
@@ -208,7 +208,7 @@ impl std::error::Error for LayoutError {}
 pub fn migrate(value: serde_json::Value) -> Option<WorkbenchLayout> {
     let version = value
         .get("version")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as u32;
     match version {
         1 => serde_json::from_value(value).ok(),
@@ -275,7 +275,7 @@ where
         };
 
         // Decode tab payloads.
-        let mut decoded: HashMap<TabHandle, TabEntry<Tab>> = HashMap::new();
+        let mut decoded: HashMap<TabId, TabEntry<Tab>> = HashMap::new();
         for dto in layout.tab_entries {
             let tab: Tab = serde_json::from_value(dto.payload).map_err(|e| {
                 LayoutError::PayloadDeserialise {
@@ -283,7 +283,7 @@ where
                     source: e,
                 }
             })?;
-            let handle = TabHandle(dto.handle);
+            let handle = TabId(dto.handle);
             decoded.insert(handle, TabEntry::new(tab, dto.state, handle));
         }
 
@@ -319,8 +319,8 @@ where
         self.primary_side_bar.visible = layout.side_bar_visible;
         self.primary_side_bar.width = layout.side_bar_width;
         self.secondary_side_bar.side = match layout.primary_side {
-            SideBarSide::Left => SideBarSide::Right,
-            SideBarSide::Right => SideBarSide::Left,
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
         };
         self.secondary_side_bar.visible = layout.secondary_side_bar_visible;
         self.secondary_side_bar.width = layout.secondary_side_bar_width;
@@ -339,7 +339,7 @@ where
     }
 }
 
-fn entry_to_dto<Tab: PersistableTab>(handle: TabHandle, entry: &TabEntry<Tab>) -> TabEntryDto {
+fn entry_to_dto<Tab: PersistableTab>(handle: TabId, entry: &TabEntry<Tab>) -> TabEntryDto {
     TabEntryDto {
         handle: handle.0,
         state: entry.state,
@@ -350,15 +350,15 @@ fn entry_to_dto<Tab: PersistableTab>(handle: TabHandle, entry: &TabEntry<Tab>) -
 
 // --- Tree ↔ TileDto bridge -------------------------------------------------
 
-/// Serialise an `egui_tiles::Tree<TabHandle>` into the workbench's
+/// Serialise an `egui_tiles::Tree<TabId>` into the workbench's
 /// portable [`TreeDto`] form.
-pub(crate) fn tree_to_dto(tree: &egui_tiles::Tree<TabHandle>) -> TreeDto {
+pub(crate) fn tree_to_dto(tree: &egui_tiles::Tree<TabId>) -> TreeDto {
     TreeDto {
         root: tree.root.and_then(|id| tile_to_dto(tree, id)),
     }
 }
 
-fn tile_to_dto(tree: &egui_tiles::Tree<TabHandle>, id: egui_tiles::TileId) -> Option<TileDto> {
+fn tile_to_dto(tree: &egui_tiles::Tree<TabId>, id: egui_tiles::TileId) -> Option<TileDto> {
     match tree.tiles.get(id)? {
         egui_tiles::Tile::Pane(handle) => Some(TileDto::Pane { handle: handle.0 }),
         egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs)) => {
@@ -404,12 +404,12 @@ fn tile_to_dto(tree: &egui_tiles::Tree<TabHandle>, id: egui_tiles::TileId) -> Op
     }
 }
 
-/// Rebuild an `egui_tiles::Tree<TabHandle>` from its persisted form.
+/// Rebuild an `egui_tiles::Tree<TabId>` from its persisted form.
 /// `id` is the egui persistence key for the new tree.
 pub(crate) fn tree_from_dto(
     dto: &TreeDto,
     id: egui::Id,
-) -> egui_tiles::Tree<TabHandle> {
+) -> egui_tiles::Tree<TabId> {
     let mut tree = egui_tiles::Tree::empty(id);
     let root = dto.root.as_ref().map(|t| insert_tile(&mut tree, t));
     tree.root = root;
@@ -417,11 +417,11 @@ pub(crate) fn tree_from_dto(
 }
 
 fn insert_tile(
-    tree: &mut egui_tiles::Tree<TabHandle>,
+    tree: &mut egui_tiles::Tree<TabId>,
     dto: &TileDto,
 ) -> egui_tiles::TileId {
     match dto {
-        TileDto::Pane { handle } => tree.tiles.insert_pane(TabHandle(*handle)),
+        TileDto::Pane { handle } => tree.tiles.insert_pane(TabId(*handle)),
         TileDto::Tabs { children, active } => {
             let child_ids: Vec<_> = children.iter().map(|c| insert_tile(tree, c)).collect();
             let tabs_id = tree.tiles.insert_tab_tile(child_ids.clone());
@@ -466,19 +466,19 @@ fn insert_tile(
 
 // Internal accessors so `persistence` doesn't need crate-public fields
 // on the area types.
-impl<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
+impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
     pub(crate) fn panel_area_entries(
         &self,
-    ) -> impl Iterator<Item = (TabHandle, &TabEntry<Tab>)> {
+    ) -> impl Iterator<Item = (TabId, &TabEntry<Tab>)> {
         self.panel_area.inner.iter_entries()
     }
-    pub(crate) fn panel_area_tree_clone(&self) -> egui_tiles::Tree<TabHandle> {
+    pub(crate) fn panel_area_tree_clone(&self) -> egui_tiles::Tree<TabId> {
         self.panel_area.inner.tree_clone()
     }
     pub(crate) fn panel_area_replace(
         &mut self,
-        tree: egui_tiles::Tree<TabHandle>,
-        entries: HashMap<TabHandle, TabEntry<Tab>>,
+        tree: egui_tiles::Tree<TabId>,
+        entries: HashMap<TabId, TabEntry<Tab>>,
     ) {
         self.panel_area.inner.replace_tree(tree, entries);
     }

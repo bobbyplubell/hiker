@@ -1,8 +1,8 @@
 //! Editor area — tabbed editor groups with splits. See `DESIGN.md`.
 //!
-//! Holds an `egui_tiles::Tree<TabHandle>` (groups + splits) plus a
+//! Holds an `egui_tiles::Tree<TabId>` (groups + splits) plus a
 //! payload map keyed by handle. A crate-private Behavior impl is built
-//! per-frame and bridges egui_tiles back to the [`WorkbenchBehavior`]
+//! per-frame and bridges egui_tiles back to the [`Host`]
 //! supplied by the host.
 
 use std::collections::HashMap;
@@ -17,24 +17,24 @@ use egui_tiles::{
     Tabs, Tile, TileId, Tiles, Tree, UiResponse,
 };
 
-use crate::behavior::WorkbenchBehavior;
-use crate::handle::{GroupHandle, TabHandle};
+use crate::behavior::Host;
+use crate::workspace::{GroupId, TabId};
 use crate::internal::tree_adapter;
-use crate::tab::{DocumentTab, TabEntry, TabState, TabUiContext};
-use crate::theme::WorkbenchTheme;
+use crate::tab::{Document, TabEntry, State, UiContext};
+use crate::theme::Palette;
 
 /// The central editor region. Owns the tab payload map and an
-/// `egui_tiles::Tree<TabHandle>` describing the groups + splits.
-pub struct EditorArea<Tab: DocumentTab> {
-    pub(crate) tree: Tree<TabHandle>,
-    pub(crate) entries: HashMap<TabHandle, TabEntry<Tab>>,
+/// `egui_tiles::Tree<TabId>` describing the groups + splits.
+pub struct EditorArea<Tab: Document> {
+    pub(crate) tree: Tree<TabId>,
+    pub(crate) entries: HashMap<TabId, TabEntry<Tab>>,
     /// Most recently focused group (the one user actions like
     /// "close active tab" target). May be `None` when the tree is empty.
     pub(crate) focused_group: Option<TileId>,
     _marker: PhantomData<Tab>,
 }
 
-impl<Tab: DocumentTab> Default for EditorArea<Tab> {
+impl<Tab: Document> Default for EditorArea<Tab> {
     fn default() -> Self {
         Self {
             tree: Tree::empty(egui::Id::new("egui_workbench::editor_tree")),
@@ -45,7 +45,7 @@ impl<Tab: DocumentTab> Default for EditorArea<Tab> {
     }
 }
 
-impl<Tab: DocumentTab> EditorArea<Tab> {
+impl<Tab: Document> EditorArea<Tab> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -71,19 +71,19 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// Iterate `(handle, entry)` pairs — used by persistence.
     pub(crate) fn iter_entries(
         &self,
-    ) -> impl Iterator<Item = (TabHandle, &TabEntry<Tab>)> {
+    ) -> impl Iterator<Item = (TabId, &TabEntry<Tab>)> {
         self.entries.iter().map(|(h, e)| (*h, e))
     }
 
     /// Clone the underlying tree — used by persistence.
-    pub(crate) fn tree_clone(&self) -> Tree<TabHandle> {
+    pub(crate) fn tree_clone(&self) -> Tree<TabId> {
         self.tree.clone()
     }
 
-    /// For each `Tabs` container, return the first child `TabHandle`,
+    /// For each `Tabs` container, return the first child `TabId`,
     /// in tree-iteration order. Public for tests and host-side
     /// inspection of pinned-first enforcement.
-    pub fn leading_handle_per_group(&self) -> Vec<TabHandle> {
+    pub fn leading_handle_per_group(&self) -> Vec<TabId> {
         let mut out = Vec::new();
         for (_id, tile) in self.tree.tiles.iter() {
             if let Tile::Container(Container::Tabs(tabs)) = tile
@@ -99,8 +99,8 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// Replace the tree + entries wholesale. Used by persistence.
     pub(crate) fn replace_tree(
         &mut self,
-        tree: Tree<TabHandle>,
-        entries: HashMap<TabHandle, TabEntry<Tab>>,
+        tree: Tree<TabId>,
+        entries: HashMap<TabId, TabEntry<Tab>>,
     ) {
         self.tree = tree;
         self.entries = entries;
@@ -108,25 +108,25 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     }
 
     /// Iterate over open tabs.
-    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabHandle, &Tab)> {
+    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabId, &Tab)> {
         self.entries.iter().map(|(h, e)| (*h, &e.tab))
     }
 
     /// Look up a tab payload by handle.
-    pub fn get(&self, handle: TabHandle) -> Option<&Tab> {
+    pub fn get(&self, handle: TabId) -> Option<&Tab> {
         self.entries.get(&handle).map(|e| &e.tab)
     }
 
     /// Mutable access to a tab payload.
-    pub fn get_mut(&mut self, handle: TabHandle) -> Option<&mut Tab> {
+    pub fn get_mut(&mut self, handle: TabId) -> Option<&mut Tab> {
         self.entries.get_mut(&handle).map(|e| &mut e.tab)
     }
 
-    pub fn state(&self, handle: TabHandle) -> Option<TabState> {
+    pub fn state(&self, handle: TabId) -> Option<State> {
         self.entries.get(&handle).map(|e| e.state)
     }
 
-    pub(crate) fn set_state(&mut self, handle: TabHandle, state: TabState) {
+    pub(crate) fn set_state(&mut self, handle: TabId, state: State) {
         if let Some(entry) = self.entries.get_mut(&handle) {
             entry.state = state;
         }
@@ -136,9 +136,9 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// Caller supplies the handle (the workbench allocates them).
     pub(crate) fn insert_tab(
         &mut self,
-        handle: TabHandle,
+        handle: TabId,
         tab: Tab,
-        state: TabState,
+        state: State,
         focus: bool,
     ) -> TileId {
         self.entries
@@ -185,7 +185,7 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     }
 
     /// Remove a tab. Returns `true` if a tab was removed.
-    pub(crate) fn remove_tab(&mut self, handle: TabHandle) -> bool {
+    pub(crate) fn remove_tab(&mut self, handle: TabId) -> bool {
         let Some(pane_id) = tree_adapter::find_pane_of(&self.tree, handle) else {
             self.entries.remove(&handle);
             return false;
@@ -198,20 +198,20 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// Return the handle of the (single) Preview tab inside `group`, if
     /// any. Used by [`crate::Workbench::open_tab`] to enforce the
     /// "one Preview tab per group" invariant.
-    pub(crate) fn preview_handle_in_group(&self, group: TileId) -> Option<TabHandle> {
+    pub(crate) fn preview_handle_in_group(&self, group: TileId) -> Option<TabId> {
         let handles = tree_adapter::handles_in_group(&self.tree, group);
         handles
             .into_iter()
-            .find(|h| self.state(*h) == Some(TabState::Preview))
+            .find(|h| self.state(*h) == Some(State::Preview))
     }
 
     /// Mark the given group as focused for future operations.
-    pub fn set_focused_group(&mut self, group: GroupHandle) {
+    pub const fn set_focused_group(&mut self, group: GroupId) {
         self.focused_group = Some(group.0);
     }
 
-    pub fn focused_group(&self) -> Option<GroupHandle> {
-        self.focused_group.map(GroupHandle)
+    pub fn focused_group(&self) -> Option<GroupId> {
+        self.focused_group.map(GroupId)
     }
 
     /// Make `handle` the active tab inside its enclosing `Tabs`
@@ -221,7 +221,7 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// over to a tab the user didn't click. Returns `true` when the
     /// active tab actually changed; `false` if the handle is unknown
     /// or already active.
-    pub fn set_active(&mut self, handle: TabHandle) -> bool {
+    pub fn set_active(&mut self, handle: TabId) -> bool {
         let Some(pane_id) = tree_adapter::find_pane_of(&self.tree, handle) else {
             return false;
         };
@@ -244,8 +244,8 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
     /// Locate the tab payload whose host id (as exposed by the host
     /// tab type) matches a predicate. Used by [`Workbench::set_active`]
     /// when the host knows its own id but not the workbench's
-    /// `TabHandle`.
-    pub fn handle_for<F: Fn(&Tab) -> bool>(&self, pred: F) -> Option<TabHandle> {
+    /// `TabId`.
+    pub fn handle_for<F: Fn(&Tab) -> bool>(&self, pred: F) -> Option<TabId> {
         self.entries
             .iter()
             .find(|(_, e)| pred(&e.tab))
@@ -265,17 +265,28 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
         &mut self,
         ui: &mut egui::Ui,
         behavior: &mut B,
-        theme: &WorkbenchTheme,
+        theme: &Palette,
         placeholder_id: egui::Id,
     ) -> DriveOutcome
     where
         Mode: Clone + Eq + Hash + 'static,
-        B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+        B: Host<Tab, Mode> + ?Sized,
     {
         let placeholder = Tree::empty(placeholder_id);
         let mut tree = std::mem::replace(&mut self.tree, placeholder);
         let focused_group = self.focused_group;
-        let pane_to_group = crate::internal::tree_adapter::pane_to_group_map(&tree);
+        // Build a `pane TileId → parent Tabs-container TileId` map for
+        // the whole tree so `EditorBehavior::pane_ui` can resolve a
+        // pane's owning group without a per-frame tree walk.
+        let mut pane_to_group: std::collections::HashMap<TileId, TileId> =
+            std::collections::HashMap::new();
+        for (tile_id, tile) in tree.tiles.iter() {
+            if let Tile::Container(Container::Tabs(tabs)) = tile {
+                for child in &tabs.children {
+                    pane_to_group.insert(*child, *tile_id);
+                }
+            }
+        }
         let mut adapter = EditorBehavior::<Tab, Mode, _> {
             entries: &mut self.entries,
             behavior,
@@ -347,10 +358,58 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
         }
 
         // Post-frame: enforce pinned-first in each Tabs container.
+        // egui_tiles permits pinned tabs to land after Regular ones; the
+        // workbench forbids that ordering. Two passes so we don't hold
+        // a `&mut Tiles` while looking at panes, and to keep this O(n)
+        // without per-container scratch allocation.
         let entries = &self.entries;
-        crate::internal::enforcement::enforce_pinned_first(&mut self.tree, |h| {
-            entries.get(&h).map(|e| e.state).unwrap_or_default()
-        });
+        let state_for = |h: TabId| entries.get(&h).map(|e| e.state).unwrap_or_default();
+        let container_ids: Vec<_> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| match tile {
+                Tile::Container(Container::Tabs(_)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for cid in container_ids {
+            let snapshot: Vec<(TileId, bool)> = {
+                let Some(Tile::Container(Container::Tabs(tabs))) = self.tree.tiles.get(cid) else {
+                    continue;
+                };
+                tabs.children
+                    .iter()
+                    .map(|child_id| {
+                        let pinned = match self.tree.tiles.get(*child_id) {
+                            Some(Tile::Pane(h)) => state_for(*h) == State::Pinned,
+                            _ => false,
+                        };
+                        (*child_id, pinned)
+                    })
+                    .collect()
+            };
+            let mut seen_unpinned = false;
+            let mut needs_sort = false;
+            for (_, pinned) in &snapshot {
+                if *pinned && seen_unpinned {
+                    needs_sort = true;
+                    break;
+                }
+                if !*pinned {
+                    seen_unpinned = true;
+                }
+            }
+            if !needs_sort {
+                continue;
+            }
+            let mut reordered: Vec<TileId> =
+                snapshot.iter().filter(|(_, p)| *p).map(|(id, _)| *id).collect();
+            reordered.extend(snapshot.iter().filter(|(_, p)| !*p).map(|(id, _)| *id));
+            if let Some(Tile::Container(Container::Tabs(tabs))) = self.tree.tiles.get_mut(cid) {
+                tabs.children = reordered;
+            }
+        }
 
         // If the focused group was pruned by simplification, fall back to
         // the first remaining Tabs container.
@@ -370,11 +429,11 @@ impl<Tab: DocumentTab> EditorArea<Tab> {
 pub(crate) struct DriveOutcome {
     /// `true` if `egui_tiles` reported any edit (drag, resize, activate).
     pub dirty: bool,
-    pub pending_close_others: Option<TabHandle>,
-    pub pending_close_to_right: Option<TabHandle>,
+    pub pending_close_others: Option<TabId>,
+    pub pending_close_to_right: Option<TabId>,
     pub pending_close_all: bool,
-    pub pending_pin_toggles: Vec<TabHandle>,
-    pub pending_promote: Vec<TabHandle>,
+    pub pending_pin_toggles: Vec<TabId>,
+    pub pending_promote: Vec<TabId>,
 }
 
 /// Per-frame `egui_tiles::Behavior` adapter. Holds borrows of the
@@ -382,29 +441,29 @@ pub(crate) struct DriveOutcome {
 /// behavior. Constructed and dropped within a single `Tree::ui` call.
 pub(crate) struct EditorBehavior<'a, Tab, Mode, B>
 where
-    Tab: DocumentTab,
+    Tab: Document,
     Mode: Clone + Eq + Hash + 'static,
-    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+    B: Host<Tab, Mode> + ?Sized,
 {
-    pub entries: &'a mut HashMap<TabHandle, TabEntry<Tab>>,
+    pub entries: &'a mut HashMap<TabId, TabEntry<Tab>>,
     pub behavior: &'a mut B,
-    pub theme: &'a WorkbenchTheme,
+    pub theme: &'a Palette,
     /// Set to `true` if any edit happened (drag, resize, tab select).
     /// The workbench uses this to mark its layout cache dirty.
     pub dirty: bool,
     /// Tabs the user asked to close this frame. Drained by the workbench.
-    pub pending_closes: Vec<TabHandle>,
+    pub pending_closes: Vec<TabId>,
     /// Tabs to close (others / right-of) requested via context menu this
     /// frame. Drained by the workbench, which applies the close-others
     /// semantics (skip pinned).
-    pub pending_close_others: Option<TabHandle>,
-    pub pending_close_to_right: Option<TabHandle>,
+    pub pending_close_others: Option<TabId>,
+    pub pending_close_to_right: Option<TabId>,
     pub pending_close_all: bool,
     /// Tabs whose pinned state was toggled via context menu this frame.
-    pub pending_pin_toggles: Vec<TabHandle>,
+    pub pending_pin_toggles: Vec<TabId>,
     /// Tabs whose Preview state should be promoted to Regular this frame
     /// (e.g. because the user explicitly clicked "Keep open").
-    pub pending_promote: Vec<TabHandle>,
+    pub pending_promote: Vec<TabId>,
     /// `(group, child)` pairs to activate this frame — sourced from the
     /// "all tabs" dropdown rendered via `top_bar_right_ui`.
     pub pending_tab_activations: Vec<(TileId, TileId)>,
@@ -420,29 +479,29 @@ where
     pub _mode: PhantomData<Mode>,
 }
 
-impl<'a, Tab, Mode, B> TilesBehavior<TabHandle> for EditorBehavior<'a, Tab, Mode, B>
+impl<'a, Tab, Mode, B> TilesBehavior<TabId> for EditorBehavior<'a, Tab, Mode, B>
 where
-    Tab: DocumentTab,
+    Tab: Document,
     Mode: Clone + Eq + Hash + 'static,
-    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+    B: Host<Tab, Mode> + ?Sized,
 {
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
         tile_id: TileId,
-        handle: &mut TabHandle,
+        handle: &mut TabId,
     ) -> UiResponse {
         let Some(entry) = self.entries.get_mut(handle) else {
             ui.weak("missing tab");
             return UiResponse::None;
         };
         let parent = self.pane_to_group.get(&tile_id).copied();
-        let group = GroupHandle(parent.unwrap_or(tile_id));
+        let group = GroupId(parent.unwrap_or(tile_id));
         let focused = match (parent, self.focused_group) {
             (Some(p), Some(f)) => p == f,
             _ => false,
         };
-        let ctx = TabUiContext {
+        let ctx = UiContext {
             handle: *handle,
             group,
             focused,
@@ -469,20 +528,20 @@ where
         UiResponse::None
     }
 
-    fn tab_title_for_pane(&mut self, handle: &TabHandle) -> egui::WidgetText {
+    fn tab_title_for_pane(&mut self, handle: &TabId) -> egui::WidgetText {
         let Some(entry) = self.entries.get(handle) else {
             return "(missing)".into();
         };
         let raw = entry.tab.title().text().to_string();
         let mut rich = egui::RichText::new(raw);
-        if entry.state == TabState::Preview {
+        if entry.state == State::Preview {
             rich = rich.italics();
         }
         rich.into()
     }
 
-    fn is_tab_closable(&self, tiles: &Tiles<TabHandle>, tile_id: TileId) -> bool {
-        // Closability is determined per-tab via DocumentTab::closable.
+    fn is_tab_closable(&self, tiles: &Tiles<TabId>, tile_id: TileId) -> bool {
+        // Closability is determined per-tab via Document::closable.
         match tiles.get(tile_id) {
             Some(Tile::Pane(h)) => self
                 .entries
@@ -495,7 +554,7 @@ where
 
     fn tab_ui(
         &mut self,
-        tiles: &mut Tiles<TabHandle>,
+        tiles: &mut Tiles<TabId>,
         ui: &mut egui::Ui,
         id: egui::Id,
         tile_id: TileId,
@@ -516,8 +575,8 @@ where
         };
 
         // Pull glyph / dirty placement state.
-        let pinned = tab_state == TabState::Pinned;
-        let preview = tab_state == TabState::Preview;
+        let pinned = tab_state == State::Pinned;
+        let preview = tab_state == State::Preview;
 
         let text = self.tab_title_for_tile(tiles, tile_id);
         let font_id = TextStyle::Button.resolve(ui.style());
@@ -620,7 +679,7 @@ where
             }
         }
 
-        // Tooltip from DocumentTab::tooltip().
+        // Tooltip from Document::tooltip().
         let tab_response = if let Some(tip) = tooltip {
             tab_response.on_hover_text(tip)
         } else {
@@ -674,7 +733,7 @@ where
                 ui.close();
             }
             ui.separator();
-            let pin_label = if tab_state == TabState::Pinned { "Unpin" } else { "Pin" };
+            let pin_label = if tab_state == State::Pinned { "Unpin" } else { "Pin" };
             if ui.button(pin_label).clicked() {
                 toggle_pin = true;
                 ui.close();
@@ -710,7 +769,7 @@ where
         self.on_tab_button(tiles, tile_id, tab_response)
     }
 
-    fn on_tab_close(&mut self, tiles: &mut Tiles<TabHandle>, tile_id: TileId) -> bool {
+    fn on_tab_close(&mut self, tiles: &mut Tiles<TabId>, tile_id: TileId) -> bool {
         let handle = match tiles.get(tile_id) {
             Some(Tile::Pane(handle)) => *handle,
             _ => return true,
@@ -810,7 +869,7 @@ where
     /// activates the chosen tab.
     fn top_bar_right_ui(
         &mut self,
-        tiles: &Tiles<TabHandle>,
+        tiles: &Tiles<TabId>,
         ui: &mut egui::Ui,
         tile_id: TileId,
         tabs: &Tabs,
@@ -835,7 +894,7 @@ where
 
         let popup_id = ui.id().with(("workbench_all_tabs", tile_id));
         let button = ui
-            .add(egui::Button::image(crate::icons::chevron_down()).small())
+            .add(egui::Button::image(crate::workspace::chevron_down()).small())
             .on_hover_text("All tabs");
         let mut activate: Option<TileId> = None;
         egui::Popup::menu(&button)

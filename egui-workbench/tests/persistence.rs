@@ -1,15 +1,24 @@
 //! Persistence round-trip tests for `WorkbenchLayout`.
 
-use egui_workbench::{
-    DocumentTab, OpenTabOptions, TabState, TabUiContext, Workbench, WorkbenchBehavior, migrate,
-};
+use egui_workbench::tab::Document;
 
+use egui_workbench::workspace::OpenTabOptions;
+
+use egui_workbench::tab::State;
+
+use egui_workbench::tab::UiContext;
+
+use egui_workbench::workspace::Workbench;
+
+use egui_workbench::behavior::Host;
+
+use egui_workbench::persistence::migrate;
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 struct PTab {
     title: String,
 }
 
-impl DocumentTab for PTab {
+impl Document for PTab {
     fn title(&self) -> egui::WidgetText {
         self.title.clone().into()
     }
@@ -23,8 +32,8 @@ enum PMode {
 
 #[allow(dead_code)]
 struct PBehavior;
-impl WorkbenchBehavior<PTab, PMode> for PBehavior {
-    fn pane_ui(&mut self, _ui: &mut egui::Ui, _tab: &mut PTab, _ctx: TabUiContext<'_>) {}
+impl Host<PTab, PMode> for PBehavior {
+    fn pane_ui(&mut self, _ui: &mut egui::Ui, _tab: &mut PTab, _ctx: UiContext<'_>) {}
 }
 
 #[test]
@@ -33,16 +42,16 @@ fn layout_round_trip_preserves_tabs() {
     wb.activity_bar.set_active(Some(PMode::Files));
     let h1 = wb.open_tab(
         PTab { title: "alpha".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     let h2 = wb.open_tab(
         PTab { title: "beta".into() },
-        OpenTabOptions {
-            state: TabState::Pinned,
+        &OpenTabOptions {
+            state: State::Pinned,
             ..OpenTabOptions::default()
         },
     );
-    wb.open_panel_tab(PTab { title: "term".into() }, OpenTabOptions::default());
+    wb.open_panel_tab(PTab { title: "term".into() }, &OpenTabOptions::default());
 
     let layout = wb.layout();
     let json = serde_json::to_string(&layout).expect("serialise");
@@ -62,7 +71,7 @@ fn layout_round_trip_preserves_tabs() {
     // Pinned state survived.
     assert_eq!(
         wb2.editor_area.state(h2),
-        Some(TabState::Pinned),
+        Some(State::Pinned),
         "pinned state must round-trip",
     );
 

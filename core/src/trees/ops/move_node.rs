@@ -2,9 +2,9 @@
 //! relocate one or more nodes to new parents.
 
 use super::super::storage::{params, OptionalExtension};
-use super::super::types::{Trees, TreesError};
+use super::super::types::{Db, Error};
 
-impl Trees {
+impl Db {
     /// Move a node to a new parent (or to the root when `new_parent` is
     /// `None`). Appends a `move` history entry.
     pub fn move_node(
@@ -12,9 +12,9 @@ impl Trees {
         tree_id: &str,
         node_id: &str,
         new_parent: Option<&str>,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         let prior = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }
@@ -75,7 +75,7 @@ impl Trees {
         &self,
         tree_id: &str,
         moves: &[(String, Option<String>)],
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         // Capture prior parents before mutating so we can bump the source
         // chain after the move. Read in a short-lived scope to avoid
         // holding the mutex across the bump_churn_chain calls below
@@ -152,9 +152,9 @@ impl Trees {
         tree_id: &str,
         leaf_id: &str,
         new_parent: Option<&str>,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         let prior = self.get_node(tree_id, leaf_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: leaf_id.to_string(),
             }

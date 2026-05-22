@@ -1,5 +1,6 @@
-use editor_core::{EditorState, Selection};
-use editor_md::markdown_indent_on_enter;
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::Selection;
+use editor_md::indenter::markdown_indent_on_enter;
 
 fn state_with_caret(text: &str, caret: usize) -> EditorState {
     let mut s = EditorState::new(text);

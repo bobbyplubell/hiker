@@ -45,6 +45,7 @@ pub struct Tab {
 
 /// What's in an editor tab's buffer. Each variant maps to a different
 /// loading path and a different read/write posture.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferSource {
     /// Vault file — editable, dirty-tracked, autosaved.
@@ -68,15 +69,11 @@ impl BufferSource {
             BufferSource::Trash { original_path, .. } => original_path,
         }
     }
-
-    /// True for sources that map to an editable vault buffer.
-    pub fn is_vault(&self) -> bool {
-        matches!(self, BufferSource::Vault { .. })
-    }
 }
 
 /// The "other side" of a diff. Resolves through existing services to a
 /// rope at render time.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSource {
     /// On-disk text at the given vault-relative path.
@@ -149,49 +146,28 @@ impl TabKind {
         }
     }
 
-    /// Construct an editor tab for a vault file with the on-disk diff active
-    /// (the dirty-buffer diff toggle's default state).
-    pub fn buffer_diff(path: impl Into<String>) -> Self {
+    /// Construct a snapshot-preview editor tab. The buffer holds the
+    /// snapshot's content read-only; the diff layer shows how the
+    /// snapshot differs from the current on-disk text of the same path.
+    pub fn snapshot_preview(path: impl Into<String>, change_id: impl Into<String>) -> Self {
         let p = path.into();
         TabKind::Editor {
-            buffer: BufferSource::Vault { path: p.clone() },
+            buffer: BufferSource::Snapshot { path: p.clone(), change_id: change_id.into() },
             diff: Some(DiffSource::Disk { path: p }),
         }
     }
 
-    /// Construct a snapshot-preview editor tab (read-only snapshot blob
-    /// with diff against current disk active by default).
-    pub fn snapshot_preview(path: impl Into<String>, change_id: impl Into<String>) -> Self {
-        let p = path.into();
-        let cid = change_id.into();
-        TabKind::Editor {
-            buffer: BufferSource::Snapshot { path: p.clone(), change_id: cid.clone() },
-            diff: Some(DiffSource::ChangesDb { change_id: cid, path: p }),
-        }
-    }
-
-    /// Construct a staging-proposal review tab (proposal content read-only,
-    /// diff against current disk active).
+    /// Construct a staging-proposal review tab. The buffer holds the
+    /// proposed full-file content read-only; the diff layer shows how it
+    /// would change the current on-disk text of the target path.
     pub fn staging_preview(proposal_id: impl Into<String>, target_path: impl Into<String>) -> Self {
-        let pid = proposal_id.into();
-        let target = target_path.into();
+        let t = target_path.into();
         TabKind::Editor {
             buffer: BufferSource::StagingProposal {
-                proposal_id: pid.clone(),
-                target_path: target.clone(),
+                proposal_id: proposal_id.into(),
+                target_path: t.clone(),
             },
-            diff: Some(DiffSource::StagingProposal { proposal_id: pid }),
-        }
-    }
-
-    /// Construct a trash-preview tab (trashed file content read-only, no diff).
-    pub fn trash_preview(trash_path: impl Into<String>, original_path: impl Into<String>) -> Self {
-        TabKind::Editor {
-            buffer: BufferSource::Trash {
-                trash_path: trash_path.into(),
-                original_path: original_path.into(),
-            },
-            diff: None,
+            diff: Some(DiffSource::Disk { path: t }),
         }
     }
 
@@ -204,48 +180,31 @@ impl TabKind {
         }
     }
 
-    /// Returns the buffer-source's path for any `Editor` tab (vault path,
-    /// snapshot path, proposal target path, trash original path).
-    pub fn editor_path(&self) -> Option<&str> {
-        match self {
-            TabKind::Editor { buffer, .. } => Some(buffer.path()),
-            _ => None,
-        }
-    }
-
-    /// Returns the buffer source if this is an Editor tab.
-    pub fn buffer_source(&self) -> Option<&BufferSource> {
-        match self {
-            TabKind::Editor { buffer, .. } => Some(buffer),
-            _ => None,
-        }
-    }
-
     /// Returns the diff source if this Editor tab has diff mode active.
-    pub fn diff_source(&self) -> Option<&DiffSource> {
+    pub const fn diff_source(&self) -> Option<&DiffSource> {
         match self {
             TabKind::Editor { diff: Some(d), .. } => Some(d),
             _ => None,
         }
     }
 
-    /// True if this is an Editor tab whose buffer is a read-only preview
-    /// (snapshot, staging proposal, or trash entry).
-    pub fn is_readonly_preview(&self) -> bool {
-        matches!(
-            self,
-            TabKind::Editor {
-                buffer: BufferSource::Snapshot { .. }
-                    | BufferSource::StagingProposal { .. }
-                    | BufferSource::Trash { .. },
-                ..
-            }
-        )
-    }
-
     pub fn label(&self) -> String {
         match self {
-            TabKind::Editor { buffer, diff } => editor_label(buffer, diff.as_ref()),
+            // Editor-tab label is the buffer's basename, prefixed by source
+            // kind for non-vault (read-only) sources. The diff toggle
+            // doesn't change the label.
+            TabKind::Editor { buffer, .. } => match buffer {
+                BufferSource::Vault { path } => path_basename(path),
+                BufferSource::Snapshot { path, .. } => {
+                    format!("Snapshot · {}", path_basename(path))
+                }
+                BufferSource::StagingProposal { target_path, .. } => {
+                    format!("Staging · {}", path_basename(target_path))
+                }
+                BufferSource::Trash { original_path, .. } => {
+                    format!("Trash · {}", path_basename(original_path))
+                }
+            },
             TabKind::Home => "Home".to_string(),
             TabKind::HomeDetail { which } => match which {
                 HomeDetail::Snapshots => "Snapshots".to_string(),
@@ -277,38 +236,25 @@ impl TabKind {
         use crate::icons;
         match self {
             TabKind::Editor { buffer, .. } => match buffer {
-                BufferSource::Vault { .. } => icons::file(),
-                BufferSource::Snapshot { .. } => icons::clock(),
-                BufferSource::StagingProposal { .. } => icons::edit(),
-                BufferSource::Trash { .. } => icons::trash(),
+                BufferSource::Vault { .. } => icons::ICONS.image(crate::icons::Icon::File),
+                BufferSource::Snapshot { .. } => icons::ICONS.image(crate::icons::Icon::Clock),
+                BufferSource::StagingProposal { .. } => icons::ICONS.image(crate::icons::Icon::Edit),
+                BufferSource::Trash { .. } => icons::ICONS.image(crate::icons::Icon::Trash),
             },
-            TabKind::Home => icons::home(),
-            TabKind::HomeDetail { .. } => icons::home(),
-            TabKind::Queue => icons::clipboard(),
-            TabKind::QueueDetail { .. } => icons::clipboard(),
-            TabKind::Settings => icons::settings(),
-            TabKind::Properties { .. } => icons::info(),
-            TabKind::Graph => icons::graph(),
-            TabKind::Agent { .. } => icons::chat(),
-            TabKind::PatchReview => icons::robot(),
-            TabKind::Plugins => icons::plugin(),
-            TabKind::IndexerDetail => icons::compass(),
-            TabKind::Changes => icons::clock(),
-            TabKind::ClusterReview { .. } => icons::graph(),
-            TabKind::ClusterGraph { .. } => icons::graph(),
-        }
-    }
-}
-
-fn editor_label(buffer: &BufferSource, _diff: Option<&DiffSource>) -> String {
-    match buffer {
-        BufferSource::Vault { path } => path_basename(path),
-        BufferSource::Snapshot { path, .. } => format!("Snapshot · {}", path_basename(path)),
-        BufferSource::StagingProposal { target_path, .. } => {
-            format!("Staging · {}", path_basename(target_path))
-        }
-        BufferSource::Trash { original_path, .. } => {
-            format!("Trash · {}", path_basename(original_path))
+            TabKind::Home => icons::ICONS.image(crate::icons::Icon::Home),
+            TabKind::HomeDetail { .. } => icons::ICONS.image(crate::icons::Icon::Home),
+            TabKind::Queue => icons::ICONS.image(crate::icons::Icon::Clipboard),
+            TabKind::QueueDetail { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
+            TabKind::Settings => icons::ICONS.image(crate::icons::Icon::Settings),
+            TabKind::Properties { .. } => icons::ICONS.image(crate::icons::Icon::Info),
+            TabKind::Graph => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
+            TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
+            TabKind::Plugins => icons::ICONS.image(crate::icons::Icon::Plugin),
+            TabKind::IndexerDetail => icons::ICONS.image(crate::icons::Icon::Compass),
+            TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
+            TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
         }
     }
 }
@@ -326,7 +272,7 @@ impl Tab {
     /// True if the tab kind shows the buffer-scoped chrome (editor
     /// toolbar, status bar). Editor tabs only.
     #[allow(dead_code)]
-    pub fn shows_buffer_chrome(&self) -> bool {
+    pub const fn shows_buffer_chrome(&self) -> bool {
         matches!(&self.kind, TabKind::Editor { .. })
     }
 

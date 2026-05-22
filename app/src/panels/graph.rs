@@ -20,15 +20,15 @@ use crate::editor_pane;
 use crate::icons;
 use crate::state::AppState;
 use crate::theme;
-use crate::widgets::force_graph::{ForceGraphView, ZoomBounds};
-use crate::widgets::force_layout::{LayoutParams, LayoutWorker};
-use crate::widgets::graph_layouts::{
+use crate::widgets::force_graph::{View, ZoomBounds};
+use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::graph_layouts::{
     LayoutKind, bfs_tree, dfs_tree, horizontal_tree_positions, radial_positions,
     vertical_tree_positions,
 };
 
 /// Cached graph + layout state. Lives on `AppState::graph_state`.
-pub struct GraphState {
+pub struct State {
     pub graph: DiGraph<NodeData, ()>,
     /// Per-node positions, indexed by `NodeIndex::index()`. Refreshed
     /// from `layout` every frame while the worker is running.
@@ -45,7 +45,7 @@ pub struct GraphState {
     pub needs_fit: bool,
     /// Pan/zoom + shared input handling. Extracted to
     /// `widgets::force_graph` so the cluster-graph panel can reuse it.
-    pub view: ForceGraphView,
+    pub view: View,
     /// View options surfaced in the panel header.
     pub show_labels: bool,
     pub show_edges: bool,
@@ -80,7 +80,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         .session.active_tab
         .and_then(|id| app.tab_by_id(id))
         .and_then(|t| t.buffer_path())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     // Header row.
     ui.horizontal(|ui| {
@@ -93,7 +93,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         }
         if let Some(gs) = app.panels.graph.as_mut() {
             let prev_kind = gs.layout_kind;
-            view_options_menu(ui, gs);
+            gs.view_options_menu(ui);
             if gs.layout_kind != prev_kind {
                 relayout = true;
             }
@@ -128,7 +128,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         .map(|gs| gs.built_at.elapsed().as_secs() > REBUILD_AFTER_SECS)
         .unwrap_or(true);
     if rebuild || stale {
-        app.panels.graph = Some(build(app, active_path.as_deref()));
+        app.panels.graph = Some(Builder { app }.build(active_path.as_deref()));
     } else if relayout
         && let Some(gs) = app.panels.graph.as_mut()
     {
@@ -141,7 +141,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
 
     // Pull latest positions from the worker (cheap RwLock read). Skip
     // once the worker is done — positions are already final.
-    let layout_running = gs.layout.as_ref().is_some_and(|w| w.is_running());
+    let layout_running = gs.layout.as_ref().is_some_and(graph_widgets::force_layout::LayoutWorker::is_running);
     if layout_running
         && let Some(w) = gs.layout.as_ref()
     {
@@ -312,26 +312,27 @@ fn update_selection(app: &mut AppState, path: String) {
     if !needs_load {
         return;
     }
+    // Body preview, capped at 500 chars (post-frontmatter).
+    const MAX: usize = 500;
     let preview = app
         .vault_session
         .vault
         .read_file(&path)
         .ok()
-        .map(|s| truncate_preview(skip_frontmatter(&s).to_string()));
+        .map(|s| {
+            let body = skip_frontmatter(&s);
+            if body.chars().count() <= MAX {
+                body.to_string()
+            } else {
+                let mut out: String = body.chars().take(MAX).collect();
+                out.push('…');
+                out
+            }
+        });
     if let Some(gs) = app.panels.graph.as_mut() {
         gs.selected_path = Some(path);
         gs.selected_preview = preview;
     }
-}
-
-fn truncate_preview(s: String) -> String {
-    const MAX: usize = 500;
-    if s.chars().count() <= MAX {
-        return s;
-    }
-    let mut out: String = s.chars().take(MAX).collect();
-    out.push('…');
-    out
 }
 
 /// Skip a YAML frontmatter block at the start of a markdown file and
@@ -437,24 +438,47 @@ pub(crate) fn paint_preview_card(
     clip_painter.galley(body_rect.left_top(), body_galley, body_color);
 }
 
-fn view_options_menu(ui: &mut egui::Ui, gs: &mut GraphState) {
-    let resp = ui
-        .add(egui::Button::image(icons::eye()))
-        .on_hover_text("View options");
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.label(egui::RichText::new("Layout").small().color(theme::muted()));
-        for kind in LayoutKind::all() {
-            let mut selected = gs.layout_kind == kind;
-            if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
-                gs.layout_kind = kind;
+impl State {
+    fn view_options_menu(&mut self, ui: &mut egui::Ui) {
+        let resp = ui
+            .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Eye)))
+            .on_hover_text("View options");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.label(egui::RichText::new("Layout").small().color(theme::muted()));
+            for kind in LayoutKind::all() {
+                let mut selected = self.layout_kind == kind;
+                if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
+                    self.layout_kind = kind;
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut self.show_labels, "Labels");
+            ui.checkbox(&mut self.show_edges, "Edges");
+            ui.checkbox(&mut self.show_orphans, "Orphans");
+            ui.checkbox(&mut self.show_preview, "Show note preview");
+        });
+    }
+
+    fn pick_root(&self, active_path: Option<&str>) -> usize {
+        if let Some(p) = active_path {
+            for idx in self.graph.node_indices() {
+                if self.graph[idx].path == p {
+                    return idx.index();
+                }
             }
         }
-        ui.separator();
-        ui.checkbox(&mut gs.show_labels, "Labels");
-        ui.checkbox(&mut gs.show_edges, "Edges");
-        ui.checkbox(&mut gs.show_orphans, "Orphans");
-        ui.checkbox(&mut gs.show_preview, "Show note preview");
-    });
+        // Highest-degree node as a fallback.
+        let mut best_i = 0usize;
+        let mut best_d = 0u32;
+        for idx in self.graph.node_indices() {
+            let d = self.graph[idx].degree;
+            if d > best_d {
+                best_d = d;
+                best_i = idx.index();
+            }
+        }
+        best_i
+    }
 }
 
 fn node_radius(degree: u32) -> f32 {
@@ -466,9 +490,18 @@ fn basename(path: &str) -> String {
     stem.strip_suffix(".md").unwrap_or(stem).to_string()
 }
 
-/// Walk the vault, collect nodes, parse wikilinks, build petgraph,
-/// and run the initial layout.
-fn build(app: &AppState, active_path: Option<&str>) -> GraphState {
+/// Vault-graph builder. Bundles `&AppState` so the multi-step build
+/// (walk → parse wikilinks → resolve targets) is a set of inherent
+/// methods rather than single-use free functions.
+struct Builder<'a> {
+    app: &'a AppState,
+}
+
+impl Builder<'_> {
+    /// Walk the vault, collect nodes, parse wikilinks, build petgraph,
+    /// and run the initial layout.
+    fn build(&self, active_path: Option<&str>) -> State {
+    let app = self.app;
     let paths: Vec<String> = app
         .vault_session.vault
         .walk_indexable_files("")
@@ -498,8 +531,8 @@ fn build(app: &AppState, active_path: Option<&str>) -> GraphState {
             Err(_) => continue,
         };
         let src = by_path[p];
-        for target in scan_wikilinks(&body) {
-            let resolved = resolve_target(&target, &by_path, &by_basename);
+        for target in self.scan_wikilinks(&body) {
+            let resolved = self.resolve_target(&target, &by_path, &by_basename);
             if let Some(rel) = resolved {
                 if let Some(&dst) = by_path.get(&rel) {
                     if dst != src {
@@ -518,14 +551,14 @@ fn build(app: &AppState, active_path: Option<&str>) -> GraphState {
         .map(|(a, b)| (a.index() as u32, b.index() as u32))
         .collect();
 
-    let mut state = GraphState {
+    let mut state = State {
         graph,
         positions: vec![egui::Vec2::ZERO; paths.len()],
         edges,
         layout_kind: LayoutKind::ForceDirected,
         layout: None,
         built_at: Instant::now(),
-        view: ForceGraphView::default(),
+        view: View::default(),
         show_labels: true,
         show_edges: true,
         show_orphans: true,
@@ -536,12 +569,13 @@ fn build(app: &AppState, active_path: Option<&str>) -> GraphState {
     };
     recompute_layout(&mut state, active_path);
     state
+    }
 }
 
 /// Spawn the worker (force-directed) or compute pure positions
 /// (radial / tree). Picks a root for tree layouts: prefers the active
 /// note when it's in the graph, else the highest-degree node.
-fn recompute_layout(state: &mut GraphState, active_path: Option<&str>) {
+fn recompute_layout(state: &mut State, active_path: Option<&str>) {
     state.layout = None;
     state.needs_fit = true;
     let n = state.graph.node_count();
@@ -579,7 +613,7 @@ fn recompute_layout(state: &mut GraphState, active_path: Option<&str>) {
             ));
         }
         LayoutKind::Radial | LayoutKind::VerticalTree | LayoutKind::HorizontalTree => {
-            let root = pick_root(state, active_path);
+            let root = state.pick_root(active_path);
             // Radial wants a shallow tree (one ring per depth → BFS).
             // Vertical/horizontal want a deep tree so dense clusters
             // don't collapse into flat horizontal bands → DFS.
@@ -597,30 +631,10 @@ fn recompute_layout(state: &mut GraphState, active_path: Option<&str>) {
     }
 }
 
-fn pick_root(state: &GraphState, active_path: Option<&str>) -> usize {
-    if let Some(p) = active_path {
-        for idx in state.graph.node_indices() {
-            if state.graph[idx].path == p {
-                return idx.index();
-            }
-        }
-    }
-    // Highest-degree node as a fallback.
-    let mut best_i = 0usize;
-    let mut best_d = 0u32;
-    for idx in state.graph.node_indices() {
-        let d = state.graph[idx].degree;
-        if d > best_d {
-            best_d = d;
-            best_i = idx.index();
-        }
-    }
-    best_i
-}
-
-/// Scan `body` for `[[Target]]` / `[[Target|Alias]]`, returning targets.
-/// `\n` terminates a search so we don't span paragraphs.
-fn scan_wikilinks(body: &str) -> Vec<String> {
+impl Builder<'_> {
+    /// Scan `body` for `[[Target]]` / `[[Target|Alias]]`, returning targets.
+    /// `\n` terminates a search so we don't span paragraphs.
+    fn scan_wikilinks(&self, body: &str) -> Vec<String> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -658,22 +672,24 @@ fn scan_wikilinks(body: &str) -> Vec<String> {
         i += 1;
     }
     out
-}
+    }
 
-/// Map a wikilink target to an existing vault rel-path.
-fn resolve_target(
-    target: &str,
-    by_path: &HashMap<String, NodeIndex>,
-    by_basename: &HashMap<String, String>,
-) -> Option<String> {
-    if by_path.contains_key(target) {
-        return Some(target.to_string());
+    /// Map a wikilink target to an existing vault rel-path.
+    fn resolve_target(
+        &self,
+        target: &str,
+        by_path: &HashMap<String, NodeIndex>,
+        by_basename: &HashMap<String, String>,
+    ) -> Option<String> {
+        if by_path.contains_key(target) {
+            return Some(target.to_string());
+        }
+        let with_md = format!("{target}.md");
+        if by_path.contains_key(&with_md) {
+            return Some(with_md);
+        }
+        let leaf = target.rsplit('/').next().unwrap_or(target);
+        let key = leaf.strip_suffix(".md").unwrap_or(leaf).to_lowercase();
+        by_basename.get(&key).cloned()
     }
-    let with_md = format!("{target}.md");
-    if by_path.contains_key(&with_md) {
-        return Some(with_md);
-    }
-    let leaf = target.rsplit('/').next().unwrap_or(target);
-    let key = leaf.strip_suffix(".md").unwrap_or(leaf).to_lowercase();
-    by_basename.get(&key).cloned()
 }

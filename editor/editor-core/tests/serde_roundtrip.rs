@@ -3,14 +3,19 @@
 
 #![cfg(feature = "serde")]
 
-use editor_core::{
-    Diagnostic, EditorState, SavedState, SelRange, Selection, Severity,
-};
+use editor_core::decoration::Diagnostic;
+
+use editor_core::decoration::Severity;
+use editor_core::selection::SelRange;
+
+use editor_core::selection::Selection;
+use editor_core::state::Editor;
+use editor_core::state::SavedState;
 use smol_str::SmolStr;
 
 #[test]
 fn saved_state_json_round_trip() {
-    let mut state = EditorState::new("hello world");
+    let mut state = Editor::new("hello world");
     state.selection = Selection::from_ranges(
         vec![SelRange::point(0), SelRange::new(6, 11)],
         1,
@@ -22,7 +27,7 @@ fn saved_state_json_round_trip() {
     let json = serde_json::to_string(&saved).expect("serialize");
     let decoded: SavedState = serde_json::from_str(&json).expect("deserialize");
 
-    let restored = EditorState::from_saved(decoded);
+    let restored = Editor::from_saved(decoded);
     assert_eq!(restored.doc.to_string(), "hello world");
     assert_eq!(restored.selection.ranges().len(), 2);
     assert_eq!(restored.selection.ranges()[0].start(), 0);

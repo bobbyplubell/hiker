@@ -1,4 +1,9 @@
-use super::*;
+use rusqlite::{params, OptionalExtension};
+
+use super::error::Error;
+use super::dto::{ChunkBounds, ChunkRow, NoteUpsert};
+use super::vec::{blob_to_embedding, byte_weighted_mean_pool, embedding_to_blob, read_chunk_vecs_dim};
+use super::Store;
 
 impl Store {
     /// Ordered chunk bounds for the note at `rel_path`. Empty vec for an
@@ -7,7 +12,7 @@ impl Store {
     /// to the editor pane stays small even on long notes.
     ///
     /// status: cmd-chunks-for-path
-    pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, StoreError> {
+    pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, Error> {
         let id = match self.id_for_path(rel_path)? {
             Some(id) => id,
             None => return Ok(Vec::new()),
@@ -42,7 +47,7 @@ impl Store {
     pub fn note_embedding_for_path(
         &self,
         rel_path: &str,
-    ) -> Result<Option<Vec<f32>>, StoreError> {
+    ) -> Result<Option<Vec<f32>>, Error> {
         let blob: Option<Option<Vec<u8>>> = self
             .conn
             .query_row(
@@ -68,7 +73,7 @@ impl Store {
     pub fn compute_and_store_note_embedding(
         &mut self,
         rel_path: &str,
-    ) -> Result<Option<Vec<f32>>, StoreError> {
+    ) -> Result<Option<Vec<f32>>, Error> {
         let note_id = match self.id_for_path(rel_path)? {
             Some(id) => id,
             None => return Ok(None),
@@ -94,7 +99,7 @@ impl Store {
     /// recomputes from current data.
     ///
     /// status: cluster-note-embeddings
-    pub fn clear_note_embedding(&mut self, rel_path: &str) -> Result<(), StoreError> {
+    pub fn clear_note_embedding(&mut self, rel_path: &str) -> Result<(), Error> {
         self.conn.execute(
             "UPDATE notes SET note_embedding = NULL WHERE path = ?1",
             params![rel_path],
@@ -107,7 +112,7 @@ impl Store {
     fn collect_weighted_chunk_embeddings(
         &self,
         note_id: &str,
-    ) -> Result<Vec<(Vec<f32>, u64)>, StoreError> {
+    ) -> Result<Vec<(Vec<f32>, u64)>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT v.embedding, c.byte_end - c.byte_start
              FROM chunk_vecs v
@@ -125,24 +130,34 @@ impl Store {
     }
 
     /// Fetch all chunks for a note, ordered by chunk_index.
-    pub fn get_note_chunks(&self, note_id: &str) -> Result<Vec<ChunkRow>, StoreError> {
+    pub fn get_note_chunks(&self, note_id: &str) -> Result<Vec<ChunkRow>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, note_id, chunk_index, byte_start, byte_end, text, heading_path
              FROM chunks WHERE note_id = ?1 ORDER BY chunk_index",
         )?;
         let rows = stmt
-            .query_map(params![note_id], map_chunk_row)?
+            .query_map(params![note_id], |row| {
+                Ok(ChunkRow {
+                    id: row.get(0)?,
+                    note_id: row.get(1)?,
+                    chunk_index: row.get::<_, i64>(2)? as u32,
+                    byte_start: row.get::<_, i64>(3)? as u64,
+                    byte_end: row.get::<_, i64>(4)? as u64,
+                    text: row.get(5)?,
+                    heading_path: row.get(6)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// Atomic upsert: replace any existing chunks + vec rows for this note,
     /// then write the new ones. Single transaction.
-    pub fn upsert_note(&mut self, upsert: NoteUpsert<'_>) -> Result<(), StoreError> {
+    pub fn upsert_note(&mut self, upsert: &NoteUpsert<'_>) -> Result<(), Error> {
         let expected = self.dim;
         for (_, emb) in &upsert.chunks {
             if emb.len() != expected {
-                return Err(StoreError::EmbedDim {
+                return Err(Error::EmbedDim {
                     got: emb.len(),
                     expected,
                 });
@@ -255,7 +270,7 @@ impl Store {
     /// the `notes` / `chunks` shapes don't change.
     ///
     /// status: store-rebuild-chunk-vecs-on-dim-change
-    pub fn ensure_chunk_vecs_dim(&mut self, expected_dim: usize) -> Result<(), StoreError> {
+    pub fn ensure_chunk_vecs_dim(&mut self, expected_dim: usize) -> Result<(), Error> {
         let current = read_chunk_vecs_dim(&self.conn)?;
         if current == Some(expected_dim) {
             self.dim = expected_dim;

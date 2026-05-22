@@ -6,7 +6,11 @@
 //! area, the widget calls [`paint_panels`] which lays out each panel in its
 //! reserved strip.
 
-use editor_view::{PanelKind, PanelPlacement, ViewState};
+use editor_view::panels::PanelKind;
+
+use editor_view::panels::PanelPlacement;
+
+use editor_view::viewport::ViewState;
 use egui::{Pos2, Rect};
 
 /// Paint all registered panels into the strips reserved at the top and
@@ -42,16 +46,23 @@ pub fn paint_panels(
                 r
             }
         };
+        let mut pp = PanelPainter { ui, view };
         match &panel.kind {
-            PanelKind::Search => paint_search_panel(ui, view, rect),
-            PanelKind::Label(text) => paint_label_panel(ui, rect, text.as_str()),
+            PanelKind::Search => pp.paint_search_panel(rect),
+            PanelKind::Label(text) => pp.paint_label_panel(rect, text.as_str()),
         }
     }
 }
 
-fn paint_label_panel(ui: &mut egui::Ui, rect: Rect, text: &str) {
-    let visuals = ui.visuals().clone();
-    let painter = ui.painter_at(rect);
+struct PanelPainter<'a, 'b> {
+    ui: &'a mut egui::Ui,
+    view: &'b mut ViewState,
+}
+
+impl<'a, 'b> PanelPainter<'a, 'b> {
+fn paint_label_panel(&mut self, rect: Rect, text: &str) {
+    let visuals = self.ui.visuals().clone();
+    let painter = self.ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, visuals.faint_bg_color);
     painter.text(
         Pos2::new(rect.left() + 8.0, rect.center().y),
@@ -62,24 +73,27 @@ fn paint_label_panel(ui: &mut egui::Ui, rect: Rect, text: &str) {
     );
 }
 
-fn paint_search_panel(ui: &mut egui::Ui, view: &mut ViewState, rect: Rect) {
-    let visuals = ui.visuals().clone();
-    let painter = ui.painter_at(rect);
+fn paint_search_panel(&mut self, rect: Rect) {
+    let visuals = self.ui.visuals().clone();
+    let painter = self.ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, visuals.window_fill);
     painter.line_segment(
         [Pos2::new(rect.left(), rect.top()), Pos2::new(rect.right(), rect.top())],
         egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.5)),
     );
 
-    let mut child = ui.new_child(
+    let mut child = self.ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(egui::vec2(6.0, 4.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    search_panel_widgets(&mut child, view);
+    let mut sub = PanelPainter { ui: &mut child, view: self.view };
+    sub.search_panel_widgets();
 }
 
-fn search_panel_widgets(ui: &mut egui::Ui, view: &mut ViewState) {
+fn search_panel_widgets(&mut self) {
+    let ui = &mut *self.ui;
+    let view = &mut *self.view;
     let query_resp = ui.add(
         egui::TextEdit::singleline(&mut view.search.query)
             .desired_width(140.0)
@@ -128,4 +142,5 @@ fn search_panel_widgets(ui: &mut egui::Ui, view: &mut ViewState) {
     // Enter inside the query field is a no-op here; the host re-runs search
     // each frame from `view.search.query` when it changes.
     let _ = query_resp;
+}
 }

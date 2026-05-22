@@ -7,7 +7,7 @@
 //! `Arc<Staging>` handles. Consumers (activity detail page, status-bar
 //! version dropdown, queue-bar combined badge) call one of `list` /
 //! `list_for_path` / `count` and render directly off the unified
-//! `ActivityItem` DTO.
+//! `Item` DTO.
 //
 // status: activity-feed-merged
 // status: activity-feed-module
@@ -22,11 +22,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::changes::{ChangeOp, ChangeRow, Changes, ChangesError};
-use crate::staging::{Proposal, Staging, StagingError, StagingFilter};
+use crate::changes::{ChangeOp, ChangeRow, Changes, Error as ChangesError};
+use crate::staging::error::Error as StagingError;
+use crate::staging::types::Filter as StagingFilter;
+use crate::staging::Staging;
 
 #[derive(Debug, Error)]
-pub enum ActivityError {
+pub enum Error {
     #[error("changes: {0}")]
     Changes(#[from] ChangesError),
     #[error("staging: {0}")]
@@ -40,7 +42,7 @@ pub enum ActivityError {
 /// unified envelope. `Merged` runs both and interleaves by timestamp.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActivitySource {
+pub enum Source {
     ChangesOnly,
     StagingOnly,
     #[default]
@@ -48,9 +50,9 @@ pub enum ActivitySource {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ActivityFilter {
+pub struct Filter {
     #[serde(default)]
-    pub source: ActivitySource,
+    pub source: Source,
     pub limit: usize,
     /// Optional SQL LIKE pattern matched against `ChangeRow.author`
     /// (e.g. `agent:%`). Staging items match only the synthetic
@@ -62,10 +64,10 @@ pub struct ActivityFilter {
     pub since_ms: Option<i64>,
 }
 
-impl Default for ActivityFilter {
+impl Default for Filter {
     fn default() -> Self {
         Self {
-            source: ActivitySource::default(),
+            source: Source::default(),
             limit: 200,
             author_pattern: None,
             since_ms: None,
@@ -76,7 +78,7 @@ impl Default for ActivityFilter {
 /// Short label material — UI formats display strings off this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ActivitySummary {
+pub enum Summary {
     Change { op: ChangeOp },
     Staging { surface: String, action: String },
 }
@@ -84,7 +86,7 @@ pub enum ActivitySummary {
 /// Per-kind payload. Tagged enum so the frontend can switch on `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ActivityPayload {
+pub enum Payload {
     Change(ChangeRow),
     Staging(StagingItem),
 }
@@ -108,36 +110,15 @@ pub struct StagingItem {
     pub metadata: serde_json::Value,
 }
 
-impl StagingItem {
-    fn from_proposal(p: Proposal) -> Self {
-        let metadata = p.metadata.unwrap_or(serde_json::Value::Null);
-        let session_id = metadata
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        StagingItem {
-            id: p.id,
-            surface: p.surface,
-            action: p.action,
-            target_path: p.target_path,
-            trail_id: p.trail_id,
-            session_id,
-            content_hash: p.content_hash,
-            created_at_ms: p.created_at_ms,
-            metadata,
-        }
-    }
-}
-
 /// One row in the unified feed. Flat envelope (timestamp / path / author /
 /// summary) plus a per-kind payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivityItem {
+pub struct Item {
     pub timestamp_ms: i64,
     pub path: String,
     pub author: String,
-    pub summary: ActivitySummary,
-    pub payload: ActivityPayload,
+    pub summary: Summary,
+    pub payload: Payload,
 }
 
 /// Synthetic author stamped on staging items in the unified feed so
@@ -145,37 +126,14 @@ pub struct ActivityItem {
 /// client or surface produced the proposal.
 const STAGING_AUTHOR: &str = "pending";
 
-impl ActivityItem {
-    fn from_change(row: ChangeRow) -> Self {
-        ActivityItem {
-            timestamp_ms: row.timestamp_ms,
-            path: row.path.clone(),
-            author: row.author.clone(),
-            summary: ActivitySummary::Change { op: row.op },
-            payload: ActivityPayload::Change(row),
-        }
-    }
-
-    fn from_staging(item: StagingItem) -> Self {
-        ActivityItem {
-            timestamp_ms: item.created_at_ms,
-            path: item.target_path.clone(),
-            author: STAGING_AUTHOR.to_string(),
-            summary: ActivitySummary::Staging {
-                surface: item.surface.clone(),
-                action: item.action.clone(),
-            },
-            payload: ActivityPayload::Staging(item),
-        }
-    }
-
+impl Item {
     /// Stable tiebreaker for items with identical timestamps. Staging ids
     /// are ULIDs (string-sortable by timestamp); change ids are monotonic
     /// ints. We sort on a `(timestamp_ms desc, secondary desc)` key.
     fn sort_secondary(&self) -> String {
         match &self.payload {
-            ActivityPayload::Change(c) => format!("c:{:020}", c.id),
-            ActivityPayload::Staging(s) => format!("s:{}", s.id),
+            Payload::Change(c) => format!("c:{:020}", c.id),
+            Payload::Staging(s) => format!("s:{}", s.id),
         }
     }
 }
@@ -186,46 +144,46 @@ pub struct Activity {
 }
 
 impl Activity {
-    pub fn new(changes: Arc<Changes>, staging: Arc<Staging>) -> Self {
+    pub const fn new(changes: Arc<Changes>, staging: Arc<Staging>) -> Self {
         Self { changes, staging }
     }
 
     /// Merged listing across the whole vault.
-    pub fn list(&self, filter: ActivityFilter) -> Result<Vec<ActivityItem>, ActivityError> {
-        self.list_inner(filter, None)
+    pub fn list(&self, filter: &Filter) -> Result<Vec<Item>, Error> {
+        self.collect_items(filter, None)
     }
 
     /// Per-path variant — backs the editor status-bar version dropdown.
     pub fn list_for_path(
         &self,
         path: &str,
-        filter: ActivityFilter,
-    ) -> Result<Vec<ActivityItem>, ActivityError> {
-        self.list_inner(filter, Some(path.to_string()))
+        filter: &Filter,
+    ) -> Result<Vec<Item>, Error> {
+        self.collect_items(filter, Some(path))
     }
 
-    pub fn count(&self, filter: ActivityFilter) -> Result<u32, ActivityError> {
-        let items = self.list_inner(filter, None)?;
+    pub fn count(&self, filter: &Filter) -> Result<u32, Error> {
+        let items = self.collect_items(filter, None)?;
         Ok(items.len() as u32)
     }
 
-    fn list_inner(
+    fn collect_items(
         &self,
-        filter: ActivityFilter,
-        path: Option<String>,
-    ) -> Result<Vec<ActivityItem>, ActivityError> {
-        let mut out: Vec<ActivityItem> = Vec::new();
+        filter: &Filter,
+        path: Option<&str>,
+    ) -> Result<Vec<Item>, Error> {
+        let mut out: Vec<Item> = Vec::new();
 
         // Pull from changes when source allows it. The `pending` synthetic
         // author lives on staging only; if the caller restricts by
         // author_pattern to staging-only, skip the changes side.
         let wants_changes = matches!(
             filter.source,
-            ActivitySource::ChangesOnly | ActivitySource::Merged
-        ) && !is_pending_only_author(&filter.author_pattern);
+            Source::ChangesOnly | Source::Merged
+        ) && !matches!(filter.author_pattern.as_deref(), Some("pending"));
 
         if wants_changes {
-            let change_rows = match (&filter.author_pattern, &path) {
+            let change_rows = match (&filter.author_pattern, path) {
                 (Some(pat), Some(p)) => self
                     .changes
                     .history_for_path(p, filter.limit)?
@@ -236,25 +194,57 @@ impl Activity {
                 (None, Some(p)) => self.changes.history_for_path(p, filter.limit)?,
                 (None, None) => self.changes.recent(filter.limit)?,
             };
-            out.extend(change_rows.into_iter().map(ActivityItem::from_change));
+            out.extend(change_rows.into_iter().map(|row| Item {
+                timestamp_ms: row.timestamp_ms,
+                path: row.path.clone(),
+                author: row.author.clone(),
+                summary: Summary::Change { op: row.op },
+                payload: Payload::Change(row),
+            }));
         }
 
         let wants_staging = matches!(
             filter.source,
-            ActivitySource::StagingOnly | ActivitySource::Merged
-        ) && staging_author_matches(&filter.author_pattern);
+            Source::StagingOnly | Source::Merged
+        ) && match filter.author_pattern.as_deref() {
+            None => true,
+            Some(p) => sql_like_match(STAGING_AUTHOR, p),
+        };
 
         if wants_staging {
             let staging_filter = StagingFilter {
-                path: path.clone(),
+                path: path.map(String::from),
                 ..StagingFilter::default()
             };
             let proposals = self.staging.list(&staging_filter)?;
-            out.extend(
-                proposals
-                    .into_iter()
-                    .map(|p| ActivityItem::from_staging(StagingItem::from_proposal(p))),
-            );
+            out.extend(proposals.into_iter().map(|p| {
+                let metadata = p.metadata.unwrap_or(serde_json::Value::Null);
+                let session_id = metadata
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string);
+                let staging_item = StagingItem {
+                    id: p.id,
+                    surface: p.surface,
+                    action: p.action,
+                    target_path: p.target_path,
+                    trail_id: p.trail_id,
+                    session_id,
+                    content_hash: p.content_hash,
+                    created_at_ms: p.created_at_ms,
+                    metadata,
+                };
+                Item {
+                    timestamp_ms: staging_item.created_at_ms,
+                    path: staging_item.target_path.clone(),
+                    author: STAGING_AUTHOR.to_string(),
+                    summary: Summary::Staging {
+                        surface: staging_item.surface.clone(),
+                        action: staging_item.action.clone(),
+                    },
+                    payload: Payload::Staging(staging_item),
+                }
+            }));
         }
 
         if let Some(since) = filter.since_ms {
@@ -271,22 +261,6 @@ impl Activity {
             out.truncate(filter.limit);
         }
         Ok(out)
-    }
-}
-
-/// Returns true when the author_pattern targets only the synthetic
-/// `pending` author used for staging items. `recent_by_author` would
-/// always return zero rows, so we skip the changes query entirely.
-fn is_pending_only_author(pattern: &Option<String>) -> bool {
-    matches!(pattern.as_deref(), Some("pending"))
-}
-
-/// Does the author_pattern allow the synthetic `pending` staging author?
-/// `None` → yes; otherwise SQL LIKE match.
-fn staging_author_matches(pattern: &Option<String>) -> bool {
-    match pattern.as_deref() {
-        None => true,
-        Some(p) => sql_like_match(STAGING_AUTHOR, p),
     }
 }
 
@@ -320,7 +294,7 @@ fn like(s: &[u8], p: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::changes::ChangeAppend;
-    use crate::staging::ProposalInput;
+    use crate::staging::types::ProposalInput;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, Arc<Changes>, Arc<Staging>, Activity) {
@@ -349,7 +323,7 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: "chat".into(),
                 action: "write_note".into(),
                 target_path: "b.md".into(),
@@ -361,8 +335,8 @@ mod tests {
             })
             .unwrap();
         let items = act
-            .list(ActivityFilter {
-                source: ActivitySource::Merged,
+            .list(&Filter {
+                source: Source::Merged,
                 limit: 50,
                 author_pattern: None,
                 since_ms: None,
@@ -370,8 +344,8 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 2);
         // staging is newer → first
-        assert!(matches!(items[0].payload, ActivityPayload::Staging(_)));
-        assert!(matches!(items[1].payload, ActivityPayload::Change(_)));
+        assert!(matches!(items[0].payload, Payload::Staging(_)));
+        assert!(matches!(items[1].payload, Payload::Change(_)));
     }
 
     #[test]
@@ -389,7 +363,7 @@ mod tests {
             })
             .unwrap();
         staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: "chat".into(),
                 action: "write_note".into(),
                 target_path: "a.md".into(),
@@ -401,19 +375,19 @@ mod tests {
             })
             .unwrap();
         let only_changes = act
-            .list(ActivityFilter {
-                source: ActivitySource::ChangesOnly,
+            .list(&Filter {
+                source: Source::ChangesOnly,
                 limit: 50,
                 author_pattern: None,
                 since_ms: None,
             })
             .unwrap();
         assert_eq!(only_changes.len(), 1);
-        assert!(matches!(only_changes[0].payload, ActivityPayload::Change(_)));
+        assert!(matches!(only_changes[0].payload, Payload::Change(_)));
 
         let only_staging = act
-            .list(ActivityFilter {
-                source: ActivitySource::StagingOnly,
+            .list(&Filter {
+                source: Source::StagingOnly,
                 limit: 50,
                 author_pattern: None,
                 since_ms: None,
@@ -422,7 +396,7 @@ mod tests {
         assert_eq!(only_staging.len(), 1);
         assert!(matches!(
             only_staging[0].payload,
-            ActivityPayload::Staging(_)
+            Payload::Staging(_)
         ));
     }
 
@@ -442,7 +416,7 @@ mod tests {
                 })
                 .unwrap();
             staging
-                .propose(ProposalInput {
+                .propose(&ProposalInput {
                     surface: "chat".into(),
                     action: "write_note".into(),
                     target_path: (*p).into(),
@@ -455,7 +429,7 @@ mod tests {
                 .unwrap();
         }
         let items = act
-            .list_for_path("a.md", ActivityFilter::default())
+            .list_for_path("a.md", &Filter::default())
             .unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| i.path == "a.md"));
@@ -476,7 +450,7 @@ mod tests {
             })
             .unwrap();
         staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: "chat".into(),
                 action: "write_note".into(),
                 target_path: "a.md".into(),
@@ -488,22 +462,22 @@ mod tests {
             })
             .unwrap();
         let items = act
-            .list(ActivityFilter {
-                source: ActivitySource::Merged,
+            .list(&Filter {
+                source: Source::Merged,
                 limit: 50,
                 author_pattern: Some("pending".into()),
                 since_ms: None,
             })
             .unwrap();
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0].payload, ActivityPayload::Staging(_)));
+        assert!(matches!(items[0].payload, Payload::Staging(_)));
     }
 
     #[test]
     fn session_id_projected_from_metadata() {
         let (_d, _c, staging, act) = setup();
         staging
-            .propose(ProposalInput {
+            .propose(&ProposalInput {
                 surface: "chat".into(),
                 action: "write_note".into(),
                 target_path: "a.md".into(),
@@ -515,14 +489,14 @@ mod tests {
             })
             .unwrap();
         let items = act
-            .list(ActivityFilter {
-                source: ActivitySource::StagingOnly,
+            .list(&Filter {
+                source: Source::StagingOnly,
                 limit: 50,
                 author_pattern: None,
                 since_ms: None,
             })
             .unwrap();
-        let ActivityPayload::Staging(s) = &items[0].payload else {
+        let Payload::Staging(s) = &items[0].payload else {
             panic!("expected staging");
         };
         assert_eq!(s.session_id.as_deref(), Some("s42"));

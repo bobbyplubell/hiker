@@ -1,7 +1,7 @@
 //! Shared types for `core::trees`. Pure data — no rusqlite, no SQL.
 //!
 //! Every public type the rest of the crate consumes lives here. The
-//! `Trees` struct's internals (the `rusqlite::Connection` mutex) are
+//! `Db` struct's internals (the `rusqlite::Connection` mutex) are
 //! kept private to the `trees` module; see `super::storage` for the
 //! constructor.
 
@@ -10,12 +10,14 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cluster::{Algorithm, LeidenParams, SummarizeMode};
+
 /// Bumped only when on-disk schema changes. Pre-1.0 policy: a mismatch
 /// is an error; delete `.hiker/trees.db` and rebuild.
 pub const SCHEMA_VERSION: i32 = 1;
 
 #[derive(Debug, thiserror::Error)]
-pub enum TreesError {
+pub enum Error {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
@@ -32,9 +34,9 @@ pub enum TreesError {
     Poisoned,
 }
 
-impl From<TreesError> for crate::error::HikerError {
-    fn from(e: TreesError) -> Self {
-        crate::error::HikerError::Io(e.to_string())
+impl From<Error> for crate::errors::HikerError {
+    fn from(e: Error) -> Self {
+        crate::errors::HikerError::Io(e.to_string())
     }
 }
 
@@ -53,19 +55,11 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             NodeKind::Cluster => "cluster",
             NodeKind::Leaf => "leaf",
             NodeKind::OutlierBucket => "outlier-bucket",
-        }
-    }
-    pub(super) fn parse(s: &str) -> Option<Self> {
-        match s {
-            "cluster" => Some(NodeKind::Cluster),
-            "leaf" => Some(NodeKind::Leaf),
-            "outlier-bucket" => Some(NodeKind::OutlierBucket),
-            _ => None,
         }
     }
 }
@@ -180,12 +174,12 @@ pub struct HistoryEntry {
 
 // ── Ops-framework types ───────────────────────────────────────────────
 //
-// `Trees::split_cluster` / `Trees::plan_summarize_sweep` /
-// `Trees::apply_rollup` form the three "Operations framework" ops per
+// `Db::split_cluster` / `Db::plan_summarize_sweep` /
+// `Db::apply_rollup` form the three "Operations framework" ops per
 // `clustering.md`'s ops-framework section. Each carries its own
 // param / outcome struct.
 
-/// Output of `Trees::split_cluster`. Per `cluster-op-split`.
+/// Output of `Db::split_cluster`. Per `cluster-op-split`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitOutcome {
     pub new_clusters: Vec<NodeId>,
@@ -197,7 +191,7 @@ pub struct SplitOutcome {
     pub outliers: Vec<NoteId>,
 }
 
-/// Scope discriminator for `Trees::plan_summarize_sweep`. Per
+/// Scope discriminator for `Db::plan_summarize_sweep`. Per
 /// `cluster-op-summarize-sweep`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -211,7 +205,7 @@ pub enum SummarizeScope {
     Subset { ids: Vec<NodeId> },
 }
 
-/// Params for `Trees::plan_summarize_sweep`. Per `cluster-op-summarize-sweep`.
+/// Params for `Db::plan_summarize_sweep`. Per `cluster-op-summarize-sweep`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizeParams {
     pub scope: SummarizeScope,
@@ -224,22 +218,22 @@ pub struct SummarizeParams {
     pub recursive: bool,
     /// Carried through to the per-cluster `RaptorSummarize` task. The
     /// queue's existing summarize worker reads it from the task payload;
-    /// kept on the params struct so callers can pass it through `Trees`.
+    /// kept on the params struct so callers can pass it through `Db`.
     #[serde(default)]
-    pub summarize_mode: crate::cluster::SummarizeMode,
+    pub summarize_mode: SummarizeMode,
     /// Default `false` — user-edited rows are preserved unless this
     /// flag is explicitly opted-into.
     #[serde(default)]
     pub overwrite_user_edited: bool,
 }
 
-fn default_summarize_recursive() -> bool {
+const fn default_summarize_recursive() -> bool {
     true
 }
 
-/// Submission plan returned by `Trees::plan_summarize_sweep`. The
+/// Submission plan returned by `Db::plan_summarize_sweep`. The
 /// caller consumes this and performs the actual queue submission (the
-/// queue API is async; `Trees` stays sync per module discipline).
+/// queue API is async; `Db` stays sync per module discipline).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizePlan {
     pub tree_id: TreeId,
@@ -253,26 +247,26 @@ pub struct SummarizePlan {
     pub skipped_fresh: Vec<NodeId>,
 }
 
-/// Params for `Trees::apply_rollup`. Per `cluster-op-rollup`.
+/// Params for `Db::apply_rollup`. Per `cluster-op-rollup`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollupParams {
     pub input_node_ids: Vec<NodeId>,
     #[serde(default)]
-    pub algorithm: crate::cluster::ClusterAlgorithm,
+    pub algorithm: Algorithm,
     #[serde(default)]
-    pub leiden: crate::cluster::LeidenParams,
+    pub leiden: LeidenParams,
     #[serde(default = "default_rollup_min_cluster_size")]
     pub min_cluster_size: u32,
     #[serde(default)]
     pub new_layer_name_pattern: Option<String>,
 }
 
-fn default_rollup_min_cluster_size() -> u32 {
+const fn default_rollup_min_cluster_size() -> u32 {
     2
 }
 
-/// Per-input shape produced by `Trees::validate_rollup_inputs` and
-/// consumed by `Trees::apply_rollup`. Carries the summary text the
+/// Per-input shape produced by `Db::validate_rollup_inputs` and
+/// consumed by `Db::apply_rollup`. Carries the summary text the
 /// caller embeds + the prior parent so the history snapshot can undo.
 #[derive(Debug, Clone)]
 pub struct RollupInput {
@@ -281,7 +275,7 @@ pub struct RollupInput {
     pub prior_parent: Option<NodeId>,
 }
 
-/// Output of `Trees::apply_rollup`. Per `cluster-op-rollup`. The
+/// Output of `Db::apply_rollup`. Per `cluster-op-rollup`. The
 /// `Refused` variant carries the reason as a static string so the UI
 /// can surface it verbatim without consulting a translation table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,7 +289,7 @@ pub enum RollupOutcome {
 /// connection under a mutex (mirrors `core::staging`'s shape — the
 /// concurrency profile is "infrequent user edits," not the high-throughput
 /// indexer drain `core::store` is tuned for).
-pub struct Trees {
+pub struct Db {
     pub(super) conn: Mutex<rusqlite::Connection>,
     pub(super) db_path: PathBuf,
 }

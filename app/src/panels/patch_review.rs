@@ -88,7 +88,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{}  · {}  · {}",
-                                        short_id(&p.id),
+                                        &p.id[..p.id.len().min(8)],
                                         p.surface,
                                         p.action,
                                     ))
@@ -101,10 +101,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                         .monospace(),
                                 );
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "created {}",
-                                        fmt_ts_ms(p.created_at_ms),
-                                    ))
+                                    egui::RichText::new({
+                                        // chrono not in deps; print raw ms as
+                                        // a short HH:MM:SS readable form.
+                                        let secs = p.created_at_ms / 1000;
+                                        let m = (secs / 60) % 60;
+                                        let h = (secs / 3600) % 24;
+                                        let s = secs % 60;
+                                        format!("created {:02}:{:02}:{:02}", h, m, s)
+                                    })
                                     .color(theme::muted())
                                     .small(),
                                 );
@@ -115,7 +120,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                     if ui
                                         .add(
                                             egui::Button::image_and_text(
-                                                crate::icons::primary_check(),
+                                                crate::icons::ICONS.primary_check(),
                                                 egui::RichText::new("Accept")
                                                     .color(egui::Color32::WHITE),
                                             )
@@ -130,7 +135,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                     if ui
                                         .add(
                                             egui::Button::image_and_text(
-                                                crate::icons::primary_cross(),
+                                                crate::icons::ICONS.primary_cross(),
                                                 egui::RichText::new("Reject")
                                                     .color(egui::Color32::WHITE),
                                             )
@@ -157,7 +162,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         });
 
     if let Some((proposal_id, target_path)) = to_view {
-        open_singleton(app, TabKind::staging_preview(proposal_id, target_path));
+        app.open_singleton_tab(TabKind::staging_preview(proposal_id, target_path));
     }
     if let Some(id) = to_accept {
         match staging.accept(&id, &app.vault_session.vault, Some(changes.as_ref())) {
@@ -181,7 +186,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         }
     }
     if accept_all {
-        let filter = hiker_core::staging::StagingFilter::default();
+        let filter = hiker_core::staging::types::Filter::default();
         match staging.accept_all(&filter, &app.vault_session.vault, Some(changes.as_ref())) {
             Ok(outcomes) => app.push_toast(
                 format!("Accepted {} proposal(s)", outcomes.len()),
@@ -204,24 +209,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     }
 }
 
-fn short_id(id: &str) -> &str {
-    &id[..id.len().min(8)]
-}
-
-fn fmt_ts_ms(ms: i64) -> String {
-    // Minimal "HH:MM:SS" style relative to local — chrono not in deps, so
-    // we just print the raw ms divided into a short readable form.
-    let secs = ms / 1000;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
-}
-
-fn open_singleton(state: &mut AppState, kind: TabKind) {
-    // Match toolbar's open_singleton_tab semantics: by discriminant, except
-    // for staging-proposal previews which carry a payload — there we keep
-    // one tab per proposal_id.
+impl AppState {
+    /// Match the toolbar's open-singleton semantics: focus an existing tab
+    /// by discriminant, except for staging-proposal previews which carry a
+    /// payload — there we keep one tab per `proposal_id`.
+    fn open_singleton_tab(&mut self, kind: TabKind) {
+    let state = self;
     if let TabKind::Editor {
         buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
         ..
@@ -247,4 +240,5 @@ fn open_singleton(state: &mut AppState, kind: TabKind) {
         sticky: true,
     });
     state.session.active_tab = Some(id);
+    }
 }

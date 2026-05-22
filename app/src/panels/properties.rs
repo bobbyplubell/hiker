@@ -24,7 +24,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     // last_accessed_at, change count, skipped state). The read store may be
     // offline (vault not yet indexed) in which case the rows below are
     // simply omitted.
-    let props: Option<hiker_core::store::NoteProperties> = app
+    let props: Option<hiker_core::store::dto::NoteProperties> = app
         .vault_session.services.read_store
         .lock()
         .ok()
@@ -39,6 +39,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         Some(b) => b.current_text(),
         None => app.vault_session.vault.read_file(path).unwrap_or_default(),
     };
+
+    let view = View { app };
 
     egui::Grid::new("props-fs")
         .num_columns(2)
@@ -61,7 +63,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                 let s = m
                     .modified()
                     .ok()
-                    .map(format_systime)
+                    .map(|t| view.format_systime(t))
                     .unwrap_or_else(|| "(unknown)".to_string());
                 ui.label(s);
                 ui.end_row();
@@ -88,12 +90,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
             ui.label(format!("{}", lc));
             ui.end_row();
 
-            let outgoing = count_outgoing_wikilinks(&body);
+            let outgoing = view.count_outgoing_wikilinks(&body);
             ui.label("outgoing links:");
             ui.label(format!("{}", outgoing));
             ui.end_row();
 
-            let (inbound, capped) = estimate_inbound(app, &basename);
+            let (inbound, capped) = view.estimate_inbound(&basename);
             ui.label("inbound links:");
             ui.label(if capped {
                 format!(">={}", inbound)
@@ -113,7 +115,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                 }
                 if let Some(h) = &p.content_hash {
                     ui.label("content hash:");
-                    ui.label(egui::RichText::new(short_hash(h)).monospace());
+                    ui.label(egui::RichText::new(view.short_hash(h)).monospace());
                     ui.end_row();
                 }
                 if let Some(c) = p.chunk_count {
@@ -158,7 +160,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         });
 
     // Frontmatter section. Only render if we parsed at least one key.
-    if let Some(pairs) = parse_frontmatter(&body)
+    if let Some(pairs) = view.parse_frontmatter(&body)
         && !pairs.is_empty()
     {
         ui.add_space(12.0);
@@ -203,7 +205,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
 
     // Cluster membership: walk the persisted trees and surface the
     // (tree, cluster) pairs this note belongs to via its leaf rows.
-    let cluster_hits = cluster_memberships(app, path);
+    let cluster_hits = view.cluster_memberships(path);
     if !cluster_hits.is_empty() {
         ui.add_space(12.0);
         ui.label(egui::RichText::new("Clusters").strong());
@@ -225,8 +227,17 @@ struct ClusterMembership {
     cluster_label: String,
 }
 
-fn cluster_memberships(app: &AppState, path: &str) -> Vec<ClusterMembership> {
-    use hiker_core::trees::NodeKind;
+/// Read-only render context for the properties tab. Bundles `&AppState`
+/// so the metadata helpers are inherent methods rather than a row of
+/// single-use free functions.
+struct View<'a> {
+    app: &'a AppState,
+}
+
+impl View<'_> {
+    fn cluster_memberships(&self, path: &str) -> Vec<ClusterMembership> {
+    use hiker_core::trees::types::NodeKind;
+    let app = self.app;
     let trees = app.vault_session.services.trees.as_ref();
     let store_mutex = app.vault_session.services.read_store.as_ref();
     // Resolve path → note_id via the read store. Without an id we can't
@@ -248,7 +259,7 @@ fn cluster_memberships(app: &AppState, path: &str) -> Vec<ClusterMembership> {
         let Ok(nodes) = trees.list_nodes(&tree.id) else {
             continue;
         };
-        let nodes_by_id: std::collections::HashMap<&str, &hiker_core::trees::EditableNode> =
+        let nodes_by_id: std::collections::HashMap<&str, &hiker_core::trees::types::EditableNode> =
             nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         for n in &nodes {
             if !matches!(n.kind, NodeKind::Leaf) {
@@ -277,11 +288,12 @@ fn cluster_memberships(app: &AppState, path: &str) -> Vec<ClusterMembership> {
         }
     }
     out
-}
+    }
 
-fn short_hash(h: &str) -> String {
-    let n = h.len().min(16);
-    h[..n].to_string()
+    fn short_hash(&self, h: &str) -> String {
+        let n = h.len().min(16);
+        h[..n].to_string()
+    }
 }
 
 /// Format a Unix epoch value as a local date-time string. The legacy DTO
@@ -300,7 +312,8 @@ fn format_unix_ms(t: i64) -> String {
     odt.format(fmt).unwrap_or_else(|_| "(format failed)".to_string())
 }
 
-fn format_systime(t: SystemTime) -> String {
+impl View<'_> {
+    fn format_systime(&self, t: SystemTime) -> String {
     use time::OffsetDateTime;
     use time::macros::format_description;
     let Ok(d) = t.duration_since(SystemTime::UNIX_EPOCH) else {
@@ -311,11 +324,11 @@ fn format_systime(t: SystemTime) -> String {
     };
     let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
     odt.format(fmt).unwrap_or_else(|_| "(format failed)".to_string())
-}
+    }
 
-/// Count `[[…]]` wikilinks in `body`. Mirrors the regex
-/// `\[\[([^\]|]+)` but written by hand since `app` has no `regex` dep.
-fn count_outgoing_wikilinks(body: &str) -> usize {
+    /// Count `[[…]]` wikilinks in `body`. Mirrors the regex
+    /// `\[\[([^\]|]+)` but written by hand since `app` has no `regex` dep.
+    fn count_outgoing_wikilinks(&self, body: &str) -> usize {
     let bytes = body.as_bytes();
     let mut count = 0;
     let mut i = 0;
@@ -341,13 +354,14 @@ fn count_outgoing_wikilinks(body: &str) -> usize {
         }
     }
     count
-}
+    }
 
-/// Scan the vault for `[[basename]]` references. Bounded effort — we stop
-/// after `MAX_FILES` files or `MAX_HITS` matches and signal "capped" so the
-/// caller can render `≥N`. The basename is matched without its `.md` ext
-/// since wikilinks are typically extensionless.
-fn estimate_inbound(app: &AppState, basename: &str) -> (usize, bool) {
+    /// Scan the vault for `[[basename]]` references. Bounded effort — we stop
+    /// after `MAX_FILES` files or `MAX_HITS` matches and signal "capped" so the
+    /// caller can render `≥N`. The basename is matched without its `.md` ext
+    /// since wikilinks are typically extensionless.
+    fn estimate_inbound(&self, basename: &str) -> (usize, bool) {
+    let app = self.app;
     const MAX_FILES: usize = 500;
     const MAX_HITS: usize = 50;
 
@@ -379,7 +393,7 @@ fn estimate_inbound(app: &AppState, basename: &str) -> (usize, bool) {
                 stack.push(p);
                 continue;
             }
-            if !is_md(&p) {
+            if !self.is_md(&p) {
                 continue;
             }
             scanned += 1;
@@ -409,18 +423,18 @@ fn estimate_inbound(app: &AppState, basename: &str) -> (usize, bool) {
         }
     }
     (hits, capped)
-}
+    }
 
-fn is_md(p: &Path) -> bool {
-    p.extension()
-        .map(|e| e.eq_ignore_ascii_case("md"))
-        .unwrap_or(false)
-}
+    fn is_md(&self, p: &Path) -> bool {
+        p.extension()
+            .map(|e| e.eq_ignore_ascii_case("md"))
+            .unwrap_or(false)
+    }
 
-/// Parse a YAML frontmatter block at the head of `body`, formatted as
-/// `---\n…\n---\n`. Returns a flat list of stringified key/value pairs;
-/// nested structures are rendered via `serde_yml` default formatting.
-fn parse_frontmatter(body: &str) -> Option<Vec<(String, String)>> {
+    /// Parse a YAML frontmatter block at the head of `body`, formatted as
+    /// `---\n…\n---\n`. Returns a flat list of stringified key/value pairs;
+    /// nested structures are rendered via `serde_yml` default formatting.
+    fn parse_frontmatter(&self, body: &str) -> Option<Vec<(String, String)>> {
     let rest = body.strip_prefix("---\n")?;
     let end = rest.find("\n---\n").or_else(|| rest.find("\n---"))?;
     let yaml = &rest[..end];
@@ -442,4 +456,5 @@ fn parse_frontmatter(body: &str) -> Option<Vec<(String, String)>> {
         out.push((k_str, v_str));
     }
     Some(out)
+    }
 }

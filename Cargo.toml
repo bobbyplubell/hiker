@@ -16,8 +16,10 @@ members = [
     "editor/examples/diff",
     "egui-workbench",
     "egui-workbench/examples/workbench-demo",
+    "site",
     "tools/graph-snapshot",
     "tools/profile-indexer",
+    "widgets/graph-widgets",
 ]
 
 [workspace.package]
@@ -86,6 +88,7 @@ eframe = { version = "0.32", default-features = false, features = ["default_font
 egui_dock = "0.17"
 egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { path = "egui-workbench" }
+graph-widgets = { path = "widgets/graph-widgets" }
 petgraph = { version = "0.6", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }

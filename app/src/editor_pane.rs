@@ -21,10 +21,10 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
 
     // If the path is already an open tab, focus it and (if it was preview
     // and the request is sticky) promote it.
-    if let Some(existing_id) = find_buffer_tab(state, rel) {
+    if let Some(existing_id) = state.find_buffer_tab(rel) {
         state.session.active_tab = Some(existing_id);
         if sticky && state.session.preview_tab == Some(existing_id) {
-            promote_preview(state);
+            state.promote_preview();
         }
         return;
     }
@@ -36,7 +36,7 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
                 let cfg_guard = state.vault_session.config.read().ok();
                 let mut buf = Buffer::with_config_and_vault(
                     rel.to_string(),
-                    contents,
+                    &contents,
                     hash,
                     cfg_guard.as_deref(),
                     Some(state.vault_session.vault.clone()),
@@ -92,14 +92,73 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     }
 }
 
-fn find_buffer_tab(state: &AppState, rel: &str) -> Option<TabId> {
-    state.session.tabs.iter().find_map(|t| {
+impl AppState {
+    fn find_buffer_tab(&self, rel: &str) -> Option<TabId> {
+    self.session.tabs.iter().find_map(|t| {
         if t.kind.vault_path() == Some(rel) && t.kind.diff_source().is_none() {
             Some(t.id)
         } else {
             None
         }
     })
+    }
+}
+
+/// Load a read-only preview buffer (snapshot blob / staging proposal /
+/// trash entry) into `state.session.buffers` under its composite key.
+/// Idempotent: re-calling for the same source is a no-op once loaded.
+/// Returns the storage key callers use to look the buffer up later.
+pub fn ensure_readonly_buffer_loaded(
+    state: &mut AppState,
+    source: &crate::tab::BufferSource,
+) -> Option<String> {
+    use crate::tab::BufferSource;
+    let key = crate::buffer::buffer_key_for_source(source);
+    if state.session.buffers.contains_key(&key) {
+        return Some(key);
+    }
+    let contents = match source {
+        BufferSource::Snapshot { change_id, .. } => {
+            let id = change_id.parse::<i64>().ok()?;
+            let bytes = state
+                .vault_session
+                .services
+                .changes
+                .content_at(id)
+                .ok()
+                .flatten()?;
+            String::from_utf8(bytes).ok()?
+        }
+        BufferSource::StagingProposal { proposal_id, .. } => state
+            .vault_session
+            .services
+            .staging
+            .content(proposal_id)
+            .ok()?,
+        BufferSource::Trash { trash_path, .. } => std::fs::read_to_string(trash_path).ok()?,
+        BufferSource::Vault { .. } => return None,
+    };
+    let cfg_guard = state.vault_session.config.read().ok();
+    // Read-only buffer fronting a non-vault `BufferSource` (snapshot blob,
+    // staging proposal, trash entry). `read_only = true` no-ops editing
+    // commands; the save path already short-circuits non-`Vault` sources.
+    let buf = {
+        let path = source.path().to_string();
+        let hash = hiker_core::hash_string(&contents);
+        let mut buf = Buffer::with_config_and_vault(
+            path,
+            &contents,
+            hash,
+            cfg_guard.as_deref(),
+            Some(state.vault_session.vault.clone()),
+        );
+        buf.source = source.clone();
+        buf.view.read_only = true;
+        buf
+    };
+    drop(cfg_guard);
+    state.session.buffers.insert(key.clone(), buf);
+    Some(key)
 }
 
 /// Move the navigation cursor by `delta` (-1 = back, +1 = forward) and
@@ -128,13 +187,15 @@ pub fn nav_go(state: &mut AppState, delta: i32) {
     state.session.nav.locked = false;
 }
 
-/// Promote the current preview tab to sticky.
-pub fn promote_preview(state: &mut AppState) {
-    let Some(id) = state.session.preview_tab else { return };
-    if let Some(tab) = state.tab_by_id_mut(id) {
+impl AppState {
+    /// Promote the current preview tab to sticky.
+    pub fn promote_preview(&mut self) {
+    let Some(id) = self.session.preview_tab else { return };
+    if let Some(tab) = self.tab_by_id_mut(id) {
         tab.sticky = true;
     }
-    state.session.preview_tab = None;
+    self.session.preview_tab = None;
+    }
 }
 
 /// Save the buffer at `rel` to disk. Updates loaded_hash on success.
@@ -151,6 +212,11 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     let Some(buffer) = state.session.buffers.get(rel) else {
         return Err("buffer not found".to_string());
     };
+    // Read-only preview buffers (snapshot / staging / trash) have no save
+    // path — their verbs are Restore / Accept / Reject in the toolbar.
+    if !matches!(&buffer.source, crate::tab::BufferSource::Vault { .. }) {
+        return Ok(());
+    }
     if !buffer.is_dirty() {
         return Ok(());
     }
@@ -203,7 +269,7 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
             state.push_toast(format!("Saved {}", rel), ToastLevel::Info);
             Ok(())
         }
-        Err(hiker_core::error::HikerError::DiskDrift { .. }) => {
+        Err(hiker_core::errors::HikerError::DiskDrift { .. }) => {
             state.session.modal = Some(crate::state::Modal::DiskDrift {
                 path: rel.to_string(),
                 in_buffer_text: text,
@@ -214,10 +280,12 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     }
 }
 
+impl AppState {
 /// Force-overwrite a drifted file: re-read the current disk hash so the
 /// write-checked path accepts our text. Used by the "Keep mine" branch of
 /// the drift modal.
-pub fn force_save(state: &mut AppState, rel: &str, text: &str) -> Result<(), String> {
+pub fn force_save(&mut self, rel: &str, text: &str) -> Result<(), String> {
+    let state = self;
     // Re-read the on-disk hash so the second `write_file_checked` call
     // succeeds. If the file vanished entirely we still want to write.
     let pre_state = state.vault_session.vault.read_file_with_hash(rel).ok();
@@ -258,6 +326,7 @@ pub fn force_save(state: &mut AppState, rel: &str, text: &str) -> Result<(), Str
     state.push_toast(format!("Saved {} (forced)", rel), ToastLevel::Info);
     Ok(())
 }
+}
 
 /// Reload a buffer from disk, discarding the user's in-buffer edits. Used
 /// by the "Take theirs" branch of the drift modal.
@@ -270,7 +339,7 @@ pub fn reload_from_disk(state: &mut AppState, rel: &str) -> Result<(), String> {
     let cfg_guard = state.vault_session.config.read().ok();
     let buf = crate::buffer::Buffer::with_config_and_vault(
         rel.to_string(),
-        contents,
+        &contents,
         hash,
         cfg_guard.as_deref(),
         Some(state.vault_session.vault.clone()),
@@ -302,7 +371,7 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
     }
 
     // If no other tab references this buffer, drop it from memory.
-    if let Some(path) = removed.kind.vault_path().map(|p| p.to_string()) {
+    if let Some(path) = removed.kind.vault_path().map(std::string::ToString::to_string) {
         let still_open =
             state.session.tabs.iter().any(|t| t.kind.vault_path() == Some(&path));
         if !still_open {
@@ -310,21 +379,23 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
         }
     }
 
-    // Drop preview buffers for tabs that owned them. The diff / snapshot
-    // panels lazily inserted an `EditorState` (full Rope + history) keyed
-    // by `path` / `path::change_id`; without this they'd accumulate across
-    // the session.
-    if let crate::tab::TabKind::Editor { buffer, .. } = &removed.kind {
-        use crate::tab::BufferSource;
-        match buffer {
-            BufferSource::Vault { path } => {
-                state.panels.preview_buffers.remove(path);
-            }
-            BufferSource::Snapshot { path, change_id } => {
-                let key = format!("{}::{}", path, change_id);
-                state.panels.preview_buffers.remove(&key);
-            }
-            _ => {}
+    // Drop any read-only preview buffer this tab was the last referrer
+    // for. Vault buffers were already removed above by vault_path; this
+    // covers the snapshot / staging / trash buffers stored under the
+    // composite keys produced by `buffer_key_for_source`.
+    if let crate::tab::TabKind::Editor { buffer, .. } = &removed.kind
+        && !matches!(buffer, crate::tab::BufferSource::Vault { .. })
+    {
+        let key = crate::buffer::buffer_key_for_source(buffer);
+        let still_used = state.session.tabs.iter().any(|t| {
+            matches!(
+                &t.kind,
+                crate::tab::TabKind::Editor { buffer: b, .. }
+                    if crate::buffer::buffer_key_for_source(b) == key
+            )
+        });
+        if !still_used {
+            state.session.buffers.remove(&key);
         }
     }
 

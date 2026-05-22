@@ -6,7 +6,21 @@ use eframe::egui;
 use crate::editor_pane;
 use crate::state::{AppState, Modal, ToastLevel};
 
-pub fn show(ctx: &egui::Context, app: &mut AppState) {
+/// The display half of a confirm modal: the text shown and whether the
+/// confirm button uses the danger style. Bundled so `confirm_dialog`
+/// takes the prompt as one value, separate from the `ctx` it renders
+/// into and the `intent` it fires on accept.
+struct ConfirmPrompt {
+    title: String,
+    body: String,
+    confirm_label: String,
+    cancel_label: String,
+    danger: bool,
+}
+
+impl AppState {
+pub fn modal(&mut self, ctx: &egui::Context) {
+    let app = self;
     let Some(modal) = app.session.modal.take() else { return };
     match modal {
         Modal::Confirm {
@@ -17,42 +31,46 @@ pub fn show(ctx: &egui::Context, app: &mut AppState) {
             danger,
             intent,
         } => {
-            confirm_dialog(
+            app.confirm_dialog(
                 ctx,
-                app,
-                title,
-                body,
-                confirm_label,
-                cancel_label,
-                danger,
+                ConfirmPrompt {
+                    title,
+                    body,
+                    confirm_label,
+                    cancel_label,
+                    danger,
+                },
                 intent,
             );
         }
         Modal::DirtyClose { path, tab_id } => {
-            dirty_close_dialog(ctx, app, path, tab_id);
+            app.dirty_close_dialog(ctx, path, tab_id);
         }
         Modal::Recovery { entries } => {
-            recovery_dialog(ctx, app, entries);
+            app.recovery_dialog(ctx, entries);
         }
         Modal::ConfirmDelete { path } => {
-            confirm_delete_dialog(ctx, app, path);
+            app.confirm_delete_dialog(ctx, path);
         }
         Modal::DiskDrift { path, in_buffer_text } => {
-            disk_drift_dialog(ctx, app, path, in_buffer_text);
+            app.disk_drift_dialog(ctx, path, in_buffer_text);
         }
     }
+}
 }
 
 /// Resolve a `pre-write-drift-check` failure. Offers three branches that
 /// mirror the TS UI's drift modal: keep mine (force-overwrite), take
 /// theirs (reload from disk, discard local edits), or open the dirty-
 /// buffer diff so the user can merge by hand.
+impl AppState {
 fn disk_drift_dialog(
+    &mut self,
     ctx: &egui::Context,
-    app: &mut AppState,
     path: String,
     in_buffer_text: String,
 ) {
+    let app = self;
     #[derive(Clone, Copy)]
     enum Choice {
         KeepMine,
@@ -99,7 +117,7 @@ fn disk_drift_dialog(
 
     match decision {
         Some(Choice::KeepMine) => {
-            if let Err(err) = editor_pane::force_save(app, &path, &in_buffer_text) {
+            if let Err(err) = app.force_save(&path, &in_buffer_text) {
                 app.push_toast(
                     format!("Save failed: {err}"),
                     ToastLevel::Error,
@@ -134,9 +152,13 @@ fn disk_drift_dialog(
                 app.session.active_tab = Some(tab.id);
             } else {
                 let id = app.next_tab_id();
+                // Vault buffer with the on-disk diff already active.
                 app.session.tabs.push(Tab {
                     id,
-                    kind: TabKind::buffer_diff(p),
+                    kind: TabKind::Editor {
+                        buffer: BufferSource::Vault { path: p.clone() },
+                        diff: Some(DiffSource::Disk { path: p }),
+                    },
                     sticky: true,
                 });
                 app.session.active_tab = Some(id);
@@ -152,8 +174,11 @@ fn disk_drift_dialog(
         }
     }
 }
+}
 
-fn confirm_delete_dialog(ctx: &egui::Context, app: &mut AppState, path: String) {
+impl AppState {
+fn confirm_delete_dialog(&mut self, ctx: &egui::Context, path: String) {
+    let app = self;
     let mut decision: Option<bool> = None;
     let mut open = true;
     egui::Window::new("Delete note")
@@ -181,7 +206,7 @@ fn confirm_delete_dialog(ctx: &egui::Context, app: &mut AppState, path: String) 
         });
 
     match decision {
-        Some(true) => apply_confirm_delete(app, &path),
+        Some(true) => app.apply_confirm_delete(&path),
         Some(false) => {}
         None if !open => {}
         None => {
@@ -190,7 +215,8 @@ fn confirm_delete_dialog(ctx: &egui::Context, app: &mut AppState, path: String) 
     }
 }
 
-fn apply_confirm_delete(app: &mut AppState, rel: &str) {
+fn apply_confirm_delete(&mut self, rel: &str) {
+    let app = self;
     let store_mutex = app.vault_session.services.read_store.clone();
     let watcher = app.vault_session.services.watcher.clone();
     let trash = hiker_core::trash::Trash::open(&app.vault_session.vault_root);
@@ -227,18 +253,17 @@ fn apply_confirm_delete(app: &mut AppState, rel: &str) {
     app.session.sidebar.dir_cache.remove(parent);
     app.push_toast(format!("Moved {} to trash", rel), ToastLevel::Info);
 }
+}
 
-#[allow(clippy::too_many_arguments)]
+impl AppState {
 fn confirm_dialog(
+    &mut self,
     ctx: &egui::Context,
-    app: &mut AppState,
-    title: String,
-    body: String,
-    confirm_label: String,
-    cancel_label: String,
-    danger: bool,
+    prompt: ConfirmPrompt,
     intent: crate::state::ConfirmIntent,
 ) {
+    let ConfirmPrompt { title, body, confirm_label, cancel_label, danger } = prompt;
+    let app = self;
     let mut open = true;
     let mut decision: Option<bool> = None;
 
@@ -271,7 +296,7 @@ fn confirm_dialog(
         });
 
     match decision {
-        Some(true) => crate::state::apply_confirm(app, intent),
+        Some(true) => app.apply_confirm(intent),
         Some(false) | None if !open => {}
         _ => {
             // Reinsert the modal — user hasn't decided yet.
@@ -286,13 +311,16 @@ fn confirm_dialog(
         }
     }
 }
+}
 
+impl AppState {
 fn dirty_close_dialog(
+    &mut self,
     ctx: &egui::Context,
-    app: &mut AppState,
     path: String,
     tab_id: crate::tab::TabId,
 ) {
+    let app = self;
     let mut decision: Option<DirtyChoice> = None;
     let mut open = true;
 
@@ -356,6 +384,7 @@ fn dirty_close_dialog(
         }
     }
 }
+}
 
 enum DirtyChoice {
     Save,
@@ -363,11 +392,13 @@ enum DirtyChoice {
     Cancel,
 }
 
+impl AppState {
 fn recovery_dialog(
+    &mut self,
     ctx: &egui::Context,
-    app: &mut AppState,
     mut entries: Vec<hiker_core::autosave::RecoveredEntry>,
 ) {
+    let app = self;
     let mut bulk_decision: Option<BulkChoice> = None;
     let mut per_row: Vec<RowChoice> = Vec::new();
 
@@ -445,6 +476,7 @@ fn recovery_dialog(
         app.session.modal = Some(Modal::Recovery { entries });
     }
 }
+}
 
 enum BulkChoice {
     RestoreAll,
@@ -472,10 +504,13 @@ fn apply_restore(app: &mut AppState, entry: &hiker_core::autosave::RecoveredEntr
     // immediately marked dirty (current_hash != loaded_hash) and the user
     // sees an unsaved buffer they can Save or Revert.
     let on_disk_hash = entry.on_disk_hash.clone().unwrap_or_default();
-    let buffer = crate::buffer::Buffer::from_disk(
+    // Plain disk-backed buffer (no config / vault completion sources).
+    let buffer = crate::buffer::Buffer::with_config_and_vault(
         entry.path.clone(),
-        text,
+        &text,
         on_disk_hash,
+        None,
+        None,
     );
     app.session.buffers.insert(entry.path.clone(), buffer);
     crate::editor_pane::open_file(app, &entry.path, /* sticky */ true);

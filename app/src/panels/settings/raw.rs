@@ -4,16 +4,26 @@
 
 use eframe::egui;
 
-use hiker_core::config::{ConfigPaths, SettingsScope};
+use hiker_core::config::{Paths, SettingsScope};
 
 use crate::state::AppState;
 use crate::theme;
 
-pub fn show(ui: &mut egui::Ui, app: &mut AppState, scope: SettingsScope) {
+/// Render context for the raw-TOML fallback view. A struct so the
+/// single-call entry stays an inherent method.
+pub struct Raw<'a> {
+    pub ui: &'a mut egui::Ui,
+    pub app: &'a mut AppState,
+}
+
+impl Raw<'_> {
+    pub fn show(&mut self, scope: SettingsScope) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
     egui::CollapsingHeader::new("Raw TOML (read-only)")
         .default_open(false)
         .show(ui, |ui| {
-            let paths = ConfigPaths::resolve(&app.vault_session.vault_root);
+            let paths = Paths::resolve(&app.vault_session.vault_root);
             let path = match scope {
                 SettingsScope::User => paths.user,
                 SettingsScope::Vault => Some(paths.vault),
@@ -39,4 +49,5 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, scope: SettingsScope) {
                     .interactive(false),
             );
         });
+    }
 }

@@ -15,16 +15,16 @@ use eframe::egui;
 use crate::icons;
 use crate::state::AppState;
 use crate::theme;
-use crate::widgets::force_graph::{ForceGraphView, ZoomBounds};
-use crate::widgets::force_layout::{LayoutParams, LayoutWorker};
-use crate::widgets::graph_layouts::{
+use crate::widgets::force_graph::{View, ZoomBounds};
+use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::graph_layouts::{
     LayoutKind, LayoutTree, horizontal_tree_positions, radial_positions,
     vertical_tree_positions,
 };
 
 /// Persistent per-tree state. Held on `AppState`, not egui memory,
 /// because `LayoutWorker` isn't `Clone`.
-pub struct ClusterGraphState {
+pub struct ClusterGraph {
     /// Stable id list — `positions[i]` corresponds to `ids[i]`.
     pub ids: Vec<String>,
     pub id_index: HashMap<String, usize>,
@@ -34,7 +34,7 @@ pub struct ClusterGraphState {
     /// Force-directed layout worker; `Some` only when
     /// `layout_kind == ForceDirected`.
     pub layout_worker: Option<LayoutWorker>,
-    pub view: ForceGraphView,
+    pub view: View,
     pub show_labels: bool,
     pub show_edges: bool,
     pub show_leaves: bool,
@@ -52,7 +52,7 @@ pub struct ClusterGraphState {
     pub needs_fit: bool,
 }
 
-impl Default for ClusterGraphState {
+impl Default for ClusterGraph {
     fn default() -> Self {
         Self {
             ids: Vec::new(),
@@ -61,7 +61,7 @@ impl Default for ClusterGraphState {
             positions: Vec::new(),
             layout_kind: LayoutKind::Radial,
             layout_worker: None,
-            view: ForceGraphView::default(),
+            view: View::default(),
             show_labels: true,
             show_edges: true,
             show_leaves: true,
@@ -77,7 +77,8 @@ impl Default for ClusterGraphState {
 const FR_BOX: f32 = 800.0;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
-    ui.heading(format!("Cluster graph · {}", tree_id_short(tree_id)));
+    let short = &tree_id[..tree_id.len().min(8)];
+    ui.heading(format!("Cluster graph · {short}"));
 
     let trees = app.vault_session.services.trees.clone();
     let nodes = match trees.list_nodes(tree_id) {
@@ -119,8 +120,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
 pub fn show_with_nodes(
     ui: &mut egui::Ui,
     app: &mut AppState,
-    state_key: &str,
-    nodes: &[hiker_core::trees::EditableNode],
+    tree_id: &str,
+    nodes: &[hiker_core::trees::types::EditableNode],
     clickable_leaves: bool,
 ) {
     if nodes.is_empty() {
@@ -130,17 +131,19 @@ pub fn show_with_nodes(
         );
         return;
     }
-    show_with_nodes_inner(ui, app, state_key, nodes, clickable_leaves);
-}
-
-fn show_with_nodes_inner(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    tree_id: &str,
-    nodes: &[hiker_core::trees::EditableNode],
-    clickable_leaves: bool,
-) {
-    let shape_hash = shape_hash(nodes);
+    // Cheap shape fingerprint over the (id, parent) edges. Changes when
+    // nodes are added, removed, or re-parented; doesn't churn on summary/
+    // policy edits.
+    let shape_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        nodes.len().hash(&mut h);
+        for n in nodes {
+            n.id.hash(&mut h);
+            n.parent.hash(&mut h);
+        }
+        h.finish()
+    };
 
     // Ensure per-tree state exists and is fresh.
     {
@@ -149,7 +152,7 @@ fn show_with_nodes_inner(
             .entry(tree_id.to_string())
             .or_default();
         if entry.seeded_for != shape_hash {
-            seed_state(entry, nodes, shape_hash);
+            entry.seed(nodes, shape_hash);
             recompute_layout(entry);
         }
     }
@@ -160,7 +163,7 @@ fn show_with_nodes_inner(
         let state = app.panels.cluster_graph.get_mut(tree_id).unwrap();
         ui.horizontal_wrapped(|ui| {
             let prev_kind = state.layout_kind;
-            view_options_menu(ui, state);
+            state.view_options_menu(ui);
             if state.layout_kind != prev_kind {
                 relayout = true;
             }
@@ -228,7 +231,7 @@ fn show_with_nodes_inner(
         // panel to an off-screen layout. We refit a few times while the
         // force layout settles so the framing tracks the changing scale.
         let still_settling =
-            state.layout_worker.as_ref().is_some_and(|w| w.is_running());
+            state.layout_worker.as_ref().is_some_and(graph_widgets::force_layout::LayoutWorker::is_running);
         if state.needs_fit && !state.positions.is_empty() {
             state.view.fit_to_positions(&state.positions, rect, (0.005, 6.0));
             if !still_settling {
@@ -264,45 +267,76 @@ fn show_with_nodes_inner(
         }
     }
 
-    let hits = paint_nodes(
-        &painter,
+    let hits = PaintCtx {
+        painter: &painter,
         nodes,
-        &ids,
-        &positions,
+        ids: &ids,
+        positions: &positions,
         show_labels,
         show_leaves,
         zoom,
-        &resp,
-        &to_screen,
+        resp: &resp,
+        to_screen: &to_screen,
         app,
         clickable_leaves,
-    );
-    if let Some(path) = hits.clicked {
+    }
+    .paint_nodes();
+    if let Some(path) = hits.clicked.clone() {
         crate::editor_pane::open_file(app, &path, /*sticky=*/ true);
         update_selection(app, tree_id, path);
     }
 
-    // Hover-driven preview. For leaves we keep `selected_preview`'s
-    // file-content cache up to date (so the body text follows the
-    // cursor across leaves). For clusters there's no file to read —
-    // the card uses the node's in-memory summary directly.
-    let show_preview = app
-        .panels
-        .cluster_graph
-        .get(tree_id)
-        .map(|s| s.show_preview)
-        .unwrap_or(false);
-    if show_preview
-        && let Some(h) = hits.hovered.as_ref()
-        && let Some(path) = h.leaf_path.as_deref()
-    {
-        update_selection(app, tree_id, path.to_string());
-    }
+    app.render_cluster_preview(&painter, rect, tree_id, &hits);
 
-    if show_preview
-        && let Some(h) = hits.hovered.as_ref()
-    {
-        let cached_body = app
+    ui.add_space(4.0);
+    use hiker_core::trees::types::NodeKind;
+    ui.label(
+        egui::RichText::new(format!(
+            "{} nodes · {} clusters · {} leaves",
+            nodes.len(),
+            nodes
+                .iter()
+                .filter(|n| matches!(n.kind, NodeKind::Cluster))
+                .count(),
+            nodes
+                .iter()
+                .filter(|n| matches!(n.kind, NodeKind::Leaf))
+                .count(),
+        ))
+        .color(theme::muted())
+        .small(),
+    );
+}
+
+impl AppState {
+    /// Hover-driven preview card for the cluster graph. For leaves we keep
+    /// `selected_preview`'s file-content cache up to date (so the body text
+    /// follows the cursor across leaves). For clusters there's no file to
+    /// read — the card uses the node's in-memory summary directly.
+    fn render_cluster_preview(
+        &mut self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        tree_id: &str,
+        hits: &PaintHits,
+    ) {
+        let show_preview = self
+            .panels
+            .cluster_graph
+            .get(tree_id)
+            .map(|s| s.show_preview)
+            .unwrap_or(false);
+        if !show_preview {
+            return;
+        }
+        let Some(h) = hits.hovered.as_ref() else {
+            return;
+        };
+        if let Some(path) = h.leaf_path.as_deref() {
+            update_selection(self, tree_id, path.to_string());
+        }
+
+        let cached_body = self
             .panels
             .cluster_graph
             .get(tree_id)
@@ -343,85 +377,67 @@ fn show_with_nodes_inner(
             };
             (h.name.clone(), body)
         };
-        crate::panels::graph::paint_preview_card(&painter, rect, &title, &body, h.screen_pos);
+        crate::panels::graph::paint_preview_card(painter, rect, &title, &body, h.screen_pos);
+    }
+}
+
+impl ClusterGraph {
+    /// View-options popup. Mirrors the buffer pane's eye-icon menu so all
+    /// the per-view toggles live in one consistent place.
+    fn view_options_menu(&mut self, ui: &mut egui::Ui) {
+        let resp = ui
+            .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Eye)))
+            .on_hover_text("View options");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.label(egui::RichText::new("Layout").small().color(theme::muted()));
+            for kind in LayoutKind::all() {
+                let mut selected = self.layout_kind == kind;
+                if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
+                    self.layout_kind = kind;
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut self.show_labels, "Labels");
+            ui.checkbox(&mut self.show_edges, "Edges");
+            ui.checkbox(&mut self.show_leaves, "Leaves");
+            ui.checkbox(&mut self.show_preview, "Show note preview");
+        });
     }
 
-    ui.add_space(4.0);
-    use hiker_core::trees::NodeKind;
-    ui.label(
-        egui::RichText::new(format!(
-            "{} nodes · {} clusters · {} leaves",
-            nodes.len(),
-            nodes
-                .iter()
-                .filter(|n| matches!(n.kind, NodeKind::Cluster))
-                .count(),
-            nodes
-                .iter()
-                .filter(|n| matches!(n.kind, NodeKind::Leaf))
-                .count(),
-        ))
-        .color(theme::muted())
-        .small(),
-    );
-}
-
-/// View-options popup. Mirrors the buffer pane's eye-icon menu so all
-/// the per-view toggles live in one consistent place.
-fn view_options_menu(ui: &mut egui::Ui, state: &mut ClusterGraphState) {
-    let resp = ui
-        .add(egui::Button::image(icons::eye()))
-        .on_hover_text("View options");
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.label(egui::RichText::new("Layout").small().color(theme::muted()));
-        for kind in LayoutKind::all() {
-            let mut selected = state.layout_kind == kind;
-            if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
-                state.layout_kind = kind;
-            }
-        }
-        ui.separator();
-        ui.checkbox(&mut state.show_labels, "Labels");
-        ui.checkbox(&mut state.show_edges, "Edges");
-        ui.checkbox(&mut state.show_leaves, "Leaves");
-        ui.checkbox(&mut state.show_preview, "Show note preview");
-    });
-}
-
-fn seed_state(
-    state: &mut ClusterGraphState,
-    nodes: &[hiker_core::trees::EditableNode],
-    shape_hash: u64,
-) {
-    state.ids = nodes.iter().map(|n| n.id.clone()).collect();
-    state.id_index = state
-        .ids
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id.clone(), i))
-        .collect();
-    state.parent_of = nodes
-        .iter()
-        .map(|n| {
-            n.parent
-                .as_deref()
-                .and_then(|p| state.id_index.get(p).copied())
-        })
-        .collect();
-    state.positions = vec![egui::Vec2::ZERO; nodes.len()];
-    state.layout_worker = None;
-    state.seeded_for = shape_hash;
+    /// Rebuild the stable id list, parent index, and zeroed positions
+    /// from a fresh `EditableNode` slice, recording the shape fingerprint
+    /// it was seeded for.
+    fn seed(&mut self, nodes: &[hiker_core::trees::types::EditableNode], shape_hash: u64) {
+        self.ids = nodes.iter().map(|n| n.id.clone()).collect();
+        self.id_index = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        self.parent_of = nodes
+            .iter()
+            .map(|n| {
+                n.parent
+                    .as_deref()
+                    .and_then(|p| self.id_index.get(p).copied())
+            })
+            .collect();
+        self.positions = vec![egui::Vec2::ZERO; nodes.len()];
+        self.layout_worker = None;
+        self.seeded_for = shape_hash;
+    }
 }
 
 /// (Re)compute positions for the current `layout_kind`. Force-directed
 /// spawns the background worker; tree layouts run inline (O(n)).
-fn recompute_layout(state: &mut ClusterGraphState) {
+fn recompute_layout(state: &mut ClusterGraph) {
     state.layout_worker = None;
     state.needs_fit = true;
     if state.ids.is_empty() {
         return;
     }
-    let tree = LayoutTree::from_parents(state.parent_of.clone());
+    let tree = LayoutTree::from_parents(&state.parent_of);
     let area = FR_BOX * FR_BOX;
     match state.layout_kind {
         LayoutKind::Radial => {
@@ -476,35 +492,52 @@ fn recompute_layout(state: &mut ClusterGraphState) {
     }
 }
 
-/// Paint all cluster/leaf nodes with color-by-policy, size-by-members, and
-/// staleness encodings. Surfaces hover tooltips and detects clicks on leaf
-/// nodes carrying a `note_ref`, returning the resolved vault path so the
-/// caller can open it.
-#[allow(clippy::too_many_arguments)]
-fn paint_nodes(
-    painter: &egui::Painter,
-    nodes: &[hiker_core::trees::EditableNode],
-    ids: &[String],
-    positions: &[egui::Vec2],
+/// All the borrows [`PaintCtx::paint_nodes`] needs for one paint pass.
+/// Bundling them keeps the painter a single inherent method rather than
+/// a 11-argument free function.
+struct PaintCtx<'a> {
+    painter: &'a egui::Painter,
+    nodes: &'a [hiker_core::trees::types::EditableNode],
+    ids: &'a [String],
+    positions: &'a [egui::Vec2],
     show_labels: bool,
     show_leaves: bool,
     zoom: f32,
-    resp: &egui::Response,
-    to_screen: &dyn Fn(egui::Vec2) -> egui::Pos2,
-    app: &AppState,
+    resp: &'a egui::Response,
+    to_screen: &'a dyn Fn(egui::Vec2) -> egui::Pos2,
+    app: &'a AppState,
     clickable_leaves: bool,
-) -> PaintHits {
-    use hiker_core::trees::{NodeKind, NodePolicy};
+}
 
-    let members = compute_member_counts(nodes);
-    let max_members = members.values().copied().max().unwrap_or(1) as f32;
+impl PaintCtx<'_> {
+    /// Paint all cluster/leaf nodes with color-by-policy, size-by-members, and
+    /// staleness encodings. Surfaces hover tooltips and detects clicks on leaf
+    /// nodes carrying a `note_ref`, returning the resolved vault path so the
+    /// caller can open it.
+    fn paint_nodes(&self) -> PaintHits {
+        use hiker_core::trees::types::{NodeKind, NodePolicy};
 
-    // Build id→index lookup from `ids`.
-    let id_index: HashMap<&str, usize> = ids
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
+        let painter = self.painter;
+        let nodes = self.nodes;
+        let positions = self.positions;
+        let show_labels = self.show_labels;
+        let show_leaves = self.show_leaves;
+        let zoom = self.zoom;
+        let resp = self.resp;
+        let to_screen = self.to_screen;
+        let app = self.app;
+        let clickable_leaves = self.clickable_leaves;
+
+        let members = self.compute_member_counts();
+        let max_members = members.values().copied().max().unwrap_or(1) as f32;
+
+        // Build id→index lookup from `ids`.
+        let id_index: HashMap<&str, usize> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
 
     let hover = resp.hover_pos();
     let mut tooltip: Option<(egui::Pos2, String)> = None;
@@ -544,7 +577,7 @@ fn paint_nodes(
         let churn = n.summary_membership_churn as f32;
         let stale_t = (churn / 10.0).clamp(0.0, 0.7);
         let grey = egui::Color32::from_rgb(0xa0, 0xa0, 0xa0);
-        let fill = blend(base_fill, grey, stale_t);
+        let fill = self.blend(base_fill, grey, stale_t);
         let hovered = hover.map(|h| h.distance(p) < size + 4.0).unwrap_or(false);
         if is_cluster {
             painter.circle_filled(p, size, fill);
@@ -634,9 +667,67 @@ fn paint_nodes(
         clicked: clicked_path,
         hovered: hovered_node,
     }
+    }
+
+    /// Walk every node and count its Leaf descendants. Returns a map keyed
+    /// by node id; cluster nodes carry the count, leaves carry 1 (themselves).
+    fn compute_member_counts(&self) -> HashMap<String, usize> {
+        use hiker_core::trees::types::NodeKind;
+        let nodes = self.nodes;
+        let mut out: HashMap<String, usize> = HashMap::new();
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for n in nodes {
+            if let Some(p) = n.parent.as_deref() {
+                children.entry(p).or_default().push(n.id.as_str());
+            }
+        }
+        let by_id: HashMap<&str, &hiker_core::trees::types::EditableNode> =
+            nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        fn count(
+            id: &str,
+            by_id: &HashMap<&str, &hiker_core::trees::types::EditableNode>,
+            children: &HashMap<&str, Vec<&str>>,
+            memo: &mut HashMap<String, usize>,
+        ) -> usize {
+            if let Some(v) = memo.get(id) {
+                return *v;
+            }
+            let n = match by_id.get(id) {
+                Some(n) => n,
+                None => return 0,
+            };
+            let v = if matches!(n.kind, NodeKind::Leaf) {
+                1
+            } else {
+                children
+                    .get(id)
+                    .map(|cs| cs.iter().map(|c| count(c, by_id, children, memo)).sum())
+                    .unwrap_or(0)
+            };
+            memo.insert(id.to_string(), v);
+            v
+        }
+        for n in nodes {
+            let v = count(n.id.as_str(), &by_id, &children, &mut out);
+            out.insert(n.id.clone(), v);
+        }
+        out
+    }
+
+    /// Linear-interpolate two colors. `t=0` returns `a`, `t=1` returns `b`.
+    fn blend(&self, a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+        let t = t.clamp(0.0, 1.0);
+        let lerp = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t) as u8;
+        egui::Color32::from_rgba_unmultiplied(
+            lerp(a.r(), b.r()),
+            lerp(a.g(), b.g()),
+            lerp(a.b(), b.b()),
+            a.a(),
+        )
+    }
 }
 
-/// Output of [`paint_nodes`]: which leaf was clicked this frame (used
+/// Output of [`PaintCtx::paint_nodes`]: which leaf was clicked this frame (used
 /// to open the note) and which node the cursor is currently over (used
 /// to drive the live preview card).
 struct PaintHits {
@@ -659,9 +750,6 @@ struct HoveredNode {
     screen_pos: egui::Pos2,
 }
 
-/// Cheap shape fingerprint over the (id, parent) edges. Changes when
-/// nodes are added, removed, or re-parented; doesn't churn on summary/
-/// policy edits.
 /// Refresh `selected_path` + `selected_preview` for the given tree on
 /// click. Mirrors `panels::graph::update_selection`.
 fn update_selection(app: &mut AppState, tree_id: &str, path: String) {
@@ -673,99 +761,27 @@ fn update_selection(app: &mut AppState, tree_id: &str, path: String) {
     if !needs_load {
         return;
     }
+    // Body preview, capped at 500 chars (post-frontmatter).
+    const MAX: usize = 500;
     let preview = app
         .vault_session
         .vault
         .read_file(&path)
         .ok()
-        .map(|s| truncate_preview(crate::panels::graph::skip_frontmatter(&s).to_string()));
+        .map(|s| {
+            let body = crate::panels::graph::skip_frontmatter(&s);
+            if body.chars().count() <= MAX {
+                body.to_string()
+            } else {
+                let mut out: String = body.chars().take(MAX).collect();
+                out.push('…');
+                out
+            }
+        });
     if let Some(s) = app.panels.cluster_graph.get_mut(tree_id) {
         s.selected_path = Some(path);
         s.selected_preview = preview;
     }
-}
-
-fn truncate_preview(s: String) -> String {
-    const MAX: usize = 500;
-    if s.chars().count() <= MAX {
-        return s;
-    }
-    let mut out: String = s.chars().take(MAX).collect();
-    out.push('…');
-    out
-}
-
-fn shape_hash(nodes: &[hiker_core::trees::EditableNode]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    nodes.len().hash(&mut h);
-    for n in nodes {
-        n.id.hash(&mut h);
-        n.parent.hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Walk every node and count its Leaf descendants. Returns a map keyed
-/// by node id; cluster nodes carry the count, leaves carry 1 (themselves).
-fn compute_member_counts(
-    nodes: &[hiker_core::trees::EditableNode],
-) -> HashMap<String, usize> {
-    use hiker_core::trees::NodeKind;
-    let mut out: HashMap<String, usize> = HashMap::new();
-    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
-    for n in nodes {
-        if let Some(p) = n.parent.as_deref() {
-            children.entry(p).or_default().push(n.id.as_str());
-        }
-    }
-    let by_id: HashMap<&str, &hiker_core::trees::EditableNode> =
-        nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    fn count(
-        id: &str,
-        by_id: &HashMap<&str, &hiker_core::trees::EditableNode>,
-        children: &HashMap<&str, Vec<&str>>,
-        memo: &mut HashMap<String, usize>,
-    ) -> usize {
-        if let Some(v) = memo.get(id) {
-            return *v;
-        }
-        let n = match by_id.get(id) {
-            Some(n) => n,
-            None => return 0,
-        };
-        let v = if matches!(n.kind, NodeKind::Leaf) {
-            1
-        } else {
-            children
-                .get(id)
-                .map(|cs| cs.iter().map(|c| count(c, by_id, children, memo)).sum())
-                .unwrap_or(0)
-        };
-        memo.insert(id.to_string(), v);
-        v
-    }
-    for n in nodes {
-        let v = count(n.id.as_str(), &by_id, &children, &mut out);
-        out.insert(n.id.clone(), v);
-    }
-    out
-}
-
-/// Linear-interpolate two colors. `t=0` returns `a`, `t=1` returns `b`.
-fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t) as u8;
-    egui::Color32::from_rgba_unmultiplied(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-        a.a(),
-    )
-}
-
-fn tree_id_short(id: &str) -> &str {
-    &id[..id.len().min(8)]
 }
 
 fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {

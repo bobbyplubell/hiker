@@ -10,8 +10,11 @@ name = "graph-snapshot"
 path = "src/main.rs"
 
 [dependencies]
-# eframe (not just egui) so the `eframe::egui::Vec2` imports inside the
-# included production source files resolve without any shimming.
+# Cross-crate dep on `graph-widgets` (where the production force-layout
+# / tree-layout code lives). Same code as the app runs — no
+# copy/paste drift — and crossing a crate boundary takes the algorithm
+# files out of this binary's `single_call_fn` view.
 eframe = { workspace = true }
 egui = { workspace = true }
+graph-widgets.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

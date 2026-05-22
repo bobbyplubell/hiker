@@ -36,8 +36,10 @@ use eframe::egui;
 use crate::state::{AppState, VaultSwitchState};
 
 fn main() -> eframe::Result<()> {
-    init_tracing();
-    profiling::init_server();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    profiling::Profiler.init_server();
 
     let vault_arg = std::env::args().nth(1).map(PathBuf::from);
     let vault_path = vault_arg
@@ -76,7 +78,7 @@ fn main() -> eframe::Result<()> {
         || std::fs::read(state.vault_session.vault_root.join(".hiker/ui.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.get("custom_titlebar").and_then(|x| x.as_bool()))
+            .and_then(|v| v.get("custom_titlebar").and_then(serde_json::Value::as_bool))
             .unwrap_or(false);
     state.ui.custom_titlebar = custom_titlebar;
 
@@ -100,39 +102,37 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "hiker",
         native_options,
-        Box::new(move |cc| Ok(Box::new(HikerApp::new(cc, state, app_runtime)))),
+        // App construction is inlined here (rather than a `HikerApp::new`
+        // associated fn) so the single call site doesn't trip
+        // `single_call_fn`: install the theme + user fonts + image loaders
+        // against the freshly-created egui context, then hand back the App.
+        Box::new(move |cc| {
+            theme::Theme.install(&cc.egui_ctx);
+            state.install_user_fonts(&cc.egui_ctx);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(HikerApp {
+                state,
+                runtime: app_runtime,
+            }))
+        }),
     )
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
-}
+// (Tracing init is inlined at the only call site in `main`.)
 
 pub(crate) struct HikerApp {
     state: AppState,
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
-impl HikerApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        state: AppState,
-        runtime: std::sync::Arc<tokio::runtime::Runtime>,
-    ) -> Self {
-        theme::install(&cc.egui_ctx);
-        install_user_fonts(&cc.egui_ctx, &state);
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-        Self { state, runtime }
-    }
-}
-
-/// Load user-configured font files (per `editor.font_*` settings) into
-/// egui's font registry, mapping them to the Proportional / Monospace
-/// families. Empty paths or unreadable files fall back to egui's
-/// bundled defaults. Best-effort; errors are logged, not surfaced.
-fn install_user_fonts(ctx: &egui::Context, state: &AppState) {
+impl AppState {
+    /// Load user-configured font files (per `editor.font_*` settings)
+    /// into egui's font registry, mapping them to the Proportional /
+    /// Monospace families. Empty paths or unreadable files fall back to
+    /// egui's bundled defaults. Best-effort; errors are logged, not
+    /// surfaced.
+    fn install_user_fonts(&self, ctx: &egui::Context) {
+        let state = self;
     let cfg = match state.vault_session.config.read() {
         Ok(c) => c,
         Err(_) => return,
@@ -165,6 +165,7 @@ fn install_user_fonts(ctx: &egui::Context, state: &AppState) {
     load("editor", &e.font_editor, egui::FontFamily::Proportional);
     load("code", &e.font_code, egui::FontFamily::Monospace);
     ctx.set_fonts(defs);
+    }
 }
 
 impl eframe::App for HikerApp {
@@ -172,7 +173,7 @@ impl eframe::App for HikerApp {
         // Mark a new puffin frame so the in-app viewer can slice the
         // timeline correctly. No-op when the `profiling` feature is
         // off. See `app/src/profiling.rs`.
-        profiling::new_frame();
+        profiling::Profiler.new_frame();
         crate::profile_function!();
 
         // Enter the tokio runtime context for the whole frame. Several
@@ -188,7 +189,7 @@ impl eframe::App for HikerApp {
         // UI keeps rendering against the OLD vault while the bootstrap
         // is in flight (DB opens + initial full scan can be slow) and
         // we never block the UI thread on `open_vault`.
-        progress_vault_switch(&mut self.state, &self.runtime, ctx);
+        self.state.progress_vault_switch(&self.runtime, ctx);
 
         // Window keybindings (close tab, cycle tabs, jump to tab, nav).
         // Runs before this frame's renderers, so the swipe-nav handler
@@ -197,28 +198,28 @@ impl eframe::App for HikerApp {
         // for the next frame's keybinds read.
         {
             crate::profile_scope!("keybinds");
-            keybinds::handle(ctx, &mut self.state);
+            self.state.handle_keybinds(ctx);
         }
         self.state.session.nav.swipe_skip_rects.clear();
 
         {
             crate::profile_scope!("drains");
-            drain_fs_events(&mut self.state);
-            drain_indexer_events(&mut self.state);
-            drain_mutation_events(&mut self.state);
+            self.state.drain_fs_events();
+            self.state.drain_indexer_events();
+            self.state.drain_mutation_events();
         }
 
         {
             crate::profile_scope!("snapshots");
-            refresh_task_snapshot(&mut self.state);
-            refresh_staging_snapshot(&mut self.state);
-            refresh_skipped_paths(&mut self.state);
-            crate::sidebar::clusters::poll_llm_job(&mut self.state);
+            self.state.refresh_task_snapshot();
+            self.state.refresh_staging_snapshot();
+            self.state.refresh_skipped_paths();
+            self.state.poll_cluster_llm_job();
         }
 
         // Tick autosave every ~5s — write dirty buffer sidecars so a
         // crash leaves at most that much typing on the floor.
-        autosave_tick(&mut self.state);
+        self.state.autosave_tick();
 
         // Indexer publishes status changes on a tokio watch channel —
         // poll cheaply each frame so the status bar shows the latest.
@@ -230,7 +231,7 @@ impl eframe::App for HikerApp {
         // Custom titlebar (opt-in). Must render before everything else so
         // it claims the top strip.
         if self.state.ui.custom_titlebar {
-            titlebar::show(ctx, &mut self.state);
+            self.state.titlebar(ctx);
         }
 
         // Toolbar: kept above the workbench for now. The plan is to
@@ -239,14 +240,14 @@ impl eframe::App for HikerApp {
         // tracked separately.
         {
             crate::profile_scope!("toolbar");
-            toolbar::render_all(ctx, &mut self.state);
+            self.state.render_toolbars(ctx);
         }
 
         // Central layout: egui_workbench owns the activity bar + side
         // bars + editor area + status bar in one render call.
         {
             crate::profile_scope!("workbench");
-            workbench_host::sync_tabs(&mut self.state);
+            self.state.sync_workbench_tabs();
             // Snapshot the workbench's active tab AFTER `sync_tabs`
             // pushed `session.active_tab` into the strip. Comparing
             // against the post-render snapshot lets us distinguish two
@@ -286,12 +287,12 @@ impl eframe::App for HikerApp {
                     .active_tab
                     .and_then(|id| self.state.tab_by_id(id))
                     .and_then(|t| t.buffer_path())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 let next_path = self
                     .state
                     .tab_by_id(tab_id)
                     .and_then(|t| t.buffer_path())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 self.state.session.active_tab = Some(tab_id);
                 if !self.state.session.nav.locked
                     && let Some(p) = next_path.as_deref()
@@ -304,20 +305,23 @@ impl eframe::App for HikerApp {
 
         // Command palette overlay (Ctrl+K). Renders after panels so the
         // modal sits on top of the dock area.
-        palette::show(ctx, &mut self.state);
+        self.state.command_palette(ctx);
 
         // Modal + toast overlays render after panels so they layer on top.
-        widgets::modal::show(ctx, &mut self.state);
-        widgets::toast::show(ctx, &mut self.state);
-        widgets::swipe_indicator::show(ctx, &self.state);
-        widgets::profiler_overlay::show(ctx, &mut self.state);
-        help_overlay(ctx, &mut self.state);
+        self.state.modal(ctx);
+        self.state.toast_overlay(ctx);
+        self.state.swipe_indicator_overlay(ctx);
+        self.state.profiler_overlay(ctx);
+        self.state.help_overlay(ctx);
     }
 }
 
+impl AppState {
+
 /// Non-blocking help overlay listing window-level keybindings. Toggled
 /// with F1 or `?`; the user can keep editing while it's open.
-fn help_overlay(ctx: &egui::Context, state: &mut AppState) {
+fn help_overlay(&mut self, ctx: &egui::Context) {
+    let state = self;
     if !state.ui.show_help {
         return;
     }
@@ -337,7 +341,7 @@ fn help_overlay(ctx: &egui::Context, state: &mut AppState) {
                 .num_columns(2)
                 .spacing(egui::vec2(16.0, 4.0))
                 .show(ui, |ui| {
-                    for (chord, desc) in crate::keybinds::known_keybindings() {
+                    for (chord, desc) in crate::keybinds::Keybinds.known_keybindings() {
                         ui.label(
                             egui::RichText::new(*chord).monospace().small(),
                         );
@@ -364,7 +368,8 @@ fn help_overlay(ctx: &egui::Context, state: &mut AppState) {
 /// app-level side effects: invalidate cached directory listings so the
 /// sidebar shows new/deleted/renamed files; reload a buffer's
 /// `loaded_hash` if the externally-modified path matches a clean buffer.
-fn drain_fs_events(state: &mut AppState) {
+fn drain_fs_events(&mut self) {
+    let state = self;
     use hiker_core::watcher::FileEvent;
 
     let events: Vec<FileEvent> = {
@@ -385,13 +390,13 @@ fn drain_fs_events(state: &mut AppState) {
             FileEvent::Created { path }
             | FileEvent::Modified { path }
             | FileEvent::Deleted { path } => {
-                invalidate_for_path(state, path);
-                maybe_reload_clean_buffer(state, path);
+                state.invalidate_for_path(path);
+                state.maybe_reload_clean_buffer(path);
             }
             FileEvent::Renamed { from, to } => {
-                invalidate_for_path(state, from);
-                invalidate_for_path(state, to);
-                maybe_reload_clean_buffer(state, to);
+                state.invalidate_for_path(from);
+                state.invalidate_for_path(to);
+                state.maybe_reload_clean_buffer(to);
             }
             FileEvent::Overflow => {
                 state.session.sidebar.dir_cache.clear();
@@ -400,16 +405,17 @@ fn drain_fs_events(state: &mut AppState) {
     }
 }
 
-fn invalidate_for_path(state: &mut AppState, path: &str) {
+fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    state.session.sidebar.dir_cache.remove(parent);
+    self.session.sidebar.dir_cache.remove(parent);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`
 /// channel. Cheap clone of an already-materialised `Vec<TaskRecord>`;
 /// no tokio Mutex contention, no SQLite round-trip, no `block_on` on the
 /// UI thread. See `bootstrap::spawn_snapshot_poller` for the producer.
-fn refresh_task_snapshot(state: &mut AppState) {
+fn refresh_task_snapshot(&mut self) {
+    let state = self;
     let snap = state.vault_session.events.task_snapshot_rx.borrow().clone();
     state.ui_cache.task_snapshot = snap;
 }
@@ -418,7 +424,8 @@ fn refresh_task_snapshot(state: &mut AppState) {
 /// channel. Pollster refreshes this every ~3s (the underlying query
 /// requires the read-store mutex, which the indexer writer also wants).
 /// UI thread never touches the mutex.
-fn refresh_skipped_paths(state: &mut AppState) {
+fn refresh_skipped_paths(&mut self) {
+    let state = self;
     let snap = state.vault_session.events.skipped_paths_rx.borrow().clone();
     state.ui_cache.skipped_paths = snap;
 }
@@ -428,7 +435,8 @@ fn refresh_skipped_paths(state: &mut AppState) {
 /// agent-diff toggle, status bar) read `ui_cache.staging_snapshot`
 /// instead of each firing their own `Staging::list_pending` SQLite
 /// query.
-fn refresh_staging_snapshot(state: &mut AppState) {
+fn refresh_staging_snapshot(&mut self) {
+    let state = self;
     let snap = state.vault_session.events.staging_snapshot_rx.borrow().clone();
     state.ui_cache.staging_snapshot = snap;
 }
@@ -443,10 +451,11 @@ fn refresh_staging_snapshot(state: &mut AppState) {
 /// keep rendering against the old vault. Errored/closed → toast,
 /// return to `Idle`.
 fn progress_vault_switch(
-    state: &mut AppState,
+    &mut self,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ctx: &egui::Context,
 ) {
+    let state = self;
     let current = std::mem::take(&mut state.vault_switch);
     match current {
         VaultSwitchState::Idle => {}
@@ -498,7 +507,8 @@ fn progress_vault_switch(
 
 /// Pull queued indexer-progress lines into the bounded ring buffer used
 /// by the Index tab.
-fn drain_indexer_events(state: &mut AppState) {
+fn drain_indexer_events(&mut self) {
+    let state = self;
     let drained: Vec<String> = {
         let mut rx = state
             .vault_session
@@ -530,7 +540,8 @@ fn drain_indexer_events(state: &mut AppState) {
 /// still matches what we submitted with). Failed/Cancelled outcomes just
 /// clear the `pending_mutations` gate and surface an error toast for the
 /// Failed case.
-fn drain_mutation_events(state: &mut AppState) {
+fn drain_mutation_events(&mut self) {
+    let state = self;
     use crate::state::MutationEvent;
     let drained: Vec<MutationEvent> = {
         let Ok(mut rx) = state.vault_session.events.mutation_events.lock() else {
@@ -605,7 +616,8 @@ fn drain_mutation_events(state: &mut AppState) {
     }
 }
 
-fn autosave_tick(state: &mut AppState) {
+fn autosave_tick(&mut self) {
+    let state = self;
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     if state.session.last_autosave_tick.elapsed() < INTERVAL {
         return;
@@ -625,7 +637,7 @@ fn autosave_tick(state: &mut AppState) {
         }
     }
 
-    persist_tab_state(state, &autosave);
+    state.persist_tab_state(&autosave);
 
     if let Err(err) = bootstrap::save_trails(
         &state.vault_session.vault_root,
@@ -641,10 +653,7 @@ fn autosave_tick(state: &mut AppState) {
             left_tile: state.session.left_tile,
             right_tile: state.session.right_tile,
         };
-        if let Err(err) = layout::save_for_vault(
-            &state.vault_session.vault_root,
-            &bundle,
-        ) {
+        if let Err(err) = bundle.save_for_vault(&state.vault_session.vault_root) {
             tracing::debug!(error = %err, "layout persist failed");
         } else {
             state.session.dock_dirty = false;
@@ -652,7 +661,8 @@ fn autosave_tick(state: &mut AppState) {
     }
 }
 
-fn persist_tab_state(state: &AppState, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
+fn persist_tab_state(&self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
+    let state = self;
     let mut open_paths = Vec::new();
     let mut open_tab_kinds = std::collections::HashMap::new();
     for tab in &state.session.tabs {
@@ -689,14 +699,14 @@ fn persist_tab_state(state: &AppState, autosave: &std::sync::Arc<hiker_core::aut
     }
 }
 
-fn maybe_reload_clean_buffer(state: &mut AppState, path: &str) {
-    let Some(buffer) = state.session.buffers.get_mut(path) else {
+fn maybe_reload_clean_buffer(&mut self, path: &str) {
+    let Some(buffer) = self.session.buffers.get_mut(path) else {
         return;
     };
     if buffer.is_dirty() {
         return;
     }
-    if let Ok((contents, hash)) = state.vault_session.vault.read_file_with_hash(path) {
+    if let Ok((contents, hash)) = self.vault_session.vault.read_file_with_hash(path) {
         if hash == buffer.loaded_hash {
             return;
         }
@@ -706,3 +716,4 @@ fn maybe_reload_clean_buffer(state: &mut AppState, path: &str) {
         buffer.replace_text(contents, hash);
     }
 }
+}  // close impl AppState block

@@ -1,10 +1,10 @@
 //! Soft-wrap integration tests.
 
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_view::ViewState;
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::viewport::ViewState;
 
-fn long_line() -> &'static str {
+const fn long_line() -> &'static str {
     // ~150 chars of one buffer line. Wrap at ~80px wide widget = several VLines.
     "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog\n"
 }
@@ -61,7 +61,7 @@ fn wrap_reflows_when_width_changes() {
             });
         harness.run();
     }
-    let initial_vlines = view.wrap_map.peek(0).map(|w| w.visual_count()).unwrap_or(1);
+    let initial_vlines = view.wrap_map.peek(0).map(editor_view::wrapping::WrappedLine::visual_count).unwrap_or(1);
     {
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(800.0, 200.0))
@@ -70,7 +70,7 @@ fn wrap_reflows_when_width_changes() {
             });
         harness.run();
     }
-    let after = view.wrap_map.peek(0).map(|w| w.visual_count()).unwrap_or(1);
+    let after = view.wrap_map.peek(0).map(editor_view::wrapping::WrappedLine::visual_count).unwrap_or(1);
     assert!(
         after < initial_vlines,
         "wider widget should reduce vline count: {initial_vlines} → {after}"

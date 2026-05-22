@@ -1,6 +1,6 @@
-//! Stable byte positions that survive edits via ChangeSet::map_pos.
+//! Stable byte positions that survive edits via Set::map_pos.
 
-use crate::change::ChangeSet;
+use crate::change::Set;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -19,15 +19,15 @@ pub struct Anchor {
 }
 
 impl Anchor {
-    pub fn at(byte: usize, bias: Bias) -> Self {
+    pub const fn at(byte: usize, bias: Bias) -> Self {
         Self { byte: byte as u32, bias }
     }
 
-    pub fn offset(&self) -> usize {
+    pub const fn offset(&self) -> usize {
         self.byte as usize
     }
 
-    pub fn map(self, changes: &ChangeSet) -> Self {
+    pub fn map(self, changes: &Set) -> Self {
         Self {
             byte: changes.map_pos(self.byte as usize, self.bias) as u32,
             bias: self.bias,

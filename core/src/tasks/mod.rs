@@ -37,20 +37,14 @@
 //!   `TaskShape`, `WorkerKind`, records, events, errors, `TaskHandle`.
 //! - `queue`    — internal `Slot`/`Lease`, `Queue` struct + impl, and
 //!   the pure helpers (`validate_against_schema`, time helpers).
-//! - `handlers` — `NonLlmHandlers` trait + the in-process direct-LLM
+//! - `handlers` — `NonLlm` trait + the in-process direct-LLM
 //!   worker entry point (`run_direct_worker`).
 //! - `tests`    — `#[cfg(test)]` unit tests.
 
-mod handlers;
-mod queue;
-mod types;
+pub mod handlers;
+pub mod queue;
+pub mod types;
 
 #[cfg(test)]
 mod tests;
 
-pub use types::{
-    CancelReason, McpClientVia, Priority, QueueError, QueueEvent, Task, TaskDetails, TaskHandle,
-    TaskId, TaskKind, TaskOutcome, TaskPayload, TaskRecord, TaskShape, TaskState, WorkerKind,
-};
-pub use queue::{Queue, WorkerPreferenceCfg};
-pub use handlers::{run_direct_worker, NonLlmHandlers};

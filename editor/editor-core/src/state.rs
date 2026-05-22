@@ -5,49 +5,49 @@
 //! the surface here is stable enough that adding generic extension storage
 //! later won't break callers.
 
-use crate::change::ChangeSet;
-use crate::compartment::{Compartment, CompartmentStore};
+use crate::change::Set;
+use crate::compartment::{Compartment, Store};
 use crate::history::History;
 use crate::rope::Rope;
 use crate::selection::Selection;
 use crate::transaction::{EditType, StateEffect, Transaction};
 
 pub type TransactionListener =
-    std::sync::Arc<dyn Fn(&EditorState, &EditorState, &Transaction) + Send + Sync>;
+    std::sync::Arc<dyn Fn(&Editor, &Editor, &Transaction) + Send + Sync>;
 
-/// Per SPEC §13.4: pre-apply filter that can veto or rewrite a `ChangeSet`.
+/// Per SPEC §13.4: pre-apply filter that can veto or rewrite a `Set`.
 /// Returning `None` vetoes the changes (selection-only effects still apply).
 pub type ChangeFilter =
-    std::sync::Arc<dyn Fn(&EditorState, &ChangeSet) -> Option<ChangeSet> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&Editor, &Set) -> Option<Set> + Send + Sync>;
 
 /// Per SPEC §13.4: pre-apply filter that rewrites the whole transaction.
 pub type TransactionFilter =
-    std::sync::Arc<dyn Fn(&EditorState, Transaction) -> Transaction + Send + Sync>;
+    std::sync::Arc<dyn Fn(&Editor, Transaction) -> Transaction + Send + Sync>;
 
 /// Per SPEC §13.4: post-filter extender that contributes additional effects
 /// based on the (already-filtered) transaction.
 pub type TransactionExtender =
-    std::sync::Arc<dyn Fn(&EditorState, &Transaction) -> Vec<StateEffect> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&Editor, &Transaction) -> Vec<StateEffect> + Send + Sync>;
 
 #[derive(Clone, Default)]
-pub struct EditorState {
+pub struct Editor {
     pub doc: Rope,
     pub selection: Selection,
     pub history: History,
-    pub compartments: CompartmentStore,
+    pub compartments: Store,
     listeners: Vec<TransactionListener>,
     change_filters: Vec<ChangeFilter>,
     transaction_filters: Vec<TransactionFilter>,
     transaction_extenders: Vec<TransactionExtender>,
 }
 
-impl EditorState {
+impl Editor {
     pub fn new(text: &str) -> Self {
         Self {
             doc: Rope::from_str(text),
             selection: Selection::single(0),
             history: History::new(),
-            compartments: CompartmentStore::default(),
+            compartments: Store::default(),
             listeners: Vec::new(),
             change_filters: Vec::new(),
             transaction_filters: Vec::new(),
@@ -60,7 +60,7 @@ impl EditorState {
             doc,
             selection: Selection::single(0),
             history: History::new(),
-            compartments: CompartmentStore::default(),
+            compartments: Store::default(),
             listeners: Vec::new(),
             change_filters: Vec::new(),
             transaction_filters: Vec::new(),
@@ -78,7 +78,7 @@ impl EditorState {
     ) -> Self {
         let mut next = self.clone();
         next.compartments.set(c, v);
-        let tx = Transaction::new(ChangeSet::empty(self.doc.len_bytes()));
+        let tx = Transaction::new(Set::empty(self.doc.len_bytes()));
         for listener in &self.listeners {
             listener(self, &next, &tx);
         }
@@ -117,7 +117,7 @@ impl EditorState {
 
     /// Apply a transaction, returning a new state. The previous state is
     /// untouched; cheap clones are encouraged.
-    pub fn apply(&self, tx: Transaction) -> EditorState {
+    pub fn apply(&self, tx: Transaction) -> Editor {
         let mut tx = tx;
 
         // SPEC §13.4: run change filters in registration order. `None` vetoes.
@@ -128,7 +128,7 @@ impl EditorState {
             }
             match filter(self, &tx.changes) {
                 None => {
-                    tx.changes = ChangeSet::empty(self.doc.len_bytes());
+                    tx.changes = Set::empty(self.doc.len_bytes());
                     vetoed = true;
                 }
                 Some(new_cs) => {
@@ -196,7 +196,7 @@ impl EditorState {
             .map(|r| (r.range(), text.to_string()))
             .collect();
         edits.sort_by_key(|(r, _)| r.start);
-        let changes = ChangeSet::of(self.doc.len_bytes(), edits);
+        let changes = Set::of(self.doc.len_bytes(), edits);
         Transaction::new(changes).with_edit_type(EditType::Input)
     }
 
@@ -229,7 +229,7 @@ impl EditorState {
             .collect();
         edits.sort_by_key(|(r, _)| r.start);
         edits.dedup_by_key(|(r, _)| r.clone());
-        let changes = ChangeSet::of(self.doc.len_bytes(), edits);
+        let changes = Set::of(self.doc.len_bytes(), edits);
         Transaction::new(changes).with_edit_type(EditType::Delete)
     }
 
@@ -245,7 +245,7 @@ impl EditorState {
         }
     }
 
-    /// Rebuild an `EditorState` from a previously serialized snapshot. The
+    /// Rebuild an `Editor` from a previously serialized snapshot. The
     /// history starts empty.
     #[cfg(feature = "serde")]
     pub fn from_saved(saved: SavedState) -> Self {
@@ -253,7 +253,7 @@ impl EditorState {
             doc: Rope::from_str(&saved.doc_text),
             selection: saved.selection,
             history: History::new(),
-            compartments: CompartmentStore::default(),
+            compartments: Store::default(),
             listeners: Vec::new(),
             change_filters: Vec::new(),
             transaction_filters: Vec::new(),
@@ -261,12 +261,12 @@ impl EditorState {
         }
     }
 
-    pub fn undo(&self) -> Option<EditorState> {
+    pub fn undo(&self) -> Option<Editor> {
         let mut hist = self.history.clone();
         let tx = hist.undo()?;
         let new_doc = tx.changes.apply(&self.doc);
         let selection = tx.selection.unwrap_or_else(|| self.selection.map(&tx.changes));
-        Some(EditorState {
+        Some(Editor {
             doc: new_doc,
             selection,
             history: hist,
@@ -278,12 +278,12 @@ impl EditorState {
         })
     }
 
-    pub fn redo(&self) -> Option<EditorState> {
+    pub fn redo(&self) -> Option<Editor> {
         let mut hist = self.history.clone();
         let tx = hist.redo()?;
         let new_doc = tx.changes.apply(&self.doc);
         let selection = tx.selection.unwrap_or_else(|| self.selection.map(&tx.changes));
-        Some(EditorState {
+        Some(Editor {
             doc: new_doc,
             selection,
             history: hist,
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn insert_at_cursor() {
-        let s = EditorState::new("hello world");
+        let s = Editor::new("hello world");
         let mut s = s;
         s.selection = Selection::single(5);
         let tx = s.insert_at_selections(", lovely");
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn delete_backspace() {
-        let mut s = EditorState::new("hello");
+        let mut s = Editor::new("hello");
         s.selection = Selection::single(5);
         let tx = s.delete_at_selections();
         let s2 = s.apply(tx);
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn multi_cursor_insert() {
-        let mut s = EditorState::new("abc abc abc");
+        let mut s = Editor::new("abc abc abc");
         s.selection = Selection::from_ranges(
             vec![
                 crate::selection::SelRange::point(0),
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn undo_redo_round_trip() {
-        let s0 = EditorState::new("hello");
+        let s0 = Editor::new("hello");
         let mut s = s0.clone();
         s.selection = Selection::single(5);
 
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn new_edit_drops_redo_branch() {
-        let mut s = EditorState::new("hello");
+        let mut s = Editor::new("hello");
         s.selection = Selection::single(5);
         let s = s.apply(s.insert_at_selections("!"));
         assert_eq!(s.doc.to_string(), "hello!");

@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hiker_core::agent::{
-    AgentEvent, AgentTurnInput, FinishReason, StopSignal, ToolDispatchError, ToolDispatcher,
+    Event, TurnInput, FinishReason, StopSignal, ToolDispatchError, ToolDispatcher,
     TurnId,
 };
 use hiker_core::config::Config;
-use hiker_core::llm::{GraniteLlmClient, LlmClient, Message, ToolCall, ToolResult};
+use hiker_core::llm::{GraniteLlmClient, Client, Message, ToolCall, ToolResult};
 use hiker_core::sessions;
 
 use crate::chat::session;
@@ -30,14 +30,16 @@ use crate::chat::state::{ChatEvent, ChatRegistry, ChatRole, ChatTurn};
 /// (search, get_note, write_note, etc., per `agent-tool-routing-via-mcp`).
 /// When `None` (MCP disabled), tool calls error back to the model as
 /// `UnknownTool`.
-pub fn send_message(
-    reg: &mut ChatRegistry,
+impl ChatRegistry {
+pub fn send(
+    &mut self,
     vault_root: &Path,
     rt: &Arc<tokio::runtime::Runtime>,
     config: Arc<std::sync::RwLock<Config>>,
-    mcp_handler: Option<Arc<hiker_mcp::HikerHandler>>,
-    message: String,
+    mcp_handler: &Option<Arc<hiker_mcp::handler::App>>,
+    message: &str,
 ) {
+    let reg = self;
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return;
@@ -61,8 +63,9 @@ pub fn send_message(
         }
     };
 
-    let Some(s) = reg.sessions.get_mut(&session_id) else { return };
     let user_text = trimmed.to_string();
+    let user_preview = reg.short_preview(&user_text, 60);
+    let Some(s) = reg.sessions.get_mut(&session_id) else { return };
     // Snapshot the prior conversation as `Message` history. If the session
     // was resumed from disk, prefer the structured `resumed_history` (which
     // preserves tool-call alternation per `chat-session-markdown-store`) so
@@ -86,7 +89,7 @@ pub fn send_message(
         tool: None,
     });
     if s.preview == "(new session)" || s.preview == "(empty session)" {
-        s.preview = short_preview(&user_text, 60);
+        s.preview = user_preview;
     }
     s.pending = true;
     let file_rel = s.rel_path.clone();
@@ -103,27 +106,27 @@ pub fn send_message(
     // Spawn the reply task. Keep the user-message persistence inside
     // the task so it stays off the egui frame thread.
     let mcp_handler_owned = mcp_handler.clone();
+    let task = ReplyTask {
+        tx,
+        session_id,
+        user_message: user_text,
+        prior_history,
+        file_rel,
+        vault_root: vault_root_owned,
+        config,
+        mcp_handler: mcp_handler_owned,
+        stop,
+    };
     rt.spawn(async move {
-        dispatch_reply(
-            tx,
-            session_id,
-            user_text,
-            prior_history,
-            file_rel,
-            vault_root_owned,
-            config,
-            mcp_handler_owned,
-            stop,
-        )
-        .await;
+        task.run().await;
     });
 }
+}
 
-/// Run one full agent turn: build the LLM client, drive `run_turn`,
-/// translate `AgentEvent`s into `ChatEvent`s for the UI, and persist
-/// the (user, assistant) pair to the session file on completion.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_reply(
+/// Owned inputs for one spawned reply task. Bundling the nine fields
+/// into a struct keeps the spawned worker a single `&self`-style method
+/// (`run`) instead of a wide free function.
+struct ReplyTask {
     tx: tokio::sync::mpsc::UnboundedSender<ChatEvent>,
     session_id: String,
     user_message: String,
@@ -131,9 +134,26 @@ async fn dispatch_reply(
     file_rel: String,
     vault_root: std::path::PathBuf,
     config: Arc<std::sync::RwLock<Config>>,
-    mcp_handler: Option<Arc<hiker_mcp::HikerHandler>>,
+    mcp_handler: Option<Arc<hiker_mcp::handler::App>>,
     stop: StopSignal,
-) {
+}
+
+impl ReplyTask {
+/// Run one full agent turn: build the LLM client, drive `run_turn`,
+/// translate `Event`s into `ChatEvent`s for the UI, and persist
+/// the (user, assistant) pair to the session file on completion.
+async fn run(self) {
+    let ReplyTask {
+        tx,
+        session_id,
+        user_message,
+        prior_history,
+        file_rel,
+        vault_root,
+        config,
+        mcp_handler,
+        stop,
+    } = self;
     // Build the LLM client from the active [llm] config snapshot. If
     // construction fails (bad backend, missing key) surface the error
     // through ChatEvent so the user sees it in-panel and the session is
@@ -150,7 +170,7 @@ async fn dispatch_reply(
         }
     };
     let client = match GraniteLlmClient::from_config(&llm_cfg) {
-        Ok(c) => Arc::new(c) as Arc<dyn LlmClient>,
+        Ok(c) => Arc::new(c) as Arc<dyn Client>,
         Err(err) => {
             let _ = tx.send(ChatEvent::Delta {
                 session_id: session_id.clone(),
@@ -164,11 +184,11 @@ async fn dispatch_reply(
     };
 
     // Tool dispatch: when MCP is up we route through the in-process
-    // `HikerHandler`, sharing one tool registry / audit log with the
+    // `App`, sharing one tool registry / audit log with the
     // external rmcp surface (`agent-tool-routing-via-mcp`). When MCP is
     // disabled the no-op dispatcher errors back to the model.
     let dispatcher: Arc<dyn ToolDispatcher> = match mcp_handler {
-        Some(h) => Arc::new(hiker_mcp::McpAgentDispatcher::new(h)),
+        Some(h) => Arc::new(hiker_mcp::agent_bridge::McpAgentDispatcher::new(h)),
         None => Arc::new(NoToolsDispatcher),
     };
     // Tool defs advertised to the LLM. Mirrors the agent-bridge filter so
@@ -180,12 +200,12 @@ async fn dispatch_reply(
             Err(_) => (None, false),
         }
     };
-    let tool_defs = hiker_mcp::agent_tool_defs_filtered(
+    let tool_defs = hiker_mcp::agent_bridge::agent_tool_defs_filtered(
         expose_tasks,
         mcp_tools_cfg.as_ref(),
     );
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<Event>(64);
     let session_for_events = session_id.clone();
     let tx_for_events = tx.clone();
     // Forward AgentEvents into ChatEvents while run_turn is producing.
@@ -205,7 +225,7 @@ async fn dispatch_reply(
         let mut completed_results: Vec<ToolResult> = Vec::new();
         while let Some(ev) = event_rx.recv().await {
             match ev {
-                AgentEvent::TextDelta { text, .. } => {
+                Event::TextDelta { text, .. } => {
                     assistant_acc.push_str(&text);
                     if tx_for_events
                         .send(ChatEvent::Delta {
@@ -217,13 +237,13 @@ async fn dispatch_reply(
                         break;
                     }
                 }
-                AgentEvent::Error { message, .. } => {
+                Event::Error { message, .. } => {
                     let _ = tx_for_events.send(ChatEvent::Delta {
                         session_id: session_for_events.clone(),
                         text: format!("\n\n(error: {message})"),
                     });
                 }
-                AgentEvent::ToolCallStart { call_id, tool_name, .. } => {
+                Event::ToolCallStart { call_id, tool_name, .. } => {
                     call_names.insert(call_id.clone(), tool_name.clone());
                     let _ = tx_for_events.send(ChatEvent::ToolCall {
                         session_id: session_for_events.clone(),
@@ -231,16 +251,16 @@ async fn dispatch_reply(
                         args: String::new(),
                     });
                 }
-                AgentEvent::ToolCallArgsDelta { call_id, args_delta, .. } => {
+                Event::ToolCallArgsDelta { call_id, args_delta, .. } => {
                     call_args.entry(call_id).or_default().push_str(&args_delta);
                 }
-                AgentEvent::ToolCallComplete { call_id, args, .. } => {
+                Event::ToolCallComplete { call_id, args, .. } => {
                     // The agent loop hands back the canonical args string
                     // here — use it in preference to the accumulated
                     // delta buffer.
                     call_args.insert(call_id, args);
                 }
-                AgentEvent::ToolResult { call_id, ok, summary, output, .. } => {
+                Event::ToolResult { call_id, ok, summary, output, .. } => {
                     let name = call_names.remove(&call_id).unwrap_or_default();
                     let args = call_args.remove(&call_id).unwrap_or_default();
                     let result_text = output.clone().unwrap_or_else(|| summary.clone());
@@ -268,9 +288,14 @@ async fn dispatch_reply(
         (assistant_acc, completed_calls, completed_results)
     });
 
-    let turn_input = AgentTurnInput {
-        turn_id: TurnId(hiker_core::store::new_id()),
-        system_prompt: Some(default_system_prompt()),
+    let turn_input = TurnInput {
+        turn_id: TurnId(hiker_core::store::dto::new_id()),
+        system_prompt: Some(
+            "You are a helpful assistant embedded in the hiker note-taking app. \
+             The user is working in a local markdown vault. Answer concisely. \
+             If you don't know something, say so."
+                .to_string(),
+        ),
         history: prior_history,
         user_message: Some(user_message.clone()),
         tools: tool_defs,
@@ -320,12 +345,6 @@ async fn dispatch_reply(
         }
     }
 }
-
-fn default_system_prompt() -> String {
-    "You are a helpful assistant embedded in the hiker note-taking app. \
-     The user is working in a local markdown vault. Answer concisely. \
-     If you don't know something, say so."
-        .to_string()
 }
 
 /// No-op tool dispatcher. Tools land when MCP + agent-changes are
@@ -344,11 +363,15 @@ impl ToolDispatcher for NoToolsDispatcher {
     }
 }
 
-fn short_preview(s: &str, max: usize) -> String {
-    let one_line: String = s.lines().next().unwrap_or("").chars().take(max).collect();
-    if one_line.chars().count() < s.chars().count() {
-        format!("{one_line}…")
-    } else {
-        one_line
+impl ChatRegistry {
+    /// First-line, char-capped preview of a message — used to label a
+    /// session in the picker from its opening user turn.
+    pub(in crate::chat) fn short_preview(&self, s: &str, max: usize) -> String {
+        let one_line: String = s.lines().next().unwrap_or("").chars().take(max).collect();
+        if one_line.chars().count() < s.chars().count() {
+            format!("{one_line}…")
+        } else {
+            one_line
+        }
     }
 }

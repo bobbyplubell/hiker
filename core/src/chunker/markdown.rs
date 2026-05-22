@@ -19,21 +19,73 @@ const SOFT_SIZE_LIMIT: usize = 1200;
 
 /// Stateless markdown chunker. Implements [`Chunker`] so the ingest pipeline
 /// can dispatch by extension.
-pub struct MarkdownChunker;
+pub struct Markdown;
 
-impl Chunker for MarkdownChunker {
+impl Chunker for Markdown {
     fn chunk(&self, source: &str) -> Vec<Chunk> {
-        chunk_markdown(source)
+        chunk(source)
     }
 }
 
 /// Split a markdown source into chunks. Frontmatter is stripped before
 /// chunking; byte offsets in the returned chunks are relative to the original
 /// `source` (so callers can still index into the input string).
-pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
-    let (body_start, body) = strip_frontmatter(source);
+pub fn chunk(source: &str) -> Vec<Chunk> {
+    // Strip a YAML frontmatter block delimited by `---` lines at the very start
+    // of the file. Returns the byte offset where the body begins (relative to
+    // the original source) and the body slice.
+    let (body_start, body): (usize, &str) = if !source.starts_with("---\n")
+        && !source.starts_with("---\r\n")
+    {
+        (0, source)
+    } else {
+        let after_open = if source.starts_with("---\r\n") { 5 } else { 4 };
+        let rest = &source[after_open..];
+        let mut found: Option<(usize, &str)> = None;
+        let mut search_from = 0;
+        while let Some(idx) = rest[search_from..].find("---") {
+            let abs = search_from + idx;
+            let at_line_start = abs == 0 || rest.as_bytes()[abs - 1] == b'\n';
+            if !at_line_start {
+                search_from = abs + 1;
+                continue;
+            }
+            let after = abs + 3;
+            let valid_end = after >= rest.len()
+                || rest.as_bytes()[after] == b'\n'
+                || (rest.as_bytes()[after] == b'\r'
+                    && rest.len() > after + 1
+                    && rest.as_bytes()[after + 1] == b'\n');
+            if valid_end {
+                let mut body_start_in_rest = after;
+                if body_start_in_rest < rest.len()
+                    && rest.as_bytes()[body_start_in_rest] == b'\r'
+                {
+                    body_start_in_rest += 1;
+                }
+                if body_start_in_rest < rest.len()
+                    && rest.as_bytes()[body_start_in_rest] == b'\n'
+                {
+                    body_start_in_rest += 1;
+                }
+                let body_offset = after_open + body_start_in_rest;
+                found = Some((body_offset, &source[body_offset..]));
+                break;
+            }
+            search_from = abs + 1;
+        }
+        found.unwrap_or((0, source))
+    };
 
-    let mut state = ChunkBuilder::new(body_start);
+    let mut state = ChunkBuilder {
+        body_start_offset: body_start,
+        next_index: 0,
+        chunks: Vec::new(),
+        cur_byte_start: None,
+        cur_byte_end: 0,
+        cur_text: String::new(),
+        cur_heading_path: None,
+    };
     let parser = Parser::new_ext(body, Options::all()).into_offset_iter();
 
     // Track active block bounds. We only flush when we cross a heading boundary
@@ -68,7 +120,14 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
                         current_heading_buf.clear();
                         // Trim the heading_stack to one shallower than this level
                         // before we push, so an H2 after an H3 pops back up.
-                        let depth = heading_level_depth(level);
+                        let depth: usize = match level {
+                            HeadingLevel::H1 => 1,
+                            HeadingLevel::H2 => 2,
+                            HeadingLevel::H3 => 3,
+                            HeadingLevel::H4 => 4,
+                            HeadingLevel::H5 => 5,
+                            HeadingLevel::H6 => 6,
+                        };
                         heading_stack.truncate(depth.saturating_sub(1));
                         // Seed the chunk with the heading line's own markdown so
                         // chunks containing nothing but a heading still survive
@@ -91,7 +150,7 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
                         in_heading_text = false;
                         let title = current_heading_buf.trim().to_string();
                         heading_stack.push(title);
-                        let breadcrumb = breadcrumb_from(&heading_stack);
+                        let breadcrumb = heading_stack.join(" > ");
                         state.set_heading_path(Some(breadcrumb));
                         // After the heading line itself, mark the chunk as having
                         // a fresh size budget (the title bytes already counted).
@@ -133,65 +192,6 @@ pub fn chunk_markdown(source: &str) -> Vec<Chunk> {
     state.finish()
 }
 
-fn heading_level_depth(level: HeadingLevel) -> usize {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}
-
-fn breadcrumb_from(stack: &[String]) -> String {
-    stack.join(" > ")
-}
-
-/// Strip a YAML frontmatter block delimited by `---` lines at the very start of
-/// the file. Returns the byte offset where the body begins (relative to the
-/// original source) and the body slice.
-fn strip_frontmatter(source: &str) -> (usize, &str) {
-    if !source.starts_with("---\n") && !source.starts_with("---\r\n") {
-        return (0, source);
-    }
-    let after_open = if source.starts_with("---\r\n") { 5 } else { 4 };
-    // Look for a closing `---` line.
-    let rest = &source[after_open..];
-    let mut search_from = 0;
-    while let Some(idx) = rest[search_from..].find("---") {
-        let abs = search_from + idx;
-        // Must be at a line start (preceded by \n or be at the very start).
-        let at_line_start = abs == 0 || rest.as_bytes()[abs - 1] == b'\n';
-        if !at_line_start {
-            search_from = abs + 1;
-            continue;
-        }
-        // After the `---`, must be end-of-input or a newline.
-        let after = abs + 3;
-        let valid_end = after >= rest.len()
-            || rest.as_bytes()[after] == b'\n'
-            || (rest.as_bytes()[after] == b'\r'
-                && rest.len() > after + 1
-                && rest.as_bytes()[after + 1] == b'\n');
-        if valid_end {
-            // Skip the closing `---` line and its newline.
-            let mut body_start_in_rest = after;
-            if body_start_in_rest < rest.len() && rest.as_bytes()[body_start_in_rest] == b'\r' {
-                body_start_in_rest += 1;
-            }
-            if body_start_in_rest < rest.len() && rest.as_bytes()[body_start_in_rest] == b'\n' {
-                body_start_in_rest += 1;
-            }
-            let body_offset = after_open + body_start_in_rest;
-            return (body_offset, &source[body_offset..]);
-        }
-        search_from = abs + 1;
-    }
-    // Unterminated frontmatter — bail and treat the whole file as body.
-    (0, source)
-}
-
 struct ChunkBuilder {
     body_start_offset: usize,
     next_index: u32,
@@ -203,19 +203,8 @@ struct ChunkBuilder {
 }
 
 impl ChunkBuilder {
-    fn new(body_start_offset: usize) -> Self {
-        Self {
-            body_start_offset,
-            next_index: 0,
-            chunks: Vec::new(),
-            cur_byte_start: None,
-            cur_byte_end: 0,
-            cur_text: String::new(),
-            cur_heading_path: None,
-        }
-    }
 
-    fn size(&self) -> usize {
+    const fn size(&self) -> usize {
         self.cur_text.len()
     }
 
@@ -281,20 +270,20 @@ mod tests {
 
     #[test]
     fn empty_input_produces_no_chunks() {
-        let chunks = chunk_markdown("");
+        let chunks = chunk("");
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn whitespace_only_input_produces_no_chunks() {
-        let chunks = chunk_markdown("   \n\n\t\n");
+        let chunks = chunk("   \n\n\t\n");
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn no_headings_yields_one_chunk() {
         let src = "Just a paragraph.\n\nAnd another.\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("Just a paragraph"));
         assert!(chunks[0].text.contains("And another"));
@@ -305,7 +294,7 @@ mod tests {
     #[test]
     fn each_heading_starts_a_new_chunk() {
         let src = "# A\n\nbody a\n\n# B\n\nbody b\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading_path.as_deref(), Some("A"));
         assert_eq!(chunks[1].heading_path.as_deref(), Some("B"));
@@ -316,7 +305,7 @@ mod tests {
     #[test]
     fn nested_headings_build_breadcrumb() {
         let src = "# A\n\n## A1\n\nbody.\n\n## A2\n\nbody.\n\n# B\n\nbody.\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         let paths: Vec<_> = chunks
             .iter()
             .map(|c| c.heading_path.as_deref().unwrap_or(""))
@@ -327,7 +316,7 @@ mod tests {
     #[test]
     fn content_above_any_heading_has_no_breadcrumb() {
         let src = "intro paragraph\n\n# First\n\nbody\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].heading_path.is_none());
         assert_eq!(chunks[1].heading_path.as_deref(), Some("First"));
@@ -336,7 +325,7 @@ mod tests {
     #[test]
     fn frontmatter_is_stripped() {
         let src = "---\ntitle: hello\ntags: [x]\n---\n\n# Real Heading\n\nbody\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].heading_path.as_deref(), Some("Real Heading"));
         assert!(!chunks[0].text.contains("title: hello"));
@@ -348,7 +337,7 @@ mod tests {
     fn unterminated_frontmatter_falls_through() {
         // No closing `---` — we treat the whole file as body and parse it.
         let src = "---\ntitle: hello\n\n# Heading\n\nbody\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         // pulldown-cmark sees `---` followed by `title:` etc. as a setext-ish
         // structure; we don't assert the exact chunk shape, only that we don't
         // panic and produce *something*.
@@ -363,7 +352,7 @@ mod tests {
             src.push_str(&format!("paragraph {i} ").repeat(20));
             src.push_str("\n\n");
         }
-        let chunks = chunk_markdown(&src);
+        let chunks = chunk(&src);
         assert!(
             chunks.len() >= 2,
             "expected multiple chunks within one heading, got {}",
@@ -384,7 +373,7 @@ mod tests {
         // A 2000-char code block, single fenced section.
         src.push_str(&"x".repeat(2000));
         src.push_str("\n```\n\nepilogue.\n");
-        let chunks = chunk_markdown(&src);
+        let chunks = chunk(&src);
         // Find the chunk that contains the code fence.
         let code_chunks: Vec<_> = chunks
             .iter()
@@ -398,7 +387,7 @@ mod tests {
     #[test]
     fn chunk_indexes_are_contiguous_and_zero_based() {
         let src = "# A\n\nbody\n\n# B\n\nbody\n\n# C\n\nbody\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         let indexes: Vec<_> = chunks.iter().map(|c| c.index).collect();
         assert_eq!(indexes, vec![0, 1, 2]);
     }
@@ -406,7 +395,7 @@ mod tests {
     #[test]
     fn byte_offsets_point_into_original_source() {
         let src = "---\nx: 1\n---\n\n# Hi\n\nbody.\n";
-        let chunks = chunk_markdown(src);
+        let chunks = chunk(src);
         // The first chunk's byte range, sliced out of the original src,
         // should at minimum overlap with the heading text.
         let c = &chunks[0];

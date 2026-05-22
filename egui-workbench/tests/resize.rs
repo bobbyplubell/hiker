@@ -2,14 +2,19 @@
 //! hit while building the chat side bar: resize snap-back from content
 //! inflation, mirrored width drift on idle frames, etc.
 
-use egui_workbench::{
-    DocumentTab, SideBarSide, TabUiContext, Workbench, WorkbenchBehavior,
-};
+use egui_workbench::tab::Document;
 
+use egui_workbench::side_bar::Side;
+
+use egui_workbench::tab::UiContext;
+
+use egui_workbench::workspace::Workbench;
+
+use egui_workbench::behavior::Host;
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TestTab;
 
-impl DocumentTab for TestTab {
+impl Document for TestTab {
     fn title(&self) -> egui::WidgetText {
         "tab".into()
     }
@@ -22,8 +27,8 @@ struct TestMode;
 /// the default 260 side bar. Reproduces the snap-back source.
 struct WideBehavior;
 
-impl WorkbenchBehavior<TestTab, TestMode> for WideBehavior {
-    fn pane_ui(&mut self, _ui: &mut egui::Ui, _tab: &mut TestTab, _ctx: TabUiContext<'_>) {}
+impl Host<TestTab, TestMode> for WideBehavior {
+    fn pane_ui(&mut self, _ui: &mut egui::Ui, _tab: &mut TestTab, _ctx: UiContext<'_>) {}
 
     fn side_bar_ui(&mut self, ui: &mut egui::Ui, _mode: &TestMode) {
         ui.add_sized([400.0, 20.0], egui::Label::new("wide content"));
@@ -33,8 +38,8 @@ impl WorkbenchBehavior<TestTab, TestMode> for WideBehavior {
         ui.add_sized([400.0, 20.0], egui::Label::new("wide content"));
     }
 
-    fn activity_items(&self) -> Vec<egui_workbench::ActivityItem<TestMode>> {
-        vec![egui_workbench::ActivityItem {
+    fn activity_items(&self) -> Vec<egui_workbench::activity_bar::Item<TestMode>> {
+        vec![egui_workbench::activity_bar::Item {
             label: "Mode".into(),
             icon: None,
             mode: TestMode,
@@ -43,23 +48,19 @@ impl WorkbenchBehavior<TestTab, TestMode> for WideBehavior {
     }
 }
 
-fn make_workbench() -> Workbench<TestTab, TestMode> {
-    let mut wb = Workbench::<TestTab, TestMode>::new();
-    wb.activity_bar.set_active(Some(TestMode));
-    wb.secondary_side_bar.visible = true;
-    wb
-}
-
 fn build_harness(
     size: egui::Vec2,
 ) -> egui_kittest::Harness<'static, Workbench<TestTab, TestMode>> {
+    let mut wb = Workbench::<TestTab, TestMode>::new();
+    wb.activity_bar.set_active(Some(TestMode));
+    wb.secondary_side_bar.visible = true;
     egui_kittest::Harness::builder()
         .with_size(size)
         .build_state(
             |ctx, wb| {
                 wb.ui(ctx, &mut WideBehavior);
             },
-            make_workbench(),
+            wb,
         )
 }
 
@@ -71,8 +72,8 @@ fn default_widths_match_sidebar_defaults() {
     let wb = harness.state();
     assert_eq!(wb.primary_side_bar.width, 260.0);
     assert_eq!(wb.secondary_side_bar.width, 260.0);
-    assert_eq!(wb.primary_side_bar.side, SideBarSide::Left);
-    assert_eq!(wb.secondary_side_bar.side, SideBarSide::Right);
+    assert_eq!(wb.primary_side_bar.side, Side::Left);
+    assert_eq!(wb.secondary_side_bar.side, Side::Right);
 }
 
 #[test]

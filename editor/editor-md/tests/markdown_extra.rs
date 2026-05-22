@@ -1,8 +1,10 @@
-use editor_core::{Decoration, EditorState, Selection};
-use editor_md::{
-    footnote_decorations, math_decorations, mermaid_decorations, transclusion_decorations,
-};
-
+use editor_core::decoration::Decoration;
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::Selection;
+use editor_md::notes::footnote_decorations;
+use editor_md::equations::math_decorations;
+use editor_md::diagrams::mermaid_decorations;
+use editor_md::embeds::transclusion_decorations;
 #[test]
 fn transclusion_emits_replace_and_mark_when_cursor_off_line() {
     let src = "first\nsee ![[OtherNote]] now\n";

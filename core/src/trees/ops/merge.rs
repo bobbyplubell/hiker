@@ -1,9 +1,9 @@
 //! `merge_siblings` and `merge_children_up` reshape ops.
 
 use super::super::storage::params;
-use super::super::types::{EditableNode, Trees, TreesError};
+use super::super::types::{EditableNode, Db, Error};
 
-impl Trees {
+impl Db {
     /// Merge a set of sibling clusters into one. The first id in `node_ids`
     /// is kept as the survivor; every other listed node's children are
     /// re-parented under the survivor, then the absorbed nodes are
@@ -17,9 +17,9 @@ impl Trees {
         &self,
         tree_id: &str,
         node_ids: &[String],
-    ) -> Result<String, TreesError> {
+    ) -> Result<String, Error> {
         if node_ids.len() < 2 {
-            return Err(TreesError::TreeNotFound(format!(
+            return Err(Error::TreeNotFound(format!(
                 "merge_siblings needs >=2 ids, got {}",
                 node_ids.len()
             )));
@@ -27,7 +27,7 @@ impl Trees {
         let nodes: Vec<EditableNode> = node_ids
             .iter()
             .map(|id| {
-                self.get_node(tree_id, id)?.ok_or_else(|| TreesError::NodeNotFound {
+                self.get_node(tree_id, id)?.ok_or_else(|| Error::NodeNotFound {
                     tree_id: tree_id.to_string(),
                     node_id: id.clone(),
                 })
@@ -36,7 +36,7 @@ impl Trees {
         let parent = nodes[0].parent.clone();
         for n in &nodes[1..] {
             if n.parent != parent {
-                return Err(TreesError::TreeNotFound(format!(
+                return Err(Error::TreeNotFound(format!(
                     "merge_siblings: node {} has different parent",
                     n.id
                 )));
@@ -125,7 +125,7 @@ impl Trees {
     /// stay put.
     ///
     /// status: cluster-editor-merge-children-up
-    pub fn merge_children_up(&self, tree_id: &str, parent_id: &str) -> Result<(), TreesError> {
+    pub fn merge_children_up(&self, tree_id: &str, parent_id: &str) -> Result<(), Error> {
         // Snapshot so we can undo: each absorbed cluster + each
         // grand-child's prior parent.
         let mut absorbed_snapshots: Vec<serde_json::Value> = Vec::new();

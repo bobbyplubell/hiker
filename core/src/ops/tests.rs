@@ -1,6 +1,6 @@
-use super::*;
-use crate::embed::{EmbedError, Embedder};
-use crate::indexer::{start_indexer, IndexerHandle};
+use super::file::{create_with_suffix, delete, move_folder, move_note, restore};
+use crate::embed::{Error, Embedder};
+use crate::indexer::{self, Handle};
 use crate::store::Store;
 use crate::trash::Trash;
 use crate::vault::Vault;
@@ -13,7 +13,7 @@ use tempfile::TempDir;
 /// 384-dim zero vector for any input.
 struct ZeroEmbedder;
 impl Embedder for ZeroEmbedder {
-    fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, Error> {
         Ok(batch.iter().map(|_| vec![0.0; 384]).collect())
     }
     fn version(&self) -> &str {
@@ -28,8 +28,8 @@ fn open_vault(td: &TempDir) -> Vault {
     Vault::open(td.path()).expect("open vault")
 }
 
-fn start(vault: Vault, store: Store) -> IndexerHandle {
-    start_indexer(vault, store, || {
+fn start_indexer(vault: Vault, store: Store) -> Handle {
+    indexer::start(vault, store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     })
 }
@@ -40,7 +40,7 @@ async fn create_with_suffix_picks_first_free_slot() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     let p1 = create_with_suffix(&watcher, &idx.job_sender(), &vault, None, "", "new-note")
         .await
@@ -66,7 +66,7 @@ async fn move_note_renames_existing_file() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     std::fs::write(td.path().join("a.md"), "hello").unwrap();
     move_note(&watcher, &idx.job_sender(), &vault, None, "a.md", "b.md")
@@ -84,7 +84,7 @@ async fn move_folder_renames_directory_with_members() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     std::fs::create_dir(td.path().join("src")).unwrap();
     std::fs::write(td.path().join("src/a.md"), "x").unwrap();
@@ -110,7 +110,7 @@ async fn move_note_suppresses_watcher_events_for_both_paths() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     // Subscribe before the op so any event the rename produces lands in
     // our channel. Settle briefly so the watcher's bridge thread is up.
@@ -162,7 +162,7 @@ async fn delete_then_restore_round_trips() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     std::fs::write(td.path().join("note.md"), "body").unwrap();
 

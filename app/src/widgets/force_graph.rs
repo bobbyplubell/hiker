@@ -17,15 +17,15 @@
 use eframe::egui;
 
 /// Persistent pan/zoom state. Both consumers store an instance per
-/// canvas (the vault graph holds it on `GraphState`; the cluster graph
+/// canvas (the vault graph holds it on `State`; the cluster graph
 /// stores it in egui memory keyed by tree id).
 #[derive(Clone, Copy)]
-pub struct ForceGraphView {
+pub struct View {
     pub pan: egui::Vec2,
     pub zoom: f32,
 }
 
-impl Default for ForceGraphView {
+impl Default for View {
     fn default() -> Self {
         Self {
             pan: egui::Vec2::ZERO,
@@ -43,7 +43,7 @@ pub struct ZoomBounds {
     pub max: f32,
 }
 
-impl ForceGraphView {
+impl View {
     /// Apply drag-to-pan + scroll-to-zoom (anchored on the cursor when
     /// possible). Mirrors the inline blocks the two panels had before
     /// extraction.
@@ -90,7 +90,7 @@ impl ForceGraphView {
 
     /// Convenience: reset pan to origin and zoom to 1.0.
     #[allow(dead_code)] // TODO: bind to a "Reset view" toolbar button.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.pan = egui::Vec2::ZERO;
         self.zoom = 1.0;
     }

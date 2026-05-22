@@ -10,10 +10,10 @@
 //! the existing `chunk_vecs` table populated by the indexer.
 //!
 //! The top-level entry is `query()`. It composes the two engines based on
-//! `SearchModes`, groups chunk-level hits by note (best chunk wins per
+//! `Modes`, groups chunk-level hits by note (best chunk wins per
 //! note), and fuses the two ranked lists via RRF (k=60). Callers (the
 //! search command, MCP) hand it the query string + modes and get a
-//! `SearchResponse` with `lexical_hits`, `semantic_hits`, and `fused`
+//! `Response` with `lexical_hits`, `semantic_hits`, and `fused`
 //! all populated; the frontend renders whichever bucket matches the mode.
 
 use std::collections::HashMap;
@@ -22,8 +22,10 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::RecencyBias;
-use crate::store::{knn_chunks_on, Store, StoreError};
+use crate::config::sections::RecencyBias;
+use crate::store::error::Error as StoreError;
+use crate::store::vec::knn_chunks_on;
+use crate::store::Store;
 #[cfg(test)]
 use crate::store::DEFAULT_EMBED_DIM;
 
@@ -44,7 +46,7 @@ const RRF_K: f32 = 60.0;
 const SNIPPET_WINDOW: usize = 32;
 
 #[derive(Debug, Error)]
-pub enum SearchError {
+pub enum Error {
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("sqlite: {0}")]
@@ -106,7 +108,7 @@ impl Default for SemanticOpts {
 /// rejected at the UI layer (`search-modes-both-off-disabled`); if a
 /// caller ever passes both-false the response is simply empty.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct SearchModes {
+pub struct Modes {
     pub semantic: bool,
     pub lexical: bool,
 }
@@ -135,7 +137,7 @@ pub struct NoteHit {
 /// "show what each backend found separately" affordances without a new
 /// command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResponse {
+pub struct Response {
     /// Echoed back so the frontend can drop stale results
     /// (`search-typeahead-debounce`).
     pub epoch: u64,
@@ -164,7 +166,7 @@ pub trait LexicalEngine {
         q: &str,
         top_k: usize,
         opts: LexicalOpts,
-    ) -> Result<Vec<NoteHit>, SearchError>;
+    ) -> Result<Vec<NoteHit>, Error>;
     fn version(&self) -> &str;
 }
 
@@ -178,7 +180,7 @@ pub trait SemanticEngine {
         &self,
         embedding: &[f32],
         top_k: usize,
-    ) -> Result<Vec<NoteHit>, SearchError>;
+    ) -> Result<Vec<NoteHit>, Error>;
     fn version(&self) -> &str;
 }
 
@@ -193,7 +195,7 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
         q: &str,
         top_k: usize,
         opts: LexicalOpts,
-    ) -> Result<Vec<NoteHit>, SearchError> {
+    ) -> Result<Vec<NoteHit>, Error> {
         if q.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -203,7 +205,28 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
         // exact-phrase semantics; prefix match rewrites each token to
         // `token*`. Phrase mode wins when both are set (FTS5 ignores `*`
         // inside a quoted phrase per the spec hint in `search.md`).
-        let match_string = build_match_string(q, opts);
+        // Build the FTS5 `MATCH` string from the user's raw query plus the
+        // lexical option flags. Phrase mode wraps the whole query in double
+        // quotes (FTS5 exact-phrase). Prefix match rewrites each whitespace
+        // token to `token*`. Phrase wins over prefix when both are set —
+        // FTS5 silently ignores `*` inside a quoted phrase.
+        let match_string = {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else if opts.phrase_mode {
+                let escaped = trimmed.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            } else if opts.prefix_match {
+                trimmed
+                    .split_whitespace()
+                    .map(|tok| format!("{tok}*"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                trimmed.to_string()
+            }
+        };
         // status: search-fts5-bm25-snippet
         // SQLite's bm25() returns a NEGATIVE-going score (more-negative =
         // better match), so ORDER BY bm25 ASC produces best-first.
@@ -266,10 +289,19 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
             // (and vice versa) without a normalization pass — so the
             // narrower setting is enforced by exactly the same byte-level
             // contains check as case_sensitive.
-            if (opts.case_sensitive || opts.diacritic_sensitive)
-                && !chunk_contains(q, &chunk_text, opts)
-            {
-                continue;
+            // Substring check used by the lexical post-filter pass. When
+            // `case_sensitive` is off, both sides are lowercased before
+            // comparison. Diacritic-sensitivity is handled by the natural
+            // byte-level mismatch between accented and unaccented forms.
+            if opts.case_sensitive || opts.diacritic_sensitive {
+                let contains = if opts.case_sensitive {
+                    chunk_text.contains(q)
+                } else {
+                    chunk_text.to_lowercase().contains(&q.to_lowercase())
+                };
+                if !contains {
+                    continue;
+                }
             }
             chunk_hits.push(hit);
         }
@@ -295,7 +327,7 @@ impl<'a> SemanticEngine for VecSemanticEngine<'a> {
         &self,
         embedding: &[f32],
         top_k: usize,
-    ) -> Result<Vec<NoteHit>, SearchError> {
+    ) -> Result<Vec<NoteHit>, Error> {
         // Dim check is owned by `knn_chunks_on`, which reads the live
         // on-disk `chunk_vecs` dim and rejects mismatches there — that's
         // the source of truth after `embedder-dim-from-model`, not a
@@ -323,7 +355,20 @@ impl<'a> SemanticEngine for VecSemanticEngine<'a> {
                     path: h.note_path,
                     chunk_index,
                     heading_path: h.heading_path,
-                    snippet: snippet_from_text(&h.text),
+                    snippet: {
+                        let collapsed: String =
+                            h.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if collapsed.len() <= 200 {
+                            collapsed
+                        } else {
+                            let cutoff = collapsed
+                                .char_indices()
+                                .nth(200)
+                                .map(|(i, _)| i)
+                                .unwrap_or(collapsed.len());
+                            format!("{}…", &collapsed[..cutoff])
+                        }
+                    },
                     score: h.score,
                 }
             })
@@ -372,7 +417,15 @@ fn group_by_note(chunks: Vec<RawChunkHit>, top_k: usize) -> Vec<NoteHit> {
         .filter_map(|id| best.remove(&id))
         .map(|c| NoteHit {
             note_id: c.note_id,
-            title: title_from_path(&c.path),
+            title: {
+                let last = c.path.rsplit('/').next().unwrap_or(c.path.as_str());
+                let stem = last.strip_suffix(".md").unwrap_or(last);
+                if stem.is_empty() {
+                    "Untitled".into()
+                } else {
+                    stem.to_string()
+                }
+            },
             path: c.path,
             score: c.score,
             chunk_id: c.chunk_id,
@@ -386,90 +439,6 @@ fn group_by_note(chunks: Vec<RawChunkHit>, top_k: usize) -> Vec<NoteHit> {
     hits
 }
 
-/// Reciprocal rank fusion (k=60) over two ranked, per-note lists.
-/// Group-by-note happens before fusion (each input is already deduped).
-/// The chunk shown in the fused row is the best chunk from whichever
-/// backend ranked the note highest. status: search-rrf-fusion
-fn rrf_fuse(
-    lexical: &[NoteHit],
-    semantic: &[NoteHit],
-    top_k: usize,
-) -> Vec<NoteHit> {
-    let mut scores: HashMap<String, f32> = HashMap::new();
-    let mut best: HashMap<String, (NoteHit, f32)> = HashMap::new();
-
-    let mut record = |hits: &[NoteHit]| {
-        for (rank, hit) in hits.iter().enumerate() {
-            let contribution = 1.0 / (RRF_K + (rank as f32 + 1.0));
-            *scores.entry(hit.note_id.clone()).or_insert(0.0) += contribution;
-            // Track which side gave the better-ranked appearance — that's
-            // whose snippet/heading we surface.
-            best.entry(hit.note_id.clone())
-                .and_modify(|(cur, cur_contribution)| {
-                    if contribution > *cur_contribution {
-                        *cur = hit.clone();
-                        *cur_contribution = contribution;
-                    }
-                })
-                .or_insert_with(|| (hit.clone(), contribution));
-        }
-    };
-    record(lexical);
-    record(semantic);
-
-    let mut fused: Vec<(String, f32)> = scores.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    fused
-        .into_iter()
-        .take(top_k)
-        .filter_map(|(note_id, fused_score)| {
-            best.remove(&note_id).map(|(mut hit, _)| {
-                hit.score = fused_score;
-                hit
-            })
-        })
-        .collect()
-}
-
-/// Build the FTS5 `MATCH` string from the user's raw query plus the
-/// lexical option flags. Phrase mode wraps the whole query in double
-/// quotes (FTS5 exact-phrase). Prefix match rewrites each whitespace
-/// token to `token*`. Phrase wins over prefix when both are set —
-/// FTS5 silently ignores `*` inside a quoted phrase.
-fn build_match_string(q: &str, opts: LexicalOpts) -> String {
-    let trimmed = q.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if opts.phrase_mode {
-        // Escape any embedded double quotes by doubling them per FTS5's
-        // string literal rules.
-        let escaped = trimmed.replace('"', "\"\"");
-        return format!("\"{escaped}\"");
-    }
-    if opts.prefix_match {
-        return trimmed
-            .split_whitespace()
-            .map(|tok| format!("{tok}*"))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    trimmed.to_string()
-}
-
-/// Substring check used by the lexical post-filter pass. When
-/// `case_sensitive` is off, both sides are lowercased before comparison.
-/// Diacritic-sensitivity is handled by the natural byte-level mismatch
-/// between accented and unaccented forms — see the call site for why no
-/// normalization pass runs here.
-fn chunk_contains(query: &str, chunk_text: &str, opts: LexicalOpts) -> bool {
-    if opts.case_sensitive {
-        chunk_text.contains(query)
-    } else {
-        chunk_text.to_lowercase().contains(&query.to_lowercase())
-    }
-}
-
 /// Top-level entry. `lexical_query_text` and `query_embedding` are the
 /// caller's responsibility; embedding is done in a `spawn_blocking` hop
 /// outside the store's connection pool per
@@ -478,12 +447,12 @@ fn chunk_contains(query: &str, chunk_text: &str, opts: LexicalOpts) -> bool {
 pub fn query(
     store: &Store,
     epoch: u64,
-    modes: SearchModes,
+    modes: Modes,
     lexical_query_text: Option<&str>,
     query_embedding: Option<&[f32]>,
     lexical_opts: LexicalOpts,
     semantic_opts: SemanticOpts,
-) -> Result<SearchResponse, SearchError> {
+) -> Result<Response, Error> {
     let conn = store.open_reader()?;
 
     let lexical_hits = if modes.lexical {
@@ -510,8 +479,78 @@ pub fn query(
                     hits.retain(|h| h.score >= semantic_opts.min_similarity);
                 }
                 // status: search-semantic-recency-bias
+                //
+                // Blend an `notes.mtime`-derived rank into each semantic
+                // hit's score using the same RRF k=60 shape as the
+                // cross-mode fusion:
+                //
+                //   score' = 1/(k + sim_rank) + w · 1/(k + recency_rank)
+                //
+                // where `w` is `0.5` (Mild) or `1.0` (Strong) and
+                // `recency_rank` is the note's position when the candidate
+                // set is sorted by `notes.mtime DESC`. The semantic rank
+                // used is the input ordering: `hits` arrives already
+                // sorted best-first by cosine similarity.
                 if semantic_opts.recency_bias != RecencyBias::Off && !hits.is_empty() {
-                    apply_recency_bias(&conn, &mut hits, semantic_opts.recency_bias)?;
+                    let weight = semantic_opts.recency_bias.weight();
+                    if weight != 0.0 {
+                        // Pull each candidate's mtime in one query.
+                        let mut placeholders = String::new();
+                        for i in 0..hits.len() {
+                            if i > 0 {
+                                placeholders.push(',');
+                            }
+                            placeholders.push('?');
+                        }
+                        let sql = format!(
+                            "SELECT id, mtime FROM notes WHERE id IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let params_iter: Vec<&dyn rusqlite::ToSql> = hits
+                            .iter()
+                            .map(|h| &h.note_id as &dyn rusqlite::ToSql)
+                            .collect();
+                        let mtime_rows = stmt.query_map(
+                            rusqlite::params_from_iter(params_iter),
+                            |row| {
+                                let id: String = row.get(0)?;
+                                let mtime: i64 = row.get(1)?;
+                                Ok((id, mtime))
+                            },
+                        )?;
+                        let mut mtimes: HashMap<String, i64> = HashMap::new();
+                        for r in mtime_rows {
+                            let (id, m) = r?;
+                            mtimes.insert(id, m);
+                        }
+                        // Recency rank: sort note ids by mtime DESC.
+                        let mut by_recency: Vec<(&str, i64)> = hits
+                            .iter()
+                            .map(|h| {
+                                (h.note_id.as_str(), *mtimes.get(&h.note_id).unwrap_or(&0))
+                            })
+                            .collect();
+                        by_recency.sort_by_key(|x| std::cmp::Reverse(x.1));
+                        let mut recency_rank: HashMap<String, usize> = HashMap::new();
+                        for (i, (id, _)) in by_recency.iter().enumerate() {
+                            recency_rank.insert((*id).to_string(), i + 1);
+                        }
+                        // Apply the RRF blend in place.
+                        let total = hits.len();
+                        for (i, hit) in hits.iter_mut().enumerate() {
+                            let sim_rank = (i + 1) as f32;
+                            let rec_rank =
+                                *recency_rank.get(&hit.note_id).unwrap_or(&total) as f32;
+                            let blended = 1.0 / (RRF_K + sim_rank)
+                                + weight * (1.0 / (RRF_K + rec_rank));
+                            hit.score = blended;
+                        }
+                        hits.sort_by(|a, b| {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
                 }
                 hits
             }
@@ -522,7 +561,44 @@ pub fn query(
     };
 
     let fused = if modes.lexical && modes.semantic {
-        rrf_fuse(&lexical_hits, &semantic_hits, FUSED_TOP_K)
+        // Reciprocal rank fusion (k=60) over two ranked, per-note lists.
+        // Group-by-note happens before fusion (each input is already deduped).
+        // The chunk shown in the fused row is the best chunk from whichever
+        // backend ranked the note highest. status: search-rrf-fusion
+        let mut scores: HashMap<String, f32> = HashMap::new();
+        let mut best: HashMap<String, (NoteHit, f32)> = HashMap::new();
+        let mut record = |hits: &[NoteHit]| {
+            for (rank, hit) in hits.iter().enumerate() {
+                let contribution = 1.0 / (RRF_K + (rank as f32 + 1.0));
+                *scores.entry(hit.note_id.clone()).or_insert(0.0) += contribution;
+                // Track which side gave the better-ranked appearance —
+                // that's whose snippet/heading we surface.
+                best.entry(hit.note_id.clone())
+                    .and_modify(|(cur, cur_contribution)| {
+                        if contribution > *cur_contribution {
+                            *cur = hit.clone();
+                            *cur_contribution = contribution;
+                        }
+                    })
+                    .or_insert_with(|| (hit.clone(), contribution));
+            }
+        };
+        record(&lexical_hits);
+        record(&semantic_hits);
+        let mut fused_pairs: Vec<(String, f32)> = scores.into_iter().collect();
+        fused_pairs.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        fused_pairs
+            .into_iter()
+            .take(FUSED_TOP_K)
+            .filter_map(|(note_id, fused_score)| {
+                best.remove(&note_id).map(|(mut hit, _)| {
+                    hit.score = fused_score;
+                    hit
+                })
+            })
+            .collect()
     } else if modes.lexical {
         lexical_hits.iter().take(FUSED_TOP_K).cloned().collect()
     } else if modes.semantic {
@@ -533,7 +609,7 @@ pub fn query(
 
     let hits = pick_bucket(&lexical_hits, &semantic_hits, &fused, modes);
 
-    Ok(SearchResponse {
+    Ok(Response {
         epoch,
         lexical_hits,
         semantic_hits,
@@ -551,7 +627,7 @@ pub fn pick_bucket(
     lexical_hits: &[NoteHit],
     semantic_hits: &[NoteHit],
     fused: &[NoteHit],
-    modes: SearchModes,
+    modes: Modes,
 ) -> Vec<NoteHit> {
     if modes.lexical && modes.semantic {
         fused.to_vec()
@@ -564,106 +640,11 @@ pub fn pick_bucket(
     }
 }
 
-/// Blend an `notes.mtime`-derived rank into each semantic hit's score
-/// using the same RRF k=60 shape as the cross-mode fusion:
-///
-/// ```text
-/// score' = 1/(k + sim_rank) + w · 1/(k + recency_rank)
-/// ```
-///
-/// where `w` is `0.5` (Mild) or `1.0` (Strong) and `recency_rank` is the
-/// note's position when the candidate set is sorted by `notes.mtime
-/// DESC`. The semantic rank used is the input ordering: `hits` arrives
-/// already sorted best-first by cosine similarity. Mtimes for every hit
-/// are pulled in one bulk `IN (...)` query.
-///
-/// status: search-semantic-recency-bias
-fn apply_recency_bias(
-    conn: &Connection,
-    hits: &mut [NoteHit],
-    bias: RecencyBias,
-) -> Result<(), SearchError> {
-    let weight = bias.weight();
-    if weight == 0.0 {
-        return Ok(());
-    }
-    // Pull each candidate's mtime in one query. `IN (?, ?, ?, ...)`.
-    let mut placeholders = String::new();
-    for i in 0..hits.len() {
-        if i > 0 {
-            placeholders.push(',');
-        }
-        placeholders.push('?');
-    }
-    let sql = format!("SELECT id, mtime FROM notes WHERE id IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql)?;
-    let params_iter: Vec<&dyn rusqlite::ToSql> = hits
-        .iter()
-        .map(|h| &h.note_id as &dyn rusqlite::ToSql)
-        .collect();
-    let mtime_rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |row| {
-        let id: String = row.get(0)?;
-        let mtime: i64 = row.get(1)?;
-        Ok((id, mtime))
-    })?;
-    let mut mtimes: HashMap<String, i64> = HashMap::new();
-    for r in mtime_rows {
-        let (id, m) = r?;
-        mtimes.insert(id, m);
-    }
-    // Recency rank: sort note ids by mtime DESC. Notes missing from the
-    // map (shouldn't happen, but guard) tail with mtime=0.
-    let mut by_recency: Vec<(&str, i64)> = hits
-        .iter()
-        .map(|h| (h.note_id.as_str(), *mtimes.get(&h.note_id).unwrap_or(&0)))
-        .collect();
-    by_recency.sort_by_key(|x| std::cmp::Reverse(x.1));
-    let mut recency_rank: HashMap<String, usize> = HashMap::new();
-    for (i, (id, _)) in by_recency.iter().enumerate() {
-        recency_rank.insert((*id).to_string(), i + 1);
-    }
-    // Apply the RRF blend in place. `sim_rank` is the input order (1-based).
-    let total = hits.len();
-    for (i, hit) in hits.iter_mut().enumerate() {
-        let sim_rank = (i + 1) as f32;
-        let rec_rank = *recency_rank.get(&hit.note_id).unwrap_or(&total) as f32;
-        let blended = 1.0 / (RRF_K + sim_rank) + weight * (1.0 / (RRF_K + rec_rank));
-        hit.score = blended;
-    }
-    // Re-sort by the blended score so the panel sees the recency-aware order.
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(())
-}
-
-fn title_from_path(path: &str) -> String {
-    let last = path.rsplit('/').next().unwrap_or(path);
-    let stem = last.strip_suffix(".md").unwrap_or(last);
-    if stem.is_empty() {
-        "Untitled".into()
-    } else {
-        stem.to_string()
-    }
-}
-
-fn snippet_from_text(text: &str) -> String {
-    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= 200 {
-        collapsed
-    } else {
-        let cutoff = collapsed
-            .char_indices()
-            .nth(200)
-            .map(|(i, _)| i)
-            .unwrap_or(collapsed.len());
-        format!("{}…", &collapsed[..cutoff])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chunker::Chunk;
-    use crate::store::{new_id, NoteUpsert};
+    use crate::store::dto::{new_id, NoteUpsert};
     use tempfile::tempdir;
 
     fn unit_vec(seed: f32) -> Vec<f32> {
@@ -691,7 +672,7 @@ mod tests {
         let (_dir, mut store) = fresh_store();
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path: "alpha.md",
                 content_hash: "h",
@@ -720,7 +701,7 @@ mod tests {
         let (_dir, mut store) = fresh_store();
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path: "a.md",
                 content_hash: "h",
@@ -750,7 +731,7 @@ mod tests {
         // only thing being filtered, not "everything is empty."
         let id_ok = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id_ok,
                 path: "ok.md",
                 content_hash: "h",
@@ -775,7 +756,7 @@ mod tests {
         let id_a = new_id();
         let id_b = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id_a,
                 path: "a.md",
                 content_hash: "h",
@@ -787,7 +768,7 @@ mod tests {
             })
             .unwrap();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id_b,
                 path: "b.md",
                 content_hash: "h",
@@ -808,23 +789,94 @@ mod tests {
 
     #[test]
     fn rrf_fusion_promotes_notes_ranked_well_by_both() {
-        let lex = vec![
-            mk_hit("n1", 10.0),
-            mk_hit("n2", 9.0),
-            mk_hit("n3", 8.0),
-        ];
-        let sem = vec![
-            mk_hit("n3", 0.9),
-            mk_hit("n1", 0.8),
-            mk_hit("n4", 0.7),
-        ];
-        let fused = rrf_fuse(&lex, &sem, 10);
-        // n1 (1+2) and n3 (3+1) both appear high in both lists; n2 only in
-        // lex, n4 only in sem. Ordering details depend on RRF; assert n1 and
-        // n3 outrank n2 and n4.
-        let pos = |id: &str| fused.iter().position(|h| h.note_id == id).unwrap();
-        assert!(pos("n1") < pos("n2"));
-        assert!(pos("n3") < pos("n4"));
+        // Drive RRF via the public `query()`. Set up four notes:
+        // - n1 ranks highly in BOTH lexical (many "needle" tokens) and
+        //   semantic (embedding nearest the query).
+        // - n3 also appears in both, mid-rank on each.
+        // - n2 appears only in lexical.
+        // - n4 appears only in semantic.
+        // RRF should push n1 and n3 above n2 and n4 in the fused output.
+        let (_dir, mut store) = fresh_store();
+        let id_n1 = "n1".to_string();
+        let id_n2 = "n2".to_string();
+        let id_n3 = "n3".to_string();
+        let id_n4 = "n4".to_string();
+        // n1: strong lexical AND near-query embedding.
+        store
+            .upsert_note(&NoteUpsert {
+                id: &id_n1,
+                path: "n1.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![(
+                    mk_chunk(0, "needle needle needle needle"),
+                    unit_vec(0.0),
+                )],
+            })
+            .unwrap();
+        // n2: lexical only (no semantic relevance — far embedding).
+        store
+            .upsert_note(&NoteUpsert {
+                id: &id_n2,
+                path: "n2.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![(mk_chunk(0, "needle needle"), unit_vec(500.0))],
+            })
+            .unwrap();
+        // n3: weaker lexical and mid-distance semantic.
+        store
+            .upsert_note(&NoteUpsert {
+                id: &id_n3,
+                path: "n3.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![(mk_chunk(0, "needle"), unit_vec(1.0))],
+            })
+            .unwrap();
+        // n4: semantic only (no lexical match) — closer than n2.
+        store
+            .upsert_note(&NoteUpsert {
+                id: &id_n4,
+                path: "n4.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![(mk_chunk(0, "haystack"), unit_vec(2.0))],
+            })
+            .unwrap();
+
+        let resp = query(
+            &store,
+            1,
+            Modes { lexical: true, semantic: true },
+            Some("needle"),
+            Some(&unit_vec(0.0)),
+            LexicalOpts::default(),
+            SemanticOpts::default(),
+        )
+        .unwrap();
+        let pos = |id: &str| {
+            resp.fused
+                .iter()
+                .position(|h| h.note_id == id)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(pos(&id_n1) < pos(&id_n2));
+        assert!(pos(&id_n1) < pos(&id_n4));
+        assert!(pos(&id_n3) < pos(&id_n2));
+        assert!(pos(&id_n3) < pos(&id_n4));
     }
 
     #[test]
@@ -833,7 +885,7 @@ mod tests {
         let resp = query(
             &store,
             7,
-            SearchModes { lexical: false, semantic: false },
+            Modes { lexical: false, semantic: false },
             Some("anything"),
             Some(&unit_vec(0.0)),
             LexicalOpts::default(),
@@ -852,7 +904,7 @@ mod tests {
         let (_dir, mut store) = fresh_store();
         let id = new_id();
         store
-            .upsert_note(NoteUpsert {
+            .upsert_note(&NoteUpsert {
                 id: &id,
                 path: "n.md",
                 content_hash: "h",
@@ -866,7 +918,7 @@ mod tests {
         let resp = query(
             &store,
             42,
-            SearchModes { lexical: true, semantic: false },
+            Modes { lexical: true, semantic: false },
             Some("needle"),
             None, // no embedding required when semantic is off
             LexicalOpts::default(),
@@ -880,16 +932,4 @@ mod tests {
         assert_eq!(resp.hits.len(), 1);
     }
 
-    fn mk_hit(id: &str, score: f32) -> NoteHit {
-        NoteHit {
-            note_id: id.into(),
-            path: format!("{id}.md"),
-            title: id.into(),
-            score,
-            chunk_id: format!("{id}:0"),
-            chunk_index: 0,
-            heading_path: None,
-            snippet: "".into(),
-        }
-    }
 }

@@ -1,9 +1,21 @@
-use super::*;
+use rusqlite::params;
+use ulid::Ulid;
+
+use super::patch::{apply_edit, find_all_matches};
+use super::error::Error;
+use super::types::{
+    now_ms, AcceptOutcome, BatchOutcome, ConflictReason, EditProposalInput, Filter, Proposal,
+    ProposalInput, ProposalState, RecheckOutcome, ACTION_MOVE_NOTE, INSERT_SQL, ZSTD_LEVEL,
+};
+use super::Staging;
+use crate::changes::{ChangeAppend, ChangeOp, Changes};
+use crate::hash_string;
+use crate::vault::Vault;
 
 impl Staging {
-    pub fn propose(&self, input: ProposalInput) -> Result<String, StagingError> {
+    pub fn propose(&self, input: &ProposalInput) -> Result<String, Error> {
         let id = Ulid::new().to_string();
-        let content_hash = input.content.as_ref().map(|c| hash_str(c));
+        let content_hash = input.content.as_ref().map(|c| hash_string(c));
         let encoded_content: Option<Vec<u8>> = match input.content.as_ref() {
             Some(c) => Some(zstd::encode_all(c.as_bytes(), ZSTD_LEVEL)?),
             None => None,
@@ -48,8 +60,8 @@ impl Staging {
     /// status: staging-per-edit-proposals
     pub fn propose_batch(
         &self,
-        inputs: Vec<EditProposalInput>,
-    ) -> Result<BatchOutcome, StagingError> {
+        inputs: &[EditProposalInput],
+    ) -> Result<BatchOutcome, Error> {
         let batch_id = Ulid::new().to_string();
         let mut ids = Vec::with_capacity(inputs.len());
 
@@ -57,9 +69,9 @@ impl Staging {
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare(INSERT_SQL)?;
-                for input in &inputs {
+                for input in inputs {
                     let id = Ulid::new().to_string();
-                    let content_hash = input.content.as_ref().map(|c| hash_str(c));
+                    let content_hash = input.content.as_ref().map(|c| hash_string(c));
                     let encoded_content: Option<Vec<u8>> = match input.content.as_ref() {
                         Some(c) => Some(zstd::encode_all(c.as_bytes(), ZSTD_LEVEL)?),
                         None => None,
@@ -107,10 +119,10 @@ impl Staging {
         id: &str,
         vault: &Vault,
         changes: Option<&Changes>,
-    ) -> Result<AcceptOutcome, StagingError> {
+    ) -> Result<AcceptOutcome, Error> {
         let proposal = self
             .get_full(id)?
-            .ok_or_else(|| StagingError::ProposalNotFound(id.to_string()))?;
+            .ok_or_else(|| Error::ProposalNotFound(id.to_string()))?;
 
         // status: staging-action-move-note
         // Route move_note rows separately from content writes — the
@@ -133,7 +145,7 @@ impl Staging {
                 vault.read_file_with_hash(&proposal.target_path)?;
             // Baseline-on-first-touch: snapshot pre-write state so rollback
             // of this user-accepted agent edit has somewhere to go. Mirrors
-            // `ops::agent_write_note` and `ops::commit_buffer`.
+            // `ops::write_note` and `ops::commit`.
             if let Some(c) = changes
                 && let Err(e) = c.ensure_baseline(
                     &proposal.target_path,
@@ -155,11 +167,11 @@ impl Staging {
         } else if let Some(ref content_hash) = proposal.content_hash {
             let content = self
                 .read_content(id)?
-                .ok_or_else(|| StagingError::MissingContent(id.to_string()))?;
+                .ok_or_else(|| Error::MissingContent(id.to_string()))?;
 
-            let actual_hash = hash_str(&content);
+            let actual_hash = hash_string(&content);
             if &actual_hash != content_hash {
-                return Err(StagingError::DiskDrift {
+                return Err(Error::DiskDrift {
                     expected: content_hash.clone(),
                     found: actual_hash,
                 });
@@ -241,12 +253,12 @@ impl Staging {
         })
     }
 
-    pub fn reject(&self, id: &str) -> Result<(), StagingError> {
+    pub fn reject(&self, id: &str) -> Result<(), Error> {
         let removed = self.with_conn(|conn| {
             Ok(conn.execute("DELETE FROM proposals WHERE id = ?1", params![id])?)
         })?;
         if removed == 0 {
-            return Err(StagingError::ProposalNotFound(id.to_string()));
+            return Err(Error::ProposalNotFound(id.to_string()));
         }
         let _ = self.changed_tx.send(());
         Ok(())
@@ -254,10 +266,10 @@ impl Staging {
 
     pub fn accept_all(
         &self,
-        filter: &StagingFilter,
+        filter: &Filter,
         vault: &Vault,
         changes: Option<&Changes>,
-    ) -> Result<Vec<AcceptOutcome>, StagingError> {
+    ) -> Result<Vec<AcceptOutcome>, Error> {
         let proposals = self.list(filter)?;
         let mut outcomes = Vec::new();
         for p in &proposals {
@@ -275,7 +287,7 @@ impl Staging {
         Ok(outcomes)
     }
 
-    pub fn gc(&self, max_age_days: u32) -> Result<usize, StagingError> {
+    pub fn gc(&self, max_age_days: u32) -> Result<usize, Error> {
         let cutoff = now_ms() - (max_age_days as i64) * 86_400_000;
         let removed = self.with_conn(|conn| {
             Ok(conn.execute(
@@ -310,12 +322,12 @@ impl Staging {
         proposal: &Proposal,
         vault: &Vault,
         changes: Option<&Changes>,
-    ) -> Result<AcceptOutcome, StagingError> {
+    ) -> Result<AcceptOutcome, Error> {
         let source = proposal
             .source_path
             .as_deref()
             .ok_or_else(|| {
-                StagingError::Vault(
+                Error::Vault(
                     "move_note proposal missing source_path".to_string(),
                 )
             })?;
@@ -330,13 +342,13 @@ impl Staging {
         let source_exists = source_abs.exists();
         let target_exists = target_abs.exists();
         if !source_exists {
-            return Err(StagingError::Vault(format!(
+            return Err(Error::Vault(format!(
                 "{}: source not found",
                 ConflictReason::SourceMissing.as_str()
             )));
         }
         if target_exists {
-            return Err(StagingError::Vault(format!(
+            return Err(Error::Vault(format!(
                 "{}: target {} already exists",
                 ConflictReason::TargetOccupied.as_str(),
                 target,
@@ -382,7 +394,7 @@ impl Staging {
                 } else {
                     Some(&new_hash)
                 },
-                content: post_body.as_deref().map(|s| s.as_bytes()),
+                content: post_body.as_deref().map(str::as_bytes),
                 rename_from: Some(source),
                 metadata: serde_json::json!({
                     "staging_proposal_id": id,
@@ -398,6 +410,133 @@ impl Staging {
             proposal_id: id.to_string(),
             target_path: target.to_string(),
             new_hash,
+        })
+    }
+
+    /// Recheck a `move_note` proposal against the live filesystem.
+    /// Callers (the eager-recheck task, accept-time safety net) pass in
+    /// the current existence of the source and target paths — both
+    /// are vault-relative and resolved through `Vault::abs_path`
+    /// upstream. Returns the same `RecheckOutcome` shape as `recheck`.
+    ///
+    /// status: staging-action-move-note
+    pub fn recheck_move(
+        &self,
+        id: &str,
+        source_exists: bool,
+        target_exists: bool,
+    ) -> Result<RecheckOutcome, Error> {
+        let proposal = self
+            .get_full(id)?
+            .ok_or_else(|| Error::ProposalNotFound(id.to_string()))?;
+        // Recheck-state derivation for `action = "move_note"` rows. Drift
+        // flips applyability when (a) the source file disappeared since
+        // the proposal was made (`SourceMissing`) or (b) the target path
+        // is already occupied (`TargetOccupied`). Both at once →
+        // SourceMissing is reported first since it's the harder block.
+        // status: staging-action-move-note
+        let (new_state, new_reason) = if !source_exists {
+            (ProposalState::Conflicted, Some(ConflictReason::SourceMissing))
+        } else if target_exists {
+            (ProposalState::Conflicted, Some(ConflictReason::TargetOccupied))
+        } else {
+            (ProposalState::Applyable, None)
+        };
+        let prior_state = proposal.state;
+        let prior_reason = proposal.conflict_reason;
+        if prior_state == new_state && prior_reason == new_reason {
+            return Ok(RecheckOutcome {
+                prior_state,
+                new_state,
+                new_reason,
+            });
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proposals SET state = ?1, conflict_reason = ?2 WHERE id = ?3",
+                params![new_state.as_str(), new_reason.map(ConflictReason::as_str), id],
+            )?;
+            Ok(())
+        })?;
+        let _ = self.changed_tx.send(());
+        Ok(RecheckOutcome {
+            prior_state,
+            new_state,
+            new_reason,
+        })
+    }
+
+    /// status: staging-proposal-state
+    pub fn recheck(
+        &self,
+        id: &str,
+        current_disk: Option<&str>,
+    ) -> Result<RecheckOutcome, Error> {
+        let proposal = self
+            .get_full(id)?
+            .ok_or_else(|| Error::ProposalNotFound(id.to_string()))?;
+
+        // status: staging-proposal-state
+        //
+        // Per-proposal recheck: move_note rows recheck via recheck_move
+        // (which sees both source and target). Edit rows resolve the
+        // anchor against the current disk text. Whole-file rows compare
+        // a fresh content hash against the propose-time hash.
+        let (new_state, new_reason) = if proposal.action == ACTION_MOVE_NOTE {
+            (proposal.state, proposal.conflict_reason)
+        } else if let Some(ref edit) = proposal.edit {
+            match current_disk {
+                None => (
+                    ProposalState::Conflicted,
+                    Some(ConflictReason::TargetMissing),
+                ),
+                Some(disk) => {
+                    let matches = find_all_matches(disk, &edit.old_str);
+                    if matches.is_empty() {
+                        (ProposalState::Conflicted, Some(ConflictReason::AnchorMissing))
+                    } else if matches.len() > 1 && !edit.replace_all {
+                        (ProposalState::Conflicted, Some(ConflictReason::AnchorNotUnique))
+                    } else {
+                        (ProposalState::Applyable, None)
+                    }
+                }
+            }
+        } else {
+            let current_hash = current_disk.map(hash_string);
+            let matches = match (&proposal.source_hash, &current_hash) {
+                (None, None) => true,
+                (Some(propose), Some(now)) => propose == now,
+                _ => false,
+            };
+            if matches {
+                (ProposalState::Applyable, None)
+            } else {
+                (ProposalState::Conflicted, Some(ConflictReason::HashChanged))
+            }
+        };
+        let prior_state = proposal.state;
+        let prior_reason = proposal.conflict_reason;
+
+        if prior_state == new_state && prior_reason == new_reason {
+            return Ok(RecheckOutcome {
+                prior_state,
+                new_state,
+                new_reason,
+            });
+        }
+
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proposals SET state = ?1, conflict_reason = ?2 WHERE id = ?3",
+                params![new_state.as_str(), new_reason.map(ConflictReason::as_str), id],
+            )?;
+            Ok(())
+        })?;
+        let _ = self.changed_tx.send(());
+        Ok(RecheckOutcome {
+            prior_state,
+            new_state,
+            new_reason,
         })
     }
 }

@@ -21,9 +21,11 @@ use crate::state::{AppState, Toolbar, ToolbarSide, ToastLevel};
 use crate::tab::TabKind;
 use crate::theme;
 
+impl AppState {
 /// Render every configured toolbar. Call once per frame, BEFORE side
 /// panels — top/bottom panels claim their strip first.
-pub fn render_all(ctx: &egui::Context, app: &mut AppState) {
+pub fn render_toolbars(&mut self, ctx: &egui::Context) {
+    let app = self;
     // Clone the bars list (cheap — just a Vec of small structs) so we can
     // mutate `app` while iterating.
     let bars = app.ui.toolbars.bars.clone();
@@ -56,6 +58,7 @@ pub fn render_all(ctx: &egui::Context, app: &mut AppState) {
             }
         }
     }
+}
 }
 
 fn panel_frame(ctx: &egui::Context) -> egui::Frame {
@@ -130,10 +133,10 @@ fn render_bar_items(
         });
     }
     if customize {
-        customize_add_button(ui, app, bar_idx, &mut pending);
+        app.customize_add_button(ui, bar_idx, &mut pending);
     }
 
-    apply_pending(app, bar_idx, pending);
+    app.apply_pending(bar_idx, pending);
 }
 
 /// Pending mutation against a toolbar — collected while iterating, then
@@ -149,7 +152,9 @@ enum BarOp {
     NewToolbar { side: ToolbarSide, seed: Option<String> },
 }
 
-fn apply_pending(app: &mut AppState, bar_idx: usize, ops: Vec<BarOp>) {
+impl AppState {
+fn apply_pending(&mut self, bar_idx: usize, ops: Vec<BarOp>) {
+    let app = self;
     if ops.is_empty() {
         return;
     }
@@ -198,6 +203,7 @@ fn apply_pending(app: &mut AppState, bar_idx: usize, ops: Vec<BarOp>) {
         actions::persist_toolbars(app);
     }
 }
+}
 
 /// Render a single slot in a toolbar. Special-cases the layout ids
 /// (`sep`, `vault.label`, `actions.menu`); everything else falls through
@@ -219,18 +225,20 @@ fn render_single(
             // Handled by caller — should not arrive here.
         }
         ID_VAULT_LABEL => {
-            render_vault_label(ui, app);
+            app.render_vault_label(ui);
         }
         ID_ACTIONS_MENU => {
-            render_actions_menu(ui, app);
+            app.render_actions_menu(ui);
         }
         _ => {
-            render_action_button(ui, app, bar_idx, slot, id, customize, pending);
+            app.render_action_button(ui, bar_idx, slot, id, customize, pending);
         }
     }
 }
 
-fn render_vault_label(ui: &mut egui::Ui, state: &mut AppState) {
+impl AppState {
+fn render_vault_label(&mut self, ui: &mut egui::Ui) {
+    let state = self;
     let vault_label = state
         .vault_session
         .vault_root
@@ -244,7 +252,7 @@ fn render_vault_label(ui: &mut egui::Ui, state: &mut AppState) {
             match hiker_core::config::Config::set(
                 hiker_core::config::SettingsScope::User,
                 "vault.default",
-                serde_json::json!(p),
+                &serde_json::json!(p),
                 &state.vault_session.vault_root,
             ) {
                 Ok(_) => state.push_toast("Set as default vault", ToastLevel::Info),
@@ -257,16 +265,19 @@ fn render_vault_label(ui: &mut egui::Ui, state: &mut AppState) {
         }
     });
 }
+}
 
+impl AppState {
 fn render_action_button(
+    &mut self,
     ui: &mut egui::Ui,
-    app: &mut AppState,
     bar_idx: usize,
     slot: usize,
     id: &str,
     customize: bool,
     pending: &mut Vec<BarOp>,
 ) {
+    let app = self;
     let Some(action) = ActionRegistry::all().by_id(id) else {
         // Unknown id — show a placeholder so the user can right-click to
         // remove it.
@@ -286,7 +297,7 @@ fn render_action_button(
     let resp = ui
         .scope(|ui| {
             ui.horizontal(|ui| {
-                let btn = ui.add_enabled(enabled, egui::Button::image((action.icon)()));
+                let btn = ui.add_enabled(enabled, egui::Button::image(crate::icons::ICONS.image(action.icon)));
                 if let Some(b) = &badge_text {
                     ui.label(
                         egui::RichText::new(b)
@@ -341,12 +352,14 @@ fn render_action_button(
         });
     }
 }
+}
 
+impl AppState {
 /// "+ Add" / "+ New toolbar" affordance shown at the end of every bar
 /// while in customize mode.
 fn customize_add_button(
+    &mut self,
     ui: &mut egui::Ui,
-    _app: &mut AppState,
     _bar_idx: usize,
     pending: &mut Vec<BarOp>,
 ) {
@@ -381,6 +394,7 @@ fn customize_add_button(
         }
     });
 }
+}
 
 /// Submenu listing every registered action plus the synthetic layout
 /// items. `pick` is called with the chosen id (heap String would be
@@ -411,12 +425,14 @@ fn add_action_picker(ui: &mut egui::Ui, mut pick: impl FnMut(&'static str)) {
 /// Hamburger "More actions" composite. Mirrors the legacy
 /// `actions_menu` shape: lists the open-tab actions and "New chat
 /// session", with a combined queue+staging badge on the trigger.
-fn render_actions_menu(ui: &mut egui::Ui, state: &mut AppState) {
-    let queue_count = pending_task_count(state);
-    let staging_count = pending_staging_count(state);
+impl AppState {
+fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
+    let state = self;
+    let queue_count = state.pending_task_count();
+    let staging_count = state.pending_staging_count();
     let total = queue_count + staging_count;
     let trigger = ui.horizontal(|ui| {
-        let r = ui.add(egui::Button::image(icons::menu()));
+        let r = ui.add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Menu)));
         if total > 0 {
             ui.label(
                 egui::RichText::new(format!("{}", total))
@@ -429,52 +445,53 @@ fn render_actions_menu(ui: &mut egui::Ui, state: &mut AppState) {
     });
     let trigger_resp = trigger.inner.on_hover_text("More actions");
     egui::Popup::menu(&trigger_resp).show(|ui| {
-        if tab_menu_row(ui, TabKind::Queue, queue_count) {
+        if tab_menu_row(ui, &TabKind::Queue, queue_count) {
             open_singleton_tab(state, TabKind::Queue);
             ui.close();
         }
-        if menu_row(ui, icons::brain(), "Index", 0) {
+        if menu_row(ui, icons::ICONS.image(crate::icons::Icon::Brain), "Index", 0) {
             open_singleton_tab(state, TabKind::IndexerDetail);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::Settings, 0) {
+        if tab_menu_row(ui, &TabKind::Settings, 0) {
             open_singleton_tab(state, TabKind::Settings);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::Graph, 0) {
+        if tab_menu_row(ui, &TabKind::Graph, 0) {
             open_singleton_tab(state, TabKind::Graph);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::PatchReview, staging_count) {
+        if tab_menu_row(ui, &TabKind::PatchReview, staging_count) {
             open_singleton_tab(state, TabKind::PatchReview);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::Changes, 0) {
+        if tab_menu_row(ui, &TabKind::Changes, 0) {
             open_singleton_tab(state, TabKind::Changes);
             ui.close();
         }
-        if tab_menu_row(ui, TabKind::Plugins, 0) {
+        if tab_menu_row(ui, &TabKind::Plugins, 0) {
             open_singleton_tab(state, TabKind::Plugins);
             ui.close();
         }
         ui.separator();
-        if menu_row(ui, icons::plus(), "New chat session", 0) {
+        if menu_row(ui, icons::ICONS.image(crate::icons::Icon::Plus), "New chat session", 0) {
             crate::actions::dispatch(state, "chat.new_session");
             ui.close();
         }
         ui.separator();
-        if menu_row(ui, icons::wrench(), "Customize toolbars", 0) {
+        if menu_row(ui, icons::ICONS.image(crate::icons::Icon::Wrench), "Customize toolbars", 0) {
             crate::actions::dispatch(state, "view.toolbar_customize");
             ui.close();
         }
-        if menu_row(ui, icons::search(), "Command palette", 0) {
+        if menu_row(ui, icons::ICONS.image(crate::icons::Icon::Search), "Command palette", 0) {
             crate::actions::dispatch(state, "palette.open");
             ui.close();
         }
     });
 }
+}
 
-fn tab_menu_row(ui: &mut egui::Ui, kind: TabKind, count: usize) -> bool {
+fn tab_menu_row(ui: &mut egui::Ui, kind: &TabKind, count: usize) -> bool {
     let label = kind.label();
     menu_row(ui, kind.icon(), &label, count)
 }
@@ -495,56 +512,24 @@ fn menu_row(ui: &mut egui::Ui, image: egui::Image<'_>, label: &str, count: usize
     resp.inner.clicked()
 }
 
-fn pending_staging_count(state: &AppState) -> usize {
-    state.ui_cache.staging_snapshot.len()
+impl AppState {
+fn pending_staging_count(&self) -> usize {
+    self.ui_cache.staging_snapshot.len()
 }
 
-fn pending_task_count(state: &AppState) -> usize {
-    use hiker_core::tasks::TaskState;
-    state
+fn pending_task_count(&self) -> usize {
+    use hiker_core::tasks::types::TaskState;
+    self
         .ui_cache
         .task_snapshot
         .iter()
         .filter(|r| matches!(r.state, TaskState::Queued | TaskState::Leased))
         .count()
 }
-
-/// Queue a vault switch, prompting first if any buffer is dirty so we
-/// don't silently discard unsaved work. Matches the legacy guard from
-/// `ui/src/topBar/index.ts` where the picker asks before tearing down.
-pub(crate) fn queue_vault_switch(state: &mut AppState, path: std::path::PathBuf) {
-    let dirty: Vec<String> = state
-        .session
-        .buffers
-        .iter()
-        .filter(|(_, b)| b.is_dirty())
-        .map(|(p, _)| p.clone())
-        .collect();
-    if dirty.is_empty() {
-        state.vault_switch = crate::state::VaultSwitchState::Requested(path.clone());
-        state.push_toast(
-            format!("Switching vault to {}", path.display()),
-            ToastLevel::Info,
-        );
-        return;
-    }
-    let body = format!(
-        "{} unsaved buffer{} will be discarded:\n  {}",
-        dirty.len(),
-        if dirty.len() == 1 { "" } else { "s" },
-        dirty.join("\n  "),
-    );
-    state.session.modal = Some(crate::state::Modal::Confirm {
-        title: "Switch vault?".into(),
-        body,
-        confirm_label: "Discard and switch".into(),
-        cancel_label: "Cancel".into(),
-        danger: true,
-        intent: crate::state::ConfirmIntent::SwitchVault { path: path.clone() },
-    });
 }
 
 pub(crate) fn open_singleton_tab(state: &mut AppState, kind: TabKind) {
     let kind_disc = std::mem::discriminant(&kind);
     state.find_or_open_tab(|k| std::mem::discriminant(k) == kind_disc, || kind);
 }
+

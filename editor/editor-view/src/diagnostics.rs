@@ -2,33 +2,31 @@
 //! [`DecorationSet`]: severity-colored underline `Mark`s over each diagnostic
 //! range plus a per-line `gutter_marker`. See SPEC §9.7, IMPLEMENTATION §16.5.1.
 
-use editor_core::{
-    Color, Decoration, DecorationSet, Diagnostic, GutterMarker, LineStyle, MarkStyle, RangeSet,
-    Rope, Severity, Theme,
-};
+use editor_core::decoration::Color;
 
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::decoration::Diagnostic;
+
+use editor_core::decoration::GutterMarker;
+
+use editor_core::decoration::LineStyle;
+
+use editor_core::decoration::MarkStyle;
+
+use editor_core::rangeset::RangeSet;
+
+use editor_core::rope::Rope;
+
+use editor_core::decoration::Severity;
+
+use editor_core::theme::Theme;
 /// VSCode-ish severity colors.
 pub const ERROR_COLOR: Color = Color::rgba(244, 71, 71, 255);
 pub const WARNING_COLOR: Color = Color::rgba(228, 188, 48, 255);
 pub const INFO_COLOR: Color = Color::rgba(75, 156, 211, 255);
 pub const HINT_COLOR: Color = Color::rgba(160, 160, 160, 255);
-
-fn severity_color(sev: Severity, theme: Option<&Theme>) -> Color {
-    match theme {
-        None => match sev {
-            Severity::Error => ERROR_COLOR,
-            Severity::Warning => WARNING_COLOR,
-            Severity::Info => INFO_COLOR,
-            Severity::Hint => HINT_COLOR,
-        },
-        Some(t) => match sev {
-            Severity::Error => t.diagnostics.error,
-            Severity::Warning => t.diagnostics.warning,
-            Severity::Info => t.diagnostics.info,
-            Severity::Hint => t.diagnostics.hint,
-        },
-    }
-}
 
 /// Build a decoration set for the given diagnostics:
 ///   * a `Mark` with `underline: true` colored by severity over each
@@ -52,7 +50,20 @@ pub fn diagnostic_decorations(
     for d in diags {
         let start = d.range.start.min(total_bytes);
         let end = d.range.end.min(total_bytes).max(start);
-        let color = severity_color(d.severity, theme);
+        let color = match theme {
+            None => match d.severity {
+                Severity::Error => ERROR_COLOR,
+                Severity::Warning => WARNING_COLOR,
+                Severity::Info => INFO_COLOR,
+                Severity::Hint => HINT_COLOR,
+            },
+            Some(t) => match d.severity {
+                Severity::Error => t.diagnostics.error,
+                Severity::Warning => t.diagnostics.warning,
+                Severity::Info => t.diagnostics.info,
+                Severity::Hint => t.diagnostics.hint,
+            },
+        };
 
         // Underline mark over the diagnostic range.
         if end > start {
@@ -113,7 +124,7 @@ pub fn diagnostic_decorations(
     RangeSet::from_iter(entries)
 }
 
-fn severity_rank(s: Severity) -> u8 {
+const fn severity_rank(s: Severity) -> u8 {
     match s {
         Severity::Hint => 0,
         Severity::Info => 1,

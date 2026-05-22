@@ -6,10 +6,14 @@
 //! layout serialise/deserialise to a JSON file on disk.
 
 use eframe::egui;
-use egui_workbench::{
-    ActivityBadge, ActivityItem, DocumentTab, OpenTabOptions, TabState, TabUiContext, Workbench,
-    WorkbenchBehavior,
-};
+use egui_workbench::activity_bar::ActivityBadge;
+use egui_workbench::activity_bar::Item;
+use egui_workbench::tab::Document;
+use egui_workbench::workspace::OpenTabOptions;
+use egui_workbench::tab::State;
+use egui_workbench::tab::UiContext;
+use egui_workbench::workspace::Workbench;
+use egui_workbench::behavior::Host;
 use serde::{Deserialize, Serialize};
 
 const LAYOUT_PATH: &str = "/tmp/workbench-demo-layout.json";
@@ -52,19 +56,19 @@ impl DemoApp {
                 body: "This tab is pinned.".into(),
                 dirty: false,
             },
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
         workbench.pin_tab(pinned, true);
 
         // Regular tabs.
-        workbench.open_tab(DemoTab::Welcome, OpenTabOptions::default());
+        workbench.open_tab(DemoTab::Welcome, &OpenTabOptions::default());
         workbench.open_tab(
             DemoTab::Doc {
                 title: "notes.md".into(),
                 body: "# notes\n\nHello from egui_workbench.".into(),
                 dirty: false,
             },
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
 
         // Preview tab — opening another Preview will replace this one.
@@ -74,8 +78,8 @@ impl DemoApp {
                 body: "Preview tab — italic title; replaced by next preview.".into(),
                 dirty: false,
             },
-            OpenTabOptions {
-                state: TabState::Preview,
+            &OpenTabOptions {
+                state: State::Preview,
                 ..OpenTabOptions::default()
             },
         );
@@ -83,11 +87,11 @@ impl DemoApp {
         // Seed panel area with two tool tabs.
         workbench.open_panel_tab(
             DemoTab::Terminal,
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
         workbench.open_panel_tab(
             DemoTab::Output,
-            OpenTabOptions::default(),
+            &OpenTabOptions::default(),
         );
         // Start with panel area visible to make the feature discoverable.
         workbench.panel_area.visible = true;
@@ -111,17 +115,19 @@ impl eframe::App for DemoApp {
                     self.workbench.toggle_primary_side_bar();
                 }
                 if ui.button("Open preview tab").clicked() {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let suffix: u32 = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0);
                     self.workbench.open_tab(
                         DemoTab::Doc {
-                            title: format!(
-                                "preview-{}.md",
-                                rand_suffix()
-                            ),
+                            title: format!("preview-{suffix}.md"),
                             body: "Another preview tab — italic title.".into(),
                             dirty: false,
                         },
-                        OpenTabOptions {
-                            state: TabState::Preview,
+                        &OpenTabOptions {
+                            state: State::Preview,
                             ..OpenTabOptions::default()
                         },
                     );
@@ -139,7 +145,7 @@ impl eframe::App for DemoApp {
                 if ui.button("Load layout").clicked() {
                     match std::fs::read_to_string(LAYOUT_PATH) {
                         Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
-                            Ok(v) => match egui_workbench::migrate(v) {
+                            Ok(v) => match egui_workbench::persistence::migrate(v) {
                                 Some(layout) => match self.workbench.apply_layout(layout) {
                                     Ok(()) => self.status = "Loaded layout".into(),
                                     Err(e) => self.status = format!("Apply failed: {e}"),
@@ -161,14 +167,6 @@ impl eframe::App for DemoApp {
     }
 }
 
-fn rand_suffix() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 enum DemoTab {
     Doc {
@@ -181,7 +179,7 @@ enum DemoTab {
     Output,
 }
 
-impl DocumentTab for DemoTab {
+impl Document for DemoTab {
     fn title(&self) -> egui::WidgetText {
         match self {
             DemoTab::Doc { title, .. } => title.clone().into(),
@@ -210,7 +208,7 @@ enum DemoMode {
 }
 
 impl DemoMode {
-    fn label(&self) -> &'static str {
+    const fn label(&self) -> &'static str {
         match self {
             DemoMode::Explorer => "Explorer",
             DemoMode::Search => "Search",
@@ -224,8 +222,8 @@ struct DemoBehavior {
     status: String,
 }
 
-impl WorkbenchBehavior<DemoTab, DemoMode> for DemoBehavior {
-    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut DemoTab, _ctx: TabUiContext<'_>) {
+impl Host<DemoTab, DemoMode> for DemoBehavior {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut DemoTab, _ctx: UiContext<'_>) {
         match tab {
             DemoTab::Doc { body, dirty, .. } => {
                 let resp = ui.text_edit_multiline(body);
@@ -279,27 +277,27 @@ impl WorkbenchBehavior<DemoTab, DemoMode> for DemoBehavior {
         });
     }
 
-    fn activity_items(&self) -> Vec<ActivityItem<DemoMode>> {
+    fn activity_items(&self) -> Vec<Item<DemoMode>> {
         vec![
-            ActivityItem {
+            Item {
                 mode: DemoMode::Explorer,
                 icon: None,
                 label: "Explorer".into(),
                 badge: None,
             },
-            ActivityItem {
+            Item {
                 mode: DemoMode::Search,
                 icon: None,
                 label: "Search".into(),
                 badge: Some(ActivityBadge::Dot),
             },
-            ActivityItem {
+            Item {
                 mode: DemoMode::Scm,
                 icon: None,
                 label: "Source Control".into(),
                 badge: Some(ActivityBadge::Count(3)),
             },
-            ActivityItem {
+            Item {
                 mode: DemoMode::Debug,
                 icon: None,
                 label: "Debug".into(),

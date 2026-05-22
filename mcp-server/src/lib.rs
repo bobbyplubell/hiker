@@ -19,10 +19,6 @@ pub mod audit;
 pub mod discovery;
 pub mod handler;
 
-pub use agent_bridge::{
-    agent_tool_defs, agent_tool_defs_filtered, agent_tool_defs_with, McpAgentDispatcher,
-};
-pub use handler::HikerHandler;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -30,12 +26,12 @@ use std::sync::{Arc, Mutex};
 
 use hiker_core::audit::AgentLog;
 use hiker_core::changes::Changes;
-use hiker_core::config::{McpConfig, TasksConfig};
+use hiker_core::config::sections::{McpConfig, TasksConfig};
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
 use hiker_core::staging::Staging;
 use hiker_core::store::Store;
-use hiker_core::tasks::Queue as TaskQueue;
+use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
 use rmcp::transport::streamable_http_server::{
@@ -44,7 +40,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::AuditLog;
+use crate::audit::Log;
 
 /// All shared dependencies the MCP server needs from the rest of the app.
 /// Constructed by the app's `open_vault_at` and consumed by `start`.
@@ -68,7 +64,7 @@ pub struct McpDeps {
     /// `port` aren't included here because they control the TCP bind
     /// and changing them mid-flight would require rebinding the
     /// listener — those stay restart-bound.
-    pub tools: Arc<std::sync::RwLock<hiker_core::config::McpToolsConfig>>,
+    pub tools: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
     /// Shared agent-log writer (see `core::audit`). MCP tool calls
     /// record through this so all surfaces — `core::agent`, `core::llm`,
     /// `mcp-tool-call` — land in the same daily JSONL.
@@ -118,11 +114,11 @@ pub struct McpServerHandle {
     /// Shares the same `HikerState` (audit log, tool registry, error
     /// model) as the rmcp-side handlers, so the basic agent and external
     /// rmcp clients see one tool surface.
-    agent_handler: Arc<HikerHandler>,
+    agent_handler: Arc<handler::App>,
 }
 
 impl McpServerHandle {
-    pub fn addr(&self) -> SocketAddr {
+    pub const fn addr(&self) -> SocketAddr {
         self.addr
     }
     pub fn discovery_path(&self) -> &Path {
@@ -131,9 +127,9 @@ impl McpServerHandle {
     pub fn url(&self) -> String {
         format!("http://{}/mcp", self.addr)
     }
-    /// Handler for in-process tool dispatch (basic agent loop). Cheap to
+    /// App for in-process tool dispatch (basic agent loop). Cheap to
     /// clone — wraps an `Arc<HikerState>`.
-    pub fn agent_handler(&self) -> Arc<HikerHandler> {
+    pub fn agent_handler(&self) -> Arc<handler::App> {
         self.agent_handler.clone()
     }
     /// Stop the listener and wait briefly for the task to finish. Removing
@@ -202,7 +198,7 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
     // MCP tool calls share the session's agent log via this thin
     // wrapper that carries the input-redaction toggle. `core::audit`
     // owns the on-disk JSONL writer.
-    let audit = Arc::new(AuditLog::new(deps.audit.clone(), deps.config.audit.log_full_input));
+    let audit = Arc::new(Log::new(deps.audit.clone(), deps.config.audit.log_full_input));
 
     let cancel = CancellationToken::new();
     let cancel_for_service = cancel.clone();
@@ -229,9 +225,9 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         llm_enabled: deps.llm_enabled,
     });
     let factory_state = handler_state.clone();
-    let service: StreamableHttpService<HikerHandler, LocalSessionManager> =
+    let service: StreamableHttpService<handler::App, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(HikerHandler::new(factory_state.clone())),
+            move || Ok(handler::App::new(factory_state.clone())),
             std::sync::Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 .with_stateful_mode(false)
@@ -257,7 +253,7 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         "mcp: server bound",
     );
 
-    let agent_handler = Arc::new(HikerHandler::new(handler_state));
+    let agent_handler = Arc::new(handler::App::new(handler_state));
 
     Ok(McpServerHandle {
         addr,

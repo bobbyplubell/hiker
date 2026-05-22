@@ -10,7 +10,7 @@
 //!
 //! Submodule layout (per `trees-module-discipline`):
 //!
-//! - `types`         — public DTOs (`Trees`, `EditableNode`, `NodeKind`, …)
+//! - `types`         — public DTOs (`Db`, `EditableNode`, `NodeKind`, …)
 //! - `storage`       — rusqlite + schema + CRUD + SQL helpers (the **only**
 //!   submodule that imports `rusqlite::params` /
 //!   `OptionalExtension` / `Connection`)
@@ -22,8 +22,10 @@
 //! - `ops::drop`     — `drop_cluster`
 //! - `ops::folder_rename` — `update_for_folder_rename`
 //! - `ops::split`    — `split_cluster` + recursive helper
-//! - `ops::summarize`— `plan_summarize_sweep`
-//! - `ops::rollup`   — `validate_rollup_inputs` + `apply_rollup`
+//! - `ops` (root)    — `plan_summarize_sweep` (Summarize sweep) +
+//!   `validate_rollup_inputs` / `apply_rollup` (Rollup); forward-looking
+//!   ops with no in-tree caller yet, so they stay in the module root per
+//!   `check-splits.py` rule #6 rather than in standalone files
 //!
 //! status: trees-db
 //! status: trees-db-schema
@@ -31,25 +33,20 @@
 //! status: cluster-editor-tree-shape
 //! status: cluster-editor-edit-history
 
-mod history;
-mod ops;
-mod storage;
-mod types;
+pub mod history;
+pub mod ops;
+pub mod storage;
+pub mod types;
 
-pub use types::{
-    EditableNode, HistoryEntry, NodeId, NodeInsert, NodeKind, NodePolicy, NoteId, RollupInput,
-    RollupOutcome, RollupParams, SplitOutcome, SummarizeParams, SummarizePlan, SummarizeScope,
-    TreeId, TreeInsert, TreeRow, Trees, TreesError, SCHEMA_VERSION,
-};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::types::{Db, NodeInsert, NodeKind, NodePolicy, TreeInsert};
     use tempfile::TempDir;
 
-    fn open_tmp() -> (TempDir, Trees) {
+    fn open_tmp() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
-        let trees = Trees::open(dir.path()).unwrap();
+        let trees = Db::open(dir.path()).unwrap();
         (dir, trees)
     }
 
@@ -168,7 +165,7 @@ mod tests {
             .set_policy(
                 &tree_id,
                 "n1",
-                Some(NodePolicy::Tag {
+                Some(&NodePolicy::Tag {
                     slug: "research".into(),
                     require_review: false,
                 }),
@@ -286,7 +283,7 @@ mod tests {
             .unwrap();
         let mk = |id: &str, parent: Option<&str>, kind: NodeKind| NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind,
             note_id: None,
             name: id.into(),
@@ -331,7 +328,7 @@ mod tests {
         trees
             .insert_single_node(
                 &tid,
-                NodeInsert {
+                &NodeInsert {
                     node_id: "b".into(),
                     parent_id: Some("root".into()),
                     kind: NodeKind::Cluster,
@@ -464,7 +461,7 @@ mod tests {
             .unwrap();
         let mk = |id: &str, parent: Option<&str>, kind: NodeKind| NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind,
             note_id: None,
             name: id.into(),
@@ -540,9 +537,9 @@ mod tests {
                 vault_snapshot: None,
             })
             .unwrap();
-        let cluster = |id: &str, parent: Option<&str>| NodeInsert {
+        let branch = |id: &str, parent: Option<&str>| NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind: NodeKind::Cluster,
             note_id: None,
             name: id.into(),
@@ -572,10 +569,10 @@ mod tests {
             .insert_nodes(
                 &tid,
                 &[
-                    cluster("root", None),
-                    cluster("p", Some("root")),
-                    cluster("sub-0", Some("p")),
-                    cluster("sub-1", Some("p")),
+                    branch("root", None),
+                    branch("p", Some("root")),
+                    branch("sub-0", Some("p")),
+                    branch("sub-1", Some("p")),
                     leaf("leaf-a", "p"),
                     leaf("leaf-b", "p"),
                 ],
@@ -636,7 +633,7 @@ mod tests {
         };
         let mkc = |id: &str, parent: Option<&str>| NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind: NodeKind::Cluster,
             note_id: None,
             name: id.into(),
@@ -699,7 +696,7 @@ mod tests {
         };
         let mkc = |id: &str, parent: Option<&str>, policy: Option<NodePolicy>| NodeInsert {
             node_id: id.into(),
-            parent_id: parent.map(|s| s.into()),
+            parent_id: parent.map(std::convert::Into::into),
             kind: NodeKind::Cluster,
             note_id: None,
             name: id.into(),

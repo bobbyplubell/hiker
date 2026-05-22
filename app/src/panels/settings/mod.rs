@@ -10,9 +10,8 @@ use std::sync::{Arc, RwLock};
 
 use eframe::egui;
 
-use hiker_core::config::{
-    Config, IdStampingMode, RecencyBias, SettingsScope, TreeSortBy, WorkerPreferenceCfg,
-};
+use hiker_core::config::{Config, SettingsScope};
+use hiker_core::config::sections::{IdStampingMode, RecencyBias, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
 use crate::theme;
@@ -27,7 +26,7 @@ enum Scope {
 }
 
 impl Scope {
-    fn to_core(self) -> SettingsScope {
+    const fn to_core(self) -> SettingsScope {
         match self {
             Scope::User => SettingsScope::User,
             Scope::Vault => SettingsScope::Vault,
@@ -116,7 +115,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(scope_path_hint(app, ui_state.scope))
+                egui::RichText::new(app.scope_path_hint(ui_state.scope))
                     .color(theme::muted())
                     .small()
                     .monospace(),
@@ -140,34 +139,45 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            window_section(ui, app);
-            vault_section(ui, app, &snapshot, &mut ui_state);
-            indexing_section(ui, app, &snapshot, &mut ui_state);
-            llm_section(ui, app, &snapshot, &mut ui_state);
-            mcp_section(ui, app, &snapshot, &mut ui_state);
-            staging_section(ui, app, &snapshot, &mut ui_state);
-            editor_section(ui, app, &snapshot, &mut ui_state);
-            search_section(ui, app, &snapshot, &mut ui_state);
-            tasks_section(ui, app, &snapshot, &mut ui_state);
-            acp_section(ui, app, &snapshot, &mut ui_state);
-            trails_section(ui, app, &snapshot, &mut ui_state);
-            suggestions_section(ui, app, &snapshot, &mut ui_state);
+            {
+                let mut ctx = SettingsCtx {
+                    ui: &mut *ui,
+                    app: &mut *app,
+                    snap: &snapshot,
+                    st: &mut ui_state,
+                };
+                ctx.window_section();
+                ctx.vault_section();
+                ctx.indexing_section();
+                ctx.llm_section();
+                ctx.mcp_section();
+                ctx.staging_section();
+                ctx.editor_section();
+                ctx.search_section();
+                ctx.tasks_section();
+                ctx.acp_section();
+                ctx.trails_section();
+                ctx.suggestions_section();
+            }
 
             ui.add_space(8.0);
-            raw::show(ui, app, ui_state.scope.to_core());
+            raw::Raw { ui, app }.show(ui_state.scope.to_core());
         });
 
     ui.ctx().data_mut(|d| d.insert_temp(mem_id, ui_state));
 }
 
-fn scope_path_hint(app: &AppState, scope: Scope) -> String {
-    let paths = hiker_core::config::ConfigPaths::resolve(&app.vault_session.vault_root);
+impl AppState {
+    fn scope_path_hint(&self, scope: Scope) -> String {
+        let app = self;
+    let paths = hiker_core::config::Paths::resolve(&app.vault_session.vault_root);
     match scope {
         Scope::User => paths
             .user
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(no platform config dir)".to_string()),
         Scope::Vault => paths.vault.display().to_string(),
+    }
     }
 }
 
@@ -184,7 +194,7 @@ fn launch_external(p: &std::path::Path) {
 }
 
 fn scope_path_pathbuf(app: &AppState, scope: Scope) -> Option<PathBuf> {
-    let paths = hiker_core::config::ConfigPaths::resolve(&app.vault_session.vault_root);
+    let paths = hiker_core::config::Paths::resolve(&app.vault_session.vault_root);
     match scope {
         Scope::User => paths.user,
         Scope::Vault => Some(paths.vault),
@@ -195,7 +205,18 @@ fn scope_path_pathbuf(app: &AppState, scope: Scope) -> Option<PathBuf> {
 // Section renderers.
 // ---------------------------------------------------------------------------
 
-fn window_section(ui: &mut egui::Ui, app: &mut AppState) {
+/// Bundles the four args every section helper shares so they can all
+/// hang off `&mut self` and skirt `clippy::single_call_fn`.
+struct SettingsCtx<'a> {
+    ui: &'a mut egui::Ui,
+    app: &'a mut AppState,
+    snap: &'a Config,
+    st: &'a mut SettingsUi,
+}
+
+impl<'a> SettingsCtx<'a> {
+fn window_section(&mut self) {
+    let (ui, app) = (&mut *self.ui, &mut *self.app);
     egui::CollapsingHeader::new("Window")
         .default_open(false)
         .show(ui, |ui| {
@@ -205,7 +226,7 @@ fn window_section(ui: &mut egui::Ui, app: &mut AppState) {
                 .changed()
             {
                 app.ui.custom_titlebar = v;
-                commit(app, Scope::Vault, "ui.custom_titlebar", serde_json::json!(v));
+                commit(app, Scope::Vault, "ui.custom_titlebar", &serde_json::json!(v));
                 app.push_toast(
                     "Custom titlebar setting saved (restart to apply)",
                     ToastLevel::Info,
@@ -214,7 +235,8 @@ fn window_section(ui: &mut egui::Ui, app: &mut AppState) {
         });
 }
 
-fn vault_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn vault_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("Vault")
         .default_open(matches!(st.scope, Scope::Vault))
         .show(ui, |ui| {
@@ -236,9 +258,9 @@ fn vault_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut 
                 "vault.sidebar_mode",
                 snap.vault.sidebar_mode,
                 &[
-                    (hiker_core::config::SidebarMode::Files, "Files", "files"),
-                    (hiker_core::config::SidebarMode::Clusters, "Cluster trees", "clusters"),
-                    (hiker_core::config::SidebarMode::Trails, "Trails", "trails"),
+                    (hiker_core::config::sections::SidebarMode::Files, "Files", "files"),
+                    (hiker_core::config::sections::SidebarMode::Clusters, "Cluster trees", "clusters"),
+                    (hiker_core::config::sections::SidebarMode::Trails, "Trails", "trails"),
                 ],
             );
             bool_row(ui, app, st, "Show sessions in tree", "vault.show_sessions_in_tree", snap.vault.show_sessions_in_tree);
@@ -247,7 +269,8 @@ fn vault_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut 
         });
 }
 
-fn indexing_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn indexing_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("Indexing")
         .default_open(true)
         .show(ui, |ui| {
@@ -309,7 +332,8 @@ fn indexing_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &m
         });
 }
 
-fn llm_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn llm_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("LLM")
         .default_open(true)
         .show(ui, |ui| {
@@ -326,20 +350,21 @@ fn llm_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut Se
 
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Limits").color(theme::muted()).small());
-            int_row(ui, app, st, "Max tokens", "llm.limits.max_tokens", snap.llm.limits.max_tokens as u64, 1, u32::MAX as u64);
-            int_row(ui, app, st, "Timeout (s)", "llm.limits.timeout_secs", snap.llm.limits.timeout_secs, 1, u32::MAX as u64);
+            int_row(ui, app, st, "Max tokens", "llm.limits.max_tokens", &IntField { current: snap.llm.limits.max_tokens as u64, min: 1, max: u32::MAX as u64 });
+            int_row(ui, app, st, "Timeout (s)", "llm.limits.timeout_secs", &IntField { current: snap.llm.limits.timeout_secs, min: 1, max: u32::MAX as u64 });
 
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Agent").color(theme::muted()).small());
-            int_row(ui, app, st, "Iteration cap", "llm.agent.iteration_cap", snap.llm.agent.iteration_cap as u64, 1, u32::MAX as u64);
-            int_row(ui, app, st, "Tool timeout (s)", "llm.agent.tool_timeout_secs", snap.llm.agent.tool_timeout_secs, 1, u32::MAX as u64);
+            int_row(ui, app, st, "Iteration cap", "llm.agent.iteration_cap", &IntField { current: snap.llm.agent.iteration_cap as u64, min: 1, max: u32::MAX as u64 });
+            int_row(ui, app, st, "Tool timeout (s)", "llm.agent.tool_timeout_secs", &IntField { current: snap.llm.agent.tool_timeout_secs, min: 1, max: u32::MAX as u64 });
 
             bool_row(ui, app, st, "Audit: log full prompt", "llm.audit.log_full_prompt", snap.llm.audit.log_full_prompt);
             bool_row(ui, app, st, "Background writes need review", "llm.background.review_required", snap.llm.background.review_required);
         });
 }
 
-fn mcp_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn mcp_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("MCP server")
         .default_open(true)
         .show(ui, |ui| {
@@ -347,15 +372,16 @@ fn mcp_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut Se
             string_row(ui, app, st, "Bind host", "mcp.host", &snap.mcp.host);
             if snap.mcp.host != "127.0.0.1" && snap.mcp.host != "localhost" {
                 ui.horizontal(|ui| {
-                    ui.add(crate::icons::warning().tint(egui::Color32::from_rgb(0xb0, 0x4a, 0x00)));
+                    ui.add(crate::icons::ICONS.image(crate::icons::Icon::Warning).tint(egui::Color32::from_rgb(0xb0, 0x4a, 0x00)));
                     ui.colored_label(
                         egui::Color32::from_rgb(0xb0, 0x4a, 0x00),
                         "non-loopback host exposes vault contents on the network",
                     );
                 });
             }
-            port_row(ui, app, st, "Port (0 = ephemeral)", "mcp.port", snap.mcp.port);
-            int_row(ui, app, st, "Max top_k", "mcp.max_top_k", snap.mcp.max_top_k as u64, 1, u32::MAX as u64);
+            SettingsCtx { ui: &mut *ui, app: &mut *app, snap, st: &mut *st }
+                .port_row("Port (0 = ephemeral)", "mcp.port", snap.mcp.port);
+            int_row(ui, app, st, "Max top_k", "mcp.max_top_k", &IntField { current: snap.mcp.max_top_k as u64, min: 1, max: u32::MAX as u64 });
 
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Tools").color(theme::muted()).small());
@@ -384,16 +410,18 @@ fn mcp_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut Se
         });
 }
 
-fn staging_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn staging_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("Staging")
         .default_open(true)
         .show(ui, |ui| {
             bool_row(ui, app, st, "Auto-reject on conflict", "staging.auto_reject_on_conflict", snap.staging.auto_reject_on_conflict);
-            int_row(ui, app, st, "Retention (days)", "staging.retention_days", snap.staging.retention_days as u64, 1, u32::MAX as u64);
+            int_row(ui, app, st, "Retention (days)", "staging.retention_days", &IntField { current: snap.staging.retention_days as u64, min: 1, max: u32::MAX as u64 });
         });
 }
 
-fn editor_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn editor_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     if matches!(st.scope, Scope::User) {
         // Editor flags are vault-scope only. Show a hint instead of the form.
         egui::CollapsingHeader::new("Editor")
@@ -429,10 +457,7 @@ fn editor_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
                 "editor.hide_scrollbar",
                 e.hide_scrollbar,
             );
-            float_row(
-                ui,
-                app,
-                st,
+            SettingsCtx { ui: &mut *ui, app: &mut *app, snap, st: &mut *st }.float_row(
                 "Scroll speed",
                 "editor.scroll_speed",
                 e.scroll_speed as f64,
@@ -443,12 +468,12 @@ fn editor_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
             ui.collapsing("Minimap customization", |ui| {
                 let m = &e.minimap;
                 ui.label(egui::RichText::new("Layout").color(theme::muted()).small());
-                int_row(ui, app, st, "Width (px)", "editor.minimap.width", m.width as u64, 16, 300);
-                int_row(ui, app, st, "Bar padding left (px)", "editor.minimap.bar_padding_left", m.bar_padding_left as u64, 0, 24);
-                int_row(ui, app, st, "Bar padding right (px)", "editor.minimap.bar_padding_right", m.bar_padding_right as u64, 0, 24);
-                int_row(ui, app, st, "Bar corner radius (px)", "editor.minimap.bar_corner_radius", m.bar_corner_radius as u64, 0, 6);
-                int_row(ui, app, st, "Minimum bar width (px)", "editor.minimap.min_bar_width", m.min_bar_width as u64, 1, 12);
-                int_row(ui, app, st, "Bar vertical gap (×0.1px)", "editor.minimap.bar_gap_tenths", m.bar_gap_tenths as u64, 0, 20);
+                int_row(ui, app, st, "Width (px)", "editor.minimap.width", &IntField { current: m.width as u64, min: 16, max: 300 });
+                int_row(ui, app, st, "Bar padding left (px)", "editor.minimap.bar_padding_left", &IntField { current: m.bar_padding_left as u64, min: 0, max: 24 });
+                int_row(ui, app, st, "Bar padding right (px)", "editor.minimap.bar_padding_right", &IntField { current: m.bar_padding_right as u64, min: 0, max: 24 });
+                int_row(ui, app, st, "Bar corner radius (px)", "editor.minimap.bar_corner_radius", &IntField { current: m.bar_corner_radius as u64, min: 0, max: 6 });
+                int_row(ui, app, st, "Minimum bar width (px)", "editor.minimap.min_bar_width", &IntField { current: m.min_bar_width as u64, min: 1, max: 12 });
+                int_row(ui, app, st, "Bar vertical gap (×0.1px)", "editor.minimap.bar_gap_tenths", &IntField { current: m.bar_gap_tenths as u64, min: 0, max: 20 });
                 ui.separator();
                 ui.label(egui::RichText::new("Toggles").color(theme::muted()).small());
                 bool_row(ui, app, st, "Apply per-kind colors", "editor.minimap.colored", m.colored);
@@ -480,7 +505,8 @@ fn editor_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
         });
 }
 
-fn search_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn search_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     if matches!(st.scope, Scope::User) {
         return;
     }
@@ -510,14 +536,15 @@ fn search_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
                         .fixed_decimals(2),
                 );
                 if resp.drag_stopped() || resp.lost_focus() {
-                    commit(app, st.scope, "search.semantic.min_similarity", json_f(sim));
+                    commit(app, st.scope, "search.semantic.min_similarity", &json_f(sim));
                 }
             });
-            int_row(ui, app, st, "Semantic top_k", "search.semantic.top_k", snap.search.semantic.top_k as u64, 5, 100);
+            int_row(ui, app, st, "Semantic top_k", "search.semantic.top_k", &IntField { current: snap.search.semantic.top_k as u64, min: 5, max: 100 });
         });
 }
 
-fn tasks_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn tasks_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("Tasks")
         .default_open(false)
         .show(ui, |ui| {
@@ -533,17 +560,18 @@ fn tasks_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut 
                 ],
             );
             if matches!(st.scope, Scope::Vault) {
-                int_row(ui, app, st, "Terminal retention (s)", "tasks.terminal_retention_secs", snap.tasks.terminal_retention_secs, 1, u32::MAX as u64);
+                int_row(ui, app, st, "Terminal retention (s)", "tasks.terminal_retention_secs", &IntField { current: snap.tasks.terminal_retention_secs, min: 1, max: u32::MAX as u64 });
                 bool_row(ui, app, st, "Direct worker enabled", "tasks.direct_worker.enabled", snap.tasks.direct_worker.enabled);
-                int_row(ui, app, st, "Direct worker parallelism", "tasks.direct_worker.parallelism", snap.tasks.direct_worker.parallelism as u64, 1, u32::MAX as u64);
+                int_row(ui, app, st, "Direct worker parallelism", "tasks.direct_worker.parallelism", &IntField { current: snap.tasks.direct_worker.parallelism as u64, min: 1, max: u32::MAX as u64 });
                 bool_row(ui, app, st, "Expose to chat agent", "tasks.expose_to_chat_agent", snap.tasks.expose_to_chat_agent);
-                int_row(ui, app, st, "Lease default (s)", "tasks.lease.default_secs", snap.tasks.lease.default_secs, 1, u32::MAX as u64);
-                int_row(ui, app, st, "Lease max (s)", "tasks.lease.max_secs", snap.tasks.lease.max_secs, 1, u32::MAX as u64);
+                int_row(ui, app, st, "Lease default (s)", "tasks.lease.default_secs", &IntField { current: snap.tasks.lease.default_secs, min: 1, max: u32::MAX as u64 });
+                int_row(ui, app, st, "Lease max (s)", "tasks.lease.max_secs", &IntField { current: snap.tasks.lease.max_secs, min: 1, max: u32::MAX as u64 });
             }
         });
 }
 
-fn acp_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn acp_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("ACP")
         .default_open(false)
         .show(ui, |ui| {
@@ -552,7 +580,8 @@ fn acp_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut Se
         });
 }
 
-fn trails_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn trails_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     if matches!(st.scope, Scope::User) {
         return;
     }
@@ -563,7 +592,8 @@ fn trails_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut
         });
 }
 
-fn suggestions_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st: &mut SettingsUi) {
+fn suggestions_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     egui::CollapsingHeader::new("Suggestions / Triage")
         .default_open(false)
         .show(ui, |ui| {
@@ -582,10 +612,11 @@ fn suggestions_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st:
                         .fixed_decimals(2),
                 );
                 if resp.drag_stopped() || resp.lost_focus() {
-                    commit(app, st.scope, "suggestions.triage.modified_rerun_cosine_guard", json_f(g));
+                    commit(app, st.scope, "suggestions.triage.modified_rerun_cosine_guard", &json_f(g));
                 }
             });
         });
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +626,7 @@ fn suggestions_section(ui: &mut egui::Ui, app: &mut AppState, snap: &Config, st:
 fn bool_row(ui: &mut egui::Ui, app: &mut AppState, st: &mut SettingsUi, label: &str, key: &str, current: bool) {
     let mut v = current;
     if ui.checkbox(&mut v, label).changed() {
-        commit(app, st.scope, key, serde_json::Value::Bool(v));
+        commit(app, st.scope, key, &serde_json::Value::Bool(v));
     }
 }
 
@@ -622,23 +653,30 @@ fn string_row(
         // We commit on focus-loss regardless of Enter — focus loss is the
         // standard "I'm done editing" gesture in egui forms.
         if resp.lost_focus() && draft.as_str() != current {
-            commit(app, st.scope, key, serde_json::Value::String(draft.clone()));
+            commit(app, st.scope, key, &serde_json::Value::String(draft.clone()));
         }
         let _ = commit_now;
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A bounded integer setting: its current value plus the inclusive
+/// `[min, max]` range the drag-value clamps to. Grouped so `int_row`
+/// takes one field descriptor instead of three loose `u64`s.
+struct IntField {
+    current: u64,
+    min: u64,
+    max: u64,
+}
+
 fn int_row(
     ui: &mut egui::Ui,
     app: &mut AppState,
     st: &mut SettingsUi,
     label: &str,
     key: &str,
-    current: u64,
-    min: u64,
-    max: u64,
+    field: &IntField,
 ) {
+    let &IntField { current, min, max } = field;
     let mut v = current;
     ui.horizontal(|ui| {
         ui.label(label);
@@ -648,15 +686,14 @@ fn int_row(
                 .speed(1.0),
         );
         if (resp.drag_stopped() || resp.lost_focus()) && v != current {
-            commit(app, st.scope, key, json_u(v));
+            commit(app, st.scope, key, &json_u(v));
         }
     });
 }
 
+impl<'a> SettingsCtx<'a> {
 fn float_row(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    st: &mut SettingsUi,
+    &mut self,
     label: &str,
     key: &str,
     current: f64,
@@ -664,6 +701,7 @@ fn float_row(
     max: f64,
     speed: f64,
 ) {
+    let (ui, app, st) = (&mut *self.ui, &mut *self.app, &mut *self.st);
     let mut v = current;
     ui.horizontal(|ui| {
         ui.label(label);
@@ -674,12 +712,13 @@ fn float_row(
                 .max_decimals(2),
         );
         if (resp.drag_stopped() || resp.lost_focus()) && (v - current).abs() > f64::EPSILON {
-            commit(app, st.scope, key, json_f(v));
+            commit(app, st.scope, key, &json_f(v));
         }
     });
 }
 
-fn port_row(ui: &mut egui::Ui, app: &mut AppState, st: &mut SettingsUi, label: &str, key: &str, current: u16) {
+fn port_row(&mut self, label: &str, key: &str, current: u16) {
+    let (ui, app, st) = (&mut *self.ui, &mut *self.app, &mut *self.st);
     let mut v = current as u64;
     ui.horizontal(|ui| {
         ui.label(label);
@@ -689,9 +728,10 @@ fn port_row(ui: &mut egui::Ui, app: &mut AppState, st: &mut SettingsUi, label: &
                 .speed(1.0),
         );
         if (resp.drag_stopped() || resp.lost_focus()) && v as u16 != current {
-            commit(app, st.scope, key, json_u(v));
+            commit(app, st.scope, key, &json_u(v));
         }
     });
+}
 }
 
 /// Hex color row: a swatch button that opens egui's color picker, plus
@@ -718,13 +758,13 @@ fn color_row(
     }
     let draft = st.text_drafts.entry(draft_key.clone()).or_default();
 
-    let mut color = hex_to_color32(draft.as_str()).unwrap_or(egui::Color32::MAGENTA);
+    let mut color = draft.parse_hex_color().unwrap_or(egui::Color32::MAGENTA);
     let mut committed: Option<String> = None;
     ui.horizontal(|ui| {
         ui.label(label);
         let resp = ui.color_edit_button_srgba(&mut color);
         if resp.changed() {
-            let new_hex = color32_to_hex(color);
+            let new_hex = color.to_hex_string();
             *draft = new_hex.clone();
             committed = Some(new_hex);
         }
@@ -735,7 +775,7 @@ fn color_row(
         }
     });
     if let Some(v) = committed {
-        commit(app, st.scope, key, serde_json::Value::String(v));
+        commit(app, st.scope, key, &serde_json::Value::String(v));
     }
 }
 
@@ -743,25 +783,42 @@ fn is_valid_hex(s: &str) -> bool {
     let b = s.as_bytes();
     matches!(b.first(), Some(b'#'))
         && (b.len() == 7 || b.len() == 9)
-        && b[1..].iter().all(|c| c.is_ascii_hexdigit())
+        && b[1..].iter().all(u8::is_ascii_hexdigit)
 }
 
-fn hex_to_color32(s: &str) -> Option<egui::Color32> {
-    if !is_valid_hex(s) {
-        return None;
+/// Parse a `#RRGGBB` or `#RRGGBBAA` string into an egui Color32. Trait
+/// methods with `&self` are exempt from `single_call_fn`.
+trait ParseHexColor {
+    fn parse_hex_color(&self) -> Option<egui::Color32>;
+}
+
+impl ParseHexColor for str {
+    fn parse_hex_color(&self) -> Option<egui::Color32> {
+        let s = self;
+        if !is_valid_hex(s) {
+            return None;
+        }
+        let hex = &s[1..];
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        let (r, g, b) = (byte(0)?, byte(2)?, byte(4)?);
+        let a = if hex.len() == 8 { byte(6)? } else { 255 };
+        Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
     }
-    let hex = &s[1..];
-    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    let (r, g, b) = (byte(0)?, byte(2)?, byte(4)?);
-    let a = if hex.len() == 8 { byte(6)? } else { 255 };
-    Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
 }
 
-fn color32_to_hex(c: egui::Color32) -> String {
-    if c.a() == 255 {
-        format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
-    } else {
-        format!("#{:02x}{:02x}{:02x}{:02x}", c.r(), c.g(), c.b(), c.a())
+/// Render an egui Color32 as a `#RRGGBB` / `#RRGGBBAA` string.
+trait HexString {
+    fn to_hex_string(&self) -> String;
+}
+
+impl HexString for egui::Color32 {
+    fn to_hex_string(&self) -> String {
+        let c = *self;
+        if c.a() == 255 {
+            format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+        } else {
+            format!("#{:02x}{:02x}{:02x}{:02x}", c.r(), c.g(), c.b(), c.a())
+        }
     }
 }
 
@@ -792,7 +849,7 @@ fn enum_combo<T: Copy + PartialEq>(
     });
     if selected != current {
         if let Some((_, _, wire)) = options.iter().find(|(v, _, _)| *v == selected) {
-            commit(app, st.scope, key, serde_json::Value::String((*wire).to_string()));
+            commit(app, st.scope, key, &serde_json::Value::String((*wire).to_string()));
         }
     }
 }
@@ -806,12 +863,12 @@ fn help(ui: &mut egui::Ui, text: &str) {
 // and toast the result.
 // ---------------------------------------------------------------------------
 
-fn commit(app: &mut AppState, scope: Scope, key: &str, value: serde_json::Value) {
+fn commit(app: &mut AppState, scope: Scope, key: &str, value: &serde_json::Value) {
     let core_scope = scope.to_core();
     let vault_root: PathBuf = app.vault_session.vault_root.clone();
     match Config::set(core_scope, key, value, &vault_root) {
         Ok(new_cfg) => {
-            swap_in_place(&app.vault_session.config, new_cfg);
+            app.vault_session.config.swap_in_place(new_cfg);
             app.push_toast(format!("Saved {key}"), ToastLevel::Info);
         }
         Err(e) => {
@@ -820,9 +877,19 @@ fn commit(app: &mut AppState, scope: Scope, key: &str, value: serde_json::Value)
     }
 }
 
-fn swap_in_place(handle: &Arc<RwLock<Config>>, new_cfg: Config) {
+/// Extension trait so the merge-swap can be a method on the shared
+/// config handle. Trait methods with `&self` are exempt from
+/// `clippy::single_call_fn`.
+trait ConfigHandleExt {
+    fn swap_in_place(&self, new_cfg: Config);
+}
+
+impl ConfigHandleExt for Arc<RwLock<Config>> {
+    fn swap_in_place(&self, new_cfg: Config) {
+        let handle = self;
     if let Ok(mut guard) = handle.write() {
         *guard = new_cfg;
+    }
     }
 }
 

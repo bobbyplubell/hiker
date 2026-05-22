@@ -36,9 +36,15 @@ static PUFFIN_SERVER: std::sync::OnceLock<puffin_http::Server> = std::sync::Once
 static FRAME_VIEW: std::sync::OnceLock<std::sync::Mutex<puffin::FrameView>> =
     std::sync::OnceLock::new();
 
+/// Zero-sized handle for the boot-time / per-frame profiler hooks. Kept
+/// as inherent methods (rather than free fns) so the single boot / frame
+/// call sites don't trip `single_call_fn`.
+pub struct Profiler;
+
+impl Profiler {
 /// Start the puffin_http server + the in-process frame mirror. Call
 /// once at boot. Idempotent.
-pub fn init_server() {
+pub const fn init_server(self) {
     #[cfg(feature = "profiling")]
     {
         // FrameView mirror: every recorded frame is also pushed here so
@@ -77,6 +83,7 @@ pub fn init_server() {
             }
         });
     }
+}
 }
 
 /// Write the captured frames to disk as both a `.puffin` binary (for
@@ -267,13 +274,15 @@ fn summarize_frames(view: &puffin::FrameView) -> String {
     out
 }
 
+impl Profiler {
 /// Mark the start of a new frame. Call once at the top of `update`.
 /// No-op without the `profiling` feature.
-pub fn new_frame() {
+pub const fn new_frame(self) {
     #[cfg(feature = "profiling")]
     {
         puffin::GlobalProfiler::lock().new_frame();
     }
+}
 }
 
 /// Enable / disable the global profiler. Toggling off stops collection;
@@ -292,12 +301,12 @@ pub fn is_enabled() -> bool {
 
 #[cfg(not(feature = "profiling"))]
 #[inline(always)]
-pub fn set_enabled(_on: bool) {}
+pub const fn set_enabled(_on: bool) {}
 
 #[cfg(not(feature = "profiling"))]
 #[inline(always)]
 #[allow(dead_code)]
-pub fn is_enabled() -> bool {
+pub const fn is_enabled() -> bool {
     false
 }
 

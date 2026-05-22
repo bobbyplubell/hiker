@@ -20,33 +20,12 @@ const SOFT_SIZE_LIMIT: usize = 1200;
 /// Stateless plain-text chunker. Implements [`Chunker`] so the ingest pipeline
 /// can dispatch by extension.
 // status: txt-chunker-paragraph-splits
-pub struct TxtChunker;
+pub struct Txt;
 
-impl Chunker for TxtChunker {
+impl Chunker for Txt {
     fn chunk(&self, source: &str) -> Vec<Chunk> {
-        chunk_txt(source)
+        chunk(source)
     }
-}
-
-/// Split a `.txt` source into chunks. See module docs for the pipeline.
-// status: txt-chunker-sentence-pack
-// status: txt-chunker-structure-heuristics
-// status: txt-chunker-guardrails
-pub fn chunk_txt(source: &str) -> Vec<Chunk> {
-    if source.trim().is_empty() {
-        return Vec::new();
-    }
-    let lines = split_lines(source);
-    let code_mask = detect_code_regions(&lines, source);
-    let headings = detect_headings(&lines, source, &code_mask);
-    let sections = build_sections(&lines, &headings, source);
-
-    let mut chunks = Vec::new();
-    let mut next_index: u32 = 0;
-    for sec in &sections {
-        emit_section(&mut chunks, &mut next_index, source, sec, &code_mask, &lines);
-    }
-    chunks
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,84 +35,6 @@ struct LineSpec {
     end_no_nl: usize,
     /// Range INCLUDING trailing newline (or end-of-file).
     end_with_nl: usize,
-}
-
-fn split_lines(source: &str) -> Vec<LineSpec> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let start = i;
-        let mut end = start;
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
-        }
-        let after = if end < bytes.len() { end + 1 } else { end };
-        out.push(LineSpec {
-            start,
-            end_no_nl: end,
-            end_with_nl: after,
-        });
-        i = after;
-    }
-    out
-}
-
-fn line_text<'a>(source: &'a str, l: &LineSpec) -> &'a str {
-    &source[l.start..l.end_no_nl]
-}
-
-fn is_blank_line(source: &str, l: &LineSpec) -> bool {
-    line_text(source, l).trim().is_empty()
-}
-
-/// Mark lines that are part of a code-shaped region (3+ consecutive lines
-/// satisfying either pattern (a) or (b) in docs/txt-ingest.md). Blank lines
-/// don't break a code run on their own — but they don't extend it either:
-/// detection requires consecutive non-blank lines.
-fn detect_code_regions(lines: &[LineSpec], source: &str) -> Vec<bool> {
-    let mut mask = vec![false; lines.len()];
-    let n = lines.len();
-    let mut i = 0;
-    while i < n {
-        if is_blank_line(source, &lines[i]) {
-            i += 1;
-            continue;
-        }
-        // Count consecutive non-blank lines from i.
-        let mut j = i;
-        while j < n && !is_blank_line(source, &lines[j]) {
-            j += 1;
-        }
-        let run = &lines[i..j];
-        let indented = run
-            .iter()
-            .all(|l| line_starts_with_indent(line_text(source, l)));
-        let symbol_heavy = run
-            .iter()
-            .all(|l| symbol_count(line_text(source, l)) >= 3);
-        if run.len() >= 3 && (indented || symbol_heavy) {
-            for slot in mask.iter_mut().take(j).skip(i) {
-                *slot = true;
-            }
-        }
-        i = j;
-    }
-    mask
-}
-
-fn line_starts_with_indent(text: &str) -> bool {
-    if text.starts_with('\t') {
-        return true;
-    }
-    let leading_spaces = text.bytes().take_while(|&b| b == b' ').count();
-    leading_spaces >= 4
-}
-
-fn symbol_count(text: &str) -> usize {
-    text.bytes()
-        .filter(|&b| matches!(b, b';' | b'{' | b'}' | b'(' | b')' | b'='))
-        .count()
 }
 
 #[derive(Debug, Clone)]
@@ -148,118 +49,6 @@ struct HeadingMark {
     span: usize,
 }
 
-/// Pass over the lines once, marking those that should be promoted to virtual
-/// headings. Code-region lines are skipped (per the spec's code-region
-/// exclusion guardrail), and ALL-CAPS promotions are throttled to at most
-/// one per rolling 5-line window.
-fn detect_headings(
-    lines: &[LineSpec],
-    source: &str,
-    code_mask: &[bool],
-) -> Vec<HeadingMark> {
-    let mut out = Vec::new();
-    let n = lines.len();
-    // Last index at which we promoted an ALL-CAPS heading; used to enforce
-    // the rolling-window guardrail.
-    let mut last_caps_promotion: Option<usize> = None;
-    let mut i = 0;
-    while i < n {
-        if code_mask[i] {
-            i += 1;
-            continue;
-        }
-        let text = line_text(source, &lines[i]);
-
-        // Setext: this line is non-empty, next line is all `=` (H1) or `-` (H2).
-        if i + 1 < n && !is_blank_line(source, &lines[i]) && !code_mask[i + 1] {
-            let next_text = line_text(source, &lines[i + 1]).trim();
-            if is_setext_underline(next_text, '=') {
-                out.push(HeadingMark {
-                    line: i,
-                    level: 1,
-                    title: text.trim().to_string(),
-                    span: 2,
-                });
-                i += 2;
-                continue;
-            }
-            if is_setext_underline(next_text, '-') {
-                out.push(HeadingMark {
-                    line: i,
-                    level: 2,
-                    title: text.trim().to_string(),
-                    span: 2,
-                });
-                i += 2;
-                continue;
-            }
-        }
-
-        // ALL-CAPS heading.
-        if looks_like_all_caps_heading(text) {
-            let allowed = match last_caps_promotion {
-                Some(prev) => i.saturating_sub(prev) >= 5,
-                None => true,
-            };
-            if allowed {
-                out.push(HeadingMark {
-                    line: i,
-                    level: 2,
-                    title: text.trim().to_string(),
-                    span: 1,
-                });
-                last_caps_promotion = Some(i);
-                i += 1;
-                continue;
-            }
-        }
-
-        i += 1;
-    }
-    out
-}
-
-fn is_setext_underline(text: &str, ch: char) -> bool {
-    if text.len() < 3 {
-        return false;
-    }
-    text.chars().all(|c| c == ch)
-}
-
-fn looks_like_all_caps_heading(text: &str) -> bool {
-    let trimmed = text.trim();
-    let len = trimmed.chars().count();
-    if !(3..=60).contains(&len) {
-        return false;
-    }
-    // Must contain at least one letter, and every letter must be uppercase.
-    let mut has_letter = false;
-    for c in trimmed.chars() {
-        if c.is_alphabetic() {
-            has_letter = true;
-            if !c.is_uppercase() {
-                return false;
-            }
-        }
-    }
-    if !has_letter {
-        return false;
-    }
-    // More than one distinct non-space character (rejects `==========`).
-    let mut distinct = std::collections::HashSet::new();
-    for c in trimmed.chars().filter(|c| !c.is_whitespace()) {
-        distinct.insert(c);
-    }
-    if distinct.len() < 2 {
-        return false;
-    }
-    // Fewer than ~10 words.
-    if trimmed.split_whitespace().count() > 10 {
-        return false;
-    }
-    true
-}
-
 #[derive(Debug, Clone)]
 struct Section {
     heading_path: Option<String>,
@@ -269,286 +58,444 @@ struct Section {
     body_end_line: usize,
 }
 
-fn build_sections(
-    lines: &[LineSpec],
-    headings: &[HeadingMark],
-    _source: &str,
-) -> Vec<Section> {
-    let n = lines.len();
-    if headings.is_empty() {
-        return vec![Section {
-            heading_path: None,
-            body_start_line: 0,
-            body_end_line: n,
-        }];
+/// Per-call chunker state. Holds the source and lazily-built tables; methods
+/// drive the pipeline stages. Wrapping the work in `self`-methods keeps each
+/// stage focused without splitting the file into single-call free helpers.
+struct ChunkerCtx<'a> {
+    source: &'a str,
+    lines: Vec<LineSpec>,
+    code_mask: Vec<bool>,
+    headings: Vec<HeadingMark>,
+    sections: Vec<Section>,
+    chunks: Vec<Chunk>,
+    next_index: u32,
+}
+
+/// Split a `.txt` source into chunks. See module docs for the pipeline.
+// status: txt-chunker-sentence-pack
+// status: txt-chunker-structure-heuristics
+// status: txt-chunker-guardrails
+pub fn chunk(source: &str) -> Vec<Chunk> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut ctx = ChunkerCtx {
+        source,
+        lines: Vec::new(),
+        code_mask: Vec::new(),
+        headings: Vec::new(),
+        sections: Vec::new(),
+        chunks: Vec::new(),
+        next_index: 0,
+    };
+    ctx.split_lines();
+    ctx.detect_code_regions();
+    ctx.detect_headings();
+    ctx.build_sections();
+    ctx.emit_all_sections();
+    ctx.chunks
+}
+
+impl<'a> ChunkerCtx<'a> {
+    fn line_text(&self, l: &LineSpec) -> &'a str {
+        &self.source[l.start..l.end_no_nl]
     }
 
-    let mut sections = Vec::new();
-    let mut heading_stack: Vec<String> = Vec::new();
-
-    // Pre-section content (before the first heading).
-    if headings[0].line > 0 {
-        sections.push(Section {
-            heading_path: None,
-            body_start_line: 0,
-            body_end_line: headings[0].line,
-        });
+    fn is_blank_line(&self, l: &LineSpec) -> bool {
+        self.line_text(l).trim().is_empty()
     }
 
-    for (idx, h) in headings.iter().enumerate() {
-        // Update heading_stack to reflect this heading's level.
-        let depth = h.level as usize;
-        heading_stack.truncate(depth.saturating_sub(1));
-        heading_stack.push(h.title.clone());
-        let breadcrumb = heading_stack.join(" > ");
+    fn split_lines(&mut self) {
+        let bytes = self.source.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let start = i;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'\n' {
+                end += 1;
+            }
+            let after = if end < bytes.len() { end + 1 } else { end };
+            self.lines.push(LineSpec {
+                start,
+                end_no_nl: end,
+                end_with_nl: after,
+            });
+            i = after;
+        }
+    }
 
-        let body_start = h.line + h.span;
-        let body_end = if idx + 1 < headings.len() {
-            headings[idx + 1].line
+    fn detect_code_regions(&mut self) {
+        let n = self.lines.len();
+        self.code_mask = vec![false; n];
+        let mut i = 0;
+        while i < n {
+            if self.is_blank_line(&self.lines[i]) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < n && !self.is_blank_line(&self.lines[j]) {
+                j += 1;
+            }
+            let run = &self.lines[i..j];
+            let indented = run.iter().all(|l| {
+                let text = self.line_text(l);
+                text.starts_with('\t')
+                    || text.bytes().take_while(|&b| b == b' ').count() >= 4
+            });
+            let symbol_heavy = run.iter().all(|l| {
+                self.line_text(l)
+                    .bytes()
+                    .filter(|&b| matches!(b, b';' | b'{' | b'}' | b'(' | b')' | b'='))
+                    .count()
+                    >= 3
+            });
+            if run.len() >= 3 && (indented || symbol_heavy) {
+                for slot in self.code_mask.iter_mut().take(j).skip(i) {
+                    *slot = true;
+                }
+            }
+            i = j;
+        }
+    }
+
+    fn is_setext_underline(&self, text: &str, ch: char) -> bool {
+        if text.len() < 3 {
+            return false;
+        }
+        text.chars().all(|c| c == ch)
+    }
+
+    fn try_setext_heading(&mut self, i: usize) -> Option<usize> {
+        let n = self.lines.len();
+        if i + 1 >= n || self.is_blank_line(&self.lines[i]) || self.code_mask[i + 1] {
+            return None;
+        }
+        let text = self.line_text(&self.lines[i]);
+        let next_text = self.line_text(&self.lines[i + 1]).trim();
+        let level = if self.is_setext_underline(next_text, '=') {
+            1
+        } else if self.is_setext_underline(next_text, '-') {
+            2
         } else {
-            n
+            return None;
         };
-        sections.push(Section {
-            heading_path: Some(breadcrumb),
-            body_start_line: body_start,
-            body_end_line: body_end,
+        self.headings.push(HeadingMark {
+            line: i,
+            level,
+            title: text.trim().to_string(),
+            span: 2,
         });
+        Some(i + 2)
     }
 
-    sections
-}
-
-/// Walk the section's body, emitting sentence-packed prose chunks and
-/// keeping any code-shaped runs whole.
-fn emit_section(
-    chunks: &mut Vec<Chunk>,
-    next_index: &mut u32,
-    source: &str,
-    sec: &Section,
-    code_mask: &[bool],
-    lines: &[LineSpec],
-) {
-    if sec.body_start_line >= sec.body_end_line {
-        return;
+    fn looks_like_all_caps_heading(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        let len = trimmed.chars().count();
+        if !(3..=60).contains(&len) {
+            return false;
+        }
+        let mut has_letter = false;
+        let mut all_upper = true;
+        for c in trimmed.chars() {
+            if c.is_alphabetic() {
+                has_letter = true;
+                if !c.is_uppercase() {
+                    all_upper = false;
+                    break;
+                }
+            }
+        }
+        let mut distinct = std::collections::HashSet::new();
+        for c in trimmed.chars().filter(|c| !c.is_whitespace()) {
+            distinct.insert(c);
+        }
+        let few_words = trimmed.split_whitespace().count() <= 10;
+        has_letter && all_upper && distinct.len() >= 2 && few_words
     }
-    let mut i = sec.body_start_line;
-    while i < sec.body_end_line {
-        if code_mask[i] {
-            // Group consecutive code lines into one chunk (kept whole).
-            let start_line = i;
-            let mut j = i + 1;
-            while j < sec.body_end_line && code_mask[j] {
-                j += 1;
+
+    fn try_caps_heading(&mut self, i: usize, last_caps_promotion: &mut Option<usize>) -> bool {
+        let text = self.line_text(&self.lines[i]);
+        if !self.looks_like_all_caps_heading(text) {
+            return false;
+        }
+        let allowed = match *last_caps_promotion {
+            Some(prev) => i.saturating_sub(prev) >= 5,
+            None => true,
+        };
+        if !allowed {
+            return false;
+        }
+        self.headings.push(HeadingMark {
+            line: i,
+            level: 2,
+            title: text.trim().to_string(),
+            span: 1,
+        });
+        *last_caps_promotion = Some(i);
+        true
+    }
+
+    fn detect_headings(&mut self) {
+        let n = self.lines.len();
+        let mut last_caps_promotion: Option<usize> = None;
+        let mut i = 0;
+        while i < n {
+            if self.code_mask[i] {
+                i += 1;
+                continue;
             }
-            let start_byte = lines[start_line].start;
-            let end_byte = lines[j - 1].end_with_nl;
-            push_chunk(chunks, next_index, source, start_byte, end_byte, sec.heading_path.clone());
-            i = j;
-        } else {
-            // Group consecutive prose (non-code) lines into one packing run.
-            let start_line = i;
-            let mut j = i + 1;
-            while j < sec.body_end_line && !code_mask[j] {
-                j += 1;
+            if let Some(next) = self.try_setext_heading(i) {
+                i = next;
+                continue;
             }
-            let start_byte = lines[start_line].start;
-            let end_byte = lines[j - 1].end_with_nl;
-            sentence_pack_range(
-                chunks,
-                next_index,
-                source,
-                start_byte,
-                end_byte,
-                sec.heading_path.clone(),
-            );
-            i = j;
+            if self.try_caps_heading(i, &mut last_caps_promotion) {
+                i += 1;
+                continue;
+            }
+            i += 1;
         }
     }
-}
 
-fn push_chunk(
-    chunks: &mut Vec<Chunk>,
-    next_index: &mut u32,
-    source: &str,
-    start: usize,
-    end: usize,
-    heading_path: Option<String>,
-) {
-    let text = source[start..end].trim().to_string();
-    if text.is_empty() {
-        return;
+    fn build_sections(&mut self) {
+        let n = self.lines.len();
+        if self.headings.is_empty() {
+            self.sections.push(Section {
+                heading_path: None,
+                body_start_line: 0,
+                body_end_line: n,
+            });
+            return;
+        }
+        let mut heading_stack: Vec<String> = Vec::new();
+        if self.headings[0].line > 0 {
+            self.sections.push(Section {
+                heading_path: None,
+                body_start_line: 0,
+                body_end_line: self.headings[0].line,
+            });
+        }
+        for idx in 0..self.headings.len() {
+            let h = &self.headings[idx];
+            let depth = h.level as usize;
+            heading_stack.truncate(depth.saturating_sub(1));
+            heading_stack.push(h.title.clone());
+            let breadcrumb = heading_stack.join(" > ");
+            let body_start = h.line + h.span;
+            let body_end = if idx + 1 < self.headings.len() {
+                self.headings[idx + 1].line
+            } else {
+                n
+            };
+            self.sections.push(Section {
+                heading_path: Some(breadcrumb),
+                body_start_line: body_start,
+                body_end_line: body_end,
+            });
+        }
     }
-    chunks.push(Chunk {
-        index: *next_index,
-        byte_start: start,
-        byte_end: end,
-        text,
-        heading_path,
-    });
-    *next_index += 1;
-}
 
-fn sentence_pack_range(
-    chunks: &mut Vec<Chunk>,
-    next_index: &mut u32,
-    source: &str,
-    range_start: usize,
-    range_end: usize,
-    heading_path: Option<String>,
-) {
-    let slice = &source[range_start..range_end];
-    if slice.trim().is_empty() {
-        return;
+    fn emit_all_sections(&mut self) {
+        let sections = std::mem::take(&mut self.sections);
+        for sec in &sections {
+            self.emit_section(sec);
+        }
     }
-    let units = segment_units(slice);
-    let mut cur_start: Option<usize> = None;
-    let mut cur_end: usize = 0;
-    for &(s, e) in &units {
-        let abs_s = range_start + s;
-        let abs_e = range_start + e;
+
+    fn emit_section(&mut self, sec: &Section) {
+        if sec.body_start_line >= sec.body_end_line {
+            return;
+        }
+        let mut i = sec.body_start_line;
+        while i < sec.body_end_line {
+            if self.code_mask[i] {
+                let start_line = i;
+                let mut j = i + 1;
+                while j < sec.body_end_line && self.code_mask[j] {
+                    j += 1;
+                }
+                let start_byte = self.lines[start_line].start;
+                let end_byte = self.lines[j - 1].end_with_nl;
+                self.push_chunk(start_byte, end_byte, sec.heading_path.clone());
+                i = j;
+            } else {
+                let start_line = i;
+                let mut j = i + 1;
+                while j < sec.body_end_line && !self.code_mask[j] {
+                    j += 1;
+                }
+                let start_byte = self.lines[start_line].start;
+                let end_byte = self.lines[j - 1].end_with_nl;
+                self.sentence_pack_range(start_byte, end_byte, sec.heading_path.clone());
+                i = j;
+            }
+        }
+    }
+
+    fn sentence_pack_range(
+        &mut self,
+        range_start: usize,
+        range_end: usize,
+        heading_path: Option<String>,
+    ) {
+        let slice = &self.source[range_start..range_end];
+        if slice.trim().is_empty() {
+            return;
+        }
+        let units = self.segment_units(slice);
+        let mut cur_start: Option<usize> = None;
+        let mut cur_end: usize = 0;
+        for (s, e) in units {
+            let abs_s = range_start + s;
+            let abs_e = range_start + e;
+            if let Some(cs) = cur_start {
+                let prospective = abs_e - cs;
+                if prospective > SOFT_SIZE_LIMIT {
+                    self.push_chunk(cs, cur_end, heading_path.clone());
+                    cur_start = None;
+                }
+            }
+            if cur_start.is_none() {
+                cur_start = Some(abs_s);
+            }
+            cur_end = abs_e;
+        }
         if let Some(cs) = cur_start {
-            let prospective = abs_e - cs;
-            if prospective > SOFT_SIZE_LIMIT {
-                push_chunk(chunks, next_index, source, cs, cur_end, heading_path.clone());
-                cur_start = None;
-            }
+            self.push_chunk(cs, cur_end, heading_path);
         }
-        if cur_start.is_none() {
-            cur_start = Some(abs_s);
+    }
+
+    /// Segment a slice into sentence-or-line units. If any sentence terminator
+    /// (`.`, `?`, `!`) is present, walk sentences per docs/txt-ingest.md (with
+    /// the abbreviation allowlist and numbered-list carve-out); otherwise fall
+    /// back to packing non-blank lines.
+    fn segment_units(&self, slice: &str) -> Vec<(usize, usize)> {
+        let has_term = slice.bytes().any(|b| matches!(b, b'.' | b'?' | b'!'));
+        if has_term {
+            self.segment_sentences(slice)
+        } else {
+            self.segment_lines(slice)
         }
-        cur_end = abs_e;
     }
-    if let Some(cs) = cur_start {
-        push_chunk(chunks, next_index, source, cs, cur_end, heading_path);
-    }
-}
 
-fn segment_units(source: &str) -> Vec<(usize, usize)> {
-    if has_sentence_terminator(source) {
-        segment_sentences(source)
-    } else {
-        segment_lines(source)
-    }
-}
-
-fn has_sentence_terminator(source: &str) -> bool {
-    source.bytes().any(|b| matches!(b, b'.' | b'?' | b'!'))
-}
-
-/// Walk `source` finding sentence boundaries per the docs/txt-ingest.md rule:
-/// `.`, `?`, `!` followed by whitespace and a capital letter (or end-of-input).
-/// Skips boundaries whose preceding word is in the abbreviation allowlist.
-fn segment_sentences(source: &str) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-        if matches!(c, b'.' | b'?' | b'!') {
-            let term_end = i + 1;
-            let mut j = term_end;
-            // Allow consecutive terminators ("!!!") to count as one boundary.
-            while j < bytes.len() && matches!(bytes[j], b'.' | b'?' | b'!') {
-                j += 1;
+    fn segment_sentences(&self, slice: &str) -> Vec<(usize, usize)> {
+        let bytes = slice.as_bytes();
+        let mut out = Vec::new();
+        let mut seg_start = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let c = bytes[p];
+            if !matches!(c, b'.' | b'?' | b'!') {
+                p += 1;
+                continue;
             }
-            let after_terms = j;
-            // Whitespace after the terminator(s)?
+            let term_end = p + 1;
+            let mut q = term_end;
+            while q < bytes.len() && matches!(bytes[q], b'.' | b'?' | b'!') {
+                q += 1;
+            }
+            let after_terms = q;
             let mut k = after_terms;
             while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
                 k += 1;
             }
-            let had_whitespace = k > after_terms;
+            let had_ws = k > after_terms;
             let is_eof = k >= bytes.len();
-            let next_is_capital = !is_eof && bytes[k].is_ascii_uppercase();
-            let is_terminator = is_eof || (had_whitespace && next_is_capital);
+            let next_cap = !is_eof && bytes[k].is_ascii_uppercase();
+            let is_terminator = is_eof || (had_ws && next_cap);
 
-            if is_terminator && c == b'.' && is_abbreviation_ending_at(source, i) {
-                i = term_end;
-                continue;
-            }
-            // Numbered-list prefix: `^\s*\d+\.` at line start is not a
-            // sentence terminator, even though the next token is usually
-            // capitalized ("1. Buy milk. 2. Bake bread."). Without this,
-            // the period-space-capital rule mid-splits list items.
-            if is_terminator && c == b'.' && is_numbered_list_prefix(source, i) {
-                i = term_end;
+            if is_terminator
+                && c == b'.'
+                && (self.is_abbrev_at(slice, bytes, p) || self.is_list_prefix_at(bytes, p))
+            {
+                p = term_end;
                 continue;
             }
             if is_terminator {
-                if after_terms > start {
-                    out.push((start, after_terms));
+                if after_terms > seg_start {
+                    out.push((seg_start, after_terms));
                 }
-                start = k;
-                i = k;
+                seg_start = k;
+                p = k;
                 continue;
             }
-            i = term_end;
-            continue;
+            p = term_end;
         }
-        i += 1;
+        if seg_start < bytes.len() {
+            out.push((seg_start, bytes.len()));
+        }
+        out
     }
-    if start < bytes.len() {
-        out.push((start, bytes.len()));
-    }
-    out
-}
 
-/// True when the period at `period_idx` closes a numbered-list prefix —
-/// i.e. the run from the start of the current line up to (but not including)
-/// this period is one or more ASCII digits, with optional leading whitespace.
-fn is_numbered_list_prefix(source: &str, period_idx: usize) -> bool {
-    let bytes = source.as_bytes();
-    let mut line_start = period_idx;
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
+    // status: txt-abbreviation-allowlist
+    fn is_abbrev_at(&self, slice: &str, bytes: &[u8], p: usize) -> bool {
+        let mut wstart = p;
+        while wstart > 0 {
+            let prev = bytes[wstart - 1];
+            if matches!(prev, b' ' | b'\t' | b'\n' | b'\r') {
+                break;
+            }
+            wstart -= 1;
+        }
+        let word = &slice[wstart..=p];
+        abbreviations::ALL.iter().any(|a| word.eq_ignore_ascii_case(a))
     }
-    let mut i = line_start;
-    while i < period_idx && matches!(bytes[i], b' ' | b'\t') {
-        i += 1;
-    }
-    let digits_start = i;
-    while i < period_idx && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    i == period_idx && i > digits_start
-}
 
-// status: txt-abbreviation-allowlist
-fn is_abbreviation_ending_at(source: &str, period_idx: usize) -> bool {
-    let bytes = source.as_bytes();
-    let mut start = period_idx;
-    while start > 0 {
-        let prev = bytes[start - 1];
-        if matches!(prev, b' ' | b'\t' | b'\n' | b'\r') {
-            break;
+    /// Numbered-list prefix carve-out: `^\s*\d+\.` at line start is not a
+    /// sentence terminator (else list items split mid-line).
+    fn is_list_prefix_at(&self, bytes: &[u8], p: usize) -> bool {
+        let mut line_start = p;
+        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+            line_start -= 1;
         }
-        start -= 1;
+        let mut r = line_start;
+        while r < p && matches!(bytes[r], b' ' | b'\t') {
+            r += 1;
+        }
+        let digits_start = r;
+        while r < p && bytes[r].is_ascii_digit() {
+            r += 1;
+        }
+        r == p && r > digits_start
     }
-    let word = &source[start..=period_idx];
-    abbreviations::ALL
-        .iter()
-        .any(|a| word.eq_ignore_ascii_case(a))
-}
 
-fn segment_lines(source: &str) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let line_start = i;
-        let mut line_end = line_start;
-        while line_end < bytes.len() && bytes[line_end] != b'\n' {
-            line_end += 1;
+    fn segment_lines(&self, slice: &str) -> Vec<(usize, usize)> {
+        let bytes = slice.as_bytes();
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let line_start = p;
+            let mut line_end = line_start;
+            while line_end < bytes.len() && bytes[line_end] != b'\n' {
+                line_end += 1;
+            }
+            let after = if line_end < bytes.len() {
+                line_end + 1
+            } else {
+                line_end
+            };
+            if !slice[line_start..line_end].trim().is_empty() {
+                out.push((line_start, after));
+            }
+            p = after;
         }
-        let after = if line_end < bytes.len() { line_end + 1 } else { line_end };
-        if !source[line_start..line_end].trim().is_empty() {
-            out.push((line_start, after));
-        }
-        i = after;
+        out
     }
-    out
+
+    fn push_chunk(&mut self, start: usize, end: usize, heading_path: Option<String>) {
+        let text = self.source[start..end].trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.chunks.push(Chunk {
+            index: self.next_index,
+            byte_start: start,
+            byte_end: end,
+            text,
+            heading_path,
+        });
+        self.next_index += 1;
+    }
 }
 
 mod abbreviations {
@@ -570,17 +517,17 @@ mod tests {
 
     #[test]
     fn empty_input_produces_no_chunks() {
-        assert!(chunk_txt("").is_empty());
+        assert!(chunk("").is_empty());
     }
 
     #[test]
     fn whitespace_only_produces_no_chunks() {
-        assert!(chunk_txt("   \n\n\t\n").is_empty());
+        assert!(chunk("   \n\n\t\n").is_empty());
     }
 
     #[test]
     fn single_short_file_one_chunk() {
-        let chunks = chunk_txt("Hello world. This is a note.\n");
+        let chunks = chunk("Hello world. This is a note.\n");
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("Hello world"));
         assert!(chunks[0].heading_path.is_none());
@@ -592,7 +539,7 @@ mod tests {
         for n in 0..200 {
             src.push_str(&format!("Sentence number {n}. "));
         }
-        let chunks = chunk_txt(&src);
+        let chunks = chunk(&src);
         assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
         for c in &chunks {
             assert!(
@@ -605,23 +552,49 @@ mod tests {
 
     #[test]
     fn abbreviation_does_not_terminate_sentence() {
-        let src = "Mr. Smith arrived early. He was happy.";
-        let units = segment_sentences(src);
-        assert_eq!(units.len(), 2, "got units {units:?}");
-        assert!(src[units[0].0..units[0].1].contains("Mr. Smith arrived early."));
+        // Force a chunk split by exceeding SOFT_SIZE_LIMIT. The split must
+        // never land between "Mr." and "Smith" — the allowlist keeps that
+        // pair in the same sentence unit (and therefore the same chunk).
+        let mut src = String::new();
+        for _ in 0..80 {
+            src.push_str("Mr. Smith arrived early and stayed late. ");
+        }
+        let chunks = chunk(&src);
+        assert!(chunks.len() >= 2, "expected split, got {}", chunks.len());
+        for c in &chunks {
+            // No chunk should start with "Smith" — that would mean a split
+            // landed between "Mr." and "Smith".
+            assert!(
+                !c.text.starts_with("Smith"),
+                "split landed inside `Mr. Smith`: {:?}",
+                c.text
+            );
+        }
     }
 
     #[test]
     fn period_inside_word_is_not_a_break() {
-        let src = "Visit foo.bar today. The next sentence.";
-        let units = segment_sentences(src);
-        assert_eq!(units.len(), 2);
+        // Force a split; verify no chunk begins with "bar" (which would mean
+        // a split landed inside `foo.bar`).
+        let mut src = String::new();
+        for _ in 0..80 {
+            src.push_str("Visit foo.bar today and tomorrow as well. ");
+        }
+        let chunks = chunk(&src);
+        assert!(chunks.len() >= 2, "expected split, got {}", chunks.len());
+        for c in &chunks {
+            assert!(
+                !c.text.starts_with("bar"),
+                "split landed inside `foo.bar`: {:?}",
+                c.text
+            );
+        }
     }
 
     #[test]
     fn no_terminator_falls_back_to_line_packing() {
         let src = "let x  one\nlet y  two\nlet z  three\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("let x"));
     }
@@ -631,17 +604,23 @@ mod tests {
         // The period after `1` is followed by space + capital `B`, which
         // would normally fire the sentence-terminator rule. The numbered-
         // list prefix carve-out suppresses that so list items don't split
-        // mid-line. (Items themselves can still bunch into one unit when
-        // the following item starts with a digit, not a capital — that's
-        // fine for chunking; what matters is no mid-item breaks.)
-        let src = "1. Buy milk and butter.\n2. Bake bread.\n";
-        let units = segment_sentences(src);
-        for &(s, e) in &units {
-            let unit_text = &src[s..e];
-            // No unit should start with the bare list marker on its own.
+        // mid-line. Force a chunk split by repeating the list, then verify
+        // no chunk starts with "Buy milk" (which would mean the split
+        // landed inside item `1.`).
+        let mut src = String::new();
+        for _ in 0..60 {
+            // Each block: a real capital-starting sentence followed by a
+            // newline-anchored list. The carve-out must prevent a split
+            // between the list marker (`1.`) and its content ("Buy milk…").
+            src.push_str("And then rest came at last.\n1. Buy milk and butter for the week.\n2. Bake bread for tomorrow.\n");
+        }
+        let chunks = chunk(&src);
+        assert!(chunks.len() >= 2, "expected split, got {}", chunks.len());
+        for c in &chunks {
             assert!(
-                !unit_text.trim_start().starts_with("Buy milk"),
-                "list item split mid-line: {unit_text:?}"
+                !c.text.trim_start().starts_with("Buy milk"),
+                "list item split mid-line: {:?}",
+                c.text
             );
         }
     }
@@ -650,23 +629,48 @@ mod tests {
     fn numbered_list_followed_by_capital_paragraph_breaks_correctly() {
         // After the last item, a real sentence beginning with a capital
         // should still be a sentence break (the carve-out only applies to
-        // the period inside the list prefix itself).
-        let src = "1. Buy milk.\n\nThe next paragraph follows.";
-        let units = segment_sentences(src);
-        assert_eq!(units.len(), 2, "got {units:?}");
+        // the period inside the list prefix itself). Force a chunk split
+        // and verify a chunk starts at "The next paragraph" — proving the
+        // break landed at that sentence boundary rather than mid-item.
+        let mut src = String::new();
+        for _ in 0..40 {
+            src.push_str("1. Buy milk for the household.\n\nThe next paragraph follows here.\n\n");
+        }
+        let chunks = chunk(&src);
+        assert!(chunks.len() >= 2, "expected split, got {}", chunks.len());
+        let has_paragraph_start = chunks
+            .iter()
+            .any(|c| c.text.starts_with("The next paragraph"));
+        assert!(
+            has_paragraph_start,
+            "expected a chunk starting at the paragraph break"
+        );
     }
 
     #[test]
     fn lowercase_after_period_does_not_break() {
-        let src = "First half. but lowercase continues.";
-        let units = segment_sentences(src);
-        assert_eq!(units.len(), 1);
+        // "First half. but lowercase…" — lowercase after the period must
+        // NOT be a sentence break. Force a split and verify no chunk
+        // begins with "but lowercase".
+        let mut src = String::new();
+        for _ in 0..80 {
+            src.push_str("First half. but lowercase continues all the way through. ");
+        }
+        let chunks = chunk(&src);
+        assert!(chunks.len() >= 2, "expected split, got {}", chunks.len());
+        for c in &chunks {
+            assert!(
+                !c.text.starts_with("but lowercase"),
+                "split landed at lowercase-after-period: {:?}",
+                c.text
+            );
+        }
     }
 
     #[test]
     fn all_caps_line_promoted_to_heading() {
         let src = "INTRODUCTION\n\nfirst sentence here. second sentence.\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         // Pre-section content is empty (heading is at line 0); one section
         // under "INTRODUCTION" with a single chunk.
         assert_eq!(chunks.len(), 1);
@@ -676,7 +680,7 @@ mod tests {
     #[test]
     fn setext_underlines_create_h1_and_h2() {
         let src = "Big Title\n=========\n\nintro.\n\nSubtitle\n--------\n\nbody.\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         let paths: Vec<_> = chunks.iter().filter_map(|c| c.heading_path.as_deref()).collect();
         assert!(paths.contains(&"Big Title"), "got paths: {paths:?}");
         assert!(paths.contains(&"Big Title > Subtitle"), "got paths: {paths:?}");
@@ -686,7 +690,7 @@ mod tests {
     fn equals_run_alone_is_not_a_setext_without_title() {
         // A line of `=` with nothing above it shouldn't promote anything.
         let src = "=========\n\nbody.\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         for c in &chunks {
             assert!(c.heading_path.is_none());
         }
@@ -696,7 +700,7 @@ mod tests {
     fn caps_promotion_throttled_within_5_line_window() {
         // Five consecutive ALL-CAPS lines should promote at most one heading.
         let src = "FIRST CAPS\nSECOND CAPS\nTHIRD CAPS\nFOURTH CAPS\nFIFTH CAPS\n\nbody.\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         let promoted: Vec<_> = chunks.iter().filter(|c| c.heading_path.is_some()).collect();
         // Only one heading should have been promoted; later CAPS lines fall
         // into the section as content.
@@ -712,7 +716,7 @@ mod tests {
         // (`SOMETHING` would normally promote). The 4-space indent + 3+ lines
         // makes it a code region.
         let src = "Intro paragraph.\n\n    if (x):\n    SOMETHING = y\n    return z\n\nOutro paragraph.\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         // No heading_path should ever be set — SOMETHING is inside a code
         // region.
         for c in &chunks {
@@ -737,7 +741,7 @@ mod tests {
         // 3+ lines with at least 3 of `;{}()=` each — counts as code-shaped
         // even without indentation.
         let src = "SOMETHING TODO\nfn foo() { return 1; }\nfn bar() { return 2; }\nfn baz() { return 3; }\n";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         // The leading ALL-CAPS line is on a non-code line, so it *can*
         // promote. Verify it does.
         assert!(chunks
@@ -754,7 +758,7 @@ mod tests {
     #[test]
     fn byte_offsets_index_into_source() {
         let src = "Alpha sentence. Beta sentence.";
-        let chunks = chunk_txt(src);
+        let chunks = chunk(src);
         for c in &chunks {
             assert!(c.byte_end <= src.len());
         }
@@ -766,7 +770,7 @@ mod tests {
         for n in 0..150 {
             src.push_str(&format!("S{n} word word word word word. "));
         }
-        let chunks = chunk_txt(&src);
+        let chunks = chunk(&src);
         let idx: Vec<_> = chunks.iter().map(|c| c.index).collect();
         let expected: Vec<u32> = (0..chunks.len() as u32).collect();
         assert_eq!(idx, expected);

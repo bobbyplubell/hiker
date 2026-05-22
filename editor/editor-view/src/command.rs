@@ -1,17 +1,25 @@
 //! Default command set. Translates [`InputEvent`]s into [`Transaction`]s and
 //! direct selection / scroll mutations on the [`ViewState`].
 
-use editor_core::{ChangeSet, EditType, EditorState, SelRange, Selection, Transaction};
+use editor_core::change::Set as ChangeSet;
+use editor_core::transaction::EditType;
+
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::SelRange;
+
+use editor_core::selection::Selection;
+
+use editor_core::transaction::Transaction;
 use smol_str::SmolStr;
 
-use crate::completion::{CompletionItem, CompletionKind};
-use crate::snippet::{self, Snippet};
-use crate::event::{
+use crate::autocomplete::{CompletionItem, CompletionKind};
+use crate::snippets::{self, Snippet};
+use crate::events::{
     ImeEvent, InputEvent, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
 };
 use crate::motion::{self, Direction};
 use crate::multicursor;
-use crate::view::{ClickAction, DragState, ViewState};
+use crate::viewport::{ClickAction, DragState, ViewState};
 
 /// Outcome of handling one input event.
 pub enum Action {
@@ -25,29 +33,17 @@ pub enum Action {
     Click(ClickAction),
 }
 
+/// Command-handler context: bundles the immutable editor state and mutable
+/// view state that every command needs. Sub-handlers (key/mouse dispatch,
+/// motion, snippet cycling, etc.) live as methods on this struct so that the
+/// top-level dispatcher stays under the cognitive-complexity budget while
+/// each helper still gets a unique entry point.
+struct Cmd<'a> {
+    state: &'a EditorState,
+    view: &'a mut ViewState,
+}
+
 pub fn handle(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> Action {
-    handle_inner(state, view, event)
-}
-
-/// Apply a transaction, then — if a snippet is active — map the snippet's
-/// anchors through the change and run a mirror sync so the primary cursor's
-/// text is propagated to every mirror span. Returns the final state.
-fn apply_with_snippet(state: &EditorState, view: &mut ViewState, tx: Transaction) -> EditorState {
-    let changes = tx.changes.clone();
-    let after = state.apply(tx);
-    if view.snippet.is_active() {
-        snippet::map_through(&mut view.snippet, &changes);
-        if let Some(sync_tx) = snippet::mirror_sync(&after, &view.snippet) {
-            let sync_changes = sync_tx.changes.clone();
-            let synced = after.apply(sync_tx);
-            snippet::map_through(&mut view.snippet, &sync_changes);
-            return synced;
-        }
-    }
-    after
-}
-
-fn handle_inner(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> Action {
     if view.read_only {
         return match event {
             InputEvent::Mouse(ev) => handle_mouse(state, view, ev),
@@ -77,7 +73,30 @@ fn handle_inner(state: &EditorState, view: &mut ViewState, event: &InputEvent) -
     match event {
         InputEvent::Text(s) => insert_text(state, view, s),
         InputEvent::Key(KeyEvent { key, mods, .. }) => handle_key(state, view, *key, *mods),
-        InputEvent::Ime(ev) => handle_ime(state, view, ev),
+        InputEvent::Ime(ev) => match ev {
+            ImeEvent::Enabled => {
+                view.ime.enabled = true;
+                Action::None
+            }
+            ImeEvent::Disabled => {
+                view.ime.enabled = false;
+                view.ime.clear_preedit();
+                Action::None
+            }
+            ImeEvent::Preedit(text) => {
+                view.ime.preedit = if text.is_empty() { None } else { Some(text.clone()) };
+                Action::None
+            }
+            ImeEvent::Commit(text) => {
+                view.ime.clear_preedit();
+                if text.is_empty() {
+                    Action::None
+                } else {
+                    let tx = state.insert_at_selections(text);
+                    Action::Replace(state.apply(tx))
+                }
+            }
+        },
         InputEvent::Mouse(ev) => handle_mouse(state, view, ev),
         InputEvent::Scroll { delta_y, .. } => {
             scroll_by(view, *delta_y);
@@ -105,18 +124,39 @@ fn handle_inner(state: &EditorState, view: &mut ViewState, event: &InputEvent) -
     }
 }
 
-/// Motion-only key dispatch. Extracted from `handle_key` to keep the
-/// dispatcher's cognitive complexity under the clippy budget.
+/// Apply a transaction, then — if a snippet is active — map the snippet's
+/// anchors through the change and run a mirror sync so the primary cursor's
+/// text is propagated to every mirror span. Returns the final state.
+fn apply_with_snippet(state: &EditorState, view: &mut ViewState, tx: Transaction) -> EditorState {
+    let changes = tx.changes.clone();
+    let after = state.apply(tx);
+    if view.snippet.is_active() {
+        snippets::map_through(&mut view.snippet, &changes);
+        if let Some(sync_tx) = snippets::mirror_sync(&after, &view.snippet) {
+            let sync_changes = sync_tx.changes.clone();
+            let synced = after.apply(sync_tx);
+            snippets::map_through(&mut view.snippet, &sync_changes);
+            return synced;
+        }
+    }
+    after
+}
+
+impl<'a> Cmd<'a> {
+
+/// Motion-only key dispatch. Extracted from the top-level `handle_key` to
+/// keep the dispatcher's cognitive complexity under the clippy budget.
 /// Returns `Some(action)` if the key was a motion key (arrows / page /
 /// home / end / column-cursor add), `None` otherwise.
 fn handle_motion_key(
-    state: &EditorState,
-    view: &mut ViewState,
+    &mut self,
     key: Key,
     mods: Modifiers,
     extend: bool,
     word_jump: bool,
 ) -> Option<Action> {
+    let state = self.state;
+    let view = &mut *self.view;
     use Direction::*;
     let action = match key {
         Key::Named(NamedKey::ArrowUp) if mods.alt && mods.primary() => {
@@ -188,6 +228,8 @@ fn handle_motion_key(
     Some(action)
 }
 
+}
+
 fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifiers) -> Action {
     view.touch();
     view.ime.clear_preedit();
@@ -197,7 +239,7 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
     // Search panel keybindings. Cmd-F / Ctrl-F always opens. While the panel
     // is active, Enter / Shift-Enter / Escape are intercepted for match
     // navigation and dismissal BEFORE any other handler.
-    if let Some(action) = handle_search_key(view, key, mods) {
+    if let Some(action) = (Cmd { state, view }).handle_search_key(key, mods) {
         return action;
     }
 
@@ -205,13 +247,13 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
     // expansion is active. Must run BEFORE the existing Tab indent path
     // and before completion handling so the user's Tab advances the stop.
     if view.snippet.is_active() {
-        if let Some(action) = handle_snippet_key(state, view, key, mods) {
+        if let Some(action) = (Cmd { state, view }).handle_snippet_key(key, mods) {
             return action;
         }
     }
 
     if view.completion.active {
-        if let Some(action) = handle_completion_key(state, view, key, mods) {
+        if let Some(action) = (Cmd { state, view }).handle_completion_key(key, mods) {
             return action;
         }
     }
@@ -223,7 +265,7 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
     // We use `alt` here for word boundaries — most platforms accept it.
     let word_jump = mods.alt;
 
-    if let Some(action) = handle_motion_key(state, view, key, mods, extend, word_jump) {
+    if let Some(action) = (Cmd { state, view }).handle_motion_key(key, mods, extend, word_jump) {
         return action;
     }
 
@@ -233,7 +275,7 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
             Action::Replace(apply_with_snippet(state, view, tx))
         }
         Key::Named(NamedKey::Delete) => {
-            let tx = delete_forward(state);
+            let tx = (Cmd { state, view }).delete_forward();
             Action::Replace(apply_with_snippet(state, view, tx))
         }
         Key::Named(NamedKey::Enter) if mods.is_empty() => {
@@ -245,9 +287,9 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
             insert_text(state, view, "\n")
         }
         Key::Named(NamedKey::Enter) if mods.shift => insert_text(state, view, "\n"),
-        Key::Named(NamedKey::Tab) if mods.is_empty() => indent_tab(state, view),
+        Key::Named(NamedKey::Tab) if mods.is_empty() => (Cmd { state, view }).indent_tab(),
         Key::Named(NamedKey::Tab) if mods.shift && !mods.primary() && !mods.alt => {
-            shift_tab_outdent(state, view)
+            (Cmd { state, view }).shift_tab_outdent()
         }
         // Note: don't handle plain Space here. egui emits BOTH a Key
         // event and a Text(" ") event for one physical space press; the
@@ -288,7 +330,7 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
         // Escape collapses to the main cursor.
         Key::Named(NamedKey::Escape) => {
             let main = state.selection.main().head.offset();
-            let sel = editor_core::Selection::single(main);
+            let sel = editor_core::selection::Selection::single(main);
             Action::Replace(apply_selection(state, sel))
         }
         _ => Action::None,
@@ -306,23 +348,23 @@ fn insert_text(state: &EditorState, view: &mut ViewState, s: &str) -> Action {
     // First: if we're typing a close char right before an auto-inserted close,
     // skip over it instead of inserting a duplicate.
     if s.chars().count() == 1
-        && state.selection.ranges().iter().all(|r| r.is_empty())
+        && state.selection.ranges().iter().all(editor_core::selection::SelRange::is_empty)
     {
-        if let Some(tx) = crate::autopair::autopair_skip(state, saved_skip, s) {
+        if let Some(tx) = crate::pairs::autopair_skip(state, saved_skip, s) {
             return Action::Replace(apply_with_snippet(state, view, tx));
         }
     }
 
     // Auto-pair: only when typing a single char and no selection text.
     if s.chars().count() == 1
-        && state.selection.ranges().iter().all(|r| r.is_empty())
+        && state.selection.ranges().iter().all(editor_core::selection::SelRange::is_empty)
     {
-        if let Some(tx) = crate::autopair::autopair_transform(state, s) {
+        if let Some(tx) = crate::pairs::autopair_transform(state, s) {
             let new_state = apply_with_snippet(state, view, tx);
             // Record the skip marker: cursor is between open and close, so the
             // close char ends one char-len past the cursor.
             if let Some(first) = s.chars().next() {
-                if let Some(pair) = crate::autopair::DEFAULT_PAIRS
+                if let Some(pair) = crate::pairs::DEFAULT_PAIRS
                     .iter()
                     .find(|p| p.open == first)
                 {
@@ -388,11 +430,14 @@ fn gather_matches(state: &EditorState, view: &ViewState, pos: usize) -> Vec<Comp
     out
 }
 
+impl<'a> Cmd<'a> {
+
 /// Search-panel key interception. Cmd-F / Ctrl-F opens the panel. When the
 /// panel is active, Enter advances to the next match, Shift-Enter to the
 /// previous, and Escape closes. Returns `Some(Action::None)` when the key was
 /// consumed; `None` to fall through to other handlers.
-fn handle_search_key(view: &mut ViewState, key: Key, mods: Modifiers) -> Option<Action> {
+fn handle_search_key(&mut self, key: Key, mods: Modifiers) -> Option<Action> {
+    let view = &mut *self.view;
     if matches!(key, Key::Char('f') | Key::Char('F')) && mods.primary_only() {
         view.search.open();
         return Some(Action::None);
@@ -420,11 +465,12 @@ fn handle_search_key(view: &mut ViewState, key: Key, mods: Modifiers) -> Option<
 /// Handle a key while the completion popup is open. Returns `Some(action)`
 /// if the key was consumed; `None` to fall through to normal handling.
 fn handle_completion_key(
-    state: &EditorState,
-    view: &mut ViewState,
+    &mut self,
     key: Key,
     mods: Modifiers,
 ) -> Option<Action> {
+    let state = self.state;
+    let view = &mut *self.view;
     if !mods.is_empty() && !mods.shift {
         // Allow modifier-laden keys (shortcuts) to fall through.
         return None;
@@ -443,7 +489,7 @@ fn handle_completion_key(
             Some(Action::None)
         }
         Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-            Some(commit_completion(state, view))
+            Some((Cmd { state, view }).commit_completion())
         }
         Key::Named(NamedKey::Backspace) => {
             if view.completion.query.is_empty() {
@@ -469,7 +515,9 @@ fn handle_completion_key(
     }
 }
 
-fn commit_completion(state: &EditorState, view: &mut ViewState) -> Action {
+fn commit_completion(&mut self) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     let item = match view.completion.selected_item().cloned() {
         Some(it) => it,
         None => {
@@ -498,6 +546,8 @@ fn commit_completion(state: &EditorState, view: &mut ViewState) -> Action {
     Action::Replace(state.apply(tx))
 }
 
+}
+
 /// Apply a snippet expansion: build the insert transaction, then set the
 /// selection to the first stop's mirror spans and store the cycling state.
 pub fn expand_snippet(
@@ -512,7 +562,7 @@ pub fn expand_snippet(
     let after = state.apply(tx);
     // Anchors were built against positions in the new doc, so no mapping needed.
     let _ = changes;
-    let sel = snippet::selection_for_stop(&snip_state, 0)
+    let sel = snippets::selection_for_stop(&snip_state, 0)
         .unwrap_or_else(|| Selection::single(pos + snip.text().len()));
     let with_sel = Transaction::new(ChangeSet::empty(after.doc.len_bytes())).with_selection(sel);
     let after = after.apply(with_sel);
@@ -524,35 +574,40 @@ pub fn expand_snippet(
     Action::Replace(after)
 }
 
+impl<'a> Cmd<'a> {
+
 /// Snippet key handling. Returns `Some(action)` if the key was consumed.
 fn handle_snippet_key(
-    state: &EditorState,
-    view: &mut ViewState,
+    &mut self,
     key: Key,
     mods: Modifiers,
 ) -> Option<Action> {
+    let state = self.state;
+    let view = &mut *self.view;
     match key {
         Key::Named(NamedKey::Escape) if mods.is_empty() => {
             view.snippet.cancel();
             Some(Action::None)
         }
         Key::Named(NamedKey::Tab) if mods.is_empty() => {
-            Some(advance_snippet(state, view, 1))
+            Some((Cmd { state, view }).advance_snippet(1))
         }
         Key::Named(NamedKey::Tab) if mods.shift && !mods.primary() && !mods.alt => {
-            Some(advance_snippet(state, view, -1))
+            Some((Cmd { state, view }).advance_snippet(-1))
         }
         _ => None,
     }
 }
 
-fn advance_snippet(state: &EditorState, view: &mut ViewState, delta: i32) -> Action {
+fn advance_snippet(&mut self, delta: i32) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     // First, sync any mirrors at the *current* stop into the doc before moving.
     let mut working = state.clone();
-    if let Some(tx) = snippet::mirror_sync(&working, &view.snippet) {
+    if let Some(tx) = snippets::mirror_sync(&working, &view.snippet) {
         let changes = tx.changes.clone();
         working = working.apply(tx);
-        snippet::map_through(&mut view.snippet, &changes);
+        snippets::map_through(&mut view.snippet, &changes);
     }
     let n = view.snippet.stops.len() as i32;
     if n == 0 {
@@ -566,7 +621,7 @@ fn advance_snippet(state: &EditorState, view: &mut ViewState, delta: i32) -> Act
         return Action::Replace(working);
     }
     view.snippet.current = next as usize;
-    let sel = match snippet::selection_for_stop(&view.snippet, view.snippet.current) {
+    let sel = match snippets::selection_for_stop(&view.snippet, view.snippet.current) {
         Some(s) => s,
         None => {
             view.snippet.cancel();
@@ -580,13 +635,15 @@ fn advance_snippet(state: &EditorState, view: &mut ViewState, delta: i32) -> Act
 /// Tab: insert 4 spaces at every caret. SPEC §9.14 leaves the smarter
 /// "indent the entire selected block" for a future revision; the v1 rule is
 /// "insert 4 spaces at the caret" regardless of column.
-fn indent_tab(state: &EditorState, view: &mut ViewState) -> Action {
-    insert_text(state, view, "    ")
+fn indent_tab(&mut self) -> Action {
+    insert_text(self.state, self.view, "    ")
 }
 
 /// Shift-Tab: for every line that intersects the selection, remove up to 4
 /// leading whitespace bytes (spaces, or a single leading tab counted as 4).
-fn shift_tab_outdent(state: &EditorState, view: &mut ViewState) -> Action {
+fn shift_tab_outdent(&mut self) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     view.touch();
     let mut touched_lines = std::collections::BTreeSet::new();
     for r in state.selection.ranges().iter() {
@@ -626,7 +683,8 @@ fn shift_tab_outdent(state: &EditorState, view: &mut ViewState) -> Action {
     Action::Replace(state.apply(tx))
 }
 
-fn delete_forward(state: &EditorState) -> Transaction {
+fn delete_forward(&self) -> Transaction {
+    let state = self.state;
     let mut edits: Vec<(std::ops::Range<usize>, String)> = state
         .selection
         .ranges()
@@ -649,6 +707,8 @@ fn delete_forward(state: &EditorState) -> Transaction {
     edits.dedup_by_key(|(r, _)| r.clone());
     let changes = ChangeSet::of(state.doc.len_bytes(), edits);
     Transaction::new(changes).with_edit_type(EditType::Delete)
+}
+
 }
 
 fn copy_selection(state: &EditorState) -> Action {
@@ -679,33 +739,6 @@ fn apply_selection(state: &EditorState, sel: Selection) -> EditorState {
     state.apply(tx)
 }
 
-fn handle_ime(state: &EditorState, view: &mut ViewState, ev: &ImeEvent) -> Action {
-    match ev {
-        ImeEvent::Enabled => {
-            view.ime.enabled = true;
-            Action::None
-        }
-        ImeEvent::Disabled => {
-            view.ime.enabled = false;
-            view.ime.clear_preedit();
-            Action::None
-        }
-        ImeEvent::Preedit(text) => {
-            view.ime.preedit = if text.is_empty() { None } else { Some(text.clone()) };
-            Action::None
-        }
-        ImeEvent::Commit(text) => {
-            view.ime.clear_preedit();
-            if text.is_empty() {
-                Action::None
-            } else {
-                let tx = state.insert_at_selections(text);
-                Action::Replace(state.apply(tx))
-            }
-        }
-    }
-}
-
 fn handle_mouse(state: &EditorState, view: &mut ViewState, ev: &MouseEvent) -> Action {
     handle_mouse_with_mods(state, view, ev, Modifiers::default())
 }
@@ -718,26 +751,29 @@ pub fn handle_mouse_with_mods(
 ) -> Action {
     match ev {
         MouseEvent::Down { button: MouseButton::Left, x, y, click_count } => {
-            mouse_down(state, view, *x, *y, *click_count, mods)
+            (Cmd { state, view }).mouse_down(*x, *y, *click_count, mods)
         }
         MouseEvent::Drag { x, y, button: MouseButton::Left } => {
-            mouse_drag(state, view, *x, *y)
+            (Cmd { state, view }).mouse_drag(*x, *y)
         }
         MouseEvent::Up { button: MouseButton::Left, x, y } => {
-            mouse_up(state, view, *x, *y)
+            (Cmd { state, view }).mouse_up(*x, *y)
         }
         _ => Action::None,
     }
 }
 
+impl<'a> Cmd<'a> {
+
 fn mouse_down(
-    state: &EditorState,
-    view: &mut ViewState,
+    &mut self,
     x: f32,
     y: f32,
     click_count: u8,
     mods: Modifiers,
 ) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     view.touch();
     // Check for a clickable decoration first.
     if let Some(zone) = view.click_zones.iter().find(|z| z.rect.contains(x, y)) {
@@ -778,8 +814,32 @@ fn mouse_down(
 
     view.drag = DragState::MaybeSelecting { anchor: pos };
     let sel = match click_count {
-        2 => select_word_at(state, pos),
-        3 => select_line_at(state, pos),
+        2 => {
+            use unicode_segmentation::UnicodeSegmentation;
+            let line = state.doc.byte_to_line(pos);
+            let line_start = state.doc.line_to_byte(line);
+            let text = state.doc.line_str(line);
+            let local = pos - line_start;
+            let mut sel = Selection::single(pos);
+            for (i, w) in text.unicode_word_indices() {
+                let end = i + w.len();
+                if local >= i && local <= end {
+                    sel = Selection::from_range(SelRange::new(line_start + i, line_start + end));
+                    break;
+                }
+            }
+            sel
+        }
+        3 => {
+            let line = state.doc.byte_to_line(pos);
+            let line_start = state.doc.line_to_byte(line);
+            let line_end = if line + 1 < state.doc.len_lines() {
+                state.doc.line_to_byte(line + 1)
+            } else {
+                state.doc.len_bytes()
+            };
+            Selection::from_range(SelRange::new(line_start, line_end))
+        }
         _ if mods.alt || (mods.primary() && !mods.shift) => {
             multicursor::add_cursor(state, pos)
         }
@@ -792,7 +852,9 @@ fn mouse_down(
     Action::Replace(apply_selection(state, sel))
 }
 
-fn mouse_drag(state: &EditorState, view: &mut ViewState, x: f32, y: f32) -> Action {
+fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     match view.drag {
         DragState::MaybeSelecting { anchor } => {
             view.touch();
@@ -818,52 +880,42 @@ fn mouse_drag(state: &EditorState, view: &mut ViewState, x: f32, y: f32) -> Acti
         }
         DragState::RectangleSelecting { start_xy } => {
             view.touch();
-            let sel = compute_rectangle_selection(state, view, start_xy, (x, y));
+            // Build a multi-range Selection covering one SelRange per buffer
+            // line intersecting the vertical span `[start_xy.1, y]`, each
+            // spanning from x→byte(min_x) to x→byte(max_x) on its own line.
+            // The main range is the line the pointer is currently on.
+            let (sx, sy) = start_xy;
+            let (cx, cy) = (x, y);
+            let y_lo = sy.min(cy);
+            let y_hi = sy.max(cy);
+            let x_lo = sx.min(cx);
+            let x_hi = sx.max(cx);
+            let line_lo = view
+                .height_map
+                .line_at_y(y_lo + view.scroll_y)
+                .min(state.doc.len_lines().saturating_sub(1));
+            let line_hi = view
+                .height_map
+                .line_at_y(y_hi + view.scroll_y)
+                .min(state.doc.len_lines().saturating_sub(1));
+            let mut ranges: Vec<SelRange> = Vec::with_capacity(line_hi - line_lo + 1);
+            for line in line_lo..=line_hi {
+                let a = view_to_buffer_at_line(state, view, x_lo, line);
+                let b = view_to_buffer_at_line(state, view, x_hi, line);
+                ranges.push(SelRange::new(a, b));
+            }
+            let cur_line = view
+                .height_map
+                .line_at_y(cy + view.scroll_y)
+                .min(state.doc.len_lines().saturating_sub(1));
+            let main = cur_line.saturating_sub(line_lo).min(ranges.len() - 1);
+            let sel = Selection::from_ranges(ranges, main);
             Action::Replace(apply_selection(state, sel))
         }
         DragState::Idle => Action::None,
     }
 }
 
-/// Build a multi-range Selection covering one SelRange per buffer line
-/// intersecting the vertical span `[start_xy.1, cur_xy.1]`, each spanning
-/// from x→byte(min_x) to x→byte(max_x) on its own line. The main range
-/// is the last one (the line the pointer is currently on, clamped).
-fn compute_rectangle_selection(
-    state: &EditorState,
-    view: &ViewState,
-    start_xy: (f32, f32),
-    cur_xy: (f32, f32),
-) -> Selection {
-    let (sx, sy) = start_xy;
-    let (cx, cy) = cur_xy;
-    let y_lo = sy.min(cy);
-    let y_hi = sy.max(cy);
-    let x_lo = sx.min(cx);
-    let x_hi = sx.max(cx);
-
-    let line_lo = view
-        .height_map
-        .line_at_y(y_lo + view.scroll_y)
-        .min(state.doc.len_lines().saturating_sub(1));
-    let line_hi = view
-        .height_map
-        .line_at_y(y_hi + view.scroll_y)
-        .min(state.doc.len_lines().saturating_sub(1));
-
-    let mut ranges: Vec<SelRange> = Vec::with_capacity(line_hi - line_lo + 1);
-    for line in line_lo..=line_hi {
-        let a = view_to_buffer_at_line(state, view, x_lo, line);
-        let b = view_to_buffer_at_line(state, view, x_hi, line);
-        ranges.push(SelRange::new(a, b));
-    }
-    // Main range = the line under the current pointer.
-    let cur_line = view
-        .height_map
-        .line_at_y(cy + view.scroll_y)
-        .min(state.doc.len_lines().saturating_sub(1));
-    let main = cur_line.saturating_sub(line_lo).min(ranges.len() - 1);
-    Selection::from_ranges(ranges, main)
 }
 
 /// Map a widget-local `x` to a byte offset on buffer `line`. Mirrors
@@ -889,16 +941,49 @@ pub fn view_to_buffer_at_line(
         if i == col {
             return line_start + b;
         }
-        byte = b + text_no_nl[b..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        byte = b + text_no_nl[b..].chars().next().map(char::len_utf8).unwrap_or(0);
     }
     line_start + byte
 }
 
-fn mouse_up(state: &EditorState, view: &mut ViewState, x: f32, y: f32) -> Action {
+impl<'a> Cmd<'a> {
+
+fn mouse_up(&mut self, x: f32, y: f32) -> Action {
+    let state = self.state;
+    let view = &mut *self.view;
     let prev = view.drag;
     view.drag = DragState::Idle;
     match prev {
-        DragState::DraggingSelection { drop_caret } => finish_text_drag(state, view, drop_caret),
+        DragState::DraggingSelection { drop_caret } => {
+            // Apply a text drag: remove the main selection range and
+            // reinsert it at `drop_caret`. If the drop falls inside the
+            // original range, cancel.
+            let src = state.selection.main().range();
+            if drop_caret >= src.start && drop_caret <= src.end {
+                view.touch();
+                return Action::None;
+            }
+            let text = state.doc.slice(src.clone()).to_string();
+            let len = text.len();
+            let mut edits: Vec<(std::ops::Range<usize>, String)> = if drop_caret > src.end {
+                vec![(drop_caret..drop_caret, text), (src.clone(), String::new())]
+            } else {
+                vec![(src.clone(), String::new()), (drop_caret..drop_caret, text)]
+            };
+            edits.sort_by_key(|(r, _)| r.start);
+            let changes = ChangeSet::of(state.doc.len_bytes(), edits);
+            let new_start = if drop_caret > src.end {
+                drop_caret - (src.end - src.start)
+            } else {
+                drop_caret
+            };
+            let new_sel = Selection::from_range(SelRange::new(new_start, new_start + len));
+            let tx = Transaction::new(changes)
+                .with_edit_type(EditType::Other)
+                .with_selection(new_sel);
+            view.touch();
+            Action::Replace(state.apply(tx))
+        }
         DragState::MaybeDraggingSelection { .. } => {
             // No drag occurred — treat as a plain click: collapse the
             // selection to a single caret at the clicked position.
@@ -910,35 +995,6 @@ fn mouse_up(state: &EditorState, view: &mut ViewState, x: f32, y: f32) -> Action
     }
 }
 
-/// Apply a text drag: remove the main selection range and reinsert it at
-/// `drop_caret`. If the drop falls inside the original range, cancel.
-fn finish_text_drag(state: &EditorState, view: &mut ViewState, drop_caret: usize) -> Action {
-    let src = state.selection.main().range();
-    if drop_caret >= src.start && drop_caret <= src.end {
-        // Drop landed inside the original selection — cancel.
-        view.touch();
-        return Action::None;
-    }
-    let text = state.doc.slice(src.clone()).to_string();
-    let len = text.len();
-    let mut edits: Vec<(std::ops::Range<usize>, String)> = if drop_caret > src.end {
-        vec![(drop_caret..drop_caret, text), (src.clone(), String::new())]
-    } else {
-        // drop_caret < src.start
-        vec![(src.clone(), String::new()), (drop_caret..drop_caret, text)]
-    };
-    edits.sort_by_key(|(r, _)| r.start);
-    // The ChangeSet builder expects edits in ascending order; the above
-    // ordering is for our own bookkeeping. Apply via ChangeSet::of.
-    let changes = ChangeSet::of(state.doc.len_bytes(), edits);
-    // Final selection covers the moved text at its new location.
-    let new_start = if drop_caret > src.end { drop_caret - (src.end - src.start) } else { drop_caret };
-    let new_sel = Selection::from_range(SelRange::new(new_start, new_start + len));
-    let tx = Transaction::new(changes)
-        .with_edit_type(EditType::Other)
-        .with_selection(new_sel);
-    view.touch();
-    Action::Replace(state.apply(tx))
 }
 
 fn pos_in_any_nonempty_range(state: &EditorState, pos: usize) -> bool {
@@ -1001,40 +1057,14 @@ pub fn view_to_buffer(state: &EditorState, view: &ViewState, x: f32, y: f32) -> 
         if i == col {
             return line_start + vline_start_byte + b;
         }
-        byte = b + vline_text[b..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        byte = b + vline_text[b..].chars().next().map(char::len_utf8).unwrap_or(0);
     }
     line_start + vline_start_byte + byte
-}
-
-fn select_word_at(state: &EditorState, pos: usize) -> Selection {
-    let line = state.doc.byte_to_line(pos);
-    let line_start = state.doc.line_to_byte(line);
-    let text = state.doc.line_str(line);
-    let local = pos - line_start;
-    use unicode_segmentation::UnicodeSegmentation;
-    for (i, w) in text.unicode_word_indices() {
-        let end = i + w.len();
-        if local >= i && local <= end {
-            return Selection::from_range(SelRange::new(line_start + i, line_start + end));
-        }
-    }
-    Selection::single(pos)
-}
-
-fn select_line_at(state: &EditorState, pos: usize) -> Selection {
-    let line = state.doc.byte_to_line(pos);
-    let start = state.doc.line_to_byte(line);
-    let end = if line + 1 < state.doc.len_lines() {
-        state.doc.line_to_byte(line + 1)
-    } else {
-        state.doc.len_bytes()
-    };
-    Selection::from_range(SelRange::new(start, end))
 }
 
 /// Helper exposed for backends that need to construct text-insertion actions
 /// directly (e.g. on receipt of platform `Text` events that arrive separately
 /// from key events).
-pub fn insert_smol(state: &EditorState, view: &mut ViewState, s: SmolStr) -> Action {
-    insert_text(state, view, &s)
+pub fn insert_smol(state: &EditorState, view: &mut ViewState, s: &SmolStr) -> Action {
+    insert_text(state, view, s)
 }

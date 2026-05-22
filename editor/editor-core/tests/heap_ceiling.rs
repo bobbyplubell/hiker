@@ -1,6 +1,6 @@
 //! Counting-allocator regression for the editor's history-tree path.
 //!
-//! Drives a long stream of small transactions through `EditorState::apply`
+//! Drives a long stream of small transactions through `Editor::apply`
 //! and asserts the process heap stays under a hard ceiling. Without the
 //! `MAX_REVISIONS` compaction in `history.rs`, this test would grow
 //! linearly with keystroke count and trip the ceiling.
@@ -8,8 +8,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use editor_core::change::ChangeSet;
-use editor_core::state::EditorState;
+use editor_core::change::Set;
+use editor_core::state::Editor;
 use editor_core::transaction::Transaction;
 
 // ---- Counting allocator -------------------------------------------------
@@ -54,14 +54,11 @@ fn cur() -> usize {
 fn pk() -> usize {
     PEAK.load(Ordering::Relaxed)
 }
-fn reset_peak_to_current() {
-    PEAK.store(cur(), Ordering::Relaxed);
-}
 
 // ---- Test ---------------------------------------------------------------
 
 /// 10000 single-character inserts. Without history compaction this
-/// would retain 10000 Revisions (each ~200 B + ChangeSet payload),
+/// would retain 10000 Revisions (each ~200 B + Set payload),
 /// O(N²) clone cost in `apply`, and peak heap proportional to the
 /// product. With compaction, peak stays bounded by `MAX_REVISIONS`
 /// (~2000 revisions ≈ low single-digit MB).
@@ -70,8 +67,8 @@ const ITERATIONS: usize = 10_000;
 
 #[test]
 fn editor_apply_stream_stays_under_ceiling() {
-    let mut state = EditorState::new("seed\n");
-    reset_peak_to_current();
+    let mut state = Editor::new("seed\n");
+    PEAK.store(cur(), Ordering::Relaxed);
     let baseline_peak = pk();
     let baseline = cur();
 
@@ -81,7 +78,7 @@ fn editor_apply_stream_stays_under_ceiling() {
         // revision (which would defeat the test).
         let ch = (b'a' + (i % 26) as u8) as char;
         let pos = state.doc.len_bytes();
-        let changes = ChangeSet::of(pos, vec![(pos..pos, ch.to_string())]);
+        let changes = Set::of(pos, vec![(pos..pos, ch.to_string())]);
         let tx = Transaction::new(changes);
         state = state.apply(tx);
     }

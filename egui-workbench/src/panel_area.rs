@@ -1,7 +1,7 @@
 //! Panel area — bottom-docked tabbed surface for tool panels.
 //!
 //! Structurally identical to [`crate::EditorArea`] (it owns a tabbed
-//! `egui_tiles::Tree<TabHandle>` + payload map), but visually distinct:
+//! `egui_tiles::Tree<TabId>` + payload map), but visually distinct:
 //! it has its own visibility, maximize, and height state, and the
 //! workbench renders it inside a bottom `TopBottomPanel` rather than
 //! the central panel. All tabbed-area behaviour is shared by composing
@@ -9,12 +9,12 @@
 //! handful of operations the workspace needs.
 
 use crate::editor_area::EditorArea;
-use crate::handle::TabHandle;
-use crate::tab::{DocumentTab, TabState};
+use crate::workspace::TabId;
+use crate::tab::{Document, State};
 
 /// Bottom panel area. Adds visible / maximized / height chrome on top
 /// of the shared tabbed-area surface ([`EditorArea`]).
-pub struct PanelArea<Tab: DocumentTab> {
+pub struct PanelArea<Tab: Document> {
     pub visible: bool,
     /// When `true`, the panel area expands to consume the whole central
     /// region. Editor area is hidden until restored.
@@ -27,7 +27,7 @@ pub struct PanelArea<Tab: DocumentTab> {
     pub(crate) inner: EditorArea<Tab>,
 }
 
-impl<Tab: DocumentTab> Default for PanelArea<Tab> {
+impl<Tab: Document> Default for PanelArea<Tab> {
     fn default() -> Self {
         Self {
             visible: false,
@@ -38,12 +38,12 @@ impl<Tab: DocumentTab> Default for PanelArea<Tab> {
     }
 }
 
-impl<Tab: DocumentTab> PanelArea<Tab> {
+impl<Tab: Document> PanelArea<Tab> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn toggle(&mut self) {
+    pub const fn toggle(&mut self) {
         self.visible = !self.visible;
     }
 
@@ -55,11 +55,11 @@ impl<Tab: DocumentTab> PanelArea<Tab> {
         self.inner.tab_count() == 0
     }
 
-    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabHandle, &Tab)> {
+    pub fn iter_tabs(&self) -> impl Iterator<Item = (TabId, &Tab)> {
         self.inner.iter_tabs()
     }
 
-    pub fn state(&self, handle: TabHandle) -> Option<TabState> {
+    pub fn state(&self, handle: TabId) -> Option<State> {
         self.inner.state(handle)
     }
 }

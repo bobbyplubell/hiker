@@ -1,6 +1,6 @@
 //! Indexer detail tab: model id, live status, reindex, progress log.
 //!
-//! Renders state pulled from `AppState::indexer` (the live `IndexerHandle`)
+//! Renders state pulled from `AppState::indexer` (the live `Handle`)
 //! plus the per-session ring buffer of progress events that
 //! `main::drain_indexer_events` feeds from the indexer's broadcast channel.
 
@@ -66,7 +66,7 @@ pub fn show(
 
     ui.add_space(8.0);
 
-    // Reindex button — `IndexerHandle::full_scan()` is the public method
+    // Reindex button — `Handle::full_scan()` is the public method
     // for kicking off a vault-wide re-embed pass.
     let mut reindex_clicked = false;
     if ui

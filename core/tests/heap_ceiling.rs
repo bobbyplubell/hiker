@@ -16,13 +16,12 @@
 //! global allocator doesn't leak into other tests.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use hiker_core::embed::{Embedder, MockEmbedder};
-use hiker_core::indexer::{IndexJob, start_indexer};
+use hiker_core::indexer::{IndexJob, start};
 use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 
@@ -71,11 +70,6 @@ fn current() -> usize {
 fn peak() -> usize {
     PEAK_BYTES.load(Ordering::Relaxed)
 }
-fn reset_peak_to_current() {
-    let cur = current();
-    PEAK_BYTES.store(cur, Ordering::Relaxed);
-}
-
 // ---- Synthetic vault ----------------------------------------------------
 
 /// Number of synthetic markdown files to write. Large enough to exercise
@@ -98,18 +92,6 @@ const FILE_BODY_BYTES: usize = 4 * 1024;
 /// a why-comment.
 const PEAK_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
-fn build_synthetic_vault(root: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(root)?;
-    let body: String = "lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-        .repeat(FILE_BODY_BYTES / 56);
-    for i in 0..VAULT_FILES {
-        let path = root.join(format!("note-{i:04}.md"));
-        let content = format!("# Note {i}\n\n{body}\n");
-        std::fs::write(&path, content)?;
-    }
-    Ok(())
-}
-
 // ---- The test ------------------------------------------------------------
 
 /// Catches regressions that grow heap proportional to vault size *after*
@@ -119,10 +101,16 @@ fn build_synthetic_vault(root: &Path) -> std::io::Result<()> {
 #[test]
 fn indexer_full_scan_stays_under_ceiling() {
     // Use a temp dir under the system tmp so the run cleans up.
+    // Random suffix (cheap hasher) to avoid collisions when the same
+    // PID re-runs the suite.
+    use std::hash::{BuildHasher, Hasher};
+    let rand_suffix: u64 = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
     let tmp = std::env::temp_dir().join(format!(
         "hiker-heap-ceiling-{}-{}",
         std::process::id(),
-        rand_suffix(),
+        rand_suffix,
     ));
     let vault_root = tmp.join("vault");
     let db_dir = tmp.join("db");
@@ -130,7 +118,17 @@ fn indexer_full_scan_stays_under_ceiling() {
     std::fs::create_dir_all(&db_dir).unwrap();
     let cleanup = TempCleanup(tmp.clone());
 
-    build_synthetic_vault(&vault_root).expect("write synthetic vault");
+    // Build the synthetic vault inline. Large enough to exercise the
+    // per-file pipeline many times so a per-file leak shows up.
+    {
+        let body: String = "lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+            .repeat(FILE_BODY_BYTES / 56);
+        for i in 0..VAULT_FILES {
+            let path = vault_root.join(format!("note-{i:04}.md"));
+            let content = format!("# Note {i}\n\n{body}\n");
+            std::fs::write(&path, content).expect("write synthetic vault");
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -143,11 +141,11 @@ fn indexer_full_scan_stays_under_ceiling() {
 
         // Re-baseline the peak after setup so the assertion measures
         // the *indexer's* peak, not the test harness fixture cost.
-        reset_peak_to_current();
+        PEAK_BYTES.store(current(), Ordering::Relaxed);
         let baseline = current();
         let baseline_peak = peak();
 
-        let handle = start_indexer(vault, store, || {
+        let handle = start(vault, store, || {
             Ok(Arc::new(MockEmbedder::new("ceiling-mock")) as Arc<dyn Embedder>)
         });
         handle
@@ -209,9 +207,3 @@ impl Drop for TempCleanup {
     }
 }
 
-fn rand_suffix() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
-}

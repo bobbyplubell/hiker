@@ -27,7 +27,9 @@ use crate::state::AppState;
 /// - no TextEdit / editor focus (we don't want to steal scroll from a
 ///   focused input)
 /// - hovered widget isn't a horizontal ScrollArea (those want the scroll)
-pub fn handle_swipe_nav(ctx: &egui::Context, state: &mut AppState) {
+impl AppState {
+    pub fn handle_swipe_nav(&mut self, ctx: &egui::Context) {
+    let state = self;
     let now = std::time::Instant::now();
     // egui delivers scroll inputs from the platform; on macOS/Windows
     // touchpads a two-finger horizontal swipe lands here as x-axis delta.
@@ -146,4 +148,5 @@ pub fn handle_swipe_nav(ctx: &egui::Context, state: &mut AppState) {
         state.session.nav.swipe_armed_dir = None;
     }
     ctx.request_repaint();
+    }
 }

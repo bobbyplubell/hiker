@@ -1,6 +1,6 @@
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_view::ViewState;
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::viewport::ViewState;
 
 const SAMPLE: &str = "// minimal egui_editor demo\nfn main() {\n    println!(\"hello world\");\n    for i in 0..10 {\n        println!(\"{i}\");\n    }\n}\n";
 

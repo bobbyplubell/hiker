@@ -5,7 +5,7 @@
 //! who prefer Claude Code / Goose / etc. The loop is "just enough":
 //!
 //! 1. Append the user's message to history.
-//! 2. Call `LlmClient::chat_with_tools` with the system prompt + tool defs.
+//! 2. Call `Client::chat_with_tools` with the system prompt + tool defs.
 //! 3. If the response carries tool calls, dispatch each through the
 //!    injected `ToolDispatcher` (with a per-call timeout circuit-breaker),
 //!    append both the assistant's tool-use message and the synthesized
@@ -42,9 +42,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::{AgentLog, AuditEntry};
-use crate::config::LlmAgentConfig;
-use crate::llm::{AgentChunk, LlmClient, LlmError, Message, ToolCall, ToolDef, ToolResult};
+use crate::audit::{AgentLog, Entry};
+use crate::config::sections::LlmAgentConfig;
+use crate::llm::{AgentChunk, Client, Error as LlmError, Message, ToolCall, ToolDef, ToolResult};
 
 /// Discriminated union of events the chat panel renders. One per LLM call
 /// (`StepStarted` / `StepFinished`), one per delta (`TextDelta`), one per
@@ -56,7 +56,7 @@ use crate::llm::{AgentChunk, LlmClient, LlmError, Message, ToolCall, ToolDef, To
 /// turn that ends after one LLM call has `step_id = 0` only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentEvent {
+pub enum Event {
     TurnStarted { turn_id: TurnId, user_message_summary: String },
     StepStarted { turn_id: TurnId, step_id: u32 },
     TextDelta { turn_id: TurnId, step_id: u32, text: String },
@@ -127,7 +127,7 @@ impl StopSignal {
 
     /// Borrow the underlying token for `tokio::select!` arms or other
     /// callers that want a `WaitForCancellationFuture`.
-    pub fn token(&self) -> &CancellationToken {
+    pub const fn token(&self) -> &CancellationToken {
         &self.token
     }
 
@@ -218,7 +218,7 @@ pub enum ToolDispatchError {
 }
 
 #[derive(Debug, Error)]
-pub enum AgentError {
+pub enum Error {
     #[error(transparent)]
     Llm(#[from] LlmError),
     #[error("event channel closed before turn finished")]
@@ -231,7 +231,7 @@ pub enum AgentError {
 /// and the prompt feature slug they're driving (`chat_system` for the
 /// chat panel, future feature names for fan-out).
 #[derive(Clone)]
-pub struct AgentAudit {
+pub struct Audit {
     pub log: Arc<AgentLog>,
     pub feature: &'static str,
 }
@@ -239,7 +239,7 @@ pub struct AgentAudit {
 /// Inputs for one turn. The caller is responsible for accumulating
 /// history across turns; the loop only mutates the local copy passed in
 /// for this turn.
-pub struct AgentTurnInput {
+pub struct TurnInput {
     pub turn_id: TurnId,
     /// Optional system prompt (the chat panel's preamble describing the
     /// vault tools etc.). Threaded into every LLM call this turn.
@@ -263,13 +263,13 @@ pub struct AgentTurnInput {
 /// terminal completion vs. cap-hit vs. user-halt vs. error so the chat
 /// panel can render the right "you can continue from here" affordance.
 #[derive(Debug, Clone)]
-pub struct AgentTurnOutput {
+pub struct TurnOutput {
     pub history: Vec<Message>,
     pub finish_reason: FinishReason,
     pub iterations: u32,
 }
 
-/// Run one agent turn end-to-end. Emits `AgentEvent`s on `events_tx` as it
+/// Run one agent turn end-to-end. Emits `Event`s on `events_tx` as it
 /// progresses; consumes `cancel` to short-circuit on user cancel.
 ///
 /// The loop body is deliberately small — one LLM call per iteration, fan
@@ -278,14 +278,14 @@ pub struct AgentTurnOutput {
 /// loop. The cap is the only outer-loop terminator besides "model
 /// produced a terminal text response."
 pub async fn run_turn(
-    input: AgentTurnInput,
-    client: Arc<dyn LlmClient>,
+    input: TurnInput,
+    client: Arc<dyn Client>,
     dispatcher: Arc<dyn ToolDispatcher>,
     cfg: &LlmAgentConfig,
-    events_tx: &mpsc::Sender<AgentEvent>,
+    events_tx: &mpsc::Sender<Event>,
     stop: StopSignal,
-    audit: Option<AgentAudit>,
-) -> Result<AgentTurnOutput, AgentError> {
+    audit: Option<Audit>,
+) -> Result<TurnOutput, Error> {
     let turn_id = input.turn_id.clone();
     let mut history = input.history;
 
@@ -297,7 +297,7 @@ pub async fn run_turn(
         None => "(continuing)".to_string(),
     };
     let _ = events_tx
-        .send(AgentEvent::TurnStarted {
+        .send(Event::TurnStarted {
             turn_id: turn_id.clone(),
             user_message_summary: user_summary,
         })
@@ -315,12 +315,12 @@ pub async fn run_turn(
         if stop.is_cancelled() {
             let reason = stop.finish_reason();
             let _ = events_tx
-                .send(AgentEvent::TurnFinished {
+                .send(Event::TurnFinished {
                     turn_id: turn_id.clone(),
                     finish_reason: reason,
                 })
                 .await;
-            return Ok(AgentTurnOutput {
+            return Ok(TurnOutput {
                 history,
                 finish_reason: reason,
                 iterations: step_id,
@@ -331,12 +331,12 @@ pub async fn run_turn(
             // Cap hit *before* this iteration's call. Suspend; caller
             // decides whether to reinvoke run_turn (Continue) or drop.
             let _ = events_tx
-                .send(AgentEvent::IterationCapHit {
+                .send(Event::IterationCapHit {
                     turn_id: turn_id.clone(),
                     completed_iterations: step_id,
                 })
                 .await;
-            return Ok(AgentTurnOutput {
+            return Ok(TurnOutput {
                 history,
                 finish_reason: FinishReason::CapHit,
                 iterations: step_id,
@@ -344,7 +344,7 @@ pub async fn run_turn(
         }
 
         let _ = events_tx
-            .send(AgentEvent::StepStarted {
+            .send(Event::StepStarted {
                 turn_id: turn_id.clone(),
                 step_id,
             })
@@ -360,38 +360,42 @@ pub async fn run_turn(
         }
         msgs.extend(history.iter().cloned());
 
-        let stream_result = run_step_stream(
-            client.as_ref(),
-            &msgs,
-            &input.tools,
-            &turn_id,
-            step_id,
+        let ctx = TurnCtx {
+            turn_id: &turn_id,
             events_tx,
-            stop.token(),
-        )
-        .await;
+            audit: audit.as_ref(),
+        };
+        let stream_result = ctx
+            .run_step_stream(
+                client.as_ref(),
+                &msgs,
+                &input.tools,
+                step_id,
+                stop.token(),
+            )
+            .await;
         let step = match stream_result {
             Ok(s) => {
-                record_step_audit(audit.as_ref(), &turn_id, step_id, "ok", None, &s);
+                ctx.record_step_audit(step_id, "ok", None, &s);
                 s
             }
             Err(e) => {
                 let msg = e.to_string();
-                record_step_audit_err(audit.as_ref(), &turn_id, step_id, &msg);
+                ctx.record_step_audit_err(step_id, &msg);
                 let _ = events_tx
-                    .send(AgentEvent::Error {
+                    .send(Event::Error {
                         turn_id: turn_id.clone(),
                         step_id: Some(step_id),
                         message: msg,
                     })
                     .await;
                 let _ = events_tx
-                    .send(AgentEvent::TurnFinished {
+                    .send(Event::TurnFinished {
                         turn_id: turn_id.clone(),
                         finish_reason: FinishReason::Errored,
                     })
                     .await;
-                return Err(AgentError::Llm(e));
+                return Err(Error::Llm(e));
             }
         };
 
@@ -399,19 +403,19 @@ pub async fn run_turn(
             // Terminal text response. Record it and finish.
             history.push(Message::assistant(step.text.clone()));
             let _ = events_tx
-                .send(AgentEvent::StepFinished {
+                .send(Event::StepFinished {
                     turn_id: turn_id.clone(),
                     step_id,
                     finish_reason: FinishReason::EndTurn,
                 })
                 .await;
             let _ = events_tx
-                .send(AgentEvent::TurnFinished {
+                .send(Event::TurnFinished {
                     turn_id: turn_id.clone(),
                     finish_reason: FinishReason::EndTurn,
                 })
                 .await;
-            return Ok(AgentTurnOutput {
+            return Ok(TurnOutput {
                 history,
                 finish_reason: FinishReason::EndTurn,
                 iterations: step_id + 1,
@@ -426,21 +430,22 @@ pub async fn run_turn(
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(step.tool_calls.len());
         for c in &step.tool_calls {
-            let result = dispatch_with_timeout(
-                dispatcher.as_ref(),
-                &c.name,
-                &c.arguments,
-                tool_timeout,
-                stop.token(),
-            )
-            .await;
+            let result = ctx
+                .dispatch_with_timeout(
+                    dispatcher.as_ref(),
+                    &c.name,
+                    &c.arguments,
+                    tool_timeout,
+                    stop.token(),
+                )
+                .await;
             let (ok, output, summary) = match result {
                 Ok(s) => (true, s.clone(), summarize(&s, 120)),
                 Err(reason) => (false, reason.clone(), reason.clone()),
             };
             let output_for_ui = if ok { Some(output.clone()) } else { None };
             let _ = events_tx
-                .send(AgentEvent::ToolResult {
+                .send(Event::ToolResult {
                     turn_id: turn_id.clone(),
                     step_id,
                     call_id: c.id.clone(),
@@ -462,7 +467,7 @@ pub async fn run_turn(
         history.push(tool_msg);
 
         let _ = events_tx
-            .send(AgentEvent::StepFinished {
+            .send(Event::StepFinished {
                 turn_id: turn_id.clone(),
                 step_id,
                 finish_reason: FinishReason::ToolUse,
@@ -481,28 +486,40 @@ struct StepOutcome {
     tool_calls: Vec<ToolCall>,
 }
 
-/// Drive one streaming step: call `LlmClient::chat_stream_with_tools`,
-/// emit `AgentEvent`s as chunks arrive, and return the assembled
+/// Per-turn refs threaded into the small helpers (step driver, dispatch,
+/// audit). Methods (vs. free fns) so the helpers don't trip
+/// `clippy::single_call_fn` — they're inherently single-call from the loop.
+struct TurnCtx<'a> {
+    turn_id: &'a TurnId,
+    events_tx: &'a mpsc::Sender<Event>,
+    audit: Option<&'a Audit>,
+}
+
+impl<'a> TurnCtx<'a> {
+
+/// Drive one streaming step: call `Client::chat_stream_with_tools`,
+/// emit `Event`s as chunks arrive, and return the assembled
 /// `StepOutcome` for the loop to act on. If `chat_stream_with_tools` is
 /// not implemented, falls back to `chat_with_tools` for the same
 /// semantics — matters for the mock client and any future non-streaming
-/// `LlmClient` impl.
+/// `Client` impl.
 async fn run_step_stream(
-    client: &dyn LlmClient,
+    &self,
+    client: &dyn Client,
     messages: &[Message],
     tools: &[ToolDef],
-    turn_id: &TurnId,
     step_id: u32,
-    events_tx: &mpsc::Sender<AgentEvent>,
     cancel: &CancellationToken,
 ) -> Result<StepOutcome, LlmError> {
+    let turn_id = self.turn_id;
+    let events_tx = self.events_tx;
     let mut stream = match client.chat_stream_with_tools(messages, tools).await {
         Ok(s) => s,
         Err(LlmError::Unsupported { .. }) => {
             let resp = client.chat_with_tools(messages, tools).await?;
             if let Some(text) = resp.text.as_deref().filter(|t| !t.is_empty()) {
                 let _ = events_tx
-                    .send(AgentEvent::TextDelta {
+                    .send(Event::TextDelta {
                         turn_id: turn_id.clone(),
                         step_id,
                         text: text.to_string(),
@@ -511,7 +528,7 @@ async fn run_step_stream(
             }
             for c in &resp.tool_calls {
                 let _ = events_tx
-                    .send(AgentEvent::ToolCallStart {
+                    .send(Event::ToolCallStart {
                         turn_id: turn_id.clone(),
                         step_id,
                         call_id: c.id.clone(),
@@ -519,7 +536,7 @@ async fn run_step_stream(
                     })
                     .await;
                 let _ = events_tx
-                    .send(AgentEvent::ToolCallComplete {
+                    .send(Event::ToolCallComplete {
                         turn_id: turn_id.clone(),
                         step_id,
                         call_id: c.id.clone(),
@@ -552,7 +569,7 @@ async fn run_step_stream(
                         if !t.is_empty() {
                             text.push_str(&t);
                             let _ = events_tx
-                                .send(AgentEvent::TextDelta {
+                                .send(Event::TextDelta {
                                     turn_id: turn_id.clone(),
                                     step_id,
                                     text: t,
@@ -563,7 +580,7 @@ async fn run_step_stream(
                     Ok(AgentChunk::ToolUseStart { index, call_id, name }) => {
                         active.insert(index, (call_id.clone(), name.clone()));
                         let _ = events_tx
-                            .send(AgentEvent::ToolCallStart {
+                            .send(Event::ToolCallStart {
                                 turn_id: turn_id.clone(),
                                 step_id,
                                 call_id,
@@ -574,7 +591,7 @@ async fn run_step_stream(
                     Ok(AgentChunk::ToolUseInputDelta { index, partial_args }) => {
                         if let Some((call_id, _)) = active.get(&index) {
                             let _ = events_tx
-                                .send(AgentEvent::ToolCallArgsDelta {
+                                .send(Event::ToolCallArgsDelta {
                                     turn_id: turn_id.clone(),
                                     step_id,
                                     call_id: call_id.clone(),
@@ -585,7 +602,7 @@ async fn run_step_stream(
                     }
                     Ok(AgentChunk::ToolUseComplete { index, call }) => {
                         let _ = events_tx
-                            .send(AgentEvent::ToolCallComplete {
+                            .send(Event::ToolCallComplete {
                                 turn_id: turn_id.clone(),
                                 step_id,
                                 call_id: call.id.clone(),
@@ -612,6 +629,7 @@ async fn run_step_stream(
 /// (`agent-tool-call-timeout`), timeouts never bubble as turn-killing
 /// errors.
 async fn dispatch_with_timeout(
+    &self,
     dispatcher: &dyn ToolDispatcher,
     name: &str,
     args: &str,
@@ -634,14 +652,14 @@ async fn dispatch_with_timeout(
 /// call counts and the step's finish reason go in `details` so a
 /// debugging trail can correlate panel events with audit entries.
 fn record_step_audit(
-    audit: Option<&AgentAudit>,
-    turn_id: &TurnId,
+    &self,
     step_id: u32,
     status: &str,
     error: Option<String>,
     step: &StepOutcome,
 ) {
-    let Some(a) = audit else { return };
+    let turn_id = self.turn_id;
+    let Some(a) = self.audit else { return };
     let finish = if step.tool_calls.is_empty() {
         "end_turn"
     } else {
@@ -654,7 +672,7 @@ fn record_step_audit(
     if a.log.log_full_content() {
         details["text"] = serde_json::Value::String(step.text.clone());
     }
-    a.log.record(&AuditEntry {
+    a.log.record(&Entry {
         surface: "core::agent",
         feature: a.feature,
         status,
@@ -665,14 +683,10 @@ fn record_step_audit(
     });
 }
 
-fn record_step_audit_err(
-    audit: Option<&AgentAudit>,
-    turn_id: &TurnId,
-    step_id: u32,
-    err_msg: &str,
-) {
-    let Some(a) = audit else { return };
-    a.log.record(&AuditEntry {
+fn record_step_audit_err(&self, step_id: u32, err_msg: &str) {
+    let turn_id = self.turn_id;
+    let Some(a) = self.audit else { return };
+    a.log.record(&Entry {
         surface: "core::agent",
         feature: a.feature,
         status: "error",
@@ -682,6 +696,9 @@ fn record_step_audit_err(
         details: serde_json::Value::Null,
     });
 }
+
+}
+
 
 fn summarize(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -720,7 +737,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for ScriptedClient {
+    impl Client for ScriptedClient {
         async fn chat(&self, _: &[Message]) -> Result<String, LlmError> {
             unimplemented!()
         }
@@ -788,7 +805,7 @@ mod tests {
         }
     }
 
-    fn collect_events(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    fn collect_events(rx: &mut mpsc::Receiver<Event>) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             out.push(ev);
@@ -807,7 +824,7 @@ mod tests {
         let cfg = agent_cfg(10, 30);
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t1"),
                 system_prompt: None,
                 history: vec![],
@@ -833,10 +850,10 @@ mod tests {
         assert_eq!(out.history[0].role, Role::User);
         assert_eq!(out.history[1].role, Role::Assistant);
         assert_eq!(out.history[1].content, "hello there");
-        assert!(matches!(events.first(), Some(AgentEvent::TurnStarted { .. })));
+        assert!(matches!(events.first(), Some(Event::TurnStarted { .. })));
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::TurnFinished { finish_reason: FinishReason::EndTurn, .. })));
+            .any(|e| matches!(e, Event::TurnFinished { finish_reason: FinishReason::EndTurn, .. })));
     }
 
     #[tokio::test]
@@ -860,7 +877,7 @@ mod tests {
         let cfg = agent_cfg(10, 30);
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t2"),
                 system_prompt: Some("you are a vault assistant".into()),
                 history: vec![],
@@ -897,10 +914,10 @@ mod tests {
 
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::ToolCallStart { tool_name, .. } if tool_name == "search")));
+            .any(|e| matches!(e, Event::ToolCallStart { tool_name, .. } if tool_name == "search")));
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::ToolResult { ok: true, .. })));
+            .any(|e| matches!(e, Event::ToolResult { ok: true, .. })));
     }
 
     #[tokio::test]
@@ -929,7 +946,7 @@ mod tests {
         let cfg = agent_cfg(2, 30);
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t3"),
                 system_prompt: None,
                 history: vec![],
@@ -952,7 +969,7 @@ mod tests {
         assert_eq!(out.iterations, 2);
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::IterationCapHit { completed_iterations: 2, .. })));
+            .any(|e| matches!(e, Event::IterationCapHit { completed_iterations: 2, .. })));
     }
 
     #[tokio::test]
@@ -983,7 +1000,7 @@ mod tests {
         let cfg = agent_cfg(10, 0);
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t4"),
                 system_prompt: None,
                 history: vec![],
@@ -1009,7 +1026,7 @@ mod tests {
         assert_eq!(out.history[2].tool_results[0].output, "tool timed out");
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolResult { ok: false, summary, .. } if summary == "tool timed out"
+            Event::ToolResult { ok: false, summary, .. } if summary == "tool timed out"
         )));
     }
 
@@ -1036,7 +1053,7 @@ mod tests {
         let cfg = agent_cfg(10, 30);
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t5"),
                 system_prompt: None,
                 history: vec![],
@@ -1060,7 +1077,7 @@ mod tests {
         assert!(out.history[2].tool_results[0].output.contains("boom"));
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolResult { ok: false, .. }
+            Event::ToolResult { ok: false, .. }
         )));
     }
 
@@ -1074,7 +1091,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for StreamingClient {
+    impl Client for StreamingClient {
         async fn chat(&self, _: &[Message]) -> Result<String, LlmError> {
             unimplemented!()
         }
@@ -1161,7 +1178,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl LlmClient for OneShot {
+        impl Client for OneShot {
             async fn chat(&self, _: &[Message]) -> Result<String, LlmError> {
                 unimplemented!()
             }
@@ -1208,7 +1225,7 @@ mod tests {
         });
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t-stream"),
                 system_prompt: None,
                 history: vec![],
@@ -1231,16 +1248,16 @@ mod tests {
         // Confirm streaming-specific events fired.
         let arg_deltas: Vec<_> = events
             .iter()
-            .filter(|e| matches!(e, AgentEvent::ToolCallArgsDelta { .. }))
+            .filter(|e| matches!(e, Event::ToolCallArgsDelta { .. }))
             .collect();
         assert_eq!(arg_deltas.len(), 2, "expected 2 args-delta events");
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::TextDelta { text, .. } if text == "looking…"
+            Event::TextDelta { text, .. } if text == "looking…"
         )));
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolCallComplete { args, .. } if args == r#"{"q":"hiker"}"#
+            Event::ToolCallComplete { args, .. } if args == r#"{"q":"hiker"}"#
         )));
     }
 
@@ -1257,7 +1274,7 @@ mod tests {
         stop.cancel(); // cancel before the loop even starts
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t6"),
                 system_prompt: None,
                 history: vec![],
@@ -1279,7 +1296,7 @@ mod tests {
         assert_eq!(out.finish_reason, FinishReason::Cancelled);
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::TurnFinished { finish_reason: FinishReason::Cancelled, .. }
+            Event::TurnFinished { finish_reason: FinishReason::Cancelled, .. }
         )));
     }
 
@@ -1307,7 +1324,7 @@ mod tests {
         let cfg = agent_cfg(1, 30);
 
         let first = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t-cont"),
                 system_prompt: None,
                 history: vec![],
@@ -1327,7 +1344,7 @@ mod tests {
 
         let cont_cfg = agent_cfg(10, 30);
         let cont = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t-cont"),
                 system_prompt: None,
                 history: first.history.clone(),
@@ -1372,7 +1389,7 @@ mod tests {
         stop.user_halt();
 
         let out = run_turn(
-            AgentTurnInput {
+            TurnInput {
                 turn_id: TurnId::from("t-halt"),
                 system_prompt: None,
                 history: vec![],
@@ -1394,7 +1411,7 @@ mod tests {
         assert_eq!(out.finish_reason, FinishReason::UserHalted);
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::TurnFinished { finish_reason: FinishReason::UserHalted, .. }
+            Event::TurnFinished { finish_reason: FinishReason::UserHalted, .. }
         )));
     }
 }

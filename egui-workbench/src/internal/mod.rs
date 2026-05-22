@@ -4,5 +4,4 @@
 //! concepts (handle indirection, pinned tab enforcement, focused-group
 //! detection) and are subject to change without a major version bump.
 
-pub(crate) mod enforcement;
 pub(crate) mod tree_adapter;

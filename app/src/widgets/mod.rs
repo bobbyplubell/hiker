@@ -3,8 +3,6 @@
 //! shells land here as features get ported.
 
 pub mod force_graph;
-pub mod force_layout;
-pub mod graph_layouts;
 pub mod modal;
 pub mod profiler_overlay;
 pub mod swipe_indicator;

@@ -1,8 +1,11 @@
 //! Tests for `bracket_match_decorations`. See SPEC §9.10.
 
-use editor_core::{Decoration, EditorState, Selection};
-use editor_view::{bracket_match_decorations, DEFAULT_BRACKETS};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::Selection;
+use editor_view::brackets::bracket_match_decorations;
+use editor_view::brackets::DEFAULT_BRACKETS;
 fn set_caret(state: &mut EditorState, byte: usize) {
     state.selection = Selection::single(byte);
 }

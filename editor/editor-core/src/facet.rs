@@ -1,10 +1,10 @@
 //! Facet / StateField / ViewPlugin extension surface (SPEC §13.1–§13.3).
 //!
-//! Opt-in alongside the existing direct-field API on `EditorState` /
+//! Opt-in alongside the existing direct-field API on `Editor` /
 //! `ViewState`. New extensions that want typed reactive composition can use
 //! these; older code keeps reading the named fields.
 //!
-//! **Status**: scaffold only. The `FacetStore` and `FieldStore` infrastructure
+//! **Status**: scaffold only. The `Store` and `FieldStore` infrastructure
 //! is in place and tested; built-in fields (history, folds, IME, …) have
 //! *not* been migrated. They remain as direct fields. Migration is a
 //! follow-up — the goal here is to land the surface so extensions don't have
@@ -27,13 +27,13 @@ pub trait Facet: 'static + Send + Sync {
 
 /// Type-erased multi-provider store. Keyed by the facet's `TypeId`.
 #[derive(Clone, Default)]
-pub struct FacetStore {
+pub struct Store {
     /// Per-facet list of provider values, stored as `Arc<dyn Any>` so the
     /// store doesn't need to know the facet type. Combined lazily on `get`.
     inputs: HashMap<TypeId, Vec<Arc<dyn Any + Send + Sync>>>,
 }
 
-impl FacetStore {
+impl Store {
     pub fn new() -> Self {
         Self { inputs: HashMap::new() }
     }
@@ -86,7 +86,7 @@ pub trait StateField: 'static + Send + Sync {
     fn create() -> Self::T;
     /// Called after each transaction is applied. Receives the previous value
     /// plus the transaction; returns the next value. Should be pure.
-    fn update(prev: &Self::T, tx: &crate::Transaction) -> Self::T;
+    fn update(prev: &Self::T, tx: &crate::transaction::Transaction) -> Self::T;
 }
 
 /// Type-erased map of `TypeId → Arc<T>` for state fields.
@@ -121,16 +121,16 @@ impl FieldStore {
     }
 
     /// Run the field's `update` for every registered field, given a
-    /// transaction. Used by `EditorState::apply` to keep fields in sync.
+    /// transaction. Used by `Editor::apply` to keep fields in sync.
     ///
     /// v1: walks a caller-supplied list of updater closures. The
-    /// `EditorState::apply` integration is a follow-up — exposing the
+    /// `Editor::apply` integration is a follow-up — exposing the
     /// surface here lets hosts wire it manually for now.
     #[allow(clippy::type_complexity)]
     pub fn apply_updaters(
         &mut self,
-        tx: &crate::Transaction,
-        updaters: &[Arc<dyn Fn(&mut FieldStore, &crate::Transaction) + Send + Sync>],
+        tx: &crate::transaction::Transaction,
+        updaters: &[Arc<dyn Fn(&mut FieldStore, &crate::transaction::Transaction) + Send + Sync>],
     ) {
         for f in updaters {
             f(self, tx);
@@ -154,13 +154,14 @@ pub trait ViewPlugin: Send + Sync {
         Self: Sized;
     /// Called once per frame with the transactions that landed since the
     /// last update. v1: caller-supplied; future: the widget will track this.
-    fn update(&mut self, transactions: &[crate::Transaction]);
+    fn update(&mut self, transactions: &[crate::transaction::Transaction]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChangeSet, Transaction};
+    use crate::change::Set;
+use crate::transaction::Transaction;
 
     struct ColorFacet;
     impl Facet for ColorFacet {
@@ -174,7 +175,7 @@ mod tests {
 
     #[test]
     fn facet_combines_multiple_providers() {
-        let mut store = FacetStore::new();
+        let mut store = Store::new();
         store.provide::<ColorFacet>(0b0001);
         store.provide::<ColorFacet>(0b0100);
         store.provide::<ColorFacet>(0b1000);
@@ -183,13 +184,13 @@ mod tests {
 
     #[test]
     fn facet_get_none_when_no_providers() {
-        let store = FacetStore::new();
+        let store = Store::new();
         assert_eq!(store.get::<ColorFacet>(), None);
     }
 
     #[test]
     fn facet_replace_resets_providers() {
-        let mut store = FacetStore::new();
+        let mut store = Store::new();
         store.provide::<ColorFacet>(0b0001);
         store.provide::<ColorFacet>(0b0010);
         store.replace::<ColorFacet>(0b1111_0000);
@@ -226,7 +227,7 @@ mod tests {
                 let prev = s.get::<CounterField>().unwrap();
                 s.set::<CounterField>(CounterField::update(&prev, tx));
             });
-        let tx = Transaction::new(ChangeSet::empty(0));
+        let tx = Transaction::new(Set::empty(0));
         store.apply_updaters(&tx, &[updater.clone(), updater.clone()]);
         assert_eq!(store.get::<CounterField>(), Some(2));
     }
@@ -247,7 +248,7 @@ mod tests {
     fn view_plugin_create_and_update() {
         let mut p = TestPlugin::create();
         assert_eq!(p.tx_count, 0);
-        let tx = Transaction::new(ChangeSet::empty(0));
+        let tx = Transaction::new(Set::empty(0));
         p.update(&[tx.clone(), tx]);
         assert_eq!(p.tx_count, 2);
     }

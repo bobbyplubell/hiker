@@ -11,11 +11,27 @@
 //!     lines injected as `Block(Text)` above each modified/removed hunk and
 //!     intraline word marks on the added side.
 
-use editor_core::diff::{char_diff, refine_modified_hunk, Hunk, HunkKind, LinePair};
-use editor_core::{
-    BlockDeco, BlockKind, BlockSide, BlockTextLine, Color, Decoration, DecorationSet,
-    GutterMarker, LineStyle, MarkStyle, RangeSet, Rope, Theme,
-};
+use editor_core::diff::chars as char_diff;
+use editor_core::diff::refine_modified_hunk;
+
+use editor_core::diff::Hunk;
+
+use editor_core::diff::HunkKind;
+
+use editor_core::diff::LinePair;
+use editor_core::decoration::BlockDeco;
+use editor_core::decoration::BlockKind;
+use editor_core::decoration::BlockSide;
+use editor_core::decoration::BlockTextLine;
+use editor_core::decoration::Color;
+use editor_core::decoration::Decoration;
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::decoration::GutterMarker;
+use editor_core::decoration::LineStyle;
+use editor_core::decoration::MarkStyle;
+use editor_core::rangeset::RangeSet;
+use editor_core::rope::Rope;
+use editor_core::theme::Theme;
 use smol_str::SmolStr;
 
 pub const BG_ADDED: Color = Color::rgba(46, 160, 67, 38);
@@ -34,7 +50,7 @@ struct DiffPalette {
 }
 
 impl DiffPalette {
-    fn from_theme(theme: Option<&Theme>) -> Self {
+    const fn from_theme(theme: Option<&Theme>) -> Self {
         match theme {
             None => Self {
                 added_bg: BG_ADDED,
@@ -74,7 +90,7 @@ pub fn alignment_decorations(
                     left_rope,
                     &hunk.left_lines,
                     pal.removed_bg,
-                    GutterMarker::DiffRemoved,
+                    &GutterMarker::DiffRemoved,
                 );
                 let height = hunk.left_lines.len() as f32 * line_height;
                 if height > 0.0 {
@@ -93,7 +109,7 @@ pub fn alignment_decorations(
                     right_rope,
                     &hunk.right_lines,
                     pal.added_bg,
-                    GutterMarker::DiffAdded,
+                    &GutterMarker::DiffAdded,
                 );
                 let height = hunk.right_lines.len() as f32 * line_height;
                 if height > 0.0 {
@@ -112,14 +128,14 @@ pub fn alignment_decorations(
                     left_rope,
                     &hunk.left_lines,
                     pal.removed_bg,
-                    GutterMarker::DiffModified,
+                    &GutterMarker::DiffModified,
                 );
                 line_bg(
                     &mut right_entries,
                     right_rope,
                     &hunk.right_lines,
                     pal.added_bg,
-                    GutterMarker::DiffModified,
+                    &GutterMarker::DiffModified,
                 );
                 let left_start_byte = byte_of_line(left_rope, hunk.left_lines.start);
                 let right_start_byte = byte_of_line(right_rope, hunk.right_lines.start);
@@ -201,7 +217,23 @@ pub fn unified_decorations_opts(
 ) -> DecorationSet {
     let pal = DiffPalette::from_theme(theme);
     let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
-    let left_lines_all: Vec<&str> = split_lines(left_text);
+    let left_lines_all: Vec<&str> = {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, ch) in left_text.char_indices() {
+            if ch == '\n' {
+                out.push(&left_text[start..i]);
+                start = i + 1;
+            }
+        }
+        if start <= left_text.len() {
+            out.push(&left_text[start..]);
+        }
+        if matches!(out.last(), Some(last) if last.is_empty()) {
+            out.pop();
+        }
+        out
+    };
 
     for hunk in hunks {
         match hunk.kind {
@@ -212,16 +244,27 @@ pub fn unified_decorations_opts(
                     right_rope,
                     &hunk.right_lines,
                     pal.added_bg,
-                    GutterMarker::DiffAdded,
+                    &GutterMarker::DiffAdded,
                 );
             }
             HunkKind::Removed => {
-                let block = build_removed_block(
-                    &left_lines_all,
-                    &hunk.left_lines,
-                    line_height,
-                    pal.removed_bg,
-                );
+                let range = &hunk.left_lines;
+                let mut lines = Vec::with_capacity(range.len());
+                for li in range.clone() {
+                    let text = left_lines_all.get(li).copied().unwrap_or("");
+                    lines.push(BlockTextLine {
+                        text: SmolStr::from(text),
+                        bg: Some(pal.removed_bg),
+                        fg: None,
+                        gutter_marker: Some(GutterMarker::DiffRemoved),
+                        marks: Vec::new(),
+                    });
+                }
+                let block = BlockDeco {
+                    side: BlockSide::Above,
+                    height: range.len() as f32 * line_height,
+                    kind: BlockKind::Text { lines },
+                };
                 push_block_at(&mut entries, right_rope, hunk.right_lines.start, block);
             }
             HunkKind::Modified => {
@@ -241,8 +284,8 @@ pub fn unified_decorations_opts(
                         }
                     })
                     .collect();
-                let left_refs: Vec<&str> = left_hunk_owned.iter().map(|s| s.as_str()).collect();
-                let right_refs: Vec<&str> = right_hunk_owned.iter().map(|s| s.as_str()).collect();
+                let left_refs: Vec<&str> = left_hunk_owned.iter().map(std::string::String::as_str).collect();
+                let right_refs: Vec<&str> = right_hunk_owned.iter().map(std::string::String::as_str).collect();
                 let pairs = refine_modified_hunk(&left_refs, &right_refs, 0.5);
 
                 let removed_block_indices: Vec<u32> = pairs
@@ -253,12 +296,22 @@ pub fn unified_decorations_opts(
                     })
                     .collect();
                 if !removed_block_indices.is_empty() {
-                    let block = build_removed_block_indexed(
-                        &left_refs,
-                        &removed_block_indices,
-                        line_height,
-                        pal.removed_bg,
-                    );
+                    let mut lines = Vec::with_capacity(removed_block_indices.len());
+                    for idx in &removed_block_indices {
+                        let text = left_refs.get(*idx as usize).copied().unwrap_or("");
+                        lines.push(BlockTextLine {
+                            text: SmolStr::from(text),
+                            bg: Some(pal.removed_bg),
+                            fg: None,
+                            gutter_marker: Some(GutterMarker::DiffRemoved),
+                            marks: Vec::new(),
+                        });
+                    }
+                    let block = BlockDeco {
+                        side: BlockSide::Above,
+                        height: removed_block_indices.len() as f32 * line_height,
+                        kind: BlockKind::Text { lines },
+                    };
                     push_block_at(&mut entries, right_rope, hunk.right_lines.start, block);
                 }
 
@@ -345,58 +398,6 @@ fn line_bg_one(
     ));
 }
 
-fn build_removed_block_indexed(
-    left_lines: &[&str],
-    indices: &[u32],
-    line_height: f32,
-    removed_bg: Color,
-) -> BlockDeco {
-    let mut lines = Vec::with_capacity(indices.len());
-    for (i, idx) in indices.iter().enumerate() {
-        let text = left_lines.get(*idx as usize).copied().unwrap_or("");
-        // Compute per-line char marks against neighbouring right context?
-        // For v1 we just style the whole line red; intraline marks already
-        // appear on the corresponding right side for paired lines.
-        lines.push(BlockTextLine {
-            text: SmolStr::from(text),
-            bg: Some(removed_bg),
-            fg: None,
-            gutter_marker: Some(GutterMarker::DiffRemoved),
-            marks: Vec::new(),
-        });
-        let _ = i;
-    }
-    BlockDeco {
-        side: BlockSide::Above,
-        height: indices.len() as f32 * line_height,
-        kind: BlockKind::Text { lines },
-    }
-}
-
-fn build_removed_block(
-    left_lines: &[&str],
-    range: &std::ops::Range<usize>,
-    line_height: f32,
-    removed_bg: Color,
-) -> BlockDeco {
-    let mut lines = Vec::with_capacity(range.len());
-    for li in range.clone() {
-        let text = left_lines.get(li).copied().unwrap_or("");
-        lines.push(BlockTextLine {
-            text: SmolStr::from(text),
-            bg: Some(removed_bg),
-            fg: None,
-            gutter_marker: Some(GutterMarker::DiffRemoved),
-            marks: Vec::new(),
-        });
-    }
-    BlockDeco {
-        side: BlockSide::Above,
-        height: range.len() as f32 * line_height,
-        kind: BlockKind::Text { lines },
-    }
-}
-
 fn push_block_after_hunk(
     entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
     rope: &Rope,
@@ -455,7 +456,7 @@ fn line_bg(
     rope: &Rope,
     lines: &std::ops::Range<usize>,
     bg: Color,
-    marker: GutterMarker,
+    marker: &GutterMarker,
 ) {
     for line in lines.clone() {
         if line >= rope.len_lines() {
@@ -486,29 +487,11 @@ fn byte_of_line(rope: &Rope, line: usize) -> usize {
     }
 }
 
-fn split_lines(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, ch) in s.char_indices() {
-        if ch == '\n' {
-            out.push(&s[start..i]);
-            start = i + 1;
-        }
-    }
-    if start <= s.len() {
-        out.push(&s[start..]);
-    }
-    if matches!(out.last(), Some(last) if last.is_empty()) {
-        out.pop();
-    }
-    out
-}
-
 #[cfg(test)]
 mod intraline_tests {
     use super::*;
-    use editor_core::diff::diff_lines;
-    use editor_core::Rope;
+    use editor_core::diff::lines as diff_lines;
+    use editor_core::rope::Rope;
 
     /// Count Mark decorations in a `DecorationSet` — these are the
     /// per-character intraline highlights emitted on Modified hunks.

@@ -1,7 +1,7 @@
 //! Offline build pipeline: cluster → summarize → flatten, plus the
-//! `Trees`-persistence wrappers (`build_and_persist`, `rebuild_and_persist`)
+//! `Db`-persistence wrappers (`persist`, `rebuild_and_persist`)
 //! and the FromFolders alternate method. The placement classifier in
-//! `tree.rs` shares the `ClusterNode` shape but lives on the online
+//! `tree.rs` shares the `Node` shape but lives on the online
 //! path; this module produces the richer `BuiltClusterNode` described
 //! in `clustering.md` §"Output: what suggestions consume".
 //!
@@ -9,9 +9,7 @@
 //! status: cluster-tree-output
 //! status: cluster-build-from-folders
 
-mod stream;
-
-pub use stream::build_tree_structural_streaming;
+pub mod stream;
 
 use super::algo::{
     cosine_similarity, l2_normalize, mean_normalize, ninetieth_percentile_distance, partition,
@@ -19,10 +17,11 @@ use super::algo::{
 };
 use super::{
     BuildError, BuildMethod, BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree,
-    ClusterAlgorithm, ClusterAssignment, ClusterError, ClusterId, ClusterParams,
+    Algorithm, Assignment, Error, Id, Params,
     FolderDeriveParams, MemberInfo, NoteInput, OUTLIER_LABEL, Phase, SummarizeInput, SummarizeMode,
     SummaryOutput, Summarizer,
 };
+use crate::trees::types::{Db, EditableNode, NodeInsert, NodeKind, TreeInsert};
 
 /// Build a cluster tree from a resolved set of notes. Per
 /// `cluster-build-recursive` + `cluster-build-cluster-method` (and
@@ -36,7 +35,7 @@ use super::{
 ///
 /// `summarizer` provides the per-cluster naming. Producers in production
 /// hand in `LlmSummarizer`; tests pass small in-memory mocks.
-pub fn build_tree(
+pub fn tree(
     scope: BuildScope,
     method: BuildMethod,
     notes: &[NoteInput],
@@ -46,7 +45,18 @@ pub fn build_tree(
         return Err(BuildError::EmptyScope);
     }
     let tree = match &method {
-        BuildMethod::Cluster { params } => build_cluster_tree(notes, params, summarizer)?,
+        BuildMethod::Cluster { params } => {
+            let mut sctx = StreamCtx {
+                tx: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                items_processed: 0,
+                clusters_found: 0,
+                outliers: 0,
+                partition_loop_counter: 0,
+                max_partition_level_emitted: -1,
+            };
+            build_cluster_tree(notes, params, summarizer, &mut sctx)?
+        }
         BuildMethod::FromFolders { params } => build_from_folders(notes, params, summarizer)?,
     };
     Ok(BuildResult {
@@ -61,22 +71,22 @@ pub fn build_tree(
 /// under one transaction (per `cluster-editor-draft-persistence` —
 /// every node is editable from the moment it lands). Returns the new
 /// `tree_id`.
-pub fn build_and_persist(
-    trees: &crate::trees::Trees,
+pub fn persist(
+    trees: &Db,
     name: &str,
     source: &str,
-    scope: BuildScope,
-    method: BuildMethod,
+    scope: &BuildScope,
+    method: &BuildMethod,
     notes: &[NoteInput],
     summarizer: &dyn Summarizer,
 ) -> Result<String, BuildError> {
-    let result = build_tree(scope.clone(), method.clone(), notes, summarizer)?;
+    let result = tree(scope.clone(), method.clone(), notes, summarizer)?;
     let scope_json = serde_json::to_string(&result.scope)
         .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
     let method_json = serde_json::to_string(&result.method)
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
     let tree_id = trees
-        .insert_tree(crate::trees::TreeInsert {
+        .insert_tree(TreeInsert {
             id: None,
             name: name.to_string(),
             source: source.to_string(),
@@ -95,7 +105,7 @@ pub fn build_and_persist(
 
 /// Re-build an existing tree against the current vault state. Re-uses
 /// the tree's saved `scope` + `method` (from `cluster_trees.scope` /
-/// `.method`), re-runs `build_tree`, and persists a *new* tree row —
+/// `.method`), re-runs `tree`, and persists a *new* tree row —
 /// the original tree is left intact so the user can compare / discard.
 /// User-edited fields (`user_edited_name`, `user_edited_summary`,
 /// `policy`) on the old tree are preserved onto new clusters whose
@@ -109,7 +119,7 @@ pub fn build_and_persist(
 ///
 /// status: cluster-build-rebuild
 pub fn rebuild_and_persist(
-    trees: &crate::trees::Trees,
+    trees: &Db,
     old_tree_id: &str,
     new_name: &str,
     notes: &[NoteInput],
@@ -128,13 +138,13 @@ pub fn rebuild_and_persist(
         .list_nodes(old_tree_id)
         .map_err(|e| BuildError::Summarizer(format!("list_nodes: {e}")))?;
 
-    let result = build_tree(scope.clone(), method.clone(), notes, summarizer)?;
+    let result = tree(scope.clone(), method.clone(), notes, summarizer)?;
     let scope_json = serde_json::to_string(&result.scope)
         .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
     let method_json = serde_json::to_string(&result.method)
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
     let new_tree_id = trees
-        .insert_tree(crate::trees::TreeInsert {
+        .insert_tree(TreeInsert {
             id: None,
             name: new_name.to_string(),
             source: old_row.source.clone(),
@@ -151,7 +161,7 @@ pub fn rebuild_and_persist(
     // to build child→parent map + leaf note ids per cluster.
     use std::collections::{HashMap, HashSet};
     let mut old_children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut old_node_by_id: HashMap<String, &crate::trees::EditableNode> = HashMap::new();
+    let mut old_node_by_id: HashMap<String, &EditableNode> = HashMap::new();
     for n in &old_nodes {
         old_node_by_id.insert(n.id.clone(), n);
         if let Some(p) = &n.parent {
@@ -161,13 +171,13 @@ pub fn rebuild_and_persist(
     fn collect_old_notes(
         id: &str,
         old_children: &HashMap<String, Vec<String>>,
-        old_node_by_id: &HashMap<String, &crate::trees::EditableNode>,
+        old_node_by_id: &HashMap<String, &EditableNode>,
         acc: &mut HashSet<String>,
     ) {
         if let Some(kids) = old_children.get(id) {
             for k in kids {
                 if let Some(node) = old_node_by_id.get(k) {
-                    if matches!(node.kind, crate::trees::NodeKind::Leaf) {
+                    if matches!(node.kind, NodeKind::Leaf) {
                         if let Some(nid) = &node.note_ref {
                             acc.insert(nid.clone());
                         }
@@ -180,7 +190,7 @@ pub fn rebuild_and_persist(
     }
     let mut old_cluster_members: HashMap<String, HashSet<String>> = HashMap::new();
     for n in &old_nodes {
-        if matches!(n.kind, crate::trees::NodeKind::Cluster) {
+        if matches!(n.kind, NodeKind::Cluster) {
             let mut s = HashSet::new();
             collect_old_notes(&n.id, &old_children, &old_node_by_id, &mut s);
             old_cluster_members.insert(n.id.clone(), s);
@@ -189,7 +199,7 @@ pub fn rebuild_and_persist(
 
     // Build new clusters' note-id member sets from `inserts`.
     let mut new_children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut new_node_kind: HashMap<String, crate::trees::NodeKind> = HashMap::new();
+    let mut new_node_kind: HashMap<String, NodeKind> = HashMap::new();
     let mut new_note_ref: HashMap<String, Option<String>> = HashMap::new();
     for n in &inserts {
         if let Some(p) = &n.parent_id {
@@ -201,14 +211,14 @@ pub fn rebuild_and_persist(
     fn collect_new_notes(
         id: &str,
         new_children: &HashMap<String, Vec<String>>,
-        new_node_kind: &HashMap<String, crate::trees::NodeKind>,
+        new_node_kind: &HashMap<String, NodeKind>,
         new_note_ref: &HashMap<String, Option<String>>,
         acc: &mut HashSet<String>,
     ) {
         if let Some(kids) = new_children.get(id) {
             for k in kids {
                 if let Some(kind) = new_node_kind.get(k) {
-                    if matches!(kind, crate::trees::NodeKind::Leaf) {
+                    if matches!(kind, NodeKind::Leaf) {
                         if let Some(Some(nid)) = new_note_ref.get(k) {
                             acc.insert(nid.clone());
                         }
@@ -224,7 +234,7 @@ pub fn rebuild_and_persist(
     // Jaccard. If above the threshold, transfer user-edited name /
     // summary + policy.
     for ins in inserts.iter_mut() {
-        if !matches!(ins.kind, crate::trees::NodeKind::Cluster) {
+        if !matches!(ins.kind, NodeKind::Cluster) {
             continue;
         }
         let mut new_members: HashSet<String> = HashSet::new();
@@ -289,12 +299,11 @@ pub fn rebuild_and_persist(
 /// the clustering review tab's Confirm-and-name step).
 ///
 /// status: cluster-review-tab-confirm-and-name
-pub fn result_to_node_inserts_pub(tree: &BuiltClusterTree) -> Vec<crate::trees::NodeInsert> {
+pub fn result_to_node_inserts_pub(tree: &BuiltClusterTree) -> Vec<NodeInsert> {
     result_to_node_inserts(tree)
 }
 
-pub(super) fn result_to_node_inserts(tree: &BuiltClusterTree) -> Vec<crate::trees::NodeInsert> {
-    use crate::trees::{NodeInsert, NodeKind};
+pub(super) fn result_to_node_inserts(tree: &BuiltClusterTree) -> Vec<NodeInsert> {
     let mut out: Vec<NodeInsert> = Vec::new();
     if tree.levels.is_empty() {
         return out;
@@ -498,95 +507,162 @@ enum SplitNode {
 }
 
 use self::stream::StreamCtx;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-fn build_cluster_tree(
-    notes: &[NoteInput],
-    params: &ClusterParams,
-    summarizer: &dyn Summarizer,
-) -> Result<BuiltClusterTree, BuildError> {
-    let mut sctx = StreamCtx::noop();
-    build_cluster_tree_inner(notes, params, summarizer, &mut sctx)
-}
+/// Outcome of a partition pass: communities keyed by label, mapped to the
+/// member indices in each, plus the outlier indices the partitioner peeled
+/// off (folded into the first child after recursion).
+type PartitionSplit = (std::collections::BTreeMap<i32, Vec<usize>>, Vec<usize>);
 
-pub(super) fn build_cluster_tree_inner(
+pub(super) fn build_cluster_tree(
     notes: &[NoteInput],
-    params: &ClusterParams,
+    params: &Params,
     summarizer: &dyn Summarizer,
     sctx: &mut StreamCtx,
 ) -> Result<BuiltClusterTree, BuildError> {
-    // GMM isn't wired yet (linfa-clustering doesn't ship HDBSCAN; see
-    // `clustering.md` §"Crate choice"). Producers requesting `Gmm` fall
-    // back to `Hdbscan` on every Split call.
-    //
-    // status: cluster-algorithm-selectable (partial — gmm path stubbed)
-    if matches!(params.algorithm, ClusterAlgorithm::Gmm) {
-        tracing::warn!("cluster: gmm algorithm not yet supported; falling back to hdbscan");
+    Builder { notes, params, summarizer }.run(sctx)
+}
+
+/// Borrow-bundle for the build entry point. Splitting `run` into
+/// `&self` methods keeps each phase under the cognitive-complexity
+/// budget while sharing `notes`, `params`, and the summarizer with no
+/// free-helper sprawl.
+struct Builder<'a> {
+    notes: &'a [NoteInput],
+    params: &'a Params,
+    summarizer: &'a dyn Summarizer,
+}
+
+impl<'a> Builder<'a> {
+    fn run(&self, sctx: &mut StreamCtx) -> Result<BuiltClusterTree, BuildError> {
+        // GMM isn't wired yet (linfa-clustering doesn't ship HDBSCAN;
+        // see `clustering.md` §"Crate choice"). Producers requesting
+        // `Gmm` fall back to `Hdbscan` on every Split call.
+        //
+        // status: cluster-algorithm-selectable (partial — gmm path stubbed)
+        if matches!(self.params.algorithm, Algorithm::Gmm) {
+            tracing::warn!(
+                "cluster: gmm algorithm not yet supported; falling back to hdbscan"
+            );
+        }
+        tracing::info!(
+            algorithm = ?self.params.algorithm,
+            note_count = self.notes.len(),
+            recurse = !self.params.disable_recursion,
+            leaf_min_size = self.params.leaf_min_size,
+            leaf_cohesion_threshold = self.params.leaf_cohesion_threshold,
+            top_level_resolution = self.params.leiden.top_level_resolution,
+            resolution = self.params.leiden.resolution,
+            include_outliers = self.params.include_outliers,
+            "cluster: build recipe entry — top-down divisive Split from virtual root"
+        );
+        let (top_groups, top_outliers) = self.top_level_split(sctx)?;
+        let top_level_nodes = self.build_top_level_nodes(top_groups, sctx)?;
+        let outlier_ids: Vec<String> = if self.params.include_outliers {
+            top_outliers.iter().map(|&i| self.notes[i].id.clone()).collect()
+        } else {
+            // By this point every outlier was force-routed into a
+            // cluster via the recovery pass; anything still here is a
+            // degenerate case (zero centroids, etc.). Drop it so the
+            // output doesn't contradict `include_outliers = false`.
+            Vec::new()
+        };
+        sctx.check_cancel()?;
+        sctx.emit_phase(Phase::Finalizing);
+        let ctx = self.split_branch_ctx();
+        let tree = ctx.flatten_split_forest(top_level_nodes, outlier_ids);
+        sctx.emit_counters();
+        tracing::info!(
+            total_levels = tree.levels.len(),
+            per_level_counts = ?tree.levels.iter().map(std::vec::Vec::len).collect::<Vec<_>>(),
+            outliers = tree.outliers.len(),
+            "cluster: build recipe finished"
+        );
+        Ok(tree)
     }
 
-    tracing::info!(
-        algorithm = ?params.algorithm,
-        note_count = notes.len(),
-        recurse = !params.disable_recursion,
-        leaf_min_size = params.leaf_min_size,
-        leaf_cohesion_threshold = params.leaf_cohesion_threshold,
-        top_level_resolution = params.leiden.top_level_resolution,
-        resolution = params.leiden.resolution,
-        include_outliers = params.include_outliers,
-        "cluster: build recipe entry — top-down divisive Split from virtual root"
-    );
-
-    // ── Step 1: top-level Split against the virtual root ─────────────
-    //
-    // The first Split is special:
-    //   - Uses `top_level_resolution` (Leiden only) for a coarser cut.
-    //   - Handles outliers (Hybrid / `include_outliers = false`) by
-    //     force-routing them into the nearest top-level community.
-    //   - Requires at least 2 cohesive communities (else VaultTooSmall).
-    //
-    // Sub-splits below use the regular `resolution` and silently fold
-    // outliers into a per-branch outlier list (the spec doesn't ask for
-    // recursive Hybrid recovery).
-    // Cancellation check at the level boundary into the top-level Split.
-    sctx.check_cancel()?;
-    sctx.emit_partition_phase_if_new(0);
-    let indices: Vec<usize> = (0..notes.len()).collect();
-    let top_assignments =
-        partition_indices(notes, &indices, params, /* top_level */ true)?;
-    sctx.check_cancel()?;
-    let mut top_groups: std::collections::BTreeMap<i32, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for a in &top_assignments {
-        top_groups
-            .entry(a.cluster_label)
-            .or_default()
-            .push(indices[a.point_index]);
+    /// ── Step 1: top-level Split against the virtual root ─────────
+    /// The first Split is special:
+    ///   - Uses `top_level_resolution` (Leiden only) for a coarser cut.
+    ///   - Handles outliers (Hybrid / `include_outliers = false`) by
+    ///     force-routing them into the nearest top-level community.
+    ///   - Requires at least 2 cohesive communities (else
+    ///     `VaultTooSmall`).
+    ///
+    /// Sub-splits below use the regular `resolution` and silently
+    /// fold outliers into a per-branch outlier list (the spec
+    /// doesn't ask for recursive Hybrid recovery).
+    fn top_level_split(
+        &self,
+        sctx: &mut StreamCtx,
+    ) -> Result<PartitionSplit, BuildError> {
+        sctx.check_cancel()?;
+        sctx.emit_partition_phase_if_new(0);
+        let indices: Vec<usize> = (0..self.notes.len()).collect();
+        let top_assignments = partition_indices(
+            self.notes,
+            &indices,
+            self.params,
+            /* top_level */ true,
+        )?;
+        sctx.check_cancel()?;
+        let mut top_groups: std::collections::BTreeMap<i32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for a in &top_assignments {
+            top_groups
+                .entry(a.cluster_label)
+                .or_default()
+                .push(indices[a.point_index]);
+        }
+        let mut top_outliers: Vec<usize> =
+            top_groups.remove(&OUTLIER_LABEL).unwrap_or_default();
+        if top_groups.len() < 2 {
+            return Err(BuildError::VaultTooSmall {
+                found: self.notes.len(),
+            });
+        }
+        // Hybrid / force-routing applies only at the top level.
+        let hybrid_recovery_for_algo = matches!(self.params.algorithm, Algorithm::Hybrid)
+            && !matches!(self.params.algorithm, Algorithm::Leiden);
+        if hybrid_recovery_for_algo || !self.params.include_outliers {
+            top_outliers = self.recover_outliers(&mut top_groups, &top_outliers);
+        }
+        tracing::info!(
+            top_level_clusters = top_groups.len(),
+            outliers = top_outliers.len(),
+            "cluster: top-level Split produced communities"
+        );
+        // Surface the outlier count to the progress stream now that
+        // the top-level Split has settled.
+        sctx.outliers = top_outliers.len() as u32;
+        sctx.emit_counters();
+        Ok((top_groups, top_outliers))
     }
-    let mut top_outliers: Vec<usize> = top_groups.remove(&OUTLIER_LABEL).unwrap_or_default();
 
-    if top_groups.len() < 2 {
-        return Err(BuildError::VaultTooSmall { found: notes.len() });
-    }
-
-    // Hybrid / force-routing applies only at the top level.
-    let hybrid_recovery_for_algo = matches!(params.algorithm, ClusterAlgorithm::Hybrid)
-        && !matches!(params.algorithm, ClusterAlgorithm::Leiden);
-    if hybrid_recovery_for_algo || !params.include_outliers {
+    /// `include_outliers = false` → force-route every outlier into
+    /// its nearest cluster (threshold `-1.0` admits everything). Per
+    /// `cluster-build-cluster-method`'s "outlier recovery loop with
+    /// cosine threshold dropped to -1.0" requirement.
+    fn recover_outliers(
+        &self,
+        top_groups: &mut std::collections::BTreeMap<i32, Vec<usize>>,
+        outliers: &[usize],
+    ) -> Vec<usize> {
         let interim_centroids: std::collections::BTreeMap<i32, Vec<f32>> = top_groups
             .iter()
             .map(|(label, idxs)| {
-                let refs: Vec<&[f32]> =
-                    idxs.iter().map(|&i| notes[i].embedding.as_slice()).collect();
+                let refs: Vec<&[f32]> = idxs
+                    .iter()
+                    .map(|&i| self.notes[i].embedding.as_slice())
+                    .collect();
                 (*label, mean_normalize(&refs))
             })
             .collect();
-        // `include_outliers = false` → force-route every outlier into
-        // its nearest cluster (threshold `-1.0` admits everything). Per
-        // `cluster-build-cluster-method`'s "outlier recovery loop with
-        // cosine threshold dropped to -1.0" requirement.
-        let threshold: f32 = if !params.include_outliers { -1.0 } else { 0.6 };
+        let threshold: f32 = if !self.params.include_outliers { -1.0 } else { 0.6 };
         let mut still_outliers: Vec<usize> = Vec::new();
-        for &i in &top_outliers {
-            let q = l2_normalize(&notes[i].embedding);
+        for &i in outliers {
+            let q = l2_normalize(&self.notes[i].embedding);
             let mut best: Option<(i32, f32)> = None;
             for (label, centroid) in &interim_centroids {
                 let s = cosine_similarity(&q, centroid);
@@ -602,85 +678,50 @@ pub(super) fn build_cluster_tree_inner(
                 _ => still_outliers.push(i),
             }
         }
-        top_outliers = still_outliers;
+        still_outliers
     }
 
-    tracing::info!(
-        top_level_clusters = top_groups.len(),
-        outliers = top_outliers.len(),
-        "cluster: top-level Split produced communities"
-    );
-
-    // Surface the outlier count to the progress stream now that the
-    // top-level Split has settled (`include_outliers = false` / Hybrid
-    // recovery already ran above, so `top_outliers` is the final figure).
-    sctx.outliers = top_outliers.len() as u32;
-    sctx.emit_counters();
-
-    // Build a `SplitNode` per top-level community. Recursively sub-split
-    // unless `disable_recursion` is set; the recursion stops per-branch
-    // on `leaf_min_size` / `leaf_cohesion_threshold` / 16-level cap.
-    const MAX_DEPTH: u8 = 16;
-    let recurse = !params.disable_recursion;
-    let mut top_level_nodes: Vec<SplitNode> = Vec::new();
-    let ctx = SplitBranchCtx {
-        notes,
-        params,
-        summarizer,
-        recurse,
-        max_depth: MAX_DEPTH,
-    };
-    for (label, idxs) in top_groups.into_iter() {
-        // Per-cluster cancellation check at the top level — `idxs` may
-        // be large and `recursive_split_branch` may not return for a
-        // while if the sub-split is deep.
-        sctx.check_cancel()?;
-        let id = format!("c0-{label}");
-        // Top-level clusters have `parent = None` per
-        // `cluster-build-progress-stream`.
-        let node = recursive_split_branch(&ctx, id, &idxs, /* depth */ 1, None, sctx)?;
-        top_level_nodes.push(node);
+    fn split_branch_ctx(&self) -> SplitBranchCtx<'a> {
+        // Build a `SplitNode` per top-level community. Recursively
+        // sub-split unless `disable_recursion` is set; the recursion
+        // stops per-branch on `leaf_min_size` /
+        // `leaf_cohesion_threshold` / 16-level cap.
+        const MAX_DEPTH: u8 = 16;
+        SplitBranchCtx {
+            notes: self.notes,
+            params: self.params,
+            summarizer: self.summarizer,
+            recurse: !self.params.disable_recursion,
+            max_depth: MAX_DEPTH,
+        }
     }
 
-    let outlier_ids: Vec<String> = if params.include_outliers {
-        top_outliers.iter().map(|&i| notes[i].id.clone()).collect()
-    } else {
-        // By this point every outlier was force-routed into a cluster
-        // via the recovery pass above; anything still here is a
-        // degenerate case (zero centroids, etc.). Drop it so the output
-        // doesn't contradict `include_outliers = false`.
-        Vec::new()
-    };
-
-    sctx.check_cancel()?;
-    sctx.emit_phase(Phase::Finalizing);
-    let tree = flatten_split_forest(top_level_nodes, outlier_ids);
-    sctx.emit_counters();
-    tracing::info!(
-        total_levels = tree.levels.len(),
-        per_level_counts = ?tree.levels.iter().map(|l| l.len()).collect::<Vec<_>>(),
-        outliers = tree.outliers.len(),
-        "cluster: build recipe finished"
-    );
-    Ok(tree)
+    fn build_top_level_nodes(
+        &self,
+        top_groups: std::collections::BTreeMap<i32, Vec<usize>>,
+        sctx: &mut StreamCtx,
+    ) -> Result<Vec<SplitNode>, BuildError> {
+        let ctx = self.split_branch_ctx();
+        ctx.split_top_level_groups(top_groups, sctx)
+    }
 }
 
 /// Partition the `indices` subset of `notes` by their embeddings. The
 /// `top_level` flag swaps in `LeidenParams.top_level_resolution` for
 /// `resolution`; sub-splits get the normal `resolution`. Returns the
-/// partitioner's `ClusterAssignment`s with `point_index` indexing into
+/// partitioner's `Assignment`s with `point_index` indexing into
 /// the *local* `indices` slice (i.e. 0..indices.len()) — callers
 /// translate back to global `notes` indices themselves.
 fn partition_indices(
     notes: &[NoteInput],
     indices: &[usize],
-    params: &ClusterParams,
+    params: &Params,
     top_level: bool,
-) -> Result<Vec<ClusterAssignment>, ClusterError> {
+) -> Result<Vec<Assignment>, Error> {
     let embeddings: Vec<Vec<f32>> =
         indices.iter().map(|&i| notes[i].embedding.clone()).collect();
     match params.algorithm {
-        ClusterAlgorithm::Leiden => {
+        Algorithm::Leiden => {
             let mut leiden = params.leiden.clone();
             if top_level {
                 leiden.resolution = params.leiden.top_level_resolution;
@@ -716,232 +757,371 @@ fn partition_indices(
 /// differ per frame.
 struct SplitBranchCtx<'a> {
     notes: &'a [NoteInput],
-    params: &'a ClusterParams,
+    params: &'a Params,
     summarizer: &'a dyn Summarizer,
     recurse: bool,
     max_depth: u8,
 }
 
-fn recursive_split_branch(
-    ctx: &SplitBranchCtx<'_>,
-    id: String,
-    member_idxs: &[usize],
-    depth: u8,
-    parent_id: Option<ClusterId>,
-    sctx: &mut StreamCtx,
-) -> Result<SplitNode, BuildError> {
-    // Level-boundary cancellation check on every recursion frame entry.
-    sctx.check_cancel()?;
-    sctx.emit_partition_phase_if_new(depth as u32);
-    let notes = ctx.notes;
-    let params = ctx.params;
-    let summarizer = ctx.summarizer;
-    let recurse = ctx.recurse;
-    let max_depth = ctx.max_depth;
-    let refs: Vec<&[f32]> = member_idxs
-        .iter()
-        .map(|&i| notes[i].embedding.as_slice())
-        .collect();
-    let centroid = mean_normalize(&refs);
-    let radius = ninetieth_percentile_distance(&centroid, &refs);
-    let infos: Vec<MemberInfo<'_>> = member_idxs
-        .iter()
-        .map(|&i| MemberInfo {
-            title: &notes[i].title,
-            summary: &notes[i].summary,
-        })
-        .collect();
-    // Summarize at this cluster's level (depth from top, 0-indexed for
-    // the summarizer's `level` field — keeps the LLM prompt shape
-    // consistent with prior pipeline).
-    let SummaryOutput {
-        name,
-        summary,
-        confidence,
-    } = run_summarizer(params.summarize, depth as usize - 1, infos, summarizer)?;
+impl<'a> SplitBranchCtx<'a> {
+    fn split_top_level_groups(
+        &self,
+        top_groups: std::collections::BTreeMap<i32, Vec<usize>>,
+        sctx: &mut StreamCtx,
+    ) -> Result<Vec<SplitNode>, BuildError> {
+        let mut out: Vec<SplitNode> = Vec::new();
+        for (label, idxs) in top_groups.into_iter() {
+            // Per-cluster cancellation check at the top level — `idxs`
+            // may be large and `recursive_split_branch` may not return
+            // for a while if the sub-split is deep.
+            sctx.check_cancel()?;
+            let id = format!("c0-{label}");
+            // Top-level clusters have `parent = None` per
+            // `cluster-build-progress-stream`.
+            let node = self.recursive_split_branch(id, &idxs, /* depth */ 1, &None, sctx)?;
+            out.push(node);
+        }
+        Ok(out)
+    }
 
-    // Local helper: emit the leaf cluster event + return the `Leaf`
-    // node. Used by every "branch decided to be a leaf" exit below.
-    // status: cluster-build-progress-stream
-    let emit_leaf = |sctx: &mut StreamCtx| -> SplitNode {
-        let note_ids: Vec<String> = member_idxs.iter().map(|&i| notes[i].id.clone()).collect();
+    /// Flatten the top-down divisive forest into a `BuiltClusterTree`. The
+    /// `levels` contract per `cluster-tree-output`:
+    ///
+    /// - `levels[0]` = leaf clusters (`members` are note ids).
+    /// - `levels[k>0]` = parent clusters (`members` are child cluster ids).
+    /// - `levels.last()` = top-level (root candidates).
+    fn flatten_split_forest(
+        &self,
+        top_level: Vec<SplitNode>,
+        outliers: Vec<String>,
+    ) -> BuiltClusterTree {
+        let mut levels: Vec<Vec<BuiltClusterNode>> = Vec::new();
+        let mut top_ids: Vec<String> = Vec::new();
+        let mut top_centroids: Vec<Vec<f32>> = Vec::new();
+
+        for node in top_level {
+            let (_lvl, id, centroid) = place_in_levels(node, &mut levels);
+            top_ids.push(id);
+            top_centroids.push(centroid);
+        }
+
+        // Add a synthetic vault root when there's more than one top-level
+        // cluster. With exactly one, the persistence flatten
+        // (`result_to_node_inserts`) treats it as root naturally.
+        if top_ids.len() > 1 {
+            let refs: Vec<&[f32]> =
+                top_centroids.iter().map(std::vec::Vec::as_slice).collect();
+            let centroid = mean_normalize(&refs);
+            // Place above every other level.
+            let target_level = levels.len();
+            while levels.len() <= target_level {
+                levels.push(Vec::new());
+            }
+            levels[target_level].push(BuiltClusterNode {
+                id: "vault-root".to_string(),
+                members: top_ids,
+                centroid,
+                radius: 0.0,
+                name: String::new(),
+                summary: String::new(),
+                confidence: 1.0,
+            });
+        }
+
+        BuiltClusterTree { levels, outliers }
+    }
+}
+
+/// Per-frame state for one `recursive_split_branch` invocation.
+/// Centroid / radius / summary are computed once at frame entry; the
+/// `emit_leaf` and child-handling methods read them off `self` so the
+/// recursion body stays focussed on control flow instead of plumbing.
+struct BranchFrame<'a, 'b> {
+    ctx: &'a SplitBranchCtx<'b>,
+    id: String,
+    member_idxs: &'a [usize],
+    depth: u8,
+    parent_id: Option<Id>,
+    centroid: Vec<f32>,
+    radius: f32,
+    name: String,
+    summary: String,
+    confidence: f32,
+}
+
+impl<'b> SplitBranchCtx<'b> {
+    /// Build a `BranchFrame` for this recursion level. Pre-computes
+    /// centroid / radius / summary so the recursion body in
+    /// `recursive_split_branch` can stay focussed on control flow.
+    fn open_branch<'a>(
+        &'a self,
+        id: String,
+        member_idxs: &'a [usize],
+        depth: u8,
+        parent_id: Option<Id>,
+    ) -> Result<BranchFrame<'a, 'b>, BuildError> {
+        let ctx = self;
+        let notes = ctx.notes;
+        let refs: Vec<&[f32]> = member_idxs
+            .iter()
+            .map(|&i| notes[i].embedding.as_slice())
+            .collect();
+        let centroid = mean_normalize(&refs);
+        let radius = ninetieth_percentile_distance(&centroid, &refs);
+        let infos: Vec<MemberInfo<'_>> = member_idxs
+            .iter()
+            .map(|&i| MemberInfo {
+                title: &notes[i].title,
+                summary: &notes[i].summary,
+            })
+            .collect();
+        // Summarize at this cluster's level (depth from top, 0-indexed
+        // for the summarizer's `level` field — keeps the LLM prompt
+        // shape consistent with prior pipeline).
+        let SummaryOutput {
+            name,
+            summary,
+            confidence,
+        } = run_summarizer(
+            ctx.params.summarize,
+            depth as usize - 1,
+            infos,
+            ctx.summarizer,
+        )?;
+        Ok(BranchFrame {
+            ctx,
+            id,
+            member_idxs,
+            depth,
+            parent_id,
+            centroid,
+            radius,
+            name,
+            summary,
+            confidence,
+        })
+    }
+}
+
+impl<'a, 'b> BranchFrame<'a, 'b> {
+    /// Emit the leaf cluster event + return the `Leaf` node. Called
+    /// from every "branch decided to be a leaf" exit point.
+    /// status: cluster-build-progress-stream
+    fn emit_leaf(&self, sctx: &mut StreamCtx) -> SplitNode {
+        let notes = self.ctx.notes;
+        let note_ids: Vec<String> =
+            self.member_idxs.iter().map(|&i| notes[i].id.clone()).collect();
         sctx.items_processed = sctx.items_processed.saturating_add(note_ids.len() as u32);
         sctx.emit_cluster(
             BuiltClusterNode {
-                id: id.clone(),
+                id: self.id.clone(),
                 members: note_ids.clone(),
-                centroid: centroid.clone(),
-                radius,
-                name: name.clone(),
-                summary: summary.clone(),
-                confidence,
+                centroid: self.centroid.clone(),
+                radius: self.radius,
+                name: self.name.clone(),
+                summary: self.summary.clone(),
+                confidence: self.confidence,
             },
-            parent_id.clone(),
+            self.parent_id.clone(),
         );
         sctx.emit_counters();
         SplitNode::Leaf {
-            id: id.clone(),
-            centroid: centroid.clone(),
-            radius,
-            name: name.clone(),
-            summary: summary.clone(),
-            confidence,
+            id: self.id.clone(),
+            centroid: self.centroid.clone(),
+            radius: self.radius,
+            name: self.name.clone(),
+            summary: self.summary.clone(),
+            confidence: self.confidence,
             note_ids,
         }
-    };
-
-    // Per-branch stop conditions.
-    let too_small = member_idxs.len() <= params.leaf_min_size as usize;
-    let too_tight = radius < params.leaf_cohesion_threshold;
-    let at_cap = depth >= max_depth;
-    if !recurse || too_small || too_tight || at_cap {
-        let reason = if !recurse {
-            "disable_recursion"
-        } else if at_cap {
-            "16-level cap"
-        } else if too_small {
-            "member_count <= leaf_min_size"
-        } else {
-            "radius < leaf_cohesion_threshold"
-        };
-        tracing::debug!(
-            id = %id,
-            depth,
-            members = member_idxs.len(),
-            radius,
-            reason,
-            "cluster: branch stopped — emitting leaf cluster"
-        );
-        return Ok(emit_leaf(sctx));
     }
 
-    // Recursive sub-split using the normal `resolution`. If the
-    // partitioner produces fewer than 2 cohesive communities (or
-    // errors), the branch can't be refined further — emit a leaf
-    // cluster instead. We don't propagate the partition error: a
-    // sub-split is allowed to fail to refine without aborting the whole
-    // build (the per-branch outcome is "this stays a leaf cluster").
-    let sub_assignments = match partition_indices(notes, member_idxs, params, /* top_level */ false)
-    {
-        Ok(a) => a,
-        Err(e) => {
+    /// Stop-condition check. Returns `Some(leaf)` if this frame should
+    /// emit a leaf rather than sub-split.
+    fn try_stop(&self, sctx: &mut StreamCtx) -> Option<SplitNode> {
+        let params = self.ctx.params;
+        let too_small = self.member_idxs.len() <= params.leaf_min_size as usize;
+        let too_tight = self.radius < params.leaf_cohesion_threshold;
+        let at_cap = self.depth >= self.ctx.max_depth;
+        if !self.ctx.recurse || too_small || too_tight || at_cap {
+            let reason = if !self.ctx.recurse {
+                "disable_recursion"
+            } else if at_cap {
+                "16-level cap"
+            } else if too_small {
+                "member_count <= leaf_min_size"
+            } else {
+                "radius < leaf_cohesion_threshold"
+            };
             tracing::debug!(
-                id = %id,
-                depth,
-                error = %e,
-                "cluster: sub-split partition errored — emitting leaf cluster"
+                id = %self.id,
+                depth = self.depth,
+                members = self.member_idxs.len(),
+                radius = self.radius,
+                reason,
+                "cluster: branch stopped — emitting leaf cluster"
             );
-            return Ok(emit_leaf(sctx));
+            return Some(self.emit_leaf(sctx));
         }
-    };
-    let mut sub_groups: std::collections::BTreeMap<i32, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for a in &sub_assignments {
-        // Periodic per-node cancellation check inside the partition
-        // assignment loop, per `cluster-build-async-pass`. Cheap atomic
-        // load amortized via `PARTITION_CHECK_INTERVAL`.
-        sctx.check_cancel_periodic()?;
-        if a.cluster_label == OUTLIER_LABEL {
-            // Per spec, sub-splits don't run a Hybrid-style recovery;
-            // outliers at this level fold back into the *parent*
-            // cluster as plain members (we treat the parent as the
-            // settled home when sub-splitting fails to assign them).
-            // Concretely: keep them in member_idxs implicitly by
-            // routing them into a "remainder" bucket below.
-            continue;
-        }
-        sub_groups
-            .entry(a.cluster_label)
-            .or_default()
-            .push(member_idxs[a.point_index]);
-    }
-    let sub_outlier_local: Vec<usize> = sub_assignments
-        .iter()
-        .filter(|a| a.cluster_label == OUTLIER_LABEL)
-        .map(|a| member_idxs[a.point_index])
-        .collect();
-
-    if sub_groups.len() < 2 {
-        tracing::debug!(
-            id = %id,
-            depth,
-            members = member_idxs.len(),
-            sub_communities = sub_groups.len(),
-            "cluster: sub-split produced <2 communities — emitting leaf cluster"
-        );
-        return Ok(emit_leaf(sctx));
+        None
     }
 
-    tracing::debug!(
-        id = %id,
-        depth,
-        sub_communities = sub_groups.len(),
-        sub_outliers = sub_outlier_local.len(),
-        "cluster: sub-split accepted"
-    );
-
-    let mut children: Vec<SplitNode> = Vec::new();
-    for (label, child_idxs) in sub_groups.into_iter() {
-        sctx.check_cancel()?;
-        let child_id = format!("{id}-s{label}");
-        let child = recursive_split_branch(
-            ctx,
-            child_id,
-            &child_idxs,
-            depth + 1,
-            Some(id.clone()),
-            sctx,
+    /// Run the sub-split partition. `Err` here means the partitioner
+    /// itself errored; a `Ok` with `<2` communities still means "leaf"
+    /// — the caller checks. Outliers are split out so the caller can
+    /// fold them into the first child after recursion.
+    fn sub_split(
+        &self,
+        sctx: &mut StreamCtx,
+    ) -> Result<PartitionSplit, Error> {
+        let sub_assignments = partition_indices(
+            self.ctx.notes,
+            self.member_idxs,
+            self.ctx.params,
+            /* top_level */ false,
         )?;
-        children.push(child);
-    }
-    // Sub-level outliers are folded into the first child cluster as
-    // plain members so they remain reachable in the persisted tree.
-    // This matches the build recipe's "every note gets a home under the
-    // top-level community" intent (Hybrid / force-routing decided what
-    // counted as "outlier" at the top level; below that we never
-    // discard a note that already passed the top-level gate).
-    if !sub_outlier_local.is_empty()
-        && let Some(first) = children.first_mut()
-    {
-        fold_into_first_leaf(first, &sub_outlier_local, notes);
+        let mut sub_groups: std::collections::BTreeMap<i32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for a in &sub_assignments {
+            // Periodic per-node cancellation check inside the
+            // partition assignment loop, per
+            // `cluster-build-async-pass`. Cheap atomic load amortized
+            // via `PARTITION_CHECK_INTERVAL`.
+            if sctx.check_cancel_periodic().is_err() {
+                // Cancellation surfaces through `recursive_split_branch`
+                // directly; here we just bail.
+                break;
+            }
+            if a.cluster_label == OUTLIER_LABEL {
+                // Per spec, sub-splits don't run a Hybrid-style
+                // recovery; outliers at this level fold back into the
+                // *parent* cluster as plain members.
+                continue;
+            }
+            sub_groups
+                .entry(a.cluster_label)
+                .or_default()
+                .push(self.member_idxs[a.point_index]);
+        }
+        let sub_outlier_local: Vec<usize> = sub_assignments
+            .iter()
+            .filter(|a| a.cluster_label == OUTLIER_LABEL)
+            .map(|a| self.member_idxs[a.point_index])
+            .collect();
+        Ok((sub_groups, sub_outlier_local))
     }
 
-    // status: cluster-build-progress-stream
-    // Branch finalized — fire `ClusterDiscovered` after its children
-    // have already done so. Consumers expecting child-first order get
-    // it because each `recursive_split_branch` call for a child returns
-    // with the child's emission already on the wire.
-    let child_ids: Vec<String> = children.iter().map(split_node_id).collect();
-    sctx.emit_cluster(
-        BuiltClusterNode {
-            id: id.clone(),
-            members: child_ids,
-            centroid: centroid.clone(),
-            radius,
-            name: name.clone(),
-            summary: summary.clone(),
-            confidence,
-        },
-        parent_id.clone(),
-    );
-    sctx.emit_counters();
-    Ok(SplitNode::Branch {
-        id,
-        centroid,
-        radius,
-        name,
-        summary,
-        confidence,
-        children,
-    })
+    /// Finalize a branch with `children` already built and any
+    /// sub-level outliers folded in. Emits the `ClusterDiscovered`
+    /// event in child-first order.
+    fn finalize_branch(self, children: Vec<SplitNode>, sctx: &mut StreamCtx) -> SplitNode {
+        // status: cluster-build-progress-stream
+        let child_ids: Vec<String> = children
+            .iter()
+            .map(|node| match node {
+                SplitNode::Leaf { id, .. } | SplitNode::Branch { id, .. } => id.clone(),
+            })
+            .collect();
+        sctx.emit_cluster(
+            BuiltClusterNode {
+                id: self.id.clone(),
+                members: child_ids,
+                centroid: self.centroid.clone(),
+                radius: self.radius,
+                name: self.name.clone(),
+                summary: self.summary.clone(),
+                confidence: self.confidence,
+            },
+            self.parent_id.clone(),
+        );
+        sctx.emit_counters();
+        SplitNode::Branch {
+            id: self.id,
+            centroid: self.centroid,
+            radius: self.radius,
+            name: self.name,
+            summary: self.summary,
+            confidence: self.confidence,
+            children,
+        }
+    }
 }
 
-/// Borrow the id string out of a `SplitNode` without consuming it. Used
-/// when assembling the `BuiltClusterNode.members` (child cluster ids)
-/// for a `ClusterDiscovered` emission of a finalized `Branch`.
-fn split_node_id(node: &SplitNode) -> String {
-    match node {
-        SplitNode::Leaf { id, .. } | SplitNode::Branch { id, .. } => id.clone(),
+impl<'a> SplitBranchCtx<'a> {
+    fn recursive_split_branch(
+        &self,
+        id: String,
+        member_idxs: &[usize],
+        depth: u8,
+        parent_id: &Option<Id>,
+        sctx: &mut StreamCtx,
+    ) -> Result<SplitNode, BuildError> {
+        // Level-boundary cancellation check on every recursion frame
+        // entry.
+        sctx.check_cancel()?;
+        sctx.emit_partition_phase_if_new(depth as u32);
+        let frame = self.open_branch(id, member_idxs, depth, parent_id.clone())?;
+        if let Some(leaf) = frame.try_stop(sctx) {
+            return Ok(leaf);
+        }
+        // Recursive sub-split using the normal `resolution`. If the
+        // partitioner errors, the branch can't be refined further —
+        // emit a leaf cluster instead. We don't propagate the
+        // partition error: a sub-split is allowed to fail to refine
+        // without aborting the whole build (the per-branch outcome is
+        // "this stays a leaf cluster").
+        let (sub_groups, sub_outlier_local) = match frame.sub_split(sctx) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(
+                    id = %frame.id,
+                    depth = frame.depth,
+                    error = %e,
+                    "cluster: sub-split partition errored — emitting leaf cluster"
+                );
+                return Ok(frame.emit_leaf(sctx));
+            }
+        };
+        if sub_groups.len() < 2 {
+            tracing::debug!(
+                id = %frame.id,
+                depth = frame.depth,
+                members = frame.member_idxs.len(),
+                sub_communities = sub_groups.len(),
+                "cluster: sub-split produced <2 communities — emitting leaf cluster"
+            );
+            return Ok(frame.emit_leaf(sctx));
+        }
+        tracing::debug!(
+            id = %frame.id,
+            depth = frame.depth,
+            sub_communities = sub_groups.len(),
+            sub_outliers = sub_outlier_local.len(),
+            "cluster: sub-split accepted"
+        );
+        let mut children: Vec<SplitNode> = Vec::new();
+        for (label, child_idxs) in sub_groups.into_iter() {
+            sctx.check_cancel()?;
+            let child_id = format!("{}-s{label}", frame.id);
+            let child = self.recursive_split_branch(
+                child_id,
+                &child_idxs,
+                frame.depth + 1,
+                &Some(frame.id.clone()),
+                sctx,
+            )?;
+            children.push(child);
+        }
+        // Sub-level outliers are folded into the first child cluster
+        // as plain members so they remain reachable in the persisted
+        // tree. Matches the build recipe's "every note gets a home
+        // under the top-level community" intent.
+        if !sub_outlier_local.is_empty()
+            && let Some(first) = children.first_mut()
+        {
+            fold_into_first_leaf(first, &sub_outlier_local, self.notes);
+        }
+        Ok(frame.finalize_branch(children, sctx))
     }
 }
 
@@ -1005,42 +1185,6 @@ fn fold_into_first_leaf(node: &mut SplitNode, extra_idxs: &[usize], notes: &[Not
 /// top-level cluster (theoretically impossible since we error
 /// `VaultTooSmall` below 2 communities, but defended for safety), it
 /// becomes the natural root.
-fn flatten_split_forest(top_level: Vec<SplitNode>, outliers: Vec<String>) -> BuiltClusterTree {
-    let mut levels: Vec<Vec<BuiltClusterNode>> = Vec::new();
-    let mut top_ids: Vec<String> = Vec::new();
-    let mut top_centroids: Vec<Vec<f32>> = Vec::new();
-
-    for node in top_level {
-        let (_lvl, id, centroid) = place_in_levels(node, &mut levels);
-        top_ids.push(id);
-        top_centroids.push(centroid);
-    }
-
-    // Add a synthetic vault root when there's more than one top-level
-    // cluster. With exactly one, the persistence flatten
-    // (`result_to_node_inserts`) treats it as root naturally.
-    if top_ids.len() > 1 {
-        let refs: Vec<&[f32]> = top_centroids.iter().map(|v| v.as_slice()).collect();
-        let centroid = mean_normalize(&refs);
-        // Place above every other level.
-        let target_level = levels.len();
-        while levels.len() <= target_level {
-            levels.push(Vec::new());
-        }
-        levels[target_level].push(BuiltClusterNode {
-            id: "vault-root".to_string(),
-            members: top_ids,
-            centroid,
-            radius: 0.0,
-            name: String::new(),
-            summary: String::new(),
-            confidence: 1.0,
-        });
-    }
-
-    BuiltClusterTree { levels, outliers }
-}
-
 /// Recursively place a `SplitNode` into `levels`. Returns the level
 /// index, id, and centroid of the placed node. A leaf cluster lands at
 /// level 0; a branch lands at `1 + max(child levels)`.
@@ -1118,7 +1262,7 @@ fn run_summarizer(
         // status: cluster-review-tab-structural-pass-no-llm
         // `SummarizeMode::None` short-circuits the summarizer call
         // entirely so the structural pass requires no LLM client. Names
-        // are left blank here; the caller (`build_tree_structural`)
+        // are left blank here; the caller (`tree_structural`)
         // assigns placeholder `"Cluster N"` names ordered by
         // member-count-descending so the result panel has something
         // human-meaningful to show before Confirm-and-name fires.
@@ -1135,7 +1279,7 @@ fn run_summarizer(
 }
 
 /// No-op summarizer used by the structural-only build path
-/// (`build_tree_structural`). Cannot actually be invoked because the
+/// (`tree_structural`). Cannot actually be invoked because the
 /// structural path forces `SummarizeMode::None` on every method param;
 /// returns an error loudly if it ever is, so an accidental misuse is
 /// observable rather than silent.
@@ -1163,7 +1307,7 @@ impl Summarizer for NoopSummarizer {
 ///
 /// status: cluster-review-tab-run-clustering
 /// status: cluster-review-tab-structural-pass-no-llm
-pub fn build_tree_structural(
+pub fn tree_structural(
     scope: BuildScope,
     method: BuildMethod,
     notes: &[NoteInput],
@@ -1179,7 +1323,7 @@ pub fn build_tree_structural(
         }
     };
     let noop = NoopSummarizer;
-    let mut result = build_tree(scope, forced_method, notes, &noop)?;
+    let mut result = tree(scope, forced_method, notes, &noop)?;
     // Walk only level 0 (leaf-level clusters) for placeholder naming.
     // FromFolders already sets the folder basename as the name in
     // `SummarizeMode::None`, so we leave those alone; the heuristic

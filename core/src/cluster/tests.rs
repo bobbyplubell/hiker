@@ -1,5 +1,15 @@
-use super::*;
 use std::collections::HashMap;
+
+use crate::cluster::algo::{cosine_similarity, l2_normalize, partition, partition_leiden};
+use crate::cluster::build::stream::build_tree_structural_streaming;
+use crate::cluster::build::{persist, tree};
+use crate::cluster::tree::place_beam_descent;
+use crate::cluster::{
+    plan_sample_merge, Algorithm, Assignment, BuildError, BuildEvent, BuildMethod, BuildScope,
+    Error, FolderDeriveParams, InMemoryTree, LeidenParams, Node, NoteInput, Params, Phase,
+    SampleMergePlan, SummarizeInput, SummarizeMode, Summarizer, SummaryOutput, OUTLIER_LABEL,
+    SAMPLE_MERGE_BATCH_SIZE, SAMPLE_MERGE_BATCH_THRESHOLD, SAMPLE_MERGE_MEMBER_CAP,
+};
 
 /// Test-only stand-in for the production `LlmSummarizer`. Returns a
 /// deterministic name derived from member titles so build tests can
@@ -59,14 +69,14 @@ fn partition_separates_two_obvious_clusters() {
 #[test]
 fn partition_rejects_empty() {
     let r = partition(&Vec::<Vec<f32>>::new(), 5, None);
-    assert!(matches!(r, Err(ClusterError::Empty)));
+    assert!(matches!(r, Err(Error::Empty)));
 }
 
 #[test]
 fn partition_rejects_dim_mismatch() {
     let pts = vec![vec![1.0, 2.0], vec![3.0]];
     let r = partition(&pts, 2, None);
-    assert!(matches!(r, Err(ClusterError::DimMismatch { row: 1, .. })));
+    assert!(matches!(r, Err(Error::DimMismatch { row: 1, .. })));
 }
 
 #[test]
@@ -90,7 +100,7 @@ fn mk_tree() -> InMemoryTree {
     let mut nodes = HashMap::new();
     nodes.insert(
         "root".to_string(),
-        ClusterNode {
+        Node {
             id: "root".into(),
             centroid: l2_normalize(&[1.0, 1.0]),
             children: vec!["A".into(), "B".into()],
@@ -98,7 +108,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "A".into(),
-        ClusterNode {
+        Node {
             id: "A".into(),
             centroid: l2_normalize(&[1.0, 0.0]),
             children: vec!["A1".into(), "A2".into()],
@@ -106,7 +116,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "B".into(),
-        ClusterNode {
+        Node {
             id: "B".into(),
             centroid: l2_normalize(&[0.0, 1.0]),
             children: vec!["B1".into(), "B2".into()],
@@ -114,7 +124,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "A1".into(),
-        ClusterNode {
+        Node {
             id: "A1".into(),
             centroid: l2_normalize(&[1.0, 0.1]),
             children: vec![],
@@ -122,7 +132,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "A2".into(),
-        ClusterNode {
+        Node {
             id: "A2".into(),
             centroid: l2_normalize(&[1.0, -0.1]),
             children: vec![],
@@ -130,7 +140,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "B1".into(),
-        ClusterNode {
+        Node {
             id: "B1".into(),
             centroid: l2_normalize(&[0.1, 1.0]),
             children: vec![],
@@ -138,7 +148,7 @@ fn mk_tree() -> InMemoryTree {
     );
     nodes.insert(
         "B2".into(),
-        ClusterNode {
+        Node {
             id: "B2".into(),
             centroid: l2_normalize(&[-0.1, 1.0]),
             children: vec![],
@@ -191,7 +201,7 @@ fn sample_merge_plan_fans_out_above_threshold() {
     assert_eq!(batches.len(), 3);
     assert_eq!(batches[0].len(), 30);
     assert_eq!(batches[2].len(), 15);
-    let flat_count: usize = batches.iter().map(|b| b.len()).sum();
+    let flat_count: usize = batches.iter().map(std::vec::Vec::len).sum();
     assert_eq!(flat_count, 75);
 }
 
@@ -227,7 +237,7 @@ fn build_tree_cluster_method_produces_levels_and_leaves() {
     for i in 0..6 {
         notes.push(mk_note(&format!("b{i}"), "cooking", 10.0 + (i as f32) * 0.001));
     }
-    let params = ClusterParams {
+    let params = Params {
         min_cluster_size: 3,
         // Top-down divisive Split would otherwise re-split each
         // top-level community further; this test asserts on the
@@ -236,7 +246,7 @@ fn build_tree_cluster_method_produces_levels_and_leaves() {
         ..Default::default()
     };
     let summarizer = MockSummarizer;
-    let result = build_tree(
+    let result = tree(
         BuildScope::Vault { source_types: Vec::new() },
         BuildMethod::Cluster {
             params: params.clone(),
@@ -260,7 +270,7 @@ fn build_tree_from_folders_one_cluster_per_folder() {
         mk_note("c", "cooking", 10.0),
         mk_note("d", "cooking", 10.01),
     ];
-    let result = build_tree(
+    let result = tree(
         BuildScope::Vault { source_types: Vec::new() },
         BuildMethod::FromFolders {
             params: FolderDeriveParams {
@@ -284,7 +294,7 @@ fn build_tree_from_folders_one_cluster_per_folder() {
 #[test]
 fn build_and_persist_writes_rows() {
     let dir = tempfile::TempDir::new().unwrap();
-    let trees = crate::trees::Trees::open(dir.path()).unwrap();
+    let trees = crate::trees::types::Db::open(dir.path()).unwrap();
     let mut notes: Vec<NoteInput> = Vec::new();
     for i in 0..6 {
         notes.push(mk_note(&format!("a{i}"), "research", 0.0 + (i as f32) * 0.001));
@@ -292,18 +302,18 @@ fn build_and_persist_writes_rows() {
     for i in 0..6 {
         notes.push(mk_note(&format!("b{i}"), "cooking", 10.0 + (i as f32) * 0.001));
     }
-    let params = ClusterParams {
+    let params = Params {
         min_cluster_size: 3,
         disable_recursion: true,
         ..Default::default()
     };
     let summarizer = MockSummarizer;
-    let tree_id = build_and_persist(
+    let tree_id = persist(
         &trees,
         "test build",
         "one-shot",
-        BuildScope::Vault { source_types: Vec::new() },
-        BuildMethod::Cluster { params },
+        &BuildScope::Vault { source_types: Vec::new() },
+        &BuildMethod::Cluster { params },
         &notes,
         &summarizer,
     )
@@ -311,8 +321,8 @@ fn build_and_persist_writes_rows() {
     let row = trees.get_tree(&tree_id).unwrap().unwrap();
     assert_eq!(row.state, "draft");
     let nodes = trees.list_nodes(&tree_id).unwrap();
-    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::NodeKind::Cluster)));
-    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::NodeKind::Leaf)));
+    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::types::NodeKind::Cluster)));
+    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::types::NodeKind::Leaf)));
 }
 
 #[test]
@@ -354,7 +364,7 @@ fn partition_leiden_separates_two_obvious_clusters() {
     // half. The grouping itself comes out of modularity
     // optimization, not density estimates, so every point should
     // be placed.
-    fn majority_label(slice: &[ClusterAssignment]) -> i32 {
+    fn majority_label(slice: &[Assignment]) -> i32 {
         use std::collections::HashMap;
         let mut counts: HashMap<i32, usize> = HashMap::new();
         for a in slice {
@@ -380,7 +390,7 @@ fn partition_leiden_separates_two_obvious_clusters() {
 #[test]
 fn partition_leiden_rejects_empty() {
     let r = partition_leiden(&Vec::<Vec<f32>>::new(), &LeidenParams::default());
-    assert!(matches!(r, Err(ClusterError::Empty)));
+    assert!(matches!(r, Err(Error::Empty)));
 }
 
 // ── Async streaming structural pass ──────────────────────────────────
@@ -427,15 +437,14 @@ fn structural_streaming_fixture_notes() -> Vec<NoteInput> {
 #[tokio::test]
 async fn streaming_build_emits_phase_counters_clusters_and_done() {
     let notes = structural_streaming_fixture_notes();
-    let params = ClusterParams {
-        algorithm: ClusterAlgorithm::Leiden,
+    let params = Params {
+        algorithm: Algorithm::Leiden,
         min_cluster_size: 2,
         disable_recursion: true,
         ..Default::default()
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (handle, mut rx) = build_tree_structural_streaming(
-        BuildScope::Vault { source_types: Vec::new() },
         BuildMethod::Cluster { params },
         notes,
         cancel,
@@ -478,15 +487,14 @@ async fn streaming_build_respects_cancel_before_start() {
     // Pre-flipped cancel atomic: the build should emit Cancelled on
     // the first level-boundary check and never produce Done.
     let notes = structural_streaming_fixture_notes();
-    let params = ClusterParams {
-        algorithm: ClusterAlgorithm::Leiden,
+    let params = Params {
+        algorithm: Algorithm::Leiden,
         min_cluster_size: 2,
         disable_recursion: true,
         ..Default::default()
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (handle, mut rx) = build_tree_structural_streaming(
-        BuildScope::Vault { source_types: Vec::new() },
         BuildMethod::Cluster { params },
         notes,
         cancel,
@@ -511,12 +519,12 @@ async fn streaming_build_respects_cancel_before_start() {
 async fn streaming_build_cluster_discovered_parent_link_is_consistent() {
     // With recursion enabled the build emits ClusterDiscovered for
     // every leaf and every branch. A child's `parent` should point at
-    // a ClusterId we eventually see in a subsequent ClusterDiscovered
+    // a Id we eventually see in a subsequent ClusterDiscovered
     // (or at the synthesized virtual root represented as None for
     // top-level branches).
     let notes = structural_streaming_fixture_notes();
-    let params = ClusterParams {
-        algorithm: ClusterAlgorithm::Leiden,
+    let params = Params {
+        algorithm: Algorithm::Leiden,
         min_cluster_size: 2,
         // Recurse so we get a branch + leaf mix.
         disable_recursion: false,
@@ -526,7 +534,6 @@ async fn streaming_build_cluster_discovered_parent_link_is_consistent() {
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (handle, mut rx) = build_tree_structural_streaming(
-        BuildScope::Vault { source_types: Vec::new() },
         BuildMethod::Cluster { params },
         notes,
         cancel,

@@ -1,7 +1,12 @@
 //! Tests for the panel framework. SPEC §9.21.
 
-use editor_view::{Panel, PanelKind, PanelPlacement, PanelStack};
+use editor_view::panels::Panel;
 
+use editor_view::panels::PanelKind;
+
+use editor_view::panels::PanelPlacement;
+
+use editor_view::panels::PanelStack;
 #[test]
 fn heights_sums_by_placement() {
     let mut stack = PanelStack::default();

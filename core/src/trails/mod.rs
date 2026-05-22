@@ -24,8 +24,8 @@ use serde_yml::Value as YamlValue;
 use thiserror::Error;
 
 use crate::changes::{ChangeAppend, Changes};
-use crate::error::HikerError;
-use crate::frontmatter::{assemble, merge_json_into_yaml, split, FrontmatterError};
+use crate::errors::HikerError;
+use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -33,7 +33,8 @@ pub mod ops;
 #[cfg(test)]
 mod tests;
 
-pub use ops::*;
+use ops::{resolve_reference, ResolutionOutcome};
+
 
 /// A double-link reference: ULID is the canonical pointer (survives
 /// renames via `path-ids`); rel-path is the externally-interoperable
@@ -98,7 +99,7 @@ pub struct WaypointFrontmatter {
 }
 
 #[derive(Debug, Error)]
-pub enum TrailsError {
+pub enum Error {
     #[error("missing frontmatter (expected hiker.kind = trail | waypoint)")]
     MissingFrontmatter,
     #[error("hiker.kind expected `{expected}`, found `{found}`")]
@@ -110,7 +111,7 @@ pub enum TrailsError {
     #[error("non-.md path cannot be a trail-doc: {0}")]
     NotMarkdown(String),
     #[error("frontmatter assemble: {0}")]
-    Assemble(#[from] FrontmatterError),
+    Assemble(#[from] FmError),
 }
 
 /// Parse a trail-doc's frontmatter. Caller MUST verify the source path
@@ -119,25 +120,25 @@ pub enum TrailsError {
 /// is the path-aware wrapper.
 ///
 /// status: trail-doc-shape
-pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, TrailsError> {
+pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, Error> {
     let split_view = split(source);
-    let fm = split_view.frontmatter.ok_or(TrailsError::MissingFrontmatter)?;
+    let fm = split_view.frontmatter.ok_or(Error::MissingFrontmatter)?;
     let YamlValue::Mapping(map) = &fm else {
-        return Err(TrailsError::NotMapping);
+        return Err(Error::NotMapping);
     };
     let hiker = map
         .get("hiker")
-        .ok_or(TrailsError::MissingField("hiker"))?;
+        .ok_or(Error::MissingField("hiker"))?;
     let YamlValue::Mapping(hiker_map) = hiker else {
-        return Err(TrailsError::MissingField("hiker"));
+        return Err(Error::MissingField("hiker"));
     };
 
     let kind = hiker_map
         .get("kind")
         .and_then(|v| v.as_str())
-        .ok_or(TrailsError::MissingField("hiker.kind"))?;
+        .ok_or(Error::MissingField("hiker.kind"))?;
     if kind != "trail" {
-        return Err(TrailsError::KindMismatch {
+        return Err(Error::KindMismatch {
             expected: "trail",
             found: kind.to_string(),
         });
@@ -146,18 +147,18 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, TrailsError>
     let id = hiker_map
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or(TrailsError::MissingField("hiker.id"))?
+        .ok_or(Error::MissingField("hiker.id"))?
         .to_string();
 
     let last_activated_at = hiker_map
         .get("last_activated_at")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     let waypoints = match hiker_map.get("waypoints") {
         None => Vec::new(),
         Some(YamlValue::Sequence(seq)) => seq.iter().filter_map(parse_waypoint_entry).collect(),
-        Some(_) => return Err(TrailsError::MissingField("hiker.waypoints")),
+        Some(_) => return Err(Error::MissingField("hiker.waypoints")),
     };
 
     // status: trail-append-cursor
@@ -167,7 +168,7 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, TrailsError>
     let append_under = hiker_map
         .get("append_under")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     Ok(TrailDocFrontmatter {
         id,
@@ -180,9 +181,9 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, TrailsError>
 /// Path-aware wrapper around `parse_trail_doc`: rejects non-`.md`
 /// extensions before parsing, per the spec's "discriminator alone isn't
 /// enough" rule.
-pub fn parse_trail_doc_for(rel: &str, source: &str) -> Result<TrailDocFrontmatter, TrailsError> {
+pub fn parse_trail_doc_for(rel: &str, source: &str) -> Result<TrailDocFrontmatter, Error> {
     if !rel.ends_with(".md") {
-        return Err(TrailsError::NotMarkdown(rel.to_string()));
+        return Err(Error::NotMarkdown(rel.to_string()));
     }
     parse_trail_doc(source)
 }
@@ -190,25 +191,25 @@ pub fn parse_trail_doc_for(rel: &str, source: &str) -> Result<TrailDocFrontmatte
 /// Parse a waypoint-note's frontmatter.
 ///
 /// status: waypoint-note-shape
-pub fn parse_waypoint(source: &str) -> Result<WaypointFrontmatter, TrailsError> {
+pub fn parse_waypoint(source: &str) -> Result<WaypointFrontmatter, Error> {
     let split_view = split(source);
-    let fm = split_view.frontmatter.ok_or(TrailsError::MissingFrontmatter)?;
+    let fm = split_view.frontmatter.ok_or(Error::MissingFrontmatter)?;
     let YamlValue::Mapping(map) = &fm else {
-        return Err(TrailsError::NotMapping);
+        return Err(Error::NotMapping);
     };
     let hiker = map
         .get("hiker")
-        .ok_or(TrailsError::MissingField("hiker"))?;
+        .ok_or(Error::MissingField("hiker"))?;
     let YamlValue::Mapping(hiker_map) = hiker else {
-        return Err(TrailsError::MissingField("hiker"));
+        return Err(Error::MissingField("hiker"));
     };
 
     let kind = hiker_map
         .get("kind")
         .and_then(|v| v.as_str())
-        .ok_or(TrailsError::MissingField("hiker.kind"))?;
+        .ok_or(Error::MissingField("hiker.kind"))?;
     if kind != "waypoint" {
-        return Err(TrailsError::KindMismatch {
+        return Err(Error::KindMismatch {
             expected: "waypoint",
             found: kind.to_string(),
         });
@@ -217,17 +218,17 @@ pub fn parse_waypoint(source: &str) -> Result<WaypointFrontmatter, TrailsError> 
     let id = hiker_map
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or(TrailsError::MissingField("hiker.id"))?
+        .ok_or(Error::MissingField("hiker.id"))?
         .to_string();
 
     let references = hiker_map
         .get("references")
         .and_then(parse_double_link)
-        .ok_or(TrailsError::MissingField("hiker.references"))?;
+        .ok_or(Error::MissingField("hiker.references"))?;
     let in_trail = hiker_map
         .get("in_trail")
         .and_then(parse_double_link)
-        .ok_or(TrailsError::MissingField("hiker.in_trail"))?;
+        .ok_or(Error::MissingField("hiker.in_trail"))?;
 
     Ok(WaypointFrontmatter {
         id,
@@ -271,7 +272,7 @@ fn parse_waypoint_entry(v: &YamlValue) -> Option<WaypointEntry> {
 pub fn write_trail_doc_frontmatter(
     body_source: &str,
     fm: &TrailDocFrontmatter,
-) -> Result<String, TrailsError> {
+) -> Result<String, Error> {
     let split_view = split(body_source);
     let mut existing = match split_view.frontmatter {
         Some(v) => v,
@@ -356,7 +357,7 @@ fn waypoint_entry_to_json(e: &WaypointEntry) -> serde_json::Value {
 pub fn write_waypoint_frontmatter(
     body_source: &str,
     fm: &WaypointFrontmatter,
-) -> Result<String, TrailsError> {
+) -> Result<String, Error> {
     let split_view = split(body_source);
     let mut existing = match split_view.frontmatter {
         Some(v) => v,
@@ -534,27 +535,6 @@ fn append_change_best_effort(changes: Option<&Arc<Changes>>, append: ChangeAppen
     }
 }
 
-fn empty_trail_doc(trail_id: &str) -> String {
-    // Minimal valid trail-doc frontmatter — no last_activated_at yet.
-    format!("---\nhiker:\n  kind: trail\n  id: {trail_id}\n  waypoints: []\n---\n")
-}
-
-fn empty_waypoint_note(
-    waypoint_id: &str,
-    source_ref: &DoubleLinkRef,
-    in_trail: &DoubleLinkRef,
-) -> Result<String, TrailsError> {
-    let fm = WaypointFrontmatter {
-        id: waypoint_id.to_string(),
-        references: source_ref.clone(),
-        in_trail: in_trail.clone(),
-    };
-    // Body-source is just the empty string — no body, no extra newlines
-    // beyond the closing `---\n` that `assemble` produces. Per spec,
-    // `trail-empty-waypoint-body` requires zero bytes after the FM.
-    write_waypoint_frontmatter("", &fm)
-}
-
 // ---------------------------------------------------------------------------
 // Listing / detail helpers (slice U1: drives `trails_list` /
 // `trail_get` and the planned MCP `trails_list` / `trail_get` tools).
@@ -563,7 +543,7 @@ fn empty_waypoint_note(
 // its frontmatter, surface waypoint count + activation timestamp + title.
 // ---------------------------------------------------------------------------
 
-/// One row of `list_trails`. Title is the trail-doc's basename without
+/// One row of `list`. Title is the trail-doc's basename without
 /// `.md`; the UI may rewrite this once the trail-doc body grows a
 /// markdown title affordance, but for v1 the basename is the user-facing
 /// name (per the "create_trail names verbatim" path).
@@ -614,11 +594,6 @@ pub struct TrailDetail {
     pub append_under: Option<String>,
 }
 
-fn basename_no_md(rel: &str) -> String {
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    base.strip_suffix(".md").unwrap_or(base).to_string()
-}
-
 /// Enumerate every trail-doc in the vault. Strategy: walk the indexer's
 /// `path_ids` listing (cheap, already in memory) and try `parse_trail_doc_for`
 /// on each `.md` file; rows that parse Ok are trail-docs. Notes whose
@@ -628,7 +603,7 @@ fn basename_no_md(rel: &str) -> String {
 /// Pure data-shaping: the same listing drives the UI dropdown,
 /// `mcp-tool-trails-list`, and `cli-trail-list`. Lives in core so the
 /// three surfaces don't fork.
-pub fn list_trails(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, HikerError> {
+pub fn list(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, HikerError> {
     let paths = store
         .all_note_paths()
         .map_err(|e| HikerError::Io(e.to_string()))?;
@@ -652,7 +627,10 @@ pub fn list_trails(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, H
         out.push(TrailListItem {
             rel_path: rel.clone(),
             trail_id: fm.id,
-            title: basename_no_md(&rel),
+            title: {
+                let base = rel.rsplit('/').next().unwrap_or(&rel);
+                base.strip_suffix(".md").unwrap_or(base).to_string()
+            },
             waypoint_count: count,
             last_activated_at: fm.last_activated_at,
         });
@@ -694,21 +672,21 @@ pub fn get_trail(
     })
 }
 
-/// One row of `trails_containing_note_with_paths`. Pairs the
+/// One row of `containing_note_with_paths`. Pairs the
 /// derived-table hit's `trail_id` with the trail-doc's vault-relative
 /// path so the UI can decide membership for any specific trail without
 /// a second round-trip per trail.
 ///
 /// status: trail-add-to-active-from-editor-verb
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrailsContainingNoteHit {
+pub struct ContainingNoteHit {
     pub trail_id: String,
     pub trail_doc_rel: String,
 }
 
 /// Reverse-lookup: which trails contain `source_rel` as a waypoint at
 /// any depth. Resolves each derived-table `trail_id` to its trail-doc
-/// rel-path via the same `list_trails` walk the dropdown uses, so the
+/// rel-path via the same `list` walk the dropdown uses, so the
 /// UI gets both halves in one call.
 ///
 /// Drives the per-trail idempotency check used by the
@@ -717,11 +695,11 @@ pub struct TrailsContainingNoteHit {
 /// === active)` over the result.
 ///
 /// status: trail-add-to-active-from-editor-verb
-pub fn trails_containing_note_with_paths(
+pub fn containing_note_with_paths(
     vault: &Vault,
     store: &Store,
     source_rel: &str,
-) -> Result<Vec<TrailsContainingNoteHit>, HikerError> {
+) -> Result<Vec<ContainingNoteHit>, HikerError> {
     let hits = store
         .trails_containing_note(source_rel)
         .map_err(|e| HikerError::Io(e.to_string()))?;
@@ -733,7 +711,7 @@ pub fn trails_containing_note_with_paths(
     // sidebar dropdown so the two stay consistent (e.g. trail-doc
     // renamed but indexer not yet caught up — both surfaces see the
     // same view).
-    let listing = list_trails(vault, store)?;
+    let listing = list(vault, store)?;
     let mut by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for t in &listing {
         by_id.insert(t.trail_id.as_str(), t.rel_path.as_str());
@@ -744,7 +722,7 @@ pub fn trails_containing_note_with_paths(
         if let Some(rel) = by_id.get(h.trail_id.as_str())
             && seen.insert(h.trail_id.clone())
         {
-            out.push(TrailsContainingNoteHit {
+            out.push(ContainingNoteHit {
                 trail_id: h.trail_id,
                 trail_doc_rel: (*rel).to_string(),
             });

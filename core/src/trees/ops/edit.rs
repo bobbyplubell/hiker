@@ -2,9 +2,9 @@
 //! Each one appends one history row with symmetric undo_args.
 
 use super::super::storage::params;
-use super::super::types::{NodePolicy, Trees, TreesError};
+use super::super::types::{NodePolicy, Db, Error};
 
-impl Trees {
+impl Db {
     /// Set the policy on a node (or clear it with `None`). Appends a
     /// `set-policy` history entry with both prior and new policy in the
     /// undo payload.
@@ -12,15 +12,15 @@ impl Trees {
         &self,
         tree_id: &str,
         node_id: &str,
-        policy: Option<NodePolicy>,
-    ) -> Result<(), TreesError> {
+        policy: Option<&NodePolicy>,
+    ) -> Result<(), Error> {
         let prior = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }
         })?;
-        let policy_json = match &policy {
+        let policy_json = match policy {
             Some(p) => Some(serde_json::to_string(p)?),
             None => None,
         };
@@ -39,9 +39,9 @@ impl Trees {
 
     /// Rename a node. Stamps `user_edited_name = true`. Appends a
     /// `rename` history entry.
-    pub fn rename(&self, tree_id: &str, node_id: &str, new_name: &str) -> Result<(), TreesError> {
+    pub fn rename(&self, tree_id: &str, node_id: &str, new_name: &str) -> Result<(), Error> {
         let prior = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }
@@ -77,9 +77,9 @@ impl Trees {
         node_id: &str,
         new_name: &str,
         new_summary: &str,
-    ) -> Result<(bool, bool), TreesError> {
+    ) -> Result<(bool, bool), Error> {
         let prior = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }
@@ -143,9 +143,9 @@ impl Trees {
         tree_id: &str,
         node_id: &str,
         new_summary: &str,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         let prior = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }

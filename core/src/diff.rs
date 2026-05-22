@@ -3,8 +3,8 @@
 // Pure line-diff computation. Mirrors the discipline used elsewhere in core
 // (`rusqlite` confined to `store`, `fastembed` to `embed`, `notify` to
 // `watcher`): the `similar` crate is confined to this module and never
-// leaks past the `compute` boundary. Callers see only `DiffResult` /
-// `DiffHunk` / `DiffLine` values.
+// leaks past the `compute` boundary. Callers see only `Outcome` /
+// `Hunk` / `Line` values.
 //
 // No I/O, no async, no state — just text → diff. See docs/diff.md.
 
@@ -13,7 +13,7 @@ use similar::{Algorithm, ChangeTag, TextDiff};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DiffOp {
+pub enum Op {
     Equal,
     Insert,
     Delete,
@@ -30,7 +30,7 @@ pub enum DiffOp {
 // status: diff-intraline-char-level-v1
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntralineSpan {
-    pub op: DiffOp,
+    pub op: Op,
     pub byte_start_before: u32,
     pub byte_end_before: u32,
     pub byte_start_after: u32,
@@ -38,8 +38,8 @@ pub struct IntralineSpan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffLine {
-    pub op: DiffOp,
+pub struct Line {
+    pub op: Op,
     pub line: String,
     pub before_line_no: Option<u32>,
     pub after_line_no: Option<u32>,
@@ -53,13 +53,13 @@ pub struct DiffLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffHunk {
-    pub lines: Vec<DiffLine>,
+pub struct Hunk {
+    pub lines: Vec<Line>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffResult {
-    pub hunks: Vec<DiffHunk>,
+pub struct Outcome {
+    pub hunks: Vec<Hunk>,
 }
 
 /// Compute a unified-diff representation of `before` → `after`.
@@ -71,26 +71,26 @@ pub struct DiffResult {
 /// format so a future consumer (large diffs, MCP) can opt into a grouped
 /// representation by calling a different entry point without reshaping the
 /// existing call sites.
-pub fn compute(before: &str, after: &str) -> DiffResult {
+pub fn compute(before: &str, after: &str) -> Outcome {
     compute_with_intraline(before, after, false)
 }
 
-/// Same as `compute` but populates `DiffLine::intraline_spans` for each
+/// Same as `compute` but populates `Line::intraline_spans` for each
 /// paired delete/insert line when `intraline` is true. A pair is a delete
 /// line immediately followed by an insert line in the same hunk; unpaired
 /// deletes/inserts and equal lines are left untouched. v1 char-level only
 /// per `diff-intraline-char-level-v1`.
 // status: diff-intraline-core-pair
-pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> DiffResult {
+pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> Outcome {
     let diff = TextDiff::configure()
         .algorithm(Algorithm::Myers)
         .diff_lines(before, after);
-    let mut lines: Vec<DiffLine> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
     for change in diff.iter_all_changes() {
         let kind = match change.tag() {
-            ChangeTag::Equal => DiffOp::Equal,
-            ChangeTag::Insert => DiffOp::Insert,
-            ChangeTag::Delete => DiffOp::Delete,
+            ChangeTag::Equal => Op::Equal,
+            ChangeTag::Insert => Op::Insert,
+            ChangeTag::Delete => Op::Delete,
         };
         // `similar` keeps the trailing newline on each line; strip it so
         // the wire format carries one logical line per entry.
@@ -101,7 +101,7 @@ pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> Dif
                 text.pop();
             }
         }
-        lines.push(DiffLine {
+        lines.push(Line {
             op: kind,
             line: text,
             before_line_no: change.old_index().map(|i| (i + 1) as u32),
@@ -110,7 +110,7 @@ pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> Dif
         });
     }
     if lines.is_empty() {
-        return DiffResult { hunks: Vec::new() };
+        return Outcome { hunks: Vec::new() };
     }
     if intraline {
         // Pair scan: a Delete immediately followed by an Insert is a pair.
@@ -118,7 +118,7 @@ pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> Dif
         // simultaneous &muts (one Delete + one Insert).
         let mut i = 0;
         while i + 1 < lines.len() {
-            if lines[i].op == DiffOp::Delete && lines[i + 1].op == DiffOp::Insert {
+            if lines[i].op == Op::Delete && lines[i + 1].op == Op::Insert {
                 let spans = compute_intraline(&lines[i].line, &lines[i + 1].line);
                 lines[i].intraline_spans = Some(spans.clone());
                 lines[i + 1].intraline_spans = Some(spans);
@@ -128,8 +128,8 @@ pub fn compute_with_intraline(before: &str, after: &str, intraline: bool) -> Dif
             }
         }
     }
-    DiffResult {
-        hunks: vec![DiffHunk { lines }],
+    Outcome {
+        hunks: vec![Hunk { lines }],
     }
 }
 
@@ -151,7 +151,7 @@ pub fn compute_intraline(before_line: &str, after_line: &str) -> Vec<IntralineSp
         match change.tag() {
             ChangeTag::Equal => {
                 out.push(IntralineSpan {
-                    op: DiffOp::Equal,
+                    op: Op::Equal,
                     byte_start_before: b_off,
                     byte_end_before: b_off + len,
                     byte_start_after: a_off,
@@ -162,7 +162,7 @@ pub fn compute_intraline(before_line: &str, after_line: &str) -> Vec<IntralineSp
             }
             ChangeTag::Delete => {
                 out.push(IntralineSpan {
-                    op: DiffOp::Delete,
+                    op: Op::Delete,
                     byte_start_before: b_off,
                     byte_end_before: b_off + len,
                     byte_start_after: 0,
@@ -172,7 +172,7 @@ pub fn compute_intraline(before_line: &str, after_line: &str) -> Vec<IntralineSp
             }
             ChangeTag::Insert => {
                 out.push(IntralineSpan {
-                    op: DiffOp::Insert,
+                    op: Op::Insert,
                     byte_start_before: 0,
                     byte_end_before: 0,
                     byte_start_after: a_off,
@@ -193,7 +193,7 @@ mod tests {
     fn identical_inputs_produce_all_equal_lines() {
         let r = compute("a\nb\nc\n", "a\nb\nc\n");
         assert_eq!(r.hunks.len(), 1);
-        assert!(r.hunks[0].lines.iter().all(|l| l.op == DiffOp::Equal));
+        assert!(r.hunks[0].lines.iter().all(|l| l.op == Op::Equal));
     }
 
     #[test]
@@ -206,19 +206,19 @@ mod tests {
     fn pure_insert_produces_one_hunk_with_inserts_and_context() {
         let r = compute("a\nb\nc\n", "a\nb\nNEW\nc\n");
         assert_eq!(r.hunks.len(), 1);
-        let kinds: Vec<DiffOp> = r.hunks[0].lines.iter().map(|l| l.op).collect();
-        assert!(kinds.contains(&DiffOp::Insert));
-        assert!(kinds.contains(&DiffOp::Equal));
+        let kinds: Vec<Op> = r.hunks[0].lines.iter().map(|l| l.op).collect();
+        assert!(kinds.contains(&Op::Insert));
+        assert!(kinds.contains(&Op::Equal));
     }
 
     #[test]
     fn pure_delete_carries_before_line_numbers() {
         let r = compute("a\nb\nc\n", "a\nc\n");
         assert_eq!(r.hunks.len(), 1);
-        let removed: Vec<&DiffLine> = r.hunks[0]
+        let removed: Vec<&Line> = r.hunks[0]
             .lines
             .iter()
-            .filter(|l| l.op == DiffOp::Delete)
+            .filter(|l| l.op == Op::Delete)
             .collect();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].line, "b");
@@ -245,7 +245,7 @@ mod tests {
         let equals = r.hunks[0]
             .lines
             .iter()
-            .filter(|l| l.op == DiffOp::Equal)
+            .filter(|l| l.op == Op::Equal)
             .count();
         assert!(equals >= 20, "expected ≥20 equal context lines, got {equals}");
     }
@@ -257,27 +257,27 @@ mod tests {
         // spans together cover bytes 0..6 ("foo ba") on both sides.
         let r = compute_with_intraline("foo bar\n", "foo baz\n", true);
         let lines = &r.hunks[0].lines;
-        let del = lines.iter().find(|l| l.op == DiffOp::Delete).unwrap();
-        let ins = lines.iter().find(|l| l.op == DiffOp::Insert).unwrap();
+        let del = lines.iter().find(|l| l.op == Op::Delete).unwrap();
+        let ins = lines.iter().find(|l| l.op == Op::Insert).unwrap();
         let dspans = del.intraline_spans.as_ref().expect("del spans");
         let ispans = ins.intraline_spans.as_ref().expect("ins spans");
         assert_eq!(dspans, ispans, "paired lines carry the same span list");
         let equal_bytes_before: u32 = dspans
             .iter()
-            .filter(|s| s.op == DiffOp::Equal)
+            .filter(|s| s.op == Op::Equal)
             .map(|s| s.byte_end_before - s.byte_start_before)
             .sum();
         let equal_bytes_after: u32 = dspans
             .iter()
-            .filter(|s| s.op == DiffOp::Equal)
+            .filter(|s| s.op == Op::Equal)
             .map(|s| s.byte_end_after - s.byte_start_after)
             .sum();
         assert_eq!(equal_bytes_before, 6);
         assert_eq!(equal_bytes_after, 6);
         let del_spans: Vec<&IntralineSpan> =
-            dspans.iter().filter(|s| s.op == DiffOp::Delete).collect();
+            dspans.iter().filter(|s| s.op == Op::Delete).collect();
         let ins_spans: Vec<&IntralineSpan> =
-            dspans.iter().filter(|s| s.op == DiffOp::Insert).collect();
+            dspans.iter().filter(|s| s.op == Op::Insert).collect();
         assert_eq!(del_spans.len(), 1);
         assert_eq!(ins_spans.len(), 1);
         assert_eq!(del_spans[0].byte_start_before, 6);
@@ -306,10 +306,10 @@ mod tests {
     #[test]
     fn newline_stripping_handles_crlf() {
         let r = compute("a\r\nb\r\n", "a\r\nB\r\n");
-        let changed: Vec<&DiffLine> = r.hunks[0]
+        let changed: Vec<&Line> = r.hunks[0]
             .lines
             .iter()
-            .filter(|l| l.op != DiffOp::Equal)
+            .filter(|l| l.op != Op::Equal)
             .collect();
         for l in changed {
             assert!(!l.line.ends_with('\n'));

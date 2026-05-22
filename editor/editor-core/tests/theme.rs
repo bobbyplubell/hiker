@@ -1,29 +1,20 @@
 //! Integration tests for the `theme` module (SPEC §9.20).
 
-use editor_core::{
-    dark_default, light_default, Color, Compartment, CompartmentStore, Theme,
-};
+use editor_core::compartment::Compartment;
 
-fn alpha(c: Color) -> u8 {
+use editor_core::compartment::Store;
+use editor_core::decoration::Color;
+
+
+use editor_core::theme::dark_default;
+
+
+use editor_core::theme::light_default;
+
+
+use editor_core::theme::Theme;
+const fn alpha(c: Color) -> u8 {
     c.a
-}
-
-fn palette_colors(t: &Theme) -> [Color; 13] {
-    [
-        t.palette.bg,
-        t.palette.fg,
-        t.palette.accent,
-        t.palette.dim,
-        t.palette.error,
-        t.palette.warning,
-        t.palette.info,
-        t.palette.hint,
-        t.palette.selection,
-        t.palette.current_line,
-        t.palette.gutter_fg,
-        t.palette.gutter_bg,
-        t.palette.border,
-    ]
 }
 
 #[test]
@@ -42,10 +33,24 @@ fn defaults_have_mostly_nonzero_alpha() {
         // Of the 13 palette colors, allow at most a couple to be fully
         // transparent (none should be in our defaults, but the test is
         // forgiving in case a future tweak adds one).
-        let zero_count = palette_colors(&theme)
-            .iter()
-            .filter(|c| alpha(**c) == 0)
-            .count();
+        let zero_count = [
+            theme.palette.bg,
+            theme.palette.fg,
+            theme.palette.accent,
+            theme.palette.dim,
+            theme.palette.error,
+            theme.palette.warning,
+            theme.palette.info,
+            theme.palette.hint,
+            theme.palette.selection,
+            theme.palette.current_line,
+            theme.palette.gutter_fg,
+            theme.palette.gutter_bg,
+            theme.palette.border,
+        ]
+        .iter()
+        .filter(|c| alpha(**c) == 0)
+        .count();
         assert!(
             zero_count <= 2,
             "{}: too many fully-transparent palette colors ({zero_count})",
@@ -79,7 +84,7 @@ fn themes_are_cheap_to_clone() {
 #[test]
 fn compartment_roundtrip_with_theme() {
     let c: Compartment<Theme> = Compartment::new();
-    let mut store = CompartmentStore::default();
+    let mut store = Store::default();
     store.set(&c, light_default());
     {
         let got = store.get(&c).expect("theme present");

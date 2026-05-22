@@ -1,6 +1,6 @@
 //! Bridge between the basic agent loop (`core::agent`) and the in-process
 //! MCP server. Implements `core::agent::ToolDispatcher` against a shared
-//! `HikerHandler` so the agent loop, the rmcp tool router, and the future
+//! `App` so the agent loop, the rmcp tool router, and the future
 //! ACP path all see one tool registry, one audit log, one error model.
 //
 // status: agent-tool-routing-via-mcp
@@ -11,17 +11,17 @@ use async_trait::async_trait;
 use hiker_core::agent::{ToolDispatchError, ToolDispatcher};
 use hiker_core::llm::ToolDef;
 
-use crate::handler::HikerHandler;
+use crate::handler::App;
 
 /// `ToolDispatcher` impl that hands every call back through
-/// `HikerHandler::dispatch_tool` — the same code path the rmcp router
+/// `App::dispatch_tool` — the same code path the rmcp router
 /// exercises (so audit-log + error-code behaviors stay identical).
 pub struct McpAgentDispatcher {
-    handler: Arc<HikerHandler>,
+    handler: Arc<App>,
 }
 
 impl McpAgentDispatcher {
-    pub fn new(handler: Arc<HikerHandler>) -> Self {
+    pub const fn new(handler: Arc<App>) -> Self {
         Self { handler }
     }
 }
@@ -59,7 +59,7 @@ impl ToolDispatcher for McpAgentDispatcher {
 }
 
 /// Static list of tool defs the basic agent loop advertises to the model.
-/// Mirrors the `#[tool]`-annotated methods on `HikerHandler` (the rmcp
+/// Mirrors the `#[tool]`-annotated methods on `App` (the rmcp
 /// router is the source of truth for *running* the tools; this list is the
 /// source of truth for *advertising* them to the model).
 ///
@@ -87,12 +87,12 @@ pub fn agent_tool_defs_with(expose_tasks: bool) -> Vec<ToolDef> {
 /// the live config; external rmcp clients still see the full set.
 pub fn agent_tool_defs_filtered(
     expose_tasks: bool,
-    tools_cfg: Option<&hiker_core::config::McpToolsConfig>,
+    tools_cfg: Option<&hiker_core::config::sections::McpToolsConfig>,
 ) -> Vec<ToolDef> {
     use crate::handler::{
-        ApplyTagParams, EditNoteParams, GetNoteParams, RelatedNotesParams, SearchNotesParams,
-        SetFrontmatterParams, TaskCheckoutParams, TaskFailParams, TaskHeartbeatParams,
-        TaskListParams, TaskSubmitParams, WriteNoteParams,
+        ApplyTag, EditNote, GetNote, RelatedNotes, SearchNotes,
+        SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat,
+        TaskList, TaskSubmit, WriteNote,
     };
     use schemars::schema_for;
 
@@ -115,56 +115,56 @@ pub fn agent_tool_defs_filtered(
             description:
                 "Hybrid search across the vault (lexical FTS5 + semantic vec). Returns lexical_hits, semantic_hits, and fused buckets."
                     .into(),
-            parameters: schema::<SearchNotesParams>(),
+            parameters: schema::<SearchNotes>(),
         },
         ToolDef {
             name: "get_note".into(),
             description:
                 "Fetch a note by vault-relative path. detail=digest|snippet|full controls the payload size."
                     .into(),
-            parameters: schema::<GetNoteParams>(),
+            parameters: schema::<GetNote>(),
         },
         ToolDef {
             name: "related_notes".into(),
             description:
                 "Top-K notes whose chunks are most semantically similar to a given note."
                     .into(),
-            parameters: schema::<RelatedNotesParams>(),
+            parameters: schema::<RelatedNotes>(),
         },
         ToolDef {
             name: "write_note".into(),
             description: format!(
                 "Create or replace a note's body. Returns the new content hash.{writes_gate_note}"
             ),
-            parameters: schema::<WriteNoteParams>(),
+            parameters: schema::<WriteNote>(),
         },
         ToolDef {
             name: "edit_note".into(),
             description: format!(
                 "Apply one or more span-anchored patches to an existing note. Each old_str must match exactly once unless replace_all=true.{writes_gate_note}"
             ),
-            parameters: schema::<EditNoteParams>(),
+            parameters: schema::<EditNote>(),
         },
         ToolDef {
             name: "set_frontmatter".into(),
             description: format!(
                 "Deep-merge fields into a note's YAML frontmatter (auto-stamps hiker.author=agent-authored).{writes_gate_note}"
             ),
-            parameters: schema::<SetFrontmatterParams>(),
+            parameters: schema::<SetFrontmatter>(),
         },
         ToolDef {
             name: "apply_tag".into(),
             description: format!(
                 "Append a tag to a note's tags frontmatter list (idempotent).{writes_gate_note}"
             ),
-            parameters: schema::<ApplyTagParams>(),
+            parameters: schema::<ApplyTag>(),
         },
         ToolDef {
             name: "remove_tag".into(),
             description: format!(
                 "Remove a tag from a note's tags frontmatter list (no-op if absent).{writes_gate_note}"
             ),
-            parameters: schema::<ApplyTagParams>(),
+            parameters: schema::<ApplyTag>(),
         },
     ];
     if expose_tasks {
@@ -172,27 +172,27 @@ pub fn agent_tool_defs_filtered(
             ToolDef {
                 name: "task_checkout".into(),
                 description: "Take the next eligible task from the work queue, or null if none. Stamps a lease.".into(),
-                parameters: schema::<TaskCheckoutParams>(),
+                parameters: schema::<TaskCheckout>(),
             },
             ToolDef {
                 name: "task_submit".into(),
                 description: "Submit the result for a leased task. Validates against output_schema if any.".into(),
-                parameters: schema::<TaskSubmitParams>(),
+                parameters: schema::<TaskSubmit>(),
             },
             ToolDef {
                 name: "task_fail".into(),
                 description: "Mark a leased task as failed (no auto-requeue).".into(),
-                parameters: schema::<TaskFailParams>(),
+                parameters: schema::<TaskFail>(),
             },
             ToolDef {
                 name: "task_heartbeat".into(),
                 description: "Extend the current lease on a leased task.".into(),
-                parameters: schema::<TaskHeartbeatParams>(),
+                parameters: schema::<TaskHeartbeat>(),
             },
             ToolDef {
                 name: "task_list".into(),
                 description: "List current tasks (read-only) with optional state/kind filters.".into(),
-                parameters: schema::<TaskListParams>(),
+                parameters: schema::<TaskList>(),
             },
         ]);
     }

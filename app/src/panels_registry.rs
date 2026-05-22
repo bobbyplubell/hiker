@@ -56,85 +56,12 @@ impl PanelRegistry {
     }
 }
 
-// ---- Render shims -------------------------------------------------------
-
-fn render_files(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-) {
-    crate::sidebar::files_panel(ui, app, rt);
-}
-
-fn render_clusters(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-) {
-    crate::sidebar::clusters_panel(ui, app, rt);
-}
-
-fn render_trails(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    _rt: &Arc<tokio::runtime::Runtime>,
-) {
-    crate::sidebar::trails_panel(ui, app);
-}
-
-fn render_search(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    _rt: &Arc<tokio::runtime::Runtime>,
-) {
-    egui::ScrollArea::vertical()
-        .id_salt("panel-search-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            crate::panels::search::show(ui, app);
-        });
-}
-
-fn render_related(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    _rt: &Arc<tokio::runtime::Runtime>,
-) {
-    egui::ScrollArea::vertical()
-        .id_salt("panel-related-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            crate::panels::related::show(ui, app);
-        });
-}
-
-fn render_backlinks(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    _rt: &Arc<tokio::runtime::Runtime>,
-) {
-    egui::ScrollArea::vertical()
-        .id_salt("panel-backlinks-scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            crate::panels::backlinks::show(ui, app);
-        });
-}
-
-fn render_chat(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-) {
-    if !app.session.chat_discovered {
-        let vault_root = app.vault_session.vault_root.clone();
-        crate::chat::session::discover(&mut app.session.chat, &vault_root);
-        app.session.chat_discovered = true;
-    }
-    crate::chat::render::show(ui, app, None, crate::chat::render::Layout::SideBar, rt);
-}
-
 // ---- Static panel records -----------------------------------------------
+//
+// The `render` field is `fn(...)` — a bare function pointer. Non-
+// capturing closures coerce to that type, so we use them directly in
+// place of named per-panel render-shim functions (each of which would
+// otherwise be a single-call free fn flagged by `clippy::single_call_fn`).
 
 pub const PANEL_FILES: PanelId = "files";
 pub const PANEL_CLUSTERS: PanelId = "clusters";
@@ -148,43 +75,71 @@ static P_FILES: DockPanel = DockPanel {
     id: PANEL_FILES,
     title: "Files",
     default_side: PanelSide::Left,
-    render: render_files,
+    render: |ui, app, _rt| crate::sidebar::files::FilesView { ui, state: app }.show(),
 };
 static P_CLUSTERS: DockPanel = DockPanel {
     id: PANEL_CLUSTERS,
     title: "Clusters",
     default_side: PanelSide::Left,
-    render: render_clusters,
+    render: |ui, app, _rt| crate::sidebar::PanelRender { ui, state: app }.clusters(),
 };
 static P_TRAILS: DockPanel = DockPanel {
     id: PANEL_TRAILS,
     title: "Trails",
     default_side: PanelSide::Left,
-    render: render_trails,
+    render: |ui, app, _rt| crate::sidebar::PanelRender { ui, state: app }.trails(),
 };
 static P_SEARCH: DockPanel = DockPanel {
     id: PANEL_SEARCH,
     title: "Search",
     default_side: PanelSide::Right,
-    render: render_search,
+    render: |ui, app, _rt| {
+        egui::ScrollArea::vertical()
+            .id_salt("panel-search-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                crate::panels::search::View { ui, app }.show();
+            });
+    },
 };
 static P_RELATED: DockPanel = DockPanel {
     id: PANEL_RELATED,
     title: "Related",
     default_side: PanelSide::Right,
-    render: render_related,
+    render: |ui, app, _rt| {
+        egui::ScrollArea::vertical()
+            .id_salt("panel-related-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                crate::panels::related::View { ui, app }.show();
+            });
+    },
 };
 static P_BACKLINKS: DockPanel = DockPanel {
     id: PANEL_BACKLINKS,
     title: "Backlinks",
     default_side: PanelSide::Right,
-    render: render_backlinks,
+    render: |ui, app, _rt| {
+        egui::ScrollArea::vertical()
+            .id_salt("panel-backlinks-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                crate::panels::backlinks::View { ui, app }.show();
+            });
+    },
 };
 static P_CHAT: DockPanel = DockPanel {
     id: PANEL_CHAT,
     title: "Chat",
     default_side: PanelSide::Right,
-    render: render_chat,
+    render: |ui, app, rt| {
+        if !app.session.chat_discovered {
+            let vault_root = app.vault_session.vault_root.clone();
+            crate::chat::session::discover(&mut app.session.chat, &vault_root);
+            app.session.chat_discovered = true;
+        }
+        crate::chat::render::show(ui, app, None, crate::chat::render::Layout::SideBar, rt);
+    },
 };
 
 static ALL: &[&DockPanel] = &[

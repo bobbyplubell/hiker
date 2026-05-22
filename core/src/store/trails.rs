@@ -1,4 +1,8 @@
-use super::*;
+use rusqlite::params;
+
+use super::error::Error;
+use super::dto::{TrailContainingHit, WaypointRow};
+use super::Store;
 
 impl Store {
     /// Insert or replace one `trail_waypoints` row.
@@ -7,7 +11,7 @@ impl Store {
     pub fn upsert_trail_waypoint(
         &mut self,
         row: &WaypointRow,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), Error> {
         self.conn.execute(
             "INSERT INTO trail_waypoints
                (waypoint_path, waypoint_id, trail_id, source_id, source_path,
@@ -41,7 +45,7 @@ impl Store {
     pub fn delete_trail_waypoints_by_trail(
         &mut self,
         trail_id: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, Error> {
         let n = self.conn.execute(
             "DELETE FROM trail_waypoints WHERE trail_id = ?1",
             params![trail_id],
@@ -55,7 +59,7 @@ impl Store {
     pub fn delete_trail_waypoint_by_path(
         &mut self,
         waypoint_path: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, Error> {
         let n = self.conn.execute(
             "DELETE FROM trail_waypoints WHERE waypoint_path = ?1",
             params![waypoint_path],
@@ -71,7 +75,7 @@ impl Store {
     pub fn trails_containing_note(
         &self,
         note_id_or_path: &str,
-    ) -> Result<Vec<TrailContainingHit>, StoreError> {
+    ) -> Result<Vec<TrailContainingHit>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT trail_id, waypoint_path, waypoint_id, tree_path
              FROM trail_waypoints
@@ -95,7 +99,7 @@ impl Store {
     /// the natural row order matches reading order.
     ///
     /// status: trail-waypoints-derived-table
-    pub fn waypoints_of(&self, trail_id: &str) -> Result<Vec<WaypointRow>, StoreError> {
+    pub fn waypoints_of(&self, trail_id: &str) -> Result<Vec<WaypointRow>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT waypoint_path, waypoint_id, trail_id, source_id, source_path,
                     parent_waypoint_id, tree_path
@@ -130,7 +134,7 @@ impl Store {
         &mut self,
         old_prefix: &str,
         new_prefix: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, Error> {
         // Use SQLite substr() to splice the new prefix in. Length-of-prefix
         // is computed on the server so we don't have to re-bind it.
         let like_pattern = format!("{}%", old_prefix);

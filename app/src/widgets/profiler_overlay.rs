@@ -9,7 +9,9 @@ use eframe::egui;
 
 use crate::state::AppState;
 
-pub fn show(ctx: &egui::Context, state: &mut AppState) {
+impl AppState {
+    pub fn profiler_overlay(&mut self, ctx: &egui::Context) {
+    let state = self;
     if !state.ui.show_profiler {
         return;
     }
@@ -71,5 +73,6 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         });
     if !open {
         state.ui.show_profiler = false;
+    }
     }
 }

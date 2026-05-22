@@ -81,7 +81,7 @@ pub struct SessionMeta {
     pub provider: String,
 }
 
-/// One discoverable session file on disk. Returned by `list_sessions`
+/// One discoverable session file on disk. Returned by `list`
 /// sorted newest-first.
 #[derive(Debug, Clone)]
 pub struct SessionFileInfo {
@@ -92,14 +92,14 @@ pub struct SessionFileInfo {
 }
 
 /// `<vault_root>/.hiker/sessions/`.
-pub fn sessions_dir(vault_root: &Path) -> PathBuf {
+pub fn dir(vault_root: &Path) -> PathBuf {
     vault_root.join(".hiker").join("sessions")
 }
 
 /// `vault/.hiker/sessions/<YYYY-MM-DD>-<id>.md`.
 pub fn session_file_path(vault_root: &Path, id: &SessionId, created_at_unix: i64) -> PathBuf {
     let date = format_date_yyyy_mm_dd(created_at_unix);
-    sessions_dir(vault_root).join(format!("{}-{}.md", date, id.0))
+    dir(vault_root).join(format!("{}-{}.md", date, id.0))
 }
 
 /// Vault-relative path matching `session_file_path`'s on-disk shape.
@@ -115,16 +115,31 @@ pub fn session_rel_path(id: &SessionId, created_at_unix: i64) -> String {
 /// over the directory (creates if missing); errors if the file already
 /// exists so a duplicate id is loud rather than silent.
 pub fn create_session_file(vault_root: &Path, meta: &SessionMeta) -> io::Result<PathBuf> {
-    let dir = sessions_dir(vault_root);
+    let dir = dir(vault_root);
     fs::create_dir_all(&dir)?;
     let path = session_file_path(vault_root, &meta.id, meta.created_at_unix);
     if path.exists() {
         return Ok(path);
     }
+    let iso_created_at = {
+        // Minimal ISO 8601 in UTC. Same civil-from-days math as
+        // `format_date_yyyy_mm_dd`; we tack on hh:mm:ss for the time-of-day.
+        let day_secs = meta.created_at_unix.rem_euclid(86_400);
+        let h = day_secs / 3_600;
+        let m = (day_secs % 3_600) / 60;
+        let s = day_secs % 60;
+        format!(
+            "{}T{:02}:{:02}:{:02}Z",
+            format_date_yyyy_mm_dd(meta.created_at_unix),
+            h,
+            m,
+            s
+        )
+    };
     let header = format!(
         "---\nhiker.session_id: {}\nhiker.created_at: {}\nhiker.model: {}\nhiker.provider: {}\n---\n\n",
         meta.id.0,
-        format_iso_8601(meta.created_at_unix),
+        iso_created_at,
         meta.model,
         meta.provider,
     );
@@ -222,8 +237,8 @@ pub fn append_turn_structured(
 /// Discover all session files under `<vault>/.hiker/sessions/`, sorted
 /// newest-first by filesystem mtime. Empty when the directory doesn't
 /// exist yet.
-pub fn list_sessions(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
-    let dir = sessions_dir(vault_root);
+pub fn list(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
+    let dir = dir(vault_root);
     let read = match fs::read_dir(&dir) {
         Ok(r) => r,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -235,7 +250,26 @@ pub fn list_sessions(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        let Some(id) = parse_id_from_filename(&path) else { continue };
+        // `<YYYY-MM-DD>-<id>` — the id is everything after the third '-'.
+        let id_opt = (|| -> Option<SessionId> {
+            let stem = path.file_stem()?.to_str()?;
+            let mut hyphens = 0;
+            let mut idx = 0;
+            for (i, ch) in stem.char_indices() {
+                if ch == '-' {
+                    hyphens += 1;
+                    if hyphens == 3 {
+                        idx = i + 1;
+                        break;
+                    }
+                }
+            }
+            if idx == 0 || idx >= stem.len() {
+                return None;
+            }
+            Some(SessionId(stem[idx..].to_string()))
+        })();
+        let Some(id) = id_opt else { continue };
         let mtime = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -262,7 +296,7 @@ pub fn list_sessions(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
 /// Most recent session file (newest mtime) or `None` if the dir is
 /// empty / absent.
 pub fn most_recent_session(vault_root: &Path) -> io::Result<Option<SessionFileInfo>> {
-    let mut all = list_sessions(vault_root)?;
+    let mut all = list(vault_root)?;
     Ok(if all.is_empty() { None } else { Some(all.swap_remove(0)) })
 }
 
@@ -316,7 +350,25 @@ pub fn resumed_turns_to_history(turns: &[ResumedTurn]) -> Vec<Message> {
 /// from the agent prose so callers can render the text cleanly.
 pub fn parse_session(path: &Path) -> io::Result<Vec<ResumedTurn>> {
     let body = fs::read_to_string(path)?;
-    let body = strip_frontmatter(&body);
+    let body = {
+        // Inline strip_frontmatter.
+        let mut lines = body.split_inclusive('\n');
+        match lines.next() {
+            Some(first) if first.trim_end() == "---" => {
+                let mut consumed = first.len();
+                let mut result: &str = &body;
+                for line in lines {
+                    consumed += line.len();
+                    if line.trim_end() == "---" {
+                        result = &body[consumed..];
+                        break;
+                    }
+                }
+                result
+            }
+            _ => &body,
+        }
+    };
     let mut turns: Vec<ResumedTurn> = Vec::new();
     let mut current_section: Option<&'static str> = None; // "user" | "agent"
     let mut text_buf = String::new();
@@ -429,42 +481,6 @@ fn flush_section(
     }
 }
 
-fn strip_frontmatter(body: &str) -> &str {
-    let mut lines = body.split_inclusive('\n');
-    let Some(first) = lines.next() else { return body };
-    if first.trim_end() != "---" {
-        return body;
-    }
-    let mut consumed = first.len();
-    for line in lines {
-        consumed += line.len();
-        if line.trim_end() == "---" {
-            return &body[consumed..];
-        }
-    }
-    body
-}
-
-fn parse_id_from_filename(path: &Path) -> Option<SessionId> {
-    let stem = path.file_stem()?.to_str()?;
-    // `<YYYY-MM-DD>-<id>` — the id is everything after the third '-'.
-    let mut hyphens = 0;
-    let mut idx = 0;
-    for (i, ch) in stem.char_indices() {
-        if ch == '-' {
-            hyphens += 1;
-            if hyphens == 3 {
-                idx = i + 1;
-                break;
-            }
-        }
-    }
-    if idx == 0 || idx >= stem.len() {
-        return None;
-    }
-    Some(SessionId(stem[idx..].to_string()))
-}
-
 fn format_date_yyyy_mm_dd(unix_secs: i64) -> String {
     // Civil-from-days algorithm (Howard Hinnant, public domain). Avoids
     // pulling chrono / time just for a YYYY-MM-DD stamp.
@@ -480,22 +496,6 @@ fn format_date_yyyy_mm_dd(unix_secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
-fn format_iso_8601(unix_secs: i64) -> String {
-    // Minimal ISO 8601 in UTC. Same civil-from-days math as the date
-    // formatter; we tack on hh:mm:ss derived from the time-of-day.
-    let day_secs = unix_secs.rem_euclid(86_400);
-    let h = day_secs / 3_600;
-    let m = (day_secs % 3_600) / 60;
-    let s = day_secs % 60;
-    format!(
-        "{}T{:02}:{:02}:{:02}Z",
-        format_date_yyyy_mm_dd(unix_secs),
-        h,
-        m,
-        s
-    )
 }
 
 #[cfg(test)]
@@ -658,7 +658,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(&p2, fs::read(&p2).unwrap()).unwrap();
         let _ = p1;
-        let list = list_sessions(dir.path()).unwrap();
+        let list = list(dir.path()).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id.0, "bbb");
     }
@@ -666,6 +666,24 @@ mod tests {
     #[test]
     fn parse_id_strips_date_prefix() {
         let p = PathBuf::from("/x/.hiker/sessions/2026-05-08-abc123def.md");
-        assert_eq!(parse_id_from_filename(&p).unwrap().0, "abc123def");
+        let parse = |path: &Path| -> Option<SessionId> {
+            let stem = path.file_stem()?.to_str()?;
+            let mut hyphens = 0;
+            let mut idx = 0;
+            for (i, ch) in stem.char_indices() {
+                if ch == '-' {
+                    hyphens += 1;
+                    if hyphens == 3 {
+                        idx = i + 1;
+                        break;
+                    }
+                }
+            }
+            if idx == 0 || idx >= stem.len() {
+                return None;
+            }
+            Some(SessionId(stem[idx..].to_string()))
+        };
+        assert_eq!(parse(&p).unwrap().0, "abc123def");
     }
 }

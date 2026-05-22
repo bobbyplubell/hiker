@@ -69,7 +69,24 @@ impl Rope {
         if s.is_empty() {
             return Self::new();
         }
-        Self { tree: SumTree::from_items(split_into_chunks(s)) }
+        let mut chunks: Vec<Chunk> = Vec::with_capacity(s.len() / CHUNK_MIN + 1);
+        let mut start = 0;
+        while start < s.len() {
+            let mut end = (start + CHUNK_MAX).min(s.len());
+            while end > start && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                // Pathological: a single char larger than CHUNK_MAX. Take it whole.
+                end = start + 1;
+                while end < s.len() && !s.is_char_boundary(end) {
+                    end += 1;
+                }
+            }
+            chunks.push(Chunk(SmolStr::from(&s[start..end])));
+            start = end;
+        }
+        Self { tree: SumTree::from_items(&chunks) }
     }
 
     pub fn len_bytes(&self) -> usize {
@@ -116,7 +133,7 @@ impl Rope {
         if byte == 0 {
             return 0;
         }
-        let seek = self.tree.seek(byte as u32, |s| s.bytes);
+        let seek = self.tree.seek(&(byte as u32), |s| s.bytes);
         let mut chars = seek.before.chars as usize;
         if let Some(chunk) = seek.item {
             let local = byte - seek.before.bytes as usize;
@@ -131,7 +148,7 @@ impl Rope {
         if ch == 0 {
             return 0;
         }
-        let seek = self.tree.seek(ch as u32, |s| s.chars);
+        let seek = self.tree.seek(&(ch as u32), |s| s.chars);
         let bytes = seek.before.bytes as usize;
         if let Some(chunk) = seek.item {
             let want = ch - seek.before.chars as usize;
@@ -151,7 +168,7 @@ impl Rope {
         if byte == 0 {
             return 0;
         }
-        let seek = self.tree.seek(byte as u32, |s| s.bytes);
+        let seek = self.tree.seek(&(byte as u32), |s| s.bytes);
         let mut lines = seek.before.lines as usize;
         if let Some(chunk) = seek.item {
             let local = byte - seek.before.bytes as usize;
@@ -173,7 +190,7 @@ impl Rope {
         }
         // Find the chunk containing the (line-1)th newline (0-indexed).
         let target = (line - 1) as u32;
-        let seek = self.tree.seek(target, |s| s.lines);
+        let seek = self.tree.seek(&target, |s| s.lines);
         let chunk = seek.item.expect("line < len_lines so a chunk must exist");
         let nth = (line - 1) - seek.before.lines as usize;
         let mut count = 0usize;
@@ -193,12 +210,12 @@ impl Rope {
         if byte == 0 {
             return 0;
         }
-        let seek = self.tree.seek(byte as u32, |s| s.bytes);
+        let seek = self.tree.seek(&(byte as u32), |s| s.bytes);
         let mut u = seek.before.utf16 as usize;
         if let Some(chunk) = seek.item {
             let local = byte - seek.before.bytes as usize;
             assert!(chunk.0.is_char_boundary(local), "byte offset not on char boundary");
-            u += chunk.0[..local].chars().map(|c| c.len_utf16()).sum::<usize>();
+            u += chunk.0[..local].chars().map(char::len_utf16).sum::<usize>();
         }
         u
     }
@@ -208,7 +225,7 @@ impl Rope {
         if utf16 == 0 {
             return 0;
         }
-        let seek = self.tree.seek(utf16 as u32, |s| s.utf16);
+        let seek = self.tree.seek(&(utf16 as u32), |s| s.utf16);
         let bytes = seek.before.bytes as usize;
         if let Some(chunk) = seek.item {
             let want = utf16 - seek.before.utf16 as usize;
@@ -238,7 +255,7 @@ impl Rope {
         }
 
         // Find the chunk containing `byte`.
-        let seek = self.tree.seek(byte as u32, |s| s.bytes);
+        let seek = self.tree.seek(&(byte as u32), |s| s.bytes);
         let chunk = seek.item.expect("byte < len, chunk must exist");
         let chunk_start = seek.before.bytes as usize;
         let local = byte - chunk_start;
@@ -251,7 +268,7 @@ impl Rope {
         let (left_tree, right_tree) = self
             .tree
             .clone()
-            .split(chunk_start as u32, |s| s.bytes);
+            .split(&(chunk_start as u32), |s| s.bytes);
 
         // Now the boundary chunk is the leftmost chunk of `right_tree`.
         // Slice it into (left_piece, right_piece) and rejoin.
@@ -268,7 +285,7 @@ impl Rope {
         // which is NOT strictly greater, so it stays in `boundary_only`
         // (left side). The next chunk pushes us past, moving it into
         // `rest_right`.
-        let (boundary_only, rest_right) = right_tree.split(chunk_len as u32, |s| s.bytes);
+        let (boundary_only, rest_right) = right_tree.split(&(chunk_len as u32), |s| s.bytes);
         // `boundary_only` now holds exactly the boundary chunk. Re-slice it.
         let boundary_chunk = boundary_only
             .iter()
@@ -290,14 +307,14 @@ impl Rope {
     /// Append a single chunk on the right. Used internally at split seams.
     fn push_chunk(&self, chunk: Chunk) -> Rope {
         let one = Rope {
-            tree: SumTree::from_items(vec![chunk]),
+            tree: SumTree::from_items(&[chunk]),
         };
         self.clone().concat(one)
     }
 
     fn prepend_chunk(&self, chunk: Chunk) -> Rope {
         let one = Rope {
-            tree: SumTree::from_items(vec![chunk]),
+            tree: SumTree::from_items(&[chunk]),
         };
         one.concat(self.clone())
     }
@@ -339,7 +356,7 @@ impl Rope {
             let self_len = self.len_bytes();
             let last_chunk_len = last_left_str.len();
             let (self_head, _dropped) = self.tree.clone().split(
-                (self_len - last_chunk_len) as u32,
+                &((self_len - last_chunk_len) as u32),
                 |s| s.bytes,
             );
             // Drop the leading chunk from `other`. target = first_chunk_len
@@ -349,11 +366,11 @@ impl Rope {
             let (_dropped2, other_tail) = other
                 .tree
                 .clone()
-                .split(first_chunk_len as u32, |s| s.bytes);
+                .split(&(first_chunk_len as u32), |s| s.bytes);
             let mut merged = String::with_capacity(combined_len);
             merged.push_str(&last_left_str);
             merged.push_str(&first_right_str);
-            let mid_tree = SumTree::from_items(vec![Chunk(SmolStr::from(merged))]);
+            let mid_tree = SumTree::from_items(&[Chunk(SmolStr::from(merged))]);
             let left = self_head.concat(mid_tree);
             let joined = left.concat(other_tail);
             return Rope { tree: joined };
@@ -440,7 +457,7 @@ impl Rope {
     /// Raw byte at `byte`. Panics if `byte >= len_bytes`.
     pub fn byte_at(&self, byte: usize) -> u8 {
         assert!(byte < self.len_bytes());
-        let seek = self.tree.seek(byte as u32, |s| s.bytes);
+        let seek = self.tree.seek(&(byte as u32), |s| s.bytes);
         let chunk = seek.item.expect("byte in range so chunk must exist");
         let local = byte - seek.before.bytes as usize;
         chunk.0.as_bytes()[local]
@@ -456,7 +473,7 @@ impl Rope {
         }
         let mut p = byte + 1;
         // Locate chunk containing `p` (or `byte` if `p == len`).
-        let mut seek = self.tree.seek(p.min(len.saturating_sub(1)) as u32, |s| s.bytes);
+        let mut seek = self.tree.seek(&(p.min(len.saturating_sub(1)) as u32), |s| s.bytes);
         let mut chunk_start = seek.before.bytes as usize;
         let mut chunk_bytes: &[u8] = seek.item.map(|c| c.0.as_bytes()).unwrap_or(&[]);
         loop {
@@ -464,7 +481,7 @@ impl Rope {
                 return len;
             }
             if p >= chunk_start + chunk_bytes.len() {
-                seek = self.tree.seek(p as u32, |s| s.bytes);
+                seek = self.tree.seek(&(p as u32), |s| s.bytes);
                 chunk_start = seek.before.bytes as usize;
                 chunk_bytes = seek.item.map(|c| c.0.as_bytes()).unwrap_or(&[]);
                 if chunk_bytes.is_empty() {
@@ -487,7 +504,7 @@ impl Rope {
             return 0;
         }
         let mut p = byte - 1;
-        let mut seek = self.tree.seek(p as u32, |s| s.bytes);
+        let mut seek = self.tree.seek(&(p as u32), |s| s.bytes);
         let mut chunk_start = seek.before.bytes as usize;
         let mut chunk_bytes: &[u8] = seek.item.map(|c| c.0.as_bytes()).unwrap_or(&[]);
         loop {
@@ -503,7 +520,7 @@ impl Rope {
             }
             p -= 1;
             if p < chunk_start {
-                seek = self.tree.seek(p as u32, |s| s.bytes);
+                seek = self.tree.seek(&(p as u32), |s| s.bytes);
                 chunk_start = seek.before.bytes as usize;
                 chunk_bytes = seek.item.map(|c| c.0.as_bytes()).unwrap_or(&[]);
             }
@@ -551,27 +568,6 @@ impl std::fmt::Debug for Rope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Rope").field(&self.to_string()).finish()
     }
-}
-
-fn split_into_chunks(s: &str) -> Vec<Chunk> {
-    let mut out = Vec::with_capacity(s.len() / CHUNK_MIN + 1);
-    let mut start = 0;
-    while start < s.len() {
-        let mut end = (start + CHUNK_MAX).min(s.len());
-        while end > start && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            // Pathological: a single char larger than CHUNK_MAX. Take it whole.
-            end = start + 1;
-            while end < s.len() && !s.is_char_boundary(end) {
-                end += 1;
-            }
-        }
-        out.push(Chunk(SmolStr::from(&s[start..end])));
-        start = end;
-    }
-    out
 }
 
 #[cfg(test)]

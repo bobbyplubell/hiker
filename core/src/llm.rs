@@ -27,10 +27,10 @@ use llm::error::LLMError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{LlmConfig, LlmLimitsConfig, LlmProviderConfig};
+use crate::config::sections::{LlmConfig, LlmLimitsConfig, LlmProviderConfig};
 
 #[derive(Debug, Error)]
-pub enum LlmError {
+pub enum Error {
     #[error("unknown backend: {0}")]
     UnknownBackend(String),
     #[error("missing api key: env var {0} is unset")]
@@ -50,9 +50,9 @@ pub enum LlmError {
     Unsupported { feature: &'static str },
 }
 
-impl From<LLMError> for LlmError {
+impl From<LLMError> for Error {
     fn from(e: LLMError) -> Self {
-        LlmError::Provider(e.to_string())
+        Error::Provider(e.to_string())
     }
 }
 
@@ -173,7 +173,7 @@ pub enum AgentChunk {
 }
 
 pub type ToolStream =
-    Pin<Box<dyn Stream<Item = Result<AgentChunk, LlmError>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<AgentChunk, Error>> + Send>>;
 
 /// Connection-shaped config for a provider. Mirrors the `[provider]` table
 /// in `vault/.hiker/llm.toml` (see `llm-providers-config`); this struct is
@@ -203,7 +203,7 @@ pub struct ProviderConfig {
 /// Stream item type for `chat_stream`: text deltas as they arrive from the
 /// provider. Errors mid-stream surface as `Err`; the consumer decides
 /// whether to abort the turn.
-pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send>>;
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String, Error>> + Send>>;
 
 /// Narrow, opaque generative-LLM interface. The concrete implementation
 /// (graniet/`llm` today, possibly a different multi-provider crate or a
@@ -212,10 +212,10 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send
 /// agent loop uses `chat_stream` so the chat panel can render tokens as
 /// they arrive.
 #[async_trait]
-pub trait LlmClient: Send + Sync {
-    async fn chat(&self, messages: &[Message]) -> Result<String, LlmError>;
+pub trait Client: Send + Sync {
+    async fn chat(&self, messages: &[Message]) -> Result<String, Error>;
 
-    async fn chat_stream(&self, messages: &[Message]) -> Result<ChatStream, LlmError>;
+    async fn chat_stream(&self, messages: &[Message]) -> Result<ChatStream, Error>;
 
     /// Tool-aware single-shot completion used by the basic agent loop.
     /// Default impl errors so non-tool clients (e.g. the mock) don't have
@@ -224,8 +224,8 @@ pub trait LlmClient: Send + Sync {
         &self,
         _messages: &[Message],
         _tools: &[ToolDef],
-    ) -> Result<ToolChatResponse, LlmError> {
-        Err(LlmError::Unsupported { feature: "chat_with_tools" })
+    ) -> Result<ToolChatResponse, Error> {
+        Err(Error::Unsupported { feature: "chat_with_tools" })
     }
 
     /// Tool-aware streaming. Same input as `chat_with_tools`, but emits an
@@ -235,8 +235,8 @@ pub trait LlmClient: Send + Sync {
         &self,
         _messages: &[Message],
         _tools: &[ToolDef],
-    ) -> Result<ToolStream, LlmError> {
-        Err(LlmError::Unsupported { feature: "chat_stream_with_tools" })
+    ) -> Result<ToolStream, Error> {
+        Err(Error::Unsupported { feature: "chat_stream_with_tools" })
     }
 }
 
@@ -249,7 +249,7 @@ pub struct GraniteLlmClient {
 }
 
 impl GraniteLlmClient {
-    pub fn new(cfg: ProviderConfig) -> Result<Self, LlmError> {
+    pub fn new(cfg: ProviderConfig) -> Result<Self, Error> {
         // Validate the backend name early so a misconfigured TOML fails at
         // client construction rather than on the first chat call.
         parse_backend(&cfg.backend)?;
@@ -259,7 +259,7 @@ impl GraniteLlmClient {
     /// Build a `ProviderConfig` from a loaded `[llm]` section. Empty
     /// strings in `api_key_env` / `base_url` map to `None` (the TOML
     /// auto-create writes them as empty strings).
-    pub fn from_config(cfg: &LlmConfig) -> Result<Self, LlmError> {
+    pub fn from_config(cfg: &LlmConfig) -> Result<Self, Error> {
         Self::new(provider_config_from(&cfg.provider, &cfg.limits))
     }
 
@@ -267,7 +267,7 @@ impl GraniteLlmClient {
         &self,
         system_prompt: Option<&str>,
         tools: &[ToolDef],
-    ) -> Result<Box<dyn llm::LLMProvider>, LlmError> {
+    ) -> Result<Box<dyn llm::LLMProvider>, Error> {
         let backend = parse_backend(&self.cfg.backend)?;
         let mut b = LLMBuilder::new()
             .backend(backend)
@@ -282,7 +282,7 @@ impl GraniteLlmClient {
             b = b.api_key(literal.to_string());
         } else if let Some(env_var) = &self.cfg.api_key_env {
             let key = std::env::var(env_var)
-                .map_err(|_| LlmError::MissingApiKey(env_var.clone()))?;
+                .map_err(|_| Error::MissingApiKey(env_var.clone()))?;
             b = b.api_key(key);
         }
         if let Some(url) = &self.cfg.base_url {
@@ -305,7 +305,7 @@ impl GraniteLlmClient {
             );
         }
 
-        b.build().map_err(|e| LlmError::Build(e.to_string()))
+        b.build().map_err(|e| Error::Build(e.to_string()))
     }
 }
 
@@ -333,21 +333,21 @@ fn empty_to_none(s: &str) -> Option<String> {
 }
 
 #[async_trait]
-impl LlmClient for GraniteLlmClient {
-    async fn chat(&self, messages: &[Message]) -> Result<String, LlmError> {
+impl Client for GraniteLlmClient {
+    async fn chat(&self, messages: &[Message]) -> Result<String, Error> {
         let (system, rest) = split_system(messages);
         let provider = self.build_provider(system.as_deref(), &[])?;
         let chat_msgs = to_chat_messages(rest);
         let resp = provider.chat(&chat_msgs).await?;
-        resp.text().ok_or(LlmError::EmptyResponse)
+        resp.text().ok_or(Error::EmptyResponse)
     }
 
-    async fn chat_stream(&self, messages: &[Message]) -> Result<ChatStream, LlmError> {
+    async fn chat_stream(&self, messages: &[Message]) -> Result<ChatStream, Error> {
         let (system, rest) = split_system(messages);
         let provider = self.build_provider(system.as_deref(), &[])?;
         let chat_msgs = to_chat_messages(rest);
         let inner = provider.chat_stream(&chat_msgs).await?;
-        let mapped = inner.map(|item| item.map_err(LlmError::from));
+        let mapped = inner.map(|item| item.map_err(Error::from));
         Ok(Box::pin(mapped))
     }
 
@@ -355,7 +355,7 @@ impl LlmClient for GraniteLlmClient {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
-    ) -> Result<ToolChatResponse, LlmError> {
+    ) -> Result<ToolChatResponse, Error> {
         let (system, rest) = split_system(messages);
         let provider = self.build_provider(system.as_deref(), tools)?;
         let chat_msgs = to_chat_messages(rest);
@@ -382,7 +382,7 @@ impl LlmClient for GraniteLlmClient {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
-    ) -> Result<ToolStream, LlmError> {
+    ) -> Result<ToolStream, Error> {
         use llm::chat::StreamChunk;
         let (system, rest) = split_system(messages);
         let provider = self.build_provider(system.as_deref(), tools)?;
@@ -412,15 +412,15 @@ impl LlmClient for GraniteLlmClient {
                 }
                 StreamChunk::Done { stop_reason } => AgentChunk::Done { stop_reason },
             }),
-            Err(e) => Err(LlmError::from(e)),
+            Err(e) => Err(Error::from(e)),
         });
         Ok(Box::pin(mapped))
     }
 }
 
-fn parse_backend(name: &str) -> Result<LLMBackend, LlmError> {
+fn parse_backend(name: &str) -> Result<LLMBackend, Error> {
     name.parse::<LLMBackend>()
-        .map_err(|_| LlmError::UnknownBackend(name.to_string()))
+        .map_err(|_| Error::UnknownBackend(name.to_string()))
 }
 
 /// Split off any leading `Role::System` messages, concatenated newline-wise,
@@ -512,13 +512,13 @@ impl MockLlmClient {
 }
 
 #[async_trait]
-impl LlmClient for MockLlmClient {
-    async fn chat(&self, _messages: &[Message]) -> Result<String, LlmError> {
+impl Client for MockLlmClient {
+    async fn chat(&self, _messages: &[Message]) -> Result<String, Error> {
         Ok(self.response.clone())
     }
 
-    async fn chat_stream(&self, _messages: &[Message]) -> Result<ChatStream, LlmError> {
-        let chunks: Vec<Result<String, LlmError>> = self
+    async fn chat_stream(&self, _messages: &[Message]) -> Result<ChatStream, Error> {
+        let chunks: Vec<Result<String, Error>> = self
             .response
             .as_bytes()
             .chunks(8)
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn parse_backend_unknown_errors() {
         match parse_backend("not-a-backend") {
-            Err(LlmError::UnknownBackend(name)) => assert_eq!(name, "not-a-backend"),
+            Err(Error::UnknownBackend(name)) => assert_eq!(name, "not-a-backend"),
             other => panic!("expected UnknownBackend, got {other:?}"),
         }
     }
@@ -581,7 +581,7 @@ mod tests {
             max_tokens: None,
             timeout_secs: None,
         };
-        assert!(matches!(GraniteLlmClient::new(cfg), Err(LlmError::UnknownBackend(_))));
+        assert!(matches!(GraniteLlmClient::new(cfg), Err(Error::UnknownBackend(_))));
     }
 
     #[test]

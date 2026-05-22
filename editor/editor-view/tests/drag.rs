@@ -8,11 +8,20 @@
 //! - mouse Up with the drop caret outside the original range moves the
 //!   text and selects the inserted copy.
 
-use editor_core::{ChangeSet, EditorState, SelRange, Selection, Transaction};
-use editor_view::command::{handle_mouse_with_mods, Action};
-use editor_view::event::{Modifiers, MouseButton, MouseEvent};
-use editor_view::view::{DragState, ViewState};
+use editor_core::change::Set as ChangeSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::SelRange;
 
+use editor_core::selection::Selection;
+
+use editor_core::transaction::Transaction;
+use editor_view::command::handle_mouse_with_mods;
+use editor_view::command::Action;
+use editor_view::events::Modifiers;
+use editor_view::events::MouseButton;
+use editor_view::events::MouseEvent;
+use editor_view::viewport::DragState;
+use editor_view::viewport::ViewState;
 /// Build a view sized so the x-to-byte mapping in `view_to_buffer` is
 /// roughly one pixel per character (gutter = 0, char_w ≈ font_size * 0.55).
 fn make_view() -> ViewState {

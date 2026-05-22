@@ -21,5 +21,3 @@ pub trait Chunker: Send + Sync {
     fn chunk(&self, source: &str) -> Vec<Chunk>;
 }
 
-pub use markdown::{chunk_markdown, MarkdownChunker};
-pub use txt::{chunk_txt, TxtChunker};

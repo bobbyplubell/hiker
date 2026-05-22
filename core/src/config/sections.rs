@@ -4,11 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-pub(super) fn yes() -> bool {
+pub(super) const fn yes() -> bool {
     true
 }
 
-pub(super) fn no() -> bool {
+pub(super) const fn no() -> bool {
     false
 }
 
@@ -63,7 +63,7 @@ pub struct TriageConfig {
     pub modified_rerun_cosine_guard: f32,
 }
 
-fn default_modified_rerun_cosine_guard() -> f32 {
+const fn default_modified_rerun_cosine_guard() -> f32 {
     0.15
 }
 
@@ -111,7 +111,7 @@ impl Default for StagingConfig {
     }
 }
 
-fn default_staging_retention_days() -> u32 {
+const fn default_staging_retention_days() -> u32 {
     14
 }
 
@@ -199,7 +199,7 @@ impl TasksConfig {
     /// Grace window the direct worker waits before becoming eligible for
     /// a newly-queued task, per `worker_preference`. `internal` = 0,
     /// `auto` = 1s, `external` = 5s.
-    pub fn direct_grace(&self) -> std::time::Duration {
+    pub const fn direct_grace(&self) -> std::time::Duration {
         match self.worker_preference {
             WorkerPreferenceCfg::Internal => std::time::Duration::from_secs(0),
             WorkerPreferenceCfg::Auto => std::time::Duration::from_secs(1),
@@ -253,19 +253,19 @@ impl Default for LeaseConfig {
     }
 }
 
-fn default_terminal_retention_secs() -> u64 {
+const fn default_terminal_retention_secs() -> u64 {
     60
 }
 
-fn default_direct_parallelism() -> u8 {
+const fn default_direct_parallelism() -> u8 {
     1
 }
 
-fn default_lease_default_secs() -> u64 {
+const fn default_lease_default_secs() -> u64 {
     60
 }
 
-fn default_lease_max_secs() -> u64 {
+const fn default_lease_max_secs() -> u64 {
     600
 }
 
@@ -429,19 +429,19 @@ fn default_llm_model() -> String {
     "claude-sonnet-4-7".to_string()
 }
 
-fn default_llm_max_tokens() -> u32 {
+const fn default_llm_max_tokens() -> u32 {
     4096
 }
 
-fn default_llm_timeout_secs() -> u64 {
+const fn default_llm_timeout_secs() -> u64 {
     60
 }
 
-fn default_iteration_cap() -> u32 {
+const fn default_iteration_cap() -> u32 {
     10
 }
 
-fn default_tool_timeout_secs() -> u64 {
+const fn default_tool_timeout_secs() -> u64 {
     30
 }
 
@@ -603,7 +603,7 @@ fn default_mcp_discovery_file() -> String {
     ".hiker/mcp.json".to_string()
 }
 
-fn default_mcp_max_top_k() -> u32 {
+const fn default_mcp_max_top_k() -> u32 {
     50
 }
 
@@ -675,8 +675,8 @@ impl Default for SearchSemanticConfig {
     }
 }
 
-fn default_min_similarity() -> f32 { 0.0 }
-fn default_semantic_top_k() -> u32 { 25 }
+const fn default_min_similarity() -> f32 { 0.0 }
+const fn default_semantic_top_k() -> u32 { 25 }
 
 /// Recency-bias weighting for the semantic engine. `Off` = no recency
 /// blend (default); `Mild` / `Strong` mix mtime rank into the score via
@@ -691,7 +691,7 @@ pub enum RecencyBias {
 }
 
 impl RecencyBias {
-    pub fn weight(self) -> f32 {
+    pub const fn weight(self) -> f32 {
         match self {
             RecencyBias::Off => 0.0,
             RecencyBias::Mild => 0.5,
@@ -871,11 +871,11 @@ pub struct MinimapConfig {
     pub color_viewport_hover: String,
 }
 
-fn minimap_default_width() -> u16 { 72 }
-fn minimap_default_pad() -> u16 { 5 }
-fn minimap_default_radius() -> u16 { 1 }
-fn minimap_default_min_bar_w() -> u16 { 2 }
-fn minimap_default_bar_gap_tenths() -> u16 { 5 }
+const fn minimap_default_width() -> u16 { 72 }
+const fn minimap_default_pad() -> u16 { 5 }
+const fn minimap_default_radius() -> u16 { 1 }
+const fn minimap_default_min_bar_w() -> u16 { 2 }
+const fn minimap_default_bar_gap_tenths() -> u16 { 5 }
 fn minimap_default_color_heading() -> String { "#3c7adc".into() }
 fn minimap_default_color_code() -> String { "#3c95c5".into() }
 fn minimap_default_color_emphasis() -> String { "#c98a3c".into() }
@@ -960,15 +960,15 @@ fn default_model() -> String {
     "bge-small-en-v1.5".to_string()
 }
 
-fn default_batch_size() -> u16 {
+const fn default_batch_size() -> u16 {
     64
 }
 
-fn default_tab_size() -> u8 {
+const fn default_tab_size() -> u8 {
     2
 }
 
-fn default_scroll_speed() -> f32 {
+const fn default_scroll_speed() -> f32 {
     2.5
 }
 
@@ -1042,15 +1042,15 @@ impl Default for VaultConfig {
     }
 }
 
-fn default_chat_height() -> f32 {
+const fn default_chat_height() -> f32 {
     0.30
 }
 
-fn default_sidebar_width() -> u32 {
+const fn default_sidebar_width() -> u32 {
     280
 }
 
-fn default_discovery_width() -> u32 {
+const fn default_discovery_width() -> u32 {
     320
 }
 

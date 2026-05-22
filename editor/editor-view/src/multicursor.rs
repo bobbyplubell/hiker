@@ -1,8 +1,10 @@
 //! Multi-cursor commands: add cursor at click, add next occurrence of the
 //! current selection, vertical column expansion.
 
-use editor_core::{EditorState, SelRange, Selection};
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::SelRange;
 
+use editor_core::selection::Selection;
 /// Add a cursor at `pos` to the existing selection.
 pub fn add_cursor(state: &EditorState, pos: usize) -> Selection {
     let mut ranges: Vec<SelRange> = state.selection.ranges().to_vec();
@@ -32,7 +34,10 @@ pub fn add_vertical_cursor(state: &EditorState, down: bool) -> Selection {
     let new_line_start = state.doc.line_to_byte(new_line_idx);
     let new_line_len = state.doc.line_len_bytes(new_line_idx);
     let mut new_head = new_line_start + col.min(new_line_len);
-    while new_head > new_line_start && !is_char_boundary(&state.doc, new_head) {
+    while new_head > new_line_start
+        && new_head < state.doc.len_bytes()
+        && (state.doc.byte_at(new_head) & 0b1100_0000) == 0b1000_0000
+    {
         new_head -= 1;
     }
 
@@ -48,7 +53,19 @@ pub fn add_next_occurrence(state: &EditorState) -> Selection {
     let main = state.selection.main();
     if main.is_empty() {
         // Promote to word selection.
-        return select_word_at(state, main.head.offset());
+        use unicode_segmentation::UnicodeSegmentation;
+        let pos = main.head.offset();
+        let line = state.doc.byte_to_line(pos);
+        let line_start = state.doc.line_to_byte(line);
+        let text = state.doc.line_str(line);
+        let local = pos - line_start;
+        for (i, w) in text.unicode_word_indices() {
+            let end = i + w.len();
+            if local >= i && local <= end {
+                return Selection::from_range(SelRange::new(line_start + i, line_start + end));
+            }
+        }
+        return state.selection.clone();
     }
     let needle = state.doc.slice(main.range()).to_string();
     if needle.is_empty() {
@@ -123,24 +140,3 @@ pub fn selection_occurrences(
     out
 }
 
-fn select_word_at(state: &EditorState, pos: usize) -> Selection {
-    use unicode_segmentation::UnicodeSegmentation;
-    let line = state.doc.byte_to_line(pos);
-    let line_start = state.doc.line_to_byte(line);
-    let text = state.doc.line_str(line);
-    let local = pos - line_start;
-    for (i, w) in text.unicode_word_indices() {
-        let end = i + w.len();
-        if local >= i && local <= end {
-            return Selection::from_range(SelRange::new(line_start + i, line_start + end));
-        }
-    }
-    state.selection.clone()
-}
-
-fn is_char_boundary(doc: &editor_core::Rope, byte: usize) -> bool {
-    if byte == 0 || byte >= doc.len_bytes() {
-        return true;
-    }
-    (doc.byte_at(byte) & 0b1100_0000) != 0b1000_0000
-}

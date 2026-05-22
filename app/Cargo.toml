@@ -34,6 +34,7 @@ egui.workspace = true
 egui_extras.workspace = true
 egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { workspace = true, features = ["serde"] }
+graph-widgets.workspace = true
 eframe.workspace = true
 petgraph.workspace = true
 rfd.workspace = true

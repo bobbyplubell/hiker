@@ -215,7 +215,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
     - **Open** — opens the note in the editor (same as a single click; included for discoverability and to give right-click a non-destructive default).
     - **Rename** — enters inline-rename mode (same as double-click).
     - **Delete** — calls `delete_note` after a confirm modal. Delete is *not* permanent: the file is moved into the vault's trash (see "Delete semantics" below). Modal text reflects this: "Move `<path>` to trash?" for files; "Move `<path>` and N notes inside it to trash?" for folders. Two buttons: Cancel (default focus) and Move to trash (red-ish, but not as alarming as a true delete). No "don't ask again" bypass — keep the friction since most people deleting a note from a tree mean to. [tree-context-delete]
-    - **Properties** — opens a `properties`-kind tab for the note (per `tab-kinds` and the "Note properties tab" section below). Read-only inspector of every piece of data hiker stores about the note across `index.db` and `changes.db`. [tree-context-properties]
+    - **Properties** — opens a `properties`-kind tab for the note (per `tab-kinds` and the "Note properties tab" section below). Read-only inspector of every piece of data hiker stores about the note across `index.db` and the op log. [tree-context-properties]
 
     Right-click on **empty space below the tree** opens a smaller menu with one entry — **New note here** — which is equivalent to clicking the toolbar's + New note while no folder is selected.
 
@@ -354,7 +354,7 @@ Per-mode populators live in `ui/src/main.ts` — `renderSnapshotControls(diffAct
 
 ### Dirty-buffer Diff toggle
 
-A diff toggle lives in the editor toolbar (just right of Save). Greyed when the buffer is clean *and* no other diff source is selected (nothing to diff against). Click toggles the editor tab's `diff` mode against the current `DiffSource` (see `diff.md` `diff-as-mode` and `diff-source-enum`); the default source is `Disk(path)` — the live buffer vs. last-loaded content. The flip is non-destructive: the buffer's `current` is unchanged, decorations are layered on top; toggling off restores cursor + selection. **Right-click opens a source picker** — a small context menu offering: `Diff against on-disk`, `Show changes…` (submenu of recent `changes.db` rows for this path), and future sources (snapshot, another open buffer). Selecting a source switches the tab's `DiffSource` and turns diff mode on. [editor-diff-vs-disk-toggle, editor-show-changes-menu]
+A diff toggle lives in the editor toolbar (just right of Save). Greyed when the buffer is clean *and* no other diff source is selected (nothing to diff against). Click toggles the editor tab's `diff` mode against the current `DiffSource` (see `diff.md` `diff-as-mode` and `diff-source-enum`); the default source is `Disk(path)` — the live buffer vs. last-loaded content. The flip is non-destructive: the buffer's `current` is unchanged, decorations are layered on top; toggling off restores cursor + selection. **Right-click opens a source picker** — a small context menu offering: `Diff against on-disk`, `Show changes…` (submenu of recent op-log rows for this path), and future sources (snapshot, another open buffer). Selecting a source switches the tab's `DiffSource` and turns diff mode on. [editor-diff-vs-disk-toggle, editor-show-changes-menu]
 
 Why this lives here, not in some mutation-specific surface: any time the user wants to compare the buffer against some other version of itself — current vs. disk, current vs. an earlier snapshot, current vs. another open buffer — the same affordance covers it. One toggle, one source picker, every comparison.
 
@@ -365,11 +365,11 @@ Constraints:
 
 ### Show changes menu
 
-The right-click context menu on the diff toggle (and the buffer's body, when no selection is active) carries a `Show changes…` entry whose submenu lists recent `changes.db` rows for the active buffer's path, newest first. Selecting a row sets the tab's `DiffSource = ChangesDb(change_id)` and turns diff mode on; the buffer's `current` text stays put, and `agent_base` (if any) is unaffected. [editor-show-changes-menu]
+The right-click context menu on the diff toggle (and the buffer's body, when no selection is active) carries a `Show changes…` entry whose submenu lists recent op-log rows for the active buffer's path (via `core::changes`), newest first. Selecting a row sets the tab's `DiffSource = ChangeRow(op_id)` and turns diff mode on; the buffer's `current` text stays put, and `agent_base` (if any) is unaffected. [editor-show-changes-menu]
 
-- **Submenu shape.** Up to 20 recent rows. Each row shows timestamp (relative + absolute on hover), op (`saved` / `agent-applied` / `restored` / `import` / etc.), and author. Final row: `Browse all… → ` opens the `home-detail { which: activity-row { path } }` tab filtered to this path (per `vault-home-recent-activity-detail`).
-- **Per-hunk restore.** When the diff source is `ChangesDb(id)`, hunks carry a `Restore this hunk` overlay verb (owner `Snapshot` per `diff.md`'s `diff-layer-owner`). Restore writes the historical text for that hunk's range into `current` and lets the user save through the normal path. Full-snapshot restore stays on the row-level surface (`vault-home-recent-activity-detail`), unchanged.
-- **No URI scheme.** The diff resolves directly through `core::changes::content_at(change_id)`; the editor crate doesn't go through a custom URI provider.
+- **Submenu shape.** Up to 20 recent rows. Each row shows timestamp (relative + absolute on hover), op kind (`created` / `modified` / `deleted` / `renamed`), and author. Final row: `Browse all… → ` opens the `home-detail { which: activity-row { path } }` tab filtered to this path (per `vault-home-recent-activity-detail`).
+- **Per-hunk restore.** When the diff source is `ChangeRow(op_id)`, hunks carry a `Restore this hunk` overlay verb (owner `Snapshot` per `diff.md`'s `diff-layer-owner`). Restore writes the historical text for that hunk's range into `current` and lets the user save through the normal path. Full-snapshot restore stays on the row-level surface (`vault-home-recent-activity-detail`), unchanged.
+- **No URI scheme.** The diff resolves directly through `core::changes::materialization_at(op_id)`; the editor crate doesn't go through a custom URI provider.
 
 
 ## View options menu
@@ -642,7 +642,7 @@ Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (
 
 ### Note properties tab
 
-Right-click → Properties on a tree row opens a `properties`-kind tab for that note. The tab is a read-only inspector of every piece of state hiker tracks for the note across `index.db` and `changes.db` — the answer to "what does hiker actually know about this file." Useful for debugging skip reasons, sanity-checking embedder version drift, auditing the change log without opening recent activity, and confirming trail / cluster membership. Frontmatter editing is **not** part of this tab; the in-place frontmatter editor (`tree-context-properties-frontmatter-editing`) is a separate future surface that will eventually layer in as a section once a frontmatter-editing primitive exists.
+Right-click → Properties on a tree row opens a `properties`-kind tab for that note. The tab is a read-only inspector of every piece of state hiker tracks for the note across `index.db` and the op log — the answer to "what does hiker actually know about this file." Useful for debugging skip reasons, sanity-checking embedder version drift, auditing the change log without opening recent activity, and confirming trail / cluster membership. Frontmatter editing is **not** part of this tab; the in-place frontmatter editor (`tree-context-properties-frontmatter-editing`) is a separate future surface that will eventually layer in as a section once a frontmatter-editing primitive exists.
 
 The headline decisions:
 

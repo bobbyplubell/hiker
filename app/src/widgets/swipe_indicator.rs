@@ -1,5 +1,5 @@
 //! Browser-style swipe-progress overlay. While a two-finger horizontal
-//! swipe is accumulating in `keybinds::handle_swipe_nav`, paint a
+//! swipe is accumulating in `keybinds::handle`, paint a
 //! chevron + progress fill on the appropriate edge of the central area
 //! so the user gets feedback before the threshold trips.
 //!
@@ -18,7 +18,9 @@ const PILL_WIDTH: f32 = 56.0;
 const PILL_HEIGHT: f32 = 96.0;
 const EDGE_MARGIN: f32 = 8.0;
 
-pub fn show(ctx: &egui::Context, state: &AppState) {
+impl AppState {
+    pub fn swipe_indicator_overlay(&self, ctx: &egui::Context) {
+    let state = self;
     let accum = state.session.nav.swipe_accum_x;
     if accum.abs() < 0.5 {
         return;
@@ -137,4 +139,5 @@ pub fn show(ctx: &egui::Context, state: &AppState) {
     };
     painter.line_segment([p0, p1], stroke);
     painter.line_segment([p1, p2], stroke);
+    }
 }

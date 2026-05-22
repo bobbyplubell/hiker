@@ -1,4 +1,11 @@
-use super::*;
+use rusqlite::params;
+
+use super::error::Error;
+use super::dto::{
+    basename_of, strip_indexable_extension, title_from_path, AtSuggestion, ChunkHit, RelatedHit,
+};
+use super::vec::knn_chunks_on;
+use super::Store;
 
 impl Store {
     /// Notes whose basename (filename minus extension) loosely matches the
@@ -17,7 +24,7 @@ impl Store {
         &self,
         prefix: &str,
         limit: usize,
-    ) -> Result<Vec<AtSuggestion>, StoreError> {
+    ) -> Result<Vec<AtSuggestion>, Error> {
         let limit = limit.max(1) as i64;
         // SQL pulls all non-skipped rows ordered by recency; Rust filters by
         // basename + ranks. The basename match is awkward in pure SQL (no
@@ -57,7 +64,25 @@ impl Store {
 
         Ok(scored
             .into_iter()
-            .map(|(_, _, path, last)| AtSuggestion::from_path(path, last))
+            .map(|(_, _, path, last)| {
+                let basename_full = basename_of(&path).to_string();
+                let stem = strip_indexable_extension(&basename_full).to_string();
+                let parent_dir = match path.rfind('/') {
+                    Some(i) => path[..i].to_string(),
+                    None => String::new(),
+                };
+                let rel_path = if parent_dir.is_empty() {
+                    stem.clone()
+                } else {
+                    format!("{parent_dir}/{stem}")
+                };
+                AtSuggestion {
+                    rel_path,
+                    basename: stem,
+                    parent_dir,
+                    last_accessed_at: last,
+                }
+            })
             .collect())
     }
 
@@ -71,7 +96,7 @@ impl Store {
         &self,
         source_note_id: &str,
         top_k: usize,
-    ) -> Result<Vec<RelatedHit>, StoreError> {
+    ) -> Result<Vec<RelatedHit>, Error> {
         // Pull source note's chunk embeddings. We use `chunk_vecs` directly
         // so we don't have to round-trip embeddings through Rust types.
         let mut stmt = self.conn.prepare(
@@ -145,7 +170,19 @@ impl Store {
             .into_iter()
             .map(|h| {
                 let title = title_from_path(&h.note_path);
-                let snippet = snippet_from(&h.text);
+                let snippet = {
+                    let collapsed: String = h.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if collapsed.len() <= 200 {
+                        collapsed
+                    } else {
+                        let cutoff = collapsed
+                            .char_indices()
+                            .nth(200)
+                            .map(|(i, _)| i)
+                            .unwrap_or(collapsed.len());
+                        format!("{}…", &collapsed[..cutoff])
+                    }
+                };
                 RelatedHit {
                     note_id: h.note_id,
                     path: h.note_path,
@@ -165,7 +202,7 @@ impl Store {
         query: &[f32],
         top_k: usize,
         exclude_note_id: Option<&str>,
-    ) -> Result<Vec<ChunkHit>, StoreError> {
+    ) -> Result<Vec<ChunkHit>, Error> {
         knn_chunks_on(&self.conn, query, top_k, exclude_note_id)
     }
 }

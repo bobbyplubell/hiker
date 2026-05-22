@@ -11,13 +11,13 @@
 
 use eframe::egui;
 
-use hiker_core::search::SearchModes;
+use hiker_core::search::Modes;
 
 use crate::editor_pane;
 use crate::state::AppState;
 use crate::theme;
 
-pub struct SearchState {
+pub struct State {
     pub query: String,
     /// Cached card-shaped results from the last query.
     pub results: Vec<DiscoveryHit>,
@@ -81,32 +81,30 @@ pub struct DiscoveryHit {
     pub chunk_index: u32,
 }
 
-impl SearchState {
+impl State {
     /// Seed the in-memory state from persisted vault settings. Defaults
     /// match the spec — both modes on, no lexical flags, no min-similarity.
-    pub fn from_config(cfg: &hiker_core::config::Config) -> Self {
-        Self {
-            lexical_on: cfg.search.modes.lexical,
-            semantic_on: cfg.search.modes.semantic,
-            results_expanded: cfg.search.sections.results_expanded,
-            lexical_opts: hiker_core::search::LexicalOpts {
-                case_sensitive: cfg.search.lexical.case_sensitive,
-                diacritic_sensitive: cfg.search.lexical.diacritic_sensitive,
-                prefix_match: cfg.search.lexical.prefix_match,
-                phrase_mode: cfg.search.lexical.phrase_mode,
-                top_k: 0, // 0 = defer to UI's `limit` slider
-            },
-            semantic_opts: hiker_core::search::SemanticOpts {
-                min_similarity: cfg.search.semantic.min_similarity,
-                top_k: cfg.search.semantic.top_k,
-                recency_bias: cfg.search.semantic.recency_bias,
-            },
-            ..Self::default()
-        }
+    pub const fn with_config(mut self, cfg: &hiker_core::config::Config) -> Self {
+        self.lexical_on = cfg.search.modes.lexical;
+        self.semantic_on = cfg.search.modes.semantic;
+        self.results_expanded = cfg.search.sections.results_expanded;
+        self.lexical_opts = hiker_core::search::LexicalOpts {
+            case_sensitive: cfg.search.lexical.case_sensitive,
+            diacritic_sensitive: cfg.search.lexical.diacritic_sensitive,
+            prefix_match: cfg.search.lexical.prefix_match,
+            phrase_mode: cfg.search.lexical.phrase_mode,
+            top_k: 0, // 0 = defer to UI's `limit` slider
+        };
+        self.semantic_opts = hiker_core::search::SemanticOpts {
+            min_similarity: cfg.search.semantic.min_similarity,
+            top_k: cfg.search.semantic.top_k,
+            recency_bias: cfg.search.semantic.recency_bias,
+        };
+        self
     }
 }
 
-impl Default for SearchState {
+impl Default for State {
     fn default() -> Self {
         Self {
             query: String::new(),
@@ -133,7 +131,7 @@ const SEARCH_DEBOUNCE_MS: u64 = 250;
 /// Persist a search-related setting through `core::config::Config::set`
 /// (per `search-mode-state-persisted`). Best-effort: a write failure logs
 /// and is otherwise silent, so the option still applies in-session.
-pub(crate) fn persist_search_setting(app: &AppState, key: &str, value: serde_json::Value) {
+pub(crate) fn persist_search_setting(app: &AppState, key: &str, value: &serde_json::Value) {
     crate::state::set_setting_quiet(
         app,
         hiker_core::config::SettingsScope::Vault,
@@ -143,71 +141,32 @@ pub(crate) fn persist_search_setting(app: &AppState, key: &str, value: serde_jso
     );
 }
 
-/// After opening a buffer, position its selection at the start of
-/// `chunk_index`. The indexer chunks at heading boundaries, so we walk
-/// `core::chunker` over the live buffer text to recover the byte offset.
-/// No-op when the buffer isn't open yet.
-pub(crate) fn scroll_to_chunk(app: &mut AppState, rel: &str, chunk_index: u32) {
-    if chunk_index == 0 {
-        return;
-    }
-    let Some(buffer) = app.session.buffers.get_mut(rel) else {
-        return;
-    };
-    let text = buffer.editor.doc.to_string();
-    // The chunker produces ordered chunks; we just need the byte offset
-    // at the requested index.
-    let chunks = hiker_core::chunker::chunk_markdown(&text);
-    let Some(target) = chunks.get(chunk_index as usize) else {
-        return;
-    };
-    let byte_offset = target.byte_start;
-    buffer.editor.selection = editor_core::Selection::single(byte_offset);
-    // No public reveal-byte API on the view yet; the next render pass
-    // sees the cursor on the right byte and the editor's scroll-to-
-    // selection behavior handles the rest. A targeted reveal-byte helper
-    // can land later without touching this site.
+/// Per-frame render context for the search panel. Bundling `ui` + `app`
+/// lets the panel's render steps be inherent methods rather than a row
+/// of single-use free functions.
+pub(crate) struct View<'a> {
+    pub(crate) ui: &'a mut egui::Ui,
+    pub(crate) app: &'a mut AppState,
 }
 
-/// Wrap the existing `result_card` so the active row is rendered with an
-/// accent stroke for keyboard navigation feedback. Keeps the original
-/// click semantics untouched.
-fn result_card_with_highlight(
-    ui: &mut egui::Ui,
-    hit: &DiscoveryHit,
-    allow_context: bool,
-    highlighted: bool,
-) -> CardAction {
-    if highlighted {
-        let frame = egui::Frame::default()
-            .stroke(egui::Stroke::new(2.0, theme::accent()))
-            .inner_margin(egui::Margin::same(1));
-        let mut action = CardAction::None;
-        frame.show(ui, |ui| {
-            action = result_card(ui, hit, allow_context);
-        });
-        action
-    } else {
-        result_card(ui, hit, allow_context)
+impl View<'_> {
+    pub(crate) fn show(&mut self) {
+        self.search_input_and_run();
+        self.ui.add_space(8.0);
+        self.results_section();
     }
-}
-
-pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
-    search_input_and_run(ui, app);
-    ui.add_space(8.0);
-    results_section(ui, app);
 }
 
 /// All search-mode toggles, per-mode option pickers, and the
 /// Limit/Types/Order filters. Lifted out of the inline header rows and
-/// served from a right-click on the search icon. Caller sets `run_search`
+/// served from a right-click on the search icon. Caller sets `run`
 /// when any control changes so the panel re-fires the query.
 fn search_options_menu(
     ui: &mut egui::Ui,
     app: &mut AppState,
-    run_search: &mut bool,
+    run: &mut bool,
 ) {
-    use hiker_core::config::RecencyBias;
+    use hiker_core::config::sections::RecencyBias;
 
     // Mode toggles.
     ui.label(egui::RichText::new("Modes").strong().small());
@@ -216,30 +175,30 @@ fn search_options_menu(
         .on_hover_text("Substring / token matches from the index")
         .changed()
     {
-        *run_search = true;
+        *run = true;
     }
     if ui
         .checkbox(&mut app.panels.search.semantic_on, "Semantic")
         .on_hover_text("Embedding-based similarity")
         .changed()
     {
-        *run_search = true;
+        *run = true;
     }
     ui.horizontal(|ui| {
         if ui.small_button("Only lexical").clicked() {
             app.panels.search.lexical_on = true;
             app.panels.search.semantic_on = false;
-            *run_search = true;
+            *run = true;
         }
         if ui.small_button("Only semantic").clicked() {
             app.panels.search.semantic_on = true;
             app.panels.search.lexical_on = false;
-            *run_search = true;
+            *run = true;
         }
         if ui.small_button("Both").clicked() {
             app.panels.search.lexical_on = true;
             app.panels.search.semantic_on = true;
-            *run_search = true;
+            *run = true;
         }
     });
 
@@ -264,11 +223,11 @@ fn search_options_menu(
     }
     if lex_changed {
         app.panels.search.lexical_opts = lex;
-        persist_search_setting(app, "search.lexical.case_sensitive", serde_json::json!(lex.case_sensitive));
-        persist_search_setting(app, "search.lexical.diacritic_sensitive", serde_json::json!(lex.diacritic_sensitive));
-        persist_search_setting(app, "search.lexical.prefix_match", serde_json::json!(lex.prefix_match));
-        persist_search_setting(app, "search.lexical.phrase_mode", serde_json::json!(lex.phrase_mode));
-        *run_search = true;
+        persist_search_setting(app, "search.lexical.case_sensitive", &serde_json::json!(lex.case_sensitive));
+        persist_search_setting(app, "search.lexical.diacritic_sensitive", &serde_json::json!(lex.diacritic_sensitive));
+        persist_search_setting(app, "search.lexical.prefix_match", &serde_json::json!(lex.prefix_match));
+        persist_search_setting(app, "search.lexical.phrase_mode", &serde_json::json!(lex.phrase_mode));
+        *run = true;
     }
 
     ui.separator();
@@ -299,7 +258,7 @@ fn search_options_menu(
         persist_search_setting(
             app,
             "search.semantic.min_similarity",
-            serde_json::json!(sem.min_similarity),
+            &serde_json::json!(sem.min_similarity),
         );
         let bias_str = match sem.recency_bias {
             RecencyBias::Off => "off",
@@ -309,9 +268,9 @@ fn search_options_menu(
         persist_search_setting(
             app,
             "search.semantic.recency_bias",
-            serde_json::json!(bias_str),
+            &serde_json::json!(bias_str),
         );
-        *run_search = true;
+        *run = true;
     }
 
     ui.separator();
@@ -321,7 +280,7 @@ fn search_options_menu(
         let mut limit = app.panels.search.limit;
         if ui.add(egui::Slider::new(&mut limit, 5..=100)).changed() {
             app.panels.search.limit = limit;
-            *run_search = true;
+            *run = true;
         }
     });
     ui.horizontal(|ui| {
@@ -332,7 +291,7 @@ fn search_options_menu(
                 .desired_width(140.0),
         );
         if resp.lost_focus() {
-            *run_search = true;
+            *run = true;
         }
     });
     ui.horizontal(|ui| {
@@ -351,7 +310,7 @@ fn search_options_menu(
             });
         if new_order != cur {
             app.panels.search.order_by = new_order;
-            *run_search = true;
+            *run = true;
         }
     });
 }
@@ -359,8 +318,11 @@ fn search_options_menu(
 /// Render the search input row (icon + text edit + keyboard nav), honour
 /// the typeahead debounce, and fire the search when the debounce window
 /// closes or Enter is pressed.
-fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
-    let mut run_search = false;
+impl View<'_> {
+    fn search_input_and_run(&mut self) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
+    let mut run = false;
     let mut run_search_immediate = false;
     ui.horizontal(|ui| {
         // Magnifying glass doubles as the options menu trigger
@@ -368,10 +330,10 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
         // Semantic toggles + their options, Limit, Types, Order) live
         // inside this popup so the panel header stays one line tall.
         let icon_resp = ui
-            .add(crate::icons::search().sense(egui::Sense::click()))
+            .add(crate::icons::ICONS.image(crate::icons::Icon::Search).sense(egui::Sense::click()))
             .on_hover_text("Right-click for search options");
         icon_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run_search);
+            search_options_menu(ui, app, &mut run);
         });
         let resp = ui.add(
             egui::TextEdit::singleline(&mut app.panels.search.query)
@@ -389,12 +351,12 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
             persist_search_setting(
                 app,
                 "search.modes.lexical",
-                serde_json::json!(app.panels.search.lexical_on),
+                &serde_json::json!(app.panels.search.lexical_on),
             );
-            run_search = true;
+            run = true;
         }
         lex_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run_search);
+            search_options_menu(ui, app, &mut run);
         });
         let sem_on = app.panels.search.semantic_on;
         let sem_resp = ui
@@ -405,12 +367,12 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
             persist_search_setting(
                 app,
                 "search.modes.semantic",
-                serde_json::json!(app.panels.search.semantic_on),
+                &serde_json::json!(app.panels.search.semantic_on),
             );
-            run_search = true;
+            run = true;
         }
         sem_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run_search);
+            search_options_menu(ui, app, &mut run);
         });
         if app.panels.search.focus_query_next_frame {
             app.panels.search.focus_query_next_frame = false;
@@ -464,7 +426,7 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
         if deadline.elapsed().as_millis() as u64 >= SEARCH_DEBOUNCE_MS {
             app.panels.search.pending_query_at = None;
             if app.panels.search.query != app.panels.search.last_fired_query {
-                run_search = true;
+                run = true;
             }
         } else {
             // Ensure egui repaints once the debounce window expires so
@@ -477,25 +439,34 @@ fn search_input_and_run(ui: &mut egui::Ui, app: &mut AppState) {
     }
     if run_search_immediate {
         app.panels.search.pending_query_at = None;
-        run_search = true;
+        run = true;
     }
+    // Drop the local reborrow so the run block below can take `self`
+    // again (needed by `run_query`).
+    let _ = (ui, app);
     // Search-mode toggles + advanced filters live in the magnifying-glass
     // context menu (see `search_options_menu`); the header stays minimal.
-    if run_search {
-        let q = app.panels.search.query.clone();
-        app.panels.search.query_epoch = app.panels.search.query_epoch.wrapping_add(1);
-        app.panels.search.last_fired_query = q.clone();
-        app.panels.search.results = run_query(app, &q);
+    if run {
+        let q = self.app.panels.search.query.clone();
+        self.app.panels.search.query_epoch =
+            self.app.panels.search.query_epoch.wrapping_add(1);
+        self.app.panels.search.last_fired_query = q.clone();
+        let results = self.run_query(&q);
+        self.app.panels.search.results = results;
         // Reset row selection so the next ↓ press doesn't land in
         // stale territory.
-        app.panels.search.selected_row = None;
+        self.app.panels.search.selected_row = None;
+    }
     }
 }
 
-/// Render the collapsible Results section: filename-fallback badge, the
-/// grouped hit list, and the Open/Copy/Reveal actions emitted by the
-/// per-row cards.
-fn results_section(ui: &mut egui::Ui, app: &mut AppState) {
+impl View<'_> {
+    /// Render the collapsible Results section: filename-fallback badge, the
+    /// grouped hit list, and the Open/Copy/Reveal actions emitted by the
+    /// per-row cards.
+    fn results_section(&mut self) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
     // Results section — collapsible header per
     // `search-section-collapse-persisted`. The header click toggles the
     // expanded state and persists it to vault settings so the layout
@@ -526,7 +497,7 @@ fn results_section(ui: &mut egui::Ui, app: &mut AppState) {
         persist_search_setting(
             app,
             "search.sections.results_expanded",
-            serde_json::json!(app.panels.search.results_expanded),
+            &serde_json::json!(app.panels.search.results_expanded),
         );
     }
     if !app.panels.search.results_expanded {
@@ -563,12 +534,20 @@ fn results_section(ui: &mut egui::Ui, app: &mut AppState) {
         let first = idxs[0];
         let hit = &results[first];
         let highlighted = Some(first) == selected;
-        let action = result_card_with_highlight(
-            ui,
-            hit,
-            /*allow_context=*/ true,
-            highlighted,
-        );
+        // Active row gets an accent stroke for keyboard-nav feedback;
+        // otherwise render the plain card.
+        let action = if highlighted {
+            let frame = egui::Frame::default()
+                .stroke(egui::Stroke::new(2.0, theme::accent()))
+                .inner_margin(egui::Margin::same(1));
+            let mut action = CardAction::None;
+            frame.show(ui, |ui| {
+                action = result_card(ui, hit, /*allow_context=*/ true);
+            });
+            action
+        } else {
+            result_card(ui, hit, /*allow_context=*/ true)
+        };
         match action {
             CardAction::None => {}
             CardAction::Open { sticky } => {
@@ -601,7 +580,20 @@ fn results_section(ui: &mut egui::Ui, app: &mut AppState) {
     }
     if let Some((rel, sticky, chunk_index)) = to_open {
         editor_pane::open_file(app, &rel, sticky);
-        scroll_to_chunk(app, &rel, chunk_index);
+        // Position the buffer selection at the start of `chunk_index`.
+        // The indexer chunks at heading boundaries, so we re-chunk the
+        // live buffer text to recover the byte offset. No-op when the
+        // buffer isn't open yet or the chunk is the first one.
+        if chunk_index != 0
+            && let Some(buffer) = app.session.buffers.get_mut(&rel)
+        {
+            let text = buffer.editor.doc.to_string();
+            let chunks = hiker_core::chunker::markdown::chunk(&text);
+            if let Some(target) = chunks.get(chunk_index as usize) {
+                buffer.editor.selection =
+                    editor_core::selection::Selection::single(target.byte_start);
+            }
+        }
     }
     if let Some(path) = copy {
         ui.ctx().copy_text(path);
@@ -633,9 +625,12 @@ fn results_section(ui: &mut egui::Ui, app: &mut AppState) {
                 .small(),
         );
     }
+    }
 }
 
-fn run_query(app: &AppState, q: &str) -> Vec<DiscoveryHit> {
+impl View<'_> {
+    fn run_query(&self, q: &str) -> Vec<DiscoveryHit> {
+    let app = &*self.app;
     if q.is_empty() {
         return Vec::new();
     }
@@ -643,7 +638,7 @@ fn run_query(app: &AppState, q: &str) -> Vec<DiscoveryHit> {
 
     // Each mode honours the user's toggle; semantic additionally requires
     // the embedder to be loaded.
-    let mut modes = SearchModes {
+    let mut modes = Modes {
         lexical: app.panels.search.lexical_on,
         semantic: false,
     };
@@ -723,6 +718,7 @@ fn run_query(app: &AppState, q: &str) -> Vec<DiscoveryHit> {
         return apply_post_filters(app, filename_search(app, q));
     }
     apply_post_filters(app, out)
+    }
 }
 
 /// Apply source-types filter, order-by sort, and the global limit cap.
@@ -741,7 +737,7 @@ fn apply_post_filters(app: &AppState, mut hits: Vec<DiscoveryHit>) -> Vec<Discov
                 .path
                 .rsplit('.')
                 .next()
-                .map(|s| s.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
             exts.iter().any(|e| e == &ext)
         });
@@ -882,8 +878,30 @@ pub(crate) fn result_card(
             // `search-result-row` so users can see WHY the chunk matched.
             if !hit.snippet.trim().is_empty() {
                 ui.add_space(2.0);
+                // Split the snippet into plain text and `<mark>`-wrapped
+                // runs so the highlighted portions get a yellow
+                // background. Unbalanced `<mark>` opens trail off as plain.
+                let mut segments: Vec<MarkPart<'_>> = Vec::new();
+                let mut rest = hit.snippet.as_str();
+                while let Some(open) = rest.find("<mark>") {
+                    if open > 0 {
+                        segments.push(MarkPart::Plain(&rest[..open]));
+                    }
+                    let after = &rest[open + 6..];
+                    if let Some(close) = after.find("</mark>") {
+                        segments.push(MarkPart::Highlighted(&after[..close]));
+                        rest = &after[close + 7..];
+                    } else {
+                        segments.push(MarkPart::Plain(after));
+                        rest = "";
+                        break;
+                    }
+                }
+                if !rest.is_empty() {
+                    segments.push(MarkPart::Plain(rest));
+                }
                 ui.horizontal_wrapped(|ui| {
-                    for part in split_mark_segments(&hit.snippet) {
+                    for part in segments {
                         match part {
                             MarkPart::Plain(s) if !s.is_empty() => {
                                 ui.label(egui::RichText::new(s).small());
@@ -944,29 +962,4 @@ fn strip_mark_tokens(s: &str) -> String {
 enum MarkPart<'a> {
     Plain(&'a str),
     Highlighted(&'a str),
-}
-
-/// Walk a snippet string, splitting it into plain text and `<mark>`-wrapped
-/// runs so the renderer can style the highlighted portions with a yellow
-/// background. Unbalanced `<mark>` opens trail off as plain text.
-fn split_mark_segments(s: &str) -> Vec<MarkPart<'_>> {
-    let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(open) = rest.find("<mark>") {
-        if open > 0 {
-            out.push(MarkPart::Plain(&rest[..open]));
-        }
-        let after = &rest[open + 6..];
-        if let Some(close) = after.find("</mark>") {
-            out.push(MarkPart::Highlighted(&after[..close]));
-            rest = &after[close + 7..];
-        } else {
-            out.push(MarkPart::Plain(after));
-            return out;
-        }
-    }
-    if !rest.is_empty() {
-        out.push(MarkPart::Plain(rest));
-    }
-    out
 }

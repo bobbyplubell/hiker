@@ -1,9 +1,13 @@
 use super::*;
+use super::ops::{
+    on_note_moved, append_waypoint, create_trail, delete_trail, remove_waypoint,
+    set_append_cursor, AppendWaypointArgs, AppendWaypointOutcome,
+};
 
-use crate::config::TrailsConfig;
+use crate::config::sections::TrailsConfig;
 use crate::trash::Trash;
 use crate::watcher::Watcher;
-use crate::store::new_id;
+use crate::store::dto::new_id;
 
 fn dl(id: &str, path: &str) -> DoubleLinkRef {
     DoubleLinkRef {
@@ -12,32 +16,40 @@ fn dl(id: &str, path: &str) -> DoubleLinkRef {
     }
 }
 
+/// The varying half of an `append_waypoint` call: which trail doc to
+/// append into, the source note being captured, and the optional
+/// explicit parent / annotation. The environment half (watcher, jobs,
+/// vault, changes, store) is passed separately and tends to be reused
+/// across several appends in a single test.
+struct AppendWaypointRequest<'a> {
+    trail_doc_rel: &'a str,
+    source_rel: &'a str,
+    parent_waypoint_id: Option<&'a str>,
+    annotation: Option<&'a str>,
+}
+
 /// Test-only convenience for the common shape used by the
-/// `append_waypoint` call sites in this file. Mirrors the pre-refactor
-/// positional signature; constructs `AppendWaypointArgs` so the
-/// existing tests stay short.
-#[allow(clippy::too_many_arguments)]
+/// `append_waypoint` call sites in this file. Constructs
+/// `AppendWaypointArgs` from the test environment + a per-call
+/// `AppendWaypointRequest` so the existing tests stay short.
 async fn append_waypoint_test<'a>(
     watcher: &'a Watcher,
     jobs: &'a crate::indexer::IndexJobTx,
     vault: &'a crate::vault::Vault,
     changes: Option<&'a std::sync::Arc<crate::changes::Changes>>,
     store: &'a mut crate::store::Store,
-    trail_doc_rel: &'a str,
-    source_rel: &'a str,
-    parent_waypoint_id: Option<&'a str>,
-    annotation: Option<&'a str>,
-) -> Result<AppendWaypointOutcome, crate::error::HikerError> {
+    req: AppendWaypointRequest<'a>,
+) -> Result<AppendWaypointOutcome, crate::errors::HikerError> {
     append_waypoint(AppendWaypointArgs {
         watcher,
         jobs,
         vault,
         changes,
         store,
-        trail_doc_rel,
-        source_rel,
-        parent_waypoint_id,
-        annotation,
+        trail_doc_rel: req.trail_doc_rel,
+        source_rel: req.source_rel,
+        parent_waypoint_id: req.parent_waypoint_id,
+        annotation: req.annotation,
     })
     .await
 }
@@ -181,7 +193,7 @@ fn parse_waypoint_round_trip() {
 fn parse_trail_doc_for_rejects_non_markdown() {
     let src = "---\nhiker:\n  kind: trail\n  id: 01HTRAIL\n---\n";
     let err = parse_trail_doc_for("trails/my-trail.txt", src).unwrap_err();
-    assert!(matches!(err, TrailsError::NotMarkdown(_)));
+    assert!(matches!(err, Error::NotMarkdown(_)));
     assert!(parse_trail_doc_for("trails/my-trail.md", src).is_ok());
 }
 
@@ -189,7 +201,7 @@ fn parse_trail_doc_for_rejects_non_markdown() {
 fn parse_trail_doc_rejects_wrong_kind() {
     let src = "---\nhiker:\n  kind: waypoint\n  id: 01HWP\n---\n";
     let err = parse_trail_doc(src).unwrap_err();
-    assert!(matches!(err, TrailsError::KindMismatch { expected: "trail", .. }));
+    assert!(matches!(err, Error::KindMismatch { expected: "trail", .. }));
 }
 
 #[test]
@@ -206,12 +218,14 @@ fn write_trail_doc_preserves_unknown_hiker_siblings() {
 // status: trail-empty-waypoint-body
 #[test]
 fn empty_waypoint_note_has_zero_bytes_after_closing_fm() {
-    let src = empty_waypoint_note(
-        "01HWP",
-        &dl("01HSRC", "research/raptor.md"),
-        &dl("01HTRAIL", "trails/my-trail.md"),
-    )
-    .unwrap();
+    let src = {
+        let fm = crate::trails::WaypointFrontmatter {
+            id: "01HWP".to_string(),
+            references: dl("01HSRC", "research/raptor.md"),
+            in_trail: dl("01HTRAIL", "trails/my-trail.md"),
+        };
+        crate::trails::write_waypoint_frontmatter("", &fm).unwrap()
+    };
     // The body must end at the closing `---\n` with no further bytes.
     // (This is the "clean canvas" invariant from the spec.)
     let body_start = src.find("---\n").unwrap();
@@ -237,9 +251,10 @@ fn write_trail_doc_preserves_top_level_non_hiker_fields() {
 // Ops tests (slice 2)
 // -----------------------------------------------------------------
 
-use crate::embed::{EmbedError, Embedder};
-use crate::indexer::{start_indexer, IndexerHandle};
-use crate::store::{NoteUpsert, Store};
+use crate::embed::{Error as EmbedError, Embedder};
+use crate::indexer::{self, Handle};
+use crate::store::dto::NoteUpsert;
+use crate::store::Store;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -260,8 +275,8 @@ fn open_vault(td: &TempDir) -> Vault {
     Vault::open(td.path()).expect("open vault")
 }
 
-fn start(vault: Vault, store: Store) -> IndexerHandle {
-    start_indexer(vault, store, || {
+fn start_indexer(vault: Vault, store: Store) -> Handle {
+    indexer::start(vault, store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     })
 }
@@ -272,7 +287,7 @@ async fn create_trail_writes_trail_doc_and_seeds_waypoints_dir() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     let cfg = TrailsConfig {
         new_trail_dir: "trails/".into(),
@@ -304,7 +319,7 @@ async fn append_waypoint_writes_waypoint_and_updates_trail_doc() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -318,15 +333,8 @@ async fn append_waypoint_writes_waypoint_and_updates_trail_doc() {
     std::fs::write(td.path().join("research/raptor.md"), "body").unwrap();
 
     let out = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "research/raptor.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "research/raptor.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -369,7 +377,7 @@ async fn append_waypoint_adopts_indexer_path_id_for_source() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut prog = idx.subscribe_progress();
     use crate::indexer::ProgressEvent;
     // Drain ModelLoaded.
@@ -418,15 +426,8 @@ async fn append_waypoint_adopts_indexer_path_id_for_source() {
     .unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "notes/source.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/source.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -469,7 +470,7 @@ async fn remove_waypoint_drops_entry_and_moves_waypoint_to_trash() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     let cfg = TrailsConfig {
         new_trail_dir: "trails/".into(),
@@ -479,15 +480,8 @@ async fn remove_waypoint_drops_entry_and_moves_waypoint_to_trash() {
     std::fs::write(td.path().join("a.md"), "body").unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "a.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -523,7 +517,7 @@ async fn delete_trail_cascades_doc_and_waypoint_dir() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     let cfg = TrailsConfig {
         new_trail_dir: "trails/".into(),
@@ -533,15 +527,8 @@ async fn delete_trail_cascades_doc_and_waypoint_dir() {
     std::fs::write(td.path().join("a.md"), "body").unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let _wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "a.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -581,7 +568,7 @@ async fn resolve_reference_branches() {
     let id_a = new_id();
     let id_b = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_a,
             path: "alpha.md",
             content_hash: "h",
@@ -593,7 +580,7 @@ async fn resolve_reference_branches() {
         })
         .unwrap();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id_b,
             path: "beta.md",
             content_hash: "h",
@@ -715,7 +702,7 @@ async fn move_note_rewrites_waypoint_source_path() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut prog = idx.subscribe_progress();
     // Drain ModelLoaded so subsequent waits don't see it.
     use crate::indexer::ProgressEvent;
@@ -743,15 +730,8 @@ async fn move_note_rewrites_waypoint_source_path() {
         create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "notes/a.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -762,7 +742,7 @@ async fn move_note_rewrites_waypoint_source_path() {
     wait_for_upsert(&mut prog, &wp.waypoint_rel).await;
 
     // Now move the source note.
-    crate::ops::move_note(
+    crate::ops::file::move_note(
         &watcher,
         &idx.job_sender(),
         &vault,
@@ -779,7 +759,8 @@ async fn move_note_rewrites_waypoint_source_path() {
     let fm = parse_waypoint(&waypoint_src).unwrap();
     assert_eq!(fm.references.path, "notes/b.md",
         "waypoint references.path should track the moved source");
-    assert_eq!(fm.references.id, wp_source_id(&wp, &waypoint_src),
+    let _ = &wp;
+    assert_eq!(fm.references.id, parse_waypoint(&waypoint_src).unwrap().references.id,
         "waypoint references.id must be unchanged by the path-only move");
 
     // Drain the auto-update reindex of the waypoint-note so the
@@ -794,14 +775,6 @@ async fn move_note_rewrites_waypoint_source_path() {
     idx.shutdown().await;
 }
 
-/// Pull the source-id from the waypoint-note source for the
-/// "id is unchanged" assertion in the move test; just re-read the
-/// FM and return the references.id (the assertion compares it
-/// against itself, which only fails if the parse failed entirely).
-fn wp_source_id(_wp: &AppendWaypointOutcome, waypoint_src: &str) -> String {
-    parse_waypoint(waypoint_src).unwrap().references.id
-}
-
 // status: trail-auto-update-on-note-move
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_folder_rewrites_referencing_waypoints() {
@@ -809,7 +782,7 @@ async fn move_folder_rewrites_referencing_waypoints() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut prog = idx.subscribe_progress();
     use crate::indexer::ProgressEvent;
     let _ = tokio::time::timeout(
@@ -835,22 +808,15 @@ async fn move_folder_rewrites_referencing_waypoints() {
         create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "oldfolder/x.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "oldfolder/x.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
     wait_for_upsert(&mut prog, &trail.trail_doc_rel).await;
     wait_for_upsert(&mut prog, &wp.waypoint_rel).await;
 
-    crate::ops::move_folder(
+    crate::ops::file::move_folder(
         &watcher,
         &idx.job_sender(),
         &vault,
@@ -876,7 +842,7 @@ async fn watcher_external_rename_triggers_trails_sweep() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut prog = idx.subscribe_progress();
     use crate::indexer::ProgressEvent;
     let _ = tokio::time::timeout(
@@ -902,15 +868,8 @@ async fn watcher_external_rename_triggers_trails_sweep() {
         create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher,
-        &idx.job_sender(),
-        &vault,
-        None,
-        &mut read_store,
-        &trail.trail_doc_rel,
-        "notes/src.md",
-        None,
-        None,
+        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/src.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
     .unwrap();
@@ -999,7 +958,7 @@ async fn append_waypoint_consults_cursor_when_no_explicit_parent() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -1015,11 +974,11 @@ async fn append_waypoint_consults_cursor_when_no_explicit_parent() {
     // Cursor stays put across appends — A and B both land at root.
     let wp_a = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp_b = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "b.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Point cursor at A; append C with no explicit parent → should
@@ -1028,7 +987,7 @@ async fn append_waypoint_consults_cursor_when_no_explicit_parent() {
         &trail.trail_doc_rel, Some(&wp_a.waypoint_id)).await.unwrap();
     let wp_c = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "c.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     let trail_src =
@@ -1053,7 +1012,7 @@ async fn append_waypoint_explicit_parent_overrides_cursor() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -1068,11 +1027,11 @@ async fn append_waypoint_explicit_parent_overrides_cursor() {
 
     let wp_a = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp_b = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "b.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Cursor = A, explicit parent = B → child of B; cursor stays at A
@@ -1081,7 +1040,7 @@ async fn append_waypoint_explicit_parent_overrides_cursor() {
         &trail.trail_doc_rel, Some(&wp_a.waypoint_id)).await.unwrap();
     let wp_c = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "c.md", Some(&wp_b.waypoint_id), None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: Some(&wp_b.waypoint_id), annotation: None, },
     ).await.unwrap();
 
     let trail_src =
@@ -1107,7 +1066,7 @@ async fn append_waypoint_does_not_move_cursor() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -1122,11 +1081,11 @@ async fn append_waypoint_does_not_move_cursor() {
     // Three appends with cursor = None → three siblings at root.
     let wp1 = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp2 = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "b.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     let fm = parse_trail_doc(
@@ -1142,7 +1101,7 @@ async fn append_waypoint_does_not_move_cursor() {
         &trail.trail_doc_rel, Some(&wp1.waypoint_id)).await.unwrap();
     let wp3 = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "c.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     let fm2 = parse_trail_doc(
@@ -1166,7 +1125,7 @@ async fn append_waypoint_with_stale_cursor_falls_back_to_root() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -1185,7 +1144,7 @@ async fn append_waypoint_with_stale_cursor_falls_back_to_root() {
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     let fm = parse_trail_doc(
@@ -1208,7 +1167,7 @@ async fn remove_waypoint_resets_cursor_when_removed() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
     let trash = Trash::open(td.path());
 
@@ -1220,7 +1179,7 @@ async fn remove_waypoint_resets_cursor_when_removed() {
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Move cursor onto wp explicitly, then remove wp → cursor must reset.
     set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
@@ -1245,7 +1204,7 @@ async fn remove_waypoint_resets_cursor_when_ancestor_removed() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
     let trash = Trash::open(td.path());
 
@@ -1258,14 +1217,14 @@ async fn remove_waypoint_resets_cursor_when_ancestor_removed() {
     std::fs::write(td.path().join("b.md"), "b").unwrap();
     let wp_y = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Set cursor on wp_y so the next append lands as a child.
     set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
         &trail.trail_doc_rel, Some(&wp_y.waypoint_id)).await.unwrap();
     let wp_x = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "b.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Move cursor onto wp_x — the deeper descendant.
     set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
@@ -1293,7 +1252,7 @@ async fn remove_waypoint_preserves_cursor_when_sibling_removed() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
     let trash = Trash::open(td.path());
 
@@ -1307,12 +1266,12 @@ async fn remove_waypoint_preserves_cursor_when_sibling_removed() {
 
     let wp_a = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Cursor stays None across appends, so wp_b is a root sibling.
     let wp_b = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "b.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Point cursor at wp_a.
     set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
@@ -1339,7 +1298,7 @@ async fn set_append_cursor_round_trip() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
     let mut read_store = Store::open(td.path()).unwrap();
 
     let cfg = TrailsConfig {
@@ -1350,7 +1309,7 @@ async fn set_append_cursor_round_trip() {
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
         &watcher, &idx.job_sender(), &vault, None, &mut read_store,
-        &trail.trail_doc_rel, "a.md", None, None,
+        AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Set to None.
@@ -1378,7 +1337,7 @@ async fn set_append_cursor_rejects_unknown_id() {
     let vault = open_vault(&td);
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let idx = start(vault.clone(), store);
+    let idx = start_indexer(vault.clone(), store);
 
     let cfg = TrailsConfig {
         new_trail_dir: "trails/".into(),

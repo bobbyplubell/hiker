@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::hash;
+use crate::hash_string;
 
 #[derive(Debug, Error)]
 pub enum PromptError {
@@ -64,7 +64,7 @@ pub struct PromptDefault {
 
 /// Bundled defaults registered for v3.5. Add a row here when a feature
 /// lands; the loader writes them on first launch.
-pub fn bundled_defaults() -> &'static [PromptDefault] {
+pub const fn bundled_defaults() -> &'static [PromptDefault] {
     &[
         PromptDefault {
             name: "chat_system",
@@ -168,7 +168,27 @@ impl Prompts {
                 Some(u) => PromptPaths::resolve_with_user_dir(vault_root, d.name, Some(u)),
                 None => PromptPaths::resolve(vault_root, d.name),
             };
-            ensure_user_default(&paths, d)?;
+            // Ensure user-scope default file and hash stamp exist.
+            if let (Some(user_path), Some(stamp_path)) =
+                (paths.user.as_ref(), paths.user_default_hash.as_ref())
+            {
+                if let Some(parent) = user_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if !user_path.exists() {
+                    atomic_write(user_path, d.default_body.as_bytes())?;
+                }
+                // Stamp the bundled default's hash so future runs can detect
+                // upstream drift. On a brand-new install that's "the hash
+                // matches"; once the bundled default is bumped without
+                // rewriting the user file, the staleness check fires.
+                if !stamp_path.exists() {
+                    atomic_write(
+                        stamp_path,
+                        hash_string(d.default_body).as_bytes(),
+                    )?;
+                }
+            }
             // Vault scope wins over user scope.
             let body = if paths.vault.exists() {
                 fs::read_to_string(&paths.vault)?
@@ -203,13 +223,49 @@ impl Prompts {
             .into_iter()
             .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
             .collect();
-        Ok(substitute(body, &vars))
+        // `{{var}}` substitution. Unknown placeholders are left intact — the
+        // caller almost certainly has a bug if a placeholder is missing, and
+        // silently dropping it would hide it.
+        let mut out = String::with_capacity(body.len());
+        let mut rest = body.as_str();
+        while let Some(start) = rest.find("{{") {
+            out.push_str(&rest[..start]);
+            let after_open = &rest[start + 2..];
+            match after_open.find("}}") {
+                Some(end) => {
+                    let key = after_open[..end].trim();
+                    let replacement = vars
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.as_str());
+                    match replacement {
+                        Some(v) => out.push_str(v),
+                        None => {
+                            // Pass the placeholder through verbatim.
+                            out.push_str("{{");
+                            out.push_str(&after_open[..end]);
+                            out.push_str("}}");
+                        }
+                    }
+                    rest = &after_open[end + 2..];
+                }
+                None => {
+                    // Unterminated `{{` — treat as literal and stop scanning.
+                    out.push_str("{{");
+                    out.push_str(after_open);
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        Ok(out)
     }
 
     /// Raw body for a feature; useful for the eventual Prompts tab and
     /// for tests. Returns `None` if the feature wasn't registered.
     pub fn body(&self, feature: &str) -> Option<&str> {
-        self.bodies.get(feature).map(|s| s.as_str())
+        self.bodies.get(feature).map(std::string::String::as_str)
     }
 
     /// Compare each loaded prompt's bundled-default hash against the
@@ -239,38 +295,13 @@ impl Prompts {
                 continue;
             }
             let stamped = fs::read_to_string(stamp_path)?;
-            let current = hash::hash_str(d.default_body);
+            let current = hash_string(d.default_body);
             if stamped.trim() != current {
                 stale.push(d.name.to_string());
             }
         }
         Ok(stale)
     }
-}
-
-fn ensure_user_default(paths: &PromptPaths, d: &PromptDefault) -> Result<(), PromptError> {
-    let user_path = match paths.user.as_ref() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let stamp_path = match paths.user_default_hash.as_ref() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if let Some(parent) = user_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if !user_path.exists() {
-        atomic_write(user_path, d.default_body.as_bytes())?;
-    }
-    // Stamp the bundled default's hash so future runs can detect upstream
-    // drift. On a brand-new install that's "the hash matches"; once the
-    // bundled default is bumped without rewriting the user file, the
-    // staleness check fires.
-    if !stamp_path.exists() {
-        atomic_write(stamp_path, hash::hash_str(d.default_body).as_bytes())?;
-    }
-    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PromptError> {
@@ -281,46 +312,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PromptError> {
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
     Ok(())
-}
-
-/// `{{var}}` substitution. Unknown placeholders are left intact — the
-/// caller almost certainly has a bug if a placeholder is missing, and
-/// silently dropping it would hide it.
-fn substitute(template: &str, vars: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
-        let after_open = &rest[start + 2..];
-        match after_open.find("}}") {
-            Some(end) => {
-                let key = after_open[..end].trim();
-                let replacement = vars
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.as_str());
-                match replacement {
-                    Some(v) => out.push_str(v),
-                    None => {
-                        // Pass the placeholder through verbatim.
-                        out.push_str("{{");
-                        out.push_str(&after_open[..end]);
-                        out.push_str("}}");
-                    }
-                }
-                rest = &after_open[end + 2..];
-            }
-            None => {
-                // Unterminated `{{` — treat as literal and stop scanning.
-                out.push_str("{{");
-                out.push_str(after_open);
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
@@ -351,18 +342,23 @@ mod tests {
         ]
     }
 
+    fn prompts_with_body(body: &'static str) -> Prompts {
+        let dir = tempdir().unwrap();
+        let defaults = vec![PromptDefault { name: "t", default_body: body }];
+        load_isolated(dir.path(), &defaults)
+    }
+
     #[test]
     fn substitute_replaces_known_and_preserves_unknown() {
-        let out = substitute(
-            "Hi {{name}}, your tag is {{tag}}.",
-            &[("name".into(), "Alice".into())],
-        );
+        let prompts = prompts_with_body("Hi {{name}}, your tag is {{tag}}.");
+        let out = prompts.render("t", [("name", "Alice")]).unwrap();
         assert_eq!(out, "Hi Alice, your tag is {{tag}}.");
     }
 
     #[test]
     fn substitute_handles_unterminated_braces() {
-        let out = substitute("Hi {{name", &[("name".into(), "Alice".into())]);
+        let prompts = prompts_with_body("Hi {{name");
+        let out = prompts.render("t", [("name", "Alice")]).unwrap();
         assert_eq!(out, "Hi {{name");
     }
 

@@ -2,9 +2,9 @@
 //! bucket and records the inverse for undo.
 
 use super::super::storage::params;
-use super::super::types::{EditableNode, NodeKind, Trees, TreesError};
+use super::super::types::{EditableNode, NodeKind, Db, Error};
 
-impl Trees {
+impl Db {
     /// Drop a cluster: its leaf descendants are re-parented under the
     /// nearest outlier bucket; nested cluster nodes are deleted along
     /// with the dropped cluster. Records a `drop-cluster` history row.
@@ -17,7 +17,7 @@ impl Trees {
         tree_id: &str,
         node_id: &str,
         outlier_bucket_id: &str,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         // Collect every descendant (DFS) so we know which leaves to
         // re-parent and which clusters to delete.
         let all_nodes = self.list_nodes(tree_id)?;
@@ -46,7 +46,7 @@ impl Trees {
         }
         // Snapshot the cluster itself for restore.
         let dropped_node = self.get_node(tree_id, node_id)?.ok_or_else(|| {
-            TreesError::NodeNotFound {
+            Error::NodeNotFound {
                 tree_id: tree_id.to_string(),
                 node_id: node_id.to_string(),
             }

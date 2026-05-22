@@ -1,15 +1,19 @@
-//! Integration tests for Compartment / CompartmentStore scoped reconfiguration.
+//! Integration tests for Compartment / Store scoped reconfiguration.
 
 use std::sync::Arc;
 
-use editor_core::{Compartment, CompartmentStore, EditorState, Transaction};
+use editor_core::compartment::Compartment;
+
+use editor_core::compartment::Store;
+use editor_core::state::Editor;
+use editor_core::transaction::Transaction;
 
 #[test]
 fn two_compartments_are_independent() {
     let theme: Compartment<String> = Compartment::new();
     let keymap: Compartment<String> = Compartment::new();
 
-    let mut store = CompartmentStore::default();
+    let mut store = Store::default();
     store.set(&theme, "dark".to_string());
     store.set(&keymap, "vim".to_string());
 
@@ -29,7 +33,7 @@ fn reconfigure_shares_unchanged_arcs() {
     let theme: Compartment<String> = Compartment::new();
     let keymap: Compartment<Vec<u8>> = Compartment::new();
 
-    let mut store = CompartmentStore::default();
+    let mut store = Store::default();
     store.set(&theme, "dark".to_string());
     store.set(&keymap, vec![1, 2, 3]);
 
@@ -45,7 +49,7 @@ fn reconfigure_shares_unchanged_arcs() {
 #[test]
 fn editor_state_reconfigure_preserves_doc_and_selection() {
     let theme: Compartment<String> = Compartment::new();
-    let s0 = EditorState::new("hello").reconfigure(&theme, "dark".to_string());
+    let s0 = Editor::new("hello").reconfigure(&theme, "dark".to_string());
     assert_eq!(s0.doc.to_string(), "hello");
     assert_eq!(s0.compartments.get(&theme).unwrap(), "dark");
 
@@ -59,7 +63,7 @@ fn editor_state_reconfigure_preserves_doc_and_selection() {
 #[test]
 fn transaction_reconfigure_effect_applies() {
     let lang: Compartment<String> = Compartment::new();
-    let s = EditorState::new("fn main() {}");
+    let s = Editor::new("fn main() {}");
     let tx = Transaction::reconfigure(s.doc.len_bytes(), &lang, "rust".to_string());
     let s2 = s.apply(tx);
     assert_eq!(s2.compartments.get(&lang).unwrap(), "rust");

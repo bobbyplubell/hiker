@@ -4,9 +4,32 @@
 
 use super::storage::{params, OptionalExtension};
 use super::storage::now_ms;
-use super::types::{HistoryEntry, NodePolicy, Trees, TreesError};
+use super::types::{HistoryEntry, NodePolicy, Db, Error};
 
-impl Trees {
+/// The full reshape payload for a `recluster-subtree` history entry.
+/// Splits naturally into the prior-state snapshot used to *reverse* the
+/// reshape (`prior_subtree`, `prior_leaf_parents`) and the new-state
+/// payload used to *replay* it (`new_nodes`, `leaf_moves`,
+/// `carried_policy`), all anchored at `root_id`.
+pub struct ReclusterSnapshot<'a> {
+    /// Subtree root the reshape is anchored at.
+    pub root_id: &'a str,
+    /// Each deleted cluster's full row shape + prior `parent_id`, so
+    /// undo can re-insert them exactly.
+    pub prior_subtree: &'a [serde_json::Value],
+    /// `(leaf_id, prior_parent)` parentage captured before the reshape.
+    pub prior_leaf_parents: &'a [(String, Option<String>)],
+    /// Inserted cluster rows in dependency order (parents before
+    /// children) so redo can restore each in turn.
+    pub new_nodes: &'a [serde_json::Value],
+    /// `(leaf_id, new_parent)` moves applied by the reshape.
+    pub leaf_moves: &'a [(String, Option<String>)],
+    /// Policy carried onto direct children when the user opted into
+    /// "Carry policies down".
+    pub carried_policy: Option<&'a NodePolicy>,
+}
+
+impl Db {
     /// Append one edit to `cluster_tree_history`. Public so the build
     /// pipeline (and any future op outside this module's vocabulary)
     /// can stamp custom op kinds. Returns the assigned `seq`.
@@ -16,7 +39,7 @@ impl Trees {
         op: &str,
         args: &serde_json::Value,
         undo_args: &serde_json::Value,
-    ) -> Result<i64, TreesError> {
+    ) -> Result<i64, Error> {
         let args_json = serde_json::to_string(args)?;
         let undo_json = serde_json::to_string(undo_args)?;
         let now = now_ms();
@@ -53,7 +76,7 @@ impl Trees {
         parent_id: &str,
         new_clusters: &[serde_json::Value],
         leaf_moves: &[(String, Option<String>)],
-    ) -> Result<i64, TreesError> {
+    ) -> Result<i64, Error> {
         let new_cluster_ids: Vec<String> = new_clusters
             .iter()
             .filter_map(|c| c.get("node_id").and_then(|v| v.as_str()).map(str::to_string))
@@ -76,7 +99,7 @@ impl Trees {
 
     /// Record a `recluster-subtree` history entry. Like `record_split`,
     /// the caller is responsible for running the actual clustering pass
-    /// (`core::cluster::build_tree` against the subtree's leaves) and
+    /// (`core::cluster::tree` against the subtree's leaves) and
     /// for the cluster_nodes mutations (delete descendants, insert new
     /// cluster rows, reparent leaves). This method only persists enough
     /// state on the history row to replay (redo) and reverse (undo) the
@@ -99,21 +122,19 @@ impl Trees {
     ///
     /// status: cluster-editor-recluster-subtree
     /// status: cluster-editor-recluster-subtree-policy-loss
-    // Each parameter is a distinct history-recording payload (root id,
-    // prior-subtree snapshot, prior leaf parentage, new node rows, leaf
-    // moves, carried policy) with no natural grouping — bundling would be
-    // a cosmetic rename of the call site, so allow the lint here.
-    #[allow(clippy::too_many_arguments)]
     pub fn record_recluster_subtree(
         &self,
         tree_id: &str,
-        root_id: &str,
-        prior_subtree: &[serde_json::Value],
-        prior_leaf_parents: &[(String, Option<String>)],
-        new_nodes: &[serde_json::Value],
-        leaf_moves: &[(String, Option<String>)],
-        carried_policy: Option<&NodePolicy>,
-    ) -> Result<i64, TreesError> {
+        snapshot: &ReclusterSnapshot<'_>,
+    ) -> Result<i64, Error> {
+        let &ReclusterSnapshot {
+            root_id,
+            prior_subtree,
+            prior_leaf_parents,
+            new_nodes,
+            leaf_moves,
+            carried_policy,
+        } = snapshot;
         let new_node_ids: Vec<String> = new_nodes
             .iter()
             .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(str::to_string))
@@ -156,7 +177,7 @@ impl Trees {
     /// Pop the most-recent history entry for a tree (returns `None`
     /// when the log is empty). Used by undo: caller reads `entry.op` +
     /// `entry.undo_args` and inverts the change.
-    pub fn pop_last_history(&self, tree_id: &str) -> Result<Option<HistoryEntry>, TreesError> {
+    pub fn pop_last_history(&self, tree_id: &str) -> Result<Option<HistoryEntry>, Error> {
         self.with_conn(|conn| {
             let entry: Option<HistoryEntry> = conn
                 .query_row(
@@ -187,7 +208,7 @@ impl Trees {
     }
 
     /// Read the history log for a tree, oldest first.
-    pub fn history(&self, tree_id: &str) -> Result<Vec<HistoryEntry>, TreesError> {
+    pub fn history(&self, tree_id: &str) -> Result<Vec<HistoryEntry>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT seq, ts_ms, op, args, undo_args FROM cluster_tree_history

@@ -3,54 +3,31 @@
 //! [`InputEvent`] and platform paint calls receive coordinates / layout
 //! information from [`ViewState`].
 
-pub mod event;
-pub mod view;
+pub mod events;
+pub mod viewport;
 pub mod motion;
 pub mod multicursor;
 pub mod command;
-pub mod ime;
-pub mod occurrence;
-pub mod autopair;
+pub mod highlight;
+pub mod pairs;
 pub mod brackets;
-pub mod completion;
+pub mod autocomplete;
 pub mod diagnostics;
 pub mod highlights;
-pub mod special_chars;
-pub mod tooltip;
-pub mod wrap;
-pub mod search;
-pub mod snippet;
-pub mod panel;
+pub mod whitespace;
+pub mod popup;
+pub mod wrapping;
+pub mod find;
+pub mod snippets;
+pub mod panels;
 
-pub use brackets::{bracket_match_decorations, BracketPair, DEFAULT_BRACKETS};
-pub use search::{
-    replace_all, replace_current, run_search, search_decorations, SearchFlags, SearchState,
-};
-pub use completion::{CompletionItem, CompletionKind, CompletionSource, CompletionState};
-pub use snippet::{
-    map_through as snippet_map_through, mirror_sync as snippet_mirror_sync,
-    selection_for_stop as snippet_selection_for_stop, ParseError as SnippetParseError, Snippet,
-    SnippetState,
-};
-pub use diagnostics::diagnostic_decorations;
-pub use highlights::{active_line_decorations, trailing_whitespace_decorations};
-pub use special_chars::{special_chars_decorations, SpecialCharsFlags};
-pub use event::{ImeEvent, InputEvent, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey};
-pub use ime::ImeState;
-pub use panel::{Panel, PanelKind, PanelPlacement, PanelStack};
-pub use tooltip::{Tooltip, TooltipAnchor, TooltipContent, TooltipPlacement};
-pub use view::{
-    ClickAction, ClickRect, ClickZone, DecorationLayers, DragState, HeightMap, IndentProvider,
-    LineGeometry, ViewState,
-};
-pub use wrap::{compute_wraps, WrapMap, WrappedLine};
 
 /// Convert a byte-range viewport to a line range `[start, end)`. The returned
 /// end line is exclusive and clamped to the document's line count. Used by
 /// paint-only decoration providers that walk lines so they can scope their
 /// work to the visible region.
 pub fn viewport_lines(
-    doc: &editor_core::Rope,
+    doc: &editor_core::rope::Rope,
     viewport: &std::ops::Range<usize>,
 ) -> std::ops::Range<usize> {
     let total = doc.len_lines();

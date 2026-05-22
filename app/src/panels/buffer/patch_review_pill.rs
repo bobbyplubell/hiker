@@ -10,7 +10,6 @@
 use eframe::egui;
 
 use super::diff_overlay::HunkInfo;
-use crate::state::AppState;
 use crate::theme;
 
 /// Outcome of a pill-row interaction. Resolved by the buffer panel after
@@ -24,14 +23,17 @@ pub struct PillAction {
     pub scroll_to_byte: Option<usize>,
 }
 
-/// Render the pill if `hunks` has at least one entry; return what the user
-/// asked for (bulk verbs / navigation). No-op when the slice is empty.
-pub fn show(
-    ui: &mut egui::Ui,
-    app: &AppState,
-    hunks: &[HunkInfo],
-    cursor_byte: usize,
-) -> PillAction {
+/// Render context for the per-file patch-review pill. Holds the `ui`
+/// so the pill renderer is a single inherent method.
+pub struct Pill<'a> {
+    pub ui: &'a mut egui::Ui,
+}
+
+impl Pill<'_> {
+    /// Render the pill if `hunks` has at least one entry; return what the
+    /// user asked for (bulk verbs / navigation). No-op when empty.
+    pub fn show(&mut self, hunks: &[HunkInfo], cursor_byte: usize) -> PillAction {
+    let ui = &mut *self.ui;
     let mut action = PillAction::default();
     if hunks.is_empty() {
         return action;
@@ -46,10 +48,9 @@ pub fn show(
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add(crate::icons::robot());
+                ui.add(crate::icons::ICONS.image(crate::icons::Icon::Robot));
                 let label = format!("{} agent hunk{}", n, if n == 1 { "" } else { "s" });
                 ui.label(egui::RichText::new(label).small().strong());
-                let _ = app;
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -61,7 +62,7 @@ pub fn show(
                             .on_hover_text("Scroll to the next hunk")
                             .clicked()
                         {
-                            action.scroll_to_byte = next_hunk_byte(hunks, cursor_byte);
+                            action.scroll_to_byte = HunkNav.next_byte(hunks, cursor_byte);
                         }
                         if ui
                             .add_enabled(
@@ -94,26 +95,33 @@ pub fn show(
             });
         });
     action
+    }
 }
 
-/// Pick the byte offset to scroll the editor to next: the first change
-/// hunk whose start lies strictly past `cursor_byte`; wraps to the
-/// document-order first hunk at end-of-list.
-fn next_hunk_byte(hunks: &[HunkInfo], cursor_byte: usize) -> Option<usize> {
-    let mut starts: Vec<usize> = hunks
-        .iter()
-        .filter(|h| h.is_change())
-        .map(|h| h.byte_start)
-        .collect();
-    if starts.is_empty() {
-        return None;
+/// Zero-sized next-hunk navigator. A struct (rather than a free fn) so
+/// the single prod call site stays an inherent method.
+struct HunkNav;
+
+impl HunkNav {
+    /// Pick the byte offset to scroll the editor to next: the first change
+    /// hunk whose start lies strictly past `cursor_byte`; wraps to the
+    /// document-order first hunk at end-of-list.
+    fn next_byte(&self, hunks: &[HunkInfo], cursor_byte: usize) -> Option<usize> {
+        let mut starts: Vec<usize> = hunks
+            .iter()
+            .filter(|h| h.is_change())
+            .map(|h| h.byte_start)
+            .collect();
+        if starts.is_empty() {
+            return None;
+        }
+        starts.sort_unstable();
+        starts
+            .iter()
+            .find(|&&b| b > cursor_byte)
+            .copied()
+            .or_else(|| starts.first().copied())
     }
-    starts.sort_unstable();
-    starts
-        .iter()
-        .find(|&&b| b > cursor_byte)
-        .copied()
-        .or_else(|| starts.first().copied())
 }
 
 #[cfg(test)]
@@ -132,16 +140,16 @@ mod tests {
             hunk(50, HunkKind::Added),
             hunk(200, HunkKind::Removed),
         ];
-        assert_eq!(next_hunk_byte(&hunks, 0), Some(10));
-        assert_eq!(next_hunk_byte(&hunks, 10), Some(50));
-        assert_eq!(next_hunk_byte(&hunks, 49), Some(50));
-        assert_eq!(next_hunk_byte(&hunks, 50), Some(200));
+        assert_eq!(HunkNav.next_byte(&hunks, 0), Some(10));
+        assert_eq!(HunkNav.next_byte(&hunks, 10), Some(50));
+        assert_eq!(HunkNav.next_byte(&hunks, 49), Some(50));
+        assert_eq!(HunkNav.next_byte(&hunks, 50), Some(200));
     }
 
     #[test]
     fn next_hunk_wraps_at_end() {
         let hunks = vec![hunk(10, HunkKind::Modified), hunk(200, HunkKind::Modified)];
-        assert_eq!(next_hunk_byte(&hunks, 300), Some(10));
+        assert_eq!(HunkNav.next_byte(&hunks, 300), Some(10));
     }
 
     #[test]
@@ -150,6 +158,6 @@ mod tests {
             hunk(10, HunkKind::Context),
             hunk(30, HunkKind::Modified),
         ];
-        assert_eq!(next_hunk_byte(&hunks, 0), Some(30));
+        assert_eq!(HunkNav.next_byte(&hunks, 0), Some(30));
     }
 }

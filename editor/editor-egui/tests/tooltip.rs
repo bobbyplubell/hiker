@@ -3,9 +3,13 @@
 //! not panic and that the list is still present after rendering (the widget
 //! is read-only w.r.t. tooltips; the host owns the slot).
 
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_view::{Tooltip, TooltipAnchor, TooltipContent, TooltipPlacement, ViewState};
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::popup::Tooltip;
+use editor_view::popup::TooltipAnchor;
+use editor_view::popup::TooltipContent;
+use editor_view::popup::TooltipPlacement;
+use editor_view::viewport::ViewState;
 use smol_str::SmolStr;
 
 #[test]

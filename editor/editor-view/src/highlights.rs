@@ -1,10 +1,17 @@
 //! Active-line and trailing-whitespace highlight decorations.
 //! See SPEC §9.11, §9.17 and IMPLEMENTATION §16.6.2, §16.6.8.
 
-use editor_core::{
-    Color, Decoration, DecorationSet, EditorState, LineStyle, MarkStyle, RangeSet,
-};
+use editor_core::decoration::Color;
 
+use editor_core::decoration::Decoration;
+
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::state::Editor as EditorState;
+use editor_core::decoration::LineStyle;
+
+use editor_core::decoration::MarkStyle;
+
+use editor_core::rangeset::RangeSet;
 /// Soft bluish tint for the line(s) containing a selection head.
 const ACTIVE_LINE_BG: Color = Color::rgba(120, 120, 140, 25);
 
@@ -59,7 +66,7 @@ pub fn active_line_decorations(state: &EditorState) -> DecorationSet {
 /// newline, emit a `Mark { bg: TRAILING_WS_BG }` over that run.
 pub fn trailing_whitespace_decorations(
     state: &EditorState,
-    viewport: Option<std::ops::Range<usize>>,
+    viewport: Option<&std::ops::Range<usize>>,
 ) -> DecorationSet {
     let doc = &state.doc;
     let total_lines = doc.len_lines();
@@ -67,7 +74,7 @@ pub fn trailing_whitespace_decorations(
         return RangeSet::empty();
     }
 
-    let line_range = match viewport.as_ref() {
+    let line_range = match viewport {
         Some(vp) => crate::viewport_lines(doc, vp),
         None => 0..total_lines,
     };

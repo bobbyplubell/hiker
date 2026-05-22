@@ -12,23 +12,89 @@ use std::sync::Mutex;
 pub(super) use rusqlite::{params, Connection, OptionalExtension};
 
 use super::types::{
-    EditableNode, NodeInsert, NodeKind, NodePolicy, TreeInsert, TreeRow, Trees, TreesError,
+    EditableNode, NodeInsert, NodeKind, NodePolicy, TreeInsert, TreeRow, Db, Error,
     SCHEMA_VERSION,
 };
 
 // ── Connection + schema ──────────────────────────────────────────────
 
-impl Trees {
+impl Db {
     /// Open or create the trees db at `<vault_root>/.hiker/trees.db`.
     /// Fails loud on schema-version mismatch (pre-1.0 policy: delete the
     /// file and retry).
-    pub fn open(vault_root: &Path) -> Result<Self, TreesError> {
+    pub fn open(vault_root: &Path) -> Result<Self, Error> {
         let hiker_dir = vault_root.join(".hiker");
         std::fs::create_dir_all(&hiker_dir)?;
         let db_path = hiker_dir.join("trees.db");
-        let mut conn = Connection::open(&db_path)?;
-        configure(&conn)?;
-        ensure_schema(&mut conn)?;
+        let conn = Connection::open(&db_path)?;
+        // Configure connection.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        // Ensure schema is current.
+        let user_version: i32 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if user_version != 0 && user_version != SCHEMA_VERSION {
+            return Err(Error::VersionMismatch {
+                found: user_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cluster_trees (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                state           TEXT NOT NULL,
+                scope           TEXT NOT NULL,
+                method          TEXT NOT NULL,
+                created_at_ms   INTEGER NOT NULL,
+                vault_snapshot  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_nodes (
+                tree_id                  TEXT NOT NULL REFERENCES cluster_trees(id) ON DELETE CASCADE,
+                node_id                  TEXT NOT NULL,
+                parent_id                TEXT,
+                kind                     TEXT NOT NULL,
+                note_id                  TEXT,
+                name                     TEXT NOT NULL,
+                summary                  TEXT NOT NULL,
+                user_edited_name         INTEGER NOT NULL DEFAULT 0,
+                user_edited_summary      INTEGER NOT NULL DEFAULT 0,
+                policy                   TEXT,
+                centroid                 BLOB,
+                confidence               REAL,
+                summary_membership_churn INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tree_id, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS cluster_nodes_parent
+                ON cluster_nodes(tree_id, parent_id);
+            CREATE INDEX IF NOT EXISTS cluster_nodes_note
+                ON cluster_nodes(tree_id, note_id);
+
+            CREATE TABLE IF NOT EXISTS cluster_tree_history (
+                tree_id   TEXT NOT NULL REFERENCES cluster_trees(id) ON DELETE CASCADE,
+                seq       INTEGER NOT NULL,
+                ts_ms     INTEGER NOT NULL,
+                op        TEXT NOT NULL,
+                args      TEXT NOT NULL,
+                undo_args TEXT NOT NULL,
+                PRIMARY KEY (tree_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS cluster_tree_history_seq_desc
+                ON cluster_tree_history(tree_id, seq DESC);
+            "#,
+        )?;
+        if user_version == 0 {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tracing::info!(
+                schema_version = SCHEMA_VERSION,
+                "trees: created trees db schema",
+            );
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             db_path,
@@ -42,12 +108,12 @@ impl Trees {
     /// Lock the connection mutex and run `f` against the shared
     /// connection. Standardizes the lock + poisoning-error mapping that
     /// every SQL call site used to spell inline; lock poisoning surfaces
-    /// as `TreesError::Poisoned` rather than panicking.
+    /// as `Error::Poisoned` rather than panicking.
     pub(super) fn with_conn<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, TreesError>,
-    ) -> Result<R, TreesError> {
-        let conn = self.conn.lock().map_err(|_| TreesError::Poisoned)?;
+        f: impl FnOnce(&Connection) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let conn = self.conn.lock().map_err(|_| Error::Poisoned)?;
         f(&conn)
     }
 
@@ -55,9 +121,9 @@ impl Trees {
     /// needs `conn.transaction()` (which borrows `&mut Connection`).
     pub(super) fn with_conn_mut<R>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<R, TreesError>,
-    ) -> Result<R, TreesError> {
-        let mut conn = self.conn.lock().map_err(|_| TreesError::Poisoned)?;
+        f: impl FnOnce(&mut Connection) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let mut conn = self.conn.lock().map_err(|_| Error::Poisoned)?;
         f(&mut conn)
     }
 
@@ -65,8 +131,8 @@ impl Trees {
 
     /// Insert a new tree row. Returns the tree id (generated when the
     /// caller passes `None`).
-    pub fn insert_tree(&self, t: TreeInsert) -> Result<super::types::TreeId, TreesError> {
-        let id = t.id.unwrap_or_else(crate::store::new_id);
+    pub fn insert_tree(&self, t: TreeInsert) -> Result<super::types::TreeId, Error> {
+        let id = t.id.unwrap_or_else(crate::store::dto::new_id);
         let now = now_ms();
         self.with_conn(|conn| {
             conn.execute(
@@ -90,7 +156,7 @@ impl Trees {
     }
 
     /// Look up one tree row by id. Returns `None` if it doesn't exist.
-    pub fn get_tree(&self, tree_id: &str) -> Result<Option<TreeRow>, TreesError> {
+    pub fn get_tree(&self, tree_id: &str) -> Result<Option<TreeRow>, Error> {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -104,7 +170,7 @@ impl Trees {
     }
 
     /// List every tree row, newest first.
-    pub fn list_trees(&self) -> Result<Vec<TreeRow>, TreesError> {
+    pub fn list_trees(&self) -> Result<Vec<TreeRow>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, source, state, scope, method, created_at_ms, vault_snapshot
@@ -118,7 +184,7 @@ impl Trees {
     }
 
     /// Update a tree's state. Returns `TreeNotFound` if no row matched.
-    pub fn set_tree_state(&self, tree_id: &str, state: &str) -> Result<(), TreesError> {
+    pub fn set_tree_state(&self, tree_id: &str, state: &str) -> Result<(), Error> {
         let n = self.with_conn(|conn| {
             Ok(conn.execute(
                 "UPDATE cluster_trees SET state = ?1 WHERE id = ?2",
@@ -126,14 +192,14 @@ impl Trees {
             )?)
         })?;
         if n == 0 {
-            return Err(TreesError::TreeNotFound(tree_id.to_string()));
+            return Err(Error::TreeNotFound(tree_id.to_string()));
         }
         Ok(())
     }
 
     /// Delete a tree row. Cascades to `cluster_nodes` and
     /// `cluster_tree_history` via FK ON DELETE CASCADE.
-    pub fn delete_tree(&self, tree_id: &str) -> Result<(), TreesError> {
+    pub fn delete_tree(&self, tree_id: &str) -> Result<(), Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM cluster_trees WHERE id = ?1",
@@ -147,7 +213,7 @@ impl Trees {
 
     /// Bulk-insert nodes for a tree under one transaction. Used by the
     /// build pipeline when it lands a fresh tree's initial state.
-    pub fn insert_nodes(&self, tree_id: &str, nodes: &[NodeInsert]) -> Result<(), TreesError> {
+    pub fn insert_nodes(&self, tree_id: &str, nodes: &[NodeInsert]) -> Result<(), Error> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             {
@@ -191,7 +257,7 @@ impl Trees {
         &self,
         tree_id: &str,
         node_id: &str,
-    ) -> Result<Option<EditableNode>, TreesError> {
+    ) -> Result<Option<EditableNode>, Error> {
         let row = self.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -206,7 +272,7 @@ impl Trees {
 
     /// Every node in the tree, in arbitrary order. Caller groups by
     /// `parent` to walk the tree.
-    pub fn list_nodes(&self, tree_id: &str) -> Result<Vec<EditableNode>, TreesError> {
+    pub fn list_nodes(&self, tree_id: &str) -> Result<Vec<EditableNode>, Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT node_id, parent_id, kind, note_id, name, summary,
@@ -216,7 +282,7 @@ impl Trees {
             )?;
             let rows: Vec<EditableNode> = stmt
                 .query_map(params![tree_id], map_editable_node)?
-                .collect::<Result<Vec<Result<EditableNode, TreesError>>, _>>()?
+                .collect::<Result<Vec<Result<EditableNode, Error>>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -229,7 +295,7 @@ impl Trees {
         &self,
         tree_id: &str,
         parent_id: Option<&str>,
-    ) -> Result<Vec<EditableNode>, TreesError> {
+    ) -> Result<Vec<EditableNode>, Error> {
         let rows = self.with_conn(|conn| {
             let (sql, rows) = match parent_id {
                 Some(pid) => (
@@ -271,7 +337,7 @@ impl Trees {
     /// Append a single new node row. Used by split + future operations
     /// that grow the tree mid-edit. Doesn't write a history row itself —
     /// callers wrap this inside a higher-level op that does.
-    pub fn insert_single_node(&self, tree_id: &str, n: NodeInsert) -> Result<(), TreesError> {
+    pub fn insert_single_node(&self, tree_id: &str, n: &NodeInsert) -> Result<(), Error> {
         let policy_json = match &n.policy {
             Some(p) => Some(serde_json::to_string(p)?),
             None => None,
@@ -316,7 +382,7 @@ impl Trees {
     /// counted by the upstream move. Leaf removals proper happen through
     /// `move_node` / `reparent_many` / `promote_outlier`, all of which
     /// bump their ancestor chains directly.
-    pub fn delete_node(&self, tree_id: &str, node_id: &str) -> Result<(), TreesError> {
+    pub fn delete_node(&self, tree_id: &str, node_id: &str) -> Result<(), Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM cluster_nodes WHERE tree_id = ?1 AND node_id = ?2",
@@ -334,7 +400,7 @@ impl Trees {
         &self,
         tree_id: &str,
         node_id: &str,
-    ) -> Result<std::collections::HashSet<String>, TreesError> {
+    ) -> Result<std::collections::HashSet<String>, Error> {
         self.with_conn(|conn| {
             let mut out = std::collections::HashSet::new();
             let mut cursor: Option<String> = Some(node_id.to_string());
@@ -366,7 +432,7 @@ impl Trees {
         from_node: &str,
         stop_at: &std::collections::HashSet<String>,
         delta: u32,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         if delta == 0 {
             return Ok(());
         }
@@ -408,7 +474,7 @@ impl Trees {
         tree_id: &str,
         from_node: &str,
         delta: u32,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         if delta == 0 {
             return Ok(());
         }
@@ -441,7 +507,7 @@ impl Trees {
 
     /// Reset the churn counter on one node — called when the user runs
     /// "Regenerate" on the node.
-    pub fn reset_churn(&self, tree_id: &str, node_id: &str) -> Result<(), TreesError> {
+    pub fn reset_churn(&self, tree_id: &str, node_id: &str) -> Result<(), Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes
@@ -462,7 +528,7 @@ impl Trees {
         tree_id: &str,
         node_id: &str,
         value: u32,
-    ) -> Result<(), TreesError> {
+    ) -> Result<(), Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE cluster_nodes
@@ -498,7 +564,7 @@ pub(super) fn map_tree_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TreeRow>
 
 pub(super) fn map_editable_node(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<Result<EditableNode, TreesError>> {
+) -> rusqlite::Result<Result<EditableNode, Error>> {
     let node_id: String = row.get(0)?;
     let parent_id: Option<String> = row.get(1)?;
     let kind_str: String = row.get(2)?;
@@ -512,9 +578,14 @@ pub(super) fn map_editable_node(
     let confidence: f64 = row.get(10)?;
     let churn: i64 = row.get(11)?;
 
-    Ok((|| -> Result<EditableNode, TreesError> {
-        let kind = NodeKind::parse(&kind_str).ok_or_else(|| {
-            TreesError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+    Ok((|| -> Result<EditableNode, Error> {
+        let kind = match kind_str.as_str() {
+            "cluster" => Some(NodeKind::Cluster),
+            "leaf" => Some(NodeKind::Leaf),
+            "outlier-bucket" => Some(NodeKind::OutlierBucket),
+            _ => None,
+        }.ok_or_else(|| {
+            Error::Sqlite(rusqlite::Error::FromSqlConversionFailure(
                 2,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::new(
@@ -527,7 +598,13 @@ pub(super) fn map_editable_node(
             Some(s) => Some(serde_json::from_str(&s)?),
             None => None,
         };
-        let centroid = centroid_blob.as_deref().map(unpack_centroid);
+        let centroid = centroid_blob.as_deref().map(|bytes| {
+            let mut out = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            out
+        });
         Ok(EditableNode {
             id: node_id,
             parent: parent_id,
@@ -553,15 +630,6 @@ pub(super) fn pack_centroid(v: &Vec<f32>) -> Vec<u8> {
     out
 }
 
-pub(super) fn unpack_centroid(bytes: &[u8]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        out.push(f32::from_le_bytes(arr));
-    }
-    out
-}
-
 pub(super) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -570,76 +638,3 @@ pub(super) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn configure(conn: &Connection) -> Result<(), TreesError> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    Ok(())
-}
-
-fn ensure_schema(conn: &mut Connection) -> Result<(), TreesError> {
-    let user_version: i32 =
-        conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version != 0 && user_version != SCHEMA_VERSION {
-        return Err(TreesError::VersionMismatch {
-            found: user_version,
-            expected: SCHEMA_VERSION,
-        });
-    }
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS cluster_trees (
-            id              TEXT PRIMARY KEY,
-            name            TEXT NOT NULL,
-            source          TEXT NOT NULL,
-            state           TEXT NOT NULL,
-            scope           TEXT NOT NULL,
-            method          TEXT NOT NULL,
-            created_at_ms   INTEGER NOT NULL,
-            vault_snapshot  TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS cluster_nodes (
-            tree_id                  TEXT NOT NULL REFERENCES cluster_trees(id) ON DELETE CASCADE,
-            node_id                  TEXT NOT NULL,
-            parent_id                TEXT,
-            kind                     TEXT NOT NULL,
-            note_id                  TEXT,
-            name                     TEXT NOT NULL,
-            summary                  TEXT NOT NULL,
-            user_edited_name         INTEGER NOT NULL DEFAULT 0,
-            user_edited_summary      INTEGER NOT NULL DEFAULT 0,
-            policy                   TEXT,
-            centroid                 BLOB,
-            confidence               REAL,
-            summary_membership_churn INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (tree_id, node_id)
-        );
-        CREATE INDEX IF NOT EXISTS cluster_nodes_parent
-            ON cluster_nodes(tree_id, parent_id);
-        CREATE INDEX IF NOT EXISTS cluster_nodes_note
-            ON cluster_nodes(tree_id, note_id);
-
-        CREATE TABLE IF NOT EXISTS cluster_tree_history (
-            tree_id   TEXT NOT NULL REFERENCES cluster_trees(id) ON DELETE CASCADE,
-            seq       INTEGER NOT NULL,
-            ts_ms     INTEGER NOT NULL,
-            op        TEXT NOT NULL,
-            args      TEXT NOT NULL,
-            undo_args TEXT NOT NULL,
-            PRIMARY KEY (tree_id, seq)
-        );
-        CREATE INDEX IF NOT EXISTS cluster_tree_history_seq_desc
-            ON cluster_tree_history(tree_id, seq DESC);
-        "#,
-    )?;
-    if user_version == 0 {
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tracing::info!(
-            schema_version = SCHEMA_VERSION,
-            "trees: created trees db schema",
-        );
-    }
-    Ok(())
-}

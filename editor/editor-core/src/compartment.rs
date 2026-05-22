@@ -1,7 +1,7 @@
 //! Compartment-style scoped reconfiguration.
 //!
-//! A `Compartment<T>` is a typed handle to a slot in a `CompartmentStore`.
-//! The store is a type-erased map keyed by a fresh `CompartmentId`, holding
+//! A `Compartment<T>` is a typed handle to a slot in a `Store`.
+//! The store is a type-erased map keyed by a fresh `Id`, holding
 //! `Arc<dyn Any + Send + Sync>` values. Cloning the store is cheap (it clones
 //! the inner HashMap; values stay Arc-shared), and `reconfigure` swaps a
 //! single slot without touching the others — the foundation for swapping
@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! let theme: Compartment<MyTheme> = Compartment::new();
-//! let mut store = CompartmentStore::default();
+//! let mut store = Store::default();
 //! store.set(&theme, MyTheme::dark());
 //! let store2 = store.reconfigure(&theme, MyTheme::light());
 //! assert!(store.get(&theme).unwrap().is_dark());
@@ -27,7 +27,7 @@ use std::sync::Arc;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CompartmentId(pub u64);
+pub struct Id(pub u64);
 
 /// A compartment owns a slot for swappable extension data.
 ///
@@ -35,17 +35,17 @@ pub struct CompartmentId(pub u64);
 /// compartment somewhere stable (typically as a `OnceLock` or in a config
 /// builder) so reconfiguration always targets the same slot.
 pub struct Compartment<T: Clone + Send + Sync + 'static> {
-    id: CompartmentId,
+    id: Id,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: Clone + Send + Sync + 'static> Compartment<T> {
     pub fn new() -> Self {
-        let id = CompartmentId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        let id = Id(NEXT_ID.fetch_add(1, Ordering::Relaxed));
         Self { id, _phantom: PhantomData }
     }
 
-    pub fn id(&self) -> CompartmentId {
+    pub const fn id(&self) -> Id {
         self.id
     }
 }
@@ -70,11 +70,11 @@ impl<T: Clone + Send + Sync + 'static> Clone for Compartment<T> {
 /// clones the underlying HashMap but shares the Arc'd values, so swapping a
 /// single compartment via `reconfigure` is cheap.
 #[derive(Clone, Default)]
-pub struct CompartmentStore {
-    values: HashMap<CompartmentId, Arc<dyn Any + Send + Sync>>,
+pub struct Store {
+    values: HashMap<Id, Arc<dyn Any + Send + Sync>>,
 }
 
-impl CompartmentStore {
+impl Store {
     pub fn new() -> Self {
         Self::default()
     }
@@ -101,7 +101,7 @@ impl CompartmentStore {
 
     /// Insert a pre-built Arc value by raw id. Used by the transaction
     /// effect path where the value has already been type-erased.
-    pub(crate) fn set_raw(&mut self, id: CompartmentId, value: Arc<dyn Any + Send + Sync>) {
+    pub(crate) fn set_raw(&mut self, id: Id, value: Arc<dyn Any + Send + Sync>) {
         self.values.insert(id, value);
     }
 
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn get_set_roundtrip() {
         let c: Compartment<String> = Compartment::new();
-        let mut s = CompartmentStore::default();
+        let mut s = Store::default();
         s.set(&c, "hi".to_string());
         assert_eq!(s.get(&c).map(String::as_str), Some("hi"));
     }
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn reconfigure_does_not_mutate_original() {
         let c: Compartment<String> = Compartment::new();
-        let mut s = CompartmentStore::default();
+        let mut s = Store::default();
         s.set(&c, "a".to_string());
         let s2 = s.reconfigure(&c, "b".to_string());
         assert_eq!(s.get(&c).unwrap(), "a");

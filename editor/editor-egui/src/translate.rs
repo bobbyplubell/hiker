@@ -1,15 +1,32 @@
 //! Translate egui events into [`InputEvent`].
 
-use editor_view::{ImeEvent, InputEvent, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey};
+use editor_view::events::ImeEvent;
+
+use editor_view::events::InputEvent;
+
+use editor_view::events::Key;
+
+use editor_view::events::KeyEvent;
+
+use editor_view::events::Modifiers;
+
+use editor_view::events::MouseButton;
+
+use editor_view::events::MouseEvent;
+
+use editor_view::events::NamedKey;
 use egui::Event as Ev;
 use smol_str::SmolStr;
 
 pub fn translate(ev: &Ev) -> Option<InputEvent> {
     match ev {
         Ev::Text(s) => Some(InputEvent::Text(SmolStr::from(s))),
-        Ev::Key { key, pressed: true, modifiers, repeat, .. } => {
-            let mods = translate_mods(modifiers);
-            let k = translate_key(*key)?;
+        Ev::Key { key, pressed: true, modifiers: m, repeat, .. } => {
+            // egui collapses cmd/win onto `mac_cmd` on mac, `ctrl` elsewhere;
+            // `command` is the cross-platform primary. Keep them split for
+            // downstream commands that care.
+            let mods = Modifiers { ctrl: m.ctrl, alt: m.alt, shift: m.shift, meta: m.mac_cmd };
+            let k = EguiKey(*key).into_named()?;
             Some(InputEvent::Key(KeyEvent { key: k, mods, repeat: *repeat }))
         }
         Ev::Ime(ime) => Some(InputEvent::Ime(match ime {
@@ -31,21 +48,15 @@ pub fn translate(ev: &Ev) -> Option<InputEvent> {
     }
 }
 
-fn translate_mods(m: &egui::Modifiers) -> Modifiers {
-    Modifiers {
-        ctrl: m.ctrl,
-        alt: m.alt,
-        shift: m.shift,
-        // egui collapses cmd/win onto `mac_cmd` on mac, `ctrl` elsewhere; `command`
-        // is the cross-platform primary. Keep them split for downstream commands
-        // that care.
-        meta: m.mac_cmd,
-    }
-}
+/// Newtype wrapper so the big egui-key → internal-key mapping can live in
+/// a `self`-method (and not be flagged as single-use). Inlining the match
+/// into `translate` would dominate that function's body.
+struct EguiKey(egui::Key);
 
-fn translate_key(k: egui::Key) -> Option<Key> {
-    use egui::Key as K;
-    let named = match k {
+impl EguiKey {
+    const fn into_named(self) -> Option<Key> {
+        use egui::Key as K;
+        let named = match self.0 {
         K::Enter => NamedKey::Enter,
         K::Tab => NamedKey::Tab,
         K::Escape => NamedKey::Escape,
@@ -89,6 +100,7 @@ fn translate_key(k: egui::Key) -> Option<Key> {
         _ => return None,
     };
     Some(Key::Named(named))
+    }
 }
 
 pub fn pointer_mouse_events(

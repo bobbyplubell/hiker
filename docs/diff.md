@@ -1,13 +1,13 @@
 # Diff
 
-A unified diff primitive plus the editor surfaces that consume it. Every diff in hiker — uncommitted-buffer diff, changes.db history, pending agent edits, snapshot review — is the same `DiffLayer` rendered against an editor tab.
+A unified diff primitive plus the editor surfaces that consume it. Every diff in hiker — uncommitted-buffer diff, op-log history (via `core::changes`), pending agent ops, snapshot review — is the same `DiffLayer` rendered against an editor tab.
 
 The headline decisions:
 
 - **One primitive: `DiffLayer { base, current, owner }`.** Two text inputs in; hunks + intraline spans + decoration set out. The renderer is owner-agnostic. Hosted in the editor crate alongside the existing decoration primitives. [diff-layer]
 - **Diff is a mode of the editor tab, not a tab kind.** An editor tab carries an optional `diff: DiffSource`; when set, the tab renders the buffer's `current` text decorated by `DiffLayer(resolve(diff), current)`. Toggle is in the editor toolbar; no separate `BufferDiff` / `SnapshotPreview` / `StagingPreview` / `TrashPreview` tab kinds. [diff-as-mode]
-- **`DiffSource` enumerates where `base` comes from.** `Disk(path)`, `LiveBuffer(doc_id)`, `ChangesDb(change_id)`, `StagingProposal(proposal_id)`, `Trash(trash_path)`, `Empty`. Each variant resolves to a `Rope` directly — no URI scheme indirection. [diff-source-enum]
-- **Owners drive UI affordances, not rendering.** The decoration set is identical across owners; what differs is per-hunk verbs (accept/reject for `Agent` and `Staging`, restore for `Snapshot`, none for `Index` or `Manual`). Verbs ride as overlay widgets on the hunk. [diff-layer-owner]
+- **`DiffSource` enumerates where `base` comes from.** `Disk(path)`, `LiveBuffer(doc_id)`, `ChangeRow(op_id)`, `PendingOp(op_id)`, `Trash(trash_path)`, `Empty`. Each variant resolves to a `Rope` directly — no URI scheme indirection. [diff-source-enum]
+- **Owners drive UI affordances, not rendering.** The decoration set is identical across owners; what differs is per-hunk verbs (accept/reject for `Agent`, restore for `Snapshot`, none for `Index` or `Manual`). Verbs ride as overlay widgets on the hunk. [diff-layer-owner]
 - **Computation is pure; rendering is in the editor crate.** `core::diff::compute(before, after)` returns hunks with optional intraline spans. `editor-diff` turns hunks into a `DecorationSet` (line backgrounds, removed-line view zones, intraline marks). Side-by-side layout is a future view option on the same primitive, not a separate tab. [diff-core-module, diff-renderer, diff-viewer-split-view]
 
 
@@ -22,9 +22,8 @@ pub struct DiffLayer {
 
 pub enum DiffOwner {
     Index,     // gutter-only; no inline decorations, no controls
-    Staging,   // per-hunk accept/reject
-    Agent,     // per-hunk accept/reject (same render as Staging; distinct telemetry)
-    Snapshot,  // per-hunk restore (writes that hunk's base text back to disk)
+    Agent,     // per-hunk accept/reject of pending ops
+    Snapshot,  // per-hunk restore (writes that hunk's base text back as a fresh op)
     Manual,    // no controls (user-initiated diff, e.g. between two snapshots)
 }
 ```
@@ -46,14 +45,14 @@ The decoration set the layer emits:
 pub enum DiffSource {
     Disk(PathBuf),                  // on-disk text at read time
     LiveBuffer(DocId),              // another open buffer's current rope
-    ChangesDb(ChangeId),            // content_at(change_id) from changes.db
-    StagingProposal(ProposalId),    // proposal's stored before-text
+    ChangeRow(OpId),                // materialization at the given accepted op via core::changes
+    PendingOp(OpId),                // proposed content for a pending op (whole-document shapes)
     Trash(PathBuf),                 // trashed file content
     Empty,                          // empty rope (for diff-against-nothing)
 }
 ```
 
-Each variant resolves to a `Rope` synchronously off existing services (`vault.read_file`, `app.buffers.get(doc_id)`, `changes.content_at(id)`, `staging.proposal(id)`, `vault.read_trash(path)`). No async, no caching layer; resolved each time the tab activates or its source is invalidated.
+Each variant resolves to a `Rope` synchronously off existing services (`vault.read_file`, `app.buffers.get(doc_id)`, `changes.materialization_at(op_id)`, `oplog.pending_content(op_id)`, `vault.read_trash(path)`). No async, no caching layer; resolved each time the tab activates or its source is invalidated.
 
 `LiveBuffer` is the "diff against another open buffer" affordance — used by the dirty-buffer toggle (`base = LiveBuffer(self)` is wrong; the dirty-buffer diff is `base = Disk(path), current = live buffer`).
 
@@ -72,8 +71,8 @@ The buffer's `current` is whatever the buffer normally holds — its rope is unc
 
 `owner_for(diff)` maps:
 - `Disk` / `LiveBuffer` → `Manual` (no per-hunk controls; user is just looking)
-- `ChangesDb` → `Snapshot` (per-hunk restore verb)
-- `StagingProposal` → `Staging` (per-hunk accept/reject)
+- `ChangeRow` → `Snapshot` (per-hunk restore verb)
+- `PendingOp` → `Agent` (per-hunk accept/reject)
 - `Trash` → `Manual`
 - `Empty` → `Manual` (diff is empty anyway)
 
@@ -82,12 +81,12 @@ The buffer's `current` is whatever the buffer normally holds — its rope is unc
 Read-only vs editable is independent of diff mode. Snapshot / trash sources mark the buffer read-only (no save path). The dirty-buffer diff and the agent diff leave the buffer editable.
 
 
-## Show changes (changes.db browser)
+## Show changes (op-log history browser)
 
-Right-clicking inside an editor buffer opens a context menu whose "Show changes…" entry lists recent `changes.db` rows for the buffer's path, newest first. Selecting a row switches the active tab into diff mode with `diff = Some(ChangesDb(change_id))`. [editor-show-changes-menu]
+Right-clicking inside an editor buffer opens a context menu whose "Show changes…" entry lists recent accepted ops for the buffer's path (via `core::changes`), newest first. Selecting a row switches the active tab into diff mode with `diff = Some(ChangeRow(op_id))`. [editor-show-changes-menu]
 
-- **Submenu shape.** Up to N=20 recent rows. Each row shows timestamp (relative + absolute on hover), op, author. Last entry: `Browse all… → ` opens the `history` app page filtered to this path.
-- **No URI scheme.** `DiffSource::ChangesDb` resolves directly through `core::changes::content_at(change_id)`. The editor crate doesn't know about URI providers.
+- **Submenu shape.** Up to N=20 recent rows. Each row shows timestamp (relative + absolute on hover), op kind, author. Last entry: `Browse all… → ` opens the `history` app page filtered to this path.
+- **No URI scheme.** `DiffSource::ChangeRow` resolves directly through `core::changes::materialization_at(op_id)`. The editor crate doesn't know about URI providers.
 - **Per-hunk restore.** Hunks carry a `Restore this hunk` verb that writes `base` (the historical text) back into the buffer for that range and saves. Restore-all stays as the existing `restore_snapshot` row-level action on the activity surface. [diff-layer-hunk-widgets]
 - **Read-only on history side.** The displayed diff is `base = historical`, `current = live buffer`. The user can keep editing `current` while a historical diff is shown; the diff updates each frame.
 
@@ -115,5 +114,5 @@ Right-clicking inside an editor buffer opens a context menu whose "Show changes�
 - `diff-viewer-three-way` — third rope input for merge resolution.
 - `diff-viewer-ignore-whitespace` — toggle on the compute call.
 - `diff-viewer-export-patch` — "copy as unified diff" affordance.
-- `activity-detail-diff-between-versions` — multi-select two `changes.db` rows + "Diff selected" opens a tab with `diff = Some(ChangesDb(id_a))` against a buffer whose content is `content_at(id_b)`.
+- `activity-detail-diff-between-versions` — multi-select two op-log rows + "Diff selected" opens a tab with `diff = Some(ChangeRow(op_id_a))` against a buffer whose content is `materialization_at(op_id_b)`.
 - `mcp-tool-diff` — agent-facing diff IPC.

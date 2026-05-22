@@ -14,8 +14,10 @@
 
 use egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 
-use editor_core::{Decoration, EditorState};
-use editor_view::ViewState;
+use editor_core::decoration::Decoration;
+
+use editor_core::state::Editor as EditorState;
+use editor_view::viewport::ViewState;
 
 /// What a given doc line looks like structurally. Higher variants beat
 /// lower ones when multiple decorations overlap the same line.
@@ -30,10 +32,10 @@ enum LineKind {
 }
 
 /// Visual + behavior knobs. All sizes are pixels. Defaults match the
-/// previous hard-coded look so a freshly-defaulted `MinimapOptions`
+/// previous hard-coded look so a freshly-defaulted `Options`
 /// renders identically to the original widget.
 #[derive(Clone, Debug)]
-pub struct MinimapOptions {
+pub struct Options {
     pub width: f32,
     pub bar_padding_left: f32,
     pub bar_padding_right: f32,
@@ -56,7 +58,7 @@ pub struct MinimapOptions {
     pub color_viewport_hover: Color32,
 }
 
-impl Default for MinimapOptions {
+impl Default for Options {
     fn default() -> Self {
         Self {
             width: 72.0,
@@ -83,7 +85,7 @@ impl Default for MinimapOptions {
 }
 
 impl LineKind {
-    fn color(self, opts: &MinimapOptions) -> Color32 {
+    const fn color(self, opts: &Options) -> Color32 {
         if !opts.colored {
             return match self {
                 LineKind::Hidden => Color32::TRANSPARENT,
@@ -101,30 +103,34 @@ impl LineKind {
     }
 }
 
-pub struct MinimapWidget<'a> {
+pub struct Widget<'a> {
     state: &'a EditorState,
     view: &'a mut ViewState,
-    opts: MinimapOptions,
+    opts: Options,
 }
 
-impl<'a> MinimapWidget<'a> {
+impl<'a> Widget<'a> {
     pub fn new(state: &'a EditorState, view: &'a mut ViewState) -> Self {
-        Self { state, view, opts: MinimapOptions::default() }
+        Self { state, view, opts: Options::default() }
     }
 
     /// Backwards-compatible shortcut for `with_options({ width, ..default })`.
-    pub fn with_width(mut self, width: f32) -> Self {
+    pub const fn with_width(mut self, width: f32) -> Self {
         self.opts.width = width;
         self
     }
 
-    pub fn with_options(mut self, opts: MinimapOptions) -> Self {
+    pub const fn with_options(mut self, opts: Options) -> Self {
         self.opts = opts;
         self
     }
 
     pub fn show(self, ui: &mut egui::Ui) -> egui::Response {
-        let MinimapWidget { state, view, opts } = self;
+        let kinds = self.classify_lines();
+        let metrics = self.measure_lines();
+        let opts = self.opts.clone();
+        let state = &*self.state;
+        let view = &mut *self.view;
         let height = ui.available_height().max(0.0);
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(opts.width, height), Sense::click_and_drag());
@@ -161,8 +167,6 @@ impl<'a> MinimapWidget<'a> {
             .max(1.0);
         let scale = rect.height() / total_content;
 
-        let kinds = classify_lines(state, view);
-        let metrics = measure_lines(state);
         let max_visible = metrics
             .iter()
             .map(|m| m.visible)
@@ -231,7 +235,12 @@ impl<'a> MinimapWidget<'a> {
             } else {
                 opts.color_viewport
             };
-            let thumb_stroke = boost_alpha(thumb_fill, 2.2);
+            let thumb_stroke = {
+                // Brighten the stroke relative to the fill so the
+                // viewport box reads as a framed rect, not a faint blur.
+                let a = (thumb_fill.a() as f32 * 2.2).clamp(0.0, 255.0) as u8;
+                Color32::from_rgba_unmultiplied(thumb_fill.r(), thumb_fill.g(), thumb_fill.b(), a)
+            };
             let frac_top = (view.scroll_y / total_content).clamp(0.0, 1.0);
             let frac_h = (view.height / total_content).clamp(0.0, 1.0);
             let vp_y = rect.top() + frac_top * rect.height();
@@ -275,11 +284,6 @@ impl<'a> MinimapWidget<'a> {
     }
 }
 
-fn boost_alpha(c: Color32, factor: f32) -> Color32 {
-    let a = (c.a() as f32 * factor).clamp(0.0, 255.0) as u8;
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
 /// Per-line "how much of the line is visible content vs. leading
 /// whitespace", in bytes. Bytes are a fine proxy at minimap scale and let
 /// us avoid a UTF-8 walk per line.
@@ -289,7 +293,9 @@ struct LineMetrics {
     visible: u32,
 }
 
-fn measure_lines(state: &EditorState) -> Vec<LineMetrics> {
+impl<'a> Widget<'a> {
+fn measure_lines(&self) -> Vec<LineMetrics> {
+    let state = &*self.state;
     let line_count = state.doc.len_lines();
     let mut out = Vec::with_capacity(line_count);
     for line in 0..line_count {
@@ -309,7 +315,9 @@ fn measure_lines(state: &EditorState) -> Vec<LineMetrics> {
 /// the highest-priority kind that overlaps it. This is the shared path
 /// with the editor's syntax pipeline — anything the editor highlights
 /// shows up here automatically.
-fn classify_lines(state: &EditorState, view: &ViewState) -> Vec<LineKind> {
+fn classify_lines(&self) -> Vec<LineKind> {
+    let state = &*self.state;
+    let view = &*self.view;
     let line_count = state.doc.len_lines();
     let mut out = vec![LineKind::Plain; line_count];
     if line_count == 0 {
@@ -363,4 +371,5 @@ fn classify_lines(state: &EditorState, view: &ViewState) -> Vec<LineKind> {
         }
     }
     out
+}
 }

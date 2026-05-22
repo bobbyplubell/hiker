@@ -13,7 +13,7 @@
 use std::time::Duration;
 use web_time::Instant;
 
-use crate::change::ChangeSet;
+use crate::change::Set;
 use crate::rope::Rope;
 use crate::selection::Selection;
 use crate::transaction::{EditType, Transaction};
@@ -25,7 +25,7 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(500);
 /// drop every other branch + every ancestor older than `KEEP_RECENT`
 /// steps. Without this cap, a long editing session against a large
 /// buffer accumulates revisions unbounded (each carries forward +
-/// inverse ChangeSets), and `EditorState::apply` deep-clones the
+/// inverse ChangeSets), and `Editor::apply` deep-clones the
 /// entire revisions Vec per keystroke — a fast path to OOM.
 ///
 /// 2000 ≈ ~1 MiB of revision metadata for typical short edits; a
@@ -37,8 +37,8 @@ const KEEP_RECENT: usize = 1000;
 struct Revision {
     parent: Option<u32>,
     last_child: Option<u32>,
-    forward: ChangeSet,
-    inverse: ChangeSet,
+    forward: Set,
+    inverse: Set,
     selection_before: Selection,
     selection_after: Selection,
     edit_type: Option<EditType>,
@@ -50,8 +50,8 @@ impl Revision {
         Self {
             parent: None,
             last_child: None,
-            forward: ChangeSet::empty(0),
-            inverse: ChangeSet::empty(0),
+            forward: Set::empty(0),
+            inverse: Set::empty(0),
             selection_before: Selection::default(),
             selection_after: Selection::default(),
             edit_type: None,
@@ -96,7 +96,7 @@ impl History {
     }
 
     #[cfg(test)]
-    fn set_now(&mut self, t: Instant) {
+    const fn set_now(&mut self, t: Instant) {
         self.now_override = Some(t);
     }
 
@@ -251,7 +251,7 @@ impl History {
         // Walk up while the current revision's timestamp is newer than cutoff
         // (i.e. we want to undo it).
         let mut cur = start;
-        let mut composed: Option<ChangeSet> = None;
+        let mut composed: Option<Set> = None;
         let mut final_selection = self.revisions[cur as usize].selection_before.clone();
         loop {
             let rev = &self.revisions[cur as usize];
@@ -284,7 +284,7 @@ impl History {
         let cutoff = now.checked_sub(dur)?;
         let start = self.head;
         let mut cur = start;
-        let mut composed: Option<ChangeSet> = None;
+        let mut composed: Option<Set> = None;
         let mut final_selection = self.revisions[cur as usize].selection_after.clone();
         while let Some(child_idx) = self.revisions[cur as usize].last_child {
             let child = &self.revisions[child_idx as usize];
@@ -317,10 +317,10 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change::ChangeSet;
+    use crate::change::Set;
 
     fn insert_tx(doc_len: usize, at: usize, text: &str, edit: EditType) -> Transaction {
-        let cs = ChangeSet::of(doc_len, vec![(at..at, text.to_string())]);
+        let cs = Set::of(doc_len, vec![(at..at, text.to_string())]);
         Transaction::new(cs).with_edit_type(edit)
     }
 

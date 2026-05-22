@@ -9,22 +9,23 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::changes::{ChangeAppend, ChangeOp, Changes};
-use crate::config::TrailsConfig;
-use crate::error::HikerError;
-use crate::hash::hash_str;
+use crate::config::sections::TrailsConfig;
+use crate::errors::HikerError;
+use crate::hash_string;
 use crate::indexer::{IndexJob, IndexJobTx};
-use crate::store::{new_id, Store};
-use crate::trash::{Trash, TrashEntry};
+use crate::store::dto::new_id;
+use crate::store::Store;
+use crate::trash::{Trash, Entry};
 use crate::vault::Vault;
 use crate::watcher::Watcher;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::{
-    append_change_best_effort, collect_descendant_ids, empty_trail_doc, empty_waypoint_note,
-    find_waypoint, find_waypoint_mut, parse_trail_doc_for, parse_waypoint, remove_waypoint_from_tree,
-    short_id_of, waypoint_filename, waypoints_dir_for, write_trail_doc_frontmatter,
-    write_waypoint_frontmatter, DoubleLinkRef, WaypointEntry,
+    append_change_best_effort, collect_descendant_ids, find_waypoint, find_waypoint_mut,
+    parse_trail_doc_for, parse_waypoint, remove_waypoint_from_tree, short_id_of,
+    waypoint_filename, waypoints_dir_for, write_trail_doc_frontmatter,
+    write_waypoint_frontmatter, DoubleLinkRef, WaypointEntry, WaypointFrontmatter,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,7 +92,8 @@ pub async fn create_trail(
     }
 
     let trail_id = new_id();
-    let body = empty_trail_doc(&trail_id);
+    // Minimal valid trail-doc frontmatter — no last_activated_at yet.
+    let body = format!("---\nhiker:\n  kind: trail\n  id: {trail_id}\n  waypoints: []\n---\n");
 
     // Write the trail-doc with auto-suffix on collision.
     let mut chosen: Option<String> = None;
@@ -146,7 +148,7 @@ pub async fn create_trail(
             path: &trail_doc_rel,
             op: ChangeOp::Created,
             author: "user",
-            content_hash: Some(&hash_str(&body)),
+            content_hash: Some(&hash_string(&body)),
             content: Some(body.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trails.create_trail"}),
@@ -217,7 +219,7 @@ pub async fn append_waypoint(
     // Trails-mode rendering — see
     // `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`).
     let source_id =
-        crate::ops::ensure_note_id_stamped(watcher, jobs, vault, changes, store, source_rel)
+        crate::ops::buffer::ensure_note_id_stamped(watcher, jobs, vault, changes, store, source_rel)
             .await?;
 
     // 2. Read the trail-doc.
@@ -282,8 +284,18 @@ pub async fn append_waypoint(
         id: trail_id.clone(),
         path: trail_doc_rel.to_string(),
     };
-    let mut waypoint_body = empty_waypoint_note(&waypoint_id, &source_ref, &in_trail)
-        .map_err(|e| HikerError::Io(format!("write waypoint fm: {e}")))?;
+    let mut waypoint_body = {
+        let fm = WaypointFrontmatter {
+            id: waypoint_id.clone(),
+            references: source_ref.clone(),
+            in_trail: in_trail.clone(),
+        };
+        // Body-source is just the empty string — no body, no extra newlines
+        // beyond the closing `---\n` that `assemble` produces. Per spec,
+        // `trail-empty-waypoint-body` requires zero bytes after the FM.
+        write_waypoint_frontmatter("", &fm)
+            .map_err(|e| HikerError::Io(format!("write waypoint fm: {e}")))?
+    };
     // Honor optional annotation; None or empty → spec-mandated empty body.
     if let Some(ann) = annotation
         && !ann.is_empty()
@@ -304,7 +316,7 @@ pub async fn append_waypoint(
             path: &waypoint_rel,
             op: ChangeOp::Created,
             author: "user",
-            content_hash: Some(&hash_str(&waypoint_body)),
+            content_hash: Some(&hash_string(&waypoint_body)),
             content: Some(waypoint_body.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trails.append_waypoint"}),
@@ -384,7 +396,7 @@ pub async fn append_waypoint(
             path: trail_doc_rel,
             op: ChangeOp::Modified,
             author: "user",
-            content_hash: Some(&hash_str(&new_trail_src)),
+            content_hash: Some(&hash_string(&new_trail_src)),
             content: Some(new_trail_src.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trails.append_waypoint"}),
@@ -470,7 +482,7 @@ pub async fn remove_waypoint(
     // partial success in v1; revisit if real use surfaces it.
     for rel in &removed_paths {
         let _entry =
-            crate::ops::delete(watcher, jobs, vault, changes, rel).await?;
+            crate::ops::file::delete(watcher, jobs, vault, changes, rel).await?;
     }
 
     // Rewrite the trail-doc.
@@ -486,7 +498,7 @@ pub async fn remove_waypoint(
             path: trail_doc_rel,
             op: ChangeOp::Modified,
             author: "user",
-            content_hash: Some(&hash_str(&new_trail_src)),
+            content_hash: Some(&hash_string(&new_trail_src)),
             content: Some(new_trail_src.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trails.remove_waypoint"}),
@@ -545,7 +557,7 @@ pub async fn delete_trail(
     changes: Option<&Arc<Changes>>,
     _trash: &Trash,
     trail_doc_rel: &str,
-) -> Result<TrashEntry, HikerError> {
+) -> Result<Entry, HikerError> {
     // Pull the trail id off the trail-doc so we know which waypoint dir
     // to cascade. If the trail-doc can't be parsed (mid-edit, garbage),
     // fall back to deleting just the trail-doc — surface that clearly.
@@ -565,7 +577,7 @@ pub async fn delete_trail(
         }
     };
 
-    let entry = crate::ops::delete(watcher, jobs, vault, changes, trail_doc_rel).await?;
+    let entry = crate::ops::file::delete(watcher, jobs, vault, changes, trail_doc_rel).await?;
 
     if let Some(tid) = trail_id {
         let waypoint_dir = waypoints_dir_for(&tid);
@@ -579,7 +591,7 @@ pub async fn delete_trail(
             // are deferred — for v1 the trail-doc and the waypoint dir
             // become two separate trash entries; the user restores both.
             if let Err(e) =
-                crate::ops::delete(watcher, jobs, vault, changes, &trail_root).await
+                crate::ops::file::delete(watcher, jobs, vault, changes, &trail_root).await
             {
                 tracing::warn!(error = %e, trail_id = %tid,
                     "delete_trail: cascade delete of waypoint dir failed");
@@ -733,10 +745,9 @@ pub async fn on_note_moved(
     if old_rel == new_rel {
         return Ok(0);
     }
-    let mut touched: usize = 0;
-
-    // -- Case 1: a source note moved. Find every waypoint-note that
-    // references `old_rel` as its source.
+    // Gather all store reads up front so the async fan-out doesn't hold
+    // a `&Store` (rusqlite is !Sync, which would make the resulting
+    // future !Send under tokio's multi-thread scheduler).
     let containing = match store.trails_containing_note(old_rel) {
         Ok(rows) => rows,
         Err(e) => {
@@ -745,26 +756,6 @@ pub async fn on_note_moved(
             Vec::new()
         }
     };
-    for hit in &containing {
-        if let Err(e) = rewrite_waypoint_source_path(
-            watcher, jobs, vault, changes, &hit.waypoint_path, new_rel,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, path = %hit.waypoint_path,
-                "on_note_moved: source-rewrite of waypoint-note failed");
-            continue;
-        }
-        touched += 1;
-    }
-
-    // -- Case 2: the moved note may itself be a trail-doc. Detect via the
-    // path_ids → ULID round-trip (the trail-doc's `hiker.id` is the
-    // trail_id, so `id_for_path(new_rel)` gives us the trail_id directly
-    // when it resolves; the indexer's Move/Rename handler ran path remap
-    // before us, so `new_rel` is the live row). For safety we also try
-    // `old_rel` as a fallback — `path_ids` retains old paths via
-    // `rename_note`'s upsert path.
     let trail_id_candidate = match store.id_for_path(new_rel) {
         Ok(Some(id)) => Some(id),
         _ => match store.id_for_path(old_rel) {
@@ -772,139 +763,178 @@ pub async fn on_note_moved(
             _ => None,
         },
     };
-    if let Some(trail_id) = trail_id_candidate {
-        // Cheap check: did this id correspond to a trail-doc? `waypoints_of`
-        // returns rows only for trail ids — an empty result is the no-op
-        // case (regular note move, not a trail-doc move).
-        let waypoints = store.waypoints_of(&trail_id).unwrap_or_default();
-        if !waypoints.is_empty() {
-            for wp in &waypoints {
-                // Each waypoint-note's `hiker.in_trail.path` pointed at
-                // the trail-doc's old path. Rewrite to new.
-                if let Err(e) = rewrite_waypoint_in_trail_path(
-                    watcher,
-                    jobs,
-                    vault,
-                    changes,
-                    &wp.waypoint_path,
-                    new_rel,
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, path = %wp.waypoint_path,
-                        "on_note_moved: in_trail-rewrite of waypoint-note failed");
-                    continue;
-                }
-                touched += 1;
-            }
-        }
-    }
+    let waypoints_of_trail = match &trail_id_candidate {
+        Some(trail_id) => store.waypoints_of(trail_id).unwrap_or_default(),
+        None => Vec::new(),
+    };
 
-    // -- Case 3: the moved note may be a waypoint-note. The derived table
-    // is keyed by `waypoint_path`; if `old_rel` matches any row, rewrite
-    // its parent trail-doc's `hiker.waypoints[]` entry, then bulk-rename
-    // the derived row's `waypoint_path` column.
-    if old_rel.starts_with(".hiker/trails/") && old_rel.contains("/waypoints/") {
-        // Look up the row's trail_id by walking trails_containing_note
-        // won't work (matches source). Use a direct id_for_path:
-        // the waypoint-note's own id → in_trail.id is its parent trail.
-        // Easier: read the waypoint-note from disk (it's at new_rel now)
-        // and parse its in_trail to learn the trail_id, then rewrite the
-        // trail-doc.
-        if let Ok(src) = vault.read_file(new_rel)
-            && let Ok(fm) = parse_waypoint(&src)
-        {
-            let trail_doc_rel = fm.in_trail.path.clone();
-            if let Err(e) = rewrite_trail_doc_waypoint_entry(
-                watcher,
-                jobs,
-                vault,
-                changes,
-                &trail_doc_rel,
-                old_rel,
-                new_rel,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, path = %trail_doc_rel,
-                    "on_note_moved: trail-doc waypoint-entry rewrite failed");
-            } else {
-                touched += 1;
-            }
-            // Derived-table single-row rename via the prefix helper —
-            // exact match acts as a degenerate prefix rewrite.
-            if let Err(e) = store.rename_trail_waypoint_paths(old_rel, new_rel) {
-                tracing::warn!(error = %e,
-                    "on_note_moved: rename_trail_waypoint_paths failed");
-            }
-        }
-    }
-
+    let rctx = RewriteCtx { watcher, jobs, vault, changes };
+    let mut touched: usize = 0;
+    touched += rctx.fan_out_source_moved(&containing, new_rel).await;
+    touched += rctx.fan_out_trail_doc_moved(&waypoints_of_trail, new_rel).await;
+    touched += rctx.fan_out_waypoint_moved(store, old_rel, new_rel).await;
     Ok(touched)
 }
 
-/// Read + parse a waypoint-note, rewrite `hiker.references.path`
-/// (id unchanged), persist via the standard write path with watcher
-/// suppression + changelog append + reindex.
-async fn rewrite_waypoint_source_path(
-    watcher: Option<&Watcher>,
-    jobs: Option<&IndexJobTx>,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    waypoint_rel: &str,
-    new_source_rel: &str,
-) -> Result<(), HikerError> {
-    let src = vault.read_file(waypoint_rel)?;
-    let mut fm = parse_waypoint(&src)
-        .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
-    if fm.references.path == new_source_rel {
-        return Ok(()); // already canonical (idempotent re-runs)
-    }
-    fm.references.path = new_source_rel.to_string();
-    let new_src = write_waypoint_frontmatter(&src, &fm)
-        .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
-    write_with_suppress_and_log(
-        watcher, jobs, vault, changes, waypoint_rel, &new_src,
-    )
-    .await
+/// Borrow-bundle for the three path-rewrite helpers in `on_note_moved`.
+/// Methods on this struct stay exempt from `single_call_fn` and share the
+/// suppression / changelog plumbing without repeating four-arg signatures.
+struct RewriteCtx<'a> {
+    watcher: Option<&'a Watcher>,
+    jobs: Option<&'a IndexJobTx>,
+    vault: &'a Vault,
+    changes: Option<&'a Arc<Changes>>,
 }
 
-/// Read + parse a waypoint-note, rewrite `hiker.in_trail.path`
-/// (id unchanged), persist.
-async fn rewrite_waypoint_in_trail_path(
-    watcher: Option<&Watcher>,
-    jobs: Option<&IndexJobTx>,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    waypoint_rel: &str,
-    new_trail_doc_rel: &str,
-) -> Result<(), HikerError> {
-    let src = vault.read_file(waypoint_rel)?;
-    let mut fm = parse_waypoint(&src)
-        .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
-    if fm.in_trail.path == new_trail_doc_rel {
-        return Ok(());
+impl<'a> RewriteCtx<'a> {
+    /// Case 1: a source note moved. Rewrite every waypoint-note in
+    /// `containing` to point at `new_rel`. Returns the count rewritten.
+    async fn fan_out_source_moved(
+        &self,
+        containing: &[crate::store::dto::TrailContainingHit],
+        new_rel: &str,
+    ) -> usize {
+        let mut touched = 0;
+        for hit in containing {
+            if let Err(e) = self
+                .rewrite_waypoint_source_path(&hit.waypoint_path, new_rel)
+                .await
+            {
+                tracing::warn!(error = %e, path = %hit.waypoint_path,
+                    "on_note_moved: source-rewrite of waypoint-note failed");
+                continue;
+            }
+            touched += 1;
+        }
+        touched
     }
-    fm.in_trail.path = new_trail_doc_rel.to_string();
-    let new_src = write_waypoint_frontmatter(&src, &fm)
-        .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
-    write_with_suppress_and_log(
-        watcher, jobs, vault, changes, waypoint_rel, &new_src,
-    )
-    .await
-}
 
-/// Read + parse a trail-doc, rewrite the `hiker.waypoints[]` entry
-/// whose `path == old_waypoint_rel` to `new_waypoint_rel`, persist.
-async fn rewrite_trail_doc_waypoint_entry(
-    watcher: Option<&Watcher>,
-    jobs: Option<&IndexJobTx>,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
-    trail_doc_rel: &str,
-    old_waypoint_rel: &str,
-    new_waypoint_rel: &str,
-) -> Result<(), HikerError> {
+    /// Case 2: the moved note may itself be a trail-doc. Rewrite the
+    /// `hiker.in_trail.path` of every waypoint in `waypoints_of_trail`.
+    async fn fan_out_trail_doc_moved(
+        &self,
+        waypoints_of_trail: &[crate::store::dto::WaypointRow],
+        new_rel: &str,
+    ) -> usize {
+        let mut touched = 0;
+        for wp in waypoints_of_trail {
+            // Each waypoint-note's `hiker.in_trail.path` pointed at the
+            // trail-doc's old path. Rewrite to new.
+            if let Err(e) = self
+                .rewrite_waypoint_in_trail_path(&wp.waypoint_path, new_rel)
+                .await
+            {
+                tracing::warn!(error = %e, path = %wp.waypoint_path,
+                    "on_note_moved: in_trail-rewrite of waypoint-note failed");
+                continue;
+            }
+            touched += 1;
+        }
+        touched
+    }
+
+    /// Case 3: the moved note may be a waypoint-note. The derived table is
+    /// keyed by `waypoint_path`; if `old_rel` matches any row, rewrite its
+    /// parent trail-doc's `hiker.waypoints[]` entry, then bulk-rename the
+    /// derived row's `waypoint_path` column.
+    async fn fan_out_waypoint_moved(
+        &self,
+        store: &mut Store,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> usize {
+        if !(old_rel.starts_with(".hiker/trails/") && old_rel.contains("/waypoints/")) {
+            return 0;
+        }
+        // Look up the row's trail_id by walking trails_containing_note
+        // won't work (matches source). Use a direct id_for_path: the
+        // waypoint-note's own id → in_trail.id is its parent trail.
+        // Easier: read the waypoint-note from disk (it's at new_rel now)
+        // and parse its in_trail to learn the trail_id, then rewrite the
+        // trail-doc.
+        let Ok(src) = self.vault.read_file(new_rel) else { return 0 };
+        let Ok(fm) = parse_waypoint(&src) else { return 0 };
+        let trail_doc_rel = fm.in_trail.path.clone();
+        // Drop `src` / `fm` borrows before the .await so no Store-derived
+        // value lives across the suspension point.
+        drop(src);
+        drop(fm);
+        let mut touched = 0;
+        if let Err(e) = self
+            .rewrite_trail_doc_waypoint_entry(&trail_doc_rel, old_rel, new_rel)
+            .await
+        {
+            tracing::warn!(error = %e, path = %trail_doc_rel,
+                "on_note_moved: trail-doc waypoint-entry rewrite failed");
+        } else {
+            touched += 1;
+        }
+        // Derived-table single-row rename via the prefix helper — exact
+        // match acts as a degenerate prefix rewrite.
+        if let Err(e) = store.rename_trail_waypoint_paths(old_rel, new_rel) {
+            tracing::warn!(error = %e,
+                "on_note_moved: rename_trail_waypoint_paths failed");
+        }
+        touched
+    }
+
+    /// Read + parse a waypoint-note, rewrite `hiker.references.path`
+    /// (id unchanged), persist via the standard write path with watcher
+    /// suppression + changelog append + reindex.
+    async fn rewrite_waypoint_source_path(
+        &self,
+        waypoint_rel: &str,
+        new_source_rel: &str,
+    ) -> Result<(), HikerError> {
+        let src = self.vault.read_file(waypoint_rel)?;
+        let mut fm = parse_waypoint(&src)
+            .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
+        if fm.references.path == new_source_rel {
+            return Ok(()); // already canonical (idempotent re-runs)
+        }
+        fm.references.path = new_source_rel.to_string();
+        let new_src = write_waypoint_frontmatter(&src, &fm)
+            .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
+        write_with_suppress_and_log(
+            self.watcher, self.jobs, self.vault, self.changes, waypoint_rel, &new_src,
+        )
+        .await
+    }
+
+    /// Read + parse a waypoint-note, rewrite `hiker.in_trail.path`
+    /// (id unchanged), persist.
+    async fn rewrite_waypoint_in_trail_path(
+        &self,
+        waypoint_rel: &str,
+        new_trail_doc_rel: &str,
+    ) -> Result<(), HikerError> {
+        let src = self.vault.read_file(waypoint_rel)?;
+        let mut fm = parse_waypoint(&src)
+            .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
+        if fm.in_trail.path == new_trail_doc_rel {
+            return Ok(());
+        }
+        fm.in_trail.path = new_trail_doc_rel.to_string();
+        let new_src = write_waypoint_frontmatter(&src, &fm)
+            .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
+        write_with_suppress_and_log(
+            self.watcher, self.jobs, self.vault, self.changes, waypoint_rel, &new_src,
+        )
+        .await
+    }
+
+    /// Read + parse a trail-doc, rewrite the `hiker.waypoints[]` entry
+    /// whose `path == old_waypoint_rel` to `new_waypoint_rel`, persist.
+    async fn rewrite_trail_doc_waypoint_entry(
+        &self,
+        trail_doc_rel: &str,
+        old_waypoint_rel: &str,
+        new_waypoint_rel: &str,
+    ) -> Result<(), HikerError> {
+        let vault = self.vault;
+        let watcher = self.watcher;
+        let jobs = self.jobs;
+        let changes = self.changes;
     let src = vault.read_file(trail_doc_rel)?;
     let mut fm = parse_trail_doc_for(trail_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
@@ -927,12 +957,13 @@ async fn rewrite_trail_doc_waypoint_entry(
     if !changed {
         return Ok(());
     }
-    let new_src = write_trail_doc_frontmatter(&src, &fm)
-        .map_err(|e| HikerError::Io(format!("write trail-doc: {e}")))?;
-    write_with_suppress_and_log(
-        watcher, jobs, vault, changes, trail_doc_rel, &new_src,
-    )
-    .await
+        let new_src = write_trail_doc_frontmatter(&src, &fm)
+            .map_err(|e| HikerError::Io(format!("write trail-doc: {e}")))?;
+        write_with_suppress_and_log(
+            watcher, jobs, vault, changes, trail_doc_rel, &new_src,
+        )
+        .await
+    }
 }
 
 /// Common: pre-suppress watcher → write file → re-suppress watcher →
@@ -959,7 +990,7 @@ async fn write_with_suppress_and_log(
             path: rel,
             op: ChangeOp::Modified,
             author: "user",
-            content_hash: Some(&hash_str(new_src)),
+            content_hash: Some(&hash_string(new_src)),
             content: Some(new_src.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trail-auto-update-on-note-move"}),
@@ -1009,7 +1040,7 @@ pub async fn stamp_last_activated_at(
             path: trail_doc_rel,
             op: ChangeOp::Modified,
             author: "user",
-            content_hash: Some(&hash_str(&new_src)),
+            content_hash: Some(&hash_string(&new_src)),
             content: Some(new_src.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trails.set_active"}),
@@ -1054,7 +1085,7 @@ pub async fn set_append_cursor(
             "waypoint id: {id}"
         )));
     }
-    fm.append_under = waypoint_id.map(|s| s.to_string());
+    fm.append_under = waypoint_id.map(std::string::ToString::to_string);
 
     let new_src = write_trail_doc_frontmatter(&src, &fm)
         .map_err(|e| HikerError::Io(format!("rewrite trail-doc: {e}")))?;
@@ -1069,7 +1100,7 @@ pub async fn set_append_cursor(
             path: trail_doc_rel,
             op: ChangeOp::Modified,
             author: "user",
-            content_hash: Some(&hash_str(&new_src)),
+            content_hash: Some(&hash_string(&new_src)),
             content: Some(new_src.as_bytes()),
             rename_from: None,
             metadata: serde_json::json!({"reason": "trail-append-cursor"}),

@@ -3,22 +3,14 @@
 //! Alt+mouse-drag creates one SelRange per buffer line in the y-span of
 //! the drag, each spanning the same horizontal x-range.
 
-use editor_core::EditorState;
-use editor_view::command::{handle_mouse_with_mods, Action};
-use editor_view::event::{Modifiers, MouseButton, MouseEvent};
-use editor_view::view::{DragState, ViewState};
-
-fn make_view() -> ViewState {
-    ViewState {
-        gutter_width: 0.0,
-        font_size: 14.0,
-        line_height: 18.0,
-        width: 400.0,
-        height: 200.0,
-        ..ViewState::default()
-    }
-}
-
+use editor_core::state::Editor as EditorState;
+use editor_view::command::handle_mouse_with_mods;
+use editor_view::command::Action;
+use editor_view::events::Modifiers;
+use editor_view::events::MouseButton;
+use editor_view::events::MouseEvent;
+use editor_view::viewport::DragState;
+use editor_view::viewport::ViewState;
 fn x_for_col(view: &ViewState, col: usize) -> f32 {
     let char_w = view.font_size * 0.55;
     view.gutter_width + col as f32 * char_w
@@ -28,7 +20,14 @@ fn x_for_col(view: &ViewState, col: usize) -> f32 {
 fn alt_drag_creates_one_range_per_row_at_same_columns() {
     let text = "hello world\nhello world\nhello world\nhello world\nhello world\n";
     let mut state = EditorState::new(text);
-    let mut view = make_view();
+    let mut view = ViewState {
+        gutter_width: 0.0,
+        font_size: 14.0,
+        line_height: 18.0,
+        width: 400.0,
+        height: 200.0,
+        ..ViewState::default()
+    };
     view.sync_to(&state);
 
     // Down at column 5 on line 0 (y=0) with Alt held — start RectangleSelecting.

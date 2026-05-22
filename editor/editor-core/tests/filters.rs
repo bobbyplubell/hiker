@@ -2,13 +2,17 @@
 
 use std::sync::Arc;
 
-use editor_core::change::{ChangeSet, Op};
+use editor_core::change::Set;
+use editor_core::change::Op;
 use editor_core::compartment::Compartment;
 use editor_core::selection::Selection;
-use editor_core::state::{ChangeFilter, EditorState, TransactionExtender, TransactionFilter};
+use editor_core::state::ChangeFilter;
+use editor_core::state::Editor;
+use editor_core::state::TransactionExtender;
+use editor_core::state::TransactionFilter;
 use editor_core::transaction::StateEffect;
 
-/// A change filter that vetoes any ChangeSet that inserts the substring "BAD".
+/// A change filter that vetoes any Set that inserts the substring "BAD".
 #[test]
 fn change_filter_veto_blocks_insert() {
     let filter: ChangeFilter = Arc::new(|_state, cs| {
@@ -22,7 +26,7 @@ fn change_filter_veto_blocks_insert() {
         Some(cs.clone())
     });
 
-    let mut state = EditorState::new("hello").with_change_filter(filter);
+    let mut state = Editor::new("hello").with_change_filter(filter);
     state.selection = Selection::single(5);
 
     let tx = state.insert_at_selections("BAD");
@@ -40,12 +44,12 @@ fn change_filter_veto_blocks_insert() {
 }
 
 /// A transaction filter that strips trailing ASCII whitespace from every
-/// Insert op in the ChangeSet.
+/// Insert op in the Set.
 #[test]
 fn transaction_filter_rewrites_inserts() {
     let filter: TransactionFilter = Arc::new(|state, mut tx| {
         // Walk ops, trimming trailing whitespace from inserts. Rebuild as a
-        // new ChangeSet using the same retain/delete structure but trimmed
+        // new Set using the same retain/delete structure but trimmed
         // inserts.
         let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut pos = 0usize;
@@ -70,11 +74,11 @@ fn transaction_filter_rewrites_inserts() {
                 }
             }
         }
-        tx.changes = ChangeSet::of(state.doc.len_bytes(), edits);
+        tx.changes = Set::of(state.doc.len_bytes(), edits);
         tx
     });
 
-    let mut state = EditorState::new("").with_transaction_filter(filter);
+    let mut state = Editor::new("").with_transaction_filter(filter);
     state.selection = Selection::single(0);
 
     let tx = state.insert_at_selections("hello   ");
@@ -101,7 +105,7 @@ fn transaction_extender_adds_effect_on_doc_change() {
         }]
     });
 
-    let mut state = EditorState::new("a").with_transaction_extender(extender);
+    let mut state = Editor::new("a").with_transaction_extender(extender);
     state.compartments.set(&counter, 0u32);
     state.selection = Selection::single(1);
 

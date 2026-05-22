@@ -3,25 +3,20 @@
 //! `force_layout` worker to convergence, and dumps a PNG so we can
 //! iterate on FA2 params without firing up the full app.
 //!
-//! The two algorithm modules are pulled in via `#[path]` so we're
-//! testing the same code the app runs — no copy/paste drift.
-
-#[path = "../../../app/src/widgets/force_layout.rs"]
-mod force_layout;
-
-#[path = "../../../app/src/widgets/graph_layouts.rs"]
-mod graph_layouts;
+//! The two algorithm modules live in the `graph-widgets` crate so
+//! we're testing the same code the app runs — no copy/paste drift,
+//! and a normal Cargo dep crosses the crate boundary that
+//! `single_call_fn` audits within.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use egui::Vec2;
-use image::{Rgba, RgbaImage};
-
-use force_layout::{LayoutParams, LayoutWorker};
-use graph_layouts::{
+use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::graph_layouts::{
     bfs_tree, dfs_tree, horizontal_tree_positions, radial_positions, vertical_tree_positions,
 };
+use image::{Rgba, RgbaImage};
 
 /// CLI configuration. Hand-parsed instead of pulling clap to keep the
 /// crate's deps minimal.
@@ -99,53 +94,6 @@ impl Default for Args {
     }
 }
 
-fn parse_args() -> Args {
-    let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
-    while let Some(k) = it.next() {
-        let mut v = || it.next().expect("missing value for arg");
-        match k.as_str() {
-            "--clusters" => a.clusters = v().parse().unwrap(),
-            "--per-cluster" => a.per_cluster = v().parse().unwrap(),
-            "--bridges" => a.bridges = v().parse().unwrap(),
-            "--hubs" => a.hubs = v().parse().unwrap(),
-            "--hub-leaves" => a.hub_leaves = v().parse().unwrap(),
-            "--intra-density" => a.intra_density = v().parse().unwrap(),
-            "--layout" => a.layout = v(),
-            "--synth" => a.synth_kind = v(),
-            "--branching" => a.tree_branching = v().parse().unwrap(),
-            "--depth" => a.tree_depth = v().parse().unwrap(),
-            "--out" => a.out = v(),
-            "--size" => {
-                let s = v();
-                let (w, h) = s.split_once('x').expect("size form is WxH");
-                a.width = w.parse().unwrap();
-                a.height = h.parse().unwrap();
-            }
-            "--scaling" => a.scaling_ratio = v().parse().unwrap(),
-            "--gravity" => a.gravity = v().parse().unwrap(),
-            "--strong-gravity" => a.strong_gravity = true,
-            "--slow-down" => a.slow_down = v().parse().unwrap(),
-            "--lin-log" => a.lin_log = true,
-            "--no-outbound" => a.outbound_attr = false,
-            "--no-degree-repulsion" => a.degree_repulsion = false,
-            "--iters" => a.max_iters = v().parse().unwrap(),
-            "--theta" => a.theta = v().parse().unwrap(),
-            "--timeout" => a.timeout_secs = v().parse().unwrap(),
-            "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("unknown arg: {other}");
-                print_help();
-                std::process::exit(2);
-            }
-        }
-    }
-    a
-}
-
 fn print_help() {
     eprintln!(
         "graph-snapshot — render synthetic force-layout to PNG\n\n\
@@ -170,7 +118,7 @@ impl Lcg {
     fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
-    fn next_u32(&mut self) -> u32 {
+    const fn next_u32(&mut self) -> u32 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
@@ -194,131 +142,6 @@ struct Graph {
     is_hub: Vec<bool>,
 }
 
-fn synth(args: &Args) -> Graph {
-    let mut rng = Lcg::new(0xC0FFEE);
-    let mut edges = Vec::new();
-    let mut cluster_of = Vec::new();
-    let mut is_hub = Vec::new();
-
-    // 1) Cluster blocks.
-    let cluster_starts: Vec<usize> = (0..args.clusters)
-        .map(|c| c * args.per_cluster)
-        .collect();
-    for c in 0..args.clusters {
-        for _ in 0..args.per_cluster {
-            cluster_of.push(c);
-            is_hub.push(false);
-        }
-    }
-    // Random intra-cluster edges.
-    for &start in cluster_starts.iter().take(args.clusters) {
-        for i in start..(start + args.per_cluster) {
-            for j in (i + 1)..(start + args.per_cluster) {
-                if rng.next_f32() < args.intra_density {
-                    edges.push((i as u32, j as u32));
-                }
-            }
-        }
-    }
-
-    // 2) Inter-cluster bridges.
-    for _ in 0..args.bridges {
-        let c1 = rng.range(0, args.clusters);
-        let mut c2 = rng.range(0, args.clusters);
-        if c2 == c1 {
-            c2 = (c2 + 1) % args.clusters;
-        }
-        let a = cluster_starts[c1] + rng.range(0, args.per_cluster);
-        let b = cluster_starts[c2] + rng.range(0, args.per_cluster);
-        edges.push((a as u32, b as u32));
-    }
-
-    // 3) Hub-and-spoke subgraphs — connected to a random cluster so
-    // they're not floating, and with a few leaf-to-leaf edges so the
-    // flower pattern breaks symmetry the way a real vault's local
-    // topology would.
-    for _ in 0..args.hubs {
-        let hub = cluster_of.len();
-        cluster_of.push(usize::MAX);
-        is_hub.push(true);
-        let leaf_start = cluster_of.len();
-        for _ in 0..args.hub_leaves {
-            let leaf = cluster_of.len();
-            cluster_of.push(usize::MAX);
-            is_hub.push(false);
-            edges.push((hub as u32, leaf as u32));
-        }
-        // Bridge hub into a random cluster.
-        let c = rng.range(0, args.clusters);
-        let target = cluster_starts[c] + rng.range(0, args.per_cluster);
-        edges.push((hub as u32, target as u32));
-        // A few leaf-leaf edges to break the ring symmetry.
-        for _ in 0..(args.hub_leaves / 4).max(1) {
-            let i = leaf_start + rng.range(0, args.hub_leaves);
-            let j = leaf_start + rng.range(0, args.hub_leaves);
-            if i != j {
-                edges.push((i as u32, j as u32));
-            }
-        }
-    }
-
-    Graph {
-        n: cluster_of.len(),
-        edges,
-        cluster_of,
-        is_hub,
-    }
-}
-
-fn build_params(a: &Args) -> LayoutParams {
-    LayoutParams {
-        bound: 10_000.0,
-        max_iters: a.max_iters,
-        theta: a.theta,
-        convergence_eps: 0.5,
-        convergence_streak: 20,
-        scaling_ratio: a.scaling_ratio,
-        gravity: a.gravity,
-        strong_gravity: a.strong_gravity,
-        slow_down: a.slow_down,
-        lin_log: a.lin_log,
-        outbound_attraction_distribution: a.outbound_attr,
-        degree_repulsion: a.degree_repulsion,
-    }
-}
-
-fn run_layout(g: &Graph, params: LayoutParams, timeout_secs: u64) -> Vec<Vec2> {
-    // Small randomised seed; FA2 settles into its own scale.
-    let mut rng = Lcg::new(0xBEEF);
-    let seed: Vec<Vec2> = (0..g.n)
-        .map(|_| Vec2::new((rng.next_f32() - 0.5) * 50.0, (rng.next_f32() - 0.5) * 50.0))
-        .collect();
-    let worker = LayoutWorker::spawn(seed.clone(), g.edges.clone(), params);
-    let start = Instant::now();
-    let mut last_iter = 0u32;
-    while worker.is_running() {
-        if start.elapsed() >= Duration::from_secs(timeout_secs) {
-            eprintln!("(timeout — bailing with last snapshot)");
-            break;
-        }
-        let it = worker.iters_done();
-        if it != last_iter && it % 50 == 0 {
-            print!("\r  iter {}…", it);
-            std::io::stdout().flush().ok();
-            last_iter = it;
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    println!(
-        "\r  converged in {} iters ({:.2}s)        ",
-        worker.iters_done(),
-        start.elapsed().as_secs_f32()
-    );
-    let mut pos = seed;
-    worker.snapshot_into(&mut pos);
-    pos
-}
-
 /// Cluster palette — 8 hand-picked hues so blocks are visually distinct.
 const PALETTE: &[Rgba<u8>] = &[
     Rgba([0xe6, 0x4d, 0x4d, 0xff]),
@@ -330,77 +153,6 @@ const PALETTE: &[Rgba<u8>] = &[
     Rgba([0x4d, 0xe6, 0xd0, 0xff]),
     Rgba([0xe6, 0x4d, 0xa8, 0xff]),
 ];
-
-fn render_png(g: &Graph, pos: &[Vec2], args: &Args) {
-    let mut img: RgbaImage = RgbaImage::from_pixel(
-        args.width,
-        args.height,
-        Rgba([0x14, 0x18, 0x1d, 0xff]),
-    );
-
-    // Fit to image with margin.
-    let margin = 30.0_f32;
-    let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
-    for &p in pos {
-        lo.x = lo.x.min(p.x);
-        lo.y = lo.y.min(p.y);
-        hi.x = hi.x.max(p.x);
-        hi.y = hi.y.max(p.y);
-    }
-    let span_x = (hi.x - lo.x).max(1.0);
-    let span_y = (hi.y - lo.y).max(1.0);
-    let avail_w = (args.width as f32) - margin * 2.0;
-    let avail_h = (args.height as f32) - margin * 2.0;
-    let scale = (avail_w / span_x).min(avail_h / span_y);
-    let center_world = (lo + hi) * 0.5;
-    let center_screen = Vec2::new(args.width as f32 * 0.5, args.height as f32 * 0.5);
-    let to_screen = |w: Vec2| -> (f32, f32) {
-        let s = center_screen + (w - center_world) * scale;
-        (s.x, s.y)
-    };
-
-    // Edges first.
-    let edge_col = Rgba([0x55, 0x5d, 0x68, 0x90]);
-    for &(a, b) in &g.edges {
-        let (a, b) = (a as usize, b as usize);
-        if a >= g.n || b >= g.n {
-            continue;
-        }
-        let (x1, y1) = to_screen(pos[a]);
-        let (x2, y2) = to_screen(pos[b]);
-        draw_line(&mut img, x1, y1, x2, y2, edge_col);
-    }
-
-    // Nodes on top.
-    for i in 0..g.n {
-        let (x, y) = to_screen(pos[i]);
-        let color = if g.is_hub[i] {
-            Rgba([0xff, 0xff, 0xff, 0xff])
-        } else if g.cluster_of[i] == usize::MAX {
-            Rgba([0xa0, 0xa0, 0xa0, 0xff])
-        } else {
-            PALETTE[g.cluster_of[i] % PALETTE.len()]
-        };
-        let radius = if g.is_hub[i] { 7.0 } else { 4.5 };
-        fill_circle(&mut img, x, y, radius, color);
-    }
-
-    // Title overlay: render params at top-left so PNGs are self-labelled.
-    let label = format!(
-        "scaling={}  gravity={}{}  slow_down={}  lin_log={}  outbound={}  deg_rep={}",
-        args.scaling_ratio,
-        args.gravity,
-        if args.strong_gravity { " (strong)" } else { "" },
-        args.slow_down,
-        args.lin_log,
-        args.outbound_attr,
-        args.degree_repulsion,
-    );
-    draw_label(&mut img, 8, 8, &label, Rgba([0xc6, 0xcc, 0xd5, 0xff]));
-
-    img.save(&args.out).expect("failed to write PNG");
-    eprintln!("wrote {}", args.out);
-}
 
 // ── Minimal pixel ops ───────────────────────────────────────────────
 
@@ -418,201 +170,405 @@ fn put_px(img: &mut RgbaImage, x: i32, y: i32, color: Rgba<u8>) {
     dst[3] = 0xff;
 }
 
-fn fill_circle(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, color: Rgba<u8>) {
-    let r2 = r * r;
-    let x0 = (cx - r).floor() as i32;
-    let x1 = (cx + r).ceil() as i32;
-    let y0 = (cy - r).floor() as i32;
-    let y1 = (cy + r).ceil() as i32;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            if dx * dx + dy * dy <= r2 {
-                put_px(img, x, y, color);
+impl Args {
+    fn absorb_cli(&mut self) {
+        let a = self;
+        let mut it = std::env::args().skip(1);
+        while let Some(k) = it.next() {
+            let mut v = || it.next().expect("missing value for arg");
+            match k.as_str() {
+                "--clusters" => a.clusters = v().parse().unwrap(),
+                "--per-cluster" => a.per_cluster = v().parse().unwrap(),
+                "--bridges" => a.bridges = v().parse().unwrap(),
+                "--hubs" => a.hubs = v().parse().unwrap(),
+                "--hub-leaves" => a.hub_leaves = v().parse().unwrap(),
+                "--intra-density" => a.intra_density = v().parse().unwrap(),
+                "--layout" => a.layout = v(),
+                "--synth" => a.synth_kind = v(),
+                "--branching" => a.tree_branching = v().parse().unwrap(),
+                "--depth" => a.tree_depth = v().parse().unwrap(),
+                "--out" => a.out = v(),
+                "--size" => {
+                    let s = v();
+                    let (w, h) = s.split_once('x').expect("size form is WxH");
+                    a.width = w.parse().unwrap();
+                    a.height = h.parse().unwrap();
+                }
+                "--scaling" => a.scaling_ratio = v().parse().unwrap(),
+                "--gravity" => a.gravity = v().parse().unwrap(),
+                "--strong-gravity" => a.strong_gravity = true,
+                "--slow-down" => a.slow_down = v().parse().unwrap(),
+                "--lin-log" => a.lin_log = true,
+                "--no-outbound" => a.outbound_attr = false,
+                "--no-degree-repulsion" => a.degree_repulsion = false,
+                "--iters" => a.max_iters = v().parse().unwrap(),
+                "--theta" => a.theta = v().parse().unwrap(),
+                "--timeout" => a.timeout_secs = v().parse().unwrap(),
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    eprintln!("unknown arg: {other}");
+                    print_help();
+                    std::process::exit(2);
+                }
             }
         }
     }
-}
 
-fn draw_line(img: &mut RgbaImage, x1: f32, y1: f32, x2: f32, y2: f32, color: Rgba<u8>) {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let steps = dx.abs().max(dy.abs()).ceil() as i32;
-    if steps <= 0 {
-        return;
+    fn build_graph(&self) -> Graph {
+        match self.synth_kind.as_str() {
+            "graph" => self.build_graph_clustered(),
+            "tree" => self.build_graph_tree(),
+            other => {
+                eprintln!("unknown --synth: {other}");
+                std::process::exit(2);
+            }
+        }
     }
-    for s in 0..=steps {
-        let t = s as f32 / steps as f32;
-        let x = (x1 + dx * t).round() as i32;
-        let y = (y1 + dy * t).round() as i32;
-        put_px(img, x, y, color);
-    }
-}
 
-/// 5×7 bitmap font for the params label. Only enough glyphs to render
-/// what we actually put in the label.
-fn draw_label(img: &mut RgbaImage, x0: i32, y0: i32, s: &str, color: Rgba<u8>) {
-    let mut x = x0;
-    for ch in s.chars() {
-        if let Some(glyph) = glyph(ch) {
-            for (row, bits) in glyph.iter().enumerate() {
-                for col in 0..5 {
-                    if bits & (1 << (4 - col)) != 0 {
-                        put_px(img, x + col, y0 + row as i32, color);
+    fn build_graph_clustered(&self) -> Graph {
+        let mut rng = Lcg::new(0xC0FFEE);
+        let mut edges = Vec::new();
+        let mut cluster_of = Vec::new();
+        let mut is_hub = Vec::new();
+        let cluster_starts: Vec<usize> = (0..self.clusters)
+            .map(|c| c * self.per_cluster)
+            .collect();
+        for c in 0..self.clusters {
+            for _ in 0..self.per_cluster {
+                cluster_of.push(c);
+                is_hub.push(false);
+            }
+        }
+        for &start in cluster_starts.iter().take(self.clusters) {
+            for i in start..(start + self.per_cluster) {
+                for j in (i + 1)..(start + self.per_cluster) {
+                    if rng.next_f32() < self.intra_density {
+                        edges.push((i as u32, j as u32));
                     }
                 }
             }
         }
-        x += 6;
-    }
-}
-
-fn glyph(c: char) -> Option<[u8; 7]> {
-    // 5-bit-wide rows, MSB = leftmost pixel. Bare-bones; unknown
-    // characters render as a blank cell.
-    Some(match c {
-        'a' => [0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F],
-        'b' => [0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E],
-        'c' => [0x00, 0x00, 0x0E, 0x10, 0x10, 0x11, 0x0E],
-        'd' => [0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F],
-        'e' => [0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E],
-        'f' => [0x06, 0x09, 0x08, 0x1E, 0x08, 0x08, 0x08],
-        'g' => [0x00, 0x00, 0x0F, 0x11, 0x0F, 0x01, 0x0E],
-        'h' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11],
-        'i' => [0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E],
-        'l' => [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        'n' => [0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11],
-        'o' => [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E],
-        'p' => [0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10],
-        'r' => [0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10],
-        's' => [0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E],
-        't' => [0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06],
-        'u' => [0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D],
-        'v' => [0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04],
-        'w' => [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A],
-        'x' => [0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11],
-        'y' => [0x00, 0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E],
-        'z' => [0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F],
-        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        '2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-        '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
-        '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F],
-        '=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
-        ' ' => [0; 7],
-        '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
-        ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
-        '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
-        _ => return None,
-    })
-}
-
-/// Build a synthetic cluster tree: synthetic root → branching N at
-/// each of `depth` levels. Mirrors the topology `panels/cluster_graph`
-/// receives from `trees::list_nodes`.
-fn synth_tree(branching: usize, depth: usize) -> Graph {
-    let mut edges = Vec::new();
-    let mut cluster_of = Vec::new();
-    let mut is_hub = Vec::new();
-
-    // BFS construction so node indices are contiguous per level.
-    let mut frontier: Vec<usize> = Vec::new();
-    cluster_of.push(0);
-    is_hub.push(true);
-    frontier.push(0);
-
-    let mut next_level: Vec<usize> = Vec::new();
-    let mut color = 0usize;
-    for level in 0..depth {
-        next_level.clear();
-        let mut leaf_color = color;
-        for &parent in &frontier {
-            for _ in 0..branching {
-                let child = cluster_of.len();
-                let is_leaf = level == depth - 1;
-                cluster_of.push(if is_leaf { leaf_color } else { usize::MAX });
-                is_hub.push(false);
-                edges.push((parent as u32, child as u32));
-                next_level.push(child);
+        for _ in 0..self.bridges {
+            let c1 = rng.range(0, self.clusters);
+            let mut c2 = rng.range(0, self.clusters);
+            if c2 == c1 {
+                c2 = (c2 + 1) % self.clusters;
             }
-            leaf_color = (leaf_color + 1) % 8;
+            let a = cluster_starts[c1] + rng.range(0, self.per_cluster);
+            let b = cluster_starts[c2] + rng.range(0, self.per_cluster);
+            edges.push((a as u32, b as u32));
         }
-        color = leaf_color;
-        std::mem::swap(&mut frontier, &mut next_level);
+        for _ in 0..self.hubs {
+            let hub = cluster_of.len();
+            cluster_of.push(usize::MAX);
+            is_hub.push(true);
+            let leaf_start = cluster_of.len();
+            for _ in 0..self.hub_leaves {
+                let leaf = cluster_of.len();
+                cluster_of.push(usize::MAX);
+                is_hub.push(false);
+                edges.push((hub as u32, leaf as u32));
+            }
+            let c = rng.range(0, self.clusters);
+            let target = cluster_starts[c] + rng.range(0, self.per_cluster);
+            edges.push((hub as u32, target as u32));
+            for _ in 0..(self.hub_leaves / 4).max(1) {
+                let i = leaf_start + rng.range(0, self.hub_leaves);
+                let j = leaf_start + rng.range(0, self.hub_leaves);
+                if i != j {
+                    edges.push((i as u32, j as u32));
+                }
+            }
+        }
+        Graph {
+            n: cluster_of.len(),
+            edges,
+            cluster_of,
+            is_hub,
+        }
     }
 
-    Graph {
-        n: cluster_of.len(),
-        edges,
-        cluster_of,
-        is_hub,
+    fn build_graph_tree(&self) -> Graph {
+        let branching = self.tree_branching;
+        let depth = self.tree_depth;
+        let mut edges = Vec::new();
+        let mut cluster_of = Vec::new();
+        let mut is_hub = Vec::new();
+        let mut frontier: Vec<usize> = Vec::new();
+        cluster_of.push(0);
+        is_hub.push(true);
+        frontier.push(0);
+        let mut next_level: Vec<usize> = Vec::new();
+        let mut color = 0usize;
+        for level in 0..depth {
+            next_level.clear();
+            let mut leaf_color = color;
+            for &parent in &frontier {
+                for _ in 0..branching {
+                    let child = cluster_of.len();
+                    let is_leaf = level == depth - 1;
+                    cluster_of.push(if is_leaf { leaf_color } else { usize::MAX });
+                    is_hub.push(false);
+                    edges.push((parent as u32, child as u32));
+                    next_level.push(child);
+                }
+                leaf_color = (leaf_color + 1) % 8;
+            }
+            color = leaf_color;
+            std::mem::swap(&mut frontier, &mut next_level);
+        }
+        Graph {
+            n: cluster_of.len(),
+            edges,
+            cluster_of,
+            is_hub,
+        }
     }
-}
 
-fn pick_root(g: &Graph) -> usize {
-    // Highest-degree node (matches the vault-graph fallback).
-    let mut deg = vec![0u32; g.n];
-    for &(a, b) in &g.edges {
-        if (a as usize) < g.n {
-            deg[a as usize] += 1;
-        }
-        if (b as usize) < g.n {
-            deg[b as usize] += 1;
+    fn run_layout(&self, g: &Graph) -> Vec<Vec2> {
+        match self.layout.as_str() {
+            "force" => self.run_force_layout(g),
+            "radial" | "vertical" | "horizontal" => self.run_tree_layout(g),
+            other => {
+                eprintln!("unknown layout: {other}");
+                std::process::exit(2);
+            }
         }
     }
-    deg.iter()
-        .enumerate()
-        .max_by_key(|(_, d)| **d)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+
+    fn run_force_layout(&self, g: &Graph) -> Vec<Vec2> {
+        let params = LayoutParams {
+            bound: 10_000.0,
+            max_iters: self.max_iters,
+            theta: self.theta,
+            convergence_eps: 0.5,
+            convergence_streak: 20,
+            scaling_ratio: self.scaling_ratio,
+            gravity: self.gravity,
+            strong_gravity: self.strong_gravity,
+            slow_down: self.slow_down,
+            lin_log: self.lin_log,
+            outbound_attraction_distribution: self.outbound_attr,
+            degree_repulsion: self.degree_repulsion,
+        };
+        let mut rng = Lcg::new(0xBEEF);
+        let seed: Vec<Vec2> = (0..g.n)
+            .map(|_| Vec2::new((rng.next_f32() - 0.5) * 50.0, (rng.next_f32() - 0.5) * 50.0))
+            .collect();
+        let worker = LayoutWorker::spawn(seed.clone(), g.edges.clone(), params);
+        let start = Instant::now();
+        let mut last_iter = 0u32;
+        while worker.is_running() {
+            if start.elapsed() >= Duration::from_secs(self.timeout_secs) {
+                eprintln!("(timeout — bailing with last snapshot)");
+                break;
+            }
+            let it = worker.iters_done();
+            if it != last_iter && it % 50 == 0 {
+                print!("\r  iter {}…", it);
+                std::io::stdout().flush().ok();
+                last_iter = it;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        println!(
+            "\r  converged in {} iters ({:.2}s)        ",
+            worker.iters_done(),
+            start.elapsed().as_secs_f32()
+        );
+        let mut pos = seed;
+        worker.snapshot_into(&mut pos);
+        pos
+    }
+
+    fn run_tree_layout(&self, g: &Graph) -> Vec<Vec2> {
+        let mut deg = vec![0u32; g.n];
+        for &(a, b) in &g.edges {
+            if (a as usize) < g.n {
+                deg[a as usize] += 1;
+            }
+            if (b as usize) < g.n {
+                deg[b as usize] += 1;
+            }
+        }
+        let root = deg
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, d)| **d)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let area = 1000.0 * 1000.0;
+        let tree = match self.layout.as_str() {
+            "radial" => bfs_tree(g.n, &g.edges, root),
+            _ => dfs_tree(g.n, &g.edges, root),
+        };
+        match self.layout.as_str() {
+            "radial" => radial_positions(&tree, area),
+            "vertical" => vertical_tree_positions(&tree, area),
+            "horizontal" => horizontal_tree_positions(&tree, area),
+            _ => unreachable!(),
+        }
+    }
+
+    fn render_png(&self, g: &Graph, pos: &[Vec2]) {
+        let mut img: RgbaImage = RgbaImage::from_pixel(
+            self.width,
+            self.height,
+            Rgba([0x14, 0x18, 0x1d, 0xff]),
+        );
+        let margin = 30.0_f32;
+        let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for &p in pos {
+            lo.x = lo.x.min(p.x);
+            lo.y = lo.y.min(p.y);
+            hi.x = hi.x.max(p.x);
+            hi.y = hi.y.max(p.y);
+        }
+        let span_x = (hi.x - lo.x).max(1.0);
+        let span_y = (hi.y - lo.y).max(1.0);
+        let avail_w = (self.width as f32) - margin * 2.0;
+        let avail_h = (self.height as f32) - margin * 2.0;
+        let scale = (avail_w / span_x).min(avail_h / span_y);
+        let center_world = (lo + hi) * 0.5;
+        let center_screen = Vec2::new(self.width as f32 * 0.5, self.height as f32 * 0.5);
+        let to_screen = |w: Vec2| -> (f32, f32) {
+            let s = center_screen + (w - center_world) * scale;
+            (s.x, s.y)
+        };
+        let edge_col = Rgba([0x55, 0x5d, 0x68, 0x90]);
+        for &(ea, eb) in &g.edges {
+            let (ea, eb) = (ea as usize, eb as usize);
+            if ea >= g.n || eb >= g.n {
+                continue;
+            }
+            let (x1, y1) = to_screen(pos[ea]);
+            let (x2, y2) = to_screen(pos[eb]);
+            let dx = x2 - x1;
+            let dy = y2 - y1;
+            let steps = dx.abs().max(dy.abs()).ceil() as i32;
+            if steps > 0 {
+                for s in 0..=steps {
+                    let t = s as f32 / steps as f32;
+                    let x = (x1 + dx * t).round() as i32;
+                    let y = (y1 + dy * t).round() as i32;
+                    put_px(&mut img, x, y, edge_col);
+                }
+            }
+        }
+        for i in 0..g.n {
+            let (cx, cy) = to_screen(pos[i]);
+            let color = if g.is_hub[i] {
+                Rgba([0xff, 0xff, 0xff, 0xff])
+            } else if g.cluster_of[i] == usize::MAX {
+                Rgba([0xa0, 0xa0, 0xa0, 0xff])
+            } else {
+                PALETTE[g.cluster_of[i] % PALETTE.len()]
+            };
+            let r = if g.is_hub[i] { 7.0 } else { 4.5 };
+            let r2 = r * r;
+            let x0 = (cx - r).floor() as i32;
+            let x1 = (cx + r).ceil() as i32;
+            let y0 = (cy - r).floor() as i32;
+            let y1 = (cy + r).ceil() as i32;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    if dx * dx + dy * dy <= r2 {
+                        put_px(&mut img, x, y, color);
+                    }
+                }
+            }
+        }
+        let label = format!(
+            "scaling={}  gravity={}{}  slow_down={}  lin_log={}  outbound={}  deg_rep={}",
+            self.scaling_ratio,
+            self.gravity,
+            if self.strong_gravity { " (strong)" } else { "" },
+            self.slow_down,
+            self.lin_log,
+            self.outbound_attr,
+            self.degree_repulsion,
+        );
+        let label_color = Rgba([0xc6, 0xcc, 0xd5, 0xff]);
+        let glyph = |c: char| -> Option<[u8; 7]> {
+            Some(match c {
+                'a' => [0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F],
+                'b' => [0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E],
+                'c' => [0x00, 0x00, 0x0E, 0x10, 0x10, 0x11, 0x0E],
+                'd' => [0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F],
+                'e' => [0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E],
+                'f' => [0x06, 0x09, 0x08, 0x1E, 0x08, 0x08, 0x08],
+                'g' => [0x00, 0x00, 0x0F, 0x11, 0x0F, 0x01, 0x0E],
+                'h' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11],
+                'i' => [0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E],
+                'l' => [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+                'n' => [0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11],
+                'o' => [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E],
+                'p' => [0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10],
+                'r' => [0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10],
+                's' => [0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E],
+                't' => [0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06],
+                'u' => [0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D],
+                'v' => [0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04],
+                'w' => [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A],
+                'x' => [0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11],
+                'y' => [0x00, 0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E],
+                'z' => [0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F],
+                'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+                '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+                '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+                '2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+                '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+                '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+                '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+                '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+                '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+                '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+                '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+                '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+                '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F],
+                '=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
+                ' ' => [0; 7],
+                '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
+                ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+                '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+                _ => return None,
+            })
+        };
+        let label_x0 = 8i32;
+        let label_y0 = 8i32;
+        let mut lx = label_x0;
+        for ch in label.chars() {
+            if let Some(gl) = glyph(ch) {
+                for (row, bits) in gl.iter().enumerate() {
+                    for col in 0..5 {
+                        if bits & (1 << (4 - col)) != 0 {
+                            put_px(&mut img, lx + col, label_y0 + row as i32, label_color);
+                        }
+                    }
+                }
+            }
+            lx += 6;
+        }
+        img.save(&self.out).expect("failed to write PNG");
+        eprintln!("wrote {}", self.out);
+    }
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = Args::default();
+    args.absorb_cli();
     eprintln!(
         "synth: {} clusters × {} nodes + {} hubs × {} leaves + {} bridges",
         args.clusters, args.per_cluster, args.hubs, args.hub_leaves, args.bridges,
     );
-    let g = match args.synth_kind.as_str() {
-        "graph" => synth(&args),
-        "tree" => synth_tree(args.tree_branching, args.tree_depth),
-        other => {
-            eprintln!("unknown --synth: {other}");
-            std::process::exit(2);
-        }
-    };
+    let g = args.build_graph();
     eprintln!("  {} nodes, {} edges", g.n, g.edges.len());
     eprintln!("  layout: {}  synth: {}", args.layout, args.synth_kind);
-
-    let pos = match args.layout.as_str() {
-        "force" => run_layout(&g, build_params(&args), args.timeout_secs),
-        "radial" | "vertical" | "horizontal" => {
-            let root = pick_root(&g);
-            let area = 1000.0 * 1000.0;
-            let tree = match args.layout.as_str() {
-                "radial" => bfs_tree(g.n, &g.edges, root),
-                _ => dfs_tree(g.n, &g.edges, root),
-            };
-            match args.layout.as_str() {
-                "radial" => radial_positions(&tree, area),
-                "vertical" => vertical_tree_positions(&tree, area),
-                "horizontal" => horizontal_tree_positions(&tree, area),
-                _ => unreachable!(),
-            }
-        }
-        other => {
-            eprintln!("unknown layout: {other}");
-            std::process::exit(2);
-        }
-    };
-    render_png(&g, &pos, &args);
+    let pos = args.run_layout(&g);
+    args.render_png(&g, &pos);
 }

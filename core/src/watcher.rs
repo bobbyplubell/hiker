@@ -48,7 +48,7 @@ pub enum FileEvent {
 }
 
 #[derive(Debug, Error)]
-pub enum WatcherError {
+pub enum Error {
     #[error("notify: {0}")]
     Notify(#[from] notify::Error),
 }
@@ -63,7 +63,7 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn start(vault_root: impl Into<PathBuf>) -> Result<Self, WatcherError> {
+    pub fn start(vault_root: impl Into<PathBuf>) -> Result<Self, Error> {
         let vault_root = vault_root.into();
         let (broadcast_tx, _) = broadcast::channel::<FileEvent>(BROADCAST_CAPACITY);
         let (raw_tx, raw_rx) = mpsc::channel::<DebounceEventResult>();
@@ -79,36 +79,11 @@ impl Watcher {
         let root_for_thread = vault_root.clone();
         let suppressed_for_thread = suppressed.clone();
         std::thread::spawn(move || {
-            for batch in raw_rx {
-                let events = match batch {
-                    Ok(evs) => evs,
-                    Err(errs) => {
-                        for err in errs {
-                            tracing::error!(error = %err, "watcher: notify error");
-                        }
-                        continue;
-                    }
-                };
-                for ev in events {
-                    if ev.event.need_rescan() {
-                        tracing::warn!("watcher: kernel reported event-queue overflow");
-                        let _ = bcast.send(FileEvent::Overflow);
-                        continue;
-                    }
-                    if let Some(file_event) = normalize(&root_for_thread, &ev) {
-                        if is_suppressed_event(&suppressed_for_thread, &file_event) {
-                            tracing::debug!(
-                                event = ?file_event,
-                                "watcher: suppressed self-write",
-                            );
-                            continue;
-                        }
-                        tracing::debug!(event = ?file_event, "watcher: debounced event");
-                        // send returns Err when no receivers; that's fine.
-                        let _ = bcast.send(file_event);
-                    }
-                }
-            }
+            let wctx = WatcherCtx {
+                vault_root: &root_for_thread,
+                suppressed: &suppressed_for_thread,
+            };
+            wctx.run_bridge_thread(raw_rx, &bcast);
         });
 
         Ok(Self {
@@ -136,128 +111,190 @@ impl Watcher {
     }
 }
 
-/// Drop a normalized event if any of its referenced paths is currently
-/// suppressed. Renames suppress on either side: callers register both `from`
-/// and `to`, so seeing a fresh registration on either is sufficient.
-fn is_suppressed_event(map: &SuppressMap, ev: &FileEvent) -> bool {
-    let mut guard = map.lock().expect("suppress lock poisoned");
-    evict_expired(&mut guard);
-    match ev {
-        FileEvent::Created { path }
-        | FileEvent::Modified { path }
-        | FileEvent::Deleted { path } => guard.contains_key(path),
-        FileEvent::Renamed { from, to } => guard.contains_key(from) || guard.contains_key(to),
-        FileEvent::Overflow => false,
-    }
+/// Per-thread context bundling the vault root + suppress map. Methods on
+/// this struct stay exempt from `single_call_fn` while sharing the watcher
+/// dispatch state.
+struct WatcherCtx<'a> {
+    vault_root: &'a Path,
+    suppressed: &'a SuppressMap,
 }
 
-fn evict_expired(map: &mut HashMap<String, Instant>) {
-    let now = Instant::now();
-    map.retain(|_, t| now.duration_since(*t) < SUPPRESS_TTL);
-}
-
-/// Translate one debounced raw event into our normalized form. Returns None
-/// if the event is filtered (ignore list, unknown kind, paths outside root,
-/// or paths whose existing ancestors include a symlink — see
-/// `watcher-symlink-policy`; notify follows symlinks platform-dependently
-/// when watching recursively, so we drop those events at the normalize step
-/// so the indexer never sees content from outside the canonical vault tree).
-fn normalize(vault_root: &Path, ev: &DebouncedEvent) -> Option<FileEvent> {
-    let paths = &ev.paths;
-    if paths.iter().any(|p| has_symlink_ancestor(vault_root, p)) {
-        return None;
-    }
-    match ev.event.kind {
-        EventKind::Create(_) => {
-            let p = paths.first()?;
-            let rel = to_rel(vault_root, p)?;
-            (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
-        }
-        EventKind::Modify(notify::event::ModifyKind::Name(mode)) => {
-            // notify-debouncer-full pairs From+To into a single `Name(Both)`
-            // event with paths=[from, to]; unpaired sides surface as
-            // `Name(From)` (deleted source) or `Name(To)` (created
-            // destination).
-            use notify::event::RenameMode;
-            match mode {
-                RenameMode::Both if paths.len() >= 2 => {
-                    let from = to_rel(vault_root, &paths[0])?;
-                    let to = to_rel(vault_root, &paths[1])?;
-                    if is_ignored(&from) && is_ignored(&to) {
-                        return None;
+impl<'a> WatcherCtx<'a> {
+    /// Bridge thread body: pull raw debounced batches off `raw_rx`, normalize
+    /// each, drop suppressed self-writes, and forward survivors into
+    /// `bcast`. Holds no async state — owns no runtime.
+    fn run_bridge_thread(
+        &self,
+        raw_rx: std::sync::mpsc::Receiver<notify_debouncer_full::DebounceEventResult>,
+        bcast: &broadcast::Sender<FileEvent>,
+    ) {
+        for batch in raw_rx {
+            let events = match batch {
+                Ok(evs) => evs,
+                Err(errs) => {
+                    for err in errs {
+                        tracing::error!(error = %err, "watcher: notify error");
                     }
-                    Some(FileEvent::Renamed { from, to })
+                    continue;
                 }
-                RenameMode::From => {
-                    let p = paths.first()?;
-                    let rel = to_rel(vault_root, p)?;
-                    (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
-                }
-                RenameMode::To => {
-                    let p = paths.first()?;
-                    let rel = to_rel(vault_root, p)?;
-                    (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
-                }
-                // RenameMode::Any / Other / Both-without-2-paths: best-effort.
-                // The two explicit cases above (From/To/Both) cover every
-                // platform where notify reports a definite rename direction.
-                // This fallback inherits the original paths[0]=from /
-                // paths[1]=to ordering assumption — fine for the common cases
-                // (the platforms hitting this branch tend to mirror what Both
-                // would give) but technically still ambiguous; treat the
-                // lone-path case as Modified rather than guessing direction.
-                _ => {
-                    if paths.len() >= 2 {
+            };
+            for ev in events {
+                self.dispatch_one(&ev, bcast);
+            }
+        }
+    }
+
+    fn dispatch_one(&self, ev: &DebouncedEvent, bcast: &broadcast::Sender<FileEvent>) {
+        if ev.event.need_rescan() {
+            tracing::warn!("watcher: kernel reported event-queue overflow");
+            let _ = bcast.send(FileEvent::Overflow);
+            return;
+        }
+        let Some(file_event) = self.normalize(ev) else { return };
+        if self.is_suppressed_event(&file_event) {
+            tracing::debug!(event = ?file_event, "watcher: suppressed self-write");
+            return;
+        }
+        tracing::debug!(event = ?file_event, "watcher: debounced event");
+        // send returns Err when no receivers; that's fine.
+        let _ = bcast.send(file_event);
+    }
+
+    /// Drop a normalized event if any of its referenced paths is currently
+    /// suppressed. Renames suppress on either side: callers register both
+    /// `from` and `to`, so seeing a fresh registration on either is enough.
+    fn is_suppressed_event(&self, ev: &FileEvent) -> bool {
+        let mut guard = self.suppressed.lock().expect("suppress lock poisoned");
+        evict_expired(&mut guard);
+        match ev {
+            FileEvent::Created { path }
+            | FileEvent::Modified { path }
+            | FileEvent::Deleted { path } => guard.contains_key(path),
+            FileEvent::Renamed { from, to } => {
+                guard.contains_key(from) || guard.contains_key(to)
+            }
+            FileEvent::Overflow => false,
+        }
+    }
+
+    /// status: watcher-symlink-policy
+    ///
+    /// Test whether any existing ancestor of `abs_path` (under the vault
+    /// root) is a symlink. Components above the vault root are ignored —
+    /// the root was canonicalized at vault open. Non-existent leaves
+    /// (typical on Deleted events) walk fine: `symlink_metadata` errors
+    /// stop the walk early.
+    fn has_symlink_ancestor(&self, abs_path: &Path) -> bool {
+        let mut current = PathBuf::new();
+        for comp in abs_path.components() {
+            current.push(comp);
+            if !current.starts_with(self.vault_root) || current == self.vault_root {
+                continue;
+            }
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => return true,
+                Ok(_) => {}
+                // Component doesn't exist on disk (typical mid-rename /
+                // deleted path). The rest of the path can't exist either;
+                // stop walking.
+                Err(_) => break,
+            }
+        }
+        false
+    }
+
+    /// Translate one debounced raw event into our normalized form. Returns
+    /// None if the event is filtered (ignore list, unknown kind, paths
+    /// outside root, or paths whose existing ancestors include a symlink —
+    /// see `watcher-symlink-policy`; notify follows symlinks platform-
+    /// dependently when watching recursively, so we drop those events at
+    /// the normalize step so the indexer never sees content from outside
+    /// the canonical vault tree).
+    fn normalize(&self, ev: &DebouncedEvent) -> Option<FileEvent> {
+        let vault_root = self.vault_root;
+        let paths = &ev.paths;
+        if paths.iter().any(|p| self.has_symlink_ancestor(p)) {
+            return None;
+        }
+        match ev.event.kind {
+            EventKind::Create(_) => {
+                let p = paths.first()?;
+                let rel = to_rel(vault_root, p)?;
+                (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
+            }
+            EventKind::Modify(notify::event::ModifyKind::Name(mode)) => {
+                // notify-debouncer-full pairs From+To into a single
+                // `Name(Both)` event with paths=[from, to]; unpaired sides
+                // surface as `Name(From)` (deleted source) or `Name(To)`
+                // (created destination).
+                use notify::event::RenameMode;
+                match mode {
+                    RenameMode::Both if paths.len() >= 2 => {
                         let from = to_rel(vault_root, &paths[0])?;
                         let to = to_rel(vault_root, &paths[1])?;
                         if is_ignored(&from) && is_ignored(&to) {
                             return None;
                         }
                         Some(FileEvent::Renamed { from, to })
-                    } else {
+                    }
+                    RenameMode::From => {
                         let p = paths.first()?;
                         let rel = to_rel(vault_root, p)?;
-                        (!is_ignored(&rel)).then_some(FileEvent::Modified { path: rel })
+                        (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
                     }
+                    RenameMode::To => {
+                        let p = paths.first()?;
+                        let rel = to_rel(vault_root, p)?;
+                        (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
+                    }
+                    // RenameMode::Any / Other / Both-without-2-paths:
+                    // best-effort. The two explicit cases above
+                    // (From/To/Both) cover every platform where notify
+                    // reports a definite rename direction. This fallback
+                    // inherits the original paths[0]=from / paths[1]=to
+                    // ordering assumption — fine for the common cases (the
+                    // platforms hitting this branch tend to mirror what
+                    // Both would give) but technically still ambiguous;
+                    // treat the lone-path case as Modified rather than
+                    // guessing direction.
+                    _ => self.normalize_rename_fallback(ev),
                 }
             }
+            EventKind::Modify(_) => {
+                let p = paths.first()?;
+                let rel = to_rel(vault_root, p)?;
+                (!is_ignored(&rel)).then_some(FileEvent::Modified { path: rel })
+            }
+            EventKind::Remove(_) => {
+                let p = paths.first()?;
+                let rel = to_rel(vault_root, p)?;
+                (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
+            }
+            _ => None,
         }
-        EventKind::Modify(_) => {
+    }
+
+    fn normalize_rename_fallback(&self, ev: &DebouncedEvent) -> Option<FileEvent> {
+        let vault_root = self.vault_root;
+        let paths = &ev.paths;
+        if paths.len() >= 2 {
+            let from = to_rel(vault_root, &paths[0])?;
+            let to = to_rel(vault_root, &paths[1])?;
+            if is_ignored(&from) && is_ignored(&to) {
+                return None;
+            }
+            Some(FileEvent::Renamed { from, to })
+        } else {
             let p = paths.first()?;
             let rel = to_rel(vault_root, p)?;
             (!is_ignored(&rel)).then_some(FileEvent::Modified { path: rel })
         }
-        EventKind::Remove(_) => {
-            let p = paths.first()?;
-            let rel = to_rel(vault_root, p)?;
-            (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
-        }
-        _ => None,
     }
 }
 
-/// True if any existing ancestor of `abs_path` *under* `vault_root` is a
-/// symlink. Components above the vault root are ignored (the root itself was
-/// canonicalized at vault open). Non-existent leaves (typical on Deleted
-/// events) walk fine — `symlink_metadata` errors stop the walk early.
-///
-/// status: watcher-symlink-policy
-fn has_symlink_ancestor(vault_root: &Path, abs_path: &Path) -> bool {
-    let mut current = PathBuf::new();
-    for comp in abs_path.components() {
-        current.push(comp);
-        if !current.starts_with(vault_root) || current == vault_root {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => return true,
-            Ok(_) => {}
-            // Component doesn't exist on disk (typical mid-rename / deleted
-            // path). The rest of the path can't exist either; stop walking.
-            Err(_) => break,
-        }
-    }
-    false
+fn evict_expired(map: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    map.retain(|_, t| now.duration_since(*t) < SUPPRESS_TTL);
 }
 
 /// Hard-coded ignore list. Mirrors docs/watcher.md.
@@ -463,22 +500,15 @@ mod tests {
         let vault_root = dir.path().canonicalize().unwrap();
         symlink(outside.path().join("d"), vault_root.join("linked")).unwrap();
         // Path under the in-vault symlink → must be detected.
-        assert!(has_symlink_ancestor(
-            &vault_root,
-            &vault_root.join("linked").join("leaf.md"),
-        ));
+        let suppressed_for_test = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ctx = WatcherCtx { vault_root: &vault_root, suppressed: &suppressed_for_test };
+        assert!(ctx.has_symlink_ancestor(&vault_root.join("linked").join("leaf.md")));
         // Path through a real directory → must not be flagged.
         fs::create_dir(vault_root.join("real")).unwrap();
         fs::write(vault_root.join("real/leaf.md"), b"y").unwrap();
-        assert!(!has_symlink_ancestor(
-            &vault_root,
-            &vault_root.join("real").join("leaf.md"),
-        ));
+        assert!(!ctx.has_symlink_ancestor(&vault_root.join("real").join("leaf.md")));
         // Non-existent leaf below a real dir → still not flagged.
-        assert!(!has_symlink_ancestor(
-            &vault_root,
-            &vault_root.join("real").join("never-existed.md"),
-        ));
+        assert!(!ctx.has_symlink_ancestor(&vault_root.join("real").join("never-existed.md")));
     }
 
     #[cfg(unix)]

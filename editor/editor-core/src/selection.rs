@@ -3,7 +3,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::anchor::{Anchor, Bias};
-use crate::change::ChangeSet;
+use crate::change::Set;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -16,7 +16,7 @@ pub struct SelRange {
 }
 
 impl SelRange {
-    pub fn point(pos: usize) -> Self {
+    pub const fn point(pos: usize) -> Self {
         Self {
             anchor: Anchor::at(pos, Bias::Right),
             head: Anchor::at(pos, Bias::Right),
@@ -24,7 +24,7 @@ impl SelRange {
         }
     }
 
-    pub fn new(anchor: usize, head: usize) -> Self {
+    pub const fn new(anchor: usize, head: usize) -> Self {
         Self {
             anchor: Anchor::at(anchor, if anchor <= head { Bias::Right } else { Bias::Left }),
             head: Anchor::at(head, if head < anchor { Bias::Left } else { Bias::Right }),
@@ -32,7 +32,7 @@ impl SelRange {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.anchor.byte == self.head.byte
     }
 
@@ -48,7 +48,7 @@ impl SelRange {
         self.start()..self.end()
     }
 
-    pub fn map(self, changes: &ChangeSet) -> Self {
+    pub fn map(self, changes: &Set) -> Self {
         Self {
             anchor: self.anchor.map(changes),
             head: self.head.map(changes),
@@ -94,11 +94,11 @@ impl Selection {
         &self.ranges[self.main as usize]
     }
 
-    pub fn main_index(&self) -> usize {
+    pub const fn main_index(&self) -> usize {
         self.main as usize
     }
 
-    pub fn map(&self, changes: &ChangeSet) -> Self {
+    pub fn map(&self, changes: &Set) -> Self {
         let ranges: Vec<SelRange> = self.ranges.iter().map(|r| r.map(changes)).collect();
         let main = self.main as usize;
         let mut out = Self { ranges: ranges.into_iter().collect(), main: main as u32 };
@@ -204,7 +204,7 @@ mod tests {
             vec![SelRange::point(2), SelRange::new(5, 9)],
             0,
         );
-        let c = crate::change::ChangeSet::of(20, [(0..0, "xx".to_string())]);
+        let c = crate::change::Set::of(20, [(0..0, "xx".to_string())]);
         let s2 = s.map(&c);
         assert_eq!(s2.ranges()[0].start(), 4);
         assert_eq!(s2.ranges()[1].range(), 7..11);

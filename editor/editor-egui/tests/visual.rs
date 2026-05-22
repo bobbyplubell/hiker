@@ -2,12 +2,14 @@
 //! font / GPU divergence is its own can of worms); we drive the widget and
 //! assert on observable state — height map, decoration layers, click sink.
 
-use editor_core::EditorState;
-use editor_egui::EditorWidget;
-use editor_md::{fold_decorations, fold_regions, markdown_decorations};
-use editor_view::{ClickAction, ViewState};
-
-fn harness_size() -> egui::Vec2 {
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_md::folds::fold_decorations;
+use editor_md::folds::fold_regions;
+use editor_md::styling::markdown_decorations;
+use editor_view::viewport::ClickAction;
+use editor_view::viewport::ViewState;
+const fn harness_size() -> egui::Vec2 {
     egui::vec2(800.0, 600.0)
 }
 

@@ -6,26 +6,47 @@
 //! click -> open. That covers the daily-use path; the rest layers on once
 //! the foundation lands.
 
-use std::sync::Arc;
-
 use eframe::egui;
 
-use hiker_core::{DirEntryDto, EntryKind};
+use hiker_core::vault::{DirEntryDto, EntryKind};
 
 use crate::editor_pane;
+use crate::icons;
 use crate::state::AppState;
 use crate::theme;
 
-pub fn show(ui: &mut egui::Ui, state: &mut AppState, rt: &Arc<tokio::runtime::Runtime>) {
-    sort_header(ui, state);
-    show_dir(ui, state, rt, "", 0);
+/// Render context for the files tree. Bundles the two refs every helper
+/// threads through (`ui`, `state`) so the per-row helpers can be
+/// `&mut self` methods rather than free functions taking the same pair.
+/// Construct with `FilesView { ui, state }` and call `render`.
+pub(crate) struct FilesView<'a> {
+    pub(crate) ui: &'a mut egui::Ui,
+    pub(crate) state: &'a mut AppState,
 }
 
+/// A context-menu verb picked on a file row. The menu render records one
+/// of these; the mutation runs afterwards via `run_file_verb` so the
+/// `&mut AppState` helpers don't fight the menu closure's `ui` borrow.
+enum FileVerb {
+    Open,
+    Rename,
+    Duplicate,
+    Reveal,
+    Properties,
+    Reindex,
+    AddToTrail { trail_name: String },
+    SetActiveTrail,
+    Delete,
+}
+
+impl FilesView<'_> {
 /// Tiny header strip with the sort-by control. Persists the selection
 /// to `vault.tree.sort_by` so the tree opens in the chosen order on
 /// next vault open.
-fn sort_header(ui: &mut egui::Ui, state: &mut AppState) {
-    use hiker_core::config::TreeSortBy;
+pub(crate) fn sort_header(&mut self) {
+    use hiker_core::config::sections::TreeSortBy;
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
     let current = default_sort(&state.vault_session.config);
     let mut new_sort = current;
     ui.horizontal(|ui| {
@@ -78,59 +99,10 @@ fn sort_header(ui: &mut egui::Ui, state: &mut AppState) {
         state.set_setting(
             hiker_core::config::SettingsScope::Vault,
             "vault.tree.sort_by",
-            serde_json::Value::String(wire.to_string()),
+            &serde_json::Value::String(wire.to_string()),
             "Sort change failed",
         );
         state.session.sidebar.dir_cache.clear();
-    }
-}
-
-#[cfg(test)]
-mod sort_label_tests {
-    use super::*;
-    use hiker_core::config::TreeSortBy;
-
-    #[test]
-    fn every_variant_has_a_label() {
-        for v in [
-            TreeSortBy::NameAsc,
-            TreeSortBy::NameDesc,
-            TreeSortBy::MtimeDesc,
-            TreeSortBy::MtimeAsc,
-        ] {
-            for compact in [false, true] {
-                let l = sort_label(v, compact);
-                assert!(!l.is_empty(), "missing label for {v:?} compact={compact}");
-            }
-        }
-    }
-
-    #[test]
-    fn labels_are_distinct() {
-        for compact in [false, true] {
-            let labels = [
-                sort_label(TreeSortBy::NameAsc, compact),
-                sort_label(TreeSortBy::NameDesc, compact),
-                sort_label(TreeSortBy::MtimeDesc, compact),
-                sort_label(TreeSortBy::MtimeAsc, compact),
-            ];
-            let set: std::collections::HashSet<&str> = labels.iter().copied().collect();
-            assert_eq!(set.len(), 4, "sort labels collide: {labels:?} compact={compact}");
-        }
-    }
-}
-
-fn sort_label(s: hiker_core::config::TreeSortBy, compact: bool) -> &'static str {
-    use hiker_core::config::TreeSortBy;
-    match (s, compact) {
-        (TreeSortBy::NameAsc, false) => "Name (A-Z)",
-        (TreeSortBy::NameDesc, false) => "Name (Z-A)",
-        (TreeSortBy::MtimeDesc, false) => "Recent",
-        (TreeSortBy::MtimeAsc, false) => "Oldest",
-        (TreeSortBy::NameAsc, true) => "A-Z",
-        (TreeSortBy::NameDesc, true) => "Z-A",
-        (TreeSortBy::MtimeDesc, true) => "New",
-        (TreeSortBy::MtimeAsc, true) => "Old",
     }
 }
 
@@ -139,8 +111,8 @@ fn sort_label(s: hiker_core::config::TreeSortBy, compact: bool) -> &'static str 
 /// disk walk on the render path — the count fills in once the user
 /// expands the parent. Matches the legacy `count_notes_in` semantics
 /// (markdown-shaped files only).
-fn count_direct_files(state: &AppState, rel: &str) -> usize {
-    let Some(entries) = state.session.sidebar.dir_cache.get(rel) else {
+fn count_direct_files(&self, rel: &str) -> usize {
+    let Some(entries) = self.state.session.sidebar.dir_cache.get(rel) else {
         return 0;
     };
     entries
@@ -149,13 +121,9 @@ fn count_direct_files(state: &AppState, rel: &str) -> usize {
         .count()
 }
 
-fn show_dir(
-    ui: &mut egui::Ui,
-    state: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-    rel: &str,
-    depth: usize,
-) {
+pub(crate) fn show_dir(&mut self, rel: &str, depth: usize) {
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
     // Ensure this dir is loaded. Cap the cache so an aggressive
     // expand-everything session can't grow it without bound — once we
     // hit `MAX_DIR_CACHE_ENTRIES`, drop the entries the user no longer
@@ -194,29 +162,23 @@ fn show_dir(
 
     // Clone the entries out so we can mutate state below without
     // overlapping borrows.
-    let entries = state.session.sidebar.dir_cache.get(rel).cloned().unwrap_or_default();
+    let entries = self.state.session.sidebar.dir_cache.get(rel).cloned().unwrap_or_default();
 
     for entry in entries {
         match entry.kind {
-            EntryKind::Dir => render_dir_row(ui, state, rt, &entry, depth),
-            EntryKind::File => render_file_row(ui, state, &entry, depth),
+            EntryKind::Dir => self.render_dir_row(&entry, depth),
+            EntryKind::File => self.render_file_row(&entry, depth),
         }
     }
 }
 
-fn render_dir_row(
-    ui: &mut egui::Ui,
-    state: &mut AppState,
-    rt: &Arc<tokio::runtime::Runtime>,
-    entry: &DirEntryDto,
-    depth: usize,
-) {
-    let expanded = state.session.sidebar.expanded.contains(&entry.rel_path);
+fn render_dir_row(&mut self, entry: &DirEntryDto, depth: usize) {
+    let expanded = self.state.session.sidebar.expanded.contains(&entry.rel_path);
     // Direct-child file count hint (`count_notes_in` parity). Cached on
     // the same dir_cache the listing renders from, so showing the count
     // is essentially free. Only the first depth is counted — recursing
     // would be O(vault) for a quick visual.
-    let child_count = count_direct_files(state, &entry.rel_path);
+    let child_count = self.count_direct_files(&entry.rel_path);
     let count_suffix = if child_count > 0 {
         format!(" ({})", child_count)
     } else {
@@ -224,12 +186,12 @@ fn render_dir_row(
     };
     let label = format!("{}{}", entry.name, count_suffix);
 
-    let resp = row_button_with_chevron(ui, &label, depth, false, Some(expanded));
+    let resp = row_button_with_chevron(self.ui, &label, depth, false, Some(expanded));
 
     // DnD: folder rows accept dropped paths and move them into this dir.
     let dropped = resp.dnd_release_payload::<String>();
     if let Some(src) = dropped {
-        move_into_folder(state, &src, &entry.rel_path);
+        self.move_into_folder(&src, &entry.rel_path);
     }
     // Folder rows are also draggable so users can re-parent subtrees.
     resp.clone()
@@ -237,20 +199,21 @@ fn render_dir_row(
 
     if resp.clicked() {
         if expanded {
-            state.session.sidebar.expanded.remove(&entry.rel_path);
+            self.state.session.sidebar.expanded.remove(&entry.rel_path);
         } else {
-            state.session.sidebar.expanded.insert(entry.rel_path.clone());
+            self.state.session.sidebar.expanded.insert(entry.rel_path.clone());
         }
-        state.session.sidebar.selected_folder = Some(entry.rel_path.clone());
+        self.state.session.sidebar.selected_folder = Some(entry.rel_path.clone());
     }
     if expanded {
-        show_dir(ui, state, rt, &entry.rel_path, depth + 1);
+        self.show_dir(&entry.rel_path, depth + 1);
     }
 }
 
 /// Move a vault-relative path into the destination folder via
 /// `vault::move_note` (which handles store + watcher updates atomically).
-fn move_into_folder(state: &mut AppState, src: &str, dest_dir: &str) {
+fn move_into_folder(&mut self, src: &str, dest_dir: &str) {
+    let state = &mut *self.state;
     let basename = basename_of(src);
     let dest = if dest_dir.is_empty() {
         basename.to_string()
@@ -305,29 +268,24 @@ fn move_into_folder(state: &mut AppState, src: &str, dest_dir: &str) {
     );
 }
 
-fn render_file_row(
-    ui: &mut egui::Ui,
-    state: &mut AppState,
-    entry: &DirEntryDto,
-    depth: usize,
-) {
+fn render_file_row(&mut self, entry: &DirEntryDto, depth: usize) {
     // Inline-rename mode preempts the regular row render. Drafts live in
     // egui memory keyed by the row's rel_path, so this stays out of
     // SidebarState (which a parallel cluster-editor port is editing).
-    if let Some(draft) = rename_draft_for(ui, &entry.rel_path) {
-        rename_row(ui, state, entry, depth, draft);
+    if let Some(draft) = self.rename_draft_for(&entry.rel_path) {
+        self.rename_row(entry, depth, draft);
         return;
     }
 
-    let active_buffer_path = state.session.active_tab.and_then(|id| {
-        state
+    let active_buffer_path = self.state.session.active_tab.and_then(|id| {
+        self.state
             .tab_by_id(id)
             .and_then(|t| t.buffer_path().map(str::to_string))
     });
     let is_active = active_buffer_path.as_deref() == Some(entry.rel_path.as_str());
 
     // Dirty-dot suffix if the buffer is loaded and dirty.
-    let dirty_marker = state
+    let dirty_marker = self.state
         .session.buffers
         .get(&entry.rel_path)
         .map(|b| if b.is_dirty() { " *" } else { "" })
@@ -336,16 +294,16 @@ fn render_file_row(
     // Index-state marker: ⌛ for files the indexer hasn't processed yet,
     // ⊘ for files the indexer skipped (unsupported extension, too big,
     // etc.). Falls back to nothing once the file is fully indexed.
-    let index_marker = index_state_marker(state, &entry.rel_path);
+    let index_marker = self.index_state_marker(&entry.rel_path);
 
     let label = format!("{}{}{}", entry.name, dirty_marker, index_marker);
-    let resp = row_button(ui, &label, depth, is_active);
+    let resp = self.row_button(&label, depth, is_active);
     // Honour a pending reveal-from-discovery: when our row matches the
     // sidebar's scroll_target one-shot, ask egui to bring us into view and
     // clear the target so subsequent frames don't keep re-scrolling.
-    if state.session.sidebar.scroll_target.as_deref() == Some(entry.rel_path.as_str()) {
+    if self.state.session.sidebar.scroll_target.as_deref() == Some(entry.rel_path.as_str()) {
         resp.scroll_to_me(Some(egui::Align::Center));
-        state.session.sidebar.scroll_target = None;
+        self.state.session.sidebar.scroll_target = None;
     }
     // Drag payload: vault-relative source path. Drop targets are
     // rendered on folder rows below.
@@ -353,83 +311,73 @@ fn render_file_row(
         .dnd_set_drag_payload::<String>(entry.rel_path.clone());
 
     if resp.clicked() {
-        editor_pane::open_file(state, &entry.rel_path, /* sticky */ false);
+        editor_pane::open_file(self.state, &entry.rel_path, /* sticky */ false);
     }
     if resp.double_clicked() {
         // Per docs/editor.md: double-click enters inline rename mode.
-        start_rename(ui, &entry.rel_path);
+        self.start_rename(&entry.rel_path);
     }
+    // The context menu only records which verb the user picked; the
+    // mutation runs after the closure so it can call the `&mut self`
+    // file-op methods without overlapping the closure's borrow of `ui`.
     let rel = entry.rel_path.clone();
+    let mut verb = self.file_row_menu(&resp, &rel);
+    if let Some(v) = verb.take() {
+        self.run_file_verb(v, &rel);
+    }
+}
+
+/// Draw the per-file context menu and return the picked verb (if any).
+/// Pure rendering: every branch maps a clicked button to a `FileVerb`
+/// and closes the menu; no `AppState` mutation happens here.
+fn file_row_menu(&mut self, resp: &egui::Response, rel: &str) -> Option<FileVerb> {
+    let mut verb = None;
+    let state = &*self.state;
+    // Pre-compute the trail context so the closure stays read-only.
+    let active_trail = state
+        .session.active_trail
+        .clone()
+        .filter(|id| state.session.trails.iter().any(|t| &t.id == id))
+        .and_then(|tid| state.session.trails.iter().find(|t| t.id == tid))
+        .map(|t| (t.name.clone(), waypoint_tree_contains(&t.waypoints, rel)));
     resp.context_menu(|ui| {
         if ui.button("Open").clicked() {
-            editor_pane::open_file(state, &rel, true);
+            verb = Some(FileVerb::Open);
             ui.close();
         }
         if ui.button("Rename").clicked() {
-            start_rename(ui, &rel);
-            state.session.sidebar.renaming = Some(rel.clone());
-            state.session.sidebar.renaming_text = basename_of(&rel).to_string();
+            verb = Some(FileVerb::Rename);
             ui.close();
         }
         if ui.button("Duplicate").clicked() {
-            duplicate_file(state, &rel);
+            verb = Some(FileVerb::Duplicate);
             ui.close();
         }
         if ui.button("Reveal in file manager").clicked() {
-            reveal_in_file_manager(state, &rel);
+            verb = Some(FileVerb::Reveal);
             ui.close();
         }
         if ui.button("Properties").clicked() {
-            open_properties(state, &rel);
+            verb = Some(FileVerb::Properties);
             ui.close();
         }
         // Reindex verb: force-enqueue this path on the indexer. Useful when
         // the watcher missed an edit or the file's hash is somehow stale.
         if ui.button("Reindex this file").clicked() {
-            {
-                let indexer = state.vault_session.services.indexer.as_ref();
-                let tx = indexer.job_sender();
-                let path_owned = rel.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = tx.send(hiker_core::indexer::IndexJob::Upsert {
-                            rel_path: path_owned,
-                            force: true,
-                        }).await;
-                    });
-                }
-                state.push_toast(
-                    format!("Reindexing {rel}"),
-                    crate::state::ToastLevel::Info,
-                );
-            }
+            verb = Some(FileVerb::Reindex);
             ui.close();
         }
         // Add-to-trail verb. Surfaces only when an active trail is set;
         // recursive membership check disables when the path is already a
         // waypoint at any depth.
-        if let Some(tid) = state
-            .session.active_trail
-            .clone()
-            .filter(|id| state.session.trails.iter().any(|t| &t.id == id))
-            && let Some(trail) = state.session.trails.iter().find(|t| t.id == tid)
-        {
-            let trail_name = trail.name.clone();
-            let already = waypoint_tree_contains(&trail.waypoints, &rel);
-            let label = if already {
+        if let Some((trail_name, already)) = &active_trail {
+            let label = if *already {
                 format!("Already in '{}'", trail_name)
             } else {
                 format!("Add to trail '{}'", trail_name)
             };
-            let resp = ui.add_enabled(!already, egui::Button::new(label));
-            if resp.clicked() {
-                let path_for_trail = rel.clone();
-                crate::state::trail_append_waypoint(state, &path_for_trail);
-                let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-                state.push_toast(
-                    format!("Added {path_for_trail} to '{trail_name}'"),
-                    crate::state::ToastLevel::Info,
-                );
+            if ui.add_enabled(!already, egui::Button::new(label)).clicked() {
+                verb = Some(FileVerb::AddToTrail { trail_name: trail_name.clone() });
                 ui.close();
             }
         }
@@ -441,87 +389,167 @@ fn render_file_row(
             && rel.ends_with(".md")
             && ui.button("Set as active trail").clicked()
         {
-            let stem = rel
-                    .rsplit('/')
-                    .next()
-                    .and_then(|n| n.strip_suffix(".md"))
-                    .unwrap_or("");
-                if let Some(t) = state
-                    .session.trails
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(stem))
-                {
-                    let tid = t.id.clone();
-                    let name = t.name.clone();
-                    state.session.active_trail = Some(tid);
-                    crate::actions::ensure_panel_visible(
-                        state,
-                        crate::panels_registry::PANEL_TRAILS,
-                    );
-                    state.push_toast(
-                        format!("Activated trail {}", name),
-                        crate::state::ToastLevel::Info,
-                    );
-                } else {
-                    state.push_toast(
-                        "No trail registered for this doc",
-                        crate::state::ToastLevel::Info,
-                    );
-                }
+            verb = Some(FileVerb::SetActiveTrail);
             ui.close();
         }
         if ui.button("Delete").clicked() {
-            state.session.modal = Some(crate::state::Modal::ConfirmDelete { path: rel.clone() });
+            verb = Some(FileVerb::Delete);
             ui.close();
         }
     });
+    verb
+}
+
+/// Execute a context-menu verb against `AppState`. Split out from the
+/// menu render so the mutating helpers run outside the menu closure's
+/// borrow of `ui`.
+fn run_file_verb(&mut self, verb: FileVerb, rel: &str) {
+    match verb {
+        FileVerb::Open => editor_pane::open_file(self.state, rel, true),
+        FileVerb::Rename => {
+            self.start_rename(rel);
+            self.state.session.sidebar.renaming = Some(rel.to_string());
+            self.state.session.sidebar.renaming_text = basename_of(rel).to_string();
+        }
+        FileVerb::Duplicate => self.duplicate_file(rel),
+        FileVerb::Reveal => self.reveal_in_file_manager(rel),
+        FileVerb::Properties => self.open_properties(rel),
+        FileVerb::Reindex => {
+            let state = &mut *self.state;
+            let indexer = state.vault_session.services.indexer.as_ref();
+            let tx = indexer.job_sender();
+            let path_owned = rel.to_string();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tx.send(hiker_core::indexer::IndexJob::Upsert {
+                        rel_path: path_owned,
+                        force: true,
+                    }).await;
+                });
+            }
+            state.push_toast(
+                format!("Reindexing {rel}"),
+                crate::state::ToastLevel::Info,
+            );
+        }
+        FileVerb::AddToTrail { trail_name } => {
+            let state = &mut *self.state;
+            crate::state::trail_append_waypoint(state, rel);
+            let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+            state.push_toast(
+                format!("Added {rel} to '{trail_name}'"),
+                crate::state::ToastLevel::Info,
+            );
+        }
+        FileVerb::SetActiveTrail => {
+            let state = &mut *self.state;
+            let stem = rel
+                .rsplit('/')
+                .next()
+                .and_then(|n| n.strip_suffix(".md"))
+                .unwrap_or("");
+            if let Some(t) = state
+                .session.trails
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(stem))
+            {
+                let tid = t.id.clone();
+                let name = t.name.clone();
+                state.session.active_trail = Some(tid);
+                crate::actions::ensure_panel_visible(
+                    state,
+                    crate::panels_registry::PANEL_TRAILS,
+                );
+                state.push_toast(
+                    format!("Activated trail {}", name),
+                    crate::state::ToastLevel::Info,
+                );
+            } else {
+                state.push_toast(
+                    "No trail registered for this doc",
+                    crate::state::ToastLevel::Info,
+                );
+            }
+        }
+        FileVerb::Delete => {
+            self.state.session.modal =
+                Some(crate::state::Modal::ConfirmDelete { path: rel.to_string() });
+        }
+    }
 }
 
 /// Renders the inline rename TextEdit. On Enter, runs `move_note` via
 /// the live Store + Watcher; on Esc, cancels.
-fn rename_row(
-    ui: &mut egui::Ui,
-    state: &mut AppState,
-    entry: &DirEntryDto,
-    depth: usize,
-    mut draft: String,
-) {
-    ui.horizontal(|ui| {
+fn rename_row(&mut self, entry: &DirEntryDto, depth: usize, mut draft: String) {
+    let path = entry.rel_path.clone();
+    let kind = entry.kind.clone();
+    // The TextEdit renders inside the `ui.horizontal` closure; it only
+    // reports what happened (commit / cancel) so the `&mut self`
+    // `commit_rename` runs after, outside the closure's `ui` borrow.
+    let outcome = self.ui.horizontal(|ui| {
         ui.add_space((depth as f32) * 12.0);
-        ui.add(match entry.kind {
-            EntryKind::Dir => crate::icons::folder(),
-            EntryKind::File => crate::icons::file(),
+        ui.add(match kind {
+            EntryKind::Dir => crate::icons::ICONS.image(crate::icons::Icon::Folder),
+            EntryKind::File => crate::icons::ICONS.image(crate::icons::Icon::File),
         });
-        let id = egui::Id::new(("rename-edit", entry.rel_path.as_str()));
+        let id = egui::Id::new(("rename-edit", path.as_str()));
         let resp = ui.add(
             egui::TextEdit::singleline(&mut draft)
                 .id(id)
                 .desired_width(ui.available_width()),
         );
-        // First frame: focus + pre-select the basename excluding extension.
-        let just_opened = rename_just_opened(ui, &entry.rel_path);
+        // First frame: focus + clear the just-opened flag.
+        let just_opened = ui.ctx().memory(|m| {
+            m.data
+                .get_temp::<RenameMem>(mem_id())
+                .map(|r| r.path == path && r.just_opened)
+                .unwrap_or(false)
+        });
         if just_opened {
             resp.request_focus();
-            mark_rename_handled(ui, &entry.rel_path);
+            ui.ctx().memory_mut(|m| {
+                if let Some(mut r) = m.data.get_temp::<RenameMem>(mem_id())
+                    && r.path == path
+                {
+                    r.just_opened = false;
+                    m.data.insert_temp(mem_id(), r);
+                }
+            });
         }
 
         if resp.changed() {
-            set_rename_draft(ui, &entry.rel_path, &draft);
+            ui.ctx().memory_mut(|m| {
+                m.data.insert_temp(mem_id(), RenameMem {
+                    path: path.clone(),
+                    draft: draft.clone(),
+                    just_opened: false,
+                });
+            });
         }
 
         let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
-
-        if commit {
-            commit_rename(state, &entry.rel_path, &draft);
-            clear_rename(ui, &entry.rel_path);
-        } else if cancel || (resp.lost_focus() && !commit) {
-            clear_rename(ui, &entry.rel_path);
+        if commit || cancel || resp.lost_focus() {
+            // Drop the draft from egui memory if it still belongs to this row.
+            ui.ctx().memory_mut(|m| {
+                if m.data
+                    .get_temp::<RenameMem>(mem_id())
+                    .map(|r| r.path == path)
+                    .unwrap_or(false)
+                {
+                    m.data.remove::<RenameMem>(mem_id());
+                }
+            });
         }
+        commit
     });
+    if outcome.inner {
+        self.commit_rename(&entry.rel_path, &draft);
+    }
 }
 
-fn commit_rename(state: &mut AppState, from: &str, draft: &str) {
+fn commit_rename(&mut self, from: &str, draft: &str) {
+    let state = &mut *self.state;
     let draft = draft.trim();
     if draft.is_empty() || draft == basename_of(from) {
         return;
@@ -577,25 +605,10 @@ fn commit_rename(state: &mut AppState, from: &str, draft: &str) {
     );
 }
 
-fn basename_of(rel: &str) -> &str {
-    rel.rsplit('/').next().unwrap_or(rel)
-}
-
-// ----- rename draft storage in egui memory -----
-
-#[derive(Clone, Default)]
-struct RenameMem {
-    path: String,
-    draft: String,
-    just_opened: bool,
-}
-
-fn mem_id() -> egui::Id {
-    egui::Id::new("sidebar-files-rename")
-}
-
-fn rename_draft_for(ui: &egui::Ui, path: &str) -> Option<String> {
-    ui.ctx().memory(|m| {
+/// Active inline-rename draft for `path`, if any (drafts live in egui
+/// memory keyed by rel-path).
+fn rename_draft_for(&self, path: &str) -> Option<String> {
+    self.ui.ctx().memory(|m| {
         m.data
             .get_temp::<RenameMem>(mem_id())
             .filter(|r| r.path == path)
@@ -603,63 +616,22 @@ fn rename_draft_for(ui: &egui::Ui, path: &str) -> Option<String> {
     })
 }
 
-fn rename_just_opened(ui: &egui::Ui, path: &str) -> bool {
-    ui.ctx().memory(|m| {
-        m.data
-            .get_temp::<RenameMem>(mem_id())
-            .map(|r| r.path == path && r.just_opened)
-            .unwrap_or(false)
-    })
-}
-
-fn mark_rename_handled(ui: &mut egui::Ui, path: &str) {
-    ui.ctx().memory_mut(|m| {
-        if let Some(mut r) = m.data.get_temp::<RenameMem>(mem_id())
-            && r.path == path
-        {
-            r.just_opened = false;
-            m.data.insert_temp(mem_id(), r);
-        }
-    });
-}
-
-fn set_rename_draft(ui: &mut egui::Ui, path: &str, draft: &str) {
-    ui.ctx().memory_mut(|m| {
-        let r = RenameMem {
-            path: path.to_string(),
-            draft: draft.to_string(),
-            just_opened: false,
-        };
-        m.data.insert_temp(mem_id(), r);
-    });
-}
-
-fn start_rename(ui: &mut egui::Ui, path: &str) {
+/// Enter inline-rename mode for `path`, seeding the draft with the
+/// current basename and flagging the row to grab focus next frame.
+fn start_rename(&mut self, path: &str) {
     let draft = basename_of(path).to_string();
-    ui.ctx().memory_mut(|m| {
-        let r = RenameMem {
+    self.ui.ctx().memory_mut(|m| {
+        m.data.insert_temp(mem_id(), RenameMem {
             path: path.to_string(),
             draft,
             just_opened: true,
-        };
-        m.data.insert_temp(mem_id(), r);
+        });
     });
 }
 
-fn clear_rename(ui: &mut egui::Ui, path: &str) {
-    ui.ctx().memory_mut(|m| {
-        if m.data
-            .get_temp::<RenameMem>(mem_id())
-            .map(|r| r.path == path)
-            .unwrap_or(false)
-        {
-            m.data.remove::<RenameMem>(mem_id());
-        }
-    });
-}
-
-fn open_properties(state: &mut AppState, rel: &str) {
+fn open_properties(&mut self, rel: &str) {
     use crate::tab::{Tab, TabKind};
+    let state = &mut *self.state;
     if let Some(existing) = state.session.tabs.iter().find(|t| match &t.kind {
         TabKind::Properties { path } => path == rel,
         _ => false,
@@ -677,7 +649,8 @@ fn open_properties(state: &mut AppState, rel: &str) {
     state.session.preview_tab = Some(id);
 }
 
-fn duplicate_file(state: &mut AppState, rel: &str) {
+fn duplicate_file(&mut self, rel: &str) {
+    let state = &mut *self.state;
     // Read the source body, choose a `<stem>-copy-N.<ext>` target in the
     // same dir, write via vault::create_note + write_file. Vault layer
     // handles parent-dir creation + collision checks.
@@ -740,7 +713,8 @@ fn duplicate_file(state: &mut AppState, rel: &str) {
     );
 }
 
-fn reveal_in_file_manager(state: &mut AppState, rel: &str) {
+fn reveal_in_file_manager(&mut self, rel: &str) {
+    let state = &mut *self.state;
     let abs = match state.vault_session.vault.abs_path(rel) {
         Ok(p) => p,
         Err(err) => {
@@ -771,24 +745,287 @@ fn reveal_in_file_manager(state: &mut AppState, rel: &str) {
     }
 }
 
-#[allow(dead_code)]
-fn queue_delete_modal(state: &mut AppState, rel: &str) {
-    let rel_owned = rel.to_string();
-    state.session.modal = Some(crate::state::Modal::Confirm {
-        title: "Delete note".to_string(),
-        body: format!("Move {} to trash?", rel_owned),
-        confirm_label: "Move to trash".to_string(),
-        cancel_label: "Cancel".to_string(),
-        danger: true,
-        intent: crate::state::ConfirmIntent::SoftDeleteIntoTrash { path: rel_owned },
+/// Short string appended to a file-tree row label describing the
+/// indexer's view of the file:
+/// - "  ..." while the path sits in the indexer's pending queue
+/// - "  [skip]" when the store has the file marked as skipped
+/// - "" once the file is indexed (or the indexer is offline)
+fn index_state_marker(&self, rel: &str) -> &'static str {
+    if self.state.vault_session.services.indexer.is_pending(rel) {
+        return "  ...";
+    }
+    // Reads `state.ui_cache.skipped_paths`, refreshed periodically by
+    // `main::refresh_skipped_paths`. Previously this issued a
+    // `store.get_note_by_path` SQLite query per visible row per frame.
+    if self.state.ui_cache.skipped_paths.contains(rel) {
+        return "  [skip]";
+    }
+    ""
+}
+
+fn row_button(&mut self, label: &str, depth: usize, active: bool) -> egui::Response {
+    row_button_with_chevron(self.ui, label, depth, active, None)
+}
+
+/// Files panel body: the file tree (in a scroll area) with the trash bin
+/// pinned below it. This is the panel's single external entry point —
+/// `panels_registry`'s `Files` record constructs a `FilesView` and calls
+/// it, the same shape Search/Related/Backlinks use for their `View`. The
+/// new-note button and the refresh / sort menu live in the side bar's
+/// title row (wired through `Host::side_bar_action_buttons` /
+/// `side_bar_actions_menu`).
+pub(crate) fn show(&mut self) {
+    let avail_height = self.ui.available_height();
+    let trash_row_height = 28.0;
+    egui::ScrollArea::vertical()
+        .id_salt("panel-files-body")
+        .max_height((avail_height - trash_row_height).max(60.0))
+        .auto_shrink([false, false])
+        .show(self.ui, |ui| {
+            let mut view = FilesView { ui, state: self.state };
+            view.sort_header();
+            view.show_dir("", 0);
+        });
+    self.ui.separator();
+    self.trash_bin();
+}
+
+/// Trash bin pinned at the bottom of the Files panel. Shows a collapsible
+/// listing built from the on-disk trash directory + manifest; each entry
+/// offers Restore and Purge actions, plus a batch "Empty" verb. Part of
+/// the Files panel body (it used to be pinned across every sidebar mode);
+/// lives here as a `FilesView` method so it shares the panel's receiver.
+fn trash_bin(&mut self) {
+    use hiker_core::trash::Trash;
+    let ui = &mut *self.ui;
+    let state = &mut *self.state;
+    let trash = Trash::open(&state.vault_session.vault_root);
+    let items = trash.list_from_disk().unwrap_or_default();
+    let count = items.len();
+
+    let label = if count == 0 {
+        "Trash".to_string()
+    } else {
+        format!("Trash ({})", count)
+    };
+    let chevron_icon = if state.session.sidebar.trash_expanded {
+        icons::ICONS.image(crate::icons::Icon::Expand)
+    } else {
+        icons::ICONS.image(crate::icons::Icon::Collapse)
+    };
+
+    let mut empty_clicked = false;
+    let row = ui.horizontal(|ui| {
+        let resp_chev = ui.add(egui::Button::image(chevron_icon).frame(false).small());
+        let resp_trash = ui.add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Trash)).frame(false).small());
+        let resp_lbl = ui.add(
+            egui::Label::new(egui::RichText::new(label).size(13.0))
+                .sense(egui::Sense::click()),
+        );
+        let mut toggle = resp_chev.clicked() || resp_trash.clicked() || resp_lbl.clicked();
+        // "Empty trash" batch action — right-aligned, only when the bin
+        // is non-empty. Mirrors `tree-trash-empty` in design.md.
+        if count > 0 {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Empty").small()).small())
+                    .on_hover_text("Permanently delete every item in the bin")
+                    .clicked()
+                {
+                    empty_clicked = true;
+                    // Don't fold trash open just because the user clicked
+                    // the inline button on a folded header.
+                    toggle = false;
+                }
+            });
+        }
+        toggle
     });
+    if row.inner {
+        state.session.sidebar.trash_expanded = !state.session.sidebar.trash_expanded;
+    }
+    if empty_clicked {
+        // Route through the confirm modal so an accidental click doesn't
+        // wipe weeks of trash. The confirm callback walks the trash list
+        // and purges each entry.
+        state.session.modal = Some(crate::state::Modal::Confirm {
+            title: "Empty trash".to_string(),
+            body: format!(
+                "Permanently delete all {count} items in the trash? This can't be undone."
+            ),
+            confirm_label: "Empty trash".to_string(),
+            cancel_label: "Cancel".to_string(),
+            danger: true,
+            intent: crate::state::ConfirmIntent::EmptyTrash,
+        });
+    }
+
+    if !state.session.sidebar.trash_expanded {
+        return;
+    }
+
+    if items.is_empty() {
+        ui.indent("trash-contents", |ui| {
+            ui.label(
+                egui::RichText::new("(empty)")
+                    .color(theme::muted())
+                    .small(),
+            );
+        });
+        return;
+    }
+
+    // Collect actions to apply after the render to avoid mutable-borrow
+    // overlap with `state` inside the row closure.
+    enum Action {
+        Restore { id: String },
+        Purge { trashed_name: String },
+    }
+    let mut pending: Option<Action> = None;
+
+    ui.indent("trash-contents", |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("trash-list")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for item in &items {
+                    let basename = item
+                        .original_path
+                        .as_deref()
+                        .unwrap_or(&item.trashed_name)
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&item.trashed_name);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(basename).small());
+                        ui.label(
+                            egui::RichText::new(TrashTimeFmt.format_ts(item.deleted_at))
+                                .color(theme::muted())
+                                .small(),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let purge = egui::Button::new(
+                                    egui::RichText::new("Purge").small(),
+                                )
+                                .small();
+                                if ui.add(purge).on_hover_text("Delete forever").clicked() {
+                                    pending = Some(Action::Purge {
+                                        trashed_name: item.trashed_name.clone(),
+                                    });
+                                }
+                                if let Some(id) = &item.id {
+                                    let restore = egui::Button::new(
+                                        egui::RichText::new("Restore").small(),
+                                    )
+                                    .small();
+                                    if ui.add(restore).clicked() {
+                                        pending = Some(Action::Restore { id: id.clone() });
+                                    }
+                                }
+                            },
+                        );
+                    });
+                }
+            });
+    });
+
+    let Some(action) = pending else { return };
+    match action {
+        Action::Restore { id } => {
+            let trash = Trash::open(&state.vault_session.vault_root);
+            match hiker_core::vault::restore_note(
+                &state.vault_session.vault,
+                Some(state.vault_session.services.watcher.as_ref()),
+                &trash,
+                &id,
+            ) {
+                Ok(entry) => {
+                    let parent = entry
+                        .original_path
+                        .rsplit_once('/')
+                        .map(|(p, _)| p)
+                        .unwrap_or("");
+                    state.session.sidebar.dir_cache.remove(parent);
+                    state.push_toast(
+                        format!("Restored {}", entry.original_path),
+                        crate::state::ToastLevel::Info,
+                    );
+                }
+                Err(err) => state.push_toast(
+                    format!("Restore failed: {}", err),
+                    crate::state::ToastLevel::Error,
+                ),
+            }
+        }
+        Action::Purge { trashed_name } => {
+            let trash = Trash::open(&state.vault_session.vault_root);
+            match trash.permanent_delete(&trashed_name) {
+                Ok(()) => state.push_toast(
+                    format!("Purged {}", trashed_name),
+                    crate::state::ToastLevel::Info,
+                ),
+                Err(err) => state.push_toast(
+                    format!("Purge failed: {}", err),
+                    crate::state::ToastLevel::Error,
+                ),
+            }
+        }
+    }
+}
 }
 
-fn row_button(ui: &mut egui::Ui, label: &str, depth: usize, active: bool) -> egui::Response {
-    row_button_with_chevron(ui, label, depth, active, None)
+/// Zero-sized timestamp formatter for trash rows. An inherent method (not
+/// a free fn) so the single caller above doesn't trip `single_call_fn`.
+struct TrashTimeFmt;
+
+impl TrashTimeFmt {
+    fn format_ts(self, unix_secs: i64) -> String {
+    use time::OffsetDateTime;
+    use time::macros::format_description;
+    let Ok(t) = OffsetDateTime::from_unix_timestamp(unix_secs) else {
+        return String::new();
+    };
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]");
+    t.format(fmt).unwrap_or_default()
+    }
 }
 
-/// Like [`row_button`] but renders an SVG chevron in the leading slot.
+// ----- free helpers (shared by multiple methods / pure) -----
+
+const fn sort_label(s: hiker_core::config::sections::TreeSortBy, compact: bool) -> &'static str {
+    use hiker_core::config::sections::TreeSortBy;
+    match (s, compact) {
+        (TreeSortBy::NameAsc, false) => "Name (A-Z)",
+        (TreeSortBy::NameDesc, false) => "Name (Z-A)",
+        (TreeSortBy::MtimeDesc, false) => "Recent",
+        (TreeSortBy::MtimeAsc, false) => "Oldest",
+        (TreeSortBy::NameAsc, true) => "A-Z",
+        (TreeSortBy::NameDesc, true) => "Z-A",
+        (TreeSortBy::MtimeDesc, true) => "New",
+        (TreeSortBy::MtimeAsc, true) => "Old",
+    }
+}
+
+fn basename_of(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+// ----- rename draft storage in egui memory -----
+
+#[derive(Clone, Default)]
+struct RenameMem {
+    path: String,
+    draft: String,
+    just_opened: bool,
+}
+
+fn mem_id() -> egui::Id {
+    egui::Id::new("sidebar-files-rename")
+}
+
+/// Renders a sidebar row button. Optionally draws an SVG chevron in the leading slot.
 /// `Some(true)` = expanded (down chevron), `Some(false)` = collapsed
 /// (right chevron), `None` = no chevron (leaf row). The chevron paints
 /// inside the row's clickable area so the whole row toggles, matching
@@ -833,9 +1070,9 @@ fn row_button_with_chevron(
             egui::vec2(chev_size, chev_size),
         );
         let icon = if expanded {
-            crate::icons::chevron_down()
+            crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
         } else {
-            crate::icons::chevron_right()
+            crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
         };
         icon.paint_at(ui, chev_rect);
     }
@@ -873,32 +1110,14 @@ mod marker_tests {
     }
 }
 
-/// Short string appended to a file-tree row label describing the
-/// indexer's view of the file. Returns:
-/// - "  ⌛" while the path sits in the indexer's pending queue
-/// - "  ⊘" when the store has the file marked as skipped
-/// - "" once the file is indexed (or the indexer is offline)
-fn index_state_marker(state: &AppState, rel: &str) -> &'static str {
-    if state.vault_session.services.indexer.is_pending(rel) {
-        return "  ...";
-    }
-    // Reads `state.ui_cache.skipped_paths`, refreshed periodically by
-    // `main::refresh_skipped_paths`. Previously this issued a
-    // `store.get_note_by_path` SQLite query per visible row per frame.
-    if state.ui_cache.skipped_paths.contains(rel) {
-        return "  [skip]";
-    }
-    ""
-}
-
 fn default_sort(
     config: &std::sync::RwLock<hiker_core::config::Config>,
-) -> hiker_core::config::TreeSortBy {
+) -> hiker_core::config::sections::TreeSortBy {
     config
         .read()
         .ok()
         .map(|c| c.vault.tree.sort_by)
-        .unwrap_or(hiker_core::config::TreeSortBy::NameAsc)
+        .unwrap_or(hiker_core::config::sections::TreeSortBy::NameAsc)
 }
 
 fn waypoint_tree_contains(waypoints: &[crate::state::Waypoint], path: &str) -> bool {
@@ -911,4 +1130,39 @@ fn waypoint_tree_contains(waypoints: &[crate::state::Waypoint], path: &str) -> b
         }
     }
     false
+}
+
+#[cfg(test)]
+mod sort_label_tests {
+    use super::*;
+    use hiker_core::config::sections::TreeSortBy;
+
+    #[test]
+    fn every_variant_has_a_label() {
+        for v in [
+            TreeSortBy::NameAsc,
+            TreeSortBy::NameDesc,
+            TreeSortBy::MtimeDesc,
+            TreeSortBy::MtimeAsc,
+        ] {
+            for compact in [false, true] {
+                let l = sort_label(v, compact);
+                assert!(!l.is_empty(), "missing label for {v:?} compact={compact}");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_are_distinct() {
+        for compact in [false, true] {
+            let labels = [
+                sort_label(TreeSortBy::NameAsc, compact),
+                sort_label(TreeSortBy::NameDesc, compact),
+                sort_label(TreeSortBy::MtimeDesc, compact),
+                sort_label(TreeSortBy::MtimeAsc, compact),
+            ];
+            let set: std::collections::HashSet<&str> = labels.iter().copied().collect();
+            assert_eq!(set.len(), 4, "sort labels collide: {labels:?} compact={compact}");
+        }
+    }
 }

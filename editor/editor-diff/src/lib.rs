@@ -1,16 +1,16 @@
-//! Diff view helpers: turn a `Vec<Hunk>` (from `editor_core::diff::diff_lines`)
+//! Diff view helpers: turn a `Vec<Hunk>` (from `editor_core::diff::lines as diff_lines`)
 //! into `DecorationSet`s ready to feed into a view's `decorations` layer.
 //!
 //! The widget itself doesn't know about diff — it just renders Block, Mark,
 //! and Line decorations. This crate is the "consumer" that produces them.
 
-mod view;
+pub mod view;
 
-pub use view::{alignment_decorations, unified_decorations, unified_decorations_opts};
-
-use editor_core::diff::{diff_lines, Hunk};
-use editor_core::{DecorationSet, Rope, Theme};
-
+use editor_core::diff::lines as diff_lines;
+use editor_core::diff::Hunk;
+use editor_core::decoration::Set as DecorationSet;
+use editor_core::rope::Rope;
+use editor_core::theme::Theme;
 /// Who owns the diff, which drives per-hunk verb affordances rendered by the
 /// host (accept/reject for `Agent` / `Staging`, restore for `Snapshot`,
 /// nothing for `Index` / `Manual`). Rendering of the underlying hunks is
@@ -63,7 +63,7 @@ impl DiffLayer {
         Self { base, current, owner, hunks, base_text }
     }
 
-    pub fn owner(&self) -> DiffOwner {
+    pub const fn owner(&self) -> DiffOwner {
         self.owner
     }
 
@@ -83,7 +83,7 @@ impl DiffLayer {
         theme: Option<&Theme>,
         intraline: bool,
     ) -> DecorationSet {
-        unified_decorations_opts(
+        view::unified_decorations_opts(
             &self.current,
             &self.base_text,
             &self.hunks,

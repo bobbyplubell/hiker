@@ -1,24 +1,24 @@
 //! Transaction: an immutable description of a state change.
 //!
-//! A transaction bundles a `ChangeSet`, an optional new `Selection`, and
+//! A transaction bundles a `Set`, an optional new `Selection`, and
 //! metadata (annotations) that downstream consumers (like the history field)
 //! use for grouping decisions.
 
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::change::ChangeSet;
-use crate::compartment::CompartmentId;
+use crate::change::Set;
+use crate::compartment::Id;
 use crate::selection::Selection;
 
 /// Side-effects layered on top of the doc/selection change.
 ///
 /// Currently the only effect is `Reconfigure`, which swaps the value held
-/// in a compartment. Apply happens inside `EditorState::apply`.
+/// in a compartment. Apply happens inside `Editor::apply`.
 #[derive(Clone)]
 pub enum StateEffect {
     Reconfigure {
-        id: CompartmentId,
+        id: Id,
         value: Arc<dyn Any + Send + Sync>,
     },
 }
@@ -56,20 +56,20 @@ pub struct Annotations {
 }
 
 // TODO(serde): `Transaction` is not serializable because it carries a
-// `ChangeSet` (sumtree-backed) and `effects: Vec<StateEffect>` containing
+// `Set` (sumtree-backed) and `effects: Vec<StateEffect>` containing
 // `Arc<dyn Any>`. A future revision will add a serializable wire form of
-// `ChangeSet` and replace effects with a tagged enum so transactions can be
+// `Set` and replace effects with a tagged enum so transactions can be
 // persisted (e.g. for collab/replay). See SPEC §9.9.
 #[derive(Clone, Debug)]
 pub struct Transaction {
-    pub changes: ChangeSet,
+    pub changes: Set,
     pub selection: Option<Selection>,
     pub annotations: Annotations,
     pub effects: Vec<StateEffect>,
 }
 
 impl Transaction {
-    pub fn new(changes: ChangeSet) -> Self {
+    pub fn new(changes: Set) -> Self {
         Self {
             changes,
             selection: None,
@@ -93,7 +93,7 @@ impl Transaction {
             id: compartment.id(),
             value: Arc::new(value),
         };
-        Self::new(ChangeSet::empty(doc_len)).with_effect(effect)
+        Self::new(Set::empty(doc_len)).with_effect(effect)
     }
 
     pub fn with_selection(mut self, sel: Selection) -> Self {
@@ -101,12 +101,12 @@ impl Transaction {
         self
     }
 
-    pub fn with_edit_type(mut self, t: EditType) -> Self {
+    pub const fn with_edit_type(mut self, t: EditType) -> Self {
         self.annotations.edit_type = Some(t);
         self
     }
 
-    pub fn joined(mut self) -> Self {
+    pub const fn joined(mut self) -> Self {
         self.annotations.join_with_previous = true;
         self
     }

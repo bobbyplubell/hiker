@@ -1,6 +1,9 @@
-//! View-options and mutations popup menus rendered in the editor toolbar.
-//! Pulled out of `buffer/mod.rs` to keep the parent file under the
-//! workspace's per-file length cap.
+//! Popup menus rendered in the editor toolbar / status bar: the
+//! view-options menu, the mutations menu, and the version dropdown (which
+//! lists pending staging proposals and changelog snapshots for the active
+//! path and opens the corresponding preview tab). All three share the same
+//! `Menus { ui, app, path }` context and are pulled out of `buffer/mod.rs`
+//! to keep the parent file under the workspace's per-file length cap.
 
 use eframe::egui;
 
@@ -8,7 +11,20 @@ use crate::buffer::DecorationCache;
 use crate::icons;
 use crate::state::{AppState, ToastLevel};
 
-pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
+/// Render context for the editor toolbar's popup menus. Bundling `ui` +
+/// `app` + the buffer `path` lets the menu builders be inherent methods
+/// rather than single-use free functions.
+pub(super) struct Menus<'a> {
+    pub(super) ui: &'a mut egui::Ui,
+    pub(super) app: &'a mut AppState,
+    pub(super) path: &'a str,
+}
+
+impl Menus<'_> {
+    pub(super) fn view_options_menu(&mut self) {
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
+    let path = self.path;
     let mut wrap = false;
     let mut hide_gutter = false;
     let mut placeholder_special = false;
@@ -24,14 +40,14 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
         show_minimap = buffer.show_minimap;
     }
     let resp = ui
-        .add(egui::Button::image(icons::eye()))
+        .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Eye)))
         .on_hover_text("View options");
     egui::Popup::menu(&resp).show(|ui| {
         if ui.checkbox(&mut wrap, "Word wrap").changed() {
             if let Some(buffer) = app.session.buffers.get_mut(path) {
                 buffer.view.wrap_map.set_enabled(wrap);
             }
-            super::persist_view_setting(app, "editor.word_wrap", serde_json::json!(wrap));
+            super::persist_view_setting(app, "editor.word_wrap", &serde_json::json!(wrap));
         }
         let mut show_gutter = !hide_gutter;
         if ui.checkbox(&mut show_gutter, "Show line numbers").changed() {
@@ -41,7 +57,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.show_line_numbers",
-                serde_json::json!(show_gutter),
+                &serde_json::json!(show_gutter),
             );
         }
         if ui.checkbox(&mut placeholder_special, "Show whitespace").changed() {
@@ -51,7 +67,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.show_whitespace",
-                serde_json::json!(placeholder_special),
+                &serde_json::json!(placeholder_special),
             );
         }
         if ui
@@ -66,7 +82,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.highlight_trailing_whitespace",
-                serde_json::json!(highlight_trailing_ws),
+                &serde_json::json!(highlight_trailing_ws),
             );
         }
         if ui
@@ -77,7 +93,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             if let Some(buffer) = app.session.buffers.get_mut(path) {
                 buffer.show_minimap = show_minimap;
             }
-            super::persist_view_setting(app, "editor.show_minimap", serde_json::json!(show_minimap));
+            super::persist_view_setting(app, "editor.show_minimap", &serde_json::json!(show_minimap));
         }
         if ui.checkbox(&mut hide_frontmatter, "Hide frontmatter").changed() {
             if let Some(buffer) = app.session.buffers.get_mut(path) {
@@ -86,7 +102,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.hide_frontmatter",
-                serde_json::json!(hide_frontmatter),
+                &serde_json::json!(hide_frontmatter),
             );
         }
         ui.separator();
@@ -114,7 +130,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.live_preview",
-                serde_json::json!(live_preview),
+                &serde_json::json!(live_preview),
             );
         }
         if ui
@@ -128,7 +144,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.show_chunk_boundaries",
-                serde_json::json!(chunk_boundaries),
+                &serde_json::json!(chunk_boundaries),
             );
         }
         let is_txt = path
@@ -149,7 +165,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
                 super::persist_view_setting(
                     app,
                     "editor.render_txt_as_markdown",
-                    serde_json::json!(render_txt_as_md),
+                    &serde_json::json!(render_txt_as_md),
                 );
             }
         });
@@ -164,7 +180,7 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             super::persist_view_setting(
                 app,
                 "editor.intraline_diff",
-                serde_json::json!(intraline_diff),
+                &serde_json::json!(intraline_diff),
             );
         }
         if ui
@@ -176,57 +192,65 @@ pub(super) fn view_options_menu(ui: &mut egui::Ui, app: &mut AppState, path: &st
             buffer.heading_breadcrumb = heading_breadcrumb;
         }
     });
-}
-
-/// Popup menu offering LLM-backed note mutations. Each pick builds a
-/// `TaskKind::NoteMutation` task and submits it to the shared queue.
-pub(super) fn mutations_menu(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
-    let in_flight = mutation_in_flight(app, path);
-    let resp = ui
-        .add_enabled(!in_flight, egui::Button::image(icons::wand()))
-        .on_hover_text(if in_flight {
-            "Mutation in flight — wait for the queued task to finish."
-        } else {
-            "Mutations"
-        });
-    let mut chosen: Option<&'static str> = None;
-    egui::Popup::menu(&resp).show(|ui| {
-        if ui.button("Reformat as markdown").clicked() {
-            chosen = Some("reformat-as-markdown");
-            ui.close();
-        }
-        if ui.button("Summarize").clicked() {
-            chosen = Some("summarize");
-            ui.close();
-        }
-        if ui.button("Auto-tag").clicked() {
-            chosen = Some("auto-tag");
-            ui.close();
-        }
-        if ui.button("Improve clarity").clicked() {
-            chosen = Some("improve-clarity");
-            ui.close();
-        }
-    });
-    if let Some(m) = chosen {
-        submit_mutation(app, path, m);
     }
-}
 
-fn mutation_in_flight(app: &AppState, path: &str) -> bool {
-    use hiker_core::tasks::{TaskKind, TaskState};
-    let in_queue = app.ui_cache.task_snapshot.iter().any(|r| {
-        matches!(r.state, TaskState::Queued | TaskState::Leased)
-            && match &r.kind {
-                TaskKind::NoteMutation { source_path, .. } => source_path == path,
-                _ => false,
+    /// Popup menu offering LLM-backed note mutations. Each pick builds a
+    /// `TaskKind::NoteMutation` task and submits it to the shared queue.
+    pub(super) fn mutations_menu(&mut self) {
+        let in_flight = self.mutation_in_flight();
+        let resp = self
+            .ui
+            .add_enabled(
+                !in_flight,
+                egui::Button::image(icons::ICONS.image(crate::icons::Icon::Wand)),
+            )
+            .on_hover_text(if in_flight {
+                "Mutation in flight — wait for the queued task to finish."
+            } else {
+                "Mutations"
+            });
+        let mut chosen: Option<&'static str> = None;
+        egui::Popup::menu(&resp).show(|ui| {
+            if ui.button("Reformat as markdown").clicked() {
+                chosen = Some("reformat-as-markdown");
+                ui.close();
             }
-    });
-    in_queue || app.session.pending_mutations.contains(path)
-}
+            if ui.button("Summarize").clicked() {
+                chosen = Some("summarize");
+                ui.close();
+            }
+            if ui.button("Auto-tag").clicked() {
+                chosen = Some("auto-tag");
+                ui.close();
+            }
+            if ui.button("Improve clarity").clicked() {
+                chosen = Some("improve-clarity");
+                ui.close();
+            }
+        });
+        if let Some(m) = chosen {
+            self.submit_mutation(m);
+        }
+    }
 
-fn submit_mutation(app: &mut AppState, path: &str, mutation: &str) {
-    use hiker_core::tasks::{Priority, Task, TaskKind, TaskPayload, TaskShape};
+    fn mutation_in_flight(&self) -> bool {
+        use hiker_core::tasks::types::{TaskKind, TaskState};
+        let app = &*self.app;
+        let path = self.path;
+        let in_queue = app.ui_cache.task_snapshot.iter().any(|r| {
+            matches!(r.state, TaskState::Queued | TaskState::Leased)
+                && match &r.kind {
+                    TaskKind::NoteMutation { source_path, .. } => source_path == path,
+                    _ => false,
+                }
+        });
+        in_queue || app.session.pending_mutations.contains(path)
+    }
+
+    fn submit_mutation(&mut self, mutation: &str) {
+    use hiker_core::tasks::types::{Priority, Task, TaskKind, TaskPayload, TaskShape};
+    let app = &mut *self.app;
+    let path = self.path;
 
     let Some(buffer) = app.session.buffers.get(path) else {
         return;
@@ -244,7 +268,7 @@ fn submit_mutation(app: &mut AppState, path: &str, mutation: &str) {
         _ => "Apply the requested mutation.",
     };
     let task = Task {
-        id: hiker_core::store::new_id(),
+        id: hiker_core::store::dto::new_id(),
         kind,
         priority: Priority::Normal,
         shape: TaskShape::Direct,
@@ -272,7 +296,7 @@ fn submit_mutation(app: &mut AppState, path: &str, mutation: &str) {
                 let h = queue.submit(task).await;
                 let outcome = h.await_outcome().await;
                 let tx = event_tx;
-                use hiker_core::tasks::TaskOutcome;
+                use hiker_core::tasks::types::TaskOutcome;
                 let ev = match outcome {
                     TaskOutcome::Completed { value, .. } => {
                         let content = match value {
@@ -306,4 +330,200 @@ fn submit_mutation(app: &mut AppState, path: &str, mutation: &str) {
         format!("Queued mutation '{mutation}' for {path}"),
         ToastLevel::Info,
     );
+    }
+
+    /// Version dropdown for the buffer status bar. Lists pending staging
+    /// proposals and changelog snapshots for the active path, and opens the
+    /// corresponding preview tab when the user picks one.
+    pub(super) fn version_dropdown(&mut self, label: &str) {
+    use crate::tab::{Tab, TabKind};
+    let ui = &mut *self.ui;
+    let app = &mut *self.app;
+    let path = self.path;
+    let resp = ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new(format!("v {label}"))
+                    .color(crate::theme::muted())
+                    .small(),
+            )
+            .small(),
+        )
+        .on_hover_text("Versions");
+    enum Pick {
+        Live,
+        Snapshot { change_id: String },
+        Proposal { id: String },
+    }
+    let mut pick: Option<Pick> = None;
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Versions of {label}"))
+                .small()
+                .strong(),
+        );
+        ui.separator();
+        if ui
+            .button(egui::RichText::new("* Live buffer (current)"))
+            .clicked()
+        {
+            pick = Some(Pick::Live);
+            ui.close();
+        }
+        // Pending staging proposals first — they're the most actionable
+        // versions and the user is most likely to be looking for them.
+        // Reads the per-frame cache populated in `refresh_staging_snapshot`.
+        let mine: Vec<_> = app
+            .ui_cache.staging_snapshot
+            .iter()
+            .filter(|p| p.target_path == path)
+            .cloned()
+            .collect();
+        if !mine.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Pending proposals")
+                    .small()
+                    .color(crate::theme::muted()),
+            );
+            for p in &mine {
+                let short = &p.id[..p.id.len().min(8)];
+                if ui
+                    .add(egui::Button::image_and_text(
+                        crate::icons::ICONS.image(crate::icons::Icon::Robot),
+                        egui::RichText::new(format!("{short} · {}", p.action)).small(),
+                    ))
+                    .clicked()
+                {
+                    pick = Some(Pick::Proposal { id: p.id.clone() });
+                    ui.close();
+                }
+            }
+        }
+        // Changelog entries.
+        let history = app
+            .vault_session.services.changes
+            .history_for_path(path, 20)
+            .ok()
+            .unwrap_or_default();
+        if !history.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Snapshots")
+                    .small()
+                    .color(crate::theme::muted()),
+            );
+            for row in &history {
+                let ts = VersionTimeFmt.hms(row.timestamp_ms);
+                let badge = if row.is_current { " · current" } else { "" };
+                if ui
+                    .button(
+                        egui::RichText::new(format!(
+                            "{ts}  {}{badge}",
+                            row.author,
+                        ))
+                        .small(),
+                    )
+                    .clicked()
+                {
+                    pick = Some(Pick::Snapshot { change_id: row.id.to_string() });
+                    ui.close();
+                }
+            }
+        }
+        if mine.is_empty() && history.is_empty() {
+            ui.label(
+                egui::RichText::new("(no prior versions)")
+                    .small()
+                    .italics()
+                    .color(crate::theme::muted()),
+            );
+        }
+    });
+    match pick {
+        Some(Pick::Live) => {}
+        Some(Pick::Proposal { id }) => {
+            let kind = TabKind::staging_preview(id.clone(), path.to_string());
+            let existing = app.session.tabs.iter().find(|t| {
+                matches!(
+                    &t.kind,
+                    TabKind::Editor {
+                        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                        ..
+                    } if *proposal_id == id
+                )
+            }).map(|t| t.id);
+            match existing {
+                Some(tab_id) => app.session.active_tab = Some(tab_id),
+                None => {
+                    let tab_id = app.next_tab_id();
+                    app.session.tabs.push(Tab { id: tab_id, kind, sticky: true });
+                    app.session.active_tab = Some(tab_id);
+                }
+            }
+        }
+        Some(Pick::Snapshot { change_id }) => {
+            let cid_for_find = change_id.clone();
+            let kind = TabKind::snapshot_preview(path.to_string(), change_id);
+            let existing = app.session.tabs.iter().find(|t| {
+                matches!(
+                    &t.kind,
+                    TabKind::Editor {
+                        buffer: crate::tab::BufferSource::Snapshot { change_id: cid, path: p },
+                        ..
+                    } if *cid == cid_for_find && p == path
+                )
+            }).map(|t| t.id);
+            match existing {
+                Some(tab_id) => app.session.active_tab = Some(tab_id),
+                None => {
+                    let tab_id = app.next_tab_id();
+                    app.session.tabs.push(Tab { id: tab_id, kind, sticky: true });
+                    app.session.active_tab = Some(tab_id);
+                }
+            }
+        }
+        None => {}
+    }
+    }
+}
+
+/// Zero-sized timestamp formatter for version-dropdown snapshot rows. A
+/// struct (rather than a free fn) so the single prod call site stays an
+/// inherent method.
+struct VersionTimeFmt;
+
+impl VersionTimeFmt {
+    /// `HH:MM:SS` from a unix-millisecond timestamp. Cheap and avoids
+    /// pulling chrono in for a single dropdown row label.
+    fn hms(&self, ms: i64) -> String {
+        let secs = ms / 1000;
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        let s = secs % 60;
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod version_time_fmt_tests {
+    use super::VersionTimeFmt;
+
+    #[test]
+    fn formats_zero() {
+        assert_eq!(VersionTimeFmt.hms(0), "00:00:00");
+    }
+
+    #[test]
+    fn formats_one_hour_one_minute_one_second() {
+        let ms = (3600 + 60 + 1) * 1000;
+        assert_eq!(VersionTimeFmt.hms(ms), "01:01:01");
+    }
+
+    #[test]
+    fn wraps_at_24_hours() {
+        // 25 hours → 01 hours displayed (mod 24)
+        let ms = 25 * 3600 * 1000;
+        assert_eq!(VersionTimeFmt.hms(ms), "01:00:00");
+    }
 }

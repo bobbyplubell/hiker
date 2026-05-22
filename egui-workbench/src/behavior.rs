@@ -1,23 +1,23 @@
-//! `WorkbenchBehavior` trait — host integration surface.
+//! `Host` trait — host integration surface.
 //!
 //! Every method has a sensible default; the only one a host must
-//! implement is [`WorkbenchBehavior::pane_ui`]. New methods on this
+//! implement is [`Host::pane_ui`]. New methods on this
 //! trait are backwards-compatible additions as long as they ship with
 //! default implementations.
 
 use std::hash::Hash;
 
-use crate::activity_bar::ActivityItem;
-use crate::tab::{DocumentTab, TabUiContext};
-use crate::theme::{TabStyle, WorkbenchTheme};
+use crate::activity_bar::Item;
+use crate::tab::{Document, UiContext};
+use crate::theme::{TabStyle, Palette};
 
 /// Host-implemented trait that supplies the workbench with rendering,
 /// state, and lifecycle hooks. See `DESIGN.md` for the full method set.
-pub trait WorkbenchBehavior<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static> {
+pub trait Host<Tab: Document, Mode: Clone + Eq + Hash + 'static> {
     // === Tab rendering ===
 
     /// Render the body of a tab in the given `Ui`. Required.
-    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab, ctx: TabUiContext<'_>);
+    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab, ctx: UiContext<'_>);
 
     /// Optional per-tab style override. Default returns `None` (inherit ambient theme).
     fn tab_style(&self, _tab: &Tab) -> Option<TabStyle> {
@@ -91,7 +91,7 @@ pub trait WorkbenchBehavior<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static>
 
     /// The activities to render, in order. Default is empty (hidden bar
     /// content, though the bar itself still draws).
-    fn activity_items(&self) -> Vec<ActivityItem<Mode>> {
+    fn activity_items(&self) -> Vec<Item<Mode>> {
         Vec::new()
     }
 
@@ -107,7 +107,7 @@ pub trait WorkbenchBehavior<Tab: DocumentTab, Mode: Clone + Eq + Hash + 'static>
 
     /// Per-workbench theme overrides. Default returns the ambient
     /// `egui::Style`-derived theme.
-    fn theme(&self, style: &egui::Style) -> WorkbenchTheme {
-        WorkbenchTheme::from_egui_style(style)
+    fn theme(&self, style: &egui::Style) -> Palette {
+        Palette::from_egui_style(style)
     }
 }

@@ -28,12 +28,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui;
+use hiker_core::cluster::build::result_to_node_inserts_pub;
+use hiker_core::cluster::build::stream::build_tree_structural_streaming;
 use hiker_core::cluster::{
-    build_tree_structural_streaming, result_to_node_inserts_pub, BuildEvent, BuildMethod,
-    BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree, ClusterAlgorithm, ClusterParams,
-    FolderDeriveParams, NoteInput, Phase, SummarizeMode,
+    BuildEvent, BuildMethod, BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree,
+    Algorithm, Params, FolderDeriveParams, NoteInput, Phase, SummarizeMode,
 };
-use hiker_core::trees::TreeInsert;
+use hiker_core::trees::types::TreeInsert;
 use tokio::sync::mpsc::Receiver;
 
 use crate::state::{AppState, ToastLevel};
@@ -166,41 +167,57 @@ pub struct StoredResult {
     pub note_titles: HashMap<String, String>,
 }
 
-/// Spawn or focus a cluster-review tab. The form lives on the tab kind
-/// (`config_json`); the result is in-memory only.
-pub fn open(app: &mut AppState, cfg: ReviewConfig) {
-    use crate::tab::{Tab, TabKind};
-    let cfg_json = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
-    if let Some(existing) = app.session.tabs.iter().find(|t| {
-        matches!(&t.kind, TabKind::ClusterReview { config_json } if config_json == &cfg_json)
-    }) {
-        app.session.active_tab = Some(existing.id);
-        return;
+impl ReviewConfig {
+    /// Spawn or focus a cluster-review tab. The form lives on the tab kind
+    /// (`config_json`); the result is in-memory only.
+    pub fn open(&self, app: &mut AppState) {
+        use crate::tab::{Tab, TabKind};
+        let cfg_json = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
+        if let Some(existing) = app.session.tabs.iter().find(|t| {
+            matches!(&t.kind, TabKind::ClusterReview { config_json } if config_json == &cfg_json)
+        }) {
+            app.session.active_tab = Some(existing.id);
+            return;
+        }
+        let id = app.next_tab_id();
+        app.session.tabs.push(Tab {
+            id,
+            kind: TabKind::ClusterReview { config_json: cfg_json },
+            sticky: true,
+        });
+        app.session.active_tab = Some(id);
     }
-    let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::ClusterReview { config_json: cfg_json },
-        sticky: true,
-    });
-    app.session.active_tab = Some(id);
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, config_json: &str) {
+    Review { app, tab_id }.show(ui, config_json);
+}
+
+/// Per-frame view context for a single open review tab. Bundles the
+/// mutable `AppState` borrow with the tab id so the render/action
+/// helpers can be `&mut self` methods on one receiver.
+struct Review<'a> {
+    app: &'a mut AppState,
+    tab_id: TabId,
+}
+
+impl Review<'_> {
+    fn show(&mut self, ui: &mut egui::Ui, config_json: &str) {
     let mut cfg: ReviewConfig =
         serde_json::from_str(config_json).unwrap_or_else(|_| ReviewConfig::default());
 
-    let trees = app.vault_session.services.trees.clone();
+    let trees = self.app.vault_session.services.trees.clone();
 
     // Drain any pending build events into the pane *before* we draw the
     // UI, so the first paint after Done shows the final tree without a
     // one-frame lag.
-    drain_events(ui, app, tab_id);
+    self.drain_events();
 
     ui.heading("Cluster review");
     ui.add_space(4.0);
 
-    let (pane_has_result, pane_running, pane_collapsed) = app
+    let tab_id = self.tab_id;
+    let (pane_has_result, pane_running, pane_collapsed) = self.app
         .panels.clusters
         .review_panes
         .get(&tab_id)
@@ -269,10 +286,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, config_json: &
         toggle_collapse = true;
     }
     if !pane_collapsed {
-        render_config_form(ui, app, &mut cfg);
+        self.render_config_form(ui, &mut cfg);
     } else {
+        let p = &self.app.panels.clusters.advanced_params;
+        let types = if cfg.source_types.trim().is_empty() {
+            "all".to_string()
+        } else {
+            cfg.source_types.clone()
+        };
+        let summary = format!(
+            "{} · types={types} · min_cs={} · include_outliers={}",
+            algo_label(cfg.algorithm),
+            p.min_cluster_size,
+            p.include_outliers,
+        );
         ui.label(
-            egui::RichText::new(one_line_summary(&cfg, &app.panels.clusters.advanced_params))
+            egui::RichText::new(summary)
                 .small()
                 .color(theme::muted()),
         );
@@ -281,43 +310,43 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, config_json: &
     // Progress row — visible only while a run is in flight.
     // status: cluster-review-tab-progress-row
     if pane_running {
-        render_progress_row(ui, app, tab_id);
+        self.render_progress_row(ui);
     }
 
     ui.separator();
 
     // Result panel — view toggle + body.
-    render_result_panel(ui, app, tab_id);
+    self.render_result_panel(ui);
 
     if toggle_collapse {
-        let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
+        let pane = self.app.panels.clusters.review_panes.entry(tab_id).or_default();
         pane.config_collapsed = !pane.config_collapsed;
     }
 
     // Re-serialize the (possibly mutated) cfg back onto the tab.
     if let Ok(new_json) = serde_json::to_string(&cfg)
-        && let Some(tab) = app.tab_by_id_mut(tab_id)
+        && let Some(tab) = self.app.tab_by_id_mut(tab_id)
     {
         tab.kind = crate::tab::TabKind::ClusterReview { config_json: new_json };
     }
 
     if want_run {
-        run_structural_streaming(ui.ctx(), app, tab_id, &cfg);
+        self.run_structural_streaming(ui.ctx(), &cfg);
     }
     if want_cancel {
-        cancel_run(app, tab_id);
+        self.cancel_run();
     }
     if want_confirm {
-        confirm(app, tab_id, &cfg, &trees, cfg.name_with_llm_after_confirm);
+        self.confirm(&cfg, &trees, cfg.name_with_llm_after_confirm);
     }
     if want_discard {
-        discard(app, tab_id);
+        self.discard();
     }
 
     // Keep the frame loop ticking while the background build is alive so
     // streamed events surface promptly even if the user isn't moving the
     // mouse.
-    if app
+    if self.app
         .panels.clusters
         .review_panes
         .get(&tab_id)
@@ -326,13 +355,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, config_json: &
     {
         ui.ctx().request_repaint();
     }
-}
+    }
 
 /// Render the expanded Configuration form (name / extensions / naming
 /// toggle / algorithm dropdown / tunables / include-outliers).
 /// Extracted from `show` to keep that function under clippy's per-fn
 /// line budget.
-fn render_config_form(ui: &mut egui::Ui, app: &mut AppState, cfg: &mut ReviewConfig) {
+fn render_config_form(&mut self, ui: &mut egui::Ui, cfg: &mut ReviewConfig) {
+    let app = &mut *self.app;
     let llm_enabled = app
         .vault_session.config
         .read()
@@ -466,8 +496,9 @@ fn render_config_form(ui: &mut egui::Ui, app: &mut AppState, cfg: &mut ReviewCon
                 });
         });
 }
+}
 
-fn algo_label(a: ReviewAlgorithm) -> &'static str {
+const fn algo_label(a: ReviewAlgorithm) -> &'static str {
     match a {
         ReviewAlgorithm::Hdbscan => "HDBSCAN",
         ReviewAlgorithm::Leiden => "Leiden",
@@ -475,27 +506,6 @@ fn algo_label(a: ReviewAlgorithm) -> &'static str {
         ReviewAlgorithm::Gmm => "GMM (falls back to HDBSCAN)",
         ReviewAlgorithm::FromFolders => "From folders",
     }
-}
-
-fn phase_label(phase: &Phase) -> String {
-    match phase {
-        Phase::LoadingEmbeddings => "loading embeddings".to_string(),
-        Phase::PartitioningLevel(n) => format!("partitioning level {n}"),
-        Phase::Finalizing => "finalizing".to_string(),
-    }
-}
-
-fn one_line_summary(cfg: &ReviewConfig, p: &crate::state::AdvancedClusterParams) -> String {
-    let algo = algo_label(cfg.algorithm);
-    let types = if cfg.source_types.trim().is_empty() {
-        "all".to_string()
-    } else {
-        cfg.source_types.clone()
-    };
-    format!(
-        "{algo} · types={types} · min_cs={} · include_outliers={}",
-        p.min_cluster_size, p.include_outliers,
-    )
 }
 
 // ── Async event drain ────────────────────────────────────────────────
@@ -506,7 +516,10 @@ fn one_line_summary(cfg: &ReviewConfig, p: &crate::state::AdvancedClusterParams)
 // Drain everything sitting in the pane's `Receiver<BuildEvent>` into the
 // pane's state. Called once per `show()` invocation, before any UI draws,
 // so the first paint after a `Done` shows the final tree immediately.
-fn drain_events(_ui: &egui::Ui, app: &mut AppState, tab_id: TabId) {
+impl Review<'_> {
+fn drain_events(&mut self) {
+    let app = &mut *self.app;
+    let tab_id = self.tab_id;
     // Lift the receiver out of the pane briefly to avoid holding a
     // mutable borrow of `review_panes` while we apply updates back.
     let rx = match app.panels.clusters.review_panes.get_mut(&tab_id) {
@@ -543,11 +556,28 @@ fn drain_events(_ui: &egui::Ui, app: &mut AppState, tab_id: TabId) {
                     outliers,
                 };
             }
-            BuildEvent::ClusterDiscovered { node, parent } => {
-                live_attach(pane, node, parent);
+            BuildEvent::ClusterDiscovered { mut node, parent } => {
+                // Stitch a freshly-discovered cluster into the live-reveal
+                // cache. `parent = None` → top-level cluster; `Some(pid)` →
+                // buffer under `live_pending_children[pid]` (the backend
+                // emits child-first, so the parent hasn't been seen yet, but
+                // the buffer is keyed by parent id so order doesn't matter).
+                //
+                // Any already-buffered children of *this* node are attached
+                // implicitly via their own `live_pending_children` entries.
+                pane.live_pending_children.remove(&node.id);
+                match parent {
+                    None => {
+                        pane.live_top.push(node);
+                    }
+                    Some(pid) => {
+                        node.members.shrink_to_fit();
+                        pane.live_pending_children.entry(pid).or_default().push(node);
+                    }
+                }
             }
             BuildEvent::Done { tree } => {
-                let leaf_count = tree.levels.first().map(|l| l.len()).unwrap_or(0);
+                let leaf_count = tree.levels.first().map(std::vec::Vec::len).unwrap_or(0);
                 let outlier_count = tree.outliers.len();
                 // BuildResult needs scope + method; reconstruct cheap
                 // ones — they're only used downstream during persist
@@ -556,7 +586,7 @@ fn drain_events(_ui: &egui::Ui, app: &mut AppState, tab_id: TabId) {
                     build: BuildResult {
                         scope: BuildScope::Vault { source_types: Vec::new() },
                         method: BuildMethod::Cluster {
-                            params: ClusterParams::default(),
+                            params: Params::default(),
                         },
                         tree,
                     },
@@ -595,58 +625,25 @@ fn drain_events(_ui: &egui::Ui, app: &mut AppState, tab_id: TabId) {
         app.push_toast(msg, level);
     }
 }
-
-/// Stitch a freshly-discovered cluster into the live-reveal cache.
-/// `parent = None` → top-level cluster. `parent = Some(pid)` → if `pid`
-/// is already in the live cache attach directly, otherwise buffer under
-/// `live_pending_children[pid]` (the backend emits child-first, so we
-/// expect to attach pending children at the moment the parent arrives).
-fn live_attach(
-    pane: &mut ReviewPane,
-    mut node: BuiltClusterNode,
-    parent: Option<String>,
-) {
-    // If we have pending children for *this* node, attach them as its
-    // members. The backend emits clusters child-first, so by the time
-    // this branch lands its leaf descendants have already been buffered.
-    if let Some(children) = pane.live_pending_children.remove(&node.id) {
-        // For a branch cluster `node.members` is a list of *child cluster
-        // ids* — already correct from the backend. We don't reorder; we
-        // only ensure those children are addressable when the user
-        // expands the row.
-        let _ = children; // children are attached implicitly via their
-                          // own `live_pending_children` entries keyed by
-                          // their own id (we still keep their full
-                          // BuiltClusterNode handy for lookup below).
-    }
-    match parent {
-        None => {
-            pane.live_top.push(node);
-        }
-        Some(pid) => {
-            // Stash in pending-children so the expansion renderer can
-            // find this child when its parent is expanded — regardless
-            // of whether the parent has been seen yet (child-first
-            // ordering means it hasn't, but the buffer is keyed by
-            // parent id so order doesn't matter for correctness).
-            // Strip the children's own members list noise: we keep the
-            // node intact.
-            node.members.shrink_to_fit();
-            pane.live_pending_children.entry(pid).or_default().push(node);
-        }
-    }
 }
 
 // ── Progress row ─────────────────────────────────────────────────────
 
-fn render_progress_row(ui: &mut egui::Ui, app: &AppState, tab_id: TabId) {
+impl Review<'_> {
+fn render_progress_row(&self, ui: &mut egui::Ui) {
+    let app = &*self.app;
+    let tab_id = self.tab_id;
     let Some(pane) = app.panels.clusters.review_panes.get(&tab_id) else {
         return;
     };
     let phase_text = pane
         .phase
         .as_ref()
-        .map(phase_label)
+        .map(|phase| match phase {
+            Phase::LoadingEmbeddings => "loading embeddings".to_string(),
+            Phase::PartitioningLevel(n) => format!("partitioning level {n}"),
+            Phase::Finalizing => "finalizing".to_string(),
+        })
         .unwrap_or_else(|| "starting…".to_string());
     let elapsed = pane
         .started_at
@@ -675,13 +672,16 @@ fn render_progress_row(ui: &mut egui::Ui, app: &AppState, tab_id: TabId) {
         });
     ui.add_space(4.0);
 }
+}
 
 // ── Result panel ─────────────────────────────────────────────────────
 
-fn render_result_panel(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+impl Review<'_> {
+fn render_result_panel(&mut self, ui: &mut egui::Ui) {
+    let tab_id = self.tab_id;
     // View toggle row.
     // status: cluster-review-tab-result-view-toggle
-    let current_view = app
+    let current_view = self.app
         .panels.clusters
         .review_panes
         .get(&tab_id)
@@ -694,35 +694,39 @@ fn render_result_panel(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
         ui.selectable_value(&mut next_view, ResultView::Graph, "Graph");
     });
     if next_view != current_view
-        && let Some(pane) = app.panels.clusters.review_panes.get_mut(&tab_id)
+        && let Some(pane) = self.app.panels.clusters.review_panes.get_mut(&tab_id)
     {
         pane.view = next_view;
     }
 
-    let Some(pane) = app.panels.clusters.review_panes.get(&tab_id) else {
-        ui.label(
-            egui::RichText::new("Click \"Run clustering\" to build a structural preview.")
-                .color(theme::muted()),
-        );
-        return;
-    };
-    let has_result = pane.result.is_some();
-    let has_live = !pane.live_top.is_empty();
-    if !pane.running && !has_result && !has_live {
-        ui.label(
-            egui::RichText::new("No result yet. Click \"Run clustering\" to build one.")
-                .color(theme::muted()),
-        );
-        return;
+    {
+        let Some(pane) = self.app.panels.clusters.review_panes.get(&tab_id) else {
+            ui.label(
+                egui::RichText::new("Click \"Run clustering\" to build a structural preview.")
+                    .color(theme::muted()),
+            );
+            return;
+        };
+        let has_result = pane.result.is_some();
+        let has_live = !pane.live_top.is_empty();
+        if !pane.running && !has_result && !has_live {
+            ui.label(
+                egui::RichText::new("No result yet. Click \"Run clustering\" to build one.")
+                    .color(theme::muted()),
+            );
+            return;
+        }
     }
 
     match next_view {
-        ResultView::Tree => render_tree_view(ui, app, tab_id),
-        ResultView::Graph => render_graph_view(ui, app, tab_id),
+        ResultView::Tree => self.render_tree_view(ui),
+        ResultView::Graph => self.render_graph_view(ui),
     }
 }
 
-fn render_tree_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+fn render_tree_view(&mut self, ui: &mut egui::Ui) {
+    let tab_id = self.tab_id;
+    let app = &mut *self.app;
     // Snapshot the data we need so we can pass `app` mutably into the
     // row renderer for `expanded`/`user_renamed`/`editing` mutations.
     let (final_leaf, final_outliers, live_top, live_children, titles, has_done) = {
@@ -785,7 +789,35 @@ fn render_tree_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
                     render_cluster_row(ui, app, tab_id, c, &titles, &HashMap::new(), 0);
                 }
                 if !final_outliers.is_empty() {
-                    render_outliers_row(ui, &final_outliers, &titles);
+                    ui.horizontal(|ui| {
+                        ui.label("[~]");
+                        ui.label("Outliers");
+                        ui.label(
+                            egui::RichText::new(format!("({})", final_outliers.len()))
+                                .small()
+                                .color(theme::muted()),
+                        );
+                    });
+                    for m in final_outliers.iter().take(8) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "  • {}",
+                                titles.get(m).cloned().unwrap_or_else(|| m.clone())
+                            ))
+                            .small()
+                            .color(theme::muted()),
+                        );
+                    }
+                    if final_outliers.len() > 8 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "  … and {} more",
+                                final_outliers.len() - 8
+                            ))
+                            .small()
+                            .color(theme::muted()),
+                        );
+                    }
                 }
             } else {
                 for c in &live_top {
@@ -793,6 +825,7 @@ fn render_tree_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
                 }
             }
         });
+}
 }
 
 /// Render one cluster row with chevron-expand + inline-rename. Recurses
@@ -831,9 +864,9 @@ fn render_cluster_row(
             ui.add_space(12.0);
         }
         let chevron = if expanded {
-            crate::icons::chevron_down()
+            crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
         } else {
-            crate::icons::chevron_right()
+            crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
         };
         if ui
             .add(egui::ImageButton::new(chevron).frame(false))
@@ -949,39 +982,6 @@ fn render_cluster_row(
     ui.add_space(2.0);
 }
 
-fn render_outliers_row(
-    ui: &mut egui::Ui,
-    outliers: &[String],
-    titles: &HashMap<String, String>,
-) {
-    ui.horizontal(|ui| {
-        ui.label("[~]");
-        ui.label("Outliers");
-        ui.label(
-            egui::RichText::new(format!("({})", outliers.len()))
-                .small()
-                .color(theme::muted()),
-        );
-    });
-    for m in outliers.iter().take(8) {
-        ui.label(
-            egui::RichText::new(format!(
-                "  • {}",
-                titles.get(m).cloned().unwrap_or_else(|| m.clone())
-            ))
-            .small()
-            .color(theme::muted()),
-        );
-    }
-    if outliers.len() > 8 {
-        ui.label(
-            egui::RichText::new(format!("  … and {} more", outliers.len() - 8))
-                .small()
-                .color(theme::muted()),
-        );
-    }
-}
-
 /// Graph view of the in-memory `BuiltClusterTree`.
 ///
 /// Adapter choice: shape (a) from the brief — synthesize a
@@ -1005,7 +1005,10 @@ fn render_outliers_row(
 /// walk, not necessarily a `read_store`-addressable id.
 ///
 /// status: cluster-review-tab-result-graph-view
-fn render_graph_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+impl Review<'_> {
+fn render_graph_view(&mut self, ui: &mut egui::Ui) {
+    let tab_id = self.tab_id;
+    let app = &mut *self.app;
     let (built, live_top, live_children, has_done) = {
         let Some(pane) = app.panels.clusters.review_panes.get(&tab_id) else {
             ui.label(
@@ -1040,9 +1043,9 @@ fn render_graph_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
 
     let nodes = if has_done {
         let tree = built.expect("has_done implies stored result");
-        graph::built_tree_to_editable_nodes(&tree, &user_renamed)
+        graph::Adapter.built_tree_to_editable_nodes(&tree, &user_renamed)
     } else {
-        graph::live_to_editable_nodes(&live_top, &live_children, &user_renamed)
+        graph::Adapter.live_to_editable_nodes(&live_top, &live_children, &user_renamed)
     };
 
     if nodes.is_empty() {
@@ -1062,9 +1065,11 @@ fn render_graph_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
         /*clickable_leaves=*/ false,
     );
 }
+}
 
 // ── Run / Cancel ─────────────────────────────────────────────────────
 
+impl Review<'_> {
 /// Kick off an async structural pass. Spawns the streaming build on a
 /// `spawn_blocking` worker (inside the runtime entered by the egui
 /// frame) and stashes the `Receiver<BuildEvent>` + cancel atomic on the
@@ -1072,11 +1077,12 @@ fn render_graph_view(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
 ///
 /// status: cluster-review-tab-async-pass
 fn run_structural_streaming(
+    &mut self,
     ctx: &egui::Context,
-    app: &mut AppState,
-    tab_id: TabId,
     cfg: &ReviewConfig,
 ) {
+    let tab_id = self.tab_id;
+    let app = &mut *self.app;
     {
         let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
         if pane.running {
@@ -1154,13 +1160,6 @@ fn run_structural_streaming(
 
     // Translate the form into core types.
     let p = app.panels.clusters.advanced_params.clone();
-    let source_types: Vec<String> = cfg
-        .source_types
-        .split(',')
-        .map(|s| s.trim().trim_start_matches('.').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let scope = BuildScope::Vault { source_types };
     let method = match cfg.algorithm {
         ReviewAlgorithm::FromFolders => BuildMethod::FromFolders {
             params: FolderDeriveParams {
@@ -1171,10 +1170,10 @@ fn run_structural_streaming(
         },
         _ => {
             let algorithm = match cfg.algorithm {
-                ReviewAlgorithm::Hdbscan => ClusterAlgorithm::Hdbscan,
-                ReviewAlgorithm::Leiden => ClusterAlgorithm::Leiden,
-                ReviewAlgorithm::Hybrid => ClusterAlgorithm::Hybrid,
-                ReviewAlgorithm::Gmm => ClusterAlgorithm::Gmm,
+                ReviewAlgorithm::Hdbscan => Algorithm::Hdbscan,
+                ReviewAlgorithm::Leiden => Algorithm::Leiden,
+                ReviewAlgorithm::Hybrid => Algorithm::Hybrid,
+                ReviewAlgorithm::Gmm => Algorithm::Gmm,
                 ReviewAlgorithm::FromFolders => unreachable!(),
             };
             let leiden = hiker_core::cluster::LeidenParams {
@@ -1185,7 +1184,7 @@ fn run_structural_streaming(
                 min_cluster_size: p.min_cluster_size as u32,
                 ..hiker_core::cluster::LeidenParams::default()
             };
-            let params = ClusterParams {
+            let params = Params {
                 min_cluster_size: p.min_cluster_size as u32,
                 min_samples: Some(p.min_samples as u32),
                 algorithm,
@@ -1194,7 +1193,7 @@ fn run_structural_streaming(
                 summary_confidence_threshold: p.summary_confidence_threshold,
                 include_outliers: p.include_outliers,
                 disable_recursion: p.disable_recursion,
-                ..ClusterParams::default()
+                ..Params::default()
             };
             BuildMethod::Cluster { params }
         }
@@ -1205,7 +1204,7 @@ fn run_structural_streaming(
     // `Handle::current` is live here.
     let cancel = Arc::new(AtomicBool::new(false));
     let (_handle, rx) =
-        build_tree_structural_streaming(scope, method, notes, cancel.clone());
+        build_tree_structural_streaming(method, notes, cancel.clone());
 
     let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
     pane.running = true;
@@ -1237,8 +1236,8 @@ fn run_structural_streaming(
 /// applied in `drain_events`.
 ///
 /// status: cluster-review-tab-cancel-pass
-fn cancel_run(app: &mut AppState, tab_id: TabId) {
-    let Some(pane) = app.panels.clusters.review_panes.get(&tab_id) else {
+fn cancel_run(&mut self) {
+    let Some(pane) = self.app.panels.clusters.review_panes.get(&self.tab_id) else {
         return;
     };
     if let Some(c) = pane.cancel.as_ref() {
@@ -1258,27 +1257,27 @@ fn cancel_run(app: &mut AppState, tab_id: TabId) {
 /// status: cluster-review-tab-confirm-with-naming-toggle
 /// status: cluster-review-tab-transition-to-pane
 fn confirm(
-    app: &mut AppState,
-    tab_id: TabId,
+    &mut self,
     cfg: &ReviewConfig,
-    trees: &Arc<hiker_core::trees::Trees>,
+    trees: &Arc<hiker_core::trees::types::Db>,
     submit_naming: bool,
 ) {
-    let Some(pane) = app.panels.clusters.review_panes.get(&tab_id) else {
-        app.push_toast("No clustering result to confirm", ToastLevel::Warn);
+    let tab_id = self.tab_id;
+    let Some(pane) = self.app.panels.clusters.review_panes.get(&tab_id) else {
+        self.app.push_toast("No clustering result to confirm", ToastLevel::Warn);
         return;
     };
     if pane.confirming {
         return;
     }
     let Some(stored) = pane.result.as_ref() else {
-        app.push_toast("No clustering result to confirm", ToastLevel::Warn);
+        self.app.push_toast("No clustering result to confirm", ToastLevel::Warn);
         return;
     };
     let renamed = pane.user_renamed.clone();
     let build = stored.build.clone();
 
-    let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
+    let pane = self.app.panels.clusters.review_panes.entry(tab_id).or_default();
     pane.confirming = true;
 
     let name = if cfg.tree_name.trim().is_empty() {
@@ -1313,9 +1312,9 @@ fn confirm(
     }) {
         Ok(tid) => tid,
         Err(err) => {
-            let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
+            let pane = self.app.panels.clusters.review_panes.entry(tab_id).or_default();
             pane.confirming = false;
-            app.push_toast(format!("insert_tree: {err}"), ToastLevel::Error);
+            self.app.push_toast(format!("insert_tree: {err}"), ToastLevel::Error);
             return;
         }
     };
@@ -1329,24 +1328,24 @@ fn confirm(
         }
     }
     if let Err(err) = trees.insert_nodes(&tree_id, &inserts) {
-        let pane = app.panels.clusters.review_panes.entry(tab_id).or_default();
+        let pane = self.app.panels.clusters.review_panes.entry(tab_id).or_default();
         pane.confirming = false;
         let _ = trees.delete_tree(&tree_id);
-        app.push_toast(format!("insert_nodes: {err}"), ToastLevel::Error);
+        self.app.push_toast(format!("insert_nodes: {err}"), ToastLevel::Error);
         return;
     }
-    app.panels.clusters.selected_tree = Some(tree_id.clone());
-    app.panels.clusters.loaded = false;
-    app.panels.clusters.dirty = true;
+    self.app.panels.clusters.selected_tree = Some(tree_id.clone());
+    self.app.panels.clusters.loaded = false;
+    self.app.panels.clusters.dirty = true;
 
     // Drop pane state + close tab — user lands on the cluster sidebar
     // (the egui port doesn't have a separate cluster-pane tab kind yet).
-    app.panels.clusters.review_panes.remove(&tab_id);
-    let tabs_pos = app.session.tabs.iter().position(|t| t.id == tab_id);
+    self.app.panels.clusters.review_panes.remove(&tab_id);
+    let tabs_pos = self.app.session.tabs.iter().position(|t| t.id == tab_id);
     if let Some(pos) = tabs_pos {
-        app.session.tabs.remove(pos);
-        if app.session.active_tab == Some(tab_id) {
-            app.session.active_tab = app.session.tabs.last().map(|t| t.id);
+        self.app.session.tabs.remove(pos);
+        if self.app.session.active_tab == Some(tab_id) {
+            self.app.session.active_tab = self.app.session.tabs.last().map(|t| t.id);
         }
     }
 
@@ -1365,15 +1364,15 @@ fn confirm(
         // the (optional) synthesized root last. We re-list from the
         // freshly persisted tree to pick up that natural order without
         // recomputing it.
-        let submitted = submit_naming_tasks(app, trees, &tree_id);
-        app.push_toast(
+        let submitted = self.submit_naming_tasks(trees, &tree_id);
+        self.app.push_toast(
             format!(
                 "Tree persisted — {name}. Queued {submitted} naming task(s)."
             ),
             ToastLevel::Info,
         );
     } else {
-        app.push_toast(
+        self.app.push_toast(
             format!(
                 "Tree persisted with placeholder names — {name}. Use \
                  'Regenerate names' on the cluster pane to LLM-name later."
@@ -1401,19 +1400,19 @@ fn confirm(
 ///
 /// status: cluster-review-tab-confirm-with-naming-toggle
 fn submit_naming_tasks(
-    app: &mut AppState,
-    trees: &Arc<hiker_core::trees::Trees>,
+    &mut self,
+    trees: &Arc<hiker_core::trees::types::Db>,
     tree_id: &str,
 ) -> usize {
-    use hiker_core::tasks::{Priority, Task, TaskKind, TaskPayload, TaskShape};
-    use hiker_core::trees::NodeKind;
+    use hiker_core::tasks::types::{Priority, Task, TaskKind, TaskPayload, TaskShape};
+    use hiker_core::trees::types::NodeKind;
 
-    let queue = app.vault_session.services.tasks.clone();
+    let queue = self.app.vault_session.services.tasks.clone();
 
     let nodes = match trees.list_nodes(tree_id) {
         Ok(ns) => ns,
         Err(err) => {
-            app.push_toast(
+            self.app.push_toast(
                 format!("list_nodes for naming submit: {err}"),
                 ToastLevel::Error,
             );
@@ -1442,7 +1441,7 @@ fn submit_naming_tasks(
     handle.spawn(async move {
         for cluster_node_id in candidates {
             let task = Task {
-                id: hiker_core::store::new_id(),
+                id: hiker_core::store::dto::new_id(),
                 kind: TaskKind::RaptorSummarize {
                     tree_id: tree_id_owned.clone(),
                     cluster_node_id: cluster_node_id.clone(),
@@ -1464,7 +1463,9 @@ fn submit_naming_tasks(
     n
 }
 
-fn discard(app: &mut AppState, tab_id: TabId) {
+fn discard(&mut self) {
+    let tab_id = self.tab_id;
+    let app = &mut *self.app;
     // Best-effort cancel of any in-flight build before tearing the pane
     // down, so the background task wakes up to a dead receiver and
     // exits promptly.
@@ -1481,5 +1482,6 @@ fn discard(app: &mut AppState, tab_id: TabId) {
             app.session.active_tab = app.session.tabs.last().map(|t| t.id);
         }
     }
+}
 }
 

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use hiker_core::embed::{Embedder, MockEmbedder};
-use hiker_core::indexer::{IndexJob, start_indexer};
+use hiker_core::indexer::{IndexJob, start};
 use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 
@@ -42,7 +42,19 @@ async fn main() -> Result<()> {
 
     // Use a temp dir for the index DB so we always start clean and
     // never pollute the vault. The vault is read-only from our POV.
-    let db_dir = tempdir()?;
+    // Hand-rolled `TempDir` here — pulls no extra crate dep into the
+    // workspace for one binary.
+    let db_dir = {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = base.join(format!("profile-indexer-{pid}-{nanos}"));
+        std::fs::create_dir_all(&path).context("mkdir profile tempdir")?;
+        TempDir { path }
+    };
     let store = Store::open(db_dir.path())
         .context("open store in temp dir")?;
     let vault = Vault::open(vault_root.clone())?;
@@ -52,7 +64,7 @@ async fn main() -> Result<()> {
     let _profiler = dhat::Profiler::new_heap();
     let scan_start = Instant::now();
 
-    let handle = start_indexer(vault, store, || {
+    let handle = start(vault, store, || {
         Ok(Arc::new(MockEmbedder::new("profile-mock")) as Arc<dyn Embedder>)
     });
 
@@ -95,20 +107,6 @@ async fn main() -> Result<()> {
     handle.shutdown().await;
     // `_profiler` drops here → writes dhat-heap.json.
     Ok(())
-}
-
-/// Minimal tempdir without pulling in the `tempfile` crate as a build
-/// dependency of the whole workspace just for one binary.
-fn tempdir() -> Result<TempDir> {
-    let base = std::env::temp_dir();
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = base.join(format!("profile-indexer-{pid}-{nanos}"));
-    std::fs::create_dir_all(&path).context("mkdir profile tempdir")?;
-    Ok(TempDir { path })
 }
 
 struct TempDir {

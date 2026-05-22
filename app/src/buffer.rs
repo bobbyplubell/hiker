@@ -1,6 +1,6 @@
 //! In-memory buffer state mirroring `ui/src/app/state.ts::Buffer`.
 //!
-//! Per-buffer ownership of the editor's `EditorState` + `ViewState` plus
+//! Per-buffer ownership of the editor's `Editor` + `ViewState` plus
 //! the per-document interaction state (fold set, click action sink).
 //! Keyed by vault-relative path. Switching tabs to a different buffer
 //! just renders that buffer's editor state in the central pane.
@@ -12,14 +12,25 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use editor_core::{DecorationSet, EditorState};
-use editor_egui::PaintCache;
-use editor_md::MarkdownIndent;
-use editor_view::view::ViewState;
-use editor_view::ClickAction;
+use editor_core::decoration::Set;
+use editor_core::state::Editor;
+use editor_egui::widget::PaintCache;
+use editor_md::indenter::MarkdownIndent;
+use editor_view::viewport::ViewState;
+use editor_view::viewport::ClickAction;
 
 pub struct Buffer {
-    /// Vault-relative path. Doubles as the key in `AppState::buffers`.
+    /// What this buffer is sourcing — vault file, snapshot blob, staging
+    /// proposal content, or trash entry. Drives the toolbar's per-source
+    /// verb bar (Save vs. Restore vs. Accept/Reject vs. nothing) and the
+    /// read-only flag in `view`. For Vault sources, the path here matches
+    /// the key in `AppState::buffers`; for the others the storage key is
+    /// composite (see `buffer_key_for_source`).
+    pub source: crate::tab::BufferSource,
+    /// Vault-relative path. Doubles as the key in `AppState::buffers`
+    /// for vault sources; for non-vault sources, the path identifies the
+    /// underlying note (e.g. the original path of a trashed file, the
+    /// target path of a staging proposal, the path the snapshot is *of*).
     pub path: String,
     /// Hash of the contents most recently read from / written to disk.
     pub loaded_hash: String,
@@ -29,10 +40,10 @@ pub struct Buffer {
     /// frame. Refreshed in lockstep with `loaded_hash`.
     pub loaded_text: String,
     /// Editor document + selection + history + decoration state.
-    pub editor: EditorState,
+    pub editor: Editor,
     /// Editor viewport + layout cache.
     pub view: ViewState,
-    /// Per-buffer galley cache reused across frames by `EditorWidget`.
+    /// Per-buffer galley cache reused across frames by `Widget`.
     /// Lives on the buffer (rather than inside `ViewState` as it used to)
     /// so the editor-view crate stays free of egui types.
     pub paint_cache: PaintCache,
@@ -115,13 +126,20 @@ pub struct Buffer {
     /// hunk's byte range back to the proposal(s) that contributed to it.
     /// One proposal can produce multiple entries when `replace_all=true`.
     pub hydration_footprints: Vec<(String, std::ops::Range<usize>)>,
+    /// Hash of `editor.doc` right after the last hydration pass. Lets the
+    /// per-frame re-hydration check tell "the user has typed since
+    /// hydration" (current hash drifted) apart from "staging changed
+    /// underneath us" (current hash still matches but pending proposal
+    /// IDs differ). Re-hydration is skipped in the former case so we
+    /// never clobber user edits.
+    pub post_hydration_hash: Option<String>,
 }
 
 /// Slot for one cached decoration provider output.
 #[derive(Clone, Default)]
 pub struct CachedDeco {
     pub fingerprint: u64,
-    pub result: DecorationSet,
+    pub result: Set,
 }
 
 /// Cache for paint-only decoration providers that walk the whole document
@@ -129,7 +147,7 @@ pub struct CachedDeco {
 /// when none of their inputs changed.
 ///
 /// Each slot is keyed by a u64 fingerprint of (doc.content_id, selection,
-/// viewport, folds, theme). On a hit the cached `DecorationSet` is cloned
+/// viewport, folds, theme). On a hit the cached `Set` is cloned
 /// (cheap — Arc-shared SumTree); on a miss the slot is recomputed via the
 /// caller-supplied closure.
 #[derive(Default)]
@@ -153,13 +171,13 @@ pub struct DecorationCache {
 }
 
 impl DecorationCache {
-    /// Either reuse the cached `DecorationSet` (when `fingerprint` matches)
+    /// Either reuse the cached `Set` (when `fingerprint` matches)
     /// or compute a fresh one via `compute` and store it.
-    pub fn get_or_compute<F: FnOnce() -> DecorationSet>(
+    pub fn get_or_compute<F: FnOnce() -> Set>(
         slot: &mut Option<CachedDeco>,
         fingerprint: u64,
         compute: F,
-    ) -> DecorationSet {
+    ) -> Set {
         if let Some(cached) = slot.as_ref()
             && cached.fingerprint == fingerprint
         {
@@ -171,34 +189,39 @@ impl DecorationCache {
     }
 }
 
+/// Stable storage key for a `BufferSource`. Vault sources key on path
+/// (unprefixed, to match every existing `app.session.buffers.get(path)`
+/// site); the read-only preview sources prefix to avoid colliding with a
+/// vault file whose name happens to look like an id.
+pub fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String {
+    use crate::tab::BufferSource;
+    match source {
+        BufferSource::Vault { path } => path.clone(),
+        BufferSource::Snapshot { change_id, path } => {
+            format!("\0snapshot:{}:{}", change_id, path)
+        }
+        BufferSource::StagingProposal { proposal_id, .. } => {
+            format!("\0staging:{}", proposal_id)
+        }
+        BufferSource::Trash { trash_path, .. } => {
+            format!("\0trash:{}", trash_path)
+        }
+    }
+}
+
 impl Buffer {
-    pub fn from_disk(path: String, contents: String, loaded_hash: String) -> Self {
-        Self::with_config(path, contents, loaded_hash, None)
-    }
-
-    /// Build a `Buffer`, initializing the view toggles from `cfg` when one
-    /// is supplied. Falls back to the same defaults `from_disk` used.
-    pub fn with_config(
-        path: String,
-        contents: String,
-        loaded_hash: String,
-        cfg: Option<&hiker_core::config::Config>,
-    ) -> Self {
-        Self::with_config_and_vault(path, contents, loaded_hash, cfg, None)
-    }
-
     /// Build a `Buffer` and, when `vault` is supplied, register editor
     /// completion sources (currently the wikilink autocomplete) so `[[`
     /// inside the editor opens the vault-path picker.
     pub fn with_config_and_vault(
         path: String,
-        contents: String,
+        contents: &str,
         loaded_hash: String,
         cfg: Option<&hiker_core::config::Config>,
         vault: Option<Arc<hiker_core::vault::Vault>>,
     ) -> Self {
-        let loaded_text = contents.clone();
-        let editor = EditorState::new(&contents);
+        let loaded_text = contents.to_string();
+        let editor = Editor::new(contents);
         let (wrap, show_ln, show_ws, highlight_trailing_ws, hide_fm) = match cfg {
             Some(c) => (
                 c.editor.word_wrap,
@@ -234,7 +257,7 @@ impl Buffer {
         };
         view.wrap_map.set_enabled(wrap);
         view.hide_gutter = !show_ln;
-        // Wikilink autocomplete: register a CompletionSource so typing `[[`
+        // Wikilink autocomplete: register a Source so typing `[[`
         // opens a vault-path picker. Only attached when a vault handle is
         // available (always true in normal app flow; preview buffers may
         // pass None to keep the source out of the read-only view).
@@ -244,6 +267,7 @@ impl Buffer {
             ));
         }
         Self {
+            source: crate::tab::BufferSource::Vault { path: path.clone() },
             path,
             loaded_hash,
             loaded_text,
@@ -274,6 +298,7 @@ impl Buffer {
             agent_base: None,
             hydrated_proposals: Vec::new(),
             hydration_footprints: Vec::new(),
+            post_hydration_hash: None,
         }
     }
 
@@ -290,7 +315,7 @@ impl Buffer {
         &mut self,
         staging: &hiker_core::staging::Staging,
     ) {
-        let filter = hiker_core::staging::StagingFilter {
+        let filter = hiker_core::staging::types::Filter {
             path: Some(self.path.clone()),
             ..Default::default()
         };
@@ -308,7 +333,7 @@ impl Buffer {
                 continue;
             }
             let Some(edit) = p.edit.as_ref() else { continue };
-            let matches = find_all(&running, &edit.old_str);
+            let matches = self.find_all(&running, &edit.old_str);
             if matches.is_empty()
                 || (matches.len() > 1 && !edit.replace_all)
             {
@@ -350,29 +375,26 @@ impl Buffer {
             applied.push(p.id.clone());
         }
 
-        if !applied.is_empty() {
+        // Always reseat hydration state — callers ensure this is only
+        // called when `editor.doc` matches the previously-recorded
+        // post-hydration text (or it's the first hydration pass right
+        // after a disk read), so reseating never clobbers user edits.
+        self.editor.doc = editor_core::rope::Rope::from_str(&running);
+        self.post_hydration_hash = Some(hiker_core::hash_string(&running));
+        if applied.is_empty() {
+            self.agent_base = None;
+            self.hydrated_proposals.clear();
+            self.hydration_footprints.clear();
+        } else {
             self.agent_base = Some(self.loaded_text.clone());
             self.hydrated_proposals = applied;
             self.hydration_footprints = footprints;
-            self.editor.doc = editor_core::Rope::from_str(&running);
-            // loaded_text / loaded_hash deliberately stay as the disk
-            // values so `is_dirty()` flips true while hydrated content is
-            // live in the buffer.
         }
+        // loaded_text / loaded_hash deliberately stay as the disk values
+        // so `is_dirty()` flips true while hydrated content is live in
+        // the buffer.
     }
 
-    /// Drop a single hydrated proposal id from both the tracker list and
-    /// the footprint table. Called from the per-hunk Accept / Reject
-    /// handlers after the corresponding proposal has been removed from
-    /// `staging.db`.
-    pub fn drop_hydrated_proposal(&mut self, proposal_id: &str) {
-        self.hydrated_proposals.retain(|id| id != proposal_id);
-        self.hydration_footprints.retain(|(id, _)| id != proposal_id);
-        if self.hydrated_proposals.is_empty() {
-            self.agent_base = None;
-            self.hydration_footprints.clear();
-        }
-    }
 
     /// Replace the buffer's text contents in place while preserving
     /// scroll position, folds, decoration caches, paint cache, and the
@@ -387,8 +409,11 @@ impl Buffer {
     /// is intentionally not touched — the replace is silent, not an
     /// undoable edit (v0; legacy CM6 also reloaded out-of-band).
     pub fn replace_text(&mut self, new_text: String, new_loaded_hash: String) {
-        use editor_core::{Rope, SelRange, Selection};
+        use editor_core::rope::Rope;
 
+        use editor_core::selection::SelRange;
+
+        use editor_core::selection::Selection;
         let new_len = new_text.len();
 
         // Clamp every cursor anchor independently to a valid byte
@@ -433,7 +458,7 @@ impl Buffer {
     }
 
     pub fn current_hash(&self) -> String {
-        hiker_core::hash_str(&self.current_text())
+        hiker_core::hash_string(&self.current_text())
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -457,21 +482,25 @@ impl Buffer {
     }
 }
 
-/// All start positions where `needle` occurs in `haystack`. Mirrors the
-/// staging service's internal `find_all_matches` so hydration's
-/// footprint tracking sees the same positions as `apply_edit`.
-fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
-    if needle.is_empty() {
-        return Vec::new();
+impl Buffer {
+    /// All start positions where `needle` occurs in `haystack`. Mirrors the
+    /// staging service's internal `find_all_matches` so hydration's
+    /// footprint tracking sees the same positions as `apply_edit`. A method
+    /// (its sole caller is `hydrate_pending_proposals`) so it doesn't trip
+    /// `single_call_fn`.
+    fn find_all(&self, haystack: &str, needle: &str) -> Vec<usize> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = haystack[from..].find(needle) {
+            let pos = from + rel;
+            out.push(pos);
+            from = pos + needle.len();
+        }
+        out
     }
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = haystack[from..].find(needle) {
-        let pos = from + rel;
-        out.push(pos);
-        from = pos + needle.len();
-    }
-    out
 }
 
 /// Compute the byte offset to add to an earlier footprint position,

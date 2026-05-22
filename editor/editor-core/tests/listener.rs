@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use editor_core::selection::Selection;
-use editor_core::state::{EditorState, TransactionListener};
-
+use editor_core::state::Editor;
+use editor_core::state::TransactionListener;
 #[test]
 fn listener_observes_post_transaction_state() {
     let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -12,7 +12,7 @@ fn listener_observes_post_transaction_state() {
         observed_clone.lock().unwrap().push(next.doc.to_string());
     });
 
-    let mut state = EditorState::new("hello").with_listener(listener);
+    let mut state = Editor::new("hello").with_listener(listener);
     state.selection = Selection::single(5);
 
     let tx = state.insert_at_selections(", world");
@@ -34,7 +34,7 @@ fn listener_survives_clone() {
         *counter_clone.lock().unwrap() += 1;
     });
 
-    let mut state = EditorState::new("a").with_listener(listener);
+    let mut state = Editor::new("a").with_listener(listener);
     state.selection = Selection::single(1);
 
     // Clone, then apply on the clone — listener should still fire.

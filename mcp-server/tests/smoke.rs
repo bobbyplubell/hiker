@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use hiker_core::changes::Changes;
 use hiker_core::chunker::Chunk;
-use hiker_core::config::{McpAuditConfig, McpConfig, McpToolsConfig};
-use hiker_core::embed::{EmbedError, Embedder};
-use hiker_core::indexer::{start_indexer, IndexerHandle};
+use hiker_core::config::sections::{McpAuditConfig, McpConfig, McpToolsConfig};
+use hiker_core::embed::{Error, Embedder};
+use hiker_core::indexer::{start as start_indexer, Handle};
 use hiker_core::staging::Staging;
-use hiker_core::store::{new_id, NoteUpsert, Store};
+use hiker_core::store::dto::{new_id, NoteUpsert};
+use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
 use hiker_mcp::{start, McpDeps, McpServerHandle};
@@ -23,7 +24,7 @@ use tempfile::TempDir;
 
 struct ZeroEmbedder;
 impl Embedder for ZeroEmbedder {
-    fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, Error> {
         Ok(batch.iter().map(|_| vec![0.0; 384]).collect())
     }
     fn version(&self) -> &str {
@@ -39,7 +40,7 @@ struct Booted {
     handle: McpServerHandle,
     client: reqwest::Client,
     url: String,
-    idx: IndexerHandle,
+    idx: Handle,
     read_store: Arc<Mutex<Store>>,
 }
 
@@ -57,8 +58,8 @@ async fn boot(config: McpConfig) -> Booted {
         td.path().join(".hiker").join("agent-log"),
         config.audit.log_full_input,
     ));
-    let tasks = std::sync::Arc::new(hiker_core::tasks::Queue::new(
-        hiker_core::config::TasksConfig::default(),
+    let tasks = std::sync::Arc::new(hiker_core::tasks::queue::Queue::new(
+        hiker_core::config::sections::TasksConfig::default(),
     ));
     let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
     let staging = std::sync::Arc::new(Staging::open(td.path()).unwrap());
@@ -75,7 +76,7 @@ async fn boot(config: McpConfig) -> Booted {
         staging,
         audit,
         tasks,
-        tasks_config: hiker_core::config::TasksConfig::default(),
+        tasks_config: hiker_core::config::sections::TasksConfig::default(),
         llm_enabled: false,
     };
     let handle = start(deps).await.expect("start mcp");
@@ -226,7 +227,7 @@ async fn get_note_snippet_uses_indexed_chunk() {
             text: "indexed snippet text".to_string(),
             heading_path: Some("Setup > Database".into()),
         };
-        s.upsert_note(NoteUpsert {
+        s.upsert_note(&NoteUpsert {
             id: &id,
             path: "a.md",
             content_hash: "h",
@@ -467,7 +468,7 @@ async fn search_top_k_clamped_by_max_top_k() {
         let mut s = b.read_store.lock().unwrap();
         for i in 0..5 {
             let id = new_id();
-            s.upsert_note(NoteUpsert {
+            s.upsert_note(&NoteUpsert {
                 id: &id,
                 path: &format!("note{i}.md"),
                 content_hash: "h",

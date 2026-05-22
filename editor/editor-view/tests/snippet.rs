@@ -1,11 +1,16 @@
 //! Integration tests for snippet expansion (SPEC §9.22).
 
-use editor_core::EditorState;
-use editor_view::command::{self, expand_snippet, Action};
-use editor_view::{
-    InputEvent, Key, KeyEvent, Modifiers, NamedKey, Snippet, ViewState,
-};
-
+use editor_core::state::Editor as EditorState;
+use editor_view::command;
+use editor_view::command::expand_snippet;
+use editor_view::command::Action;
+use editor_view::events::InputEvent;
+use editor_view::events::Key;
+use editor_view::events::KeyEvent;
+use editor_view::events::Modifiers;
+use editor_view::events::NamedKey;
+use editor_view::snippets::Snippet;
+use editor_view::viewport::ViewState;
 fn drive(state: &mut EditorState, view: &mut ViewState, ev: &InputEvent) {
     if let Action::Replace(next) = command::handle(state, view, ev) {
         *state = next;

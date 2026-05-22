@@ -1,14 +1,23 @@
 //! The `#[tool_router]` impl block — every method here is a public MCP
-//! tool entry point that audits + delegates to the matching `_inner`
-//! helper. Kept as one block because the `#[tool_router]` macro
-//! expansion wires up `Self::tool_router()` across the whole block.
+//! tool entry point that audits + delegates to the matching operation
+//! method in `dispatch.rs`. Kept as one block because the `#[tool_router]`
+//! macro expansion wires up `Self::tool_router()` across the whole block.
 
-use super::*;
+use hiker_core::tasks::types::McpClientVia;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ErrorData};
+use rmcp::{tool, tool_router};
+
+use super::App;
+use crate::handler::params::{
+    audit_err, audit_status, ApplyTag, EditNote, GetNote, RelatedNotes, SearchNotes,
+    SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
+};
 
 // ---------- tool router ----------
 
 #[tool_router(vis = "pub(super)")]
-impl HikerHandler {
+impl App {
     /// Search the vault. Wraps `core::search::query` and returns the same
     /// three-bucket payload (lexical, semantic, fused) the UI consumes.
     /// Empty query returns empty buckets without erroring.
@@ -20,10 +29,10 @@ impl HikerHandler {
     )]
     pub async fn search_notes(
         &self,
-        params: Parameters<SearchNotesParams>,
+        params: Parameters<SearchNotes>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.search_notes_inner(&p).await;
+        let outcome = self.run_search(&p).await;
         self.state.audit.record(
             "search_notes",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -42,10 +51,10 @@ impl HikerHandler {
     )]
     pub async fn get_note(
         &self,
-        params: Parameters<GetNoteParams>,
+        params: Parameters<GetNote>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.get_note_inner(&p).await;
+        let outcome = self.read_note(&p).await;
         self.state.audit.record(
             "get_note",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -65,10 +74,10 @@ impl HikerHandler {
     )]
     pub async fn related_notes(
         &self,
-        params: Parameters<RelatedNotesParams>,
+        params: Parameters<RelatedNotes>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.related_notes_inner(&p).await;
+        let outcome = self.find_related(&p).await;
         self.state.audit.record(
             "related_notes",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -91,10 +100,10 @@ impl HikerHandler {
     )]
     pub async fn write_note(
         &self,
-        params: Parameters<WriteNoteParams>,
+        params: Parameters<WriteNote>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.write_note_inner(&p).await;
+        let outcome = self.save_note(&p).await;
         self.state.audit.record(
             "write_note",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -121,10 +130,10 @@ impl HikerHandler {
     )]
     pub async fn edit_note(
         &self,
-        params: Parameters<EditNoteParams>,
+        params: Parameters<EditNote>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.edit_note_inner(&p).await;
+        let outcome = self.apply_edits(&p).await;
         self.state.audit.record(
             "edit_note",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -145,10 +154,10 @@ impl HikerHandler {
     )]
     pub async fn set_frontmatter(
         &self,
-        params: Parameters<SetFrontmatterParams>,
+        params: Parameters<SetFrontmatter>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.set_frontmatter_inner(&p).await;
+        let outcome = self.merge_frontmatter(&p).await;
         self.state.audit.record(
             "set_frontmatter",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -167,10 +176,10 @@ impl HikerHandler {
     )]
     pub async fn apply_tag(
         &self,
-        params: Parameters<ApplyTagParams>,
+        params: Parameters<ApplyTag>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.apply_tag_inner(&p, true).await;
+        let outcome = self.update_tag(&p, true).await;
         self.state.audit.record(
             "apply_tag",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -189,10 +198,10 @@ impl HikerHandler {
     )]
     pub async fn remove_tag(
         &self,
-        params: Parameters<ApplyTagParams>,
+        params: Parameters<ApplyTag>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.apply_tag_inner(&p, false).await;
+        let outcome = self.update_tag(&p, false).await;
         self.state.audit.record(
             "remove_tag",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
@@ -213,10 +222,10 @@ impl HikerHandler {
     )]
     pub async fn task_checkout(
         &self,
-        params: Parameters<TaskCheckoutParams>,
+        params: Parameters<TaskCheckout>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.task_checkout_inner(&p, McpClientVia::External).await;
+        let outcome = self.lease_task(&p, McpClientVia::External).await;
         self.state.audit.record(
             "task_checkout",
             &serde_json::Value::Null,
@@ -236,10 +245,10 @@ impl HikerHandler {
     )]
     pub async fn task_submit(
         &self,
-        params: Parameters<TaskSubmitParams>,
+        params: Parameters<TaskSubmit>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.task_submit_inner(&p).await;
+        let outcome = self.record_task_result(&p).await;
         self.state.audit.record(
             "task_submit",
             &serde_json::json!({"task_id": p.task_id}),
@@ -258,10 +267,10 @@ impl HikerHandler {
     )]
     pub async fn task_fail(
         &self,
-        params: Parameters<TaskFailParams>,
+        params: Parameters<TaskFail>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.task_fail_inner(&p).await;
+        let outcome = self.record_task_failure(&p).await;
         self.state.audit.record(
             "task_fail",
             &serde_json::json!({"task_id": p.task_id}),
@@ -280,10 +289,10 @@ impl HikerHandler {
     )]
     pub async fn task_heartbeat(
         &self,
-        params: Parameters<TaskHeartbeatParams>,
+        params: Parameters<TaskHeartbeat>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.task_heartbeat_inner(&p).await;
+        let outcome = self.extend_task_lease(&p).await;
         self.state.audit.record(
             "task_heartbeat",
             &serde_json::json!({"task_id": p.task_id}),
@@ -302,10 +311,10 @@ impl HikerHandler {
     )]
     pub async fn task_list(
         &self,
-        params: Parameters<TaskListParams>,
+        params: Parameters<TaskList>,
     ) -> Result<CallToolResult, ErrorData> {
         let Parameters(p) = params;
-        let outcome = self.task_list_inner(&p).await;
+        let outcome = self.list_tasks(&p).await;
         self.state.audit.record(
             "task_list",
             &serde_json::Value::Null,

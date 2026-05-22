@@ -1,6 +1,7 @@
-use editor_core::{diff::diff_lines, EditorState};
-use editor_egui::EditorWidget;
-use editor_view::ViewState;
+use editor_core::diff::lines as diff_lines;
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_view::viewport::ViewState;
 
 const LEFT: &str = "fn greet(name: &str) {\n    println!(\"Hello, {name}!\");\n    println!(\"Welcome.\");\n    println!(\"How are you?\");\n}\n\nfn main() {\n    greet(\"world\");\n}\n";
 
@@ -55,7 +56,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.mode {
             Mode::Unified => {
                 self.right_view.decorations.clear();
-                self.right_view.decorations.push(editor_diff::unified_decorations(
+                self.right_view.decorations.push(editor_diff::view::unified_decorations(
                     &self.right_state.doc,
                     &left_text,
                     &hunks,
@@ -65,7 +66,7 @@ impl eframe::App for App {
                 EditorWidget::new(&mut self.right_state, &mut self.right_view).show(ui);
             }
             Mode::SideBySide => {
-                let (left_set, right_set) = editor_diff::alignment_decorations(
+                let (left_set, right_set) = editor_diff::view::alignment_decorations(
                     &self.left_state.doc,
                     &self.right_state.doc,
                     &hunks,

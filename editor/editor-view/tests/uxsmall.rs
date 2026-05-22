@@ -1,12 +1,17 @@
 //! Small-UX feature smoke tests: active line highlight, placeholder, special
 //! chars, trailing whitespace, scroll-past-end. See SPEC §9.11–§9.18.
 
-use editor_core::{Decoration, EditorState, SelRange, Selection};
-use editor_view::{
-    active_line_decorations, special_chars_decorations, trailing_whitespace_decorations,
-    SpecialCharsFlags, ViewState,
-};
+use editor_core::decoration::Decoration;
 
+use editor_core::state::Editor as EditorState;
+use editor_core::selection::SelRange;
+
+use editor_core::selection::Selection;
+use editor_view::highlights::active_line_decorations;
+use editor_view::whitespace::special_chars_decorations;
+use editor_view::highlights::trailing_whitespace_decorations;
+use editor_view::whitespace::SpecialCharsFlags;
+use editor_view::viewport::ViewState;
 #[test]
 fn active_line_emits_line_decoration() {
     let mut state = EditorState::new("alpha\nbeta\ngamma\n");
@@ -47,8 +52,9 @@ fn trailing_whitespace_produces_mark() {
 
 #[test]
 fn scroll_past_end_allows_scroll_past_last_line() {
-    use editor_view::command::{self, Action};
-    use editor_view::event::InputEvent;
+    use editor_view::command;
+    use editor_view::command::Action;
+    use editor_view::events::InputEvent;
 
     let state = EditorState::new("line0\nline1\nline2\n");
     let mut view = ViewState {

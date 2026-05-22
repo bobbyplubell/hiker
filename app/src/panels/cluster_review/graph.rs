@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use hiker_core::cluster::{BuiltClusterNode, BuiltClusterTree};
-use hiker_core::trees::{EditableNode, NodeKind};
+use hiker_core::trees::types::{EditableNode, NodeKind};
 
 /// Adapter (post-Done): synthesize an `EditableNode` row for every
 /// cluster in `tree.levels` + every leaf member. Mirrors the shape
@@ -21,7 +21,13 @@ use hiker_core::trees::{EditableNode, NodeKind};
 /// `user_renamed` map so the graph view's labels track the tree view.
 /// No policy color (none exists pre-persistence) and `churn = 0` (no
 /// staleness tint), per the spec.
-pub(super) fn built_tree_to_editable_nodes(
+/// Zero-sized namespace for the `EditableNode` adapters. A struct (rather
+/// than free fns) so the single-call entry points stay inherent methods.
+pub(super) struct Adapter;
+
+impl Adapter {
+    pub(super) fn built_tree_to_editable_nodes(
+    &self,
     tree: &BuiltClusterTree,
     user_renamed: &HashMap<String, String>,
 ) -> Vec<EditableNode> {
@@ -156,14 +162,15 @@ pub(super) fn built_tree_to_editable_nodes(
     }
 
     out
-}
+    }
 
-/// Adapter (mid-build live reveal): synthesize an `EditableNode` slice
-/// from the pane's incremental `live_top` + `live_pending_children`
-/// buffers. Same encoding rules as the post-Done adapter; gracefully
-/// degrades when only partial clusters are present so the graph
-/// re-renders as new clusters arrive.
-pub(super) fn live_to_editable_nodes(
+    /// Adapter (mid-build live reveal): synthesize an `EditableNode` slice
+    /// from the pane's incremental `live_top` + `live_pending_children`
+    /// buffers. Same encoding rules as the post-Done adapter; gracefully
+    /// degrades when only partial clusters are present so the graph
+    /// re-renders as new clusters arrive.
+    pub(super) fn live_to_editable_nodes(
+    &self,
     live_top: &[BuiltClusterNode],
     live_children: &HashMap<String, Vec<BuiltClusterNode>>,
     user_renamed: &HashMap<String, String>,
@@ -184,7 +191,7 @@ pub(super) fn live_to_editable_nodes(
         let user_edited = renamed.is_some();
         out.push(EditableNode {
             id: node.id.clone(),
-            parent: parent.map(|s| s.to_string()),
+            parent: parent.map(std::string::ToString::to_string),
             kind: NodeKind::Cluster,
             note_ref: None,
             name: renamed.unwrap_or_else(|| node.name.clone()),
@@ -223,4 +230,5 @@ pub(super) fn live_to_editable_nodes(
         walk(n, None, live_children, user_renamed, &mut out);
     }
     out
+    }
 }

@@ -1,6 +1,6 @@
 use super::*;
-use crate::embed::MockEmbedder;
-use crate::store::{new_id, NoteUpsert};
+use crate::embed::{MockEmbedder, Error as EmbedError};
+use crate::store::dto::{new_id, NoteUpsert};
 use std::fs;
 use tempfile::tempdir;
 
@@ -30,7 +30,7 @@ async fn indexer_indexes_a_markdown_file() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("alpha.md"), b"# Alpha\n\nbody.\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     // Wait for ModelLoaded so the loader future has resolved.
@@ -54,7 +54,7 @@ async fn unchanged_file_is_skipped_on_second_index() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("x.md"), b"# X\n\nbody.\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -76,7 +76,7 @@ async fn force_reindex_bypasses_unchanged_short_circuit() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("y.md"), b"# Y\n\nbody.\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -103,7 +103,7 @@ async fn deleting_a_note_removes_it_from_the_index() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("doomed.md"), b"# x\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -125,7 +125,7 @@ async fn renaming_preserves_id() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("old.md"), b"# x\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -191,7 +191,7 @@ fn full_scan_emits_delete_for_missing_files() {
     let mut store = Store::open(dir.path()).unwrap();
     let id = new_id();
     store
-        .upsert_note(NoteUpsert {
+        .upsert_note(&NoteUpsert {
             id: &id,
             path: "ghost.md",
             content_hash: "h",
@@ -218,7 +218,7 @@ fn full_scan_emits_delete_for_missing_files() {
 async fn missing_file_during_upsert_is_treated_as_delete() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -237,7 +237,7 @@ async fn unsupported_extensions_are_skipped() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("a.bin"), b"x").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
@@ -284,7 +284,7 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     std::fs::write(waypoint_dir.join("0001--raptor.md"), wp).unwrap();
 
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(
+    let handle = start(
         crate::vault::Vault::open(dir.path()).unwrap(),
         store,
         mock_loader(),
@@ -343,7 +343,7 @@ async fn txt_files_are_indexed() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("note.txt"), b"first paragraph.\n\nsecond paragraph.\n").unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let handle = start_indexer(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
     let mut prog = handle.subscribe_progress();
 
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;

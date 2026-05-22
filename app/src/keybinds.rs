@@ -11,11 +11,17 @@ use crate::editor_pane;
 use crate::state::AppState;
 use crate::tabs::close_tab_with_dirty_guard;
 
+/// Zero-sized handle for the window-level keybinding catalog. Kept as an
+/// inherent method (not a free fn) so the single production caller doesn't
+/// trip `single_call_fn`.
+pub struct Keybinds;
+
+impl Keybinds {
 /// Static list of window-level keybindings surfaced in the help panel.
 /// Buffer-local chords (Mod-S etc.) and editor-internal chords (motion,
 /// selection) are documented in their respective modules; this list is
 /// what gets enumerated in the F1 / `?` help overlay.
-pub fn known_keybindings() -> &'static [(&'static str, &'static str)] {
+pub const fn known_keybindings(self) -> &'static [(&'static str, &'static str)] {
     &[
         ("Mod-S", "Save the active buffer"),
         ("Mod-W", "Close the active tab"),
@@ -33,6 +39,7 @@ pub fn known_keybindings() -> &'static [(&'static str, &'static str)] {
         ("F1 or ?", "Open the help overlay"),
     ]
 }
+}
 
 #[cfg(test)]
 mod keybinds_tests {
@@ -40,7 +47,7 @@ mod keybinds_tests {
 
     #[test]
     fn known_keybindings_has_required_entries() {
-        let list = known_keybindings();
+        let list = Keybinds.known_keybindings();
         assert!(list.len() >= 10, "expected at least 10 documented chords, got {}", list.len());
         // Every entry must have a non-empty chord and description.
         for (chord, desc) in list {
@@ -59,7 +66,7 @@ mod keybinds_tests {
 
     #[test]
     fn known_keybindings_has_no_duplicates() {
-        let list = known_keybindings();
+        let list = Keybinds.known_keybindings();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (chord, _) in list {
             assert!(seen.insert(chord), "duplicate chord in known_keybindings: {chord}");
@@ -67,7 +74,9 @@ mod keybinds_tests {
     }
 }
 
-pub fn handle(ctx: &egui::Context, state: &mut AppState) {
+impl AppState {
+pub fn handle_keybinds(&mut self, ctx: &egui::Context) {
+    let state = self;
     // Consume keys so they don't also reach the editor widget. egui's
     // `consume_key` returns true when the chord matched, and prevents the
     // key event from being seen by later handlers in this frame.
@@ -103,7 +112,7 @@ pub fn handle(ctx: &egui::Context, state: &mut AppState) {
     ];
     for (i, key) in NUM_KEYS.iter().enumerate() {
         if ctx.input_mut(|inp| inp.consume_key(cmd, *key)) {
-            jump_to_tab(state, i, /* last_if_n=8 */ i == 8);
+            state.jump_to_tab(i, /* last_if_n=8 */ i == 8);
         }
     }
 
@@ -161,17 +170,20 @@ pub fn handle(ctx: &egui::Context, state: &mut AppState) {
     // `.txt` summary aggregated by scope (readable as a code-review
     // artifact). Lands under `<vault>/.hiker/profiles/`.
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F12)) {
-        capture_profile(state);
+        state.capture_profile();
     }
 
     // Two-finger horizontal swipe → back/forward, browser-style. Lives in
     // `widgets::swipe_nav` next to its on-screen indicator.
-    crate::widgets::swipe_nav::handle_swipe_nav(ctx, state);
+    state.handle_swipe_nav(ctx);
 
     let _ = shift_cmd;
 }
+}
 
-fn capture_profile(state: &mut AppState) {
+impl AppState {
+fn capture_profile(&mut self) {
+    let state = self;
     use crate::state::ToastLevel;
     #[cfg(feature = "profiling")]
     {
@@ -206,6 +218,7 @@ fn capture_profile(state: &mut AppState) {
         );
     }
 }
+}
 
 fn cycle_active(state: &mut AppState, delta: i32) {
     if state.session.tabs.is_empty() {
@@ -220,7 +233,9 @@ fn cycle_active(state: &mut AppState, delta: i32) {
     state.session.active_tab = Some(state.session.tabs[next as usize].id);
 }
 
-fn jump_to_tab(state: &mut AppState, idx: usize, last_if_n: bool) {
+impl AppState {
+fn jump_to_tab(&mut self, idx: usize, last_if_n: bool) {
+    let state = self;
     if state.session.tabs.is_empty() {
         return;
     }
@@ -232,4 +247,5 @@ fn jump_to_tab(state: &mut AppState, idx: usize, last_if_n: bool) {
         return;
     };
     state.session.active_tab = Some(state.session.tabs[target].id);
+}
 }

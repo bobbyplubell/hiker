@@ -1,18 +1,35 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use editor_core::{light_default, Compartment, CompartmentStore, EditorState, Theme};
-use editor_egui::EditorWidget;
-use editor_md::{
-    callout_decorations, fold_decorations, footnote_decorations, frontmatter_fold,
-    markdown_decorations, math_decorations, mermaid_decorations, transclusion_decorations,
-    wikilink_decorations, MarkdownIndent,
-};
-use editor_view::{
-    active_line_decorations, brackets, bracket_match_decorations,
-    occurrence::occurrence_decorations, trailing_whitespace_decorations, ClickAction, ViewState,
-};
+use editor_core::compartment::Compartment;
 
+use editor_core::compartment::Store;
+use editor_core::state::Editor;
+use editor_core::theme::light_default;
+
+
+use editor_core::theme::Theme;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_md::admonitions::callout_decorations;
+use editor_md::notes::footnote_decorations;
+use editor_md::folds::fold_decorations;
+use editor_md::meta::frontmatter_fold;
+use editor_md::styling::markdown_decorations;
+use editor_md::equations::math_decorations;
+use editor_md::diagrams::mermaid_decorations;
+use editor_md::embeds::transclusion_decorations;
+use editor_md::links::wikilink_decorations;
+use editor_md::indenter::MarkdownIndent;
+use editor_view::brackets;
+use editor_view::highlight::occurrence_decorations;
+use editor_view::brackets::bracket_match_decorations;
+
+use editor_view::highlights::active_line_decorations;
+
+use editor_view::highlights::trailing_whitespace_decorations;
+use editor_view::viewport::ClickAction;
+
+use editor_view::viewport::ViewState;
 const SAMPLE: &str = r#"---
 title: egui_editor demo
 tags: [markdown, editor, demo]
@@ -82,26 +99,26 @@ viewport gets highlighted.
 "#;
 
 struct App {
-    state: EditorState,
+    state: Editor,
     view: ViewState,
     folds: HashSet<u64>,
     click_buffer: Vec<ClickAction>,
     /// Theme compartment + a local store. In a real app, the store would
-    /// live on `EditorState` (it does — see `state.compartments` via
-    /// `CompartmentStore`), but we keep a separate store here to keep the
+    /// live on `Editor` (it does — see `state.compartments` via
+    /// `Store`), but we keep a separate store here to keep the
     /// example self-contained while StateField wiring lands.
     theme_compartment: Compartment<Theme>,
-    theme_store: CompartmentStore,
+    theme_store: Store,
 }
 
 impl Default for App {
     fn default() -> Self {
         let theme_compartment: Compartment<Theme> = Compartment::new();
-        let mut theme_store = CompartmentStore::default();
+        let mut theme_store = Store::default();
         theme_store.set(&theme_compartment, light_default());
 
         Self {
-            state: EditorState::new(SAMPLE),
+            state: Editor::new(SAMPLE),
             view: {
                 let mut v = ViewState {
                     font_size: 15.0,

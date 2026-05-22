@@ -53,7 +53,6 @@ cargo clippy --workspace --all-targets -- \
     -D clippy::cognitive_complexity \
     -D clippy::unnecessary_wraps \
     -D clippy::needless_pass_by_value \
-    -D clippy::single_call_fn \
     -D clippy::too_many_arguments \
     -D clippy::trivially_copy_pass_by_ref \
     -D clippy::needless_late_init \

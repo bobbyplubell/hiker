@@ -5,10 +5,13 @@
 //! the way back out (decoration layers, view state, derived data) rather than
 //! pixel-snapshotting, which would be brittle across machines.
 
-use editor_core::{Decoration, EditorState};
-use editor_egui::EditorWidget;
-use editor_md::{markdown_decorations, wikilink_decorations};
-use editor_view::ViewState;
+use editor_core::decoration::Decoration;
+
+use editor_core::state::Editor as EditorState;
+use editor_egui::widget::Widget as EditorWidget;
+use editor_md::styling::markdown_decorations;
+use editor_md::links::wikilink_decorations;
+use editor_view::viewport::ViewState;
 
 fn run_one_frame(state: &mut EditorState, view: &mut ViewState) {
     let mut harness = egui_kittest::Harness::builder()
@@ -26,7 +29,7 @@ fn run_one_frame(state: &mut EditorState, view: &mut ViewState) {
 fn setext_heading_does_not_eat_first_letter() {
     let doc = "title: a thing\n---\nbody\n";
     let mut state = EditorState::new(doc);
-    state.selection = editor_core::Selection::single(doc.len());
+    state.selection = editor_core::selection::Selection::single(doc.len());
     let set = markdown_decorations(&state, None);
     // Walk all Replace decorations; none should start at byte 0 (the `t`).
     for (range, deco) in set.iter_all() {
@@ -47,7 +50,7 @@ fn wikilink_replace_consolidates_to_one_segment() {
     // Cursor off the wikilink line so the Replace fires.
     let doc = "Wikilink: [[Home]] in prose.\nsecond line\n";
     let mut state = EditorState::new(doc);
-    state.selection = editor_core::Selection::single(doc.len());
+    state.selection = editor_core::selection::Selection::single(doc.len());
     let set = wikilink_decorations(&state, None, None);
     // Find the Replace decoration's range.
     let replace_range = set
@@ -76,7 +79,7 @@ fn wikilink_replace_consolidates_to_one_segment() {
 fn widget_consolidates_replace_segments() {
     let doc = "X [[Home]] Y\n";
     let mut state = EditorState::new(doc);
-    state.selection = editor_core::Selection::single(doc.len());
+    state.selection = editor_core::selection::Selection::single(doc.len());
     let mut view = ViewState::default();
     view.decorations.push(wikilink_decorations(&state, None, None));
     run_one_frame(&mut state, &mut view);
@@ -92,7 +95,8 @@ fn widget_consolidates_replace_segments() {
 /// fold zone.
 #[test]
 fn fold_chevron_registers_click_zone_at_left_edge() {
-    use editor_md::{fold_decorations, fold_regions};
+    use editor_md::folds::fold_decorations;
+    use editor_md::folds::fold_regions;
     let doc = "# Heading\nbody1\nbody2\n";
     let mut state = EditorState::new(doc);
     let folds: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -107,7 +111,7 @@ fn fold_chevron_registers_click_zone_at_left_edge() {
         .click_zones
         .iter()
         .find(|z| {
-            matches!(z.action, editor_view::ClickAction::ToggleFold(id) if id == expected_id)
+            matches!(z.action, editor_view::viewport::ClickAction::ToggleFold(id) if id == expected_id)
         })
         .expect("fold chevron click zone should exist");
     assert!(zone.rect.x_min < 4.0);
@@ -123,7 +127,7 @@ fn fold_chevron_registers_click_zone_at_left_edge() {
 /// smooth path as hover).
 #[test]
 fn mouse_wheel_events_are_not_translated() {
-    use editor_view::InputEvent;
+    use editor_view::events::InputEvent;
     let ev = egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, -3.0),

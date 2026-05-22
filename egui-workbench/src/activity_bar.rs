@@ -11,13 +11,13 @@ use egui::{
     Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, StrokeKind, TextStyle, Vec2, vec2,
 };
 
-use crate::behavior::WorkbenchBehavior;
-use crate::side_bar::SideBarSide;
-use crate::tab::DocumentTab;
-use crate::theme::WorkbenchTheme;
+use crate::behavior::Host;
+use crate::side_bar::Side;
+use crate::tab::Document;
+use crate::theme::Palette;
 
 /// One entry in the activity bar.
-pub struct ActivityItem<Mode> {
+pub struct Item<Mode> {
     pub mode: Mode,
     /// Optional icon. When `None`, the activity bar paints the first
     /// letter of `label` as a fallback glyph.
@@ -38,11 +38,11 @@ pub enum ActivityBadge {
 
 /// Vertical icon strip bound to the host's `Mode` type.
 pub struct ActivityBar<Mode> {
-    pub(crate) items: Vec<ActivityItem<Mode>>,
+    pub(crate) items: Vec<Item<Mode>>,
     pub(crate) hidden: Vec<Mode>,
     pub(crate) active: Option<Mode>,
     pub(crate) visible: bool,
-    pub(crate) side: SideBarSide,
+    pub(crate) side: Side,
     /// User-preferred order of activity modes. When non-empty, the
     /// bar reorders the host-supplied items to match this list before
     /// rendering. Modes not present here are appended at the end in
@@ -57,7 +57,7 @@ impl<Mode> Default for ActivityBar<Mode> {
             hidden: Vec::new(),
             active: None,
             visible: true,
-            side: SideBarSide::Left,
+            side: Side::Left,
             order: Vec::new(),
         }
     }
@@ -69,16 +69,16 @@ impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
     }
 
     /// Currently selected mode (if any).
-    pub fn active(&self) -> Option<&Mode> {
+    pub const fn active(&self) -> Option<&Mode> {
         self.active.as_ref()
     }
 
     /// Whether the activity bar itself is shown.
-    pub fn is_visible(&self) -> bool {
+    pub const fn is_visible(&self) -> bool {
         self.visible
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
+    pub const fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
 
@@ -87,7 +87,7 @@ impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
         self.active = mode;
     }
 
-    pub fn set_side(&mut self, side: SideBarSide) {
+    pub const fn set_side(&mut self, side: Side) {
         self.side = side;
     }
 }
@@ -107,297 +107,393 @@ impl<Mode> Default for ActivityBarResponse<Mode> {
     }
 }
 
-/// Render the activity bar inside the given `Ui`. Returns the
-/// interaction outcome for the workbench to act on.
-pub(crate) fn show_activity_bar<Tab, Mode, B>(
-    bar: &mut ActivityBar<Mode>,
-    ui: &mut egui::Ui,
-    theme: &WorkbenchTheme,
-    behavior: &mut B,
-) -> ActivityBarResponse<Mode>
+/// Per-frame render context for the activity bar. The frame's work is
+/// split into a handful of `&mut self` methods so each can stay under
+/// the cognitive-complexity budget while sharing state (the bar, the
+/// theme, drag-memory ids, allocated slots) without a wide free
+/// helper signature.
+struct Render<'a, Tab, Mode, B>
 where
-    Tab: DocumentTab,
+    Tab: Document,
     Mode: Clone + Eq + Hash + 'static,
-    B: WorkbenchBehavior<Tab, Mode> + ?Sized,
+    B: Host<Tab, Mode> + ?Sized,
 {
-    let mut items = behavior.activity_items();
-    // Drop any items whose mode the user has chosen to hide.
-    items.retain(|it| !bar.hidden.iter().any(|m| m == &it.mode));
-    // If the user has reordered items in a previous frame, apply that
-    // permutation to the host-supplied list. Items whose mode isn't in
-    // `bar.order` keep their host-side relative position at the tail.
-    if !bar.order.is_empty() {
-        let mut sorted: Vec<ActivityItem<Mode>> = Vec::with_capacity(items.len());
-        for mode in &bar.order {
-            if let Some(pos) = items.iter().position(|it| &it.mode == mode) {
-                sorted.push(items.remove(pos));
+    bar: &'a mut ActivityBar<Mode>,
+    theme: &'a Palette,
+    behavior: &'a mut B,
+    size: f32,
+    item_padding: f32,
+    item_h: f32,
+    drag_src_id: egui::Id,
+    drag_grip_id: egui::Id,
+    response: ActivityBarResponse<Mode>,
+    _doc: std::marker::PhantomData<Tab>,
+}
+
+impl<'a, Tab, Mode, B> Render<'a, Tab, Mode, B>
+where
+    Tab: Document,
+    Mode: Clone + Eq + Hash + 'static,
+    B: Host<Tab, Mode> + ?Sized,
+{
+    /// Resolve the host-supplied item list against `bar.hidden` /
+    /// `bar.order` and store it back on the bar for this frame.
+    fn refresh_items(&mut self) {
+        let mut items = self.behavior.activity_items();
+        items.retain(|it| !self.bar.hidden.iter().any(|m| m == &it.mode));
+        if !self.bar.order.is_empty() {
+            let mut sorted: Vec<Item<Mode>> = Vec::with_capacity(items.len());
+            for mode in &self.bar.order {
+                if let Some(pos) = items.iter().position(|it| &it.mode == mode) {
+                    sorted.push(items.remove(pos));
+                }
             }
+            sorted.extend(items);
+            items = sorted;
         }
-        sorted.extend(items);
-        items = sorted;
+        self.bar.items = items;
     }
-    bar.items = items;
 
-    let mut response = ActivityBarResponse::default();
-    let size = theme.activity_item_size;
-    let item_padding = (theme.activity_bar_width - size).max(0.0) / 2.0;
-    let item_h = size + 8.0;
-
-    // Drag state lives in egui memory so it spans frames:
-    // - `drag_src`  — the index of the item being dragged.
-    // - `drag_grip` — pointer offset within the item at drag start, so
-    //   the floating ghost tracks the cursor where the user grabbed it
-    //   rather than snapping to its centre.
-    let drag_src_id = ui.id().with("egui_workbench::activity_drag_src");
-    let drag_grip_id = ui.id().with("egui_workbench::activity_drag_grip");
-
-    ui.vertical(|ui| {
-        // No vertical gaps between items so the bar reads as a single
-        // continuous strip and the drag-shift maths line up to the pixel.
-        ui.spacing_mut().item_spacing = Vec2::ZERO;
-        ui.add_space(item_padding);
-
-        let count = bar.items.len();
-        if count == 0 {
-            return;
-        }
-
-        // Pass 1: allocate every item's slot up front so we know the
-        // strip's first-item top and can compute the drag target slot
-        // from the pointer before painting.
+    /// Allocate one click-and-drag slot per item. Returned in order.
+    fn allocate_slots(&self, ui: &mut egui::Ui) -> Vec<(Rect, egui::Response)> {
+        let count = self.bar.items.len();
         let mut slots: Vec<(Rect, egui::Response)> = Vec::with_capacity(count);
         for _ in 0..count {
             let (rect, resp) = ui.allocate_exact_size(
-                vec2(theme.activity_bar_width, item_h),
+                vec2(self.theme.activity_bar_width, self.item_h),
                 Sense::click_and_drag(),
             );
             slots.push((rect, resp));
         }
+        slots
+    }
 
-        // Drag-start detection: stash src + grip on the frame a drag
-        // begins on any item.
-        let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+    /// On the frame a drag begins, stash the source index and the
+    /// pointer's offset within the item so the floating ghost (below)
+    /// tracks the cursor where the user grabbed it.
+    fn capture_drag_start(
+        &self,
+        ui: &egui::Ui,
+        slots: &[(Rect, egui::Response)],
+        pointer_pos: Option<egui::Pos2>,
+    ) {
         for (idx, (rect, resp)) in slots.iter().enumerate() {
             if resp.drag_started() {
-                let grip = pointer_pos.map(|p| p.y - rect.top()).unwrap_or(item_h / 2.0);
+                let grip = pointer_pos
+                    .map(|p| p.y - rect.top())
+                    .unwrap_or(self.item_h / 2.0);
                 ui.memory_mut(|m| {
-                    m.data.insert_temp::<usize>(drag_src_id, idx);
-                    m.data.insert_temp::<f32>(drag_grip_id, grip);
+                    m.data.insert_temp::<usize>(self.drag_src_id, idx);
+                    m.data.insert_temp::<f32>(self.drag_grip_id, grip);
                 });
             }
         }
+    }
 
-        let drag_src: Option<usize> = ui.memory(|m| m.data.get_temp(drag_src_id));
-        let drag_grip: f32 = ui
-            .memory(|m| m.data.get_temp::<f32>(drag_grip_id))
-            .unwrap_or(item_h / 2.0);
-
-        // While a drag is in flight, compute the slot the cursor wants
-        // to land in. Items between the source and the target shift to
-        // make room (live rearrange — same feel as the activity bar in
-        // a typical IDE).
-        let first_top = slots[0].0.top();
-        let target_idx: Option<usize> = match (drag_src, pointer_pos) {
-            (Some(_), Some(p)) => {
-                let raw = ((p.y - first_top) / item_h).floor();
-                Some((raw.max(0.0) as usize).min(count - 1))
+    /// Live-rearrange shift for `idx` given the current drag state.
+    fn shift_for(&self, idx: usize, drag_src: Option<usize>, target_idx: Option<usize>) -> f32 {
+        match (drag_src, target_idx) {
+            (Some(src), Some(tgt)) if idx != src => {
+                if src < tgt && idx > src && idx <= tgt {
+                    -self.item_h
+                } else if src > tgt && idx < src && idx >= tgt {
+                    self.item_h
+                } else {
+                    0.0
+                }
             }
-            _ => None,
+            _ => 0.0,
+        }
+    }
+
+    /// Render a single in-strip item: visuals, badge, hover tooltip,
+    /// context menu, and click handling.
+    fn render_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        slot: &(Rect, egui::Response),
+        drag_src: Option<usize>,
+        target_idx: Option<usize>,
+    ) {
+        let (rect, item_response) = (slot.0, slot.1.clone());
+        let (mode, label) = {
+            let item = &self.bar.items[idx];
+            (item.mode.clone(), item.label.clone())
         };
-
-        // Pass 2: paint each non-source item at its (possibly shifted)
-        // visual position. Hit-testing still uses the original rect so
-        // hover / click behaviour doesn't fight the animation.
-        for (idx, slot) in slots.iter().enumerate() {
-            let (rect, item_response) = (slot.0, slot.1.clone());
-            let (mode, label) = {
-                let item = &bar.items[idx];
-                (item.mode.clone(), item.label.clone())
-            };
-            let is_active = bar.active.as_ref() == Some(&mode);
-
-            let shift = match (drag_src, target_idx) {
-                (Some(src), Some(tgt)) if idx != src => {
-                    if src < tgt && idx > src && idx <= tgt {
-                        -item_h
-                    } else if src > tgt && idx < src && idx >= tgt {
-                        item_h
-                    } else {
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            };
-            let visual_rect = rect.translate(vec2(0.0, shift));
-
-            // Source item is painted as a floating ghost (below); skip
-            // its in-strip slot so the gap reads as the drop target.
-            let is_source = drag_src == Some(idx);
-            if !is_source && ui.is_rect_visible(visual_rect) {
-                let visuals = ui.style().interact(&item_response);
-                let painter = ui.painter().clone();
-                paint_activity_item(
-                    ui,
-                    &painter,
-                    visual_rect,
-                    bar.side,
-                    is_active,
-                    item_response.hovered(),
-                    visuals,
-                    bar.items[idx].icon.clone(),
-                    &label,
-                    size,
-                    theme.accent,
-                    1.0,
-                );
-
-                if let Some(badge) = bar.items[idx].badge.as_ref() {
-                    paint_badge(ui, visual_rect, badge, theme.accent);
-                }
-            }
-
-            let item_response = item_response.on_hover_cursor(CursorIcon::PointingHand);
-            let item_response = if !label.is_empty() && drag_src.is_none() {
-                item_response.on_hover_text(&label)
-            } else {
-                item_response
-            };
-
-            if item_response.clicked() {
-                response.clicked = Some(mode.clone());
-            }
-
-            // Context menu is only useful when not in the middle of a
-            // drag — suppress while dragging to avoid a flicker.
-            if drag_src.is_none() {
-                let mode_for_menu = mode.clone();
-                let mut hide_this = false;
-                item_response.context_menu(|ui| {
-                    if ui.button("Hide").clicked() {
-                        hide_this = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    behavior.activity_context_menu(ui, &mode_for_menu);
-                });
-                if hide_this {
-                    if !bar.hidden.iter().any(|m| m == &mode) {
-                        bar.hidden.push(mode.clone());
-                    }
-                    tracing::debug!("workbench: activity item hidden");
-                }
-            }
-        }
-
-        // Floating ghost: paint the source item on a foreground layer
-        // tracking the pointer. Translucent so it's clearly "in motion".
-        if let (Some(src), Some(p)) = (drag_src, pointer_pos)
-            && src < count
-        {
-            let ghost_top = p.y - drag_grip;
-            let ghost_rect = Rect::from_min_size(
-                egui::pos2(slots[src].0.left(), ghost_top),
-                vec2(theme.activity_bar_width, item_h),
-            );
-            let layer = egui::LayerId::new(
-                egui::Order::Tooltip,
-                ui.id().with("egui_workbench::activity_drag_ghost"),
-            );
-            let ghost_painter = ui.ctx().layer_painter(layer);
-            let (mode, label) = {
-                let item = &bar.items[src];
-                (item.mode.clone(), item.label.clone())
-            };
-            let is_active = bar.active.as_ref() == Some(&mode);
-            let visuals = ui.visuals().widgets.hovered;
+        let is_active = self.bar.active.as_ref() == Some(&mode);
+        let shift = self.shift_for(idx, drag_src, target_idx);
+        let visual_rect = rect.translate(vec2(0.0, shift));
+        let is_source = drag_src == Some(idx);
+        if !is_source && ui.is_rect_visible(visual_rect) {
+            let visuals = ui.style().interact(&item_response);
+            let painter = ui.painter().clone();
             paint_activity_item(
                 ui,
-                &ghost_painter,
-                ghost_rect,
-                bar.side,
-                is_active,
-                /* hovered */ true,
-                &visuals,
-                bar.items[src].icon.clone(),
-                &label,
-                size,
-                theme.accent,
-                0.85,
+                &painter,
+                visual_rect,
+                &ActivityItemPaint {
+                    side: self.bar.side,
+                    is_active,
+                    hovered: item_response.hovered(),
+                    visuals,
+                    icon: self.bar.items[idx].icon.clone(),
+                    label: &label,
+                    size: self.size,
+                    accent: self.theme.accent,
+                    opacity: 1.0,
+                },
             );
-
-            // Drop-indicator bar at the edge of the target slot so the
-            // user gets a precise insertion cue in addition to the
-            // shifted items.
-            if let Some(tgt) = target_idx {
-                let tgt_rect = slots[tgt].0;
-                let y = if tgt >= src {
-                    tgt_rect.bottom() - 1.0
-                } else {
-                    tgt_rect.top()
-                };
-                ghost_painter.line_segment(
-                    [
-                        egui::pos2(tgt_rect.left() + 2.0, y),
-                        egui::pos2(tgt_rect.right() - 2.0, y),
-                    ],
-                    Stroke::new(2.0, theme.accent),
-                );
+            if let Some(badge) = self.bar.items[idx].badge.as_ref() {
+                badge.paint(ui, visual_rect, self.theme.accent);
             }
         }
+        let item_response = item_response.on_hover_cursor(CursorIcon::PointingHand);
+        let item_response = if !label.is_empty() && drag_src.is_none() {
+            item_response.on_hover_text(&label)
+        } else {
+            item_response
+        };
+        if item_response.clicked() {
+            self.response.clicked = Some(mode.clone());
+        }
+        if drag_src.is_none() {
+            self.handle_context_menu(&item_response, &mode);
+        }
+    }
 
-        // Commit the reorder on pointer release.
+    fn handle_context_menu(&mut self, item_response: &egui::Response, mode: &Mode) {
+        let mode_for_menu = mode.clone();
+        let mut hide_this = false;
+        item_response.context_menu(|ui| {
+            if ui.button("Hide").clicked() {
+                hide_this = true;
+                ui.close();
+            }
+            ui.separator();
+            self.behavior.activity_context_menu(ui, &mode_for_menu);
+        });
+        if hide_this {
+            if !self.bar.hidden.iter().any(|m| m == mode) {
+                self.bar.hidden.push(mode.clone());
+            }
+            tracing::debug!("workbench: activity item hidden");
+        }
+    }
+
+    /// Floating ghost of the dragged item + drop-indicator at the
+    /// pending target slot. Painted on the tooltip layer so it sits
+    /// above the side-top panel's frame clip.
+    fn paint_ghost(
+        &self,
+        ui: &egui::Ui,
+        slots: &[(Rect, egui::Response)],
+        drag_src: Option<usize>,
+        target_idx: Option<usize>,
+        drag_grip: f32,
+        pointer_pos: Option<egui::Pos2>,
+    ) {
+        let count = self.bar.items.len();
+        let (Some(src), Some(p)) = (drag_src, pointer_pos) else {
+            return;
+        };
+        if src >= count {
+            return;
+        }
+        let ghost_top = p.y - drag_grip;
+        let ghost_rect = Rect::from_min_size(
+            egui::pos2(slots[src].0.left(), ghost_top),
+            vec2(self.theme.activity_bar_width, self.item_h),
+        );
+        let layer = egui::LayerId::new(
+            egui::Order::Tooltip,
+            ui.id().with("egui_workbench::activity_drag_ghost"),
+        );
+        let ghost_painter = ui.ctx().layer_painter(layer);
+        let (mode, label) = {
+            let item = &self.bar.items[src];
+            (item.mode.clone(), item.label.clone())
+        };
+        let is_active = self.bar.active.as_ref() == Some(&mode);
+        let visuals = ui.visuals().widgets.hovered;
+        paint_activity_item(
+            ui,
+            &ghost_painter,
+            ghost_rect,
+            &ActivityItemPaint {
+                side: self.bar.side,
+                is_active,
+                hovered: true,
+                visuals: &visuals,
+                icon: self.bar.items[src].icon.clone(),
+                label: &label,
+                size: self.size,
+                accent: self.theme.accent,
+                opacity: 0.85,
+            },
+        );
+        if let Some(tgt) = target_idx {
+            let tgt_rect = slots[tgt].0;
+            let y = if tgt >= src {
+                tgt_rect.bottom() - 1.0
+            } else {
+                tgt_rect.top()
+            };
+            ghost_painter.line_segment(
+                [
+                    egui::pos2(tgt_rect.left() + 2.0, y),
+                    egui::pos2(tgt_rect.right() - 2.0, y),
+                ],
+                Stroke::new(2.0, self.theme.accent),
+            );
+        }
+    }
+
+    /// On pointer release commit the reorder + clear drag memory.
+    /// While the drag is in flight, request a repaint so the ghost
+    /// follows the cursor smoothly.
+    fn finish_drag(
+        &mut self,
+        ui: &egui::Ui,
+        drag_src: Option<usize>,
+        target_idx: Option<usize>,
+    ) {
         let pointer_released = ui.input(|i| i.pointer.any_released());
         if pointer_released {
             if let (Some(s), Some(t)) = (drag_src, target_idx)
                 && s != t
-                && s < bar.items.len()
-                && t < bar.items.len()
+                && s < self.bar.items.len()
+                && t < self.bar.items.len()
             {
-                let item = bar.items.remove(s);
-                bar.items.insert(t, item);
-                bar.order = bar.items.iter().map(|it| it.mode.clone()).collect();
+                let item = self.bar.items.remove(s);
+                self.bar.items.insert(t, item);
+                self.bar.order = self.bar.items.iter().map(|it| it.mode.clone()).collect();
                 tracing::debug!(from = s, to = t, "workbench: activity item reordered");
             }
             ui.memory_mut(|m| {
-                m.data.remove::<usize>(drag_src_id);
-                m.data.remove::<f32>(drag_grip_id);
+                m.data.remove::<usize>(self.drag_src_id);
+                m.data.remove::<f32>(self.drag_grip_id);
             });
         } else if drag_src.is_some() {
-            // Repaint continuously while a drag is in flight so the
-            // ghost follows the cursor smoothly without waiting for
-            // unrelated input.
             ui.ctx().request_repaint();
         }
-    });
+    }
 
-    response
+    fn run(mut self, ui: &mut egui::Ui) -> ActivityBarResponse<Mode> {
+        self.refresh_items();
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            ui.add_space(self.item_padding);
+            let count = self.bar.items.len();
+            if count == 0 {
+                return;
+            }
+            let slots = self.allocate_slots(ui);
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+            self.capture_drag_start(ui, &slots, pointer_pos);
+            let drag_src: Option<usize> = ui.memory(|m| m.data.get_temp(self.drag_src_id));
+            let drag_grip: f32 = ui
+                .memory(|m| m.data.get_temp::<f32>(self.drag_grip_id))
+                .unwrap_or(self.item_h / 2.0);
+            let first_top = slots[0].0.top();
+            let target_idx: Option<usize> = match (drag_src, pointer_pos) {
+                (Some(_), Some(p)) => {
+                    let raw = ((p.y - first_top) / self.item_h).floor();
+                    Some((raw.max(0.0) as usize).min(count - 1))
+                }
+                _ => None,
+            };
+            for (idx, slot) in slots.iter().enumerate() {
+                self.render_item(ui, idx, slot, drag_src, target_idx);
+            }
+            self.paint_ghost(ui, &slots, drag_src, target_idx, drag_grip, pointer_pos);
+            self.finish_drag(ui, drag_src, target_idx);
+        });
+        self.response
+    }
+}
+
+impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
+    /// Render the activity bar inside the given `Ui`. Returns the
+    /// interaction outcome for the workbench to act on. Thin façade
+    /// over `Render::run`.
+    pub(crate) fn show<Tab, B>(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Palette,
+        behavior: &mut B,
+    ) -> ActivityBarResponse<Mode>
+    where
+        Tab: Document,
+        B: Host<Tab, Mode> + ?Sized,
+    {
+        let size = theme.activity_item_size;
+        let item_padding = (theme.activity_bar_width - size).max(0.0) / 2.0;
+        let item_h = size + 8.0;
+        let drag_src_id = ui.id().with("egui_workbench::activity_drag_src");
+        let drag_grip_id = ui.id().with("egui_workbench::activity_drag_grip");
+        let render = Render::<Tab, Mode, B> {
+            bar: self,
+            theme,
+            behavior,
+            size,
+            item_padding,
+            item_h,
+            drag_src_id,
+            drag_grip_id,
+            response: ActivityBarResponse::default(),
+            _doc: std::marker::PhantomData,
+        };
+        render.run(ui)
+    }
+}
+
+/// Appearance + content of one activity item, independent of where it
+/// is painted. Bundles the item's side/state (`side`, `is_active`,
+/// `hovered`), its content (`icon`, `label`), and its visual tuning
+/// (`visuals`, `size`, `accent`, `opacity`) so both the in-strip render
+/// and the floating drag-ghost can describe an item with one value.
+struct ActivityItemPaint<'a> {
+    side: Side,
+    is_active: bool,
+    hovered: bool,
+    visuals: &'a egui::style::WidgetVisuals,
+    icon: Option<egui::Image<'static>>,
+    label: &'a str,
+    size: f32,
+    accent: Color32,
+    opacity: f32,
 }
 
 /// Paint a single activity item (accent rail, background, icon-or-glyph)
 /// into the given rect using the supplied painter. Factored out so the
 /// floating drag-ghost can share the exact same visual treatment as the
 /// in-strip rendering.
-#[allow(clippy::too_many_arguments)]
 fn paint_activity_item(
     ui: &egui::Ui,
     painter: &egui::Painter,
     rect: Rect,
-    side: SideBarSide,
-    is_active: bool,
-    hovered: bool,
-    visuals: &egui::style::WidgetVisuals,
-    icon: Option<egui::Image<'static>>,
-    label: &str,
-    size: f32,
-    accent: Color32,
-    opacity: f32,
+    item: &ActivityItemPaint<'_>,
 ) {
+    let ActivityItemPaint {
+        side,
+        is_active,
+        hovered,
+        visuals,
+        icon,
+        label,
+        size,
+        accent,
+        opacity,
+    } = item;
+    let (side, is_active, hovered, size, accent, opacity) =
+        (*side, *is_active, *hovered, *size, *accent, *opacity);
     let accent_col = accent.gamma_multiply(opacity);
     // Leading-edge accent rail when active.
     if is_active {
         let accent_x = match side {
-            SideBarSide::Left => rect.left() + 1.5,
-            SideBarSide::Right => rect.right() - 1.5,
+            Side::Left => rect.left() + 1.5,
+            Side::Right => rect.right() - 1.5,
         };
         painter.line_segment(
             [
@@ -431,7 +527,7 @@ fn paint_activity_item(
     };
     let fg = fg.gamma_multiply(opacity);
     if let Some(image) = icon {
-        image.tint(fg).paint_at(ui, icon_rect);
+        image.clone().tint(fg).paint_at(ui, icon_rect);
     } else {
         let glyph = label
             .chars()
@@ -445,36 +541,35 @@ fn paint_activity_item(
     }
 }
 
-/// A `Painter` for activity bar badges. Badges are drawn on egui's
-/// **foreground layer** rather than the panel's own painter so they
-/// escape the side-top-panel frame's inner-margin clip. Without this,
-/// the panel's `Frame` would clip the badge at `panel_right -
-/// inner_margin` (typically 4-6 px), occluding the badge's right edge
-/// even though `item_rect.right()` reaches the panel's outer edge.
-fn badge_painter(ui: &egui::Ui) -> egui::Painter {
-    let layer = egui::LayerId::new(
-        egui::Order::Foreground,
-        ui.id().with("egui_workbench::activity_badges"),
-    );
-    ui.ctx().layer_painter(layer)
-}
-
-fn paint_badge(ui: &egui::Ui, item_rect: Rect, badge: &ActivityBadge, accent: Color32) {
-    let painter = badge_painter(ui);
-    match badge {
-        ActivityBadge::Dot => {
-            // Dot at the icon's top-right corner. Pulled well inside
-            // the activity bar so it stays visible even if the panel's
-            // frame margin trims a few pixels.
-            let center = item_rect.right_top() + vec2(-8.0, 8.0);
-            painter.circle_filled(center, 3.5, accent);
-        }
-        ActivityBadge::Count(n) => {
-            let text = if *n > 99 { "99+".to_string() } else { n.to_string() };
-            paint_badge_pill(ui, &painter, item_rect, &text, accent);
-        }
-        ActivityBadge::Text(s) => {
-            paint_badge_pill(ui, &painter, item_rect, s, accent);
+impl ActivityBadge {
+    /// Paint this badge on top of `item_rect`. Badges go on egui's
+    /// **foreground layer** rather than the panel's own painter so
+    /// they escape the side-top-panel frame's inner-margin clip.
+    /// Without this, the panel's `Frame` would clip the badge at
+    /// `panel_right - inner_margin` (typically 4-6 px), occluding the
+    /// badge's right edge even though `item_rect.right()` reaches the
+    /// panel's outer edge.
+    fn paint(&self, ui: &egui::Ui, item_rect: Rect, accent: Color32) {
+        let layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            ui.id().with("egui_workbench::activity_badges"),
+        );
+        let painter = ui.ctx().layer_painter(layer);
+        match self {
+            ActivityBadge::Dot => {
+                // Dot at the icon's top-right corner. Pulled well
+                // inside the activity bar so it stays visible even if
+                // the panel's frame margin trims a few pixels.
+                let center = item_rect.right_top() + vec2(-8.0, 8.0);
+                painter.circle_filled(center, 3.5, accent);
+            }
+            ActivityBadge::Count(n) => {
+                let text = if *n > 99 { "99+".to_string() } else { n.to_string() };
+                paint_badge_pill(ui, &painter, item_rect, &text, accent);
+            }
+            ActivityBadge::Text(s) => {
+                paint_badge_pill(ui, &painter, item_rect, s, accent);
+            }
         }
     }
 }

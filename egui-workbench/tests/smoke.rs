@@ -2,16 +2,23 @@
 //! in hiker's `app/src/smoke_tests.rs`: build a workbench, drive it for
 //! a few frames in a headless harness, assert no panic.
 
-use egui_workbench::{
-    DocumentTab, OpenTabOptions, TabState, TabUiContext, Workbench, WorkbenchBehavior,
-};
+use egui_workbench::tab::Document;
 
+use egui_workbench::workspace::OpenTabOptions;
+
+use egui_workbench::tab::State;
+
+use egui_workbench::tab::UiContext;
+
+use egui_workbench::workspace::Workbench;
+
+use egui_workbench::behavior::Host;
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TestTab {
     title: String,
 }
 
-impl DocumentTab for TestTab {
+impl Document for TestTab {
     fn title(&self) -> egui::WidgetText {
         self.title.clone().into()
     }
@@ -24,24 +31,19 @@ enum TestMode {
 
 struct TestBehavior;
 
-impl WorkbenchBehavior<TestTab, TestMode> for TestBehavior {
-    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut TestTab, _ctx: TabUiContext<'_>) {
+impl Host<TestTab, TestMode> for TestBehavior {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, tab: &mut TestTab, _ctx: UiContext<'_>) {
         ui.label(&tab.title);
     }
 }
 
-fn make_workbench() -> Workbench<TestTab, TestMode> {
+#[test]
+fn workbench_ui_runs_clean_for_three_frames() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     wb.open_tab(
         TestTab { title: "alpha".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
-    wb
-}
-
-#[test]
-fn workbench_ui_runs_clean_for_three_frames() {
-    let mut wb = make_workbench();
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1200.0, 800.0))
         .build(|ctx: &egui::Context| {
@@ -58,18 +60,18 @@ fn pinned_tabs_stay_leftmost() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     let pinned = wb.open_tab(
         TestTab { title: "pinned".into() },
-        OpenTabOptions {
-            state: TabState::Pinned,
+        &OpenTabOptions {
+            state: State::Pinned,
             ..OpenTabOptions::default()
         },
     );
     let _r1 = wb.open_tab(
         TestTab { title: "reg1".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     let _r2 = wb.open_tab(
         TestTab { title: "reg2".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
 
     // Run one frame so the enforce_pinned_first pass executes, then
@@ -97,15 +99,15 @@ fn preview_replacement_keeps_only_latest() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     let a = wb.open_tab(
         TestTab { title: "A".into() },
-        OpenTabOptions {
-            state: TabState::Preview,
+        &OpenTabOptions {
+            state: State::Preview,
             ..OpenTabOptions::default()
         },
     );
     let b = wb.open_tab(
         TestTab { title: "B".into() },
-        OpenTabOptions {
-            state: TabState::Preview,
+        &OpenTabOptions {
+            state: State::Preview,
             ..OpenTabOptions::default()
         },
     );
@@ -120,15 +122,15 @@ fn workbench_with_pinned_and_preview_tabs_runs_clean() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     wb.open_tab(
         TestTab { title: "pinned".into() },
-        OpenTabOptions { state: TabState::Pinned, ..OpenTabOptions::default() },
+        &OpenTabOptions { state: State::Pinned, ..OpenTabOptions::default() },
     );
     wb.open_tab(
         TestTab { title: "regular".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     wb.open_tab(
         TestTab { title: "preview".into() },
-        OpenTabOptions { state: TabState::Preview, ..OpenTabOptions::default() },
+        &OpenTabOptions { state: State::Preview, ..OpenTabOptions::default() },
     );
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1200.0, 800.0))
@@ -146,11 +148,11 @@ fn panel_area_visible_and_invisible_runs_clean() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     wb.open_panel_tab(
         TestTab { title: "term".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     wb.open_panel_tab(
         TestTab { title: "out".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     {
         let mut harness = egui_kittest::Harness::builder()
@@ -199,22 +201,22 @@ fn close_others_skips_pinned() {
     let mut wb = Workbench::<TestTab, TestMode>::new();
     let pinned = wb.open_tab(
         TestTab { title: "pinned".into() },
-        OpenTabOptions {
-            state: TabState::Pinned,
+        &OpenTabOptions {
+            state: State::Pinned,
             ..OpenTabOptions::default()
         },
     );
     let keep = wb.open_tab(
         TestTab { title: "keep".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     let _drop1 = wb.open_tab(
         TestTab { title: "drop1".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
     let _drop2 = wb.open_tab(
         TestTab { title: "drop2".into() },
-        OpenTabOptions::default(),
+        &OpenTabOptions::default(),
     );
 
     // Need to render one frame so the tree's Tabs container is populated

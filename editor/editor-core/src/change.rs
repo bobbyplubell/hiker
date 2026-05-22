@@ -1,4 +1,4 @@
-//! ChangeSet: list of (Retain | Insert | Delete) operations describing an edit.
+//! Set: list of (Retain | Insert | Delete) operations describing an edit.
 //!
 //! Modeled on CodeMirror 6 / Helix. ChangeSets compose, invert, and map
 //! positions through edits.
@@ -16,13 +16,13 @@ pub enum Op {
 }
 
 #[derive(Clone, Debug)]
-pub struct ChangeSet {
+pub struct Set {
     ops: Vec<Op>,
     len_before: u32,
     len_after: u32,
 }
 
-impl ChangeSet {
+impl Set {
     pub fn empty(doc_len: usize) -> Self {
         let mut cs = Self { ops: Vec::new(), len_before: 0, len_after: 0 };
         if doc_len > 0 {
@@ -60,11 +60,11 @@ impl ChangeSet {
         &self.ops
     }
 
-    pub fn len_before(&self) -> usize {
+    pub const fn len_before(&self) -> usize {
         self.len_before as usize
     }
 
-    pub fn len_after(&self) -> usize {
+    pub const fn len_after(&self) -> usize {
         self.len_after as usize
     }
 
@@ -109,7 +109,7 @@ impl ChangeSet {
         assert_eq!(
             rope.len_bytes(),
             self.len_before as usize,
-            "ChangeSet length mismatch"
+            "Set length mismatch"
         );
         let mut out = String::with_capacity(self.len_after as usize);
         let mut cursor = 0usize;
@@ -131,11 +131,11 @@ impl ChangeSet {
         Rope::from_str(&out)
     }
 
-    /// Produce a ChangeSet that, applied to the *output* of self, returns the
+    /// Produce a Set that, applied to the *output* of self, returns the
     /// original input. Captures deleted text from `before`.
-    pub fn invert(&self, before: &Rope) -> ChangeSet {
+    pub fn invert(&self, before: &Rope) -> Set {
         assert_eq!(before.len_bytes(), self.len_before as usize);
-        let mut inv = ChangeSet { ops: Vec::new(), len_before: 0, len_after: 0 };
+        let mut inv = Set { ops: Vec::new(), len_before: 0, len_after: 0 };
         let mut cursor = 0usize;
         for op in &self.ops {
             match op {
@@ -194,14 +194,14 @@ impl ChangeSet {
 
     /// Compose two changesets: self then other. Result has the same effect as
     /// applying self followed by other.
-    pub fn compose(&self, other: &ChangeSet) -> ChangeSet {
+    pub fn compose(&self, other: &Set) -> Set {
         assert_eq!(
             self.len_after, other.len_before,
             "compose length mismatch: {} vs {}",
             self.len_after, other.len_before,
         );
 
-        let mut out = ChangeSet { ops: Vec::new(), len_before: 0, len_after: 0 };
+        let mut out = Set { ops: Vec::new(), len_before: 0, len_after: 0 };
         let mut a = OpCursor::new(&self.ops);
         let mut b = OpCursor::new(&other.ops);
 
@@ -225,8 +225,15 @@ impl ChangeSet {
                     panic!("compose: `self` produces more than `other` consumes");
                 }
                 (Some(op_a), Some(op_b)) => {
-                    let len_a = produced_len(&op_a);
-                    let len_b = consumed_len(&op_b);
+                    let len_a = match &op_a {
+                        Op::Retain(n) => *n as usize,
+                        Op::Insert(s) => s.len(),
+                        Op::Delete(_) => 0,
+                    };
+                    let len_b = match &op_b {
+                        Op::Retain(n) | Op::Delete(n) => *n as usize,
+                        Op::Insert(_) => 0,
+                    };
                     let take = len_a.min(len_b);
                     match (op_a, op_b) {
                         (Op::Retain(_), Op::Retain(_)) => {
@@ -237,7 +244,9 @@ impl ChangeSet {
                         }
                         (Op::Insert(s), Op::Retain(_)) => {
                             // Keep the first `take` bytes of the insertion.
-                            let kept = byte_slice(&s, 0, take);
+                            // Char-boundary safety: insertions came from legal
+                            // char-boundary edits.
+                            let kept = &s[0..take];
                             out.push(Op::Insert(SmolStr::from(kept)));
                         }
                         (Op::Insert(_), Op::Delete(_)) => {
@@ -264,7 +273,7 @@ struct OpCursor<'a> {
 }
 
 impl<'a> OpCursor<'a> {
-    fn new(ops: &'a [Op]) -> Self {
+    const fn new(ops: &'a [Op]) -> Self {
         Self { ops, idx: 0, offset: 0 }
     }
 
@@ -283,7 +292,7 @@ impl<'a> OpCursor<'a> {
         })
     }
 
-    fn advance(&mut self) {
+    const fn advance(&mut self) {
         self.idx += 1;
         self.offset = 0;
     }
@@ -300,33 +309,12 @@ impl<'a> OpCursor<'a> {
     }
 }
 
-fn produced_len(op: &Op) -> usize {
-    match op {
-        Op::Retain(n) => *n as usize,
-        Op::Insert(s) => s.len(),
-        Op::Delete(_) => 0,
-    }
-}
-
-fn consumed_len(op: &Op) -> usize {
-    match op {
-        Op::Retain(n) | Op::Delete(n) => *n as usize,
-        Op::Insert(_) => 0,
-    }
-}
-
-fn byte_slice(s: &str, start: usize, end: usize) -> &str {
-    // Caller guarantees this lands on char boundaries when input came from
-    // legal char-boundary edits. Bytes-only callers must enforce themselves.
-    &s[start..end]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cs(doc_len: usize, edits: &[(std::ops::Range<usize>, &str)]) -> ChangeSet {
-        ChangeSet::of(
+    fn cs(doc_len: usize, edits: &[(std::ops::Range<usize>, &str)]) -> Set {
+        Set::of(
             doc_len,
             edits.iter().map(|(r, s)| (r.clone(), s.to_string())),
         )
@@ -334,7 +322,7 @@ mod tests {
 
     #[test]
     fn empty_identity() {
-        let c = ChangeSet::empty(10);
+        let c = Set::empty(10);
         assert!(c.is_identity());
         let r = Rope::from_str("0123456789");
         assert_eq!(c.apply(&r), r);

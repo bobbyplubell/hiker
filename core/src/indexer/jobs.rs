@@ -9,15 +9,18 @@ use std::time::SystemTime;
 
 use tokio::sync::{broadcast, watch, OnceCell};
 
-use crate::chunker::{Chunker, MarkdownChunker, TxtChunker};
-use crate::embed::{Embedder, EmbedError, FastembedEmbedder};
-use crate::hash::hash_str;
-use crate::store::{new_id, NoteUpsert, Store};
+use crate::chunker::Chunker;
+use crate::chunker::markdown::Markdown;
+use crate::chunker::txt::Txt;
+use crate::embed::{Embedder, Error as EmbedError, FastembedEmbedder};
+use crate::hash_string;
+use crate::store::dto::{new_id, NoteUpsert};
+use crate::store::Store;
 use crate::watcher::is_ignored;
 
 use super::{
     frontmatter_hiker_id, now_secs, path_extension, submit_embedder_load_task, update_status,
-    update_total_notes, IndexJob, IndexJobTx, IndexStatus, IndexerError, ProgressEvent,
+    update_total_notes, IndexJob, IndexJobTx, IndexStatus, Error, ProgressEvent,
     MAX_FILE_BYTES,
 };
 
@@ -50,7 +53,7 @@ pub(super) struct UpsertCtx<'a> {
 
 impl<'a> JobCtx<'a> {
     /// Narrow the job-level borrow bundle to the subset that pure-ingest
-    /// helpers (`handle_upsert_job`, `handle_restore_from_trash`,
+    /// helpers (`handle_upsert`, `handle_restore_from_trash`,
     /// `handle_inline_upsert`) actually need.
     pub(super) fn as_upsert_ctx(&self) -> UpsertCtx<'a> {
         UpsertCtx {
@@ -58,6 +61,150 @@ impl<'a> JobCtx<'a> {
             embedder: self.embedder,
             progress: self.progress,
             status: self.status,
+        }
+    }
+
+    async fn handle_upsert(&self, store: &mut Store, rel_path: String, force: bool) {
+        let progress = self.progress;
+        let status = self.status;
+        let pending = self.pending;
+        // Make sure the path is in the pending set even if it didn't go
+        // through a tracking sender (e.g. enqueued by some legacy path);
+        // remove on every terminal outcome below.
+        pending.lock().unwrap().insert(rel_path.clone());
+        let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
+        let outcome = process_upsert(self.vault_root, store, self.embedder.clone(), &rel_path, force).await;
+        pending.lock().unwrap().remove(&rel_path);
+        match outcome {
+            Ok(UpsertOutcome::Indexed) => {
+                tracing::debug!(path = %rel_path, "indexer: file indexed");
+                let _ = progress.send(ProgressEvent::Finished { path: rel_path });
+            }
+            Ok(UpsertOutcome::Unchanged) => {
+                let _ = progress.send(ProgressEvent::Skipped {
+                    path: rel_path,
+                    reason: "unchanged".into(),
+                });
+            }
+            Ok(UpsertOutcome::Skipped(reason)) => {
+                tracing::debug!(
+                    path = %rel_path,
+                    reason = %reason,
+                    "indexer: file skipped",
+                );
+                let _ = progress.send(ProgressEvent::Skipped {
+                    path: rel_path,
+                    reason,
+                });
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                tracing::error!(error = %e, path = %rel_path, "indexer: upsert failed");
+                update_status(status, |s| s.last_error = Some(msg.clone()));
+                let _ = progress.send(ProgressEvent::Error {
+                    path: Some(rel_path),
+                    message: msg,
+                });
+            }
+        }
+    }
+
+    async fn handle_rename(&self, store: &mut Store, from: String, to: String) {
+        let vault = self.vault;
+        let progress = self.progress;
+        let status = self.status;
+        let self_tx = self.self_tx;
+        let watcher_cell = self.watcher_cell;
+        let changes_cell = self.changes_cell;
+        // Inline `process_rename` (used only here): rename the stored path
+        // when an id is present, else return `Ok(false)` so the caller can
+        // treat the destination as a new upsert.
+        let process_result: Result<bool, Error> = (|| {
+            let id = match store.id_for_path(&from)? {
+                Some(id) => id,
+                None => return Ok(false),
+            };
+            store.rename_note(&id, &to)?;
+            Ok(true)
+        })();
+        match process_result {
+            Ok(true) => {
+                let _ = progress.send(ProgressEvent::Renamed {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+                // status: trail-auto-update-on-note-move
+                // Watcher-driven external rename: run the trails update.
+                run_trails_on_note_moved(
+                    watcher_cell, self_tx, vault, changes_cell, store, &from, &to,
+                )
+                .await;
+            }
+            Ok(false) => {
+                let upsert_ctx = self.as_upsert_ctx();
+                if let Err(e) = handle_inline_upsert(&upsert_ctx, store, &to).await {
+                    let msg = format!("{e}");
+                    update_status(status, |s| s.last_error = Some(msg.clone()));
+                    let _ = progress.send(ProgressEvent::Error {
+                        path: Some(to),
+                        message: msg,
+                    });
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                update_status(status, |s| s.last_error = Some(msg.clone()));
+                let _ = progress.send(ProgressEvent::Error {
+                    path: Some(to),
+                    message: msg,
+                });
+            }
+        }
+    }
+}
+
+impl<'a> UpsertCtx<'a> {
+    async fn handle_restore_from_trash(
+        &self,
+        vault: &crate::vault::Vault,
+        store: &mut Store,
+        id: &str,
+    ) -> Result<crate::trash::Entry, crate::errors::HikerError> {
+        let progress = self.progress;
+        let status = self.status;
+        let trash = crate::trash::Trash::open(vault.root());
+        match crate::vault::restore_note(vault, None, &trash, id) {
+            Ok(entry) => {
+                // Re-ingest the restored .md files inline so the index
+                // picks them up without waiting on watcher events
+                // (which the caller suppressed). For folders, walk
+                // the manifest's recorded members; for files, just the
+                // single original_path.
+                let to_index: Vec<String> = match &entry.members {
+                    Some(m) => m.clone(),
+                    None => vec![entry.original_path.clone()],
+                };
+                for rel_path in &to_index {
+                    if let Err(e) = handle_inline_upsert(self, store, rel_path).await {
+                        let msg = format!("{e}");
+                        update_status(status, |s| s.last_error = Some(msg.clone()));
+                        let _ = progress.send(ProgressEvent::Error {
+                            path: Some(rel_path.clone()),
+                            message: msg,
+                        });
+                    }
+                }
+                Ok(entry)
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                update_status(status, |s| s.last_error = Some(msg.clone()));
+                let _ = progress.send(ProgressEvent::Error {
+                    path: Some(id.to_string()),
+                    message: msg,
+                });
+                Err(e)
+            }
         }
     }
 }
@@ -80,125 +227,158 @@ impl<'a> JobCtx<'a> {
 /// touching anything.
 ///
 /// status: embedder-hot-reload-on-model-change
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_reload_embedder(
-    embedder: &mut Arc<dyn Embedder>,
-    embedder_cell: &Arc<RwLock<Option<Arc<dyn Embedder>>>>,
-    store: &mut Store,
-    status: &watch::Sender<IndexStatus>,
-    progress: &broadcast::Sender<ProgressEvent>,
-    self_tx: &IndexJobTx,
-    pending: &Arc<Mutex<HashSet<String>>>,
-    model_id: String,
-    reply: tokio::sync::oneshot::Sender<Result<(), crate::error::HikerError>>,
-    tasks: Option<&Arc<crate::tasks::Queue>>,
-) {
-    // Same model id → no-op. The set_setting caller already short-circuits
-    // on identical TOML values, but defensive: a redundant ReloadEmbedder
-    // (e.g. from a future MCP path or test) shouldn't tear down chunk_vecs.
-    //
-    // status: embedder-model-load-as-task
-    // The queue submit happens *after* the short-circuit so a redundant
-    // reload doesn't create an empty / instantly-complete row.
-    if embedder.version() == model_id {
-        let _ = reply.send(Ok(()));
-        return;
-    }
-    tracing::info!(
-        from = embedder.version(),
-        to = %model_id,
-        "indexer: hot-reloading embedder",
-    );
-    // Enqueue a queue row for the load so the user sees the work in the
-    // queue badge / detail page.
-    let load_task_id = if let Some(q) = tasks {
-        Some(submit_embedder_load_task(q, &model_id).await)
-    } else {
-        None
-    };
-    let id_for_load = model_id.clone();
-    let load = tokio::task::spawn_blocking(move || {
-        FastembedEmbedder::load_id(&id_for_load).map(|e| {
-            let arc: Arc<dyn Embedder> = Arc::new(e);
-            arc
+/// Borrow-bundle for the embedder-reload handler. Methods on this struct
+/// stay exempt from `single_call_fn` (called only by the scheduler loop)
+/// and split the work across small phases so the orchestrator stays under
+/// the cognitive-complexity cap.
+pub(super) struct ReloadCtx<'a> {
+    pub embedder: &'a mut Arc<dyn Embedder>,
+    pub embedder_cell: &'a Arc<RwLock<Option<Arc<dyn Embedder>>>>,
+    pub store: &'a mut Store,
+    pub status: &'a watch::Sender<IndexStatus>,
+    pub progress: &'a broadcast::Sender<ProgressEvent>,
+    pub self_tx: &'a IndexJobTx,
+    pub tasks: Option<&'a Arc<crate::tasks::queue::Queue>>,
+}
+
+type ReloadReply = tokio::sync::oneshot::Sender<Result<(), crate::errors::HikerError>>;
+
+type LoadResult = Result<Result<Arc<dyn Embedder>, crate::embed::Error>, tokio::task::JoinError>;
+
+impl<'a> ReloadCtx<'a> {
+    /// status: embedder-hot-reload-on-model-change
+    pub(super) async fn run(mut self, model_id: String, reply: ReloadReply) {
+        // Same model id → no-op. The set_setting caller already short-circuits
+        // on identical TOML values, but defensive: a redundant ReloadEmbedder
+        // (e.g. from a future MCP path or test) shouldn't tear down chunk_vecs.
+        //
+        // status: embedder-model-load-as-task
+        // The queue submit happens *after* the short-circuit so a redundant
+        // reload doesn't create an empty / instantly-complete row.
+        if self.embedder.version() == model_id {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        tracing::info!(
+            from = self.embedder.version(),
+            to = %model_id,
+            "indexer: hot-reloading embedder",
+        );
+        let load_task_id = match self.tasks {
+            Some(q) => Some(submit_embedder_load_task(q, &model_id).await),
+            None => None,
+        };
+        let id_for_load = model_id.clone();
+        let load: LoadResult = tokio::task::spawn_blocking(move || {
+            FastembedEmbedder::load_id(&id_for_load).map(|e| {
+                let arc: Arc<dyn Embedder> = Arc::new(e);
+                arc
+            })
         })
-    })
-    .await;
-    // Resolve the queue row up front so a downstream `ensure_chunk_vecs_dim`
-    // failure doesn't leave the row stuck in Leased. Mirror of the startup
-    // path's resolve.
-    if let (Some(q), Some(id)) = (tasks, load_task_id.as_ref()) {
-        match &load {
-            Ok(Ok(_)) => {
-                let _ = q
-                    .submit_result(id, serde_json::json!({ "ok": true }))
-                    .await;
+        .await;
+        // Resolve the queue row up front so a downstream `ensure_chunk_vecs_dim`
+        // failure doesn't leave the row stuck in Leased. Mirror of the startup
+        // path's resolve.
+        if let (Some(q), Some(id)) = (self.tasks, load_task_id.as_ref()) {
+            match &load {
+                Ok(Ok(_)) => {
+                    let _ = q
+                        .submit_result(id, serde_json::json!({ "ok": true }))
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = q.fail(id, format!("embedder reload: {e}")).await;
+                }
+                Err(e) => {
+                    let _ = q.fail(id, format!("embedder reload spawn: {e}")).await;
+                }
             }
+        }
+
+        let new_embedder = match self.unwrap_load(load, &model_id) {
+            Ok(e) => e,
+            Err(msg) => {
+                let _ = reply.send(Err(crate::errors::HikerError::Io(msg)));
+                return;
+            }
+        };
+        let new_dim = new_embedder.dim();
+        self.swap_embedder(new_embedder);
+        self.finalize_dim_rebuild(new_dim, reply);
+        if let Err(e) = self.self_tx.send(IndexJob::FullScan { force: true }).await {
+            tracing::warn!(error = %e, "indexer: failed to enqueue post-reload FullScan");
+        }
+    }
+
+    /// Unpack the spawn_blocking + load result. On the error paths,
+    /// reports through status + progress and returns the message string
+    /// for the caller to send through `reply`.
+    fn unwrap_load(
+        &self,
+        load: LoadResult,
+        model_id: &str,
+    ) -> Result<Arc<dyn Embedder>, String> {
+        match load {
+            Ok(Ok(e)) => Ok(e),
             Ok(Err(e)) => {
-                let _ = q.fail(id, format!("embedder reload: {e}")).await;
+                let msg = format!("embedder reload failed: {e}");
+                tracing::error!(error = %e, model = %model_id, "indexer: embedder reload failed");
+                update_status(self.status, |s| s.last_error = Some(msg.clone()));
+                let _ = self.progress.send(ProgressEvent::Error {
+                    path: None,
+                    message: msg.clone(),
+                });
+                Err(msg)
             }
             Err(e) => {
-                let _ = q.fail(id, format!("embedder reload spawn: {e}")).await;
+                let msg = format!("embedder reload spawn: {e}");
+                tracing::error!(error = %e, "indexer: embedder reload spawn failed");
+                update_status(self.status, |s| s.last_error = Some(msg.clone()));
+                let _ = self.progress.send(ProgressEvent::Error {
+                    path: None,
+                    message: msg.clone(),
+                });
+                Err(msg)
             }
         }
     }
-    let new_embedder: Arc<dyn Embedder> = match load {
-        Ok(Ok(e)) => e,
-        Ok(Err(e)) => {
-            let msg = format!("embedder reload failed: {e}");
-            tracing::error!(error = %e, model = %model_id, "indexer: embedder reload failed");
-            update_status(status, |s| s.last_error = Some(msg.clone()));
-            let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
-            let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
-            return;
+
+    fn swap_embedder(&mut self, new_embedder: Arc<dyn Embedder>) {
+        // Swap the live Arc — loop-local first so any same-tick logic uses
+        // it, then the shared cell so the search-query embedder picks it up
+        // on its next read.
+        *self.embedder = new_embedder.clone();
+        match self.embedder_cell.write() {
+            Ok(mut guard) => *guard = Some(new_embedder),
+            Err(_) => tracing::error!("indexer: embedder cell lock poisoned on reload"),
         }
-        Err(e) => {
-            let msg = format!("embedder reload spawn: {e}");
-            tracing::error!(error = %e, "indexer: embedder reload spawn failed");
-            update_status(status, |s| s.last_error = Some(msg.clone()));
-            let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
-            let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
-            return;
+    }
+
+    fn finalize_dim_rebuild(&mut self, new_dim: usize, reply: ReloadReply) {
+        // Reseat chunk_vecs to the new dim. Same helper used at indexer
+        // startup; drops + recreates the vec0 table and clears
+        // notes.embedder_version so the upcoming reindex actually re-embeds.
+        if let Err(e) = self.store.ensure_chunk_vecs_dim(new_dim) {
+            let msg = format!("chunk_vecs rebuild after model swap: {e}");
+            tracing::error!(error = %e, "indexer: ensure_chunk_vecs_dim failed after reload");
+            update_status(self.status, |s| s.last_error = Some(msg.clone()));
+            let _ = self.progress.send(ProgressEvent::Error {
+                path: None,
+                message: msg.clone(),
+            });
+            // The new embedder is already swapped in — the caller has
+            // committed to this model. Report the dim-rebuild failure
+            // but still enqueue the reindex so we don't leave the queue
+            // empty with a half-applied change.
+            let _ = reply.send(Err(crate::errors::HikerError::Io(msg)));
+        } else {
+            update_status(self.status, |s| {
+                s.last_error = None;
+                s.model_ready = true;
+            });
+            let _ = self.progress.send(ProgressEvent::ModelLoaded);
+            let _ = reply.send(Ok(()));
         }
-    };
-    let new_dim = new_embedder.dim();
-    // Swap the live Arc — loop-local first so any same-tick logic uses
-    // it, then the shared cell so the search-query embedder picks it up
-    // on its next read.
-    *embedder = new_embedder.clone();
-    match embedder_cell.write() {
-        Ok(mut guard) => *guard = Some(new_embedder),
-        Err(_) => tracing::error!("indexer: embedder cell lock poisoned on reload"),
-    }
-    // Reseat chunk_vecs to the new dim. Same helper used at indexer
-    // startup; drops + recreates the vec0 table and clears
-    // notes.embedder_version so the upcoming reindex actually re-embeds.
-    if let Err(e) = store.ensure_chunk_vecs_dim(new_dim) {
-        let msg = format!("chunk_vecs rebuild after model swap: {e}");
-        tracing::error!(error = %e, "indexer: ensure_chunk_vecs_dim failed after reload");
-        update_status(status, |s| s.last_error = Some(msg.clone()));
-        let _ = progress.send(ProgressEvent::Error { path: None, message: msg.clone() });
-        // The new embedder is already swapped in — the caller has
-        // committed to this model. Report the dim-rebuild failure
-        // but still enqueue the reindex so we don't leave the queue
-        // empty with a half-applied change.
-        let _ = reply.send(Err(crate::error::HikerError::Io(msg)));
-    } else {
-        update_status(status, |s| {
-            s.last_error = None;
-            s.model_ready = true;
-        });
-        let _ = progress.send(ProgressEvent::ModelLoaded);
-        let _ = reply.send(Ok(()));
-    }
-    // Enqueue a full vault reindex with `force = true` so the
-    // (now-cleared) embedder_version short-circuit doesn't keep any
-    // rows from being re-embedded. self_tx tracks pending paths
-    // automatically once per-file Upserts fan out inside the loop.
-    let _ = self_tx; // appease borrow checker — used below
-    let _ = pending; // (the FullScan handler manages pending itself)
-    if let Err(e) = self_tx.send(IndexJob::FullScan { force: true }).await {
-        tracing::warn!(error = %e, "indexer: failed to enqueue post-reload FullScan");
     }
 }
 
@@ -219,7 +399,7 @@ pub(super) async fn handle_simple_job(
     let _ = embedder; // some arms don't need it directly; per-handler ctxs pull it back in
     match job {
         IndexJob::Upsert { rel_path, force } => {
-            handle_upsert_job(ctx, store, rel_path, force).await;
+            ctx.handle_upsert(store, rel_path, force).await;
         }
         IndexJob::Delete { rel_path } => match process_delete(store, &rel_path) {
             Ok(true) => {
@@ -236,7 +416,7 @@ pub(super) async fn handle_simple_job(
             }
         },
         IndexJob::Rename { from, to } => {
-            handle_rename_job(ctx, store, from, to).await;
+            ctx.handle_rename(store, from, to).await;
         }
         IndexJob::Move { from, to, reply } => {
             // The caller suppresses the watcher around this; we don't
@@ -308,7 +488,7 @@ pub(super) async fn handle_simple_job(
         }
         IndexJob::RestoreFromTrash { id, reply } => {
             let upsert_ctx = ctx.as_upsert_ctx();
-            let result = handle_restore_from_trash(&upsert_ctx, vault, store, &id).await;
+            let result = upsert_ctx.handle_restore_from_trash(vault, store, &id).await;
             let _ = reply.send(result);
         }
         IndexJob::FullScan { .. } => {
@@ -328,147 +508,6 @@ pub(super) async fn handle_simple_job(
                     "indexer: touch_note_access failed",
                 );
             }
-        }
-    }
-}
-
-async fn handle_upsert_job(
-    ctx: &JobCtx<'_>,
-    store: &mut Store,
-    rel_path: String,
-    force: bool,
-) {
-    let progress = ctx.progress;
-    let status = ctx.status;
-    let pending = ctx.pending;
-    // Make sure the path is in the pending set even if it didn't go
-    // through a tracking sender (e.g. enqueued by some legacy path);
-    // remove on every terminal outcome below.
-    pending.lock().unwrap().insert(rel_path.clone());
-    let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
-    let outcome = process_upsert(ctx.vault_root, store, ctx.embedder.clone(), &rel_path, force).await;
-    pending.lock().unwrap().remove(&rel_path);
-    match outcome {
-        Ok(UpsertOutcome::Indexed) => {
-            tracing::debug!(path = %rel_path, "indexer: file indexed");
-            let _ = progress.send(ProgressEvent::Finished { path: rel_path });
-        }
-        Ok(UpsertOutcome::Unchanged) => {
-            let _ = progress.send(ProgressEvent::Skipped {
-                path: rel_path,
-                reason: "unchanged".into(),
-            });
-        }
-        Ok(UpsertOutcome::Skipped(reason)) => {
-            tracing::debug!(
-                path = %rel_path,
-                reason = %reason,
-                "indexer: file skipped",
-            );
-            let _ = progress.send(ProgressEvent::Skipped {
-                path: rel_path,
-                reason,
-            });
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            tracing::error!(error = %e, path = %rel_path, "indexer: upsert failed");
-            update_status(status, |s| s.last_error = Some(msg.clone()));
-            let _ = progress.send(ProgressEvent::Error {
-                path: Some(rel_path),
-                message: msg,
-            });
-        }
-    }
-}
-
-async fn handle_rename_job(
-    ctx: &JobCtx<'_>,
-    store: &mut Store,
-    from: String,
-    to: String,
-) {
-    let vault = ctx.vault;
-    let progress = ctx.progress;
-    let status = ctx.status;
-    let self_tx = ctx.self_tx;
-    let watcher_cell = ctx.watcher_cell;
-    let changes_cell = ctx.changes_cell;
-    match process_rename(store, &from, &to) {
-        Ok(true) => {
-            let _ = progress.send(ProgressEvent::Renamed {
-                from: from.clone(),
-                to: to.clone(),
-            });
-            // status: trail-auto-update-on-note-move
-            // Watcher-driven external rename: run the trails update.
-            run_trails_on_note_moved(
-                watcher_cell, self_tx, vault, changes_cell, store, &from, &to,
-            )
-            .await;
-        }
-        Ok(false) => {
-            let upsert_ctx = ctx.as_upsert_ctx();
-            if let Err(e) = handle_inline_upsert(&upsert_ctx, store, &to).await {
-                let msg = format!("{e}");
-                update_status(status, |s| s.last_error = Some(msg.clone()));
-                let _ = progress.send(ProgressEvent::Error {
-                    path: Some(to),
-                    message: msg,
-                });
-            }
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            update_status(status, |s| s.last_error = Some(msg.clone()));
-            let _ = progress.send(ProgressEvent::Error {
-                path: Some(to),
-                message: msg,
-            });
-        }
-    }
-}
-
-async fn handle_restore_from_trash(
-    ctx: &UpsertCtx<'_>,
-    vault: &crate::vault::Vault,
-    store: &mut Store,
-    id: &str,
-) -> Result<crate::trash::TrashEntry, crate::error::HikerError> {
-    let progress = ctx.progress;
-    let status = ctx.status;
-    let trash = crate::trash::Trash::open(vault.root());
-    match crate::vault::restore_note(vault, None, &trash, id) {
-        Ok(entry) => {
-            // Re-ingest the restored .md files inline so the index
-            // picks them up without waiting on watcher events
-            // (which the caller suppressed). For folders, walk
-            // the manifest's recorded members; for files, just the
-            // single original_path.
-            let to_index: Vec<String> = match &entry.members {
-                Some(m) => m.clone(),
-                None => vec![entry.original_path.clone()],
-            };
-            for rel_path in &to_index {
-                if let Err(e) = handle_inline_upsert(ctx, store, rel_path).await {
-                    let msg = format!("{e}");
-                    update_status(status, |s| s.last_error = Some(msg.clone()));
-                    let _ = progress.send(ProgressEvent::Error {
-                        path: Some(rel_path.clone()),
-                        message: msg,
-                    });
-                }
-            }
-            Ok(entry)
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            update_status(status, |s| s.last_error = Some(msg.clone()));
-            let _ = progress.send(ProgressEvent::Error {
-                path: Some(id.to_string()),
-                message: msg,
-            });
-            Err(e)
         }
     }
 }
@@ -493,7 +532,7 @@ async fn run_trails_on_note_moved(
     let changes_arc = changes_cell.get().cloned();
     let watcher_ref = watcher_arc.as_deref();
     let changes_ref = changes_arc.as_ref();
-    if let Err(e) = crate::trails::on_note_moved(
+    if let Err(e) = crate::trails::ops::on_note_moved(
         watcher_ref,
         Some(self_tx),
         vault,
@@ -515,7 +554,7 @@ async fn handle_inline_upsert(
     ctx: &UpsertCtx<'_>,
     store: &mut Store,
     rel_path: &str,
-) -> Result<(), IndexerError> {
+) -> Result<(), Error> {
     let progress = ctx.progress;
     let status = ctx.status;
     let _ = progress.send(ProgressEvent::Started { path: rel_path.to_string() });
@@ -552,12 +591,12 @@ async fn process_upsert(
     embedder: Arc<dyn Embedder>,
     rel_path: &str,
     force: bool,
-) -> Result<UpsertOutcome, IndexerError> {
+) -> Result<UpsertOutcome, Error> {
     let chunker: &dyn Chunker = match path_extension(rel_path) {
         Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
-            &MarkdownChunker
+            &Markdown
         }
-        Some(ext) if ext.eq_ignore_ascii_case("txt") => &TxtChunker,
+        Some(ext) if ext.eq_ignore_ascii_case("txt") => &Txt,
         _ => return Ok(UpsertOutcome::Skipped("unsupported extension".into())),
     };
     if is_ignored(rel_path) {
@@ -601,7 +640,7 @@ async fn process_upsert(
             return Ok(UpsertOutcome::Skipped(reason.into()));
         }
     };
-    let content_hash = hash_str(&contents);
+    let content_hash = hash_string(&contents);
 
     // Short-circuit: same content + same embedder version → no-op. Skipped
     // when `force` is set so an explicit user reindex actually re-embeds.
@@ -626,7 +665,7 @@ async fn process_upsert(
             None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
         };
         let indexed_at = now_secs();
-        store.upsert_note(NoteUpsert {
+        store.upsert_note(&NoteUpsert {
             id: &id,
             path: rel_path,
             content_hash: &content_hash,
@@ -682,7 +721,7 @@ async fn process_upsert(
         let batch_emb =
             tokio::task::spawn_blocking(move || emb_clone.embed_batch(&texts))
                 .await
-                .map_err(|e| IndexerError::Embed(EmbedError::Embed(e.to_string())))??;
+                .map_err(|e| Error::Embed(EmbedError::Embed(e.to_string())))??;
         embeddings.extend(batch_emb);
     }
     tracing::debug!(
@@ -693,7 +732,7 @@ async fn process_upsert(
     );
 
     let zipped: Vec<_> = chunks.into_iter().zip(embeddings).collect();
-    store.upsert_note(NoteUpsert {
+    store.upsert_note(&NoteUpsert {
         id: &id,
         path: rel_path,
         content_hash: &content_hash,
@@ -732,91 +771,107 @@ fn update_trail_waypoints_if_relevant(
     rel_path: &str,
     contents: &str,
 ) {
-    use crate::trails::{parse_trail_doc_for, parse_waypoint, walk_waypoints_depth_first};
-    use crate::store::WaypointRow;
-
     // Cheap kind discriminator: only attempt the parse on `.md` files.
     if !rel_path.ends_with(".md") {
         return;
     }
-    let is_under_waypoints =
-        rel_path.starts_with(".hiker/trails/") && rel_path.contains("/waypoints/");
+    let ingest = WaypointIngest { store, rel_path, contents };
+    if rel_path.starts_with(".hiker/trails/") && rel_path.contains("/waypoints/") {
+        ingest.upsert_waypoint_row();
+    } else {
+        ingest.rebuild_trail_doc_rows();
+    }
+}
 
-    if is_under_waypoints {
-        match parse_waypoint(contents) {
-            Ok(fm) => {
-                // Source id comes from the index lookup at ingest time;
-                // may be None if the source hasn't been indexed yet.
-                let source_id = match store.id_for_path(&fm.references.path) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            path = %rel_path,
-                            "indexer: source id_for_path lookup failed",
-                        );
-                        None
-                    }
-                };
-                let row = WaypointRow {
-                    waypoint_path: rel_path.to_string(),
-                    waypoint_id: fm.id,
-                    trail_id: fm.in_trail.id,
-                    source_id,
-                    source_path: fm.references.path,
-                    // Tree-position columns are owned by the trail-doc
-                    // ingest path; written as the empty / NULL default
-                    // here. The trail-doc ingest that follows
-                    // `append_waypoint` enqueues both, so the canonical
-                    // values land within the same indexer drain.
-                    parent_waypoint_id: None,
-                    tree_path: String::new(),
-                };
-                if let Err(e) = store.upsert_trail_waypoint(&row) {
-                    tracing::warn!(
-                        error = %e,
-                        path = %rel_path,
-                        "indexer: upsert_trail_waypoint failed",
-                    );
-                }
-            }
+/// Bundled refs for the two derived-table update paths. Methods stay exempt
+/// from `clippy::single_call_fn` and split the work so the dispatcher above
+/// stays under the cognitive-complexity cap.
+struct WaypointIngest<'a> {
+    store: &'a mut Store,
+    rel_path: &'a str,
+    contents: &'a str,
+}
+
+impl<'a> WaypointIngest<'a> {
+    fn upsert_waypoint_row(self) {
+        use crate::store::dto::WaypointRow;
+        use crate::trails::parse_waypoint;
+        let fm = match parse_waypoint(self.contents) {
+            Ok(fm) => fm,
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    path = %rel_path,
+                    path = %self.rel_path,
                     "indexer: waypoint parse failed (file may be mid-edit)",
                 );
+                return;
             }
+        };
+        // Source id comes from the index lookup at ingest time; may be
+        // None if the source hasn't been indexed yet.
+        let source_id = match self.store.id_for_path(&fm.references.path) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %self.rel_path,
+                    "indexer: source id_for_path lookup failed",
+                );
+                None
+            }
+        };
+        let row = WaypointRow {
+            waypoint_path: self.rel_path.to_string(),
+            waypoint_id: fm.id,
+            trail_id: fm.in_trail.id,
+            source_id,
+            source_path: fm.references.path,
+            // Tree-position columns are owned by the trail-doc ingest
+            // path; written as the empty / NULL default here. The trail-
+            // doc ingest that follows `append_waypoint` enqueues both, so
+            // the canonical values land within the same indexer drain.
+            parent_waypoint_id: None,
+            tree_path: String::new(),
+        };
+        if let Err(e) = self.store.upsert_trail_waypoint(&row) {
+            tracing::warn!(
+                error = %e,
+                path = %self.rel_path,
+                "indexer: upsert_trail_waypoint failed",
+            );
         }
-        return;
     }
 
-    // Trail-doc ingest: clear + re-insert every row for `trail_id` so
-    // tree-shape changes (re-parent, reorder, remove) propagate to the
-    // derived table. Frontmatter is the source of truth.
-    //
-    // status: trail-waypoints-derived-table
-    // status: trail-side-trail-shape
-    if let Ok(fm) = parse_trail_doc_for(rel_path, contents) {
+    /// Trail-doc ingest: clear + re-insert every row for `trail_id` so
+    /// tree-shape changes (re-parent, reorder, remove) propagate to the
+    /// derived table. Frontmatter is the source of truth.
+    ///
+    /// status: trail-waypoints-derived-table
+    /// status: trail-side-trail-shape
+    fn rebuild_trail_doc_rows(self) {
+        use crate::store::dto::WaypointRow;
+        use crate::trails::{parse_trail_doc_for, walk_waypoints_depth_first};
+        let Ok(fm) = parse_trail_doc_for(self.rel_path, self.contents) else { return };
         let trail_id = fm.id.clone();
-        // Capture existing rows BEFORE the clear so we can preserve
-        // each row's `source_id` / `source_path` (those columns are
-        // owned by the per-waypoint ingest path and aren't
-        // recoverable from the trail-doc alone).
-        let existing_by_path: std::collections::HashMap<String, (Option<String>, String)> =
-            store
-                .waypoints_of(&trail_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.waypoint_path, (r.source_id, r.source_path)))
-                .collect();
-        if let Err(e) = store.delete_trail_waypoints_by_trail(&trail_id) {
+        // Capture existing rows BEFORE the clear so we can preserve each
+        // row's `source_id` / `source_path` (those columns are owned by
+        // the per-waypoint ingest path and aren't recoverable from the
+        // trail-doc alone).
+        let existing_by_path: std::collections::HashMap<String, (Option<String>, String)> = self
+            .store
+            .waypoints_of(&trail_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.waypoint_path, (r.source_id, r.source_path)))
+            .collect();
+        if let Err(e) = self.store.delete_trail_waypoints_by_trail(&trail_id) {
             tracing::warn!(
                 error = %e,
                 trail_id = %trail_id,
                 "indexer: delete_trail_waypoints_by_trail failed",
             );
         }
+        let store = self.store;
         walk_waypoints_depth_first(&fm.waypoints, &mut |parent_id, entry, tree_path| {
             let (source_id, source_path) = existing_by_path
                 .get(&entry.path)
@@ -842,7 +897,7 @@ fn update_trail_waypoints_if_relevant(
     }
 }
 
-fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, IndexerError> {
+fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, Error> {
     // status: trail-waypoints-derived-table
     // Drop any derived waypoint row that referenced this path — both for
     // a waypoint-note being deleted (waypoint_path match) and for a
@@ -863,11 +918,3 @@ fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, IndexerErro
     Ok(true)
 }
 
-fn process_rename(store: &mut Store, from: &str, to: &str) -> Result<bool, IndexerError> {
-    let id = match store.id_for_path(from)? {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    store.rename_note(&id, to)?;
-    Ok(true)
-}
