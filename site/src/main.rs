@@ -181,7 +181,7 @@ fn rebuild_markdown_decorations(page: &mut Page, theme: &Theme) {
         .push_with_heights(fold_decorations(&page.state, &page.folds));
     page.view
         .decorations
-        .push(wikilink_decorations(&page.state, t, None));
+        .push(wikilink_decorations(&page.state, t, None, None));
     page.view
         .decorations
         .push(callout_decorations(&page.state, t, None));

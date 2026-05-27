@@ -418,7 +418,23 @@ impl<'a> BlockPaint<'a> {
                 );
                 self.painter.rect_filled(r, 0.0, to_egui_color(*mark_bg));
             }
-            self.painter.galley(Pos2::new(self.text_origin_x, y + (row_h - galley.size().y) * 0.5), galley, fg);
+            self.painter.galley(Pos2::new(self.text_origin_x, y + (row_h - galley.size().y) * 0.5), galley.clone(), fg);
+            // Strike line through the text (removed-diff lines): a thin
+            // horizontal rule at the row's vertical center, spanning the
+            // rendered glyph width.
+            if line.strikethrough {
+                let strike_w = galley.size().x;
+                if strike_w > 0.0 {
+                    let mid_y = y + row_h * 0.5;
+                    self.painter.line_segment(
+                        [
+                            Pos2::new(self.text_origin_x, mid_y),
+                            Pos2::new(self.text_origin_x + strike_w, mid_y),
+                        ],
+                        Stroke::new(1.0, fg),
+                    );
+                }
+            }
             y += row_h;
         }
     }

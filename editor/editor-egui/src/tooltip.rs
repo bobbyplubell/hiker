@@ -98,8 +98,7 @@ impl<'a> TooltipPainter<'a> {
                 let line_start = self.state.doc.line_to_byte(line);
                 let col_bytes = byte.saturating_sub(line_start);
                 let advance = self.view.font_size * 0.6;
-                let x = if self.view.hide_gutter { 4.0 } else { self.view.gutter_width }
-                    + col_bytes as f32 * advance;
+                let x = self.view.content_origin_x() + col_bytes as f32 * advance;
                 Some(Pos2::new(x, y))
             }
         }

@@ -82,8 +82,8 @@ pub struct VaultStats {
 }
 
 // status: note-properties-tab-content
-/// Read-only snapshot of everything hiker knows about a note across
-/// `index.db` and `changes.db`. Consumed by the `properties`-kind tab.
+/// Read-only snapshot of everything hiker knows about a note from
+/// `index.db`. Consumed by the `properties`-kind tab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteProperties {
@@ -200,6 +200,34 @@ pub struct TrailContainingHit {
     pub tree_path: String,
 }
 
+/// One row in the derived `board_cards` table — one row per card on a
+/// board. Populated by the indexer when it ingests a board-doc.
+///
+/// status: board-cards-derived-table
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardCardRow {
+    pub board_id: String,
+    pub board_path: String,
+    /// The referenced note's recorded ULID (the card's `id` half).
+    pub card_note_id: String,
+    /// The referenced note's recorded rel-path (the card's `path` half).
+    pub card_note_path: String,
+    pub column_name: String,
+    /// 0-based position within the column.
+    pub ordinal: i64,
+}
+
+/// Hit returned by `Store::boards_containing_note`. Holds enough to point
+/// the UI at the board and the column the card sits in.
+///
+/// status: board-cards-derived-table
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardContainingHit {
+    pub board_id: String,
+    pub board_path: String,
+    pub column_name: String,
+}
+
 /// Bundle of everything needed to upsert a note in one transaction. Caller
 /// (the indexer task) builds this after chunking + embedding.
 pub struct NoteUpsert<'a> {
@@ -211,6 +239,106 @@ pub struct NoteUpsert<'a> {
     pub indexed_at: i64,
     pub embedder_version: &'a str,
     pub chunks: Vec<(crate::chunker::Chunk, Vec<f32>)>,
+}
+
+/// One flattened frontmatter entry, the write-side input to the
+/// `note_meta` index. `key` is a dotted path (`hiker.author`); list
+/// elements share a key across rows (`tags` → many entries). `num` is the
+/// numeric mirror for YAML numbers / bools, `None` for strings.
+///
+/// status: store-note-metadata-index
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaEntry {
+    pub key: String,
+    pub value: String,
+    pub num: Option<f64>,
+}
+
+/// A single predicate in a structured `query_notes` filter. All predicates
+/// in a `NoteQuery` are ANDed.
+///
+/// status: store-note-query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum MetaFilter {
+    /// Frontmatter `key` equals `value` (string compare). Tag membership is
+    /// `Equals { key: "tags", value: "<tag>" }` since list elements are
+    /// stored one-per-row under the list's key.
+    Equals { key: String, value: String },
+    /// Frontmatter `key` is present at all (any value).
+    Exists { key: String },
+    /// Numeric `key` falls in `[min, max]` (inclusive). Either bound may be
+    /// omitted for an open range. Matches only rows whose `num` is set.
+    NumRange {
+        key: String,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+}
+
+/// Sort direction for `NoteOrder`.
+///
+/// status: store-note-query
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OrderDir {
+    Asc,
+    Desc,
+}
+
+/// Ordering for a `query_notes` result set.
+///
+/// status: store-note-query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "by")]
+pub enum NoteOrder {
+    /// Filesystem mtime (the `notes.mtime` column).
+    Mtime { dir: OrderDir },
+    /// Vault-relative path, lexicographic.
+    Path { dir: OrderDir },
+    /// A frontmatter key's numeric value (`note_meta.num`). Notes lacking
+    /// the key sort as NULL (last on Asc, first on Desc — sqlite default).
+    MetaNum { key: String, dir: OrderDir },
+    /// A frontmatter key's string value (`note_meta.value`).
+    MetaText { key: String, dir: OrderDir },
+}
+
+/// A structured query over the note metadata index. All `filters` AND
+/// together; `folder` restricts to a vault-relative subtree; `order` and
+/// `limit` shape the result. `select` names frontmatter keys whose values
+/// are returned per row in `NoteQueryRow.fields`.
+///
+/// status: store-note-query
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteQuery {
+    #[serde(default)]
+    pub filters: Vec<MetaFilter>,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub order: Option<NoteOrder>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub select: Vec<String>,
+}
+
+/// One row of a `query_notes` result. `fields` carries the values of the
+/// query's `select` keys (a key with multiple values — e.g. a tag list —
+/// yields the values joined by `, ` for display convenience; structured
+/// consumers should re-read `note_meta` if they need the list split).
+///
+/// status: store-note-query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteQueryRow {
+    pub note_id: String,
+    pub path: String,
+    pub title: String,
+    pub mtime: i64,
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 /// Generate a fresh ulid as a string. Used by the indexer when assigning ids

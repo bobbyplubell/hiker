@@ -142,6 +142,15 @@ pub struct WorkbenchLayout {
     pub secondary_side_bar_visible: bool,
     pub secondary_side_bar_width: f32,
     pub active_activity: Option<serde_json::Value>,
+    /// Hidden activity modes, each as the host `Mode` serialised to JSON
+    /// (the schema stays independent of the host's type). Defaulted so
+    /// layout files written before this field load cleanly.
+    #[serde(default)]
+    pub hidden_activities: Vec<serde_json::Value>,
+    /// User-preferred activity order, same type-erased encoding as
+    /// `hidden_activities`.
+    #[serde(default)]
+    pub activity_order: Vec<serde_json::Value>,
     pub panel_area_visible: bool,
     pub panel_area_maximized: bool,
     pub panel_area_height: f32,
@@ -162,6 +171,8 @@ impl Default for WorkbenchLayout {
             secondary_side_bar_visible: false,
             secondary_side_bar_width: 260.0,
             active_activity: None,
+            hidden_activities: Vec::new(),
+            activity_order: Vec::new(),
             panel_area_visible: false,
             panel_area_maximized: false,
             panel_area_height: 240.0,
@@ -244,6 +255,18 @@ where
                 .activity_bar
                 .active()
                 .and_then(|m| serde_json::to_value(m).ok()),
+            hidden_activities: self
+                .activity_bar
+                .hidden()
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(),
+            activity_order: self
+                .activity_bar
+                .order()
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(),
             panel_area_visible: self.panel_area.visible,
             panel_area_maximized: self.panel_area.maximized,
             panel_area_height: self.panel_area.height,
@@ -273,6 +296,20 @@ where
             ),
             None => None,
         };
+
+        // Hidden set + order are best-effort: a mode the host no longer
+        // exposes (variant removed since the layout was written) is
+        // dropped rather than failing the whole restore.
+        let hidden: Vec<Mode> = layout
+            .hidden_activities
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
+        let order: Vec<Mode> = layout
+            .activity_order
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
 
         // Decode tab payloads.
         let mut decoded: HashMap<TabId, TabEntry<Tab>> = HashMap::new();
@@ -315,6 +352,8 @@ where
 
         // Apply.
         self.activity_bar.set_active(active_mode);
+        self.activity_bar.set_hidden(hidden);
+        self.activity_bar.set_order(order);
         self.primary_side_bar.side = layout.primary_side;
         self.primary_side_bar.visible = layout.side_bar_visible;
         self.primary_side_bar.width = layout.side_bar_width;

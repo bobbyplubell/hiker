@@ -282,37 +282,50 @@ impl Chat<'_> {
     let pending = s.pending;
     let streaming = s.streaming_buf.clone();
     let turns = s.turns.clone();
-    // Set of staging proposal IDs that are still pending in the staging
-    // service this frame. The tool-card Accept / Reject buttons only
-    // render for IDs in this set — when the user accepts or rejects a
-    // proposal elsewhere (inline patch-review surface, the bulk patch-
-    // review tab, the activity widget) it disappears from staging.db
-    // and the cached snapshot shrinks, so the stale buttons on old tool
-    // cards vanish on the next frame without any per-card bookkeeping.
-    let live_proposal_ids: std::collections::HashSet<String> = self
-        .app
-        .ui_cache
-        .staging_snapshot
-        .iter()
-        .map(|p| p.id.clone())
-        .collect();
+    let session_id = s.id.clone();
+    // Map of vault-relative path → its live op-log pending ops this frame
+    // (op id + drift). A write-tool card resolves its review buttons by
+    // looking up its `target_path` here. When the user accepts or rejects an
+    // op elsewhere (inline patch-review surface, the bulk patch-review tab,
+    // the activity widget) it drops out of the op-log pending queue and this
+    // map shrinks, so the stale buttons on old tool cards vanish on the next
+    // frame without any per-card bookkeeping.
+    let mut live_ops_by_path: std::collections::HashMap<String, Vec<LiveOp>> =
+        std::collections::HashMap::new();
+    for p in &self.app.ui_cache.pending_snapshot {
+        live_ops_by_path
+            .entry(p.target_path.clone())
+            .or_default()
+            .push(LiveOp { op_id: p.op_id.clone(), drifted: p.drifted });
+    }
     let mut card_action: Option<ToolCardAction> = None;
     let mut link_clicked: Option<String> = None;
+    // Persistent read-only editor instances backing tool-card markdown
+    // previews. Borrowed mutably here for the whole transcript render;
+    // `turns` was cloned above so there's no aliasing with the session
+    // list this lives alongside on the registry.
+    let previews = &mut self.app.session.chat.md_previews;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        // Only pin to the bottom while a reply is streaming in. Pinning
+        // unconditionally yanked the viewport to the bottom whenever a
+        // card was expanded/collapsed (the content height changed), which
+        // read as the scroll position "jumping" during idle review.
+        .stick_to_bottom(pending)
         .show(ui, |ui| {
             for (turn_idx, turn) in turns.iter().enumerate() {
                 if let Some(tool) = &turn.tool {
-                    if let Some(a) = tool.render_card(ui, turn_idx, &live_proposal_ids) {
+                    if let Some(a) =
+                        tool.render_card(ui, &session_id, turn_idx, &live_ops_by_path, previews)
+                    {
                         card_action = Some(a);
                     }
-                } else if let Some(target) = self.render_turn(ui, turn.role, &turn.text) {
+                } else if let Some(target) = render_turn(ui, turn.role, &turn.text) {
                     link_clicked = Some(target);
                 }
             }
             if !streaming.is_empty()
-                && let Some(target) = self.render_turn(ui, ChatRole::Assistant, &streaming)
+                && let Some(target) = render_turn(ui, ChatRole::Assistant, &streaming)
             {
                 link_clicked = Some(target);
             }
@@ -346,9 +359,9 @@ impl Chat<'_> {
                     .request_repaint_after(std::time::Duration::from_millis(80));
             }
         });
-    // Apply tool-card actions on the AppState. Staging accept/reject
-    // route through the live `Staging`; open-target hands off to the
-    // tab-open machinery via `controllers::open_file`.
+    // Apply tool-card actions on the AppState. Accept/reject flip the op-log
+    // pending op via `op_writes::flip_op_status`; open-target hands off to the
+    // tab-open machinery via `editor_pane::open_file`.
     if let Some(action) = card_action {
         self.apply_tool_card_action(action);
     }
@@ -389,12 +402,15 @@ impl Chat<'_> {
     let app = &mut *self.app;
     use crate::state::ToastLevel;
     match action {
-        ToolCardAction::AcceptStaging { proposal_id } => {
-            let staging = app.vault_session.services.staging.clone();
-            let changes = app.vault_session.services.changes.clone();
-            match staging.accept(&proposal_id, &app.vault_session.vault, Some(changes.as_ref())) {
-                Ok(o) => app.push_toast(
-                    format!("Accepted proposal for {}", o.target_path),
+        ToolCardAction::AcceptOp { op_id, target_path } => {
+            match hiker_core::ops::op_writes::flip_op_status(
+                &app.vault_session.services.oplog,
+                &target_path,
+                &[op_id],
+                /* accept */ true,
+            ) {
+                Ok(()) => app.push_toast(
+                    format!("Accepted proposal for {target_path}"),
                     ToastLevel::Info,
                 ),
                 Err(err) => app.push_toast(
@@ -403,9 +419,13 @@ impl Chat<'_> {
                 ),
             }
         }
-        ToolCardAction::RejectStaging { proposal_id } => {
-            let staging = app.vault_session.services.staging.clone();
-            match staging.reject(&proposal_id) {
+        ToolCardAction::RejectOp { op_id, target_path } => {
+            match hiker_core::ops::op_writes::flip_op_status(
+                &app.vault_session.services.oplog,
+                &target_path,
+                &[op_id],
+                /* accept */ false,
+            ) {
                 Ok(()) => app.push_toast(
                     "Proposal rejected".to_string(),
                     ToastLevel::Info,
@@ -424,22 +444,242 @@ impl Chat<'_> {
     }
 }
 
+/// One live op-log pending op for a tool card's target path: the op id the
+/// review buttons flip via `op_writes::flip_op_status`, plus its drift status
+/// (Accept disabled for drifted ops per `patch-review-conflicted-accept-disabled`).
+#[derive(Debug, Clone)]
+pub struct LiveOp {
+    pub op_id: String,
+    pub drifted: bool,
+}
+
 /// Action requested from a tool card's review buttons. Bubbles up to the
-/// caller so accept/reject can run on the AppState (where `staging` lives)
-/// rather than through borrow gymnastics here.
+/// caller so accept/reject can run on the AppState (where the op log lives)
+/// rather than through borrow gymnastics here. Carries the resolved
+/// `target_path` so `flip_op_status` can resolve the op's doc id.
 #[derive(Debug, Clone)]
 pub enum ToolCardAction {
-    AcceptStaging { proposal_id: String },
-    RejectStaging { proposal_id: String },
+    AcceptOp { op_id: String, target_path: String },
+    RejectOp { op_id: String, target_path: String },
     OpenTarget { rel_path: String },
+}
+
+/// Cap on the height of an embedded markdown preview inside a tool card.
+/// Past this the read-only editor scrolls internally so one huge note body
+/// can't dominate the transcript.
+const MD_MAX_H: f32 = 360.0;
+
+/// Object keys whose string value is rendered as markdown rather than an
+/// inline `key: value` row — the note bodies / patch text that tools hand
+/// back. Anything multi-line or long is treated the same way regardless of
+/// key (see [`is_mdish`]).
+const MD_KEYS: &[&str] = &[
+    "content", "text", "body", "new_string", "old_string", "new_content",
+    "old_content", "new_text", "old_text", "markdown", "note", "message",
+    "summary", "snippet", "diff", "patch",
+];
+
+/// Whether a string field should render as a markdown block instead of a
+/// compact `key: value` row.
+fn is_mdish(key: &str, val: &str) -> bool {
+    MD_KEYS.contains(&key) || val.contains('\n') || val.chars().count() > 120
+}
+
+/// Render a tool `args` / `result` payload in structured form: parse JSON
+/// and lay it out as `key: value` rows, markdown blocks for content-ish
+/// string fields, and pretty-printed sub-blocks for nested objects/arrays.
+/// Non-JSON payloads render as a single markdown block.
+fn render_payload(
+    ui: &mut egui::Ui,
+    id: &str,
+    payload: &str,
+    previews: &mut crate::chat::md_preview::Cache,
+) {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::Object(map)) => {
+            for (k, v) in &map {
+                render_field(ui, &format!("{id}:{k}"), k, v, previews);
+            }
+        }
+        // Bare string payload → markdown. Other bare scalars / arrays →
+        // pretty JSON.
+        Ok(serde_json::Value::String(s)) => {
+            crate::chat::md_preview::render(ui, id, &s, MD_MAX_H, previews);
+        }
+        Ok(other) => json_block(
+            ui,
+            &serde_json::to_string_pretty(&other).unwrap_or_else(|_| payload.to_string()),
+        ),
+        // Not JSON at all — most text-returning tools hand back a bare
+        // string, which reads best as markdown.
+        Err(_) => crate::chat::md_preview::render(ui, id, payload, MD_MAX_H, previews),
+    }
+}
+
+/// Render one object field. Content-ish strings become markdown blocks;
+/// short scalars become inline rows; nested values become pretty JSON.
+fn render_field(
+    ui: &mut egui::Ui,
+    id: &str,
+    key: &str,
+    val: &serde_json::Value,
+    previews: &mut crate::chat::md_preview::Cache,
+) {
+    match val {
+        serde_json::Value::String(s) if is_mdish(key, s) => {
+            ui.label(
+                egui::RichText::new(key)
+                    .color(theme::muted())
+                    .monospace()
+                    .small(),
+            );
+            crate::chat::md_preview::render(ui, id, s, MD_MAX_H, previews);
+        }
+        serde_json::Value::String(s) => kv_row(ui, key, s),
+        serde_json::Value::Null => kv_row(ui, key, "null"),
+        serde_json::Value::Bool(b) => kv_row(ui, key, &b.to_string()),
+        serde_json::Value::Number(n) => kv_row(ui, key, &n.to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            ui.label(
+                egui::RichText::new(key)
+                    .color(theme::muted())
+                    .monospace()
+                    .small(),
+            );
+            json_block(ui, &serde_json::to_string_pretty(val).unwrap_or_default());
+        }
+    }
+}
+
+/// Compact `key: value` row for a scalar field.
+fn kv_row(ui: &mut egui::Ui, key: &str, val: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(
+            egui::RichText::new(format!("{key}:"))
+                .color(theme::accent())
+                .monospace()
+                .small(),
+        );
+        ui.label(egui::RichText::new(val).monospace().small());
+    });
+}
+
+/// Pretty-printed JSON sub-block (nested objects / arrays) with a faint
+/// code background — same treatment as a fenced code block in chat bubbles.
+fn json_block(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .monospace()
+                .small()
+                .background_color(egui::Color32::from_rgb(0xee, 0xf1, 0xf5)),
+        )
+        .wrap(),
+    );
+}
+
+/// Verbatim payload rendering for the per-card "raw" toggle.
+fn raw_payload(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
+}
+
+/// Review-mode affordance: when this card wrote (the tool result reported
+/// `written` / `staged`), surface inline Accept / Reject buttons for the
+/// op-log pending ops on the card's target path. Matches
+/// `ui/src/chat/toolCard.ts`'s action row layout. The ops are resolved from
+/// the live op-log snapshot keyed by path — when the user accepts/rejects
+/// elsewhere (inline patch-review surface, bulk patch-review tab, activity
+/// widget) the op drops out of the pending queue and the buttons vanish on
+/// the next frame. Returns the action the user clicked, if any.
+fn render_op_review(
+    ui: &mut egui::Ui,
+    tool: &crate::chat::state::ToolCard,
+    live_ops_by_path: &std::collections::HashMap<String, Vec<LiveOp>>,
+) -> Option<ToolCardAction> {
+    let mut action: Option<ToolCardAction> = None;
+    let live_ops: &[LiveOp] = tool
+        .target_path
+        .as_ref()
+        .filter(|_| tool.produced_write)
+        .and_then(|p| live_ops_by_path.get(p))
+        .map_or(&[][..], Vec::as_slice);
+    if !live_ops.is_empty() {
+        let target = tool.target_path.clone().unwrap_or_default();
+        ui.add_space(6.0);
+        ui.separator();
+        for op in live_ops {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "proposal {}",
+                        &op.op_id[..op.op_id.len().min(8)]
+                    ))
+                    .color(theme::muted())
+                    .small()
+                    .monospace(),
+                );
+                // Accept is disabled for drifted ops — the anchor no
+                // longer resolves against current accepted state
+                // (`patch-review-conflicted-accept-disabled`). Reject
+                // stays active.
+                let accept = ui.add_enabled(
+                    !op.drifted,
+                    egui::Button::image_and_text(
+                        crate::icons::ICONS.primary_check(),
+                        egui::RichText::new("Accept").color(egui::Color32::WHITE).small(),
+                    )
+                    .fill(egui::Color32::from_rgb(0x2f, 0x8f, 0x4d)),
+                );
+                if op.drifted {
+                    accept.on_hover_text("Drifted: the note changed since this edit was proposed");
+                } else if accept.clicked() {
+                    action = Some(ToolCardAction::AcceptOp {
+                        op_id: op.op_id.clone(),
+                        target_path: target.clone(),
+                    });
+                }
+                if ui
+                    .add(
+                        egui::Button::image_and_text(
+                            crate::icons::ICONS.primary_cross(),
+                            egui::RichText::new("Reject").color(egui::Color32::WHITE).small(),
+                        )
+                        .fill(egui::Color32::from_rgb(0xb9, 0x3a, 0x3a)),
+                    )
+                    .clicked()
+                {
+                    action = Some(ToolCardAction::RejectOp {
+                        op_id: op.op_id.clone(),
+                        target_path: target.clone(),
+                    });
+                }
+            });
+        }
+    } else if tool.produced_write {
+        // The card wrote, but the op is no longer pending (accepted /
+        // rejected). Leave a muted breadcrumb so the user knows the card
+        // *did* propose an edit — just not waiting on input now.
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new("proposal resolved")
+                .color(theme::muted())
+                .italics()
+                .small(),
+        );
+    }
+    action
 }
 
 impl crate::chat::state::ToolCard {
     fn render_card(
     &self,
     ui: &mut egui::Ui,
+    session_id: &str,
     turn_idx: usize,
-    live_proposal_ids: &std::collections::HashSet<String>,
+    live_ops_by_path: &std::collections::HashMap<String, Vec<LiveOp>>,
+    previews: &mut crate::chat::md_preview::Cache,
 ) -> Option<ToolCardAction> {
     let tool = self;
     let mut action: Option<ToolCardAction> = None;
@@ -499,18 +739,24 @@ impl crate::chat::state::ToolCard {
     // turn index makes it unique even when two tool calls of the same name
     // and same arg-string land in the transcript; tool_name is kept for
     // grep-ability in egui debug overlays.
-    let id_salt = format!("tool-card-{}-{}", turn_idx, tool.tool_name.as_str());
+    let id_salt = format!("{}-tool-card-{}-{}", session_id, turn_idx, tool.tool_name.as_str());
     // Manual collapsible — `CollapsingHeader` only treats the chevron +
     // label glyph as the toggle hit-region, which is a tiny click target.
-    // We render a full-width clickable header strip *and* extend click
-    // sense to the yellow body Frame so clicking anywhere on the card
-    // (other than an interactive child like an Accept / Reject button)
-    // toggles open/closed.
+    // We render a full-width clickable header strip as the toggle. The
+    // body itself is deliberately NOT click-to-collapse: a body-level
+    // interact sat on top of the raw toggle / inline links and stole
+    // their clicks, and collapsing out from under the pointer felt janky.
     let open_id = egui::Id::new(("tool-card-open", &id_salt));
     let mut open = ui
         .ctx()
         .data(|d| d.get_temp::<bool>(open_id))
         .unwrap_or(true);
+    // Per-card structured ⇄ raw toggle. Structured (default) pretty-prints
+    // JSON into key/value rows and renders content fields as styled
+    // markdown; raw shows the verbatim payload string for debugging /
+    // copy. Persisted in egui temp data like `open`.
+    let raw_id = egui::Id::new(("tool-card-raw", &id_salt));
+    let mut raw = ui.ctx().data(|d| d.get_temp::<bool>(raw_id)).unwrap_or(false);
     let header = egui::Frame::default()
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
@@ -534,157 +780,75 @@ impl crate::chat::state::ToolCard {
         ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
     }
     if open {
-    let body_response = egui::Frame::default()
+    egui::Frame::default()
         .fill(egui::Color32::from_rgb(0xff, 0xf7, 0xe6))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe0, 0xc4, 0x70)))
         .inner_margin(8.0)
         .show(ui, |ui| {
             ui.set_max_width(ui.available_width() - 12.0);
+            // Structured ⇄ raw switch, right-aligned above the payload. The
+            // outer `horizontal` pins this to a single row; the inner
+            // right-to-left layout hugs the label to the right edge with a
+            // proper margin instead of overflowing past it.
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if raw { "structured" } else { "raw" };
+                    let toggle = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .color(theme::accent())
+                                .underline()
+                                .small(),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if toggle.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if toggle.clicked() {
+                        raw = !raw;
+                        ui.ctx().data_mut(|d| d.insert_temp(raw_id, raw));
+                    }
+                });
+            });
             if !tool.args.is_empty() {
-                ui.label(
-                    egui::RichText::new("args")
-                        .color(theme::muted())
-                        .small(),
-                );
-                // Body text renders at default size so JSON args / tool
-                // results are actually readable — the prior `.small()`
-                // was hard to read on dense JSON payloads.
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&tool.args).monospace()).wrap(),
-                );
+                ui.label(egui::RichText::new("args").color(theme::muted()).small());
+                if raw {
+                    raw_payload(ui, &tool.args);
+                } else {
+                    render_payload(ui, &format!("{}:args", id_salt), &tool.args, previews);
+                }
             }
             if let Some(result) = &tool.result {
                 if !tool.args.is_empty() {
                     ui.add_space(4.0);
                 }
-                ui.label(
-                    egui::RichText::new("result")
-                        .color(theme::muted())
-                        .small(),
-                );
-                // Render the full result text inside a vertical scroll
-                // shell so multi-KB tool outputs don't get silently
-                // truncated. The outer chat panel already has its own
-                // scrollbar; nest with a fixed max height so a single
-                // huge tool result doesn't push every other turn out of
-                // view.
-                egui::ScrollArea::vertical()
-                    .id_salt(format!("{}-result", id_salt))
-                    .max_height(400.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(result.as_str()).monospace(),
-                            )
-                            .wrap(),
-                        );
-                    });
-            }
-            // Review-mode affordance: when the tool returned a staged
-            // proposal, surface inline Accept / Reject buttons paired with
-            // each staging id. Matches `ui/src/chat/toolCard.ts`'s action
-            // row layout.
-            // Skip stale staging IDs: when the user accepts/rejects the
-            // proposal elsewhere it disappears from `staging.db` and the
-            // pending-id set shrinks, so we drop the buttons on the
-            // next frame instead of leaving stale Accept / Reject
-            // affordances in the transcript.
-            let live_sids: Vec<&String> = tool
-                .staging_ids
-                .iter()
-                .filter(|sid| live_proposal_ids.contains(*sid))
-                .collect();
-            if !live_sids.is_empty() {
-                ui.add_space(6.0);
-                ui.separator();
-                for sid in live_sids {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "proposal {}",
-                                &sid[..sid.len().min(8)]
-                            ))
-                            .color(theme::muted())
-                            .small()
-                            .monospace(),
-                        );
-                        if ui
-                            .add(
-                                egui::Button::image_and_text(
-                                    crate::icons::ICONS.primary_check(),
-                                    egui::RichText::new("Accept")
-                                        .color(egui::Color32::WHITE)
-                                        .small(),
-                                )
-                                .fill(egui::Color32::from_rgb(0x2f, 0x8f, 0x4d)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(ToolCardAction::AcceptStaging {
-                                proposal_id: sid.clone(),
-                            });
-                        }
-                        if ui
-                            .add(
-                                egui::Button::image_and_text(
-                                    crate::icons::ICONS.primary_cross(),
-                                    egui::RichText::new("Reject")
-                                        .color(egui::Color32::WHITE)
-                                        .small(),
-                                )
-                                .fill(egui::Color32::from_rgb(0xb9, 0x3a, 0x3a)),
-                            )
-                            .clicked()
-                        {
-                            action = Some(ToolCardAction::RejectStaging {
-                                proposal_id: sid.clone(),
-                            });
-                        }
-                    });
+                ui.label(egui::RichText::new("result").color(theme::muted()).small());
+                if raw {
+                    // Verbatim payload inside a scroll shell so multi-KB
+                    // tool outputs don't push every other turn out of view.
+                    egui::ScrollArea::vertical()
+                        .id_salt(format!("{}-result", id_salt))
+                        .max_height(400.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| raw_payload(ui, result));
+                } else {
+                    render_payload(ui, &format!("{}:result", id_salt), result, previews);
                 }
-            } else if !tool.staging_ids.is_empty() {
-                // Tool returned proposal IDs but they're all resolved.
-                // Leave a muted breadcrumb so the user knows the card
-                // *did* stage something — just not waiting on input now.
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} proposal{} resolved",
-                        tool.staging_ids.len(),
-                        if tool.staging_ids.len() == 1 { "" } else { "s" },
-                    ))
-                    .color(theme::muted())
-                    .italics()
-                    .small(),
-                );
+            }
+            if let Some(a) = render_op_review(ui, tool, live_ops_by_path) {
+                action = Some(a);
             }
         });
-    // Extend click sense to the whole body rect. egui processes
-    // interactions in paint order — interactive children (Accept /
-    // Reject buttons, the result ScrollArea) were painted first and
-    // sit on top in z-order, so they steal clicks at their own rects.
-    // Clicks on the surrounding yellow space fall through to this
-    // body-level interact and toggle the card.
-    let body_resp = ui.interact(
-        body_response.response.rect,
-        egui::Id::new(("tool-card-toggle-body", &id_salt)),
-        egui::Sense::click(),
-    );
-    if body_resp.clicked() {
-        ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
-    }
     }
     action
     }
 }
 
-impl Chat<'_> {
 /// Render a single transcript turn. Returns `Some(target)` when the user
 /// clicked a `[[wikilink]]` inside the bubble — the caller hands that off
 /// to the file-open routing (`chat-panel-note-link-render`).
-fn render_turn(&self, ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
+fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
     let mut clicked_link: Option<String> = None;
     let (label, color) = match role {
         ChatRole::User => ("You", theme::accent()),
@@ -716,11 +880,11 @@ fn render_turn(&self, ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<S
             .inner_margin(8.0)
             .show(ui, |ui| {
                 ui.set_max_width(bubble_width);
-                for chunk in self.split_code_fences(text) {
+                for chunk in split_code_fences(text) {
                     match chunk {
                         Chunk::Text(t) => {
                             ui.horizontal_wrapped(|ui| {
-                                for part in self.split_wikilinks(t) {
+                                for part in split_wikilinks(t) {
                                     match part {
                                         TextPart::Plain(s) if !s.is_empty() => {
                                             ui.label(egui::RichText::new(s));
@@ -766,7 +930,6 @@ fn render_turn(&self, ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<S
     });
     clicked_link
 }
-}
 
 enum Chunk<'a> {
     Text(&'a str),
@@ -779,11 +942,10 @@ enum TextPart<'a> {
     Link(&'a str),
 }
 
-impl Chat<'_> {
 /// Split a plain-text chunk on `[[wikilink]]` markers. The link target is
 /// the substring before any pipe (matching the `wikilink_target_aliases`
 /// resolution rules). Lone `[` or unterminated `[[` is preserved as text.
-fn split_wikilinks<'a>(&self, s: &'a str) -> Vec<TextPart<'a>> {
+fn split_wikilinks(s: &str) -> Vec<TextPart<'_>> {
     let mut out: Vec<TextPart<'_>> = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -822,7 +984,7 @@ fn split_wikilinks<'a>(&self, s: &'a str) -> Vec<TextPart<'a>> {
 /// blocks pick up monospace styling without a full parser. Inline
 /// styling (bold/italic/links) is left for the real markdown
 /// renderer.
-fn split_code_fences<'a>(&self, s: &'a str) -> Vec<Chunk<'a>> {
+fn split_code_fences(s: &str) -> Vec<Chunk<'_>> {
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(start) = rest.find("```") {
@@ -845,7 +1007,6 @@ fn split_code_fences<'a>(&self, s: &'a str) -> Vec<Chunk<'a>> {
         out.push(Chunk::Text(rest));
     }
     out
-}
 }
 
 #[cfg(test)]
@@ -1187,6 +1348,9 @@ fn composer(
                 .desired_width(avail_w)
         };
         let resp = ui.add(edit);
+        // Record the composer's id so the editor panel can tell when this
+        // field (not the editor) owns keyboard focus and should keep Ctrl-Z.
+        app.ui.chat_input_id = Some(resp.id);
 
         // Send shortcuts: plain Enter (multiline + singleline) and
         // Cmd/Ctrl-Enter (still honored for muscle memory). Shift-Enter

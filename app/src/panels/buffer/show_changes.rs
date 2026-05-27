@@ -1,20 +1,20 @@
 //! Right-click "Show changes" context menu on the editor toolbar's diff
 //! toggle. Per `editor-show-changes-menu` in `editor.md`.
 //!
-//! Lists recent `changes.db` rows for the active buffer's path and opens
-//! the selected row as a snapshot-preview tab with diff mode on. Sibling
+//! Lists recent accepted ops for the active buffer's path and opens the
+//! selected version as a snapshot-preview tab with diff mode on. Sibling
 //! to the "Diff against on-disk" verb on the same context menu.
 
 use crate::state::AppState;
-use crate::tab::{BufferSource, Tab, TabKind};
+use crate::tab::TabKind;
 
 use eframe::egui;
 
 impl AppState {
     /// Right-click context menu on the diff toggle. Lists the available
     /// diff sources: plain disk diff, plus a "Show changes…" submenu of
-    /// recent `changes.db` rows. Method on `AppState` so the lint
-    /// exempts it from `single_call_fn`.
+    /// recent accepted ops. Method on `AppState` so the lint exempts it
+    /// from `single_call_fn`.
     pub fn show_diff_source_menu(&mut self, ui: &mut egui::Ui, path: &str) {
         if ui.button("Diff against on-disk").clicked() {
             super::open_diff_vs_disk(self, path);
@@ -23,7 +23,8 @@ impl AppState {
         ui.separator();
         let app = self;
         ui.menu_button("Show changes\u{2026}", |ui| {
-            let changes = match app.vault_session.services.changes.history_for_path(path, 20) {
+            let log = app.vault_session.services.oplog.as_ref();
+            let changes = match hiker_core::ops::op_writes::path_history(log, path, 20) {
                 Ok(rows) => rows,
                 Err(_) => return,
             };
@@ -51,35 +52,25 @@ impl AppState {
                         format!("{}d ago", secs / 86_400)
                     }
                 };
-                let op = format!("{:?}", row.op).to_lowercase();
-                let author = if row.author.is_empty() {
-                    "\u{2014}".to_string()
-                } else {
-                    row.author.clone()
+                let op = row.op_kind.clone();
+                let author = {
+                    let wire = row.author.as_wire();
+                    if wire.is_empty() {
+                        "\u{2014}".to_string()
+                    } else {
+                        wire
+                    }
                 };
                 let label = format!("{}  \u{00b7}  {}  \u{00b7}  {}", ts, op, author);
                 if ui.button(label).clicked() {
-                    // Inlined: open or focus a snapshot tab for this change row.
-                    let change_id = row.id.to_string();
-                    let row_path = row.path.clone();
-                    if let Some(existing) = app.session.tabs.iter().find(|t| {
-                        matches!(
-                            &t.kind,
-                            TabKind::Editor {
-                                buffer: BufferSource::Snapshot { change_id: c, path: p },
-                                ..
-                            } if *c == change_id && p == &row_path
-                        )
-                    }) {
-                        app.session.active_tab = Some(existing.id);
-                    } else {
-                        let id = app.next_tab_id();
-                        app.session.tabs.push(Tab {
-                            id,
-                            kind: TabKind::snapshot_preview(row_path, change_id),
-                            sticky: true,
-                        });
-                        app.session.active_tab = Some(id);
+                    // Load this version IN THIS tab (same as the version
+                    // dropdown) rather than spawning a new one.
+                    let op_id = row.op_id.clone();
+                    if let Some(active) = app.session.active_tab
+                        && let Some(tab) =
+                            app.session.tabs.iter_mut().find(|t| t.id == active)
+                    {
+                        tab.kind = TabKind::snapshot_preview(path.to_string(), op_id);
                     }
                     ui.close();
                 }

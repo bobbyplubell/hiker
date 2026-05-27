@@ -183,6 +183,98 @@ pub fn merge_agent_patch(
     assemble(&fm, split_view.body)
 }
 
+/// One flattened frontmatter field destined for the metadata index
+/// (`store-note-metadata-index`). `key` is a dotted path (`hiker.author`);
+/// list elements share a key across entries. `num` is the numeric mirror
+/// for YAML numbers / bools, `None` for strings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlatField {
+    pub key: String,
+    pub value: String,
+    pub num: Option<f64>,
+}
+
+/// Caps guarding the index against pathological frontmatter.
+const MAX_FLAT_ENTRIES: usize = 256;
+const MAX_KEY_LEN: usize = 256;
+const MAX_VALUE_LEN: usize = 1024;
+
+/// Flatten a parsed frontmatter mapping into index entries. Nested maps
+/// recurse with dotted keys (`hiker.author`); sequences emit one entry per
+/// scalar element under the list's key (`tags: [a, b]` → two entries);
+/// null values and non-scalar list elements are skipped. Bounded by
+/// `MAX_FLAT_ENTRIES` / `MAX_KEY_LEN` / `MAX_VALUE_LEN`.
+///
+/// status: store-note-metadata-index
+pub fn flatten(frontmatter: &YamlValue) -> Vec<FlatField> {
+    let mut out = Vec::new();
+    if let YamlValue::Mapping(map) = frontmatter {
+        for (k, v) in map {
+            if let Some(key) = k.as_str() {
+                flatten_into(key, v, &mut out);
+            }
+            if out.len() >= MAX_FLAT_ENTRIES {
+                break;
+            }
+        }
+    }
+    out.truncate(MAX_FLAT_ENTRIES);
+    out
+}
+
+fn flatten_into(key: &str, value: &YamlValue, out: &mut Vec<FlatField>) {
+    if out.len() >= MAX_FLAT_ENTRIES || key.len() > MAX_KEY_LEN {
+        return;
+    }
+    match value {
+        YamlValue::Mapping(map) => {
+            for (k, v) in map {
+                if let Some(child) = k.as_str() {
+                    flatten_into(&format!("{key}.{child}"), v, out);
+                }
+                if out.len() >= MAX_FLAT_ENTRIES {
+                    break;
+                }
+            }
+        }
+        YamlValue::Sequence(items) => {
+            for item in items {
+                if let Some(f) = scalar_field(key, item) {
+                    out.push(f);
+                }
+                if out.len() >= MAX_FLAT_ENTRIES {
+                    break;
+                }
+            }
+        }
+        _ => {
+            if let Some(f) = scalar_field(key, value) {
+                out.push(f);
+            }
+        }
+    }
+}
+
+/// A single scalar YAML value as a `FlatField`, or `None` for null / nested
+/// / over-long values.
+fn scalar_field(key: &str, value: &YamlValue) -> Option<FlatField> {
+    let (value, num) = match value {
+        YamlValue::String(s) => (s.clone(), None),
+        YamlValue::Bool(b) => ((*b).to_string(), Some(if *b { 1.0 } else { 0.0 })),
+        YamlValue::Number(n) => (n.to_string(), n.as_f64()),
+        // Null, and nested map/seq that slipped through, are not indexed.
+        _ => return None,
+    };
+    if value.len() > MAX_VALUE_LEN {
+        return None;
+    }
+    Some(FlatField {
+        key: key.to_string(),
+        value,
+        num,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("frontmatter patch must be a JSON object")]
@@ -255,5 +347,34 @@ mod tests {
         }
         let s = assemble(&fm, "body\n").unwrap();
         assert!(s.starts_with("---\n"));
+    }
+
+    #[test]
+    fn flatten_scalars_lists_and_nested() {
+        let src = "---\nstatus: active\npriority: 3\nstarred: true\ntags:\n  - project\n  - rust\nhiker:\n  author: user-authored\n---\nbody\n";
+        let fm = split(src).frontmatter.unwrap();
+        let fields = flatten(&fm);
+        let get = |k: &str| -> Vec<FlatField> {
+            fields.iter().filter(|f| f.key == k).cloned().collect()
+        };
+        assert_eq!(get("status")[0].value, "active");
+        assert_eq!(get("status")[0].num, None);
+        assert_eq!(get("priority")[0].value, "3");
+        assert_eq!(get("priority")[0].num, Some(3.0));
+        assert_eq!(get("starred")[0].num, Some(1.0));
+        let tags: Vec<String> = get("tags").into_iter().map(|f| f.value).collect();
+        assert_eq!(tags, vec!["project".to_string(), "rust".to_string()]);
+        assert_eq!(get("hiker.author")[0].value, "user-authored");
+    }
+
+    #[test]
+    fn flatten_skips_null_and_non_mapping() {
+        assert!(flatten(&YamlValue::Null).is_empty());
+        // A note key with a null value isn't indexed.
+        let src = "---\nstatus:\ntags:\n  - a\n---\nbody\n";
+        let fm = split(src).frontmatter.unwrap();
+        let fields = flatten(&fm);
+        assert!(fields.iter().all(|f| f.key != "status"));
+        assert_eq!(fields.iter().filter(|f| f.key == "tags").count(), 1);
     }
 }

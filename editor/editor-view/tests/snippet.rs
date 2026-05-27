@@ -12,7 +12,7 @@ use editor_view::events::NamedKey;
 use editor_view::snippets::Snippet;
 use editor_view::viewport::ViewState;
 fn drive(state: &mut EditorState, view: &mut ViewState, ev: &InputEvent) {
-    if let Action::Replace(next) = command::handle(state, view, ev) {
+    if let Action::Replace { state: next, .. } = command::handle(state, view, ev) {
         *state = next;
     }
 }
@@ -47,7 +47,7 @@ fn expand_into_empty_doc_lands_at_first_stop() {
     let mut view = ViewState::default();
     let snip = Snippet::parse("for $1 in $2:\n    $0").unwrap();
     let action = expand_snippet(&state, &mut view, &snip, 0..0);
-    if let Action::Replace(next) = action {
+    if let Action::Replace { state: next, .. } = action {
         state = next;
     }
     assert_eq!(state.doc.to_string(), "for  in :\n    ");
@@ -63,7 +63,7 @@ fn tab_cycles_to_next_stop() {
     let mut state = EditorState::new("");
     let mut view = ViewState::default();
     let snip = Snippet::parse("for $1 in $2:\n    $0").unwrap();
-    if let Action::Replace(next) = expand_snippet(&state, &mut view, &snip, 0..0) {
+    if let Action::Replace { state: next, .. } = expand_snippet(&state, &mut view, &snip, 0..0) {
         state = next;
     }
     let first = state.selection.main().start();
@@ -85,7 +85,7 @@ fn mirror_sync_replaces_both_occurrences() {
     let mut state = EditorState::new("");
     let mut view = ViewState::default();
     let snip = Snippet::parse("$1 $1").unwrap();
-    if let Action::Replace(next) = expand_snippet(&state, &mut view, &snip, 0..0) {
+    if let Action::Replace { state: next, .. } = expand_snippet(&state, &mut view, &snip, 0..0) {
         state = next;
     }
     // Initial doc is just a single space (both $1 spans empty).

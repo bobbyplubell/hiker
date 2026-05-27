@@ -57,6 +57,10 @@ arrangement is persistable per workspace.
 
 1.8. The activity bar itself may be hidden, moved to the right side, or moved to the top/bottom (top/bottom is a v1.1 stretch goal; v1.0 supports left and right).
 
+1.9. **Right-clicking the strip** — an item or its empty area — opens a context menu listing **every available item as a checkbox**, checked when the item is currently shown. Toggling a checkbox shows or hides that item. This is the affordance that restores an item hidden via 1.6, so it stays reachable from the empty strip even when all items are hidden (per 14.3). Per-item right-click shows the checklist below the item-scoped `Hide` command and above the host's own entries.
+
+1.10. The set of hidden items and the user's item order are **persisted** (see §8) so visibility and ordering survive a restart.
+
 ### 2. Primary side bar
 
 2.1. The primary side bar **renders the content of the currently-active activity** as a stacked view (single-column).
@@ -152,7 +156,7 @@ arrangement is persistable per workspace.
 
 ### 8. Layout persistence
 
-8.1. The full workbench state — activity selection, sidebar positions, panel visibility, editor group tree, sizes, pinned/preview tab states — is **serializable** to/from a single JSON document.
+8.1. The full workbench state — activity selection, activity-item visibility and order, sidebar positions, panel visibility, editor group tree, sizes, pinned/preview tab states — is **serializable** to/from a single JSON document.
 
 8.2. The schema is **versioned**. Unknown versions log a warning and fall back to defaults rather than panic.
 

@@ -9,6 +9,24 @@ use std::sync::Arc;
 use crate::anchor::{Anchor, Bias};
 use crate::change::Set;
 
+/// Whether a value, when stored in a [`RangeSet`], can change the height of
+/// the line(s) it covers. Used to decide — once, at set-construction time —
+/// whether the set must be scanned by the heightmap driver. The default is
+/// `false`; only [`crate::decoration::Decoration`] overrides it (for the
+/// hide / height-scale / block variants).
+///
+/// Computing this at construction (rather than at the push call site) is what
+/// removes the "wrong push method" footgun: a set knows for itself whether it
+/// affects height, so the layer container can route it to a height layer
+/// automatically while the heightmap driver still scans only those layers.
+pub trait HeightAffecting {
+    /// True if this value can change a line's height when used as a
+    /// decoration. Defaults to `false` for non-decoration payloads.
+    fn affects_height(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RangeSet<T: Clone> {
     entries: Arc<Vec<Entry<T>>>,
@@ -18,6 +36,10 @@ pub struct RangeSet<T: Clone> {
     /// O(N) per-call linear scan into ~O(log N + K). Cached at
     /// construction; copied through `insert` / `map`.
     max_extent: u32,
+    /// True if any stored value reports [`HeightAffecting::affects_height`].
+    /// Computed once at construction and carried through `insert` / `map`, so
+    /// the heightmap driver never has to re-derive it per frame.
+    affects_height: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,28 +60,7 @@ impl<T: Clone> RangeSet<T> {
         Self {
             entries: Arc::new(Vec::new()),
             max_extent: 0,
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_iter<I: IntoIterator<Item = (std::ops::Range<usize>, T)>>(iter: I) -> Self {
-        let mut entries: Vec<Entry<T>> = iter
-            .into_iter()
-            .map(|(r, v)| Entry {
-                start: Anchor::at(r.start, Bias::Right),
-                end: Anchor::at(r.end, Bias::Left),
-                value: v,
-            })
-            .collect();
-        entries.sort_by_key(|e| e.start.byte);
-        let max_extent = entries
-            .iter()
-            .map(|e| e.end.byte.saturating_sub(e.start.byte))
-            .max()
-            .unwrap_or(0);
-        Self {
-            entries: Arc::new(entries),
-            max_extent,
+            affects_height: false,
         }
     }
 
@@ -78,20 +79,11 @@ impl<T: Clone> RangeSet<T> {
         Arc::as_ptr(&self.entries) as usize
     }
 
-    pub fn insert(&self, range: std::ops::Range<usize>, value: T) -> Self {
-        let mut entries = (*self.entries).clone();
-        let entry = Entry {
-            start: Anchor::at(range.start, Bias::Right),
-            end: Anchor::at(range.end, Bias::Left),
-            value,
-        };
-        let entry_extent = entry.end.byte.saturating_sub(entry.start.byte);
-        let pos = entries.partition_point(|e| e.start.byte <= entry.start.byte);
-        entries.insert(pos, entry);
-        Self {
-            entries: Arc::new(entries),
-            max_extent: self.max_extent.max(entry_extent),
-        }
+    /// True if any stored value affects line height. Computed once at
+    /// construction (see [`HeightAffecting`]); the heightmap driver uses it
+    /// to decide which layers it must scan.
+    pub const fn affects_height(&self) -> bool {
+        self.affects_height
     }
 
     /// Iterate all `(range, value)` pairs whose range overlaps `query`. Zero-
@@ -133,6 +125,51 @@ impl<T: Clone> RangeSet<T> {
             .map(|e| (e.start.byte as usize..e.end.byte as usize, &e.value))
     }
 
+}
+
+impl<T: Clone + HeightAffecting> RangeSet<T> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_iter<I: IntoIterator<Item = (std::ops::Range<usize>, T)>>(iter: I) -> Self {
+        let mut entries: Vec<Entry<T>> = iter
+            .into_iter()
+            .map(|(r, v)| Entry {
+                start: Anchor::at(r.start, Bias::Right),
+                end: Anchor::at(r.end, Bias::Left),
+                value: v,
+            })
+            .collect();
+        entries.sort_by_key(|e| e.start.byte);
+        let max_extent = entries
+            .iter()
+            .map(|e| e.end.byte.saturating_sub(e.start.byte))
+            .max()
+            .unwrap_or(0);
+        let affects_height = entries.iter().any(|e| e.value.affects_height());
+        Self {
+            entries: Arc::new(entries),
+            max_extent,
+            affects_height,
+        }
+    }
+
+    pub fn insert(&self, range: std::ops::Range<usize>, value: T) -> Self {
+        let mut entries = (*self.entries).clone();
+        let entry = Entry {
+            start: Anchor::at(range.start, Bias::Right),
+            end: Anchor::at(range.end, Bias::Left),
+            value,
+        };
+        let entry_extent = entry.end.byte.saturating_sub(entry.start.byte);
+        let entry_affects_height = entry.value.affects_height();
+        let pos = entries.partition_point(|e| e.start.byte <= entry.start.byte);
+        entries.insert(pos, entry);
+        Self {
+            entries: Arc::new(entries),
+            max_extent: self.max_extent.max(entry_extent),
+            affects_height: self.affects_height || entry_affects_height,
+        }
+    }
+
     /// Map all entries through `changes`. Entries whose range fully collapses
     /// (start == end after mapping) are dropped.
     pub fn map(&self, changes: &Set) -> Self {
@@ -150,9 +187,11 @@ impl<T: Clone> RangeSet<T> {
             .map(|e| e.end.byte.saturating_sub(e.start.byte))
             .max()
             .unwrap_or(0);
+        let affects_height = out.iter().any(|e| e.value.affects_height());
         Self {
             entries: Arc::new(out),
             max_extent,
+            affects_height,
         }
     }
 }
@@ -160,6 +199,11 @@ impl<T: Clone> RangeSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The generic constructors require `T: HeightAffecting`; the test
+    // payload types are non-decoration scalars that never affect height.
+    impl HeightAffecting for u32 {}
+    impl HeightAffecting for &str {}
 
     #[test]
     fn empty() {

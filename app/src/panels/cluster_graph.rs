@@ -101,7 +101,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
 }
 
 /// Render the cluster graph from a pre-resolved `EditableNode` slice
-/// instead of loading from `trees.db`. Shared between the persisted
+/// instead of loading from the tree's `.md`. Shared between the persisted
 /// cluster-tree tab (`show`) and the un-persisted `BuiltClusterTree`
 /// preview in `panels::cluster_review` (see
 /// `built_tree_to_editable_nodes` for the synthesis path).

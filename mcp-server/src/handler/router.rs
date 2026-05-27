@@ -10,8 +10,9 @@ use rmcp::{tool, tool_router};
 
 use super::App;
 use crate::handler::params::{
-    audit_err, audit_status, ApplyTag, EditNote, GetNote, RelatedNotes, SearchNotes,
-    SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
+    audit_err, audit_status, ApplyTag, BoardAddCard, BoardGet, BoardsList, EditNote, GetNote,
+    RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList,
+    TaskSubmit, WriteNote,
 };
 
 // ---------- tool router ----------
@@ -94,9 +95,11 @@ impl App {
         name = "write_note",
         description = "Create or replace a note's body. Returns the new content hash on a direct write. \
                        NOTE: when the server is in review-required mode, the write is STAGED as a pending proposal \
-                       instead of hitting disk — the response is `{ status: \"staged\", staging_id }` and the file \
-                       will NOT be visible via `get_note` (which returns 1002 not_found) until the user accepts the \
-                       proposal. Use `list_pending_proposals` to confirm a staged write landed."
+                       instead of hitting disk — the response is `{ status: \"staged\", staging_id }`. A follow-up \
+                       `get_note` reflects your own staged edits (you read your pending replica), but the change does \
+                       not reach disk for the user until they accept the proposal. A brand-new note that does not yet \
+                       exist on disk still returns 1002 not_found from `get_note` until accepted. Use \
+                       `list_pending_proposals` to confirm a staged write landed."
     )]
     pub async fn write_note(
         &self,
@@ -204,6 +207,76 @@ impl App {
         let outcome = self.update_tag(&p, false).await;
         self.state.audit.record(
             "remove_tag",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Enumerate every board-doc in the vault (read-only).
+    ///
+    /// status: board-mcp-tools
+    #[tool(
+        name = "boards_list",
+        description = "List every board-doc in the vault. Returns rel_path, board_id, title, column_count, card_count per board."
+    )]
+    pub async fn boards_list(
+        &self,
+        params: Parameters<BoardsList>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.enumerate_boards(&p).await;
+        self.state.audit.record(
+            "boards_list",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Fetch one board's body + resolved columns/cards (read-only).
+    ///
+    /// status: board-mcp-tools
+    #[tool(
+        name = "board_get",
+        description = "Fetch a board by its vault-relative path. Returns the board-doc body plus resolved columns, each with its cards (title + reference resolution)."
+    )]
+    pub async fn board_get(
+        &self,
+        params: Parameters<BoardGet>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.fetch_board(&p).await;
+        self.state.audit.record(
+            "board_get",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Add a note as a card to a board column. Gated by
+    /// `agent-write-review-mode` like every other write tool.
+    ///
+    /// status: board-mcp-tools
+    #[tool(
+        name = "board_add_card",
+        description = "Append a note (by source_rel_path) as a card to a board column. \
+                       Idempotent per board — a note already on the board returns status=\"noop\". \
+                       NOTE: in review-required mode the board-doc edit is STAGED as a pending proposal \
+                       (status=\"staged\" + staging_id); disk is unchanged until the user accepts."
+    )]
+    pub async fn board_add_card(
+        &self,
+        params: Parameters<BoardAddCard>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.add_board_card(&p).await;
+        self.state.audit.record(
+            "board_add_card",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
             audit_status(&outcome),
             audit_err(&outcome),

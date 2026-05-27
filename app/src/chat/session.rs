@@ -64,7 +64,7 @@ pub fn discover(reg: &mut ChatRegistry, vault_root: &Path) {
                         args: tc.arguments.clone(),
                         result: matched.map(|r| r.output.clone()),
                         ok: matched.map(|r| r.ok).unwrap_or(true),
-                        staging_ids: Vec::new(),
+                        produced_write: false,
                         target_path: None,
                     }),
                 });

@@ -36,6 +36,12 @@ enum FileVerb {
     Reindex,
     AddToTrail { trail_name: String },
     SetActiveTrail,
+    /// Open a board-doc in the board view (vs. the default buffer).
+    /// status: board-view
+    OpenAsBoard,
+    /// Append this note as a card to `board_rel`'s `column`.
+    /// status: board-add-card
+    AddToBoard { board_rel: String, column: String },
     Delete,
 }
 
@@ -311,7 +317,15 @@ fn render_file_row(&mut self, entry: &DirEntryDto, depth: usize) {
         .dnd_set_drag_payload::<String>(entry.rel_path.clone());
 
     if resp.clicked() {
-        editor_pane::open_file(self.state, &entry.rel_path, /* sticky */ false);
+        // status: board-view
+        // A board-doc opens in the board view by default; everything else
+        // opens as a buffer. The frontmatter check runs only on click, not
+        // per-frame, so the tree paint stays cheap.
+        if is_board_doc(self.state, &entry.rel_path) {
+            crate::panels::board::open(self.state, &entry.rel_path);
+        } else {
+            editor_pane::open_file(self.state, &entry.rel_path, /* sticky */ false);
+        }
     }
     if resp.double_clicked() {
         // Per docs/editor.md: double-click enters inline rename mode.
@@ -332,6 +346,12 @@ fn render_file_row(&mut self, entry: &DirEntryDto, depth: usize) {
 /// and closes the menu; no `AppState` mutation happens here.
 fn file_row_menu(&mut self, resp: &egui::Response, rel: &str) -> Option<FileVerb> {
     let mut verb = None;
+    // Pre-compute the board context (read-only) so the closure stays read-
+    // only. `boards` is every board-doc + its columns; `membership` is the
+    // set of board paths this note is already a card on; `board_doc` is
+    // whether *this* row is itself a board-doc.
+    let (boards, membership, board_doc) =
+        crate::panels::board::picker_context(self.state, rel);
     let state = &*self.state;
     // Pre-compute the trail context so the closure stays read-only.
     let active_trail = state
@@ -391,6 +411,27 @@ fn file_row_menu(&mut self, resp: &egui::Response, rel: &str) -> Option<FileVerb
         {
             verb = Some(FileVerb::SetActiveTrail);
             ui.close();
+        }
+        // status: board-view
+        // Board-docs get an explicit "Open as board" verb (the default
+        // click already routes there).
+        if board_doc && ui.button("Open as board").clicked() {
+            verb = Some(FileVerb::OpenAsBoard);
+            ui.close();
+        }
+        // status: board-add-card
+        // "Add to board…" on indexable note rows: a board → column nested
+        // picker. Hidden on board-doc rows (a board isn't a card on itself)
+        // and non-`.md` rows. Disabled per-board when the note is already a
+        // card on that board.
+        if !board_doc && rel.ends_with(".md") && !boards.is_empty() {
+            ui.menu_button("Add to board…", |ui| {
+                let mut pick: Option<(String, String)> = None;
+                crate::panels::board::column_picker(ui, &boards, &membership, &mut pick);
+                if let Some((board_rel, column)) = pick {
+                    verb = Some(FileVerb::AddToBoard { board_rel, column });
+                }
+            });
         }
         if ui.button("Delete").clicked() {
             verb = Some(FileVerb::Delete);
@@ -470,6 +511,12 @@ fn run_file_verb(&mut self, verb: FileVerb, rel: &str) {
                     crate::state::ToastLevel::Info,
                 );
             }
+        }
+        FileVerb::OpenAsBoard => {
+            crate::panels::board::open(self.state, rel);
+        }
+        FileVerb::AddToBoard { board_rel, column } => {
+            crate::panels::board::add_card(self.state, &board_rel, &column, rel);
         }
         FileVerb::Delete => {
             self.state.session.modal =
@@ -1130,6 +1177,24 @@ fn waypoint_tree_contains(waypoints: &[crate::state::Waypoint], path: &str) -> b
         }
     }
     false
+}
+
+/// True if the `.md` at `rel` is a board-doc (frontmatter `hiker.kind:
+/// board`). Reads + parses the file — called on click / menu open, never
+/// per-frame.
+///
+/// status: board-view
+fn is_board_doc(state: &AppState, rel: &str) -> bool {
+    if !rel.ends_with(".md") {
+        return false;
+    }
+    state
+        .vault_session
+        .vault
+        .read_file(rel)
+        .ok()
+        .map(|src| hiker_core::boards::parse_board_for(rel, &src).is_ok())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

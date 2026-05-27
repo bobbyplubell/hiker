@@ -26,6 +26,7 @@ profiling = ["dep:puffin", "dep:puffin_http"]
 
 [dependencies]
 hiker-core.workspace = true
+hiker-sync = { path = "../hiker-sync" }
 puffin = { version = "0.19", optional = true, features = ["serialization"] }
 puffin_http = { version = "0.16", optional = true }
 

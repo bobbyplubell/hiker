@@ -8,7 +8,7 @@
 //! status: mcp-dynamic-capabilities
 //!
 //! Spawned by the app on vault open with the same `Vault`,
-//! `IndexJobTx`, read-`Store`, `Watcher`, and `Changes` the UI uses. The
+//! `IndexJobTx`, read-`Store`, and `Watcher` the UI uses. The
 //! server runs as one tokio task hosting an axum HTTP listener wrapping
 //! rmcp's `StreamableHttpService` (per `mcp-transport-streamable-http`).
 //! Handle is dropped at vault close — the cancellation token tears the
@@ -25,11 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hiker_core::audit::AgentLog;
-use hiker_core::changes::Changes;
 use hiker_core::config::sections::{McpConfig, TasksConfig};
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
-use hiker_core::staging::Staging;
 use hiker_core::store::Store;
 use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::vault::Vault;
@@ -50,7 +48,6 @@ pub struct McpDeps {
     pub read_store: Arc<Mutex<Store>>,
     pub jobs: IndexJobTx,
     pub watcher: Arc<Watcher>,
-    pub changes: Arc<Changes>,
     /// Pulls the currently-loaded embedder from the indexer's `OnceCell`.
     /// Returns `None` while the model is loading or after a load failure;
     /// search and related tools surface `1005 indexer_unavailable` in that
@@ -79,13 +76,13 @@ pub struct McpDeps {
     /// `1004 disabled` rather than letting external agents check work
     /// out that no one will drain.
     pub llm_enabled: bool,
-    /// Shared staging instance for proposal-based writes. When
-    /// `[mcp.tools].review_required` is true, MCP write tools route
-    /// through `staging.propose()`. Created by the host at
-    /// vault open and shared with the MCP handler.
+    /// The vault's op log, when open. Threaded into `HikerState` so the
+    /// write tools queue agent edits into the pending queue
+    /// (`op-log-ops-producer-helpers`). Review-mode writes stage a pending
+    /// op the user accepts/rejects in the hiker UI.
     ///
     /// status: agent-write-review-mode
-    pub staging: Arc<Staging>,
+    pub oplog: Option<Arc<hiker_core::oplog::OpLog>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,11 +209,10 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         read_store: deps.read_store,
         jobs: deps.jobs,
         watcher: deps.watcher,
-        changes: deps.changes,
         embedder_provider: deps.embedder_provider,
         config: deps.config.clone(),
         tools: deps.tools.clone(),
-        staging: deps.staging.clone(),
+        oplog: deps.oplog.clone(),
         audit,
         tasks: deps.tasks,
         default_lease_secs: deps.tasks_config.lease.default_secs,

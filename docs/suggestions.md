@@ -9,8 +9,8 @@ Two flows live on top of the same engine:
 
 The headline decisions:
 
-- **`trees.db` is the single source of truth for cluster trees.** Owned by `core::trees` (per `cluster-editor.md`); both Sapling (one-shot) and Evergreen (saved-triage) trees live as rows there. The filesystem stays the source of truth for note placement — trees are a recommendation surface, not durable organizational infrastructure. [suggestions-one-shot-flow]
-- **Markdown is an optional export, not a persisted format.** The cluster editor's markdown view (per `cluster-editor-markdown-view-toggle`) renders trees on demand from `trees.db` rows. A `hiker suggest export <tree-id> [--out <path>]` CLI command writes the same rendered markdown to a file for sharing / audit / offline review; the export is one-way and is not parsed back on Apply. [suggestions-markdown-export]
+- **Per-tree `.md` files are the source of truth for cluster trees.** Owned by `core::trees` (per `cluster-editor.md`); both Sapling (one-shot) and Evergreen (saved-triage) trees live as `.md` files under `vault/.hiker/trees/`, riding the op-log substrate. The filesystem stays the source of truth for note placement — trees are a recommendation surface, not durable organizational infrastructure. [suggestions-one-shot-flow]
+- **The tree `.md` is the persisted format; export is a separate human-readable copy.** A tree persists as a `.md` file whose frontmatter holds the structure and whose body is a regenerated render (per `cluster-editor-markdown-view-toggle`). A `hiker suggest export <tree-id> [--out <path>]` CLI command writes a standalone copy of that rendering elsewhere for sharing / audit / offline review; the export is one-way and is not parsed back on Apply. [suggestions-markdown-export]
 - **The cluster editor is the primary review surface.** Structured tree view + the batch-review pane (per `cluster-editor-batch-review-pane`) are where users decide what to apply. The markdown view + export are escape hatches for text-editing or sharing — never authoritative.
 - **Per-leaf granularity at Apply time.** Each leaf with a resolved `Tag` or `Move` policy produces one `the op log` row; the user accepts/rejects rows independently from the batch-review pane.
 - **Two output modes per suggestion: move or tag.** Move = filesystem rename into a (possibly new) folder. Tag = write to the note's frontmatter, no fs change. Configurable per cluster, overridable per note. [suggestions-mode-move, suggestions-mode-tag]
@@ -23,16 +23,16 @@ The headline decisions:
 User invokes "Suggest reorganization" — from the sidebar's Cluster trees mode (per `cluster-editor-new-tree-action`) or via `hiker suggest` on the CLI. The system:
 
 1. Resolves the build inputs (scope / method / params) via the clustering review tab (`cluster-review-tab-config-section`) for the UI path or CLI flags (`hiker suggest --scope vault --method cluster --algorithm hdbscan ...`).
-2. Runs the clustering build pipeline (`clustering.md`) and inserts the resulting tree into `trees.db` with `state = 'draft'`, `source = 'one-shot'`.
+2. Runs the clustering build pipeline (`clustering.md`) and persists the resulting tree as a `.md` file with `state: draft`, `source: one-shot`.
 3. UI: opens the new tree in the cluster editor's expanded view, ready for review and policy assignment. CLI: prints the new tree's id and a one-line summary; users open it in the UI to review, or use `hiker suggest show <tree-id>` to dump a markdown rendering to stdout.
 4. User edits policies / reshapes / sets per-leaf overrides, then clicks Apply (UI) or runs `hiker suggest apply <tree-id>` (CLI).
 
-The flow is non-interactive at the engine level — no streaming, no partial application during generation. The tree lands as a complete object in `trees.db`; the user takes their time. Reconcile is *not* an interactive operation in the sub-second sense (`clustering.md`'s cost model puts a 10k-note vault at ~30s). [suggestions-one-shot-flow]
+The flow is non-interactive at the engine level — no streaming, no partial application during generation. The tree lands as a complete `.md` file; the user takes their time. Reconcile is *not* an interactive operation in the sub-second sense (`clustering.md`'s cost model puts a 10k-note vault at ~30s). [suggestions-one-shot-flow]
 
 
 ## Markdown rendering
 
-The cluster editor's markdown view (`cluster-editor-markdown-view-toggle`) and the `hiker suggest export` CLI command both render a tree from its `trees.db` rows into the format below. The format is **read-only** with respect to the tree — edits to an exported markdown file are not parsed back. Edits happen in the cluster editor (UI) or via `hiker suggest set-policy / hiker suggest move` CLI commands that mutate `trees.db` directly. [suggestions-proposal-md]
+The cluster editor's markdown view (`cluster-editor-markdown-view-toggle`) and the `hiker suggest export` CLI command both render a tree from its frontmatter into the format below. The body render is **read-only** with respect to the structure — edits to an exported markdown file are not parsed back. Edits happen in the cluster editor (UI), by hand-editing the tree `.md`'s frontmatter, or via `hiker suggest set-policy / hiker suggest move` CLI commands that rewrite the frontmatter. [suggestions-proposal-md]
 
 ```markdown
 # Cluster tree — 01HXP7Z…  ·  2026-05-06 15:42  ·  draft
@@ -59,7 +59,7 @@ Scope: Vault   Method: Cluster (hdbscan)   24 clusters · 142 leaves · 7 outlie
 
 The rendering carries the tree's id, build timestamp + state, scope + method, member counts, per-cluster confidence + policy, and the leaf list per cluster. Outliers render as their own section. There are no checkboxes — Apply is driven by the tree's policies, not by checking the rendering.
 
-**Export.** `hiker suggest export <tree-id> [--out <path>] [--format md|json]` writes the rendering to a file. Useful for audit, sharing a tree with a teammate, or offline review on a different device. The export is one-way; importing back requires `hiker suggest import <path>` which creates a fresh `trees.db` entry — there is no "diff this exported file against my current tree" path in v1. [suggestions-markdown-export, suggestions-tree-export-cli]
+**Export.** `hiker suggest export <tree-id> [--out <path>] [--format md|json]` writes the rendering to a file. Useful for audit, sharing a tree with a teammate, or offline review on a different device. The export is one-way; importing back requires `hiker suggest import <path>` which creates a fresh tree `.md` file — there is no "diff this exported file against my current tree" path in v1. [suggestions-markdown-export, suggestions-tree-export-cli]
 
 
 ## Apply
@@ -71,7 +71,7 @@ The rendering carries the tree's id, build timestamp + state, scope + method, me
 - **Frozen leaves and unpolicied leaves are skipped** — they're listed in the post-apply summary as `(N leaves skipped — no policy assigned, M leaves frozen)` so nothing is silently dropped.
 - **Rejection bookkeeping.** When a pending op is rejected (CLI `n` answer, UI Reject), the rejection is recorded against `(tree_member_fingerprint, note_id, action)` in a small TTL'd rejection log (per `suggestions-rejection-history`) so a re-run of `hiker suggest` doesn't propose the same thing in the next reasonable window. [suggestions-rejection-history]
 
-`tree_member_fingerprint` = stable hash of the leaf's member-set + parent cluster's name. Survives reshape if Jaccard ≥ 0.7 against the prior member set, in the spirit of the dropped `cluster-stable-identity` rule but applied only at the rejection-history layer, not as durable cluster IDs.
+`tree_member_fingerprint` = stable hash of the leaf's member-set + parent cluster's name. Survives reshape if Jaccard ≥ 0.7 against the prior member set — applied only at the rejection-history layer, not as durable cluster IDs.
 
 History bookkeeping is small — one row per rejected `(note, suggested-action)` pair, with a TTL so a route the user rejects in 2026 isn't suppressed forever. Default TTL: 90 days, configurable.
 
@@ -100,8 +100,6 @@ tag_field = "hiker.suggested_tags"   # default; set to "tags" to use the regular
 ```
 
 Setting `tag_field = "tags"` writes cluster tags to the user's main `tags:` list. For users who want one tag namespace and don't mind AI-suggested tags landing alongside their own, this is the simpler shape. The slug-ification rule applies regardless.
-
-**Future integration with auto-tag.** The auto-tag enrichment pipeline (`design.md` enrichment section) has its own constrained-vocabulary system, confidence tiers, and review flow. Cluster-driven tagging is *adjacent* to it, not a replacement, and the two should converge later — likely with cluster names becoming new auto-tag vocabulary entries on user accept. Deferring that integration is intentional: the simpler shape ships first, the convergence story gets specced when both surfaces have real users.
 
 
 ## Saved-tree triage
@@ -133,7 +131,7 @@ effective_requires_review = policy.require_review || config.review_required
 ```
 
 - `effective_requires_review == false` — the op is appended with `status = accepted` directly. The accepted op carries `author = "auto:triage"`, `metadata.auto_accepted = true`, `metadata.tree_id`, `metadata.matched_node_id` for traceability and rollback.
-- `effective_requires_review == true` — the row stays pending. The user reviews via the activity-detail Pending filter (chip: `surface = "triage"`). On user accept, the changes-row author is `user` (the user owned the decision); on reject, the row deletes with no changes-row.
+- `effective_requires_review == true` — the row stays pending. The user reviews via the activity-detail Pending filter (chip: `surface = "triage"`). On user accept, the op keeps `author = "auto:triage"` (the classifier authored the placement; acceptance is a gate, not authorship) with `metadata.auto_accepted = false`; on reject, the row deletes with no op.
 
 Accept reuses the existing apply mechanic (`suggestions-apply-cmd`): `move_note` rows call `core::vault::move_note(source, target)` (auto-creating target folders), `apply_tag` rows write to the configured `[suggestions] tag_field` on the target note's frontmatter. No new code paths.
 
@@ -175,7 +173,7 @@ Strict-load schema coverage per `settings-strict-load`. The settings UI grows a 
 ## Module placement
 
 - `core::cluster` — the build engine (`clustering.md`).
-- `core::trees` — `trees.db` owner; persists saved/draft trees (per `cluster-editor.md`).
+- `core::trees` — owner of the per-tree `.md` files under `vault/.hiker/trees/`; persists saved/draft trees, committing edits through the op-log (per `cluster-editor.md`).
 - `core::suggest` — Apply mechanic (walk tree → emit pending ops), markdown-rendering helper (`render_markdown(tree_id) -> String` consumed by the editor view and CLI export), history bookkeeping, triage classifier wrapping `cluster-place-beam-descent`. Reads trees from `core::trees`, writes ops through `core::ops` (which append to the op log).
 - `core::oplog` — the substrate for every triage match (and every one-off Stage move/tag from the cluster editor). Accept path reuses `suggestions-apply-cmd`.
 - `ui` — cluster editor (Apply button, batch-review pane, markdown-view toggle), activity-detail Pending filter (`surface = "triage"` chip is just a value the existing filter already understands), toast + Undo for triage auto-accepts (the toast is fired by the auto-accept transaction, not by the queue).

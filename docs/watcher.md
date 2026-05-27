@@ -66,7 +66,7 @@ Indexer's own writes to `.hiker/index.db` would loop forever without the `.hiker
 Core exposes a broadcast channel (`tokio::sync::broadcast::channel<FileEvent>`) that anyone can subscribe to. Two subscribers in v1: [watcher-broadcast-channel]
 
 1. **Indexer task** — filters to `*.md` events, sends matching `IndexJob`s into its work queue. See index.md. [watcher-bridge-to-indexer]
-2. **Frontend bridge** — a host task that subscribes and forwards events to the app via `emit("hiker:file-changed", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. (Could filter server-side instead, but pushing all events keeps the bridge stateless and a future tree-view-refresh consumer can use the same stream without a second subscription.) [watcher-bridge-to-frontend]
+2. **Frontend bridge** — a host task that subscribes and forwards events to the app via `emit("watcher file events", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. (Could filter server-side instead, but pushing all events keeps the bridge stateless and a future tree-view-refresh consumer can use the same stream without a second subscription.) [watcher-bridge-to-frontend]
 
 Event payload to frontend:
 
@@ -81,7 +81,7 @@ type FileChangedEvent = {
 
 ## Editor integration
 
-When the frontend receives `hiker:file-changed` for the active buffer's path:
+When the frontend receives watcher file events for the active buffer's path:
 
 - `kind: "modified"` and buffer is **clean** → fetch fresh contents + hash via `read_file_with_hash`, dispatch a doc-replace transaction, update `loadedHash`. Silent reload. [watcher-editor-reload-clean]
 - `kind: "modified"` and buffer is **dirty** → fire the same conflict modal used by the pre-write drift check (Keep mine / Take theirs / Cancel). "Take theirs" reloads from disk; "Keep mine" leaves the buffer as-is — the next save will re-trigger the drift check, since the on-disk hash will differ from `loadedHash`. [watcher-editor-conflict-dirty]

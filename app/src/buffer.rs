@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 use editor_core::decoration::Set;
 use editor_core::state::Editor;
+use editor_egui::minimap::Cache as MinimapCache;
 use editor_egui::widget::PaintCache;
 use editor_md::indenter::MarkdownIndent;
 use editor_view::viewport::ViewState;
 use editor_view::viewport::ClickAction;
 
 pub struct Buffer {
-    /// What this buffer is sourcing — vault file, snapshot blob, staging
+    /// What this buffer is sourcing — vault file, snapshot blob, pending
     /// proposal content, or trash entry. Drives the toolbar's per-source
     /// verb bar (Save vs. Restore vs. Accept/Reject vs. nothing) and the
     /// read-only flag in `view`. For Vault sources, the path here matches
@@ -30,7 +31,7 @@ pub struct Buffer {
     /// Vault-relative path. Doubles as the key in `AppState::buffers`
     /// for vault sources; for non-vault sources, the path identifies the
     /// underlying note (e.g. the original path of a trashed file, the
-    /// target path of a staging proposal, the path the snapshot is *of*).
+    /// target path of a pending proposal, the path the snapshot is *of*).
     pub path: String,
     /// Hash of the contents most recently read from / written to disk.
     pub loaded_hash: String,
@@ -47,6 +48,11 @@ pub struct Buffer {
     /// Lives on the buffer (rather than inside `ViewState` as it used to)
     /// so the editor-view crate stays free of egui types.
     pub paint_cache: PaintCache,
+    /// Per-buffer minimap metrics/classification cache. Same rationale as
+    /// `paint_cache`: lives on the buffer so the minimap recomputes its
+    /// O(lines) measure+classify pass only when the doc or its decorations
+    /// change, not on every scroll frame.
+    pub minimap_cache: MinimapCache,
     /// Cached "indexer's stored content hash" for the badge in the
     /// status bar that warns when the buffer is ahead of the index.
     /// Refreshed on a coarse interval — without this the status bar
@@ -54,6 +60,13 @@ pub struct Buffer {
     /// every single frame just to render the badge state.
     pub index_hash_cache: Option<String>,
     pub index_hash_refreshed_at: Option<std::time::Instant>,
+    /// Last observed indexer `is_pending` state for this path. The status
+    /// bar forces an out-of-band hash re-read on the pending → done
+    /// transition so the "buffer ahead of index" badge clears the instant
+    /// indexing completes rather than latching until the next coarse timer
+    /// tick. `true` initially so a buffer opened mid-index still picks up
+    /// the post-index refresh.
+    pub index_pending_last: bool,
     /// Set of collapsed fold ids. Updated by `ClickAction::ToggleFold`.
     pub folds: HashSet<u64>,
     /// Per-frame click action sink consumed by `drain_clicks`.
@@ -105,34 +118,25 @@ pub struct Buffer {
     /// already serves as the scroll affordance. Vault default lives in
     /// `editor.hide_scrollbar`.
     pub hide_scrollbar: bool,
-    /// Snapshot of the disk text at the moment any pending `edit_note`
-    /// proposals were hydrated into the live buffer. `None` when no
-    /// proposals applied — the buffer is just plain editing. When `Some`,
-    /// the inline patch-review surface renders `DiffLayer(agent_base,
-    /// current, Agent)` and per-hunk accept/reject mutates these two
-    /// ropes plus removes the contributing proposals from `staging.db`.
-    /// Per `patch-review-buffer-hydration` in `patch-review.md`.
-    pub agent_base: Option<String>,
-    /// IDs of the proposals that were applied to `current` at hydration
-    /// time. Saving the buffer is refused while this is non-empty — the
-    /// user must individually accept or reject every hunk so each accepted
-    /// proposal writes its `changes.db` audit row before its content
-    /// reaches disk. Per `patch-review-hydrate-dehydrate`.
-    pub hydrated_proposals: Vec<String>,
-    /// Byte ranges in `current` that each hydrated proposal's `new_str`
-    /// occupies, recorded as proposals applied (left-to-right) and shifted
-    /// forward as later proposals lengthen / shorten earlier byte
-    /// positions. Used by the per-hunk Accept/Reject widgets to map a
-    /// hunk's byte range back to the proposal(s) that contributed to it.
-    /// One proposal can produce multiple entries when `replace_all=true`.
-    pub hydration_footprints: Vec<(String, std::ops::Range<usize>)>,
-    /// Hash of `editor.doc` right after the last hydration pass. Lets the
-    /// per-frame re-hydration check tell "the user has typed since
-    /// hydration" (current hash drifted) apart from "staging changed
-    /// underneath us" (current hash still matches but pending proposal
-    /// IDs differ). Re-hydration is skipped in the former case so we
-    /// never clobber user edits.
-    pub post_hydration_hash: Option<String>,
+    /// `materialize_review(session)` — the agent's *proposal*
+    /// (`working + pending`) — captured each frame by the buffer panel's
+    /// per-frame binding. `None` when the active session has no pending ops on
+    /// this document (then `materialize_review == materialize_working` and the
+    /// buffer is plain editing). When `Some`, the editable buffer
+    /// (`editor.doc == materialize_working`) holds only the user's text and the
+    /// inline patch-review surface diffs the buffer against this proposal
+    /// (`working` → `review`), rendering the agent's pending ops as a suggestion
+    /// overlay — additions as phantom blocks, deletions struck through; per-hunk
+    /// accept/reject flips the contributing pending op ids through
+    /// `core::ops::op_writes::flip_op_status`. Per `patch-review-buffer-state`
+    /// in `patch-review.md`.
+    pub agent_proposal: Option<String>,
+    /// Which agent session's pending ops are in scope for the inline review.
+    /// `None` selects the whole pending queue (all sessions). The file pill
+    /// flips this when the user picks a session row, and the diff overlay /
+    /// accept-reject pass it to the op-log seams so the hunks and flips are
+    /// scoped to one session at a time. Per `patch-review-multi-session`.
+    pub active_session: Option<String>,
 }
 
 /// Slot for one cached decoration provider output.
@@ -197,11 +201,11 @@ pub fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String {
     use crate::tab::BufferSource;
     match source {
         BufferSource::Vault { path } => path.clone(),
-        BufferSource::Snapshot { change_id, path } => {
-            format!("\0snapshot:{}:{}", change_id, path)
+        BufferSource::Snapshot { op_id, path } => {
+            format!("\0snapshot:{}:{}", op_id, path)
         }
-        BufferSource::StagingProposal { proposal_id, .. } => {
-            format!("\0staging:{}", proposal_id)
+        BufferSource::PendingProposal { proposal_id, .. } => {
+            format!("\0pending:{}", proposal_id)
         }
         BufferSource::Trash { trash_path, .. } => {
             format!("\0trash:{}", trash_path)
@@ -274,8 +278,10 @@ impl Buffer {
             editor,
             view,
             paint_cache: PaintCache::default(),
+            minimap_cache: MinimapCache::default(),
             index_hash_cache: None,
             index_hash_refreshed_at: None,
+            index_pending_last: true,
             folds: HashSet::new(),
             click_buffer: Vec::new(),
             decoration_cache: DecorationCache::default(),
@@ -295,106 +301,46 @@ impl Buffer {
                 .unwrap_or(false),
             show_minimap: cfg.map(|c| c.editor.show_minimap).unwrap_or(true),
             hide_scrollbar: cfg.map(|c| c.editor.hide_scrollbar).unwrap_or(false),
-            agent_base: None,
-            hydrated_proposals: Vec::new(),
-            hydration_footprints: Vec::new(),
-            post_hydration_hash: None,
+            agent_proposal: None,
+            active_session: None,
         }
     }
 
-    /// Apply pending `edit_note` proposals targeting this buffer's path,
-    /// snapshotting the pre-apply text as `agent_base`. After this returns,
-    /// `current` reflects "disk + applied proposals" and `hydrated_proposals`
-    /// carries the ids that contributed. Per `patch-review-buffer-hydration`.
+    /// Swap `editor.doc` to `new_text` and clamp every selection range to a
+    /// valid char boundary within it. The reverse half of the editor binding
+    /// (per `op-log-editor-binding`) calls this when `materialize_working`
+    /// advanced without user typing — an agent op was accepted, or an external
+    /// edit landed — so the editable buffer follows. Re-pointing to a shorter
+    /// materialization (e.g. an accepted agent delete) would otherwise leave
+    /// the cursor past the new end, and the next paint's `byte_to_line(cursor)`
+    /// panics with "byte offset out of range".
     ///
-    /// Conflicted proposals (where the edit can't apply against the
-    /// partially-applied text) are surfaced separately via the staging
-    /// service's eager-recheck path; this routine just skips them and
-    /// records the successes.
-    pub fn hydrate_pending_proposals(
-        &mut self,
-        staging: &hiker_core::staging::Staging,
-    ) {
-        let filter = hiker_core::staging::types::Filter {
-            path: Some(self.path.clone()),
-            ..Default::default()
+    /// status: op-log-editor-binding
+    pub fn set_doc_clamping_selection(&mut self, new_text: &str) {
+        use editor_core::rope::Rope;
+        use editor_core::selection::{SelRange, Selection};
+        let new_len = new_text.len();
+        let clamp = |byte: usize| -> usize {
+            let mut b = byte.min(new_len);
+            while b > 0 && !new_text.is_char_boundary(b) {
+                b -= 1;
+            }
+            b
         };
-        let proposals = match staging.list(&filter) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let mut running = self.loaded_text.clone();
-        let mut applied: Vec<String> = Vec::new();
-        let mut footprints: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-
-        for p in &proposals {
-            if p.action != "edit_note" {
-                continue;
-            }
-            let Some(edit) = p.edit.as_ref() else { continue };
-            let matches = self.find_all(&running, &edit.old_str);
-            if matches.is_empty()
-                || (matches.len() > 1 && !edit.replace_all)
-            {
-                continue;
-            }
-            let old_len = edit.old_str.len();
-            let new_len = edit.new_str.len();
-            let delta = new_len as isize - old_len as isize;
-
-            // Build the post-apply text in one pass so we can record each
-            // replacement's new byte position before the next match.
-            let mut next = String::with_capacity(
-                (running.len() as isize + delta * matches.len() as isize).max(0) as usize,
-            );
-            let mut cursor = 0usize;
-            let mut new_positions: Vec<std::ops::Range<usize>> = Vec::with_capacity(matches.len());
-            for m_start in &matches {
-                next.push_str(&running[cursor..*m_start]);
-                let new_pos = next.len();
-                next.push_str(&edit.new_str);
-                new_positions.push(new_pos..new_pos + new_len);
-                cursor = m_start + old_len;
-            }
-            next.push_str(&running[cursor..]);
-
-            // Shift earlier footprints forward to reflect the bytes added
-            // (or removed) by every match that lies strictly before them.
-            for (_pid, fp) in footprints.iter_mut() {
-                let shift_start = shift_for_position(fp.start, &matches, old_len, delta);
-                let shift_end = shift_for_position(fp.end, &matches, old_len, delta);
-                fp.start = (fp.start as isize + shift_start) as usize;
-                fp.end = (fp.end as isize + shift_end) as usize;
-            }
-
-            for pos in new_positions {
-                footprints.push((p.id.clone(), pos));
-            }
-            running = next;
-            applied.push(p.id.clone());
-        }
-
-        // Always reseat hydration state — callers ensure this is only
-        // called when `editor.doc` matches the previously-recorded
-        // post-hydration text (or it's the first hydration pass right
-        // after a disk read), so reseating never clobbers user edits.
-        self.editor.doc = editor_core::rope::Rope::from_str(&running);
-        self.post_hydration_hash = Some(hiker_core::hash_string(&running));
-        if applied.is_empty() {
-            self.agent_base = None;
-            self.hydrated_proposals.clear();
-            self.hydration_footprints.clear();
-        } else {
-            self.agent_base = Some(self.loaded_text.clone());
-            self.hydrated_proposals = applied;
-            self.hydration_footprints = footprints;
-        }
-        // loaded_text / loaded_hash deliberately stay as the disk values
-        // so `is_dirty()` flips true while hydrated content is live in
-        // the buffer.
+        let old_sel = self.editor.selection.clone();
+        let main_idx = old_sel.main_index();
+        let clamped: Vec<SelRange> = old_sel
+            .ranges()
+            .iter()
+            .map(|r| {
+                let mut nr = SelRange::new(clamp(r.anchor.offset()), clamp(r.head.offset()));
+                nr.goal_col = r.goal_col;
+                nr
+            })
+            .collect();
+        self.editor.doc = Rope::from_str(new_text);
+        self.editor.selection = Selection::from_ranges(clamped, main_idx);
     }
-
 
     /// Replace the buffer's text contents in place while preserving
     /// scroll position, folds, decoration caches, paint cache, and the
@@ -465,6 +411,19 @@ impl Buffer {
         self.current_hash() != self.loaded_hash
     }
 
+    /// Whether the "buffer ahead of index" status badge should be shown:
+    /// the indexer has a known content hash for this path (`index_hash_cache`)
+    /// *and* it differs from the buffer's live content hash. A `None` cache
+    /// (path never indexed) means there's nothing to be ahead of, so the
+    /// badge stays hidden; equal hashes — the steady state once a re-index
+    /// catches up — also hide it. Recomputed on demand from the cached
+    /// stored-hash, never latched, so the badge clears as soon as the cache
+    /// reflects the post-index value. The status bar (`panels::buffer`) is
+    /// responsible for keeping `index_hash_cache` fresh.
+    pub fn is_ahead_of_index(&self) -> bool {
+        matches!(self.index_hash_cache.as_deref(), Some(h) if h != self.current_hash())
+    }
+
     /// Drain the per-frame click buffer, applying fold toggles back into
     /// `self.folds`. Other click action kinds (`WidgetClick` etc.) are
     /// handled by the caller before this is invoked.
@@ -482,37 +441,41 @@ impl Buffer {
     }
 }
 
-impl Buffer {
-    /// All start positions where `needle` occurs in `haystack`. Mirrors the
-    /// staging service's internal `find_all_matches` so hydration's
-    /// footprint tracking sees the same positions as `apply_edit`. A method
-    /// (its sole caller is `hydrate_pending_proposals`) so it doesn't trip
-    /// `single_call_fn`.
-    fn find_all(&self, haystack: &str, needle: &str) -> Vec<usize> {
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(rel) = haystack[from..].find(needle) {
-            let pos = from + rel;
-            out.push(pos);
-            from = pos + needle.len();
-        }
-        out
-    }
-}
+#[cfg(test)]
+mod index_badge_tests {
+    use super::Buffer;
 
-/// Compute the byte offset to add to an earlier footprint position,
-/// given the list of new-replacement positions in *running* text from
-/// the current proposal. Each match whose end lies at or before `pos`
-/// shifts `pos` by `delta` bytes.
-fn shift_for_position(pos: usize, matches: &[usize], old_len: usize, delta: isize) -> isize {
-    let mut shift = 0isize;
-    for m_start in matches {
-        if *m_start + old_len <= pos {
-            shift += delta;
-        }
+    fn buf(text: &str, indexed_hash: Option<&str>) -> Buffer {
+        let mut b = Buffer::with_config_and_vault(
+            "test.md".to_string(),
+            text,
+            String::new(),
+            None,
+            None,
+        );
+        b.index_hash_cache = indexed_hash.map(str::to_string);
+        b
     }
-    shift
+
+    #[test]
+    fn hidden_when_path_never_indexed() {
+        // No stored hash → nothing to be ahead of.
+        assert!(!buf("hello", None).is_ahead_of_index());
+    }
+
+    #[test]
+    fn shown_when_buffer_diverges_from_index() {
+        // A stale stored hash that won't match the live content.
+        assert!(buf("hello world", Some("stale-hash")).is_ahead_of_index());
+    }
+
+    #[test]
+    fn clears_once_index_catches_up() {
+        // The latch case: after re-indexing, the stored hash equals the
+        // buffer's live hash and the badge must recompute to hidden.
+        let mut b = buf("hello world", None);
+        let live = b.current_hash();
+        b.index_hash_cache = Some(live);
+        assert!(!b.is_ahead_of_index());
+    }
 }

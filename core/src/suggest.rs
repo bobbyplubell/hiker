@@ -18,12 +18,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::HikerError;
 use crate::frontmatter;
-use crate::staging::error::Error as StagingError;
-use crate::staging::types::{ProposalInput, ACTION_MOVE_NOTE};
-use crate::staging::Staging;
+use crate::ops::op_writes;
+use crate::oplog::{OpLog, StageOutcome};
 use crate::store::Store;
 use crate::trees::types::{EditableNode, NodeKind, NodePolicy, Db, Error as TreesError};
 use crate::vault::Vault;
+
+/// Stable string the cluster-editor / triage surfaces use for the move
+/// action label. Centralized here now that `core::staging` (which formerly
+/// owned `ACTION_MOVE_NOTE`) is retired; the op-log `Rename` op-kind is the
+/// underlying mechanism but the action label persists for the activity feed.
+pub const ACTION_MOVE_NOTE: &str = "move_note";
 
 /// Stable string the cluster-editor surface uses for `Proposal.action` on
 /// tag-mode rows. Mirrors `ACTION_MOVE_NOTE` for the move-side actions.
@@ -37,29 +42,22 @@ pub const ACTION_APPLY_TAG: &str = "apply_tag";
 /// `[suggestions]` config section is wired.
 pub const DEFAULT_TAG_FIELD: &str = "hiker.suggested_tags";
 
-/// `surface` value stamped on every staging row produced by the
+/// `surface` value stamped on every op-log op produced by the
 /// cluster-editor Apply path. The triage surface uses `"triage"`.
 pub const SURFACE_CLUSTER_EDITOR: &str = "cluster-editor";
 
-/// `surface` value stamped on every staging row produced by the saved-
+/// `surface` value stamped on every op-log op produced by the saved-
 /// tree triage classifier. Per `docs/suggestions.md` §"Saved-tree triage".
 ///
 /// status: triage-staging-proposals
 pub const SURFACE_TRIAGE: &str = "triage";
-
-/// Author class stamped on `core::changes` rows produced by auto-accepted
-/// triage matches (per `docs/suggestions.md` §"Saved-tree triage"; per
-/// `triage-author-class`). User-accepted triage rows keep `author = "user"`.
-///
-/// status: triage-author-class
-pub const AUTHOR_AUTO_TRIAGE: &str = "auto:triage";
 
 /// Outcome of one Apply pass over a tree. The counts let the UI render
 /// "(N leaves skipped — no policy assigned, M leaves frozen)" per spec.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ApplyOutcome {
     pub tree_id: String,
-    /// IDs of staging rows produced (one per accepted leaf).
+    /// Op-log pending op ids produced (one or more per `Tag` / `Move` leaf).
     pub staged_ids: Vec<String>,
     /// Leaves with `Move` policy that produced a row.
     pub moves: u32,
@@ -75,9 +73,17 @@ pub struct ApplyOutcome {
 }
 
 /// Walk the tree, resolve each leaf's effective policy (walk-up rule),
-/// and emit one `staging.db` row per `Tag` / `Move` leaf. Frozen +
-/// unpolicied leaves are skipped (counted into the outcome so the UI can
-/// surface the "(N leaves skipped)" note).
+/// and stage one op-log pending op per `Tag` / `Move` leaf. `Move` leaves
+/// stage one pending `Rename` per note as a cross-document reorg batch
+/// (`op-log-reorg-batch`, author `auto:cluster`); `Tag` leaves stage one
+/// pending `SetFrontmatter`-shaped content op per note. Frozen + unpolicied
+/// leaves are skipped (counted into the outcome so the UI can surface the
+/// "(N leaves skipped)" note). Nothing reaches disk until the user accepts
+/// via the batch-review pane.
+///
+/// All `Move` leaves share one reorg `batch_id` so the batch-review pane can
+/// accept/reject them together; tag ops carry their own per-document batch.
+/// `out.staged_ids` collects every minted op id across both kinds.
 ///
 /// Per `suggestions-rejection-history`, the producer consults the
 /// rejection log and skips any `(tree_member_fingerprint, note_id,
@@ -85,12 +91,15 @@ pub struct ApplyOutcome {
 /// the log path but leaves the fingerprint coarse-grained (parent
 /// cluster name) so the surface ships before the full
 /// member-set-Jaccard helper lands.
+///
+/// status: suggestions-apply-cmd
+/// status: op-log-reorg-batch
 pub fn apply_tree(
     trees: &Db,
     tree_id: &str,
     vault: &Vault,
     store: &Store,
-    staging: &Staging,
+    log: &OpLog,
     history: Option<&RejectionHistory>,
 ) -> Result<ApplyOutcome, HikerError> {
     let nodes = trees
@@ -102,6 +111,9 @@ pub fn apply_tree(
         tree_id: tree_id.to_string(),
         ..Default::default()
     };
+    // Move leaves accumulate into one reorg batch staged at the end so the
+    // batch-review pane treats the tree's moves as one display group.
+    let mut moves: Vec<op_writes::ReorgMove> = Vec::new();
     for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Leaf)) {
         let policy = resolve_effective_policy(&by_id, &node.id);
         let Some(policy) = policy else {
@@ -135,10 +147,7 @@ pub fn apply_tree(
             NodePolicy::Freeze => {
                 out.frozen += 1;
             }
-            NodePolicy::Move {
-                folder,
-                require_review,
-            } => {
+            NodePolicy::Move { folder, .. } => {
                 let action = ACTION_MOVE_NOTE;
                 let fingerprint =
                     compute_fingerprint(&parent_name, &rel, action);
@@ -158,30 +167,10 @@ pub fn apply_tree(
                     // No-op move (already in target folder).
                     continue;
                 }
-                let metadata = serde_json::json!({
-                    "tree_id": tree_id,
-                    "matched_node_id": node.id,
-                    "policy_kind": "move",
-                    "require_review": require_review,
-                    "tree_member_fingerprint": fingerprint,
-                });
-                let id = staging
-                    .propose(&ProposalInput {
-                        surface: SURFACE_CLUSTER_EDITOR.into(),
-                        action: action.into(),
-                        target_path: target,
-                        source_path: Some(rel.clone()),
-                        metadata: Some(metadata),
-                        ..Default::default()
-                    })
-                    .map_err(|e| staging_to_hiker(&e))?;
-                out.staged_ids.push(id);
+                moves.push(op_writes::ReorgMove { from: rel, to: target });
                 out.moves += 1;
             }
-            NodePolicy::Tag {
-                slug,
-                require_review,
-            } => {
+            NodePolicy::Tag { slug, .. } => {
                 let action = ACTION_APPLY_TAG;
                 let fingerprint = compute_fingerprint(&parent_name, &rel, action);
                 if let Some(h) = history
@@ -189,13 +178,12 @@ pub fn apply_tree(
                 {
                     continue;
                 }
-                // Pre-compute the new file content with the tag merged
-                // into the configured `tag_field`. We snapshot
-                // `source_hash` so the standard drift-check in
-                // `Staging::accept` rejects the proposal if the file
-                // changed between propose and accept.
-                let (disk_text, disk_hash) = vault
-                    .read_file_with_hash(&rel)
+                // Pre-compute the new file content with the tag merged into
+                // the configured `tag_field`, then stage it as a pending
+                // content op. The op-log diffs against current accepted, so a
+                // no-op merge is dropped here before staging.
+                let disk_text = vault
+                    .read_file(&rel)
                     .map_err(|e| HikerError::Io(e.to_string()))?;
                 let new_content = merge_tag_into_frontmatter(
                     &disk_text,
@@ -207,30 +195,28 @@ pub fn apply_tree(
                     // Tag already present — no-op, skip.
                     continue;
                 }
-                let metadata = serde_json::json!({
-                    "tree_id": tree_id,
-                    "matched_node_id": node.id,
-                    "policy_kind": "tag",
-                    "tag_slug": slug,
-                    "tag_field": DEFAULT_TAG_FIELD,
-                    "require_review": require_review,
-                    "tree_member_fingerprint": fingerprint,
-                });
-                let id = staging
-                    .propose(&ProposalInput {
-                        surface: SURFACE_CLUSTER_EDITOR.into(),
-                        action: action.into(),
-                        target_path: rel,
-                        content: Some(new_content),
-                        source_hash: Some(disk_hash),
-                        metadata: Some(metadata),
-                        ..Default::default()
-                    })
-                    .map_err(|e| staging_to_hiker(&e))?;
-                out.staged_ids.push(id);
+                let outcome = op_writes::stage_auto_content(
+                    log,
+                    vault,
+                    PRODUCER_CLUSTER,
+                    SURFACE_CLUSTER_EDITOR,
+                    &rel,
+                    &new_content,
+                )?;
+                out.staged_ids.extend(outcome.op_ids);
                 out.tags += 1;
             }
         }
+    }
+    if !moves.is_empty() {
+        let outcome = op_writes::stage_reorg_batch(
+            log,
+            vault,
+            PRODUCER_CLUSTER,
+            SURFACE_CLUSTER_EDITOR,
+            &moves,
+        )?;
+        out.staged_ids.extend(outcome.op_ids);
     }
     Ok(out)
 }
@@ -324,10 +310,6 @@ fn insert_tag_at_path(node: &mut serde_yml::Value, path: &[&str], slug: &str) {
         *child = Yaml::Mapping(Mapping::new());
     }
     insert_tag_at_path(child, &path[1..], slug);
-}
-
-fn staging_to_hiker(e: &StagingError) -> HikerError {
-    HikerError::Io(e.to_string())
 }
 
 // ── Rejection history ───────────────────────────────────────────────
@@ -437,11 +419,26 @@ fn now_ms() -> i64 {
 //
 // status: cluster-editor-multi-select-stage-move
 // status: cluster-editor-multi-select-stage-tag
+// status: op-log-reorg-batch
 //
 // One-shot batch from the multi-select toolbar: caller passes a set of
-// leaf node IDs + the target folder (or tag slug); we emit one staging
-// row per leaf. No policy mutation — distinct from the Apply path which
-// reads policies off the tree.
+// leaf node IDs + the target folder (or tag slug); we stage op-log pending
+// ops sharing one cross-document `batch_id`, authored `auto:cluster`. Moves
+// produce one pending `Rename` per leaf (the reorg-batch shape per
+// `op-log.md`'s "Multi-file reorganization"); tags produce one pending
+// `SetFrontmatter`-shaped content edit per leaf. No policy mutation —
+// distinct from the Apply path which reads policies off the tree.
+
+/// `producer` label stamped on the `auto:<producer>` author for cluster-
+/// editor staged moves/tags (yields `auto:cluster` per `op-log.md`'s
+/// "Author classes").
+pub const PRODUCER_CLUSTER: &str = "cluster";
+
+/// `producer` label stamped on the `auto:<producer>` author for saved-tree
+/// triage matches (yields `auto:triage` per `op-log.md`'s "Author classes").
+/// Acceptance is a gate, not authorship — an auto-accepted and a
+/// user-accepted triage op both keep `auto:triage`.
+pub const PRODUCER_TRIAGE: &str = "triage";
 
 pub struct StageMoveArgs<'a> {
     pub tree_id: &'a str,
@@ -455,13 +452,23 @@ pub struct StageTagArgs<'a> {
     pub tag_slug: &'a str,
 }
 
+/// Stage a multi-select move as a reorg batch of pending `Rename` ops on the
+/// op log (`op-log-reorg-batch`). Resolves each selected leaf's note path,
+/// computes its destination under `target_folder`, and stages one pending
+/// `Rename` per moved note sharing a cross-document `batch_id` authored
+/// `auto:cluster`. Returns the [`StageOutcome`] (batch id + op ids); the
+/// cluster UI surfaces the batch for accept/reject via `flip_batch_status`.
+///
+/// status: cluster-editor-multi-select-stage-move
+/// status: op-log-reorg-batch
 pub fn stage_moves(
     trees: &Db,
     args: &StageMoveArgs<'_>,
     store: &Store,
-    staging: &Staging,
-) -> Result<Vec<String>, HikerError> {
-    let mut ids = Vec::new();
+    vault: &Vault,
+    log: &OpLog,
+) -> Result<StageOutcome, HikerError> {
+    let mut moves = Vec::new();
     for node_id in args.node_ids {
         let Some(node) = trees
             .get_node(args.tree_id, node_id)
@@ -489,32 +496,26 @@ pub fn stage_moves(
         if target == rel {
             continue;
         }
-        let metadata = serde_json::json!({
-            "tree_id": args.tree_id,
-            "matched_node_id": node.id,
-            "stage_kind": "multi-select-move",
-        });
-        let id = staging
-            .propose(&ProposalInput {
-                surface: SURFACE_CLUSTER_EDITOR.into(),
-                action: ACTION_MOVE_NOTE.into(),
-                target_path: target,
-                source_path: Some(rel),
-                metadata: Some(metadata),
-                ..Default::default()
-            })
-            .map_err(|e| staging_to_hiker(&e))?;
-        ids.push(id);
+        moves.push(op_writes::ReorgMove { from: rel, to: target });
     }
-    Ok(ids)
+    op_writes::stage_reorg_batch(log, vault, PRODUCER_CLUSTER, SURFACE_CLUSTER_EDITOR, &moves)
 }
 
+/// Stage a multi-select tag as a batch of pending `SetFrontmatter`-shaped
+/// content edits on the op log. For each selected leaf, re-emits the note's
+/// frontmatter with `tag_slug` merged into the configured tag field and
+/// stages the new content as one pending op authored `auto:cluster`. Each
+/// note's edit gets its own batch id (tags target distinct documents and the
+/// op-log content-stage seam is per-document); the returned ids are the
+/// staged op ids for the UI summary.
+///
+/// status: cluster-editor-multi-select-stage-tag
 pub fn stage_tags(
     trees: &Db,
     args: &StageTagArgs<'_>,
     vault: &Vault,
     store: &Store,
-    staging: &Staging,
+    log: &OpLog,
 ) -> Result<Vec<String>, HikerError> {
     let mut ids = Vec::new();
     for node_id in args.node_ids {
@@ -534,33 +535,23 @@ pub fn stage_tags(
         else {
             continue;
         };
-        let (disk_text, disk_hash) = vault
-            .read_file_with_hash(&rel)
+        let disk_text = vault
+            .read_file(&rel)
             .map_err(|e| HikerError::Io(e.to_string()))?;
         let new_content = merge_tag_into_frontmatter(&disk_text, DEFAULT_TAG_FIELD, args.tag_slug)
             .map_err(|e| HikerError::Io(e.to_string()))?;
         if new_content == disk_text {
             continue;
         }
-        let metadata = serde_json::json!({
-            "tree_id": args.tree_id,
-            "matched_node_id": node.id,
-            "stage_kind": "multi-select-tag",
-            "tag_slug": args.tag_slug,
-            "tag_field": DEFAULT_TAG_FIELD,
-        });
-        let id = staging
-            .propose(&ProposalInput {
-                surface: SURFACE_CLUSTER_EDITOR.into(),
-                action: ACTION_APPLY_TAG.into(),
-                target_path: rel,
-                content: Some(new_content),
-                source_hash: Some(disk_hash),
-                metadata: Some(metadata),
-                ..Default::default()
-            })
-            .map_err(|e| staging_to_hiker(&e))?;
-        ids.push(id);
+        let outcome = op_writes::stage_auto_content(
+            log,
+            vault,
+            PRODUCER_CLUSTER,
+            SURFACE_CLUSTER_EDITOR,
+            &rel,
+            &new_content,
+        )?;
+        ids.extend(outcome.op_ids);
     }
     Ok(ids)
 }
@@ -573,10 +564,10 @@ pub fn stage_tags(
 // status: triage-author-class
 //
 // Greedy beam-K descent over a saved Evergreen tree. Cheap, no LLM, no
-// re-cluster. Produces zero or one `staging.db` row per call (per the
-// resolved matched-node policy). The on-save / scheduled / modified
-// pathways all funnel here; the producer (`cluster-editor-triage-on-save`)
-// owns the trigger.
+// re-cluster. Produces zero or one op-log op per call (per the resolved
+// matched-node policy) — pending when review is required, applied directly
+// when not. The on-save / scheduled / modified pathways all funnel here;
+// the producer (`cluster-editor-triage-on-save`) owns the trigger.
 
 /// Per-vault triage configuration consumed by the classifier. Mirrors
 /// `core::config::TriageConfig` but is duplicated here so the classifier
@@ -610,7 +601,7 @@ impl Default for TriageOpts {
 /// this distinguishes user-authored notes from agent-authored notes so
 /// triage doesn't auto-route an agent draft into the user's folder
 /// structure without review. Agent-authored notes are always routed
-/// through the staging review queue regardless of `review_required`.
+/// pending for review regardless of `review_required`.
 ///
 /// status: triage-author-class
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -633,7 +624,8 @@ pub struct TriageOutcome {
     pub tree_id: String,
     pub source_path: String,
     /// `None` when no policy resolved (or the match dropped — outside
-    /// scope, no centroid, etc.). Set when a row landed in `staging.db`.
+    /// scope, no centroid, etc.). Set to the first staged op id when a
+    /// pending op (or auto-accepted op) was emitted to the op log.
     pub staged_id: Option<String>,
     /// The matched leaf node id (when descent succeeded).
     pub matched_node_id: Option<String>,
@@ -654,7 +646,7 @@ pub struct TriageOutcome {
 ///   handler reads these from `core::store`);
 /// - the saved tree id (the worker is dispatched against one tree at a
 ///   time);
-/// - per-tree handles to `Db` and `Staging`;
+/// - per-tree handles to `Db` and the op log;
 /// - the resolved `TriageOpts`.
 pub struct TriageInput<'a> {
     pub tree_id: &'a str,
@@ -666,7 +658,7 @@ pub struct TriageInput<'a> {
 }
 
 /// View into the in-memory tree the classifier needs. Implemented over
-/// the `EditableNode` rows loaded from `trees.db`; built by
+/// the `EditableNode` rows loaded from the tree's `.md`; built by
 /// `build_tree_view` below.
 struct LoadedTreeView<'a> {
     root_id: String,
@@ -696,7 +688,7 @@ pub fn triage_match(
     trees: &Db,
     vault: &Vault,
     store: &Store,
-    staging: &Staging,
+    log: &OpLog,
     input: &TriageInput<'_>,
 ) -> Result<TriageOutcome, HikerError> {
     let mut outcome = TriageOutcome {
@@ -707,7 +699,7 @@ pub fn triage_match(
 
     // Source-folder safety boundary. Notes outside the configured triage
     // scope are off-limits to triage moves; we drop the match entirely
-    // rather than emit a no-op staging row. The check intentionally
+    // rather than emit a no-op pending op. The check intentionally
     // applies even before the tree is walked — a tree built over
     // `research/` whose triage scope is `inbox/` doesn't get to fire on
     // `research/` notes (per `docs/suggestions.md`'s bounded-auto rule).
@@ -847,38 +839,36 @@ pub fn triage_match(
                 outcome.skip_reason = Some("noop-move");
                 return Ok(outcome);
             }
-            let metadata = serde_json::json!({
-                "tree_id": input.tree_id,
-                "matched_node_id": placement.leaf_node_id,
-                "confidence": placement.confidence,
-                "margin": placement.margin,
-                "policy_kind": "move",
-                "require_review": effective_requires_review,
-                "author_class": match input.author_class {
-                    NoteAuthorClass::User => "user",
-                    NoteAuthorClass::Agent => "agent",
-                },
-            });
-            let id = staging
-                .propose(&ProposalInput {
-                    surface: SURFACE_TRIAGE.into(),
-                    action: ACTION_MOVE_NOTE.into(),
-                    target_path: target,
-                    source_path: Some(input.source_path.to_string()),
-                    metadata: Some(metadata),
-                    ..Default::default()
-                })
-                .map_err(|e| staging_to_hiker(&e))?;
-            outcome.staged_id = Some(id);
+            // Stage a one-move reorg batch authored `auto:triage`. The op
+            // log's `Rename` op is the move mechanism; the batch is a
+            // display group of one. When the placement auto-accepts (no
+            // effective review required) the batch is applied immediately,
+            // mirroring the spec's `status = accepted` direct-apply path.
+            let staged = op_writes::stage_reorg_batch(
+                log,
+                vault,
+                PRODUCER_TRIAGE,
+                SURFACE_TRIAGE,
+                &[op_writes::ReorgMove {
+                    from: input.source_path.to_string(),
+                    to: target,
+                }],
+            )?;
+            if !effective_requires_review {
+                op_writes::flip_batch_status(log, &staged.batch_id, true)?;
+            }
+            outcome.staged_id = staged.op_ids.into_iter().next();
         }
         NodePolicy::Tag {
             slug,
             require_review: _,
         } => {
-            // Pre-compute the new file content so `Staging::accept`'s
-            // standard drift check can run against the captured hash.
-            let (disk_text, disk_hash) = vault
-                .read_file_with_hash(input.source_path)
+            // Pre-compute the new file content with the tag merged into the
+            // configured field, then stage it as a pending content op
+            // authored `auto:triage`. A no-op merge is dropped before
+            // staging.
+            let disk_text = vault
+                .read_file(input.source_path)
                 .map_err(|e| HikerError::Io(e.to_string()))?;
             let new_content =
                 merge_tag_into_frontmatter(&disk_text, DEFAULT_TAG_FIELD, &slug)
@@ -887,32 +877,18 @@ pub fn triage_match(
                 outcome.skip_reason = Some("tag-already-present");
                 return Ok(outcome);
             }
-            let metadata = serde_json::json!({
-                "tree_id": input.tree_id,
-                "matched_node_id": placement.leaf_node_id,
-                "confidence": placement.confidence,
-                "margin": placement.margin,
-                "policy_kind": "tag",
-                "tag_slug": slug,
-                "tag_field": DEFAULT_TAG_FIELD,
-                "require_review": effective_requires_review,
-                "author_class": match input.author_class {
-                    NoteAuthorClass::User => "user",
-                    NoteAuthorClass::Agent => "agent",
-                },
-            });
-            let id = staging
-                .propose(&ProposalInput {
-                    surface: SURFACE_TRIAGE.into(),
-                    action: ACTION_APPLY_TAG.into(),
-                    target_path: input.source_path.to_string(),
-                    content: Some(new_content),
-                    source_hash: Some(disk_hash),
-                    metadata: Some(metadata),
-                    ..Default::default()
-                })
-                .map_err(|e| staging_to_hiker(&e))?;
-            outcome.staged_id = Some(id);
+            let staged = op_writes::stage_auto_content(
+                log,
+                vault,
+                PRODUCER_TRIAGE,
+                SURFACE_TRIAGE,
+                input.source_path,
+                &new_content,
+            )?;
+            if !effective_requires_review {
+                op_writes::flip_batch_status(log, &staged.batch_id, true)?;
+            }
+            outcome.staged_id = staged.op_ids.into_iter().next();
         }
     }
     // `note_id` and `store` are not consulted directly here — the input
@@ -930,7 +906,7 @@ pub struct TriageBatch<'a> {
     pub trees: &'a Db,
     pub vault: &'a Vault,
     pub store: &'a Store,
-    pub staging: &'a Staging,
+    pub log: &'a OpLog,
     pub note_id: &'a str,
     pub source_path: &'a str,
     pub embedding: &'a [f32],
@@ -973,7 +949,7 @@ pub fn triage_all_saved_trees(
             batch.trees,
             batch.vault,
             batch.store,
-            batch.staging,
+            batch.log,
             &TriageInput {
                 tree_id: &row.id,
                 note_id: batch.note_id,
@@ -995,7 +971,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn mk_tree(td: &TempDir) -> (Db, String) {
-        let trees = Db::open(td.path()).unwrap();
+        let trees = Db::new(
+            std::sync::Arc::new(crate::oplog::OpLog::open(td.path()).unwrap()),
+            std::sync::Arc::new(crate::vault::Vault::open(td.path()).unwrap()),
+        )
+        .unwrap();
         let id = trees
             .insert_tree(TreeInsert {
                 id: Some("t".into()),
@@ -1112,35 +1092,38 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    /// Open an op log on the tempdir, creating the `.hiker` dir first.
+    fn open_log(td: &TempDir) -> OpLog {
+        std::fs::create_dir_all(td.path().join(".hiker")).unwrap();
+        OpLog::open(td.path()).unwrap()
+    }
+
     // status: cluster-editor-apply-action
     // status: suggestions-apply-cmd
     //
     // End-to-end smoke for `apply_tree`: build a tree in tempfile-backed
-    // `Db` / `Store` / `Vault` / `Staging`, attach a `Tag` policy on one
+    // `Db` / `Store` / `Vault` / `OpLog`, attach a `Tag` policy on one
     // cluster + a `Move` policy on another, run `apply_tree`, and verify
-    // both rows land in `staging.db` with the right surface / action /
-    // metadata. Asserts the tree's `state` is *not* advanced by the core
-    // mechanic — state flip to `applied` is the UI's responsibility once
-    // every emitted row resolves.
+    // both stage as op-log pending ops with the right surface / action.
+    // Asserts the tree's `state` is *not* advanced by the core mechanic —
+    // state flip to `applied` is the UI's responsibility once every emitted
+    // op resolves.
     #[test]
-    fn apply_tree_emits_tag_and_move_rows_with_expected_metadata() {
-        use crate::staging::types::{Filter, ACTION_MOVE_NOTE};
-use crate::staging::Staging;
+    fn apply_tree_stages_tag_and_move_pending_ops() {
         use crate::store::dto::NoteUpsert;
-use crate::store::Store;
+        use crate::store::Store;
         use crate::vault::Vault;
 
         let td = TempDir::new().unwrap();
-        // Seed the on-disk notes so `Vault::read_file_with_hash` (used by
-        // the Tag path) and `Store::path_for_id` (used by both paths)
-        // resolve.
+        // Seed the on-disk notes so `Vault::read_file` (Tag path) and
+        // `Store::path_for_id` (both paths) resolve.
         std::fs::write(td.path().join("a.md"), "# a\nbody-a\n").unwrap();
         std::fs::create_dir_all(td.path().join("inbox")).unwrap();
         std::fs::write(td.path().join("inbox/b.md"), "# b\nbody-b\n").unwrap();
 
         let vault = Vault::open(td.path()).unwrap();
         let mut store = Store::open(td.path()).unwrap();
-        let staging = Staging::open(td.path()).unwrap();
+        let log = open_log(&td);
 
         // Index the two notes so `path_for_id` returns the expected rels.
         store
@@ -1202,7 +1185,7 @@ use crate::store::Store;
             )
             .unwrap();
 
-        let outcome = apply_tree(&trees, &tid, &vault, &store, &staging, None).unwrap();
+        let outcome = apply_tree(&trees, &tid, &vault, &store, &log, None).unwrap();
         assert_eq!(outcome.tree_id, tid);
         assert_eq!(outcome.tags, 1, "one Tag leaf");
         assert_eq!(outcome.moves, 1, "one Move leaf");
@@ -1211,46 +1194,31 @@ use crate::store::Store;
         assert_eq!(outcome.missing, 0);
         assert_eq!(outcome.staged_ids.len(), 2);
 
-        // Pull the staged rows back and bucket by action.
-        let rows = staging
-            .list(&Filter {
-                surface: Some(SURFACE_CLUSTER_EDITOR.into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(rows.len(), 2, "exactly two cluster-editor rows: {rows:?}");
+        // Pull the pending ops back and bucket by action label.
+        let rows = op_writes::list_pending_proposals(&log).unwrap();
+        assert_eq!(rows.len(), 2, "exactly two pending ops: {rows:?}");
 
         let move_row = rows
             .iter()
-            .find(|r| r.action == ACTION_MOVE_NOTE)
-            .expect("move row present");
+            .find(|r| r.action == "rename")
+            .expect("rename op present");
         assert_eq!(move_row.surface, SURFACE_CLUSTER_EDITOR);
-        assert_eq!(move_row.target_path, "archive/b.md");
-        assert_eq!(move_row.source_path.as_deref(), Some("inbox/b.md"));
-        let md = move_row.metadata.as_ref().expect("metadata present");
-        assert_eq!(md["tree_id"], serde_json::Value::String(tid.clone()));
-        assert_eq!(md["matched_node_id"], serde_json::Value::String("leaf-b".into()));
-        assert_eq!(md["policy_kind"], serde_json::Value::String("move".into()));
-        assert_eq!(md["require_review"], serde_json::Value::Bool(true));
-        assert!(md["tree_member_fingerprint"].is_string());
+        // The rename is still pending, so the doc resolves to its current
+        // (accepted) path; the target lives in the op until accepted.
+        assert_eq!(move_row.target_path, "inbox/b.md");
 
+        // The tag op is the non-rename op; it targets the original path
+        // (no move). Its op-kind is `write_note` here because the source
+        // note had no frontmatter fence to land "inside" — the merge
+        // prepends a fresh one, so the op-log labels it a body replace.
         let tag_row = rows
             .iter()
-            .find(|r| r.action == ACTION_APPLY_TAG)
-            .expect("tag row present");
+            .find(|r| r.action != "rename")
+            .expect("tag content op present");
         assert_eq!(tag_row.surface, SURFACE_CLUSTER_EDITOR);
-        // Tag rows target the original path (the content write lands
-        // there); no folder move.
         assert_eq!(tag_row.target_path, "a.md");
-        let md = tag_row.metadata.as_ref().expect("metadata present");
-        assert_eq!(md["policy_kind"], serde_json::Value::String("tag".into()));
-        assert_eq!(md["tag_slug"], serde_json::Value::String("research".into()));
-        assert_eq!(md["tag_field"], serde_json::Value::String(DEFAULT_TAG_FIELD.into()));
-        assert_eq!(md["require_review"], serde_json::Value::Bool(false));
 
-        // `apply_tree` doesn't advance tree state on its own — the UI
-        // flips to `applied` once every emitted row resolves. The tree
-        // should still be `draft` here.
+        // `apply_tree` doesn't advance tree state on its own.
         let row = trees.get_tree(&tid).unwrap().expect("tree row");
         assert_eq!(row.state, "draft");
     }
@@ -1258,19 +1226,16 @@ use crate::store::Store;
     // status: triage-classifier-engine, triage-staging-proposals
     // status: triage-review-required, triage-author-class
     //
-    // Triage classifier smoke: build a tiny saved tree with two children
-    // (one carrying a Move policy, one carrying a Tag policy), feed an
-    // embedding pointing at each, and verify the emitted staging row's
-    // surface / action / metadata match the spec. Also exercises the
-    // source-folder safety boundary and the agent-author auto-pending
-    // rule.
+    // Triage classifier smoke: build a tiny saved tree with a Move-policy
+    // child, feed a matching embedding, and verify the op auto-accepts (no
+    // effective review required) — landing the rename on `accepted` so the
+    // doc's pending-view path is the target. Also exercises the
+    // source-folder safety boundary and the agent-author auto-pending rule.
     #[test]
-    fn triage_emits_move_row_with_triage_surface() {
+    fn triage_auto_accepts_move_when_no_review_required() {
         use crate::cluster::algo::l2_normalize;
-        use crate::staging::types::Filter;
-use crate::staging::Staging;
         use crate::store::dto::NoteUpsert;
-use crate::store::Store;
+        use crate::store::Store;
         use crate::vault::Vault;
 
         let td = TempDir::new().unwrap();
@@ -1278,7 +1243,7 @@ use crate::store::Store;
         std::fs::write(td.path().join("inbox/n.md"), "# n\nbody\n").unwrap();
         let vault = Vault::open(td.path()).unwrap();
         let mut store = Store::open(td.path()).unwrap();
-        let staging = Staging::open(td.path()).unwrap();
+        let log = open_log(&td);
         store
             .upsert_note(&NoteUpsert {
                 id: "note-n",
@@ -1292,7 +1257,7 @@ use crate::store::Store;
             })
             .unwrap();
         let (trees, tid) = mk_tree(&td);
-        // Root has centroid pointing (1,0); childA carries Move policy
+        // Root has centroid pointing (1,1); childA carries Move policy
         // and matches a (1, 0.05) query.
         let root_cent = l2_normalize(&[1.0, 1.0]);
         let a_cent = l2_normalize(&[1.0, 0.05]);
@@ -1308,12 +1273,10 @@ use crate::store::Store;
         );
         a.centroid = Some(a_cent);
         trees.insert_nodes(&tid, &[root, a]).unwrap();
-        trees
-            .set_tree_state(&tid, "saved-as-triage")
-            .unwrap();
+        trees.set_tree_state(&tid, "saved-as-triage").unwrap();
 
         let opts = TriageOpts::default();
-        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &log, &TriageInput {
                 tree_id: &tid,
                 note_id: "note-n",
                 source_path: "inbox/n.md",
@@ -1323,27 +1286,85 @@ use crate::store::Store;
             },
         )
         .unwrap();
-        assert!(outcome.staged_id.is_some(), "expected a staging row");
+        assert!(outcome.staged_id.is_some(), "expected a staged op id");
         assert_eq!(outcome.matched_node_id.as_deref(), Some("a"));
-        let rows = staging
-            .list(&Filter {
-                surface: Some(SURFACE_TRIAGE.into()),
-                ..Default::default()
+        assert!(!outcome.effective_requires_review, "auto-accept path");
+
+        // The move auto-accepted → no pending ops remain, and the doc now
+        // lives at the target path on `accepted`.
+        let pending = op_writes::list_pending_proposals(&log).unwrap();
+        assert!(pending.is_empty(), "auto-accepted move leaves no pending: {pending:?}");
+        assert!(
+            log.doc_id_for_path("archive/n.md").unwrap().is_some(),
+            "doc moved to target path on accepted"
+        );
+    }
+
+    // Review-required triage leaves the op pending rather than applying it.
+    #[test]
+    fn triage_stages_pending_when_review_required() {
+        use crate::cluster::algo::l2_normalize;
+        use crate::store::dto::NoteUpsert;
+        use crate::store::Store;
+        use crate::vault::Vault;
+
+        let td = TempDir::new().unwrap();
+        std::fs::create_dir_all(td.path().join("inbox")).unwrap();
+        std::fs::write(td.path().join("inbox/n.md"), "# n\nbody\n").unwrap();
+        let vault = Vault::open(td.path()).unwrap();
+        let mut store = Store::open(td.path()).unwrap();
+        let log = open_log(&td);
+        store
+            .upsert_note(&NoteUpsert {
+                id: "note-n",
+                path: "inbox/n.md",
+                content_hash: "h",
+                mtime: 1,
+                size: 1,
+                indexed_at: 1,
+                embedder_version: "t",
+                chunks: vec![],
             })
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].action, "move_note");
-        assert_eq!(rows[0].target_path, "archive/n.md");
-        assert_eq!(rows[0].source_path.as_deref(), Some("inbox/n.md"));
-        let md = rows[0].metadata.as_ref().expect("metadata present");
-        assert_eq!(md["tree_id"], serde_json::Value::String(tid.clone()));
-        assert_eq!(md["policy_kind"], serde_json::Value::String("move".into()));
+        let (trees, tid) = mk_tree(&td);
+        let mut root = cluster("root", None, None);
+        root.centroid = Some(l2_normalize(&[1.0, 1.0]));
+        let mut a = cluster(
+            "a",
+            Some("root"),
+            Some(NodePolicy::Move {
+                folder: "archive".into(),
+                require_review: false,
+            }),
+        );
+        a.centroid = Some(l2_normalize(&[1.0, 0.05]));
+        trees.insert_nodes(&tid, &[root, a]).unwrap();
+
+        let opts = TriageOpts {
+            review_required: true,
+            ..Default::default()
+        };
+        let outcome = triage_match(&trees, &vault, &store, &log, &TriageInput {
+                tree_id: &tid,
+                note_id: "note-n",
+                source_path: "inbox/n.md",
+                embedding: &[1.0, 0.05],
+                author_class: NoteAuthorClass::User,
+                opts: &opts,
+            },
+        )
+        .unwrap();
+        assert!(outcome.staged_id.is_some());
+        assert!(outcome.effective_requires_review);
+        let pending = op_writes::list_pending_proposals(&log).unwrap();
+        assert_eq!(pending.len(), 1, "review-required move stays pending");
+        assert_eq!(pending[0].action, "rename");
+        assert_eq!(pending[0].surface, SURFACE_TRIAGE);
     }
 
     #[test]
     fn triage_drops_match_outside_scope() {
         use crate::cluster::algo::l2_normalize;
-        use crate::staging::Staging;
         use crate::store::Store;
         use crate::vault::Vault;
 
@@ -1352,7 +1373,7 @@ use crate::store::Store;
         std::fs::write(td.path().join("research/r.md"), "# r\n").unwrap();
         let vault = Vault::open(td.path()).unwrap();
         let store = Store::open(td.path()).unwrap();
-        let staging = Staging::open(td.path()).unwrap();
+        let log = open_log(&td);
         let (trees, tid) = mk_tree(&td);
         let mut root = cluster("root", None, None);
         root.centroid = Some(l2_normalize(&[1.0, 0.0]));
@@ -1371,7 +1392,7 @@ use crate::store::Store;
             scope: "inbox/".into(),
             ..Default::default()
         };
-        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &log, &TriageInput {
                 tree_id: &tid,
                 note_id: "x",
                 source_path: "research/r.md",
@@ -1388,7 +1409,6 @@ use crate::store::Store;
     #[test]
     fn triage_agent_author_forces_pending() {
         use crate::cluster::algo::l2_normalize;
-        use crate::staging::Staging;
         use crate::store::Store;
         use crate::vault::Vault;
 
@@ -1397,7 +1417,7 @@ use crate::store::Store;
         std::fs::write(td.path().join("inbox/g.md"), "# g\n").unwrap();
         let vault = Vault::open(td.path()).unwrap();
         let store = Store::open(td.path()).unwrap();
-        let staging = Staging::open(td.path()).unwrap();
+        let log = open_log(&td);
         let (trees, tid) = mk_tree(&td);
         let mut root = cluster("root", None, None);
         root.centroid = Some(l2_normalize(&[1.0, 0.0]));
@@ -1413,7 +1433,7 @@ use crate::store::Store;
         trees.insert_nodes(&tid, &[root, a]).unwrap();
 
         let opts = TriageOpts::default();
-        let outcome = triage_match(&trees, &vault, &store, &staging, &TriageInput {
+        let outcome = triage_match(&trees, &vault, &store, &log, &TriageInput {
                 tree_id: &tid,
                 note_id: "g",
                 source_path: "inbox/g.md",

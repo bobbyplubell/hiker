@@ -49,7 +49,7 @@ fn state_with_selection(text: &str, range: std::ops::Range<usize>) -> EditorStat
 }
 
 fn apply(action: Action, state: &mut EditorState) {
-    if let Action::Replace(next) = action {
+    if let Action::Replace { state: next, .. } = action {
         *state = next;
     }
 }

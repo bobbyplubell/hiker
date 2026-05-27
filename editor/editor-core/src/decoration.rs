@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use smol_str::SmolStr;
 
-use crate::rangeset::RangeSet;
+use crate::rangeset::{HeightAffecting, RangeSet};
 
 /// Severity of a [`Diagnostic`], ordered from most to least critical.
 ///
@@ -309,6 +309,84 @@ pub struct BlockTextLine {
     pub gutter_marker: Option<GutterMarker>,
     /// Intraline byte ranges (within `text`) to emphasize with a bg color.
     pub marks: Vec<(std::ops::Range<usize>, Color)>,
+    /// Draw a horizontal strike line through the whole text row. Set on
+    /// removed-diff lines so deleted content reads as struck-through in
+    /// addition to its red background.
+    pub strikethrough: bool,
+}
+
+impl HeightAffecting for Decoration {
+    /// A decoration affects line height when it hides a line, scales its
+    /// height, or injects a vertical block above/below it. Mark / Replace /
+    /// InlineWidget styling stays within the existing line box and does not.
+    /// This is the single source of truth the heightmap driver relies on; it
+    /// must stay in sync with the variants matched in the egui widget's
+    /// `apply_line_height_decorations`.
+    fn affects_height(&self) -> bool {
+        matches!(
+            self,
+            Decoration::Line(LineStyle { hide: true, .. })
+                | Decoration::Line(LineStyle { height_scale: Some(_), .. })
+                | Decoration::Block(_)
+                | Decoration::BlockWidget { .. }
+        )
+    }
 }
 
 pub type Set = RangeSet<Decoration>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_affecting_variants() {
+        assert!(Decoration::Line(LineStyle { hide: true, ..Default::default() }).affects_height());
+        assert!(Decoration::Line(LineStyle {
+            height_scale: Some(2.0),
+            ..Default::default()
+        })
+        .affects_height());
+        assert!(
+            Decoration::Block(BlockDeco {
+                side: BlockSide::Above,
+                height: 10.0,
+                kind: BlockKind::Solid(Color::TRANSPARENT),
+            })
+            .affects_height()
+        );
+    }
+
+    #[test]
+    fn paint_only_variants_do_not_affect_height() {
+        assert!(!Decoration::Mark(MarkStyle::default()).affects_height());
+        assert!(!Decoration::Replace { display: None }.affects_height());
+        // A Line with only a bg / indent (no hide, no height_scale) is
+        // paint-only — it stays within the existing line box.
+        assert!(!Decoration::Line(LineStyle {
+            bg: Some(Color::TRANSPARENT),
+            ..Default::default()
+        })
+        .affects_height());
+    }
+
+    #[test]
+    fn set_marks_affects_height_at_construction() {
+        let height_set: Set = RangeSet::from_iter([(
+            0..1,
+            Decoration::Line(LineStyle { height_scale: Some(1.5), ..Default::default() }),
+        )]);
+        assert!(height_set.affects_height());
+
+        let paint_set: Set =
+            RangeSet::from_iter([(0..1, Decoration::Mark(MarkStyle { bold: true, ..Default::default() }))]);
+        assert!(!paint_set.affects_height());
+
+        // Mixed set: one height-affecting entry flips the whole set.
+        let mixed: Set = RangeSet::from_iter([
+            (0..1, Decoration::Mark(MarkStyle::default())),
+            (2..3, Decoration::Line(LineStyle { hide: true, ..Default::default() })),
+        ]);
+        assert!(mixed.affects_height());
+    }
+}

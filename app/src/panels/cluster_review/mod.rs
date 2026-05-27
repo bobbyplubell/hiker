@@ -5,7 +5,7 @@
 //! running on a background tokio task, reviews the result as cluster
 //! rows reveal live, optionally inline-renames placeholder names, and
 //! Confirms once. Confirm persists the in-memory `BuiltClusterTree` to
-//! `trees.db` and lands on the cluster pane. LLM naming is off by
+//! the tree's `.md` and lands on the cluster pane. LLM naming is off by
 //! default — the user can opt in via the "Name clusters with LLM after
 //! confirm" toggle, or defer to the cluster pane's Name-clusters CTA.
 //!

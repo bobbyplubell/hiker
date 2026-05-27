@@ -12,7 +12,7 @@
 //! - `Session`: editor session (tabs, buffers, modal, nav, sidebar,
 //!   trails, chat). Conceptually survives a vault swap; in practice
 //!   it's rebuilt because everything ties back to vault paths.
-//! - `UiCache`: per-frame snapshots (task / staging / skipped paths) so
+//! - `UiCache`: per-frame snapshots (task / pending / skipped paths) so
 //!   the render loop reads cheap caches instead of issuing SQLite
 //!   round-trips from every panel.
 //! - `PanelStates`: per-panel local UI state (discovery, clusters,
@@ -38,10 +38,8 @@ use hiker_core::vault::Vault;
 use hiker_core::activity::Activity;
 use hiker_core::audit::AgentLog;
 use hiker_core::autosave::Autosave;
-use hiker_core::changes::Changes;
 use hiker_core::config::Config;
 use hiker_core::indexer::Handle;
-use hiker_core::staging::Staging;
 use hiker_core::store::Store;
 use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::tasks::types::TaskRecord;
@@ -80,8 +78,13 @@ pub struct AppState {
 /// State machine for the runtime "open a different vault" flow.
 ///
 /// - `Idle`: nothing pending.
-/// - `Requested(path)`: a UI action (toolbar / confirm modal) queued a
-///   path. The next `update()` frame transitions to `InProgress` by
+/// - `Picking`: a folder picker is open on the tokio runtime. We poll the
+///   oneshot each frame for the user's choice; this keeps the dialog off
+///   the egui/winit thread so the UI never freezes while it's up (the
+///   native `rfd` portal call is synchronous and would otherwise block
+///   every repaint for the dialog's whole lifetime).
+/// - `Requested(path)`: a UI action (picker result / confirm modal) queued
+///   a path. The next `update()` frame transitions to `InProgress` by
 ///   spawning `bootstrap::open_vault` on the tokio runtime.
 /// - `InProgress`: bootstrap is running on a tokio task; the UI keeps
 ///   rendering against the OLD vault while we poll a oneshot each frame.
@@ -94,6 +97,7 @@ pub struct AppState {
 pub enum VaultSwitchState {
     #[default]
     Idle,
+    Picking(oneshot::Receiver<Option<PathBuf>>),
     Requested(PathBuf),
     InProgress {
         rx: oneshot::Receiver<anyhow::Result<AppState>>,
@@ -111,6 +115,11 @@ pub struct VaultSession {
     pub config: Arc<RwLock<Config>>,
     pub services: Services,
     pub events: VaultEvents,
+    /// The WASM plugin host for this vault: loaded plugins + their live
+    /// instances. UI-thread-owned (the engine instances aren't `Sync`), so it
+    /// lives here rather than in the `Arc`-handle `Services` bag. Drives plugin
+    /// panels through `&mut` in the frame loop.
+    pub plugins: hiker_core::plugins::PluginHost,
     /// Cancellation token shared with every background task spawned for
     /// this vault (watcher relay, indexer progress forwarder, direct
     /// LLM worker). On vault swap the update loop calls
@@ -121,8 +130,11 @@ pub struct VaultSession {
 
 pub struct Services {
     pub read_store: Arc<Mutex<Store>>,
-    pub changes: Arc<Changes>,
-    pub staging: Arc<Staging>,
+    /// The vault's op log: the CRDT-shaped write substrate every producer
+    /// rides on (`op-log-ops-producer-helpers`). User saves and agent edits
+    /// route through `core::ops::op_writes` against this handle. Seeded from the
+    /// on-disk vault at open by `core::ops::op_writes::bootstrap`.
+    pub oplog: Arc<hiker_core::oplog::OpLog>,
     pub trees: Arc<Db>,
     pub activity: Arc<Activity>,
     pub autosave: Arc<Autosave>,
@@ -139,6 +151,12 @@ pub struct Services {
     /// per-tool gates) take effect without an MCP restart. Always
     /// present even when MCP is disabled — keeps the wiring uniform.
     pub mcp_tools_cfg: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
+    /// The live `hiker-sync` engine, present only when `[sync].enabled`. When
+    /// sync is off this is `None` and nothing is constructed (no keys, no
+    /// swarm, no listener). The Sync page renders a disabled state in that
+    /// case. Wrapped in `Arc` so the page can clone a handle to spawn async
+    /// `force_sync` / `discover` work off the frame loop.
+    pub sync: Option<Arc<crate::sync_service::SyncService>>,
 }
 
 pub struct VaultEvents {
@@ -149,15 +167,25 @@ pub struct VaultEvents {
     /// Bounded ring buffer drained from `indexer_events_rx` each frame
     /// (capped at `INDEXER_EVENTS_MAX`).
     pub indexer_events: VecDeque<String>,
+    /// Receiver for human-readable sync progress lines pushed by the sync
+    /// service and its background tasks. Drained each frame into
+    /// `sync_events`. Present even when sync is disabled (the channel just
+    /// stays empty) so the wiring is uniform.
+    pub sync_events_rx: Mutex<UnboundedReceiver<String>>,
+    /// Bounded ring buffer drained from `sync_events_rx` each frame (capped at
+    /// `SYNC_EVENTS_MAX`). Backs the Sync page's progress log.
+    pub sync_events: VecDeque<String>,
+    /// Receiver for on-demand fork-diff fetch results pushed by the sync
+    /// service's `fetch_fork_diff` task: `(path, Ok(their_text) | Err(message))`.
+    /// Drained each frame into `panels.sync.fork_diffs` (the Sync page's
+    /// "view diff" cache), mirroring the `sync_events` relay. Present even when
+    /// sync is disabled (the channel just stays empty). [sync-fork-diff]
+    pub fork_diff_rx: Mutex<UnboundedReceiver<crate::sync_service::ForkDiffResult>>,
     /// Latest task-queue snapshot pushed by the background pollster
     /// (`bootstrap::spawn_snapshot_poller`). The UI thread `.borrow()`s
     /// this each frame instead of calling `tasks.snapshot().await` from
     /// the render loop. Initial value is an empty `Vec`.
     pub task_snapshot_rx: watch::Receiver<Vec<TaskRecord>>,
-    /// Latest staging snapshot pushed by the background pollster. The UI
-    /// thread `.borrow()`s this each frame instead of calling
-    /// `staging.list_pending()` (SQLite round-trip) every frame.
-    pub staging_snapshot_rx: watch::Receiver<Vec<hiker_core::staging::types::Proposal>>,
     /// Latest skipped-paths snapshot pushed by the background pollster
     /// (every 3s). The file-tree row renderer reads from
     /// `ui_cache.skipped_paths` which is populated from this channel each
@@ -256,11 +284,37 @@ impl Default for Session {
     }
 }
 
+/// One entry in the back/forward navigation stack — what a Back/Forward press
+/// restores into the active editor view. Path-only nav couldn't represent a
+/// historical snapshot (a `(path, op_id)` pair), so navigating to a snapshot
+/// dropped out of the stack and Back couldn't return; modelling the target
+/// explicitly fixes that and keeps the stack logic unit-testable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavTarget {
+    /// The live vault buffer for a path.
+    File(String),
+    /// A historical snapshot of `path` at a specific accepted op.
+    Snapshot { path: String, op_id: String },
+}
+
+impl NavTarget {
+    /// The vault-relative path this target concerns (for tab matching / the
+    /// status bar), regardless of variant.
+    pub fn path(&self) -> &str {
+        match self {
+            NavTarget::File(p) | NavTarget::Snapshot { path: p, .. } => p,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NavState {
-    /// Chronological history (with duplicates). `idx` points at the
-    /// current position; back/forward shift it.
-    pub history: Vec<String>,
+    /// Chronological history of visited targets. `idx` points at the current
+    /// position; Back/Forward shift it. Pushing a new target while `idx` is
+    /// not at the end drops the forward tail (a new branch). The stack
+    /// mechanics live in the methods below so they can be tested without an
+    /// `AppState`.
+    pub history: Vec<NavTarget>,
     pub idx: Option<usize>,
     /// True while driving open_file from a back/forward action — so
     /// open_file doesn't push a new entry on top of the one we're
@@ -281,7 +335,18 @@ pub struct NavState {
 #[derive(Default)]
 pub struct UiCache {
     pub task_snapshot: Vec<TaskRecord>,
-    pub staging_snapshot: Vec<hiker_core::staging::types::Proposal>,
+    /// Per-frame snapshot of the vault's pending agent ops, read off the op
+    /// log (`op_writes::list_pending_proposals`). Drives the pending-count
+    /// badge (toolbar / status bar / Patch-review tab) and the chat-card
+    /// "still-live" op-id set. Populated in `main::refresh_pending_proposals`.
+    pub pending_snapshot: Vec<hiker_core::ops::op_writes::PendingProposal>,
+    /// Per-frame snapshot of pending whole-file (`write_note`-shaped)
+    /// proposals read off the op log. Backs the buffer review surface — the
+    /// status-bar version dropdown's pending-proposal section, the pending-
+    /// rewrite banner, and the agent-diff toggle — replacing the prior
+    /// `pending_snapshot` feed for that surface. Populated in
+    /// `main::refresh_whole_file_proposals`.
+    pub whole_file_proposals: Vec<hiker_core::ops::op_writes::WholeFileProposal>,
     pub skipped_paths: HashSet<String>,
 }
 
@@ -298,8 +363,14 @@ pub struct PanelStates {
     pub chat_dock: crate::panels::discovery_pane::ChatDockState,
     pub clusters: ClusterUiState,
     pub trails_ui: TrailsUiState,
+    /// Per-board-tab UI state (View-as toggle, inline-rename drafts,
+    /// pending column-delete confirm). Keyed by tab id.
+    pub boards: HashMap<TabId, crate::panels::board::Pane>,
     pub graph: Option<crate::panels::graph::State>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterGraph>,
+    pub home: crate::panels::home::State,
+    /// Sync page local UI state — the per-fork "view diff" cache. [sync-fork-diff]
+    pub sync: crate::panels::sync::State,
 }
 
 // ===========================================================================
@@ -322,6 +393,7 @@ pub enum MutationEvent {
 }
 
 pub const INDEXER_EVENTS_MAX: usize = 200;
+pub const SYNC_EVENTS_MAX: usize = 200;
 pub const TRAILS_MAX: usize = 50;
 pub const NAV_MAX: usize = 200;
 
@@ -374,29 +446,72 @@ pub fn create_trail(state: &mut AppState, name: &str) -> String {
     id
 }
 
+impl NavState {
+    /// Record `target` as the new current entry: drop any forward tail (a new
+    /// branch), skip a no-op (target equals the current entry), cap to
+    /// `NAV_MAX` (dropping the oldest), and advance `idx`.
+    pub fn push(&mut self, target: NavTarget) {
+        if let Some(idx) = self.idx {
+            self.history.truncate(idx + 1);
+        }
+        if self.history.last() == Some(&target) {
+            return;
+        }
+        self.history.push(target);
+        if self.history.len() > NAV_MAX {
+            self.history.remove(0);
+            // `idx` is recomputed below; the removal shifts everything left by
+            // one but the new entry is still the last, so `idx` lands correctly.
+        }
+        self.idx = Some(self.history.len() - 1);
+    }
+
+    pub fn can_back(&self) -> bool {
+        self.idx.is_some_and(|i| i > 0)
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.idx.is_some_and(|i| i + 1 < self.history.len())
+    }
+
+    /// Move back one entry and return the target now current. `None` (no move)
+    /// when already at the oldest entry.
+    pub fn back(&mut self) -> Option<NavTarget> {
+        let i = self.idx?;
+        if i == 0 {
+            return None;
+        }
+        self.idx = Some(i - 1);
+        self.history.get(i - 1).cloned()
+    }
+
+    /// Move forward one entry and return the target now current. `None` when
+    /// already at the newest entry.
+    pub fn forward(&mut self) -> Option<NavTarget> {
+        let i = self.idx?;
+        if i + 1 >= self.history.len() {
+            return None;
+        }
+        self.idx = Some(i + 1);
+        self.history.get(i + 1).cloned()
+    }
+
+    /// The target at the current position.
+    pub fn current(&self) -> Option<&NavTarget> {
+        self.idx.and_then(|i| self.history.get(i))
+    }
+}
+
 pub fn nav_push(state: &mut AppState, path: &str) {
-    let cap = NAV_MAX;
-    let nav = &mut state.session.nav;
-    if let Some(idx) = nav.idx {
-        nav.history.truncate(idx + 1);
-    }
-    if nav.history.last().map(|p| p == path).unwrap_or(false) {
-        return;
-    }
-    nav.history.push(path.to_string());
-    if nav.history.len() > cap {
-        nav.history.remove(0);
-    }
-    nav.idx = Some(nav.history.len() - 1);
+    state.session.nav.push(NavTarget::File(path.to_string()));
 }
 
 pub fn nav_can_back(state: &AppState) -> bool {
-    state.session.nav.idx.map(|i| i > 0).unwrap_or(false)
+    state.session.nav.can_back()
 }
 
 pub fn nav_can_forward(state: &AppState) -> bool {
-    let nav = &state.session.nav;
-    nav.idx.map(|i| i + 1 < nav.history.len()).unwrap_or(false)
+    state.session.nav.can_forward()
 }
 
 /// Manually append `path` as a waypoint of the currently active trail.
@@ -471,6 +586,8 @@ pub fn find_waypoint_mut<'a>(
 pub enum MoveOp {
     /// Insert as a sibling immediately before `target`.
     Before(String),
+    /// Insert as a sibling immediately after `target`.
+    After(String),
     /// Append as a child of `target`.
     Child(String),
     /// Place at the root-level head of the trail.
@@ -546,7 +663,7 @@ impl Trail {
 /// move would create a cycle (dropping a node into its own subtree).
 pub fn move_waypoint(&mut self, src: &str, op: MoveOp) -> bool {
     match &op {
-        MoveOp::Before(t) | MoveOp::Child(t) => {
+        MoveOp::Before(t) | MoveOp::After(t) | MoveOp::Child(t) => {
             if src == t.as_str() || is_in_subtree(&self.waypoints, src, t) {
                 return false;
             }
@@ -582,6 +699,25 @@ pub fn move_waypoint(&mut self, src: &str, op: MoveOp) -> bool {
             Some((Some(parent_path), idx)) => {
                 if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &parent_path) {
                     parent.children.insert(idx, item);
+                    true
+                } else {
+                    self.waypoints.push(item);
+                    false
+                }
+            }
+            None => {
+                self.waypoints.push(item);
+                false
+            }
+        },
+        MoveOp::After(target) => match self.locate_waypoint(&target) {
+            Some((None, idx)) => {
+                self.waypoints.insert(idx + 1, item);
+                true
+            }
+            Some((Some(parent_path), idx)) => {
+                if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &parent_path) {
+                    parent.children.insert(idx + 1, item);
                     true
                 } else {
                     self.waypoints.push(item);
@@ -634,6 +770,25 @@ mod move_tests {
         assert_eq!(t.waypoints[0].children[0].path, "b");
     }
     #[test]
+    fn move_after_inserts_following_target_at_root() {
+        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
+        assert!(t.move_waypoint("a", MoveOp::After("b".into())));
+        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "a", "c"]);
+    }
+    #[test]
+    fn move_after_last_appends_to_tail() {
+        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
+        assert!(t.move_waypoint("a", MoveOp::After("c".into())));
+        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+    }
+    #[test]
+    fn move_after_nested_target_stays_in_parent_list() {
+        let mut t = tr(vec![wp("a", vec![wp("a1", vec![]), wp("a2", vec![])]), wp("b", vec![])]);
+        assert!(t.move_waypoint("b", MoveOp::After("a1".into())));
+        let children = t.waypoints[0].children.iter().map(|w| w.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(children, vec!["a1", "b", "a2"]);
+    }
+    #[test]
     fn cycle_drop_into_own_subtree_rejected() {
         let mut t = tr(vec![wp("a", vec![wp("a1", vec![])])]);
         assert!(!t.move_waypoint("a", MoveOp::Child("a1".into())));
@@ -665,6 +820,13 @@ pub struct UiState {
     pub palette_query: String,
     /// Currently-selected row index in the palette result list.
     pub palette_selected: usize,
+    /// egui id of the chat composer's text field, recorded each frame it
+    /// renders. The editor panel reads `Context::focused()` against this (and
+    /// `search_input_id`) to tell when a host text field — not the editor —
+    /// owns keyboard focus, so its panel-level Ctrl-Z handler can defer.
+    pub chat_input_id: Option<eframe::egui::Id>,
+    /// egui id of the discovery search box's text field; see `chat_input_id`.
+    pub search_input_id: Option<eframe::egui::Id>,
 }
 
 // ===========================================================================
@@ -865,6 +1027,34 @@ pub enum Modal {
         path: String,
         in_buffer_text: String,
     },
+    /// A stored double-link reference whose recorded path now points at a
+    /// note with a different ULID than the one recorded (the core's
+    /// `ResolutionOutcome::PathConflict`). Offers Keep mine / Repoint /
+    /// Break. Reusable across reference surfaces (boards, trails) via the
+    /// `target` discriminator. status: trail-path-conflict-modal
+    PathConflict {
+        /// The recorded path that now resolves to a different identity.
+        path: String,
+        /// The ULID the reference recorded.
+        recorded_id: String,
+        /// The ULID the note currently at `path` carries.
+        current_path_id: String,
+        /// Which reference surface + entry the resolution applies to.
+        target: PathConflictTarget,
+    },
+}
+
+/// Identifies the concrete reference whose `PathConflict` the modal resolves.
+/// One variant per reference surface so the single modal serves boards and
+/// (when its app-side waypoint model carries a ULID) trails alike.
+///
+/// status: trail-path-conflict-modal
+#[derive(Clone)]
+pub enum PathConflictTarget {
+    /// A board card: identified by its board-doc path + card id. "Repoint"
+    /// rewrites the card's stored path to the note now at `path`; "Break"
+    /// removes the card. status: board-card-references
+    BoardCard { board_rel: String, card_id: String },
 }
 
 /// Concrete confirm intents driving `Modal::Confirm`. New flows add a
@@ -1140,5 +1330,120 @@ impl AppState {
             }
         }
     }
+    }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    //! Back/forward navigation-stack mechanics, exercised on `NavState` alone
+    //! (no `AppState`) so the regression-prone scenarios stay fast and
+    //! exhaustive. Integration of these targets with real tabs is covered by
+    //! the app-level `nav` tests.
+    use super::{NavState, NavTarget};
+
+    fn file(p: &str) -> NavTarget {
+        NavTarget::File(p.to_string())
+    }
+    fn snap(p: &str, op: &str) -> NavTarget {
+        NavTarget::Snapshot { path: p.to_string(), op_id: op.to_string() }
+    }
+
+    #[test]
+    fn empty_stack_has_no_moves() {
+        let nav = NavState::default();
+        assert!(!nav.can_back());
+        assert!(!nav.can_forward());
+        assert_eq!(nav.current(), None);
+    }
+
+    #[test]
+    fn single_push_is_current_with_no_moves() {
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        assert_eq!(nav.current(), Some(&file("a")));
+        assert!(!nav.can_back(), "nothing before the only entry");
+        assert!(!nav.can_forward());
+    }
+
+    #[test]
+    fn back_and_forward_walk_the_stack() {
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        nav.push(file("b"));
+        nav.push(file("c"));
+        assert!(nav.can_back() && !nav.can_forward());
+        assert_eq!(nav.back(), Some(file("b")));
+        assert_eq!(nav.back(), Some(file("a")));
+        assert!(!nav.can_back() && nav.can_forward());
+        assert_eq!(nav.back(), None, "back past the oldest is a no-op");
+        assert_eq!(nav.current(), Some(&file("a")), "stayed at the oldest");
+        assert_eq!(nav.forward(), Some(file("b")));
+        assert_eq!(nav.forward(), Some(file("c")));
+        assert_eq!(nav.forward(), None, "forward past the newest is a no-op");
+        assert_eq!(nav.current(), Some(&file("c")));
+    }
+
+    #[test]
+    fn pushing_after_back_truncates_the_forward_tail() {
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        nav.push(file("b"));
+        nav.push(file("c"));
+        nav.back(); // at b
+        nav.back(); // at a
+        nav.push(file("d")); // new branch from a
+        assert_eq!(nav.current(), Some(&file("d")));
+        assert!(!nav.can_forward(), "b and c were dropped");
+        assert_eq!(nav.history, vec![file("a"), file("d")]);
+    }
+
+    #[test]
+    fn adjacent_duplicate_is_skipped() {
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        nav.push(file("a")); // same as current → no-op
+        assert_eq!(nav.history, vec![file("a")]);
+        nav.push(file("b"));
+        nav.push(file("a")); // not adjacent to the earlier a → recorded
+        assert_eq!(nav.history, vec![file("a"), file("b"), file("a")]);
+    }
+
+    #[test]
+    fn re_pushing_current_after_back_is_a_noop() {
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        nav.push(file("b"));
+        nav.back(); // at a
+        nav.push(file("a")); // re-selecting where we are
+        assert_eq!(nav.history, vec![file("a")], "forward tail dropped, no dup added");
+        assert_eq!(nav.current(), Some(&file("a")));
+    }
+
+    #[test]
+    fn snapshots_and_files_interleave_and_round_trip() {
+        // The bug this guards: a snapshot must be a first-class nav target so
+        // Back returns from it to the live file.
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        nav.push(snap("a", "op1"));
+        nav.push(snap("a", "op2"));
+        assert_eq!(nav.back(), Some(snap("a", "op1")));
+        assert_eq!(nav.back(), Some(file("a")), "Back from a snapshot returns to the live file");
+        assert!(!nav.can_back());
+        assert_eq!(nav.forward(), Some(snap("a", "op1")));
+        // A different snapshot of the same path is a distinct entry.
+        assert_ne!(snap("a", "op1"), snap("a", "op2"));
+    }
+
+    #[test]
+    fn cap_drops_oldest_and_keeps_idx_at_newest() {
+        let mut nav = NavState::default();
+        for i in 0..(super::NAV_MAX + 1) {
+            nav.push(file(&i.to_string()));
+        }
+        assert_eq!(nav.history.len(), super::NAV_MAX, "capped");
+        assert_eq!(nav.current(), Some(&file(&super::NAV_MAX.to_string())), "newest is current");
+        assert_eq!(nav.history.first(), Some(&file("1")), "oldest (0) dropped");
+        assert!(nav.can_back() && !nav.can_forward());
     }
 }

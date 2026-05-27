@@ -100,9 +100,8 @@ fn paint_row(
     expanded: bool,
 ) {
     let indent = (depth as f32) * 12.0;
-    let row_id = egui::Id::new(("cluster-row", tree_id, &node.id));
 
-    let (rect, _resp) = ui.allocate_exact_size(
+    let (rect, row_response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 22.0),
         egui::Sense::click_and_drag(),
     );
@@ -115,9 +114,14 @@ fn paint_row(
         ui.painter().rect_filled(rect, 2.0, theme::hover_bg());
     }
 
-    // Drag-source: wrap the visual paint in dnd_drag_source so egui
-    // tracks the drag + paints a ghost. We re-allocate the same area
-    // via a child UI placed at `rect`.
+    // Row contents (chevron, glyph, name) paint into a child UI placed at
+    // `rect`. The chevron is its own click target (`row_contents`); the
+    // surrounding row body is left to `row_response`, which carries the
+    // drag + the body click. Mirrors the Files tree (`files.rs`), where the
+    // row uses a plain click/drag response and the drag payload is attached
+    // afterward — egui only begins a drag once the pointer moves past its
+    // built-in threshold, so a press-release on the row body still reports
+    // `clicked()` and a press on the chevron still reaches the chevron.
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
@@ -126,12 +130,13 @@ fn paint_row(
     child.set_clip_rect(rect);
     child.set_max_width(rect.width());
     child.add_space(indent);
+    self.row_contents(&mut child, tree_id, node, has_children, expanded);
 
-    let drag_payload = DragNode { node_id: node.id.clone() };
-    let inner = child.dnd_drag_source(row_id, drag_payload, |ui| {
-        self.row_contents(ui, tree_id, node, has_children, expanded);
-    });
-    let row_response = inner.response;
+    // Drag-source: attach the dragged node id once egui decides a drag has
+    // begun (past its motion threshold). A plain click never sets a payload.
+    row_response
+        .clone()
+        .dnd_set_drag_payload::<DragNode>(DragNode { node_id: node.id.clone() });
 
     // Drop-zone: clusters and outlier-buckets accept drops; leaves don't.
     let accepts_drop = matches!(node.kind, NodeKind::Cluster | NodeKind::OutlierBucket);
@@ -151,9 +156,10 @@ fn paint_row(
         }
     }
 
-    // Click handling. Cmd/Ctrl-click toggles multi-select; plain click on a
-    // leaf opens the note; plain click on a cluster falls through (the
-    // chevron in row_contents handles expand/collapse).
+    // Click handling. A genuine click (no drag past threshold) lands here.
+    // Cmd/Ctrl-click toggles multi-select; plain click on a leaf opens the
+    // note; plain click on a cluster falls through (the chevron in
+    // row_contents handles expand/collapse).
     if row_response.clicked() {
         let multi = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
         if multi {

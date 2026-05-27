@@ -302,13 +302,29 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
     }
 
     fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
-        if matches!(mode, HikerMode::Files)
-            && ui
-                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)).small())
-                .on_hover_text("New note")
-                .clicked()
-        {
-            self.app.new_note();
+        if matches!(mode, HikerMode::Files) {
+            // Left-click → new note; right-click → cross-type picker
+            // (note / board), per `sidebar-new-item-button`.
+            // status: board-create
+            let resp = ui
+                .add(
+                    egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus))
+                        .small(),
+                )
+                .on_hover_text("New note (right-click for more)");
+            if resp.clicked() {
+                self.app.new_note();
+            }
+            resp.context_menu(|ui| {
+                if ui.button("New note").clicked() {
+                    self.app.new_note();
+                    ui.close();
+                }
+                if ui.button("New board").clicked() {
+                    self.app.new_board();
+                    ui.close();
+                }
+            });
         }
     }
 
@@ -412,17 +428,26 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
         // focused, render the per-buffer version dropdown + indexer
         // state + Ln:Col / word count row that used to live inside
         // the editor pane. For any other tab kind, fall back to the
-        // vault-level row (vault name + staging / task counters).
+        // vault-level row (vault name + pending / task counters).
         // Other panels can grow their own status content the same way
         // by matching on `TabKind` here.
-        let active_buffer_path = self
+        // The buffer-map KEY of the active editor tab, for ANY source (a vault
+        // path, or the composite key of a read-only snapshot / proposal / trash
+        // preview) — so the status bar (and its version dropdown) render on
+        // snapshot previews too, not just live vault buffers.
+        let active_buffer_key = self
             .app
             .session
             .active_tab
             .and_then(|id| self.app.tab_by_id(id))
-            .and_then(|t| t.kind.vault_path().map(std::string::ToString::to_string));
-        if let Some(path) = active_buffer_path {
-            self.app.render_buffer_status_bar(ui, &path);
+            .and_then(|t| match &t.kind {
+                crate::tab::TabKind::Editor { buffer, .. } => {
+                    Some(crate::buffer::buffer_key_for_source(buffer))
+                }
+                _ => None,
+            });
+        if let Some(key) = active_buffer_key {
+            self.app.render_buffer_status_bar(ui, &key);
             return;
         }
 
@@ -436,9 +461,9 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
                 .unwrap_or("vault");
             ui.weak(vault);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let staging_n = self.app.ui_cache.staging_snapshot.len();
-                if staging_n > 0 {
-                    ui.weak(format!("{staging_n} staged"));
+                let pending_n = self.app.ui_cache.pending_snapshot.len();
+                if pending_n > 0 {
+                    ui.weak(format!("{pending_n} staged"));
                     ui.separator();
                 }
                 let tasks_n = self.app.ui_cache.task_snapshot.len();
@@ -505,10 +530,12 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::Settings => panels::settings::show(ui, app),
             TabKind::Properties { path } => panels::properties::show(ui, app, path),
             TabKind::Graph => panels::graph::show(ui, app),
+            TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
             TabKind::Agent { session_id } => panels::agent::show(ui, app, session_id, rt),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
             TabKind::Plugins => panels::plugins::show(ui, app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, app, rt),
+            TabKind::Sync => panels::sync::show(ui, app, rt),
             TabKind::Changes => panels::changes::show(ui, app),
             TabKind::ClusterReview { config_json } => {
                 panels::cluster_review::show(ui, app, tab_id, config_json)

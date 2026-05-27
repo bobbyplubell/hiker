@@ -336,7 +336,7 @@ impl Menus<'_> {
     /// proposals and changelog snapshots for the active path, and opens the
     /// corresponding preview tab when the user picks one.
     pub(super) fn version_dropdown(&mut self, label: &str) {
-    use crate::tab::{Tab, TabKind};
+    use crate::tab::TabKind;
     let ui = &mut *self.ui;
     let app = &mut *self.app;
     let path = self.path;
@@ -352,7 +352,7 @@ impl Menus<'_> {
         .on_hover_text("Versions");
     enum Pick {
         Live,
-        Snapshot { change_id: String },
+        Snapshot { op_id: String },
         Proposal { id: String },
     }
     let mut pick: Option<Pick> = None;
@@ -370,11 +370,13 @@ impl Menus<'_> {
             pick = Some(Pick::Live);
             ui.close();
         }
-        // Pending staging proposals first — they're the most actionable
-        // versions and the user is most likely to be looking for them.
-        // Reads the per-frame cache populated in `refresh_staging_snapshot`.
+        // Pending whole-file proposals first — they're the most actionable
+        // versions and the user is most likely to be looking for them. Reads
+        // the per-frame op-log cache populated in
+        // `refresh_whole_file_proposals` (each row is a pending whole-body
+        // `Replace` / `Create` op, not a `staging.db` row).
         let mine: Vec<_> = app
-            .ui_cache.staging_snapshot
+            .ui_cache.whole_file_proposals
             .iter()
             .filter(|p| p.target_path == path)
             .cloned()
@@ -387,7 +389,7 @@ impl Menus<'_> {
                     .color(crate::theme::muted()),
             );
             for p in &mine {
-                let short = &p.id[..p.id.len().min(8)];
+                let short = &p.op_id[..p.op_id.len().min(8)];
                 if ui
                     .add(egui::Button::image_and_text(
                         crate::icons::ICONS.image(crate::icons::Icon::Robot),
@@ -395,15 +397,15 @@ impl Menus<'_> {
                     ))
                     .clicked()
                 {
-                    pick = Some(Pick::Proposal { id: p.id.clone() });
+                    pick = Some(Pick::Proposal { id: p.op_id.clone() });
                     ui.close();
                 }
             }
         }
-        // Changelog entries.
-        let history = app
-            .vault_session.services.changes
-            .history_for_path(path, 20)
+        // Accepted-op history. The newest op (index 0, newest-first) is the
+        // current version on disk.
+        let log = app.vault_session.services.oplog.as_ref();
+        let history = hiker_core::ops::op_writes::path_history(log, path, 20)
             .ok()
             .unwrap_or_default();
         if !history.is_empty() {
@@ -413,20 +415,20 @@ impl Menus<'_> {
                     .small()
                     .color(crate::theme::muted()),
             );
-            for row in &history {
+            for (i, row) in history.iter().enumerate() {
                 let ts = VersionTimeFmt.hms(row.timestamp_ms);
-                let badge = if row.is_current { " · current" } else { "" };
+                let badge = if i == 0 { " · current" } else { "" };
                 if ui
                     .button(
                         egui::RichText::new(format!(
                             "{ts}  {}{badge}",
-                            row.author,
+                            row.author.as_wire(),
                         ))
                         .small(),
                     )
                     .clicked()
                 {
-                    pick = Some(Pick::Snapshot { change_id: row.id.to_string() });
+                    pick = Some(Pick::Snapshot { op_id: row.op_id.clone() });
                     ui.close();
                 }
             }
@@ -440,47 +442,22 @@ impl Menus<'_> {
             );
         }
     });
+    // Load the picked version IN THIS TAB rather than spawning a new one, and
+    // record it on the nav stack so Back/Forward walk the active tab's view
+    // history (live ↔ snapshot). The live buffer keeps its own buffer-map key,
+    // so reverting is lossless; read-only preview sources load on the next
+    // render via the tab dispatch (`ensure_readonly_buffer_loaded`).
     match pick {
-        Some(Pick::Live) => {}
-        Some(Pick::Proposal { id }) => {
-            let kind = TabKind::staging_preview(id.clone(), path.to_string());
-            let existing = app.session.tabs.iter().find(|t| {
-                matches!(
-                    &t.kind,
-                    TabKind::Editor {
-                        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
-                        ..
-                    } if *proposal_id == id
-                )
-            }).map(|t| t.id);
-            match existing {
-                Some(tab_id) => app.session.active_tab = Some(tab_id),
-                None => {
-                    let tab_id = app.next_tab_id();
-                    app.session.tabs.push(Tab { id: tab_id, kind, sticky: true });
-                    app.session.active_tab = Some(tab_id);
-                }
-            }
+        Some(Pick::Live) => crate::editor_pane::open_live_in_tab(app, path),
+        Some(Pick::Snapshot { op_id }) => {
+            crate::editor_pane::open_snapshot_in_tab(app, path, &op_id);
         }
-        Some(Pick::Snapshot { change_id }) => {
-            let cid_for_find = change_id.clone();
-            let kind = TabKind::snapshot_preview(path.to_string(), change_id);
-            let existing = app.session.tabs.iter().find(|t| {
-                matches!(
-                    &t.kind,
-                    TabKind::Editor {
-                        buffer: crate::tab::BufferSource::Snapshot { change_id: cid, path: p },
-                        ..
-                    } if *cid == cid_for_find && p == path
-                )
-            }).map(|t| t.id);
-            match existing {
-                Some(tab_id) => app.session.active_tab = Some(tab_id),
-                None => {
-                    let tab_id = app.next_tab_id();
-                    app.session.tabs.push(Tab { id: tab_id, kind, sticky: true });
-                    app.session.active_tab = Some(tab_id);
-                }
+        Some(Pick::Proposal { id }) => {
+            // Proposals aren't a nav target (yet); swap the active tab in place.
+            if let Some(active) = app.session.active_tab
+                && let Some(tab) = app.session.tabs.iter_mut().find(|t| t.id == active)
+            {
+                tab.kind = TabKind::pending_preview(id, path.to_string());
             }
         }
         None => {}

@@ -125,7 +125,7 @@ impl<'a> CompletionPainter<'a> {
         let local = pos.saturating_sub(line_start).min(line_text.len());
         let col_chars = line_text[..local].chars().count();
         let char_w = view.font_size * 0.55;
-        let x = self.widget_rect.min.x + view.gutter_width + col_chars as f32 * char_w;
+        let x = self.widget_rect.min.x + view.content_origin_x() + col_chars as f32 * char_w;
         let y = self.widget_rect.min.y + view.line_top_y(line);
         Pos2::new(x, y)
     }

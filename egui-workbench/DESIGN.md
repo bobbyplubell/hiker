@@ -396,12 +396,27 @@ For v0.1 we may **defer cross-tree drag** and require explicit
 "move to panel area" / "move to editor area" commands. This greatly
 simplifies the model; cross-tree drag is a v0.2 feature.
 
-### Activity bar reorder
+### Activity bar reorder + visibility
 
-Activity items live in a `Vec<ActivityItem<Mode>>` on
-`ActivityBar::items`. Reordering on drag is a `Vec::swap`. Hidden
-items are stored in a separate `Vec<Mode>` and rendered in a
-"hidden activities" overflow menu.
+The host supplies the full activity list each frame via
+`Host::activity_items`. The bar resolves that against two pieces of
+user state held on `ActivityBar`:
+
+- `order: Vec<Mode>` — the user's preferred ordering. A drag commits a
+  reorder by rewriting this list; rendering sorts the host list to match
+  and appends any unlisted modes in host order.
+- `hidden: Vec<Mode>` — modes filtered out of the strip. The per-item
+  `Hide` command pushes to this list.
+
+Both are read/written through public accessors (`order` / `set_order`,
+`hidden` / `set_hidden`, `is_hidden`, `show_all`) and round-trip through
+`WorkbenchLayout` (§8), so visibility and ordering survive a restart.
+
+Right-clicking the strip — an item or its empty area — opens a context
+menu carrying a **checkbox per host item** (checked = shown); toggling a
+box adds/removes the mode from `hidden`. Because the menu enumerates the
+*unfiltered* host list, it is the path that restores a hidden item, and
+it is reachable from the empty strip even when every item is hidden.
 
 ## Demo binary
 

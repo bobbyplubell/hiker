@@ -2,9 +2,13 @@
 //!
 //! When the user types a configured opener at an empty cursor, this transform
 //! inserts the matching closer and positions the cursor between the pair.
-//! Multi-cursor friendly: all (empty) selection ranges get paired.
+//! Multi-cursor friendly: all (empty) selection ranges get paired. Auto-close
+//! is suppressed when non-whitespace text sits immediately to the right of the
+//! cursor (`has_text_to_right`), so wrapping/typing before existing text never
+//! injects a stray closer. Typing the closer right before an auto-inserted one
+//! types over it instead of doubling (`autopair_skip`).
 //!
-//! Skip-over-close and per-language config are deferred (see SPEC §9.8).
+//! Per-language config is deferred (see SPEC §9.8).
 
 use editor_core::change::Set as ChangeSet;
 use editor_core::transaction::EditType;
@@ -79,6 +83,23 @@ pub fn autopair_skip(
     )
 }
 
+/// True when the character immediately to the right of `cursor` is
+/// non-whitespace. Used to suppress auto-close when wrapping/typing before
+/// existing text (the bare cursor-at-end / cursor-before-whitespace case still
+/// auto-closes). Document end counts as "no text to the right".
+fn has_text_to_right(state: &EditorState, cursor: usize) -> bool {
+    let doc = &state.doc;
+    if cursor >= doc.len_bytes() {
+        return false;
+    }
+    let end = doc.next_char_boundary(cursor);
+    doc.slice(cursor..end)
+        .to_string()
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace())
+}
+
 /// If `inserted` is a single auto-pair opener and every selection range is
 /// empty, produce a transaction that inserts `<open><close>` at every cursor
 /// and places each cursor between the pair.
@@ -96,6 +117,13 @@ pub fn autopair_transform(state: &EditorState, inserted: &str) -> Option<Transac
     // All ranges must be empty.
     let ranges = state.selection.ranges();
     if ranges.iter().any(|r| !r.is_empty()) {
+        return None;
+    }
+
+    // Don't auto-close when there is non-whitespace text immediately to the
+    // right of any cursor: surrounding/typing before existing text shouldn't
+    // inject a stray closer. Fall through to a plain insert instead.
+    if ranges.iter().any(|r| has_text_to_right(state, r.start())) {
         return None;
     }
 

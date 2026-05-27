@@ -156,47 +156,25 @@ static A_VAULT_SWITCH: Action = Action {
     badge: None,
     enabled: None,
     run: |state| {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Pick a vault folder")
-            .set_directory(&state.vault_session.vault_root)
-            .pick_folder()
-        else {
-            return;
-        };
-        if path == state.vault_session.vault_root {
-            return;
-        }
-        // Prompt first if any buffer is dirty so we don't silently
-        // discard unsaved work.
-        let dirty: Vec<String> = state
-            .session
-            .buffers
-            .iter()
-            .filter(|(_, b)| b.is_dirty())
-            .map(|(p, _)| p.clone())
-            .collect();
-        if dirty.is_empty() {
-            state.vault_switch = crate::state::VaultSwitchState::Requested(path.clone());
-            state.push_toast(
-                format!("Switching vault to {}", path.display()),
-                ToastLevel::Info,
-            );
-            return;
-        }
-        let body = format!(
-            "{} unsaved buffer{} will be discarded:\n  {}",
-            dirty.len(),
-            if dirty.len() == 1 { "" } else { "s" },
-            dirty.join("\n  "),
-        );
-        state.session.modal = Some(crate::state::Modal::Confirm {
-            title: "Switch vault?".into(),
-            body,
-            confirm_label: "Discard and switch".into(),
-            cancel_label: "Cancel".into(),
-            danger: true,
-            intent: crate::state::ConfirmIntent::SwitchVault { path },
+        // Drive the folder picker on the tokio runtime rather than calling
+        // the synchronous `rfd::FileDialog` here: that blocks the egui/winit
+        // thread for the dialog's whole lifetime (plus the portal round-trip
+        // to even show it), which freezes every repaint. We hand the choice
+        // back through a oneshot that `progress_vault_switch` polls each
+        // frame — see `VaultSwitchState::Picking`.
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+        let dir = state.vault_session.vault_root.clone();
+        tokio::spawn(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Pick a vault folder")
+                .set_directory(&dir)
+                .pick_folder()
+                .await
+                .map(|h| h.path().to_path_buf());
+            // Receiver dropped (a newer request superseded us) → discard.
+            let _ = tx.send(picked);
         });
+        state.vault_switch = crate::state::VaultSwitchState::Picking(rx);
     },
     category: ActionCategory::Vault,
 };
@@ -255,7 +233,7 @@ static A_VAULT_PATCH_REVIEW: Action = Action {
     icon: icons::Icon::Check,
     label: "Patch review",
     badge: Some(|state| {
-        let n = state.ui_cache.staging_snapshot.len();
+        let n = state.ui_cache.pending_snapshot.len();
         if n == 0 { None } else { Some(n.to_string()) }
     }),
     enabled: None,

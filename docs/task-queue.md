@@ -1,12 +1,13 @@
 # Task queue
 
-A unified work queue for non-interactive LLM jobs — note mutations, RAPTOR / fan-out summarization, background single-shots like auto-tag-on-save. Producers submit tasks and await results; consumers (in-process workers and external MCP-attached agents) drain the queue. Replaces the "every feature calls `core::llm` directly" routing in `llm.md` for everything except chat.
+A unified work queue for non-interactive jobs — LLM work (note mutations, RAPTOR / fan-out summarization, background single-shots like auto-tag-on-save) and long-running I/O like web crawls (`extract.md`). Producers submit tasks and await results; consumers (in-process workers and external MCP-attached agents) drain the queue. Replaces the "every feature calls `core::llm` directly" routing in `llm.md` for everything except chat, and gives non-LLM background work the same progress/cancel/visibility surface.
 
 The headline decisions:
 
 - **`core::tasks` is the queue module.** A queue + dispatcher in core, sibling to `core::llm` and `core::agent`. Producers (UI mutation actions, RAPTOR build, background save hooks) submit `Task` records; the queue arbitrates who processes each one. Whether a task ends up serviced by `core::llm` direct, by an MCP-attached external agent, or by the in-process chat agent (when given the queue tools) is a runtime choice the queue makes. [task-queue-core-module]
 - **Scope is everything non-interactive: mutations, fan-out, background single-shots.** Chat (basic agent loop + ACP) keeps its existing direct path because chat is a streaming session, not a discrete unit of work. Anything else that fires an LLM prompt routes through the queue. [task-queue-scope-non-chat]
-- **One app-driven worker — the direct-LLM background drain — plus MCP-client consumers.** The only thing the app actively *drives* against the queue is an in-process worker that pulls `Direct`-shape tasks and runs them through `core::llm::chat`. Everything else that processes tasks is an MCP client: external agents over rmcp HTTP (Claude Code, Codex, an ACP-driven Goose, …) and hiker's own basic chat agent (which already dispatches tools through MCP per `agent-tool-routing-via-mcp`, so exposing `task_*` to it is a tool-surface decision, not a separate background worker). [task-queue-worker-categories]
+- **One app-driven worker — the direct-LLM background drain — plus MCP-client consumers.** The only LLM thing the app actively *drives* against the queue is an in-process worker that pulls `Direct`-shape tasks and runs them through `core::llm::chat`. Everything else that processes LLM tasks is an MCP client: external agents over rmcp HTTP (Claude Code, Codex, an ACP-driven Goose, …) and hiker's own basic chat agent (which already dispatches tools through MCP per `agent-tool-routing-via-mcp`, so exposing `task_*` to it is a tool-surface decision, not a separate background worker). [task-queue-worker-categories]
+- **A long-running non-LLM I/O lane.** I/O-bound work (a web crawl, `crawl-task-queue-lane`) drains on a dedicated in-process worker — not the single-shot direct-LLM drain, and not the synchronous `NonLlmHandlers` side-channel (a crawl runs for minutes with concurrent fetches, so it can't occupy either). It's never an MCP client (an external agent has no business running the crawl), carries no `output_schema`, and lives on the queue purely for its lease/progress/cancel/visibility surface. A crawl's per-page extractions roll up under the parent crawl via `task-queue-task-grouping` so the widget shows one row, not N. [task-queue-io-worker-lane]
 - **Two independent toggles — direct-worker on/off, expose-to-chat-agent on/off — plus a worker-preference setting.** `[tasks] direct_worker.enabled` controls the background drain. `[tasks] expose_to_chat_agent` controls whether the `task_*` tools are advertised to the basic chat agent's tool set; when on, the user chatting with the in-app agent can ask it to process queue work and the agent can pick up tasks during its turns. `worker_preference = 'auto' | 'internal' | 'external'` arbitrates when both the direct worker and external MCP clients are eligible for the same task — `'external'` makes the direct worker abstain so external agents win; `'auto'` gives external a short grace window before internal takes over. Same toggles available inline on the queue page. [task-queue-worker-toggles]
 - **Cancellation is in-process only — never an MCP tool.** UI cancel buttons and producer drops both call `core::tasks::cancel(id)`. Effect by lease holder: in-process worker has its stop signal fired; external MCP worker has its lease invalidated, with the eventual `task_submit` rejected as `stale_lease`. External agents learn cancellation by submit failure rather than push notification (notification deferred). [task-queue-cancel-app-only]
 - **Tasks declare their output schema; submissions are validated.** Optional `output_schema` (JSON Schema) on the task. Direct-LLM worker uses provider-side structured-output enforcement when available, else "ask for JSON, validate, retry once" fallback. MCP-client consumers hand back JSON via `task_submit`, which validates against the schema before completing — agent or external alike. [task-queue-structured-output]
@@ -106,7 +107,7 @@ enum Priority { High, Normal, Low }
 
 Three named tiers — `High`, `Normal`, `Low`. Strict ordering: High tasks always drain before Normal, Normal before Low. Within a tier, FIFO by `submitted_at`. [task-queue-priority-tiers]
 
-Why three named tiers rather than an integer: the UI needs a pill per tier, the user reasons in "this is urgent vs. not," and an integer field invites bikeshedding and per-feature drift. Three is enough — `High` for explicit user-initiated foreground work (clicked "rewrite this note"), `Normal` for the default (background save hooks), `Low` for ambient bulk work (RAPTOR's per-cluster summaries during a build).
+`High` for explicit user-initiated foreground work (clicked "rewrite this note"), `Normal` for the default (background save hooks), `Low` for ambient bulk work (RAPTOR's per-cluster summaries during a build).
 
 Producers default to `Normal` and bump up only with a reason. The note-mutation menu submits at `High` because the user is watching; RAPTOR build submits its hundreds of summaries at `Low` so a foreground mutation doesn't queue behind them.
 
@@ -129,7 +130,7 @@ Per-cluster LLM call during a tree build pass (one task per cluster per level), 
 
 Per-note classifier run against a saved Evergreen tree. Triggered on the three triage pathways (`cluster-editor-triage-on-save`, `cluster-editor-triage-scheduled-rerun`, `cluster-editor-triage-modified-rerun`).
 
-- **Payload:** `tree_id`, `source_path`. The worker reads the note's embedding from `index.db` and the saved tree's centroids from `trees.db`, runs the beam-descent classifier (`cluster-place-beam-descent`), produces a `PlacementMatch { leaf_node_id, confidence, margin }`, resolves the matched node's policy, and emits the corresponding pending op into the op log (per `triage-staging-proposals`). No LLM call at all — the entire task is cosine arithmetic + an op append.
+- **Payload:** `tree_id`, `source_path`. The worker reads the note's embedding from `index.db` and the saved tree's centroids from `index.db`'s `cluster_centroids` table, runs the beam-descent classifier (`cluster-place-beam-descent`), produces a `PlacementMatch { leaf_node_id, confidence, margin }`, resolves the matched node's policy, and emits the corresponding pending op into the op log (per `triage-staging-proposals`). No LLM call at all — the entire task is cosine arithmetic + an op append.
 - **Priority:** `Normal` for on-save matches (user just authored the note; they want the routing to happen now). `Low` for scheduled and modified-note reruns (ambient bulk work).
 - **Retry:** transient errors retry once. Permanent errors (target tree missing — the user deleted the Evergreen tree while a task was queued) drop the task with a warning, no staging row emitted.
 - **Routing:** direct-LLM worker drains (it doesn't actually call the LLM for this task, but the worker is the queue-draining lane). MCP clients also eligible but don't gain anything by draining cosine-only tasks; the in-process worker is faster.
@@ -207,7 +208,7 @@ Fan-out producers submit N tasks and await all handles — `try_join_all` on the
 
 ## Event stream
 
-Every state transition emits a `QueueEvent` on the channel `hiker:queue-event`:
+Every state transition emits a `QueueEvent` on the channel queue events:
 
 ```rust
 enum QueueEvent {
@@ -228,7 +229,7 @@ enum WorkerKind {
 
 [task-queue-event-stream]
 
-The home-page widget subscribes to the channel, applies events to a local mirror of the queue snapshot, and re-renders. On widget mount it calls `tasks_snapshot()` once to seed the local mirror; the event stream is the live update path. Same shape as the existing `hiker:reindex-progress` + initial-status pattern in `vault-home-stats-widget`.
+The home-page widget subscribes to the channel, applies events to a local mirror of the queue snapshot, and re-renders. On widget mount it calls `tasks_snapshot()` once to seed the local mirror; the event stream is the live update path. Same shape as the existing indexer-progress events + initial-status pattern in `vault-home-stats-widget`.
 
 Result *bodies* never travel on the event channel — only summaries. The full result goes back through the producer's handle (in-process) or as the response to the producer's `await_outcome` resolution. The event channel exists for UI awareness, not for delivering payloads.
 
@@ -244,7 +245,7 @@ Fan-out features ride the queue events like every other producer; cancellation o
 - **Leased to an MCP client** — external rmcp client *or* the basic chat agent (they're the same lease shape). The lease is marked invalid; the eventual `task_submit` returns `stale_lease`, the client/agent should stop work and not retry. The producer handle resolves to `Cancelled` immediately, without waiting for the client to acknowledge. The chat agent's existing `agent-tool-call-timeout` + Stop button cover the user-side cancel path during a chat turn; the queue-side cancel covers the producer-side path (someone clicked ✕ on the queue widget). [task-queue-stale-lease-rejection]
 - **Already terminal** (Completed / Failed / Cancelled) — no-op.
 
-MCP-client workers are *not* notified mid-work that their lease was cancelled — there's no MCP server→client push for cancellation in v1. They learn at submit time. This is a known wart: a Claude Code instance might burn an extra 10 seconds on a task the user already abandoned. The fix is rmcp-streamable cancellation notifications (`task-queue-mcp-cancel-notification`, deferred); for v1 the lease-rejection path is correct, just not optimal. (The chat agent path is partly covered by the user's existing chat-turn Stop button — that fires a turn-level cancel that aborts whatever tool call is in flight, including a `task_*` call.)
+MCP-client workers are *not* notified mid-work that their lease was cancelled — there's no MCP server→client push for cancellation in v1; they learn at submit time. The fix is rmcp-streamable cancellation notifications (`task-queue-mcp-cancel-notification`, deferred). (The chat agent path is partly covered by the user's existing chat-turn Stop button, which aborts whatever tool call is in flight, including a `task_*` call.)
 
 Cancellation is **never exposed as an MCP tool.** External agents don't get to cancel each other's tasks, and the app's cancel doesn't need to round-trip through MCP. Keeps the trust model simple. [task-queue-cancel-not-via-mcp]
 
@@ -354,7 +355,7 @@ All three converge on the same shared queue detail surface (`queue-detail-shared
 
 ## Home page widget
 
-A vault-home tile per the existing `editor.md` widget pattern: tile shows "Task queue" + active count + a small icon. Subscribes to `hiker:queue-event` with a one-time `tasks_snapshot()` seed at mount.
+A vault-home tile per the existing `editor.md` widget pattern: tile shows "Task queue" + active count + a small icon. Subscribes to queue events with a one-time `tasks_snapshot()` seed at mount.
 
 - **Tile state** — count of `Queued + Leased` tasks. Empty state ("No tasks queued") when zero. [task-queue-home-widget]
 - **Click drills into the detail view** per `vault-home-detail-views`. Detail view body is a list of task rows + a settings strip at the top with the worker toggles + preference radio. [task-queue-home-detail-view]
@@ -393,15 +394,15 @@ Filter pills (two icon-only buttons, multi-select; both active = the previous "A
 - **LLM tasks** — robot icon, same glyph as the chat panel's agent indicator. Toggles `core::tasks` rows in/out of the view. [queue-detail-filter-tasks]
 - **Embedding** — brain icon, same glyph as the search bar's semantic-search toggle. Toggles `core::indexer` rows in/out of the view. [queue-detail-filter-index]
 
-Each row carries a small badge identifying its source (`task` / `index`); when both pills are active, rows interleave by state-bucket then submitted_at. The pills can't both be off at the same time — clicking the only-active pill is a no-op (an empty page would have no recovery affordance). Drilling in from a tile pre-selects exactly one pill (the LLM-tasks tile and the Queued embedding tile each set their own); the user can re-enable the other with a single click. The original three-pill design (`All` / `LLM tasks` / `Embedding`) is retired: the "All" pill collapses to "both pills on," which is what the multi-select default already gives.
+Each row carries a small badge identifying its source (`task` / `index`); when both pills are active, rows interleave by state-bucket then submitted_at. The two pills can't both be off (clicking the only-active one is a no-op). Drilling in from a tile pre-selects one pill; the user re-enables the other with a click.
 
-Embedding-queue rows render with the same chrome as task rows — priority-pill slot left empty (the indexer doesn't have priorities), state pill driven by `hiker:reindex-progress` (`queued` / `started` / `finished` / `skipped`), pulsing `…` indicator on `started` rows reusing `tree-row-queued-marker`'s animation. The indexer queue has no per-row cancel — cancelling an embedding job individually isn't supported and isn't being added with this work. The ✕ button appears only on rows from `core::tasks`. [queue-detail-embedding-row-shape]
+Embedding-queue rows render with the same chrome as task rows — priority-pill slot left empty (the indexer doesn't have priorities), state pill driven by indexer-progress events (`queued` / `started` / `finished` / `skipped`), pulsing `…` indicator on `started` rows reusing `tree-row-queued-marker`'s animation. The indexer queue has no per-row cancel — cancelling an embedding job individually isn't supported and isn't being added with this work. The ✕ button appears only on rows from `core::tasks`. [queue-detail-embedding-row-shape]
 
-Code shared across the two: the row-rendering primitive (priority pill / state pill / pulsing indicator / hover reveal of cancel button), the section grouping (Active / Queued / Recently finished), and the event-driven local-mirror pattern (one snapshot fetch + delta updates from an event channel). The shared module lives in `ui/src/queueDetail/index.ts` (new) and exports a `<QueueRow>` primitive parameterized by source. Each queue keeps its own data fetch + event subscription. [queue-detail-shared-row-primitive]
+Code shared across the two: the row-rendering primitive (priority pill / state pill / pulsing indicator / hover reveal of cancel button), the section grouping (Active / Queued / Recently finished), and the event-driven local-mirror pattern (one snapshot fetch + delta updates from an event channel). The shared row rendering lives in `app/src/panels/queue.rs` (`task_row`), parameterized by source. Each queue keeps its own data fetch + event subscription. [queue-detail-shared-row-primitive]
 
 Code *not* shared: the data layer (separate commands, separate event channels, separate `core::*` modules), the worker controls (only the LLM queue has any), and the cancellation path. The UI is the one thing the user sees as unified; everything below the rendering layer remains decoupled.
 
-Why the embedding queue stays its own queue: scheduling, durability, and producer model differ. The embedder queue is driven by the watcher and is essentially a streaming pipeline; the task queue is producer-pull-and-await. Conflating them at the data layer would mean either dragging LLM-task semantics (priorities, leases, schemas) into the indexer (which has none of them), or stripping them out of the task queue (defeats the point). The shared UI gives the user the consolidated view without the wrong-shape coupling underneath.
+The embedding queue stays separate at the data layer: it's a watcher-driven streaming pipeline with no priorities, leases, or schemas, while the task queue is producer-pull-and-await. Sharing only the UI gives the user one consolidated view without coupling the wrong shapes.
 
 The original "Queued" tile on `vault-home-stats-widget` still exists and still drills into this same shared detail page, with the **Embedding** filter pre-selected when entered from that tile. Conversely, the new "Task queue" tile drills in with **LLM tasks** pre-selected. The header pills let the user broaden / swap views without leaving the page. [vault-home-stats-queued-tile-shared-detail]
 

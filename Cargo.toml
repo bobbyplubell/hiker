@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "core",
+    "hiker-sync",
     "cli",
     "mcp-server",
     "app",
@@ -18,9 +19,15 @@ members = [
     "egui-workbench/examples/workbench-demo",
     "site",
     "tools/graph-snapshot",
+    "tools/minimap-render",
     "tools/profile-indexer",
     "widgets/graph-widgets",
 ]
+# Example plugins compile to wasm32 (cdylib importing `hiker.host_call`), so
+# they're excluded from the host workspace build/test/clippy — they're built
+# separately with `cargo build --target wasm32-unknown-unknown`. Each carries
+# host-target unit tests for its pure logic (run from its own dir).
+exclude = ["plugins"]
 
 [workspace.package]
 version = "0.0.0"
@@ -71,6 +78,20 @@ ndarray = "0.17"
 # so any minor bump should be a deliberate re-test rather than a passive
 # cargo-update sweep.
 single-clustering = "=0.6.1"
+# status: op-log-yrs-backed
+# CRDT substrate for the op log (core::oplog). Confined to that module per
+# its module-discipline doc — no yrs types leak past the OpLog boundary.
+yrs = "0.26"
+# bincode 1.x: serde-driven binary encoding for the `<doc-id>.pending`
+# Vec<PendingOp> file (op-log-store-layout). 1.x keeps the serde-derive
+# path; 2.x's encode/decode-trait API would mean re-deriving every type.
+bincode = "1"
+# wasmi: pure-Rust WebAssembly interpreter for the plugin host
+# (`plugin-runtime-wasmi`). Chosen over wasmtime deliberately — no JIT /
+# Cranelift, a small auditable dependency tree that fits the clean-SBOM
+# posture in deny.toml. Confined behind the `WasmEngine` trait so the
+# engine is swappable later.
+wasmi = "1"
 
 # --- Editor widget (folded from egui_editor; standalone sub-crates) ---
 editor-core = { path = "editor/editor-core" }

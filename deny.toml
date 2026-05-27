@@ -1,0 +1,44 @@
+# cargo-deny configuration.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# hiker ships as a personal notes app. We do NOT want any of the "sketchy",
+# malware-adjacent networking machinery that general-purpose P2P stacks can
+# pull in — DHTs that crawl the open internet, hole-punching that tunnels
+# through firewalls, relay/TURN forwarding, NAT probing. Those behaviors are
+# exactly what botnets and malware use, and they're what makes a binary trip
+# antivirus heuristics, fail an enterprise security review, or look alarming in
+# an SBOM ("why does a notes app contain a Kademlia DHT?").
+#
+# hiker's sync only ever does boring, explicit things: LAN mDNS + dialing a
+# device/server you manually enrolled. It needs NONE of the above. So we don't
+# just leave those libp2p features off — we BAN the crates by name here, so the
+# guarantee is enforced, not a matter of discipline. If someone later flips a
+# libp2p feature (or adds a dep) that would drag one of these back into the
+# build, CI fails instead of the code silently landing in the binary / SBOM.
+# The point is a clean, auditable bill of materials: nothing that scans the
+# open net or punches through firewalls is even present in what we ship.
+#
+# This is `sync-banned-p2p-features` in docs/sync.md.
+#
+# NOTE: cargo-deny is NOT installed in the development sandbox, so this file
+# can't be exercised locally. It's a committed CI artifact — CI must run:
+#
+#     cargo deny check bans
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+# Crates that must never enter the dependency graph. Each corresponds to a
+# libp2p P2P behavior banned by sync.md:
+#   libp2p-kad     — Kademlia DHT (peer/content discovery over the open net)
+#   libp2p-dcutr   — direct connection upgrade through relay (hole-punching)
+#   libp2p-relay   — relay/TURN-style traffic forwarding
+#   libp2p-autonat — NAT detection / reachability probing
+deny = [
+    { name = "libp2p-kad" },
+    { name = "libp2p-dcutr" },
+    { name = "libp2p-relay" },
+    { name = "libp2p-autonat" },
+]

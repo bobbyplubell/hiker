@@ -263,6 +263,9 @@ backed by the same diff engine:
   the whole document per edit).
 - Soft-wrap reflow on width change is incremental — only rewraps visible lines + a margin
   on either side; offscreen lines lazily rewrap as they enter the viewport.
+- The minimap (§9.23) costs O(1) draw work per frame regardless of document length: it
+  rasterizes to an offscreen image once and re-rasterizes only on content / decoration /
+  theme / size change, never on scroll. Enabling it must not regress scroll smoothness.
 
 ---
 
@@ -405,6 +408,44 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
 - Each tab stop is an active range with multi-cursor; editing all stops with
   the same number updates them in sync (mirror).
 - Triggered by a `CompletionItem` of kind `Snippet` or via direct API.
+
+## 9.23 Minimap
+- A narrow strip docked at the side of the editor that mirrors the whole
+  document, with a translucent thumb marking the slice currently visible in
+  the viewport. Click or drag the strip to scroll there; the wheel over the
+  strip scrolls the document. Off by default; the host toggles it and owns
+  its width.
+- Two render **styles**, selectable by the host:
+  - **Glyphs** — a literal scaled-down view of the text: one cell per
+    character, each tinted by the same syntax/decoration color the editor
+    paints that span with. It renders from the editor's *display* model, so
+    it mirrors live preview (hidden markdown markers, heading styling, list
+    bullets/checkboxes) and **soft-wrap** — a line that wraps into three rows
+    in the editor wraps into three rows here. Scaled uniformly so wrapped
+    rows fit the strip width at true aspect (a short doc occupies the top of
+    the strip rather than stretching to fill it). This is the default — it
+    reads as a true miniature of the page.
+  - **Bars** — a structural abstraction: one bar per line, width set by the
+    line's visible (non-whitespace) length and color by its structural role
+    (heading / code / quote / emphasis / plain), derived from decoration
+    layers. Denser and more schematic than glyphs.
+- Both styles share one projection with the editor: soft-wrapped lines take
+  proportionally more height, headings scale up, folded/hidden lines vanish —
+  so the strip and the thumb stay in lockstep with what's on screen.
+- Lines touched by a non-empty selection, and (when find is active) search
+  matches, are marked along the strip.
+- Classification and color come entirely from the decoration layers the
+  editor already paints from, so any provider the host wired up (markdown,
+  diff, search…) participates automatically — the minimap reads decorations,
+  never produces them.
+- **Performance is a requirement, not a tuning detail**: per-frame cost is
+  independent of document length. The strip is rasterized once into an
+  offscreen image and redrawn as a single textured quad; it only re-rasterizes
+  when the document, decorations, theme, or strip size change — never on
+  scroll. (See §8 and IMPLEMENTATION §16.6.18.)
+- Host-configurable: style, width, palette, and the per-feature toggles
+  (viewport thumb, section rules, left edge). The renderer is swappable — a
+  host could supply an alternative strip without touching the editor core.
 
 ## 9.9 Serialization
 - `EditorState` and individual `StateField`s are `Serialize`/`Deserialize` (serde) so the

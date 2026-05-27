@@ -8,8 +8,8 @@
 use hiker_core::frontmatter;
 use hiker_core::ops;
 use hiker_core::search::{self, Modes};
-use hiker_core::staging::patch::{apply_edit, find_all_matches, EditPayload};
-use hiker_core::staging::types::{EditProposalInput, ProposalInput};
+use hiker_core::ops::op_writes;
+use hiker_core::textpatch::{apply_edit, find_all_matches, EditPayload};
 use hiker_core::tasks::types::{
     McpClientVia, Priority as TaskPriority, QueueError, TaskShape as TaskShapeKind, TaskState,
 };
@@ -17,10 +17,10 @@ use rmcp::model::{CallToolResult, ErrorCode, ErrorData};
 
 use super::App;
 use crate::handler::params::{
-    audit_err, audit_status, hiker_err, structured, translate_hiker_err, ApplyTag, EditNote,
-    GetNote, GetNoteDigest, GetNoteFull, GetNoteSnippet, NoteDetail, RelatedNotes, SearchNotes,
-    SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
-    WriteOutcome, EditOutcome, CLIENT_ID,
+    audit_err, audit_status, hiker_err, structured, translate_hiker_err, ApplyTag, BoardAddCard,
+    BoardGet, BoardsList, EditNote, GetNote, GetNoteDigest, GetNoteFull, GetNoteSnippet, NoteDetail,
+    RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList,
+    TaskSubmit, WriteNote, WriteOutcome, EditOutcome, CLIENT_ID,
 };
 
 impl App {
@@ -254,7 +254,10 @@ impl App {
                 );
                 r
             }
-            other => return Err(format!("unknown tool: {other}")),
+            other => match self.dispatch_board_tool(other, &raw_value).await? {
+                Some(r) => r,
+                None => return Err(format!("unknown tool: {other}")),
+            },
         };
 
         let result = outcome.map_err(|e| format!("{} (code {})", e.message, e.code.0))?;
@@ -262,6 +265,40 @@ impl App {
             .structured_content
             .unwrap_or(serde_json::Value::Null);
         serde_json::to_string(&payload).map_err(|e| format!("serialize result: {e}"))
+    }
+
+    /// Dispatch the board-* tools, split out of `dispatch_tool` to keep that
+    /// function within the length budget. Returns `Ok(None)` when `name` is not
+    /// a board tool, so the caller falls through to its unknown-tool error;
+    /// `Err` carries an argument-parse failure.
+    // status: board-mcp-tools
+    async fn dispatch_board_tool(
+        &self,
+        name: &str,
+        raw_value: &serde_json::Value,
+    ) -> Result<Option<Result<CallToolResult, ErrorData>>, String> {
+        let r = match name {
+            "boards_list" => {
+                let p: BoardsList =
+                    serde_json::from_value(raw_value.clone()).unwrap_or(BoardsList {});
+                self.enumerate_boards(&p).await
+            }
+            "board_get" => {
+                let p: BoardGet = serde_json::from_value(raw_value.clone())
+                    .map_err(|e| format!("invalid board_get args: {e}"))?;
+                self.fetch_board(&p).await
+            }
+            "board_add_card" => {
+                let p: BoardAddCard = serde_json::from_value(raw_value.clone())
+                    .map_err(|e| format!("invalid board_add_card args: {e}"))?;
+                self.add_board_card(&p).await
+            }
+            _ => return Ok(None),
+        };
+        self.state
+            .audit
+            .record(name, raw_value, audit_status(&r), audit_err(&r));
+        Ok(Some(r))
     }
 }
 
@@ -341,6 +378,30 @@ impl App {
         ))
     }
 
+    /// The note content the agent should see on a read: its own op-log
+    /// replica — `materialize_pending_view(session = agent)`, i.e. accepted
+    /// plus the agent's own queued pending ops — so a follow-up `get_note`
+    /// reflects edits the agent just staged, even before the user accepts
+    /// them (`op-log-agent-replica`). Returns `Ok(None)` when there is no op
+    /// log or the path has no doc yet, so callers fall back to on-disk bytes.
+    fn agent_view_content(&self, rel: &str) -> Result<Option<(String, String)>, ErrorData> {
+        let Some(op_log) = self.state.oplog.as_ref() else {
+            return Ok(None);
+        };
+        // `review_materializations` resolves the path → doc_id and returns
+        // `(accepted, pending_view(session))`; the pending view scoped to the
+        // agent's own session is the agent replica. `None` when the path has
+        // no op-log doc yet.
+        let Some((_accepted, pending_view)) =
+            op_writes::review_materializations(op_log, rel, Some(CLIENT_ID))
+                .map_err(translate_hiker_err)?
+        else {
+            return Ok(None);
+        };
+        let hash = hiker_core::hash_string(&pending_view);
+        Ok(Some((pending_view, hash)))
+    }
+
     pub(super) async fn read_note(&self, p: &GetNote) -> Result<CallToolResult, ErrorData> {
         self.guard_tool("get_note")?;
         // Existence check up front so we can return 1002 cleanly rather
@@ -373,11 +434,14 @@ impl App {
                 let (snippet, heading_path) = match self.first_chunk(&p.rel_path) {
                     Ok(Some(c)) => (c.text, c.heading_path),
                     _ => {
-                        let raw = self
-                            .state
-                            .vault
-                            .read_file(&p.rel_path)
-                            .map_err(translate_hiker_err)?;
+                        let raw = match self.agent_view_content(&p.rel_path)? {
+                            Some((text, _)) => text,
+                            None => self
+                                .state
+                                .vault
+                                .read_file(&p.rel_path)
+                                .map_err(translate_hiker_err)?,
+                        };
                         (self.head_snippet(&raw), None)
                     }
                 };
@@ -393,11 +457,14 @@ impl App {
                 ))
             }
             NoteDetail::Full => {
-                let (content, hash) = self
-                    .state
-                    .vault
-                    .read_file_with_hash(&p.rel_path)
-                    .map_err(translate_hiker_err)?;
+                let (content, hash) = match self.agent_view_content(&p.rel_path)? {
+                    Some(cv) => cv,
+                    None => self
+                        .state
+                        .vault
+                        .read_file_with_hash(&p.rel_path)
+                        .map_err(translate_hiker_err)?,
+                };
                 Ok(structured(
                     serde_json::to_value(GetNoteFull {
                         rel_path: p.rel_path.clone(),
@@ -461,6 +528,33 @@ impl App {
         ))
     }
 
+    /// Stage a whole-body rewrite (`write_note` / `set_frontmatter` /
+    /// `apply_tag` / `remove_tag` review shapes) as one anchorless op-log
+    /// pending op authored `agent:<client_id>`, returning the minted op id
+    /// for the tool's `staging_id` field. The op-log diffs the new text
+    /// against current accepted, so an unchanged whole-body produces no op
+    /// (returns `None`).
+    fn stage_whole_body(
+        &self,
+        op_log: &hiker_core::oplog::OpLog,
+        rel_path: &str,
+        new_content: &str,
+    ) -> Result<Option<String>, ErrorData> {
+        let outcome = op_writes::stage_agent_edits(
+            op_log,
+            &self.state.vault,
+            CLIENT_ID,
+            "mcp-tool-call",
+            rel_path,
+            &[op_writes::AgentEdit {
+                old_str: None,
+                new_str: new_content.to_string(),
+            }],
+        )
+        .map_err(translate_hiker_err)?;
+        Ok(outcome.op_ids.into_iter().next())
+    }
+
     pub(super) async fn save_note(&self, p: &WriteNote) -> Result<CallToolResult, ErrorData> {
         self.guard_tool("write_note")?;
 
@@ -473,41 +567,23 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            // status: staging-proposal-state — capture propose-time disk hash
-            // so eager recheck can detect drift before accept. `None` here is
-            // the create-shaped case (target path doesn't yet exist).
-            let source_hash = self
-                .state
-                .vault
-                .read_file_with_hash(&p.rel_path)
-                .ok()
-                .map(|(_, h)| h);
-            let staging_id = self
-                .state
-                .staging
-                .propose(&ProposalInput {
-                    surface: "mcp-tool-call".into(),
-                    action: "write_note".into(),
-                    target_path: p.rel_path.clone(),
-                    trail_id: None,
-                    content: Some(p.content.clone()),
-                    metadata: Some(serde_json::json!({
-                        "tool": "write_note",
-                        "session_id": CLIENT_ID,
-                    })),
-                    source_hash,
-                    source_path: None,
-                })
-                .map_err(|e| {
-                    tracing::error!(error = %e, "staging: propose failed");
-                    ErrorData::internal_error(e.to_string(), None)
-                })?;
+            // Review mode: stage the whole-body rewrite as one anchorless
+            // op-log pending op (`write_note` → whole-body `Replace`), the
+            // same op-log review path `edit_note` uses. Nothing reaches disk
+            // until the user accepts; the returned op id is the review handle.
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "review mode requires an open op log".to_string(),
+                    None,
+                )
+            })?;
+            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &p.content)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id: Some(staging_id),
+                    staging_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -516,9 +592,8 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                changes: Some(&self.state.changes),
+                op_log: self.state.oplog.as_ref(),
                 client_id: CLIENT_ID,
-                tool: "write_note",
             };
             let new_hash = ops::agent::write_note(
                 &ctx,
@@ -564,13 +639,20 @@ impl App {
             ));
         }
 
-        // Read the pre-application file once; every anchor resolves against
-        // this content (rule 4).
-        let (pre_content, pre_hash) = self
-            .state
-            .vault
-            .read_file_with_hash(&p.rel_path)
-            .map_err(translate_hiker_err)?;
+        // Read the pre-application content once; every anchor resolves against
+        // it (rule 4). This is the agent's own op-log replica — accepted plus
+        // the agent's queued pending ops — the same view `get_note` returns, so
+        // a follow-up edit can anchor on text the agent staged in a prior,
+        // not-yet-accepted edit (`op-log-agent-replica`). Falls back to disk
+        // when the path has no op-log doc.
+        let (pre_content, pre_hash) = match self.agent_view_content(&p.rel_path)? {
+            Some(cv) => cv,
+            None => self
+                .state
+                .vault
+                .read_file_with_hash(&p.rel_path)
+                .map_err(translate_hiker_err)?,
+        };
 
         // Rule 2 + 3: per-edit anchor uniqueness, then cross-edit overlap.
         // Collect ranges in input order so error messages name the offending
@@ -633,44 +715,67 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            // Split into N staging proposals, one per edit, sharing a
-            // batch_id. `.md` sidecar stores `new_str` (the post-edit span
-            // content) for UI preview; accept re-resolves the anchor
-            // against current disk.
-            let mut inputs = Vec::with_capacity(p.edits.len());
-            for e in &p.edits {
-                let edit_payload = EditPayload {
-                    old_str: e.old_str.clone(),
-                    new_str: e.new_str.clone(),
-                    replace_all: e.replace_all,
-                };
-                inputs.push(EditProposalInput {
-                    surface: "mcp-tool-call".into(),
-                    action: "edit_note".into(),
-                    target_path: p.rel_path.clone(),
-                    content: Some(e.new_str.clone()),
-                    metadata: Some(serde_json::json!({
-                        "tool": "edit_note",
-                        "session_id": CLIENT_ID,
-                        "pre_content_hash": pre_hash,
-                    })),
-                    edit: edit_payload,
-                    // status: staging-proposal-state
-                    source_hash: Some(pre_hash.clone()),
-                });
-            }
-            let batch = self.state.staging.propose_batch(&inputs).map_err(|e| {
-                tracing::error!(error = %e, "staging: propose_batch failed");
-                ErrorData::internal_error(e.to_string(), None)
+            // Review mode: stage the edits as op-log pending ops sharing a
+            // batch_id (per `op-log.md`'s `edit_note([e1,e2,…])` → one
+            // `Replace` per edit). Each edit becomes one anchored
+            // `AgentEdit { old_str, new_str }`; accept/reject each
+            // independently flow through the op-log review surfaces re-homed
+            // in Phases 3b–3d. A `replace_all` edit with more than one match
+            // can't be expressed as a single anchored op (the anchor must
+            // resolve uniquely), so the whole call collapses to one anchorless
+            // whole-body rewrite carrying the cumulative result — the user
+            // still reviews the net change, just not per-edit.
+            //
+            // status: mcp-tool-edit-note
+            // status: op-log-ops-producer-helpers
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "review mode requires an open op log".to_string(),
+                    None,
+                )
             })?;
+            let any_multi_replace_all = p.edits.iter().any(|e| {
+                e.replace_all && find_all_matches(&pre_content, &e.old_str).len() > 1
+            });
+            let edits: Vec<op_writes::AgentEdit> = if any_multi_replace_all {
+                let mut current = pre_content.clone();
+                for e in &p.edits {
+                    let payload = EditPayload {
+                        old_str: e.old_str.clone(),
+                        new_str: e.new_str.clone(),
+                        replace_all: e.replace_all,
+                    };
+                    current = apply_edit(&current, &payload).map_err(|err| {
+                        hiker_err(ErrorCode(1003), format!("drift: {err}"))
+                    })?;
+                }
+                vec![op_writes::AgentEdit { old_str: None, new_str: current }]
+            } else {
+                p.edits
+                    .iter()
+                    .map(|e| op_writes::AgentEdit {
+                        old_str: Some(e.old_str.clone()),
+                        new_str: e.new_str.clone(),
+                    })
+                    .collect()
+            };
+            let outcome = op_writes::stage_agent_edits(
+                op_log,
+                &self.state.vault,
+                CLIENT_ID,
+                "mcp-tool-call",
+                &p.rel_path,
+                &edits,
+            )
+            .map_err(translate_hiker_err)?;
             return Ok(structured(
                 serde_json::to_value(EditOutcome {
                     rel_path: p.rel_path.clone(),
                     status: "staged",
                     edit_count: p.edits.len() as u32,
                     content_hash: None,
-                    staging_ids: batch.ids,
-                    batch_id: Some(batch.batch_id),
+                    staging_ids: outcome.op_ids,
+                    batch_id: Some(outcome.batch_id),
                 })
                 .unwrap_or(serde_json::Value::Null),
             ));
@@ -695,9 +800,8 @@ impl App {
             watcher: &self.state.watcher,
             jobs: &self.state.jobs,
             vault: &self.state.vault,
-            changes: Some(&self.state.changes),
+            op_log: self.state.oplog.as_ref(),
             client_id: CLIENT_ID,
-            tool: "edit_note",
         };
         let new_hash = ops::agent::write_note(
             &ctx,
@@ -735,44 +839,33 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            // status: staging-proposal-state — capture propose-time disk hash
-            // alongside the read used for the frontmatter merge.
-            let (existing, source_hash) = self
+            // Review mode: merge the frontmatter patch into the current
+            // content and stage the whole-body result as one op-log pending
+            // op. The op-log labels it `SetFrontmatter` automatically when the
+            // change lands inside the frontmatter fence.
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "review mode requires an open op log".to_string(),
+                    None,
+                )
+            })?;
+            let existing = self
                 .state
                 .vault
-                .read_file_with_hash(&p.rel_path)
+                .read_file(&p.rel_path)
                 .map_err(translate_hiker_err)?;
             let merged = frontmatter::merge_agent_patch(
                 &existing,
                 serde_json::Value::Object(p.fields.clone()),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let staging_id = self
-                .state
-                .staging
-                .propose(&ProposalInput {
-                    surface: "mcp-tool-call".into(),
-                    action: "set_frontmatter".into(),
-                    target_path: p.rel_path.clone(),
-                    trail_id: None,
-                    content: Some(merged),
-                    metadata: Some(serde_json::json!({
-                        "tool": "set_frontmatter",
-                        "session_id": CLIENT_ID,
-                    })),
-                    source_hash: Some(source_hash),
-                    source_path: None,
-                })
-                .map_err(|e| {
-                    tracing::error!(error = %e, "staging: propose failed");
-                    ErrorData::internal_error(e.to_string(), None)
-                })?;
+            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id: Some(staging_id),
+                    staging_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -781,9 +874,8 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                changes: Some(&self.state.changes),
+                op_log: self.state.oplog.as_ref(),
                 client_id: CLIENT_ID,
-                tool: "set_frontmatter",
             };
             let new_hash = ops::agent::set_frontmatter(
                 &ctx,
@@ -821,14 +913,21 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            // status: staging-proposal-state — propose-time disk hash for
-            // eager drift recheck. Read existing tags from the source so
-            // staging captures the full resolved content (same merge-into-
-            // write shape as the direct path, but routed through staging).
-            let (existing, source_hash) = self
+            // Review mode: resolve the new tag list, merge into frontmatter,
+            // and stage the whole-body result as one op-log pending op (same
+            // merge-into-write shape as the direct path, but staged for
+            // review). The op-log labels it `SetFrontmatter` when the change
+            // lands inside the frontmatter fence.
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "review mode requires an open op log".to_string(),
+                    None,
+                )
+            })?;
+            let existing = self
                 .state
                 .vault
-                .read_file_with_hash(&p.rel_path)
+                .read_file(&p.rel_path)
                 .map_err(translate_hiker_err)?;
             let split = frontmatter::split(&existing);
             let existing_tags: Vec<String> = match split.frontmatter {
@@ -854,32 +953,13 @@ impl App {
                 serde_json::json!({"tags": tags}),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let staging_id = self
-                .state
-                .staging
-                .propose(&ProposalInput {
-                    surface: "mcp-tool-call".into(),
-                    action: tool_name.into(),
-                    target_path: p.rel_path.clone(),
-                    trail_id: None,
-                    content: Some(merged),
-                    metadata: Some(serde_json::json!({
-                        "tool": tool_name,
-                        "session_id": CLIENT_ID,
-                    })),
-                    source_hash: Some(source_hash),
-                    source_path: None,
-                })
-                .map_err(|e| {
-                    tracing::error!(error = %e, "staging: propose failed");
-                    ErrorData::internal_error(e.to_string(), None)
-                })?;
+            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id: Some(staging_id),
+                    staging_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -888,9 +968,8 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                changes: Some(&self.state.changes),
+                op_log: self.state.oplog.as_ref(),
                 client_id: CLIENT_ID,
-                tool: tool_name,
             };
             let result = if add {
                 ops::agent::apply_tag(&ctx, &p.rel_path, &p.tag).await
@@ -907,6 +986,144 @@ impl App {
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
+        }
+    }
+}
+
+// ---------- board-shaped tool implementations ----------
+
+impl App {
+    /// status: board-mcp-tools
+    /// Enumerate every board-doc in the vault (read-only). Mirrors the trail
+    /// `trails_list` shape: one row per board with id/title/path + column and
+    /// card counts.
+    pub(super) async fn enumerate_boards(
+        &self,
+        _p: &BoardsList,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_tool("boards_list")?;
+        let store = self.state.read_store.lock().map_err(|_| {
+            ErrorData::internal_error("read_store mutex poisoned", None)
+        })?;
+        let rows = hiker_core::boards::list(&self.state.vault, &store)
+            .map_err(translate_hiker_err)?;
+        Ok(structured(
+            serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
+    /// status: board-mcp-tools
+    /// Full detail for one board: body + resolved columns/cards (read-only).
+    pub(super) async fn fetch_board(&self, p: &BoardGet) -> Result<CallToolResult, ErrorData> {
+        self.guard_tool("board_get")?;
+        let store = self.state.read_store.lock().map_err(|_| {
+            ErrorData::internal_error("read_store mutex poisoned", None)
+        })?;
+        let detail = hiker_core::boards::get_board(&self.state.vault, &store, &p.rel_path)
+            .map_err(translate_hiker_err)?;
+        Ok(structured(
+            serde_json::to_value(&detail).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
+    /// status: board-mcp-tools
+    /// Add a note as a card to a board column. In review-required mode the
+    /// board-doc frontmatter edit STAGES as one op-log pending op (like every
+    /// other agent write); in direct mode it commits via the same
+    /// `core::boards::ops::add_card` user-save path the UI uses. Idempotent
+    /// per board — a note already on the board returns `status: "noop"`.
+    pub(super) async fn add_board_card(
+        &self,
+        p: &BoardAddCard,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_tool("board_add_card")?;
+        let review_required = self
+            .state
+            .tools
+            .read()
+            .map(|cfg| cfg.review_required)
+            .unwrap_or(false);
+
+        if review_required {
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "review mode requires an open op log".to_string(),
+                    None,
+                )
+            })?;
+            // Compute the board-doc's new frontmatter (card appended) without
+            // writing, then stage it as one anchorless pending op authored
+            // `agent:<client>` — the same review path note writes use.
+            let new_src = {
+                let store = self.state.read_store.lock().map_err(|_| {
+                    ErrorData::internal_error("read_store mutex poisoned", None)
+                })?;
+                hiker_core::boards::add_card_preview(
+                    &self.state.vault,
+                    &store,
+                    &p.board_rel_path,
+                    &p.column,
+                    &p.source_rel_path,
+                )
+                .map_err(translate_hiker_err)?
+            };
+            let Some(new_src) = new_src else {
+                return Ok(structured(serde_json::json!({
+                    "board_rel_path": p.board_rel_path,
+                    "status": "noop",
+                })));
+            };
+            let staging_id = self.stage_whole_body(op_log, &p.board_rel_path, &new_src)?;
+            Ok(structured(serde_json::json!({
+                "board_rel_path": p.board_rel_path,
+                "status": "staged",
+                "staging_id": staging_id,
+            })))
+        } else {
+            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "board_add_card requires an open op log".to_string(),
+                    None,
+                )
+            })?;
+            // Compute the new board source under the lock, then drop it before
+            // the op-log write so no `!Send` `Store` guard crosses an await
+            // (the rmcp tool future must be `Send`). The card stores the
+            // source note's current ULID (empty when unstamped — the path half
+            // still anchors it; the derived-table flow heals later).
+            let new_src = {
+                let store = self.state.read_store.lock().map_err(|_| {
+                    ErrorData::internal_error("read_store mutex poisoned", None)
+                })?;
+                hiker_core::boards::add_card_preview(
+                    &self.state.vault,
+                    &store,
+                    &p.board_rel_path,
+                    &p.column,
+                    &p.source_rel_path,
+                )
+                .map_err(translate_hiker_err)?
+            };
+            let Some(new_src) = new_src else {
+                return Ok(structured(serde_json::json!({
+                    "board_rel_path": p.board_rel_path,
+                    "status": "noop",
+                })));
+            };
+            op_writes::user_save(op_log, &self.state.vault, &p.board_rel_path, &new_src)
+                .map_err(translate_hiker_err)?;
+            let _ = self
+                .state
+                .jobs
+                .send(hiker_core::indexer::IndexJob::Upsert {
+                    rel_path: p.board_rel_path.clone(),
+                    force: false,
+                })
+                .await;
+            Ok(structured(serde_json::json!({
+                "board_rel_path": p.board_rel_path,
+                "status": "written",
+            })))
         }
     }
 }

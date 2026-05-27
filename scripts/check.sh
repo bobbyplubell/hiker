@@ -8,31 +8,18 @@ cd "$repo_root"
 
 fail() { echo "check.sh: $1 FAILED" >&2; exit 1; }
 
-echo "==> cargo test -p hiker-core --lib"
-cargo test -p hiker-core --lib || fail "cargo test -p hiker-core --lib"
-
-# Memory-regression gates. Each test installs a counting global
-# allocator in its dedicated test binary and asserts peak heap stays
-# under a fixed ceiling after exercising the relevant code path.
-# Bumping the ceilings is intentional friction — fix the regression or
-# justify the new headroom in the test file.
-echo "==> heap-ceiling regression (indexer full scan)"
-cargo test -p hiker-core --test heap_ceiling -- --nocapture \
-    || fail "heap-ceiling regression: indexer"
-
-echo "==> heap-ceiling regression (editor apply stream)"
-cargo test -p editor-core --test heap_ceiling -- --nocapture \
-    || fail "heap-ceiling regression: editor"
-
-echo "==> heap-ceiling regression (workbench render loop)"
-cargo test -p egui_workbench --test heap_ceiling -- --nocapture \
-    || fail "heap-ceiling regression: workbench"
-
-echo "==> cargo check -p hiker-app"
-cargo check -p hiker-app || fail "cargo check -p hiker-app"
-
-echo "==> cargo test -p hiker-app (smoke + unit)"
-cargo test -p hiker-app || fail "cargo test -p hiker-app"
+# Run EVERY test in the workspace, in one pass: lib unit tests for every
+# crate, the per-crate integration tests under `tests/` (editor-core / view /
+# egui / diff, mcp-server smoke, app smoke, …), the doc tests, AND the
+# heap-ceiling regression binaries.
+#
+# Heap ceilings: each `tests/heap_ceiling.rs` installs a counting global
+# allocator in its own test binary (cargo runs each as a separate process) and
+# asserts peak heap stays under a fixed ceiling. Bumping a ceiling is
+# intentional friction — fix the regression or justify the headroom in the
+# test file. They run as part of the workspace pass below.
+echo "==> cargo test --workspace (every unit, integration, doc, and heap-ceiling test)"
+cargo test --workspace || fail "cargo test --workspace"
 
 echo "==> cargo clippy (length budget + anti-arbitrary-split lints)"
 # Two clusters of lints below:

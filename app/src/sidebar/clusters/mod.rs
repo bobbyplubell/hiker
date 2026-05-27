@@ -728,17 +728,24 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Stage").clicked() && !target.trim().is_empty() {
+                        // status: cluster-editor-multi-select-stage-move
                         let store_mutex = state.vault_session.services.read_store.clone();
-                        let staging = state.vault_session.services.staging.clone();
+                        let oplog = state.vault_session.services.oplog.clone();
                         if let Ok(store) = store_mutex.lock() {
                             let args = hiker_core::suggest::StageMoveArgs {
                                 tree_id: &tree_id,
                                 node_ids: &selected,
                                 target_folder: target.trim(),
                             };
-                            match hiker_core::suggest::stage_moves(trees, &args, &store, &staging) {
-                                Ok(ids) => state.push_toast(
-                                    format!("Staged {} moves", ids.len()),
+                            match hiker_core::suggest::stage_moves(
+                                trees,
+                                &args,
+                                &store,
+                                &state.vault_session.vault,
+                                &oplog,
+                            ) {
+                                Ok(outcome) => state.push_toast(
+                                    format!("Staged {} moves", outcome.op_ids.len()),
                                     crate::state::ToastLevel::Info,
                                 ),
                                 Err(err) => state.push_toast(
@@ -781,8 +788,9 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Stage").clicked() && !slug.trim().is_empty() {
+                        // status: cluster-editor-multi-select-stage-tag
                         let store_mutex = state.vault_session.services.read_store.clone();
-                        let staging = state.vault_session.services.staging.clone();
+                        let oplog = state.vault_session.services.oplog.clone();
                         if let Ok(store) = store_mutex.lock() {
                             let args = hiker_core::suggest::StageTagArgs {
                                 tree_id: &tree_id,
@@ -794,7 +802,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                                 &args,
                                 &state.vault_session.vault,
                                 &store,
-                                &staging,
+                                &oplog,
                             ) {
                                 Ok(ids) => state.push_toast(
                                     format!("Staged {} tags", ids.len()),

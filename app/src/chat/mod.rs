@@ -15,6 +15,7 @@
 //! dispatcher otherwise; assistant deltas stream into the transcript
 //! through an mpsc channel pumped each frame.
 
+pub mod md_preview;
 pub mod render;
 pub mod send;
 pub mod session;

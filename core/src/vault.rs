@@ -12,6 +12,28 @@ use crate::store::Store;
 use crate::trash::{Trash, Entry};
 use crate::watcher::Watcher;
 
+/// Stable per-vault identifier, stored at `<root>/.hiker/vault-id` (a ULID),
+/// generated on first call when absent. It lives INSIDE the vault, so it
+/// survives the vault directory being moved or renamed on disk — unlike a
+/// path-derived id, which changes on every move. Used to key user-scope
+/// per-vault state (the sync key store) so a moved vault keeps its identity
+/// and its sync keys instead of silently regenerating them. [sync-vault-stable-id]
+pub fn stable_id(root: &Path) -> std::io::Result<String> {
+    let path = root.join(".hiker").join("vault-id");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let id = existing.trim();
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    let id = ulid::Ulid::new().to_string();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, &id)?;
+    Ok(id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {

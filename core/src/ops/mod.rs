@@ -31,8 +31,8 @@
 //!   delete/restore flows.
 //! - [`agent`] — MCP-routed writes (`write_note`,
 //!   `set_frontmatter`, `apply_tag`, `remove_tag`) +
-//!   `WriteCtx`. Author the changelog row as `agent:<client_id>` and
-//!   ride the staging path when review mode is on.
+//!   `WriteCtx`. Queue as pending op-log ops authored `agent:<client_id>`
+//!   when review mode is on.
 //! - [`buffer`] — editor-buffer lifecycle (`open_for_edit`,
 //!   `commit`, `resolve_drift`, `ensure_note_id_stamped`) + the
 //!   `Token` family of types. Owns the drift-check policy and the
@@ -41,34 +41,10 @@
 //! Every entry from the prior `core::ops` flat module re-exports here so
 //! `hiker_core::ops::FOO` continues to resolve unchanged.
 
-use std::sync::Arc;
-
-use crate::changes::{ChangeAppend, Changes};
-use crate::vault::Vault;
-
 pub mod agent;
 pub mod buffer;
 pub mod file;
-
-/// Read a file's bytes for inclusion in a changelog row. Best-effort: if the
-/// file vanishes mid-op or read fails, return `None` and the row is appended
-/// without a content blob. Better to log a hash-less row than to abort the
-/// mutation that already succeeded on disk.
-pub(super) fn read_for_changelog(vault: &Vault, rel: &str) -> Option<Vec<u8>> {
-    let abs = vault.abs_path(rel).ok()?;
-    std::fs::read(abs).ok()
-}
-
-pub(super) fn append_change_best_effort(
-    changes: Option<&Arc<Changes>>,
-    append: ChangeAppend<'_>,
-) {
-    if let Some(c) = changes
-        && let Err(e) = c.append(append)
-    {
-        tracing::warn!(error = %e, "changes: append failed");
-    }
-}
+pub mod op_writes;
 
 #[cfg(test)]
 mod tests;

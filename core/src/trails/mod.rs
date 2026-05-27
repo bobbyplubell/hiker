@@ -17,13 +17,10 @@
 // status: trail-double-link-references
 // status: trail-storage-layout
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use serde_yml::Value as YamlValue;
 use thiserror::Error;
 
-use crate::changes::{ChangeAppend, Changes};
 use crate::errors::HikerError;
 use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
 use crate::store::Store;
@@ -525,14 +522,6 @@ fn remove_waypoint_from_tree(
         }
     }
     None
-}
-
-fn append_change_best_effort(changes: Option<&Arc<Changes>>, append: ChangeAppend<'_>) {
-    if let Some(c) = changes
-        && let Err(e) = c.append(append)
-    {
-        tracing::warn!(error = %e, "trails: changes append failed");
-    }
 }
 
 // ---------------------------------------------------------------------------

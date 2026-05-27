@@ -13,6 +13,8 @@ Transactions, decorations, and selections referenced below are the types from th
 
 One open buffer at a time in v0. Switching files replaces the buffer's contents via a single `dispatch` that swaps the entire doc.
 
+The buffer renders the merged working materialization of the document's op layers — `materialize(accepted + working + pending(session))` per `op-log-layered-model`. User typing doesn't write disk or the `accepted` layer directly; the editor binding (per `op-log-editor-binding`) turns each edit into a `user` op on the `working` layer, and Save commits that layer. An agent's `pending` proposals coexist in the same buffer, reviewed via `patch-review.md`.
+
 State tracked per buffer:
 
 - `path` — vault-relative; null when no file is open [buffer-path-tracking]
@@ -23,10 +25,14 @@ State tracked per buffer:
 
 Multi-buffer / tabs deferred. When tabs land, the same per-buffer state moves into a `Buffer[]` keyed by path, with the active buffer driving the editor view.
 
+### `transactions_out` seam
+
+The editor widget exposes the change sets it applied from user input — the per-edit list of retain / delete / insert ops over byte ranges, the forward half of the editor binding (per `op-log-editor-binding`). The host drains this stream each frame and mirrors each change set into the document's CRDT `working` layer as `user` ops, so the editor stays the source of *what changed* rather than the host re-diffing the whole buffer to guess. Reverse-direction edits (an accepted/pending/external change applied back into the editor) carry a sync origin and are not re-emitted on `transactions_out`, so the binding can't echo. The seam is editor-crate-owned and host-agnostic — the same exposed transactions feed any consumer that needs a precise edit log, not just the op log. [editor-transactions-out]
+
 
 ## Save UX
 
-Save action: writes current doc to `currentPath` via the `write_file` core command. On success, updates `loadedHash` to the new doc text, which clears `isDirty`. On error, surfaces a non-blocking error toast and leaves the dirty state alone (so the user can retry).
+Save action: commits the buffer's `working` layer (`commit_working`, per `op-log.md`'s "Disk write invariant"), which folds the user's uncommitted edits into `accepted` and materializes that to `currentPath`. On success, updates `loadedHash` to the new doc text, which clears `isDirty`. On error, surfaces a non-blocking error toast and leaves the dirty state alone (so the user can retry).
 
 Triggers (all funnel into the same save function):
 
@@ -45,20 +51,20 @@ Dirty indicator:
 
 File-switch guard fires on **explicit close** of a dirty tab (× / middle-click / `tab.close` keybind) — a confirm dialog with three options: Save & close, Discard & close, Cancel. Cancel keeps the tab open. Switching away from a dirty tab via tab click / file-tree click / search-result click does *not* fire the guard — the buffer stays dirty in memory. Window close has **no** dirty-buffer modal: every dirty buffer flushes through the autosave pipeline and the open-tab snapshot is pushed, so next launch auto-restores the workspace as dirty tabs the user can save or revert via the existing affordances. [file-switch-guard-dirty, autosave-close-no-modal]
 
-External changes: two mechanisms.
+External changes: a file edited on disk outside hiker reconciles into the `accepted` layer as an `external` op (per `op-log-external-edit-sync`). Because the buffer materializes `accepted + working`, an external change and the user's uncommitted `working` edits merge by position: disjoint regions auto-merge with no prompt, and an overlapping region surfaces as a conflict hunk with **Keep mine / Keep theirs / Keep both** — the same model agent proposals use (per `op-log-merge-auto`, `op-log-merge-conflict`). Two mechanisms feed the reconciliation.
 
 - Pre-write drift check (v0). Every save re-reads the file and compares its hash to `loadedHash` before writing. [pre-write-drift-check, drift-conflict-modal]
     - match — write proceeds; `loadedHash` updates.
     - file missing — prompt: write anyway (re-creates) / cancel.
-    - hash mismatch — conflict prompt: keep mine (overwrite) / take theirs (discard buffer, reload) / open diff (deferred — falls back to keep/take in v0).
+    - hash mismatch — reconcile the disk delta into `accepted`; disjoint changes merge silently, an overlapping region opens conflict hunks. (A buffer with no `working` edits just reloads — there is nothing to conflict with.)
     - Catches the "I edited the file in vim while it was open in Hiker" case without a watcher.
 
 - Watcher integration (v1). The notify-based watcher (lands with the indexer) pushes file-change events for the open file.
     - buffer clean — silently reload; `loadedHash` updates.
-    - buffer dirty — same conflict prompt, but proactive (on event, not at save time).
+    - buffer with `working` edits — same reconciliation, but proactive (on event, not at save time).
     - Reduces the stale-buffer window; pre-write check remains as final guard since watchers miss events (network filesystems, rapid changes, event/save races).
 
-Both mechanisms reduce to the same conflict-resolution UI; only the trigger differs.
+Both mechanisms feed the same conflict-hunk reconciliation; only the trigger differs.
 
 
 ## Keybind registry
@@ -67,20 +73,13 @@ Window-level chords: `app/src/keybinds.rs`, intercepted via `ctx.input_mut(|i| i
 
 Shape:
 
-```ts
-interface Binding {
-  id: string;            // "editor.save", "editor.toggleBold"
-  keys: string;          // CM6 chord syntax: "Mod-s", "Mod-Shift-p"
-  label: string;         // human-readable for help panel
-  run: (view: EditorView) => boolean;   // returns true if handled
-}
-```
+Shape: window-level chords are a static `(chord, label)` table returned by `Keybinds::known_keybindings()` — e.g. `("Mod-S", "Save the active buffer")`, `("Ctrl-K", "Open the command palette")`. `Keybinds::handle_keybinds(ctx)` matches each chord by consuming the key combo from egui input (`ctx.input_mut(|i| i.consume_key(...))`) and runs the corresponding action.
 
-Compilation: `registry.toCMKeymap()` returns a CM6 extension built from `keymap.of(bindings.map(b => ({key: b.keys, run: b.run})))`. The editor wires this in once at startup.
+Compilation: there's no separate keymap object — `handle_keybinds` runs once per frame before the editor widget, so a consumed window-level chord never reaches the buffer.
 
-Validation: a `registry.validate()` pass at startup logs and throws on duplicate `id` or duplicate `keys`. No silent overrides.
+Validation: a startup-time test (`known_keybindings_has_no_duplicates`) rejects duplicate chords. No silent overrides.
 
-Scope: v0 has one scope — the editor. Bindings only fire when the editor has DOM focus. When a future binding needs to fire outside the editor (e.g. `Mod-P` quick-open from any pane), reuse CM6's exported `keyName` parser in a window-level `keydown` handler — never roll a custom chord parser. Add a `scope` field then; until then, omit it.
+Scope: two scopes today. Window-level chords (`app/src/keybinds.rs`) fire regardless of focus and are consumed before the editor sees them; buffer-local chords (`editor-view::command::handle`) only fire when the editor has focus. A future `scope` field could refine this further; until then the split between the two registries *is* the scope.
 
 v0 bindings:
 
@@ -110,8 +109,6 @@ Bottom strip across the editor pane only (not under the tree). Three regions: [s
   When the *active buffer*'s file is in a non-indexed state (per `cmd-file-index-state` in `index.md`), the center label is replaced for that file's lifetime as the active buffer with a file-specific message: `Not indexed (unsupported filetype)` for unsupported extensions, `Skipped — <reason>` for skipped files (reason string straight from the indexer), `Queued for indexing` while the file's job is pending. Reverts to the aggregate label once the file becomes indexed (or another file opens). [status-bar-active-file-index-state]
 - right: line:col, word count, file type badge (`md`)
 
-Why basename rather than full path: the file tree shows location, the window title carries disambiguation, and full paths overflow on deep vaults. Tooltip + tree cover "where does it live."
-
 Click targets:
 
 - dropdown → opens the version list (see below).
@@ -135,17 +132,17 @@ The dropdown is buffer-only — it hides for non-buffer tab kinds the same way t
 
 Population:
 
-- Snapshots and staging entries come from `core::activity::list_for_path(path, filter)` (see `changes.md` `## Unified activity feed`) so the dropdown shares the merged-feed type with the activity detail page rather than calling two separate APIs and reconciling them in the UI. [status-bar-version-dropdown-uses-unified-feed]
-- The list refreshes on `hiker:changes-appended` and `hiker:staging-changed` for events that touch the active buffer's path; debounced consistent with the activity widget. [status-bar-version-dropdown-live-refresh]
+- Snapshots and staging entries come from `core::activity::list_for_path(path, filter)` (see `op-log.md` "Unified activity feed") so the dropdown shares the merged-feed type with the activity detail page rather than calling two separate APIs and reconciling them in the UI. [status-bar-version-dropdown-uses-unified-feed]
+- The list refreshes on op-log append events and staging-snapshot updates for events that touch the active buffer's path; debounced consistent with the activity widget. [status-bar-version-dropdown-live-refresh]
 
-Why a dropdown rather than a static label: the prior label only surfaced *which* preview was active, and only one preview was reachable from outside the editor at a time. A per-buffer version picker makes the status bar the canonical place to ask "what other versions of this file exist?" without leaving the editor. [status-bar-version-dropdown]
+The dropdown is the canonical place to ask "what other versions of this file exist?" without leaving the editor. [status-bar-version-dropdown]
 
 Trash entries are out of scope for the dropdown — a trash entry *is* a different file on disk (different path), not a version of the open buffer; surfaced via the existing `tree-trash-preview` path.
 
 
 ### Sibling protection (overflow rule)
 
-Every status-bar region — and any other horizontal toolbar / strip elsewhere in the app — must use `min-width: 0` and `flex-shrink: 1` so a long string in one region cannot push siblings off-screen. The basename + tooltip change above fixes the common case for the path region; the rule generalizes. Anywhere a region's content is user-derived (file names, error messages, status labels reflecting external state), the same `min-width: 0` + ellipsis combo applies. Tracked as `ui-no-sibling-pushout` so the rule has a slug to cite from CSS comments and code review. [ui-no-sibling-pushout]
+Every status-bar region — and any other horizontal toolbar / strip elsewhere in the app — truncates user-derived content with an ellipsis so a long string in one region can't push its siblings off-screen. The basename + tooltip change above fixes the common case for the path region; the rule generalizes to any region whose content is user-derived (file names, error messages, status labels reflecting external state). Tracked as `ui-no-sibling-pushout` so the rule has a slug to cite in code review. [ui-no-sibling-pushout]
 
 
 ## Layout (v1)
@@ -252,7 +249,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
 
   - **Disk is the source of truth for what's in the bin.** The panel is built by walking `<vault>/.hiker/trash/` directly — every file there shows up. The manifest is consulted for *original path* and *deletion time* only, and only on a per-entry basis. Files dropped into `.hiker/trash/` by hand, or entries whose manifest row got corrupted, still appear and can still be emptied. The manifest is a hint, not a gate. [tree-trash-disk-listing]
   - **Flat list, sorted by deletion time descending.** No reconstruction of the original folder structure inside the bin. Trash is a recovery surface ("the thing I deleted ten minutes ago"), not a working tree. Each row shows the basename, a relative-time hint (`5m ago`, `yesterday`, `Mar 12`), and the original path as muted secondary text. Folder entries get a `▸` glyph and a `(N notes)` count derived from the manifest's `members` (or `?` if the entry is orphaned and we can't tell). [tree-trash-flat-by-deleted]
-  - **Click → read-only preview.** Single click on a trash row opens the file in the editor in a non-editable mode (CodeMirror `EditorState.readOnly.of(true)` plus a banner across the top: "Trash preview · Restore to edit"). The buffer's `path` is set to the on-disk trash location, `loadedHash` is set, but `isDirty` is forced false and the save button hides. Switching away from a trash preview discards nothing — there's nothing to discard. [tree-trash-preview]
+  - **Click → read-only preview.** Single click on a trash row opens the file in the editor in a non-editable mode (read-only editor mode via `ViewState.read_only` plus a banner across the top: "Trash preview · Restore to edit"). The buffer's `path` is set to the on-disk trash location, `loadedHash` is set, but `isDirty` is forced false and the save button hides. Switching away from a trash preview discards nothing — there's nothing to discard. [tree-trash-preview]
   - **Right-click → Restore / Delete permanently.** Per-row context menu has two entries. Restore calls `vault-trash-restore` and re-ingests the note (see below). Delete permanently removes that single entry from disk + manifest, with a confirm modal that says "Permanently delete `<original_path>`? This cannot be undone." Same `confirmDanger` modal pattern the soft-delete uses. [tree-trash-restore-action]
   - **Top-level right-click → Empty trash.** Right-clicking the `🗑 Trash` header itself opens a single-entry menu: "Empty trash (N entries)". Calls `vault-trash-empty` after the same `confirmDanger` modal. Disabled when `N == 0`. [tree-trash-empty-action]
 
@@ -284,11 +281,11 @@ Four regions: top strip across the window, then three columns below it (sidebar 
 
   ### Tree-row index-state markers
 
-  Beyond the dirty-suffix dot (`dirty-tree-dot`), each tree row reflects its file's index state with at most one small marker rendered as a suffix glyph (right of the filename, on the same side as the dirty dot). One marker per row, mutually exclusive across the three states. The two suffix glyphs use distinct DOM slots — the dirty dot is a `li::after` pseudo-element, the index marker is a child `.ix-marker` span — so a row can carry both ("dirty *and* queued") without colliding for the single `::after` slot. Indexed-and-clean — the common case — shows nothing on either, keeping the tree visually quiet.
+  Beyond the dirty-suffix dot (`dirty-tree-dot`), each tree row reflects its file's index state with at most one small marker rendered as a suffix glyph (right of the filename, on the same side as the dirty dot). One marker per row, mutually exclusive across the three states. The dirty dot and the index marker paint at distinct positions in the row, so a row can carry both ("dirty *and* queued") without collision. Indexed-and-clean — the common case — shows nothing on either, keeping the tree visually quiet.
 
   - **Unsupported** — hollow grey dot. The file's extension has no chunker (anything outside `.md`, `.markdown`, `.txt` in v1). Derivable client-side from the path; no index lookup needed. [tree-row-unsupported-marker]
   - **Skipped** — amber filled dot. The indexer attempted ingest and refused (>5MB sanity cap, UTF-8 decode failure, future: corrupted source). Reason string from the indexer (`"file too large"`, `"not UTF-8"`) shown in the row's `title=` tooltip. [tree-row-skipped-marker]
-  - **Queued / mid-index** — pulsing accent dot. Transient; clears when the file's index job completes. Driven by `hiker:reindex-progress` events so no polling is needed. [tree-row-queued-marker]
+  - **Queued / mid-index** — pulsing accent dot. Transient; clears when the file's index job completes. Driven by indexer-progress events so no polling is needed. [tree-row-queued-marker]
 
   State is supplied by `cmd-file-index-state` (see `index.md`), called lazily for visible rows on render and refreshed in place when index events fire. Folders are never marked — too noisy. The status-bar-side mirror of these states is `status-bar-active-file-index-state` above.
 
@@ -318,7 +315,7 @@ Four regions: top strip across the window, then three columns below it (sidebar 
 
 Default state on first launch: tree open, related panel collapsed. Persistence of these toggles across launches is a settings concern (see settings.md) — for v1 the state lives in-memory only.
 
-CSS: a 3-column grid where the side columns collapse to width 0 (or `display: none`) when toggled. Editor column is `1fr`; sides are fixed widths. Toolbar lives inside the editor column so the buttons sit where the user's eyes naturally are.
+Layout: a three-column row where the side columns collapse to zero width when toggled and the editor column takes the remaining space (sides are fixed widths). The toolbar lives inside the editor column so the buttons sit where the user's eyes naturally are.
 
 ### Resizable side columns
 
@@ -327,36 +324,28 @@ Both side columns are user-resizable horizontally via a drag handle on the inner
 Constraints:
 
 - **Min / max widths.** Each side column has a min width (~160px for the sidebar so file names stay readable; ~220px for the discovery panel so search-result snippets don't wrap into uselessness) and a max width (~50% of the window so the editor column can't be squeezed to nothing). Drags clamp at the bounds; the cursor stays as `col-resize` so the user sees they've hit the limit.
-- **Collapse interaction.** The toggle buttons (`panel-toggle-buttons`) still hide / show the column wholesale — collapse is `display: none`, not "drag width to 0." Re-opening restores the last user-set width.
+- **Collapse interaction.** The toggle buttons (`panel-toggle-buttons`) still hide / show the column wholesale — collapse hides the column entirely, not "drag width to 0." Re-opening restores the last user-set width.
 - **Persistence.** The two widths persist per-vault via `settings-write-back` to `vault.sidebar_width` / `vault.discovery_width` (eligible-key set grows by two). Defaults match the existing fixed widths so users who never drag see no change.
-- **Implementation.** Plain pointer-event drag on a 4-px-wide handle element absolutely positioned over the column's inner edge. No third-party splitter library; CM6 reflows on the editor column resize for free. The handle is purely visual on hover (subtle accent) — no persistent divider chrome, matches the rest of the UI's "quiet by default" treatment.
+- **Implementation.** Plain pointer-event drag on a 4-px-wide handle element absolutely positioned over the column's inner edge. No third-party splitter library; the editor reflows on the column resize for free. The handle is purely visual on hover (subtle accent) — no persistent divider chrome, matches the rest of the UI's "quiet by default" treatment.
 
 The same handle slot exists on both sides regardless of whether the discovery panel is currently showing search-results, related notes, or the chat surface (`chat-panel-pinned-bottom`) — width is a panel-level affordance, not a section-level one.
 
 
 ## Mode controls slot
 
-The editor toolbar reserves a centered `#mode-controls` slot between two flex spacers. The slot is empty during normal editing; entering a read-only preview mode populates it with mode-specific icon-only buttons plus a short text label naming the mode. One slot, one render function (`renderModeControls`), per-mode populators. [editor-toolbar-mode-controls]
-
-Why a single toolbar slot rather than per-mode banners:
-
-- **Consistent visual language.** Icons match the rest of the toolbar palette (line-weight, sizing, hover). Per-mode banners would be a separate visual family that fights the surrounding chrome.
-- **Less DOM and CSS.** No separate banner elements, no per-mode show/hide. Slot is `replaceChildren()`-rebuilt every transition. Idempotent.
-- **Discoverable once.** "Label + icons in toolbar center = something special is going on" carries across snapshot / trash / staging / dirty-buffer-diff / future modes.
+The editor toolbar reserves a centered `#mode-controls` slot between two flex spacers. The slot is empty during normal editing; entering a read-only preview mode populates it with mode-specific icon-only buttons plus a short text label naming the mode. One slot, one render path, per-mode populators. [editor-toolbar-mode-controls]
 
 What lands in the slot:
 
 - **Icon-only action buttons** for the mode's verbs: Diff toggle (see `editor-diff-vs-disk-toggle` below), Restore, Apply, Reject, Close — whichever the active mode exposes. Icons match the toolbar palette; pressed/unpressed states reflect toggle state for stateful icons. The mode qualifier that names which non-current version is in view sits in the status-bar left region's version dropdown closed-state label (see `status-bar-version-dropdown` above) so the toolbar stays compact and the user's eye finds the context in the same place it finds the file name.
 
-`renderModeControls()` reads the current buffer state (`buffer.mode.kind`, `isDirty()`, etc.) and the diff-active flag and rebuilds the slot's children. Called on every transition that affects the slot — buffer swap, mode entry/exit, dirty toggling, diff on/off.
+The mode-controls render path reads the current buffer state (mode kind, dirty flag, etc.) and the diff-active flag and rebuilds the slot. Called on every transition that affects the slot — buffer swap, mode entry/exit, dirty toggling, diff on/off.
 
-Per-mode populators live in `ui/src/main.ts` — `renderSnapshotControls(diffActive: bool)`, `renderTrashControls()`, `renderDirtyBufferControls(diffActive: bool)`, and (future) `renderStagingControls()`. Each appends label + icons; none mutates state directly. State changes go through the existing buffer/preview API.
+Per-mode populators live in the egui toolbar / buffer-panel code — snapshot, trash, dirty-buffer, and (future) staging variants. Each renders label + icons; none mutates state directly. State changes go through the existing buffer/preview API.
 
 ### Dirty-buffer Diff toggle
 
 A diff toggle lives in the editor toolbar (just right of Save). Greyed when the buffer is clean *and* no other diff source is selected (nothing to diff against). Click toggles the editor tab's `diff` mode against the current `DiffSource` (see `diff.md` `diff-as-mode` and `diff-source-enum`); the default source is `Disk(path)` — the live buffer vs. last-loaded content. The flip is non-destructive: the buffer's `current` is unchanged, decorations are layered on top; toggling off restores cursor + selection. **Right-click opens a source picker** — a small context menu offering: `Diff against on-disk`, `Show changes…` (submenu of recent op-log rows for this path), and future sources (snapshot, another open buffer). Selecting a source switches the tab's `DiffSource` and turns diff mode on. [editor-diff-vs-disk-toggle, editor-show-changes-menu]
-
-Why this lives here, not in some mutation-specific surface: any time the user wants to compare the buffer against some other version of itself — current vs. disk, current vs. an earlier snapshot, current vs. another open buffer — the same affordance covers it. One toggle, one source picker, every comparison.
 
 Constraints:
 
@@ -396,11 +385,11 @@ Each entry is a checkable item — checkmark when active, click flips it, menu c
 
 ### v1 entries
 
-- **Show chunk boundaries** — overlays the editor with a thin horizontal rule between chunks (pale reddish-orange — visible against prose without competing for attention) and the chunk index (`0`, `1`, `2`, ...) in the gutter at each chunk's start line. Backed by `cmd-chunks-for-path` (see `index.md`) which returns the active note's chunk bounds. Refreshes on save (debounced 500ms, same cadence as the related-notes panel). When the file isn't indexed (unsupported / skipped / queued per `cmd-file-index-state`), toggling on shows nothing and a faint hint in the gutter explains why. CodeMirror integration: a `StateField<DecorationSet>` plus a `gutter` extension; sits in its own slot in the CM6 extension order (after language, before keymap). [view-show-chunk-boundaries]
+- **Show chunk boundaries** — overlays the editor with a thin horizontal rule between chunks (pale reddish-orange — visible against prose without competing for attention) and the chunk index (`0`, `1`, `2`, ...) in the gutter at each chunk's start line. Backed by `cmd-chunks-for-path` (see `index.md`) which returns the active note's chunk bounds. Refreshes on save (debounced 500ms, same cadence as the related-notes panel). When the file isn't indexed (unsupported / skipped / queued per `cmd-file-index-state`), toggling on shows nothing and a faint hint in the gutter explains why. Editor integration: a decoration provider (`chunk_boundary_decorations` in `app/src/panels/buffer/decorations.rs`) emitting the rule + gutter index, aggregated onto the buffer view's decoration set. [view-show-chunk-boundaries]
 
   This is genuinely a debugging-grade view of the chunker's output — useful while txt-ingest is hardening, and useful long after as a sanity check when chunker behavior changes.
 
-- **Hide frontmatter** — visually collapse the leading `---\n…\n---\n` YAML block into a single placeholder line (`▸ frontmatter (N lines)`) without touching the file. Detection mirrors `core::frontmatter::split` exactly — the block must start at byte 0 with `---\n` and have a closing `---\n` line before any body content; an unterminated or non-leading block is ignored. CodeMirror integration: a `Decoration.replace({block: true})` over the byte range, recomputed off `state.doc` so edits inside or around the block update the placeholder line count immediately. Default off; persistence via `editor.hide_frontmatter` (`settings-section-editor`). Motivated by agent-stamped frontmatter (`mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) accumulating into a tall block that pushes the actual prose off screen — flipping this on lets the user read the body without manually scrolling past metadata that's already visible elsewhere (the activity widget, file detail views). [view-hide-frontmatter-toggle]
+- **Hide frontmatter** — visually collapse the leading `---\n…\n---\n` YAML block into a single placeholder line (`▸ frontmatter (N lines)`) without touching the file. Detection mirrors `core::frontmatter::split` exactly — the block must start at byte 0 with `---\n` and have a closing `---\n` line before any body content; an unterminated or non-leading block is ignored. Editor integration: a block replace decoration (`frontmatter_fold` in `editor/editor-md/src/meta.rs`) over the byte range, recomputed off the document so edits inside or around the block update the placeholder line count immediately. Default off; persistence via `editor.hide_frontmatter` (`settings-section-editor`). Motivated by agent-stamped frontmatter (`mcp-tool-set-frontmatter`, `mcp-tool-apply-tag-remove-tag`) accumulating into a tall block that pushes the actual prose off screen — flipping this on lets the user read the body without manually scrolling past metadata that's already visible elsewhere (the activity widget, file detail views). [view-hide-frontmatter-toggle]
 
 - **Intraline diff highlights** — augments the line-level red/green diff with character-level highlights inside paired delete/insert lines. Affects every consumer that calls `editor.renderDiff` (snapshot preview, dirty-buffer diff, write-note review). Default off; persistence via `editor.intraline_diff` (`settings-section-editor`). Flipping the toggle while a diff is currently displayed re-renders the active diff with the new style. Does *not* affect the patch-review agent-diff surface — that renders span-anchored hunks as widgets on the live doc and is governed by its own rules in `patch-review.md`. See `diff.md`'s "Diff style" section for the full rendering contract. [view-intraline-diff-toggle]
 
@@ -411,7 +400,7 @@ These appear in the menu now so the surface is predictable, but render greyed-ou
 - **Live preview** — hide/show markdown syntax markers on cursor-out. Specced in `live-preview.md`; entry becomes live (default on) when that ships. [view-live-preview-toggle]
 - **Render .txt as markdown** — session-scope override of `txt-render-as-markdown-default`. Greyed until `settings-vault-config-toml` lands and gives the per-vault default a real loader; see `txt-ingest.md`. Different scope from the per-note override that doc explicitly rejects — this one is "for the current app session, flip the vault default," no file mutation, no persistence in v1. [view-render-txt-as-markdown-toggle]
 - **Word wrap** — session-scope override of `settings-section-editor`'s wrap default. [view-word-wrap-toggle]
-- **Show whitespace** — toggles CM6's whitespace-rendering extension. [view-show-whitespace-toggle]
+- **Show whitespace** — toggles the editor's whitespace-glyph rendering (`editor-view`'s `whitespace` module). [view-show-whitespace-toggle]
 - **Highlight trailing whitespace** — paints a faint red background over runs of `' '` / `'\t'` that sit between the last non-blank character on a line and the line terminator. Independent of `view-show-whitespace-toggle` (which renders every whitespace glyph): this one only marks the trailing run and only as a background, so it's quiet enough to leave on for code but is noisy enough on prose / `.txt` notes that it must be opt-in. Default off; persisted per-vault. The decoration provider is `editor_view::trailing_whitespace_decorations`; gate the call in the buffer panel on this flag rather than baking it into the always-on decoration stack. [view-highlight-trailing-whitespace-toggle]
 - **Show line numbers** — toggles the line-number gutter. [view-line-numbers-toggle]
 - **Show heading breadcrumb** — overlays each chunk with its `heading_path` (already stored on chunks). Pairs with chunk boundaries; defer until both have a real user. [view-heading-breadcrumb-toggle]
@@ -431,7 +420,7 @@ Mutations are LLM-driven content rewrites of the active note. Single-note user-i
 
 1. The user clicks a mutation entry. Hiker submits a `Direct`-shape task to `core::tasks` (per `task-queue.md`) at `High` priority — the user is watching. The task carries the buffer's *live* text (not last-saved, same rule as `chat-active-note-context-injection`) so the mutation operates on what the user sees. The buffer is set read-only for the duration of the task, and the source tab is pinned (a preview tab promotes to sticky on submit per `editor-preview-tab-promotion` so a preview-slot swap can't displace the buffer the result needs to land on). [note-mutation-buffer-ro-while-in-flight]
 2. The queue's direct-LLM worker drains the task by calling `core::llm::chat` with the mutation's prompt. External MCP-attached clients can also drain the task per the queue's worker rules. The home-page Task queue widget (`task-queue-home-widget`) is the in-flight progress surface — no per-mutation toast.
-3. On `TaskCompleted`: the result replaces the source buffer's content as a single CM6 transaction, the buffer's read-only flag clears, and the buffer becomes dirty. Works whether the source tab is the active one (dispatch through the live editor view) or a background tab (rewrite the tab's saved CM6 state in place via a transaction off the existing state, preserving history so Ctrl-Z reverts the whole replacement as one undo step on activation). The user reviews by reading the buffer; the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) flips the editor view to a line-level diff against on-disk content for explicit comparison. **Save** writes the mutated content through the regular save path (which handles `pre-write-drift-check` + appends a `'modified'` row to `core::changes`). **Ctrl-Z** reverts the mutation as a single undo step. If the user closed the source tab mid-flight (only possible from the explicit close path, since the tab is RO + pinned during the flight), the result is dropped silently — no toast, no held state. [note-mutation-applies-as-buffer-edit]
+3. On `TaskCompleted`: the result replaces the source buffer's content as a single editor transaction, the buffer's read-only flag clears, and the buffer becomes dirty. Works whether the source tab is the active one (dispatch through the live editor view) or a background tab (rewrite the tab's saved editor state in place via a transaction off the existing state, preserving history so Ctrl-Z reverts the whole replacement as one undo step on activation). The user reviews by reading the buffer; the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) flips the editor view to a line-level diff against on-disk content for explicit comparison. **Save** writes the mutated content through the regular save path (which handles `pre-write-drift-check` + appends a `'modified'` row to `core::changes`). **Ctrl-Z** reverts the mutation as a single undo step. If the user closed the source tab mid-flight (only possible from the explicit close path, since the tab is RO + pinned during the flight), the result is dropped silently — no toast, no held state. [note-mutation-applies-as-buffer-edit]
 4. On `TaskFailed`, the buffer's read-only flag clears and a toast surfaces the error. No content change. On `TaskCancelled` (user cancels via the queue widget), the buffer's read-only flag clears, no content change, no toast.
 
 [note-mutations-menu-task-shape]
@@ -448,11 +437,11 @@ Submits a task with `kind: NoteMutation { mutation: ReformatAsMarkdown, source_p
 
 ### Mutations-menu button states
 
-- **Enabled** when the active buffer is an editable note (`buffer.mode.kind === "file"`) of an indexable extension (`.md` / `.markdown` / `.txt`) and has at least one byte of content.
+- **Enabled** when the active buffer is an editable note (`mode.kind` is `File`) of an indexable extension (`.md` / `.markdown` / `.txt`) and has at least one byte of content.
 - **Disabled** during read-only preview modes (trash / snapshot / staging review) — mutating from inside a review surface would be confusing. Tooltip explains why.
 - **Disabled with "Mutation in progress…" tooltip** when there is an active or leased task whose `kind: NoteMutation { source_path }` matches the active buffer's path. The buffer is RO during this window for the same reason. Only one in-flight mutation per source path (`note-mutation-one-in-flight-per-path`).
 
-- **Pending-background-mutation indicator.** When the active buffer has at least one pending background mutation job in the queue (any `NoteMutation`-kind task in non-terminal state whose `source_path` matches the buffer), the Mutations menu trigger renders a small pulsing accent-color dot in the corner of its icon. Same `@keyframes` pulse as `tree-row-queued-marker` so the visual vocabulary stays uniform. Distinct from the "Reformatting…" pill in `#mode-controls` (which names the single in-flight in-buffer mutation): the pill belongs to single-note in-buffer flight, the dot is the presence-of-any-pending indicator for the per-note menu and stays lit across multiple queued or batch-flight jobs (`note-mutation-batch-via-staging`). Driven by the same `hiker:queue-event` subscription the menu already maintains. [note-mutations-menu-pending-indicator]
+- **Pending-background-mutation indicator.** When the active buffer has at least one pending background mutation job in the queue (any `NoteMutation`-kind task in non-terminal state whose `source_path` matches the buffer), the Mutations menu trigger renders a small pulsing accent-color dot in the corner of its icon. Same `@keyframes` pulse as `tree-row-queued-marker` so the visual vocabulary stays uniform. Distinct from the "Reformatting…" pill in `#mode-controls` (which names the single in-flight in-buffer mutation): the pill belongs to single-note in-buffer flight, the dot is the presence-of-any-pending indicator for the per-note menu and stays lit across multiple queued or batch-flight jobs (`note-mutation-batch-via-staging`). Driven by the same queue events subscription the menu already maintains. [note-mutations-menu-pending-indicator]
 
 When only one mutation entry is enabled (the v1 case), the popover still opens — clicks-to-action stay one shape so users learn it once. As more mutations land, they slot in alphabetically.
 
@@ -471,11 +460,11 @@ All three converge on the same staging-driven flow; no batch-specific review sur
 
 ## Vault home page
 
-When no note is open, the editor pane shows a vault home page in place of the CM6 editor — a lightweight overview of the vault rather than empty space. Default landing surface on vault open (assuming no auto-resume of last-open buffer); reappears when the user closes the active buffer without opening another. [vault-home-screen]
+When no note is open, the editor pane shows a vault home page in place of the editor — a lightweight overview of the vault rather than empty space. Default landing surface on vault open (assuming no auto-resume of last-open buffer); reappears when the user closes the active buffer without opening another. [vault-home-screen]
 
 Three widgets, in this vertical order:
 
-- **Vault stats.** Total notes, total chunks, breakdown by index state (indexed / queued / skipped / unsupported), maybe disk usage of the vault directory. Pulled cheaply from the existing index store via a single command. Live-updates via the existing `hiker:reindex-progress` events so the counts reflect ongoing work. [vault-home-stats-widget]
+- **Vault stats.** Total notes, total chunks, breakdown by index state (indexed / queued / skipped / unsupported), maybe disk usage of the vault directory. Pulled cheaply from the existing index store via a single command. Live-updates via the existing indexer-progress events so the counts reflect ongoing work. [vault-home-stats-widget]
 - **Recently modified.** Top N (default 10) notes by filesystem mtime. Reuses the mtime field on `DirEntryDto` (`tree-sort-options`); ordering is just `ORDER BY mtime DESC LIMIT N` against the store's notes rows. Each row shows basename + relative path + relative time ("2 hours ago"). Click → open in editor. [vault-home-recent-modified]
 - **Recently accessed.** Top N notes by user-open time. Requires a new `last_accessed_at` column on the `notes` row, written from the open-file command path; same row shape and click behavior as recently-modified. [vault-home-recent-accessed]
 
@@ -483,7 +472,7 @@ The new column rides a small slug of its own since the tracking is independent i
 
 - **Note access tracking.** Add `last_accessed_at INTEGER` to the `notes` row; bump the schema-version constant (same fail-loud + reindex contract as the existing `store-version-fail-loud` / schema bump pattern). Written when a file becomes the active buffer (open from tree, search-result click, recents click, etc.). Read by the recents widget and any future consumer. [note-access-tracking]
 
-Refresh shape: the home page subscribes to `hiker:reindex-progress` for live stat updates and to `hiker:file-changed` for recent-modified updates. The recently-accessed list updates on each open without watcher involvement (the writer is hiker itself).
+Refresh shape: the home page subscribes to indexer-progress events for live stat updates and to watcher file events for recent-modified updates. The recently-accessed list updates on each open without watcher involvement (the writer is hiker itself).
 
 UI scope: minimal. Header with vault root path, three widgets stacked, no charts / graphs, no per-source-type breakdowns yet (those land when source-derived notes are real). A "New note here" button at the top is an obvious affordance to keep — same call as the sidebar's `sidebar-new-item-button`.
 
@@ -491,7 +480,7 @@ Out of scope for v1 of the home page: pinned/landmark notes, active-trail displa
 
 ### Recent activity widget (lands with `core::changes`)
 
-A fourth widget appears on the home page once `core::changes` (per `changes.md`) has any rows — i.e. as soon as any save / rename / delete has happened in this vault since the v3 schema bump. Hidden when the changelog is empty so a fresh post-upgrade vault doesn't show a confusing zero-count tile. [vault-home-recent-activity-widget]
+A fourth widget appears on the home page once the op log's accepted-op feed (`core::activity`, per `op-log.md` "History materialization") has any rows — i.e. as soon as any save / rename / delete has happened in this vault. Hidden when the feed is empty so a fresh vault doesn't show a confusing zero-count tile. [vault-home-recent-activity-widget]
 
 Preview content (the home tile):
 
@@ -499,7 +488,7 @@ Preview content (the home tile):
 - Top 3–5 most recent change events: timestamp, path, op (created / modified / deleted / renamed), author class. Click → detail view (see below).
 - Mixed-author by default — user saves and (when MCP lands) agent writes appear in the same stream. The widget is *not* agent-specific; the agent-activity use case is a filter preset within the same widget rather than a separate surface.
 
-Refresh: subscribes to a new `hiker:changes-appended` event emitted whenever the indexer task appends a row to `core::changes`. Same shape as `hiker:reindex-progress`. Light debounce (a few hundred ms) so save bursts don't repaint per keystroke.
+Refresh: subscribes to a new op-log append event emitted whenever the indexer task appends a row to `core::changes`. Same shape as indexer-progress events. Light debounce (a few hundred ms) so save bursts don't repaint per keystroke.
 
 
 ### Detail views
@@ -514,7 +503,7 @@ Transitions:
 - Gear (`vault-bar-settings-icon`) toggles editor ↔ settings.
 - Back: Home button (→ overview), note-row click (→ editor), gear (→ editor).
 
-Read-only review surfaces (trash, snapshot, staging review previews) are sub-modes of the editor state — they share the CM6 view, and the toolbar's `#mode-controls` slot lights up with mode-specific icon buttons + label (see `## Mode controls slot`). Where applicable, a Diff toggle in that slot flips between the consumer's content and the line-level diff (see `diff.md`). The dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) lives in the editor toolbar instead — always visible alongside Save, greyed when no diff target applies.
+Read-only review surfaces (trash, snapshot, staging review previews) are sub-modes of the editor state — they share the editor view, and the toolbar's `#mode-controls` slot lights up with mode-specific icon buttons + label (see `## Mode controls slot`). Where applicable, a Diff toggle in that slot flips between the consumer's content and the line-level diff (see `diff.md`). The dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) lives in the editor toolbar instead — always visible alongside Save, greyed when no diff target applies.
 
 Per-widget detail views, in roughly the order they earn their keep:
 
@@ -522,7 +511,7 @@ Per-widget detail views, in roughly the order they earn their keep:
     - **Notes** — full list of all notes, paginated, sortable by mtime / access / path.
     - **Indexed** — same shape, filtered to indexed-only.
     - **Chunks** — per-note chunk count, sortable; flags pathologies (notes with >100 chunks, notes with 0 chunks). Ties into the deferred `eval-sanity-stats` work — gives a real surface for spotting chunker pathology before the formal eval framework lands.
-    - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `cmd-file-index-state`). Updates on every `hiker:reindex-progress` event.
+    - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `cmd-file-index-state`). Updates on every indexer-progress event.
     - **Skipped** — list of skipped notes with their reasons (already tracked via `notes.skipped` + `notes.skip_reason`). Per-row "retry" affordance reroutes through `IndexJob::Upsert` with `force=true` so users can manually retry after fixing the underlying issue (file size, encoding).
 - **`vault-home-recent-activity-detail`** — full list from `core::changes::recent`, all author classes. Mental model: **each row is a saved version of the file.** Row layout: op label · path · author · time-ago, plus a `current` badge on the most recent row per path and a `↩ restored` badge on rows that were themselves a Restore. Filter pills (author class) live in the header. [vault-home-recent-activity-detail]
 
@@ -530,10 +519,10 @@ Per-widget detail views, in roughly the order they earn their keep:
 
     - **Click a row** → opens that snapshot read-only in the editor. Reuses the same `readOnlyCompartment` + banner pattern as `tree-trash-preview`; the banner reads `Snapshot of <path> · <when> · <author> · <op>` with `[Restore this version]` and `[Close preview]` actions. Closing returns to the activity detail view.
     - **Per-row `[Restore this version]`** → for power-user single-click without previewing first. Hidden on the `current` row (restoring the current state is a tautology) and on `'deleted'` rows (no content blob to write).
-    - **No separate "Open" button.** That was confusing in an earlier iteration — users expected "open" to show the historic state, not the live file. Click-the-row → snapshot preview is the only path; the live file is reached via the tree, search, or recently-modified.
-    - **No separate "Rollback to before this" button.** That phrasing was confusing because the row IS the version (the content blob lives on the row), and "before this" implied off-by-one mental gymnastics. The `Restore this version` semantics are honest: what you click is what you get.
+    - **No separate "Open" button.** Click-the-row → snapshot preview is the only path; the live file is reached via the tree, search, or recently-modified.
+    - **No separate "Rollback to before this" button.** The row *is* the version (the content blob lives on it); `Restore this version` is the verb — what you click is what you get.
 
-    Restore writes the row's `content_at(id)` blob back to disk via `vault.write_file_checked`, then appends a new `'modified'` row stamped `metadata.restored_from = id`. Command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, walks `previous_content_for_path`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same log primitives, see `changes.md` "Rollback".
+    Restore reads the version's content via `op_writes::content_at_op` and writes it back through `op_writes::user_save` — a fresh `user` op that becomes the newest accepted version. Command: `restore_snapshot`. The change-shaped flavor (`rollback_change`, via `op_writes::previous_accepted_content`) stays available for the agent-rollback consumer per `mcp.md` — both flavors coexist on the same op-log primitives, see `op-log.md` "History materialization" → "Rollback".
 
     - **Filter pills — three independent toggles.** Default-all-on; state persists per-vault. Each toggle gates a distinct row population, so two-of-three off is a meaningful filter (e.g. "show only pending agent reviews"). The pills replace the earlier "author class + Pending" split — `Pending` is no longer a separate pill, the show-staging toggle owns that visibility. [vault-home-recent-activity-filter-pills]
         - **Show staging** — pending staging proposals (the rows that route to a review surface on click). Off → backend query switches `source` from `Merged` to `ChangesOnly`. Same icon family as the editor's agent-diff toggle; tooltip "Show pending agent reviews."
@@ -649,7 +638,7 @@ The headline decisions:
 - **One properties tab per note path.** Opening Properties on a path that already has a properties tab open switches to it instead of spawning a duplicate — same shape as the file-tree click rule for buffer tabs. [note-properties-tab]
 - **Read-only data view, no editor chrome.** The tab is non-buffer per `tab-kinds`, so the editor toolbar and bottom status bar hide on activation. The tab body owns its own header (note basename + relative path). No save button, no dirty marker, no preview-slot promotion path — clicking Properties from the tree always opens sticky (it's a directed action, like restore-from-trash). [note-properties-tab-no-editor-chrome]
 - **App-page preview-slot rule still applies on open.** Properties tabs default-land in the preview slot — same rule as `home` / `queue` / `settings` (per `tab-kinds`). Clicking Properties on a second note replaces the preview; promotion paths are the standard ones (right-click "Keep open", drag, etc.). [note-properties-tab-preview-slot]
-- **Live-refreshing.** The tab subscribes to the same event surfaces the rest of the UI rides — `hiker:reindex-progress` (notes-row / chunks data refreshes when a re-ingest finishes), `hiker:changes-appended` (changes-section refreshes on every new change row for this path), `hiker:file-changed` (mtime / size refresh on external edits). No manual refresh button; the data is always current. [note-properties-tab-live-refresh]
+- **Live-refreshing.** The tab subscribes to the same event surfaces the rest of the UI rides — indexer-progress events (notes-row / chunks data refreshes when a re-ingest finishes), op-log append events (changes-section refreshes on every new change row for this path), watcher file events (mtime / size refresh on external edits). No manual refresh button; the data is always current. [note-properties-tab-live-refresh]
 
 #### Sections rendered
 
@@ -687,7 +676,7 @@ VSCode-style "preview" tab. Single-clicking a note from any browse-y entry point
 
 The headline decisions:
 
-- **At most one preview tab exists at a time.** Opening another note while a preview tab is active replaces that preview's buffer in place — same tab slot, same tab DOM node, just different contents. The replacement is a single doc swap (same as today's tab-switch path), not a close-then-open. [editor-preview-tab]
+- **At most one preview tab exists at a time.** Opening another note while a preview tab is active replaces that preview's buffer in place — same tab slot, just different contents. The replacement is a single doc swap (same as the tab-switch path), not a close-then-open. [editor-preview-tab]
 - **Visual treatment is italic title only.** No different background, no border, no extra glyph — preview tabs render exactly like sticky tabs except the title text is italicized. Active vs inactive shading and the dirty marker rules are unchanged (preview tabs are never dirty — see promotion). The italic is the only visual signal because it's the only one users actually need: "this tab will go away if I open another file." [editor-preview-tab]
 - **Every click-driven open-note callsite uses the preview slot by default.** File-tree click, search-result click, related-notes click, recents click, wikilink click (when wikilinks land), chat note-link click, `@`-mention click in the chat panel — all route through `openFile(rel, { preview: true })`. The set is uniform on purpose; carving exceptions per surface ("recents always sticky," "wikilinks always preview") would be a worse mental model than "click is preview, Mod-click is sticky." [editor-preview-tab-from-open-callsites]
 - **Mod-click on any open-note callsite forces a sticky tab.** Skips the preview slot, opens directly into a new sticky tab. Mirrors the browser convention "Mod-click opens in new tab"; same gesture meaning here. Drag-from-tree (when that's a thing) is also implicitly sticky — drag intent is more directed than click intent. [editor-preview-tab-mod-click-sticky]
@@ -695,7 +684,7 @@ The headline decisions:
 
 Behavior details:
 
-- **Replacing a preview is not "closing" it.** No dirty guard fires (preview is never dirty), the tab DOM node persists, only the buffer behind it changes. The replaced buffer is dropped from `openBuffers` since it has no tab anymore.
+- **Replacing a preview is not "closing" it.** No dirty guard fires (preview is never dirty), the tab persists, only the buffer behind it changes. The replaced buffer is dropped from the open-buffer set since it has no tab anymore.
 - **Activating a preview tab from a different sticky tab** is a normal tab switch, not a re-open. The italic stays — the preview is still a preview until promoted.
 - **Closing a preview tab** uses the same close path as any tab. No dirty guard fires (it's never dirty), the slot is empty afterward and the next click-open creates a fresh preview.
 - **Keybinds.** No new keybinds. `tab.close`, `tab.next`, `tab.previous`, `tab.jump-N` all operate on the active tab regardless of preview state.
@@ -757,9 +746,9 @@ Right-swipe = back. Left-swipe = forward. Same as every browser.
 
 Edge cases worth pinning:
 
-- **Inside CodeMirror.** CM6 doesn't intercept horizontal trackpad scroll by default for content that isn't horizontally scrollable, so wheel events with `deltaX` bubble up to the pane handler naturally. If a markdown-source line is horizontally scrolled (rare for prose; possible in code blocks), the swipe should still trigger navigation when `deltaX` substantially exceeds the line's scrollable extent.
+- **Inside the editor.** The editor widget doesn't consume horizontal trackpad scroll for content that isn't horizontally scrollable, so horizontal-scroll deltas reach the pane's swipe handler naturally. If a markdown-source line is horizontally scrolled (rare for prose; possible in code blocks), the swipe should still trigger navigation when the horizontal delta substantially exceeds the line's scrollable extent.
 - **Inside scrollable detail-view lists.** Same shape — the list scrolls on `deltaY`, so horizontal swipes pass through.
-- **Touchscreen devices.** v1 of this feature targets trackpads only. Touch swipe gestures via `touchstart`/`touchend` are a separate slug if the project ever ships a touchscreen-friendly variant.
+- **Touchscreen devices.** v1 of this feature targets trackpads only. Touch swipe gestures are a separate slug if the project ever ships a touchscreen-friendly variant.
 
 
 ### Dirty-buffer interaction
@@ -777,24 +766,24 @@ Closing the vault while history exists drops the entire stack — no warning, no
 - **Rich history menu (right-click → list of last N pages).** Browser-shaped polish, deferred.
 
 
-## Extension load order (CM6)
+## Editor layer order
 
-Order matters in CM6 — earlier extensions take precedence for keymaps and overlap-able decorations. Canonical order: [cm6-extension-order]
+The editor isn't assembled from an extension array. The view aggregates decoration providers — pure `&Editor → Set` functions — onto `ViewState`, and the order they're applied sets precedence for overlapping ranges. Canonical order: [editor-layer-order]
 
-1. `basicSetup` — gutters, history, default keymap
-2. `EditorState.tabSize.of(2)`
-3. `EditorView.lineWrapping`
-4. language compartment (`markdown()`) — swappable later when we add other langs
-5. `saveTracking` extension — updates dirty state, fires title-bar update
-6. `keybinds.editorKeymap()` — our registry's editor-scope bindings
-7. (future) `livePreview()` — syntax-marker hiding decorations
-8. (future) `wikilinks()` — `[[id]]` parser extension + decorations
-9. (future) `widgets()` — images, math, transclusions
-10. theme
+1. Built-in gutters + history (`editor-core` / `editor-view`)
+2. Tab width — `tab_size` (`settings-section-editor`)
+3. Line wrapping
+4. Markdown styling (`editor-md`) — swappable per-buffer when other languages land
+5. Save / dirty tracking — updates dirty state, fires the title-bar update
+6. Keybinds — the registry's editor-scope bindings (`editor-view::command::handle`)
+7. (future) Live preview — syntax-marker hiding decorations
+8. (future) Wikilinks — `[[id]]` decorations
+9. (future) Widgets — images, math, transclusions
+10. Theme
 
-The `language` slot uses a `Compartment` so it can be reconfigured per-buffer without rebuilding the whole state (e.g. opening a `.json` sidecar would swap to JSON mode). Same pattern for `theme` later.
+Language selection is per-buffer, so opening a `.json` sidecar can swap to JSON styling without rebuilding the editor state.
 
-Editor instance is created once at startup and reused across buffer switches; switching files dispatches a doc-replacement transaction, never reconstructs the view. [cm6-editor-reuse]
+The editor state is created once at startup and reused across buffer switches; switching files dispatches a doc-replacement transaction, never reconstructs the view. [editor-instance-reuse]
 
 
 ## Out of scope (deferred)

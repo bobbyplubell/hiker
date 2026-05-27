@@ -15,7 +15,73 @@ use egui::{
 };
 use smol_str::SmolStr;
 
+use editor_core::state::Editor as EditorState;
+use editor_view::viewport::ViewState;
+
 use super::to_egui_color;
+
+/// One run of display text on a visual row: the post-decoration string the
+/// editor would paint (markdown markers hidden / replaced) plus its color, or
+/// an inline-widget placeholder. Consumed by the minimap so it can mirror the
+/// editor's live-preview rendering.
+pub(crate) struct DisplayRun {
+    pub(crate) text: SmolStr,
+    pub(crate) fg: Color32,
+    pub(crate) is_widget: bool,
+}
+
+/// One visual row (after soft-wrap) as an ordered list of display runs.
+pub(crate) struct DisplayRow {
+    pub(crate) runs: Vec<DisplayRun>,
+}
+
+/// Build the live-preview display model for buffer `line`, split into visual
+/// rows by the editor's wrap map. Each row's runs are the decorated `Segment`s
+/// flattened to (display text, color) — the exact text the editor paints, so
+/// the minimap reflects hidden markers, heading styling, and soft-wrap without
+/// re-deriving any of it.
+pub(crate) fn display_rows(
+    state: &EditorState,
+    view: &ViewState,
+    line: usize,
+    base_color: Color32,
+) -> Vec<DisplayRow> {
+    let line_text = state.doc.line_str(line);
+    let lbs = state.doc.line_to_byte(line);
+    let vlines: Vec<(usize, usize)> = if view.wrap_map.enabled() {
+        view.wrap_map
+            .peek(line)
+            .map(|w| w.vlines.iter().map(|(s, e)| (*s as usize, *e as usize)).collect())
+            .unwrap_or_else(|| vec![(0, line_text.len())])
+    } else {
+        vec![(0, line_text.len())]
+    };
+    let mut rows = Vec::with_capacity(vlines.len());
+    for (vs, ve) in vlines {
+        let sub = &line_text[vs..ve];
+        let layout = LineLayoutBuilder {
+            line_text: sub,
+            line_byte_start: lbs + vs,
+            line_byte_end: lbs + vs + sub.len(),
+            events: Vec::new(),
+            trailing_widgets: Vec::new(),
+            base_font_size: view.font_size,
+            base_color,
+        }
+        .build(&view.decorations.layers);
+        let mut runs = Vec::with_capacity(layout.segments.len());
+        for seg in &layout.segments {
+            let fg = seg.style.fg.map(to_egui_color).unwrap_or(base_color);
+            if seg.widget.is_some() {
+                runs.push(DisplayRun { text: SmolStr::default(), fg, is_widget: true });
+            } else if !seg.display.is_empty() {
+                runs.push(DisplayRun { text: seg.display.clone(), fg, is_widget: false });
+            }
+        }
+        rows.push(DisplayRow { runs });
+    }
+    rows
+}
 
 /// A single visual line built from buffer text + overlapping decorations.
 #[derive(Clone)]
@@ -125,9 +191,14 @@ impl LineLayout {
 
 impl Segment {
     fn galley(&self, ui: &egui::Ui, base_size: f32, base_color: Color32) -> Arc<egui::Galley> {
-        let display = if self.widget.is_some() {
-            // Tiny label rendered inside the placeholder rect. The advance width
-            // for the segment uses the widget's `measure()` result, not the label.
+        // A textual widget (`InlineWidget::display()` is `Some`) reads as
+        // ordinary inline text — the galley is the widget's own text, and the
+        // segment advance widens to fit it (see `measure`). Non-textual
+        // widgets keep the literal "widget" label inside their placeholder rect.
+        let widget_text = self.widget.as_ref().and_then(|w| w.display()).map(|d| d.text);
+        let display = if let Some(t) = widget_text.as_deref() {
+            t
+        } else if self.widget.is_some() {
             "widget"
         } else if self.display.is_empty() && self.is_replacement {
             ""

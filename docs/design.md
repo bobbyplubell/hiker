@@ -27,13 +27,13 @@ A Reor-like personal notes + knowledge system, all-Rust.
 
 Live preview: per-frame decoration providers in `app/src/panels/buffer.rs` produce `DecorationSet` layers fingerprint-cached on `(doc_id, selection, folds, viewport, theme)`. Decoration kinds: `Mark`, `Line`, `Replace { display }`, `Block`, `Widget`. The markdown provider walks the buffer with `pulldown-cmark`; `Replace` fades syntax markers, `Mark`/`Line` styles content, and a decoration is suppressed when its line overlaps a selection so clicking in reveals raw markers. Widgets handle images, math, wikilink pills, callouts.
 
-Wikilinks: the markdown decoration provider emits a widget for `[[id]]` / `[[id|display]]`; click resolves via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`).
+Wikilinks: the markdown decoration provider emits a widget for `[[id]]` / `[[id|display]]`; click resolves via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`). Full spec: `wikilinks.md` (id form, name-normalize authoring, render-from-live-title, stamping, backlinks).
 
 Other components:
 
 - Filesystem watcher: notify crate
 - Markdown parsing/chunking: pulldown-cmark or comrak
-- Vector store: LanceDB (Rust-native) or sqlite + sqlite-vec
+- Vector store: sqlite + sqlite-vec
 - Full-text search: tantivy (hybrid with vector for best results)
 - Embeddings: local fastembed-rs by default (`core::embed::FastembedEmbedder`); cloud / Ollama options via `core::embed::LlmEmbedder` (wraps the `llm` crate's `EmbeddingProvider`). Both behind the same `Embedder` trait — see `index.md`'s embedder section.
 - MCP server: rmcp (official Rust SDK)
@@ -110,7 +110,7 @@ Storage modes (each row maps unambiguously to one combination of source-location
 | Vault-internal  | non-md      | no         | `sidecar`          | next to source as `<full-source-filename>.md`     | extracted text (cached)                       |
 | External        | markdown    | no         | `external-pointer` | `.hiker/external/<id>--slug.md`                   | annotations only; original re-read on refresh |
 | External        | non-md      | no         | `external-cached`  | `.hiker/external/<id>--slug.md`                   | extracted text (cached)                       |
-| Either          | any         | yes        | `versioned`        | `.hiker/refs/<id>/manifest.md` + `vN/` subfolders | manifest annotations + per-version extracted  |
+| Either          | any         | yes        | `versioned`        | sidecar note (op-log history) + `.hiker/refs/<id>/` retained artifacts | extracted text, versioned via the op-log; old artifacts kept per `extract-artifact-retention` |
 
 Notes:
 
@@ -139,68 +139,19 @@ UI affordance: hide hiker-owned sidecar files (`*.<ext>.md` next to non-md sourc
 
 **Linked vs. unlinked sidecars.** Every extracted-text sidecar (sidecar / external-cached / versioned modes) carries a `hiker.link_state: linked | unlinked` field, default `linked`. Semantics:
 
-- **Linked (default)** — the sidecar is read-only in hiker's editor. Future re-extractions of the source overwrite the sidecar's body in place; for versioned sources, a re-extraction whose source hash differs from the prior version increments the version (`vN+1`) and writes a fresh extracted body there. The user's role with a linked sidecar is reading + annotating the *source* via trails / links / search, not editing the extracted text.
+- **Linked (default)** — the sidecar is read-only in hiker's editor. A re-extraction overwrites the sidecar's body in place via an `extractor` op on the document's `accepted` state, so the prior body stays in op-log history rather than in a separate version file. The user's role with a linked sidecar is reading + annotating the *source* via trails / links / search, not editing the extracted text.
 - **Unlinked** — explicit user action ("Unlink from source") flips the sidecar to RW. Hiker stops overwriting it on re-extraction (the sidecar is now diverged from source by user choice). The relationship to the source survives in frontmatter (`hiker.source`, `hiker.source_sha256` at the time of unlink), but re-extractions of the source no longer touch this sidecar's body. Rationale: gives the user an escape hatch for cases where the extractor mangles content and they want to fix it by hand without permanently disabling extraction for the source-type.
 
-Re-link is supported (flips back to linked + re-extracts to overwrite local edits — confirm modal, since this discards the user's hand edits). Versioned-mode unlink is per-version: unlinking a single `vN` doesn't affect future versions, which still extract fresh.
+Re-link is supported (flips back to linked + re-extracts to overwrite local edits — confirm modal, since this discards the user's hand edits). Link-state is a property of the sidecar document, not of any one capture — re-extractions land as `extractor` ops on the linked sidecar and prior bodies stay in op-log history.
 
 
 ## Versioned sources
 
-Versioning is a global capability that any source can opt into (per-glob in vault config or per-source in frontmatter). Not type-tied — reference docs almost always opt in, contracts/legal sometimes, transient stuff usually doesn't. Default: off.
+The version history of a source-derived note is the op-log (`op-log.md`), not a parallel per-version store. A sidecar is a Yrs document; a re-extraction (changed source, bumped extractor version, re-fetch, re-crawl) lands as an `extractor`-authored op on its `accepted` state. So a source's "versions" are its op-log history, and diff / per-hunk restore / the version dropdown reuse the existing op-log surfaces. An identical re-extraction is a no-op, so versions accrue only on real change. The concrete slice — re-extraction policies, the crawl-job manifest note, retention — lives in `extract.md` and `op-log.md`.
 
-Storage layout for a versioned source: folder instead of single note file.
-
-```
-vault/.hiker/refs/
-  01HRX3...--stm32-rm0090/
-    manifest.md           hiker note for the logical document
-    v1/
-      source.pdf
-      extracted.md
-      meta.yaml           captured_at, source_url, sha256, extractor version
-    v2/
-      source.pdf
-      extracted.md
-      meta.yaml
-    v3/...
-```
-
-manifest.md frontmatter:
-
-```yaml
----
-hiker:
-  id: <ulid>
-  kind: reference                      # optional metadata tag
-  versioned: true
-  current_version: v3
-  versions:
-    - id: v1, captured_at: ..., source_sha256: ..., source_url: ...
-    - id: v2, ...
-    - id: v3, ...
-title: ...
-tags: [...]
----
-[user annotations, version-independent]
-```
-
-Each version's extracted.md has its own frontmatter pointing at the manifest id and naming the version (hiker.parent, hiker.version). Indexer treats each version's extracted.md as separately indexable.
-
-Ingestion paths:
-
-- File-drop — new file appears, hashed, compared to current version, creates vN+1 if different, no-op if identical
-- Scrape — `hiker scrape <url>` uses monolith for single-file HTML capture + readability/mdream for markdown extraction; new version on content change. `hiker refresh` re-fetches all scraped sources, creates versions where content changed.
-
-Search defaults:
-
-- All versions indexed; only the latest surfaces in default search results (one hit per logical document).
-- `--all-versions` or explicit version scoping reveals older versions.
-- Trails can pin a specific version with `<id>@vN` syntax; bare `<id>` resolves to current.
-
-Diff: `hiker diff <id> vA vB` runs a textual diff over extracted.md between two versions. Cheap and disproportionately useful for tracking datasheet revs or scraped doc changes.
-
-Retention: per-source retention policy (keep last N, or keep forever). Datasheets typically forever; scraped docs maybe last 5.
+- **Logical documents spanning many sources** (a crawl, a multi-file capture) are represented by a manifest note; members carry `hiker.parent: <manifest-ulid>`. A single scraped or dropped source needs no manifest — the sidecar note is itself the versioned unit.
+- **Binary artifacts** (the source bytes, the per-capture HTML archive) are what the op-log can't hold — it versions text, not blobs. Whether old artifacts are retained is a per-source retention cascade (`extract-artifact-retention`): vault default → per-crawl/glob → per-source frontmatter; values `latest` / `keep:N` / `forever`. Retained artifacts live under `.hiker/refs/<doc_id>/` keyed by the producing op, and are device-local (the op-log syncs sidecar text, not blobs).
+- **Search** indexes the current accepted state (what's on disk); historical versions live in the op-log and surface on demand rather than as separate default-search hits. Trails pin a point in a note's history via its op-log snapshot id.
 
 
 ## Index model
@@ -236,20 +187,7 @@ User-authored layer on top of the automatic indexes:
 - Collections / saved queries (named groupings — tags, folder globs, manual note IDs + order)
 - Auto-generated reorganization suggestions and inbox triage — see "Auto-organization suggestions" below, and `suggestions.md` for the full surface
 - Pinned anchors / landmarks (other notes get a "nearest landmark" tag in embedding space)
-- Trails: ordered, named sequences of notes with per-waypoint annotations. Spec lives in `trails.md`; the framing below captures *why* trails earn their keep, which is the part that wouldn't fit cleanly inside the spec itself.
-
-  **The motivating use cases.** Two paradigms pin trails as worth building:
-
-  1. **Agent-facing trails.** An agent benefits from *ordered* context the way humans benefit from *prose* — handing one a curated walk through 6 notes in order, with per-waypoint annotations explaining "why this chunk matters here," is the right granularity for the agent and very hard to produce in any other form. The MCP integration story (treat agent retrieval as activation) leans hard on this; trails are the structural unit activation wants to return. Two sub-uses live on this: (a) hand-authored or curated trails that the user explicitly hands to an agent as context; (b) opt-in agent activity logging, where every note an agent reads / writes / cites during an MCP session is appended to a draft trail. The agent is the *transcriber* in (b); the user keeps, edits, or discards the resulting trail. (b) doubles as cheap input for (a) — the agent's investigation becomes a reusable walk without the user authoring it from scratch. Trail synthesis from imported agent transcripts (Claude Code transcript / Web UI export ingestion, deferred below) is the same shape as (b) over a static input.
-  2. **Narrative layer over multimodal sources.** This case earns its keep specifically because hiker treats every searchable thing as a note (see "Source-derived notes" above): website archives, PDFs, audio transcripts, scraped reference docs all become hiker notes alongside hand-written markdown. You can't add inline narrative to a PDF page or a scraped webpage the way you can to a markdown note — the source isn't yours to edit. A summary note linking to those sources puts the narrative *around* them; a trail puts the narrative *between* them, with per-waypoint annotation of *why this section of this PDF, then this paragraph of this archived article, then this audio timestamp*. For research / learning / investigation workflows that chain together immutable external material, that's a meaningfully different (and better) experience than a summary note. This case is the one that makes website archival load-bearing for hiker, and vice versa: trails get most of their human-facing utility from the existence of multimodal source-derived notes, and source-derived notes get a richer narrative-layer story from trails.
-
-  **Where prose still wins.** A pure-prose summary note with inline links often beats a trail when the chain runs entirely through your own hand-written notes that you're already free to annotate inline. The connective tissue prose provides is more valuable than the per-waypoint structure trails impose. Trails earn their strongest keep when the chain crosses material you *can't* annotate inline (the multimodal case above) or when the *path itself* — order, side trips, the act of walking — is part of what you want to preserve and re-traverse. The two surfaces don't compete; they cover different shapes of "I want this thinking to stick."
-
-  **Trails branch.** A waypoint can have child waypoints forming a side trail; the trail-doc's waypoint list is a tree. The reader walks the main line, drops down a side trail to follow a digression, and walks back up — the Bush memex shape. Cross-references between separate trails handle adjacent cases (linking from one trail's annotation to another trail by id) but don't replace branching: a single trail-doc with side trails is one shareable artifact, one MCP fetch, and reads as one continuous walk in a way that two linked trails do not.
-
-  **Curated, not strictly user-authored.** The user owns every accepted trail, but the clustering pipeline and MCP agents may *propose* draft trails which land in a review queue scoped to trails (parallel to the `suggestions.md` reorganization-proposal shape). The user accepts, edits, or discards. This opens the door to commodity trails — agent-investigation transcripts, clustering-suggested reading orders, future imports of agent transcripts — without compromising "the user owns the trail" as the durable rule.
-
-  See `trails.md` for the full surface — storage layout, reference shape, side-trail tree, sidebar mode, capture flow, build-as-you-read verbs, draft-trail review, MCP integration, indexer / watcher / trash hooks.
+- Trails: ordered, named sequences of notes with per-waypoint annotations and side-trail branches (the waypoint list is a tree). Curated — the user owns every accepted trail, but the clustering pipeline and MCP agents may propose drafts into a trail-scoped review queue. Full surface in `trails.md`.
 
   **Drag-and-drop ingestion (deferred).** Trails should accept items dragged in from outside the trails panel — primarily file rows from the Files panel, and eventually note tabs and search-result cards. The drop target semantics match the in-panel reorder DnD already shipped: dropping onto the top half of a waypoint card inserts the new waypoint as a sibling before it; dropping onto the bottom half nests it as a child; dropping on the head / tail strips lands it at the start / end of the trail. Implementation is deferred — the in-panel reorder lands first; cross-panel ingestion piggybacks on the same drop zones once a uniform "vault path" drag payload is in place across panels. [trails-dnd-ingestion]
 
@@ -308,7 +246,7 @@ Linking metadata (general): Trails are one instance of a broader idea — first-
 
 ## Extractors
 
-Trait-based, all built-in. No runtime plugin loading (no dynamic libs, no WASM, no plugin manifest). Source types are a small finite set; the cost of a real plugin system isn't worth it for a personal tool.
+Trait-based, all built-in, living in a decoupled `hiker-extract` leaf crate that `core` does not depend on (the sidecar `.md` on disk is the seam — see `extract.md`). No runtime plugin loading (no dynamic libs, no WASM, no plugin manifest) for this registry: the binary formats (PDF, image, audio, office) need native libraries and form a small finite set, so a real plugin system isn't worth it here. The concrete first slice — the registry, sidecar write path, PDF, website-to-markdown, and the governed crawl loop — is specified in `extract.md`. The unbounded text-transform tail (per-site scrapers, niche text formats) is a separate, plugin-eligible source-fetcher surface — `plugins.md`'s source plugins — not part of this built-in set.
 
 Shape:
 
@@ -323,7 +261,7 @@ pub trait Extractor: Send + Sync {
 
 A Registry holds Box<dyn Extractor> instances and routes a source to the first matching one. Adding a new type = one new module + one registration line.
 
-Per-type modules under core::extract::*: pdf, image, audio, office, html, code, markdown, command.
+Per-type modules under hiker_extract::*: pdf, image, audio, office, html, code, markdown, command.
 
 Multi-extractor fallback: matches() can return true for several extractors; extract() returns Result<Option<Extracted>> so an extractor can say "I don't actually handle this, try the next." E.g. PDF: pdftotext fast path → marker fallback for scanned/garbage output.
 
@@ -447,7 +385,7 @@ Streaming: Long-running operations (large reindex, scrape refresh) expose progre
 ## Build order
 
 - v0 — egui shell + in-tree editor widget + folder view. Open vault, list tree, click file → buffer opens in a tab, save on Ctrl/Cmd-S. Markdown syntax styling via `editor-md` + the live-preview decoration provider in `app/`. No watcher, no index, no search yet. Hold the core/UI separation discipline from day one.
-- v1 — notify watcher + sqlite-vec or LanceDB index of chunks + "related notes" panel for the open file.
+- v1 — notify watcher + sqlite-vec index of chunks + "related notes" panel for the open file.
 - v2 — search bar (hybrid lexical + semantic).
 - v3 — MCP server adapter over the same core, exposing search and related to agents.
 - v3.5 — `core::llm` + `core::agent` (basic agent loop) + chat panel UI. Unlocks all interactive LLM features (chat over vault, vision OCR review flows, cluster naming, bulk reorg conversations) plus opt-in background/fan-out features. `core::acp` (optional ACP client for external agents) is a follow-up. See `llm.md` for the full architecture.
@@ -463,43 +401,13 @@ Apache-2.0. Permissive; explicit patent grant; fine with anyone using or forking
 
 ## Future / deferred
 
-- Apple Notes export ingestion — parse the export (apple_cloud_notes_parser or similar) into one hiker note per item, provenance tagged.
-- Claude Code transcript ingestion — scrape `~/.claude/projects/*/` transcripts, split per conversation into hiker notes, provenance tagged.
-- Web UI export ingestion — parse Claude.ai data export JSON into per-conversation notes.
-- RAG chat over the vault — subsumed by the ACP-client milestone (see `llm.md`). The embedded chat panel against any configured ACP agent IS this feature.
-- **Habits-of-association ranking layer** (the sharper form of "cross-index intelligence"). Inspired by Vannevar Bush's memex framing: a user's *associative patterns* are personally meaningful and should be allowed to bias retrieval. Concretely: optional score bumps applied to search results and related-notes results, computed from user-authored association signals — wikilink edges between notes, shared trail membership, shared tags, folder co-location, and temporal co-edit / co-open. Plugs into the existing rank-fusion stage of the query pipeline, alongside lexical / semantic / structural scores; doesn't replace them, just adds a personalization signal. **Enable/disable lives in user or vault config** (a `[search.ranking]` settings section, riding the existing `settings-write-back` plumbing) — at minimum a master toggle, and ideally per-signal toggles so users can include wikilinks-and-trails but exclude folder-co-location, etc. Default off in v1 since the layer is experimental and you can't tell if it helps without evaluation data; depends on `qa.md`'s eval framework being real to land safely. Explicitly **excludes** proactive crawling / scraping new external sources to recommend — the system curates within existing material; the user decides what enters the vault. The weak version of cross-index intelligence is already covered by the rank-fusion step (lexical + semantic + structural compose); this entry is the sharper, personalized version.
-- Per-index "smart" features (temporal anomalies, topic births/deaths, importance dynamics) — out of scope for now; revisit only if a specific need appears.
-- **draw.io ingestion + MCP integration** — ingest `.drawio` (and the related `.drawio.svg` / `.drawio.png`) diagrams as a source type, with the diagram's textual graph (nodes, edges, labels) extracted into a hiker note for search/related-notes/RAG coverage. The diagram file itself stays alongside as the canonical artifact (same dual-file pattern as future PDF/EPUB extractors per `design.md`'s extractor section). Source-derived note carries the diagram's structural skeleton in markdown — node titles as headings, edges as a relationships block — so the embedder has something to chew on. The richer half is **MCP integration**: a `drawio_*` tool family on hiker's MCP server (`get_diagram(path)`, `add_node(path, title, ...)`, `add_edge(path, from, to, label?)`, `update_node(path, id, ...)`) lets an attached agent read and incrementally edit the diagram file in place. Implementation rides drawio's existing XML format (well-documented, embedded in `.drawio.svg` files too) — no headless browser needed for read or basic write; round-tripping layout is the harder problem and may need a constrained "structural-only edits" surface in v1, leaving manual layout to the user. [drawio-source-ingest, drawio-mcp-tools]
-- **Browser extension** — companion extension that captures the current page into hiker via the same `hiker scrape` / extractor pipeline already specced for source-derived notes. Two primary buttons in the popup:
-    - **Save to Hiker** — one click sends the current URL (and optionally a user-selected text range) to the running hiker instance for ingest. Lands as a source-derived note in `inbox/` per the existing extractor flow.
-    - **Save to Hiker and append to active trail** — same capture, plus appends the resulting note as a waypoint on the user's currently-active trail (per line 260's "active trail" mode). With no active trail set, the second button is greyed (or hidden) so the choice between "land in inbox" and "land on the trail" is always explicit.
-  Mechanism: the extension talks to the running hiker app over the existing local-only MCP server (per `mcp.md`) — discovery via `vault/.hiker/mcp.json`, scrape tool added to the MCP surface alongside the existing read/write tools. No new transport, no new auth model: the localhost-trust posture extends to the extension because both run on the user's machine. When hiker isn't running, the extension surfaces a clear "open hiker first" hint rather than queuing locally — queued-capture is its own deferred design that can land later if it earns it. Phone capture (OS share-sheet / Android intent) is a sibling future item with the same target shape; the extension is the desktop side of the same active-trail-capture story. [browser-extension-capture]
-
-- **Split view** — shift-clicking a tab in the top tab strip splits the center pane and renders that tab alongside the current one. Tile orientation (horizontal / vertical) is user-selectable via a small toolbar control — placement undecided (editor toolbar's most-likely home; alternative is a per-split chrome corner). Splits compose with tab kinds (buffer + agent, buffer + graph, two buffers, etc., per `tab-kinds`). Each split holds its own active tab and its own scroll/selection state. Shift-clicking again on an existing split's tab cycles it within that split (or pops a new split, TBD). Closing the last tab of a split collapses the split. Persistence: open splits ride the autosave tab-state snapshot so workspace restore on next launch puts the user back in the same layout. Lands after `tab-kinds` since splits care about which kind sits in each pane (a graph view + a buffer side-by-side is the load-bearing case).
-
-- **Graph view** — vault-wide graph of notes as the v1 default render of a graph-view tab. Nodes are notes; edges are wikilinks (when those exist), trail waypoint sequences, and optionally folder co-location / shared-tag / cluster co-membership as filterable overlays. Filtering / selection options on the graph chrome:
-    - Folder scope — restrict to a vault subtree (e.g. only `research/`).
-    - Edge-kind filters — hide / show wikilinks, trail edges, folder-cohabitation edges, etc., independently.
-    - Trail-only mode — show only nodes that participate in at least one trail, with the trail edges drawn over them.
-    - Per-source-type node filters (only md, only PDF-derived, etc.) once source-derived notes are real.
-  Cross-highlight from the sidebar: hovering or selecting a folder / trail / cluster in the sidebar lights up matching nodes in the graph. Same hook works in reverse — clicking a node in the graph could reveal it in the tree or scroll the sidebar to it. The graph's selected node opens that note in an editor tab on the next click (or in a split, via shift-click) so the graph stays a navigation surface, not a content surface.
-
-  **Renderer choice — sigma.js + graphology.** Sigma is WebGL-backed and stays smooth at 10k+ nodes, which matters once the vault holds source-derived notes at scale (web archives, PDFs, audio/transcripts) on top of hand-written markdown — graph node count grows with every ingested source. Graphology is the data-model half (sigma is rendering-only); the canonical pairing, both MIT and narrow-purpose. Layout via `graphology-layout-forceatlas2` (FA2 surfaces clusters without hand-tuning). Lazy-load via dynamic `import()` so the renderer bundle is paid only when a graph-view tab opens. Cytoscape.js and D3 considered and dropped: cytoscape is Canvas/SVG-bound (loses scale headroom we'll need); D3 is general-purpose viz, not graph-specific. Packages go through `ui/compose.yaml`'s Docker-isolated npm install per the supply-chain hygiene rule.
-
-  **Renderer adapter pattern.** Spec the graph view behind a renderer-agnostic seam so the choice is reversible. Plain `{ nodes, edges }` DTOs from the backend; a TS `GraphRenderer` interface (mount, applyFilters, setHighlight, setSelection, onClick, onHover, exportPositions, capability flags) implemented by a single adapter file (`ui/src/graphView/renderers/sigma.ts`) — the only place sigma / graphology / layout-fa2 are imported. App state (selection / highlight / filters) lives in the panel module, not the renderer. Same module-discipline pattern as `Embedder`, `LlmClient`, `LexicalEngine`. Swapping renderers later is a one-file flip; capability flags let the UI hide options a given renderer doesn't support (e.g. compound-node cluster regions if cytoscape is ever wanted for that).
-
-- **Special-character / control-character visualization.** Notepad++-style toggle that renders non-printable control characters as small inline glyphs in the editor — NULL bytes (0x00), backspace (0x08), ESC (0x1B), DEL (0x7F), C1 controls (0x80–0x9F), and BOM markers all get distinct lightweight glyphs so the user can see them inline rather than have them silently rendered as nothing or as replacement characters. Pairs with the existing `view-show-whitespace-toggle` (which already covers tabs / spaces / newlines via CM6's `highlightWhitespace`); this entry covers the *non*-whitespace control characters. Implementation rides a CM6 ViewPlugin that scans visible ranges and emits `Decoration.replace` widgets for each match — same shape as `live-preview-marker-fade-inline` decoration emission. Toggle in the View menu sibling to the whitespace one; default off; persisted per-vault. Useful for inspecting source-derived notes where extractors might leave embedded control bytes, for diagnosing encoding issues, and for any text-with-binary-debris content. Optional sub-toggle: distinguish line-ending styles (CRLF vs LF vs CR) with different glyphs so mixed-line-ending files are visible at a glance.
-
-- **WASM plugin system** for user- or agent-authored extensions — sandboxed WASM runtime, capability-scoped host API, manifest-declared permissions presented at install, hash-pinned via vault-level `plugins.json`. Open-ended UI/automation surface; explicitly distinct from the "no runtime plugin loading" stance on extractors above (extractors are a finite core concern; plugins cover the unbounded user-extension surface). Full design in `plugins.md`.
-
-- **Hex view mode** for raw byte-level inspection of any file. Lands as a new `kind: "hex"` tab (per `tab-kinds`); payload is the file path; the tab-body renders the standard hex-editor layout (offset column / hex bytes column / ASCII rendering column) with hover-pairing between the hex and ASCII halves. Read-only in v1 — just inspection. Open paths: right-click on a file in the filetree → "Open as hex"; View menu entry while a buffer tab is active → "View as hex" (opens the same file as a hex tab; doesn't replace the buffer). Useful for binary-adjacent files (small images, PDFs, audio sidecars), source-derived notes whose extracted text looks suspect, files with weird line endings or BOMs, and the "is this actually plain text or is something weird in here" diagnostic case. Renderer doesn't need a heavy library — a CM6 view with a custom decoration set + monospace font handles this in ~200 LOC; lazy-loaded so the cost is paid only when the user opens a hex tab. Write-side hex editing is deliberately deferred — the v1 use case is inspection, not editing.
-
+Future, unimplemented, and fuzzier-than-spec concepts live in `ideas.md`.
 
 ## Sync / backup
 
 - No VCS. Reference-doc versioning lives in-app (named, semantic, diffable) where it has meaning; personal notes are continuous edits and don't benefit from git overhead.
 - Sync between machines: Syncthing — continuous, conflict-aware, no commit ceremony, handles phone.
-- Crash recovery: hiker autosaves dirty buffers Notepad++-style — every ~5s, each unsaved buffer's current text is written to a sidecar in `.hiker/autosave/`, overwritten in place per tick. A force-kill or power loss leaves at most ~5s of typing on the floor; on next vault open, a recovery modal lists each buffer whose autosaved content differs from disk and offers per-row Restore / Discard. Tab state restores silently. Full spec in `autosave.md`. Distinct from saving (autosave writes a sidecar, not the user's file) and from `changes.md` (which records *committed* writes for agent rollback / sync, not in-flight content).
+- Crash recovery: hiker autosaves dirty buffers Notepad++-style — every ~5s, each unsaved buffer's current text is written to a sidecar in `.hiker/autosave/`, overwritten in place per tick. A force-kill or power loss leaves at most ~5s of typing on the floor; on next vault open, a recovery modal lists each buffer whose autosaved content differs from disk and offers per-row Restore / Discard. Tab state restores silently. Full spec in `autosave.md`. Distinct from saving (autosave writes a sidecar, not the user's file) and from the op log (`op-log.md`, which records *committed* writes for agent rollback / sync, not in-flight content).
 - Backup with history: OS-level tooling (Time Machine, Backblaze, Restic, btrfs/zfs snapshots, etc.). The vault directory contains three classes of data with different backup semantics:
     1. **Source content** (notes, source files): canonical, must be backed up.
     2. **Durable derived data** (`.hiker/trash/`, `.hiker/oplog/`, `.hiker/agent-log/`, `.hiker/autosave/index.json`, future `.hiker/conflicts/`): user-meaningful records that aren't regenerable from source content. Must be backed up. Typically much smaller than source content.
@@ -507,21 +415,3 @@ Apache-2.0. Permissive; explicit patent grant; fine with anyone using or forking
    Simple backup tooling can include the whole `.hiker/` (slightly wasteful but correct); smarter tooling can exclude `index.db` and the model cache. The `.hiker/oplog/` directory (per `op-log.md`) is durable user data — losing it means losing edit history, agent-rollback substrate, and (when sync lands) device-sync state.
 - Mobile capture: Markor (Android) or Working Copy (iOS) against the synced folder until/unless a mobile client gets built.
 - Git remains an option to add later if collaboration or web-publishing needs appear; not a one-way door.
-
-
-### Ideas for integrated syncing (deferred)
-
-A first-party sync system isn't on the roadmap — Syncthing covers the use case for v1–v3 — but the shape it would take if/when we built it is worth pinning so the architecture stays sync-ready. Note: the **op log** below isn't deferred — it lands with v3 as `core::oplog` (see `op-log.md`) because agent-edit review and rollback need it. The sync layer when it builds will ride on top of that log; only the cross-device transport, encryption, and conflict-resolution mechanisms below stay deferred. Properties:
-
-- **One Yrs Doc per document is the unit of sync.** Each `<doc-id>.yrs` syncs independently; replicas exchange Yrs updates and the CRDT merge handles concurrent edits across devices without manual conflict resolution.
-- **Each replica has a per-document Yrs `client_id`.** Local writes carry the device's client_id; received updates carry the foreign device's. The author vocabulary (`user`, `agent:*`, `external`, `sync:<device-id>`) is preserved end-to-end via the `op_metadata` side stream (per `op-log-side-table`), which syncs alongside the Doc.
-- **Clients pull updates past their last-seen state vector.** `Doc::encode_state_as_update_v2(&peer_state_vector)` returns "ops since this watermark"; the peer merges them via `Doc::apply_update`. Standard Yjs sync; each device tracks a state vector per peer.
-- **CRDT positions, not last-write-wins.** The Yrs merge function reconciles concurrent edits losslessly within a document. Conflict copies still fall back as the user-visible escape hatch only for catastrophic divergence (e.g. one side intentionally rolled back to an earlier state).
-- **Losing version preserved as a conflict copy.** Routed through a dedicated `.hiker/conflicts/` directory (separate from `vault-trash` so users can distinguish "I deleted this" from "sync displaced this"). File naming follows the trash precedent — collision suffix `_N`, manifest entry tracking origin and timestamp. Indexable like any other note so you can search for what got displaced.
-- **Per-file version history surfaced for manual recovery.** Driven directly off the operation log; "show history of `path/to/note.md`" filters log entries on path. *Distinct from* the `versioned sources` feature, which is opt-in user-curated semantic versioning of reference docs — the sync log is automatic per-modification history. Both can coexist; they're different axes.
-- **Client-side encryption — server stores ciphertext only.** Per-vault keypair (or passphrase-derived key). The indexer never sees ciphertext: each device decrypts on receive, writes plaintext to the local vault, then runs the existing indexer over local-plaintext as usual. Index never syncs. The "filesystem is truth, index is regenerable" rule is what makes this work — the server only needs to round-trip files, not anything queryable.
-- **Sync configuration is per-vault, not per-user-globally.** The `[sync]` config section lives in vault-scope TOML (`vault/.hiker/config.toml`), not user-scope. Each vault opts in independently and carries its own server URL, keypair, device list. The user-scope config can hold defaults a user might want propagated when they create a new vault, but nothing user-scope auto-enables sync on a vault that hasn't opted in.
-
-Compatibility checks against current architecture: this model preserves "markdown-on-disk is canonical" (per `op-log-disk-canonical` — the on-disk `.md` always equals `materialize(accepted)`; sync transports Yrs updates but the materialized markdown stays the user-visible source of truth), preserves "index is regenerable from content" (each device runs its own indexer), and reuses every existing watcher / trash / drift-check mechanism. The integration points are clean.
-
-Costs that pin this as deferred rather than near-term: a server (operational commitment, hosted vs. self-hosted question), a mobile story that diverges from "Markor / Working Copy against the synced folder" (custom protocol means custom mobile clients), key-management UX (lose-key recovery, rotation), and bandwidth concerns for vaults heavy with large source-derived notes (extracted PDFs, audio sidecars).

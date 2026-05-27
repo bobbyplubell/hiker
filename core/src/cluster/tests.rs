@@ -294,7 +294,11 @@ fn build_tree_from_folders_one_cluster_per_folder() {
 #[test]
 fn build_and_persist_writes_rows() {
     let dir = tempfile::TempDir::new().unwrap();
-    let trees = crate::trees::types::Db::open(dir.path()).unwrap();
+    let trees = crate::trees::types::Db::new(
+        std::sync::Arc::new(crate::oplog::OpLog::open(dir.path()).unwrap()),
+        std::sync::Arc::new(crate::vault::Vault::open(dir.path()).unwrap()),
+    )
+    .unwrap();
     let mut notes: Vec<NoteInput> = Vec::new();
     for i in 0..6 {
         notes.push(mk_note(&format!("a{i}"), "research", 0.0 + (i as f32) * 0.001));

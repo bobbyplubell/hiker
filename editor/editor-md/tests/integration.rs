@@ -1,6 +1,7 @@
 use editor_core::decoration::Decoration;
 use editor_core::state::Editor as EditorState;
 use editor_core::decoration::MarkStyle;
+use editor_core::selection::Selection;
 use editor_md::styling::markdown_decorations;
 
 fn has_mark(state: &EditorState, byte: usize, predicate: impl Fn(&MarkStyle) -> bool) -> bool {
@@ -8,6 +9,23 @@ fn has_mark(state: &EditorState, byte: usize, predicate: impl Fn(&MarkStyle) -> 
     set.iter_overlapping(byte..byte + 1).any(|(_, d)| {
         matches!(d, Decoration::Mark(s) if predicate(s))
     })
+}
+
+/// Decorations for `src` with the cursor parked at EOF (off every interior
+/// line so the marker-fade / fence-hide rules are all "on").
+fn decorations_cursor_at_end(src: &str) -> editor_core::decoration::Set {
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(state.doc.len_bytes());
+    markdown_decorations(&state, None)
+}
+
+/// True when the byte offset of `needle`'s first char in `src` is covered by
+/// a monospace code Mark — i.e. that text was classified as code-block body.
+fn byte_is_code_body(src: &str, needle: &str) -> bool {
+    let at = src.find(needle).expect("needle present");
+    let set = decorations_cursor_at_end(src);
+    set.iter_overlapping(at..at + 1)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.monospace))
 }
 
 #[test]
@@ -76,4 +94,83 @@ fn cursor_off_heading_line_replaces_hash() {
         matches!(d, Decoration::Replace { .. })
     });
     assert!(has_replace, "cursor off heading should hide # marker");
+}
+
+// --- fenced-code-block detection (bug-inline-triple-backtick-breaks-codeblock,
+// bug-multiple-codeblocks-mis-detected) ---
+
+#[test]
+fn inline_triple_backtick_with_content_does_not_open_codeblock() {
+    // A prose line containing ```…``` plus other text (e.g. a Splunk inline
+    // comment) must not be treated as a fence delimiter, so no surrounding
+    // text gets pulled into code-block styling.
+    let src = "foo ```bar``` baz\nplain prose line\n";
+    let set = decorations_cursor_at_end(src);
+    // No line on the "plain prose line" should carry a code-block background.
+    let prose_at = src.find("plain prose").unwrap();
+    let prose_is_code = set
+        .iter_overlapping(prose_at..prose_at + 1)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.monospace));
+    assert!(!prose_is_code, "prose after an inline ``` line must not be code");
+    // And no fence line should be hidden (there is no real fence here).
+    let any_hide = set
+        .iter_overlapping(0..src.len())
+        .any(|(_, d)| matches!(d, Decoration::Line(s) if s.hide));
+    assert!(!any_hide, "inline triple-backtick line is not a fence");
+}
+
+#[test]
+fn fence_line_with_trailing_content_is_not_a_closer() {
+    // An unterminated fence runs to EOF as one pulldown block; its trailing
+    // body line ("more") must render as code body, not be mistaken for a
+    // closing fence and hidden.
+    let src = "```\ncode line\nmore\n";
+    assert!(byte_is_code_body(src, "code line"), "first body line is code");
+    assert!(byte_is_code_body(src, "more"), "trailing body line is code, not a fence");
+    let set = decorations_cursor_at_end(src);
+    let more_at = src.find("more").unwrap();
+    let more_hidden = set
+        .iter_overlapping(more_at..more_at + 1)
+        .any(|(_, d)| matches!(d, Decoration::Line(s) if s.hide));
+    assert!(!more_hidden, "non-fence body line must not be hidden");
+}
+
+#[test]
+fn single_fenced_block_styles_body_and_hides_fences() {
+    let src = "```rust\nlet x = 1;\n```\n";
+    assert!(byte_is_code_body(src, "let x = 1;"), "block body is monospace");
+    let set = decorations_cursor_at_end(src);
+    let hidden_fences = set
+        .iter_overlapping(0..src.len())
+        .filter(|(_, d)| matches!(d, Decoration::Line(s) if s.hide))
+        .count();
+    assert_eq!(hidden_fences, 2, "open + close fence both hidden");
+}
+
+#[test]
+fn two_separate_blocks_both_classified_and_prose_between_is_not() {
+    let src = "```\nblock one\n```\n\nprose between\n\n```\nblock two\n```\n\nafter\n";
+    assert!(byte_is_code_body(src, "block one"), "first block body is code");
+    assert!(byte_is_code_body(src, "block two"), "second block body is code");
+    assert!(!byte_is_code_body(src, "prose between"), "interstitial prose is not code");
+    assert!(!byte_is_code_body(src, "after"), "trailing prose is not code");
+    // All four fences (two per block) hide independently.
+    let set = decorations_cursor_at_end(src);
+    let hidden_fences = set
+        .iter_overlapping(0..src.len())
+        .filter(|(_, d)| matches!(d, Decoration::Line(s) if s.hide))
+        .count();
+    assert_eq!(hidden_fences, 4, "both blocks' fences pair independently");
+}
+
+#[test]
+fn tilde_fences_are_supported() {
+    let src = "~~~\ntilde body\n~~~\n";
+    assert!(byte_is_code_body(src, "tilde body"), "tilde block body is code");
+    let set = decorations_cursor_at_end(src);
+    let hidden_fences = set
+        .iter_overlapping(0..src.len())
+        .filter(|(_, d)| matches!(d, Decoration::Line(s) if s.hide))
+        .count();
+    assert_eq!(hidden_fences, 2, "tilde open + close fence both hidden");
 }

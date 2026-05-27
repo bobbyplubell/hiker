@@ -329,6 +329,9 @@ impl Store {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
         }
         tx.execute("DELETE FROM chunks WHERE note_id = ?1", params![id])?;
+        // A skipped file isn't indexed — drop any metadata from a prior
+        // successful ingest so structured queries don't surface it.
+        tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![id])?;
 
         tx.commit()?;
         Ok(())
@@ -349,6 +352,7 @@ impl Store {
         }
         tx.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
         tx.execute("DELETE FROM path_ids WHERE id = ?1", params![note_id])?;
+        tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![note_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -382,6 +386,7 @@ impl Store {
             }
             tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM path_ids WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![id])?;
             removed += 1;
         }
         tx.commit()?;

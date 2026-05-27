@@ -10,7 +10,6 @@
 
 use tempfile::TempDir;
 
-use crate::staging::Staging;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -39,22 +38,6 @@ pub(crate) fn test_vault_with_store() -> (TempDir, Vault, Store) {
     let (dir, vault) = test_vault();
     let store = Store::open(vault.root()).expect("store open");
     (dir, vault, store)
-}
-
-/// A vault + a fresh `Staging` opened against it. Mirrors the inline
-/// `staged()` helper that used to live in `staging/tests.rs`.
-pub(crate) fn test_vault_with_staging() -> (TempDir, Vault, Staging) {
-    let (dir, vault) = test_vault();
-    let staging = Staging::open(vault.root()).expect("staging open");
-    (dir, vault, staging)
-}
-
-/// Just a `Staging` on a tempdir. Most staging tests don't touch the
-/// vault directly — they only care about the staging surface.
-pub(crate) fn test_staging() -> (TempDir, Staging) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let staging = Staging::open(dir.path()).expect("staging open");
-    (dir, staging)
 }
 
 /// Just a `Store` on a tempdir, for tests that exercise the store

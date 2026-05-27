@@ -13,6 +13,13 @@ The headline decisions:
 - **MCP exposes trails for read and write.** Agents read trails to consume curated context and write trails to transcribe their own investigations as draft trails (gated by the standard `agent-write-review-mode` setting). [mcp-tool-trails-list, mcp-tool-trail-create, mcp-tool-trail-append-waypoint]
 - **The Trails sidebar mode shows the active trail vertically, top-to-bottom, read-only.** The dropdown at the top selects which trail is active; the trail-head icon next to it jumps to the trail-doc. The editor stays untouched — clicking a waypoint opens the source note in the editor pane on the right. [trails-mode-body, trails-mode-active-trail-dropdown]
 
+Use cases:
+
+- Ordered context for an agent (a curated walk with per-waypoint "why this matters here" annotations).
+- Opt-in agent activity logging — notes an agent reads/writes/cites become a draft trail.
+- Narrative *between* immutable multimodal sources (PDFs, web archives, audio transcripts) you can't annotate inline.
+- Re-traversable record of an investigation where the path itself — order, side trips — is the point.
+
 
 ## Storage layout
 
@@ -181,12 +188,12 @@ The single editing verb is **Remove waypoint** in a row's right-click context me
 
 **Removing a parent with children cascades.** If the waypoint being removed has child waypoints (a side trail), the confirm dialog names the child count ("Remove this waypoint and N side-trail waypoints?") and the remove operation deletes the parent and every descendant in a single pass — each descendant waypoint-note moves to `.hiker/trash/` like the parent. The trail-doc frontmatter drops the entire subtree. Cascade beats orphan-promotion (children floating up to grandparent) because the user's mental model is "this digression goes away," not "the parent goes away but its tail-end stays." Trash makes the cascade reversible if the user changes their mind.
 
-**Trails mode is independent of Cluster trees mode.** The Trails sidebar body and the Cluster trees sidebar body are siblings under `#sidebar`, gated by mode classes (`#sidebar.mode-trails` vs `#sidebar.mode-clusters`). Switching modes swaps which body is visible; bodies don't share state, don't stack, and one mode's UI must never bleed into another mode's panel. Each mode body defaults to `display: none` and only the active mode's body promotes to `display: block`. [trails-mode-isolation-from-clusters]
+**Trails mode is independent of Cluster trees mode.** The Trails and Cluster trees sidebar bodies are sibling modes; switching modes swaps which body renders. Bodies don't share state, don't stack, and one mode's UI must never bleed into another's — only the active mode's body renders. [trails-mode-isolation-from-clusters]
 
 
 ## Trail graph viewer (deferred)
 
-A future trail visualization that opens a trail (or a set of trails) as a graph in its own editor-pane tab — separate from the Cluster trees graph view. Nodes are waypoints; edges are sequence + side-trail branching. The renderer reuses the shared sigma+graphology adapter built for the cluster editor (`ui/src/graphRenderer/`) so the two viewers share rendering primitives, camera/zoom, and selection conventions. The tab kind is `graph` (already reserved in `TabKind` per `app/state.ts`); the trail viewer is one consumer, a future cross-vault overview is another.
+A future trail visualization that opens a trail (or a set of trails) as a graph in its own editor-pane tab — separate from the Cluster trees graph view. Nodes are waypoints; edges are sequence + side-trail branching. The renderer reuses the shared egui force-graph widget built for the vault graph view and cluster editor (`app/src/widgets/force_graph.rs`) so the two viewers share rendering primitives, camera/zoom, and selection conventions. The tab kind is `graph` (already reserved in `TabKind` in `app/src/tab.rs`); the trail viewer is one consumer, a future cross-vault overview is another.
 
 Scope is intentionally light for v1: open the active trail as a graph, render waypoints with their basenames, edges colored by sequence vs side-trail. Multi-trail overlays, time-axis layouts, and filtering by activation recency are deferred polish — they're things the user might ask for, not things v1 needs. [trails-graph-viewer-tab]
 

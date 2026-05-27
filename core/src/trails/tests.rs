@@ -19,8 +19,8 @@ fn dl(id: &str, path: &str) -> DoubleLinkRef {
 /// The varying half of an `append_waypoint` call: which trail doc to
 /// append into, the source note being captured, and the optional
 /// explicit parent / annotation. The environment half (watcher, jobs,
-/// vault, changes, store) is passed separately and tends to be reused
-/// across several appends in a single test.
+/// vault, store) is passed separately and tends to be reused across
+/// several appends in a single test.
 struct AppendWaypointRequest<'a> {
     trail_doc_rel: &'a str,
     source_rel: &'a str,
@@ -36,7 +36,6 @@ async fn append_waypoint_test<'a>(
     watcher: &'a Watcher,
     jobs: &'a crate::indexer::IndexJobTx,
     vault: &'a crate::vault::Vault,
-    changes: Option<&'a std::sync::Arc<crate::changes::Changes>>,
     store: &'a mut crate::store::Store,
     req: AppendWaypointRequest<'a>,
 ) -> Result<AppendWaypointOutcome, crate::errors::HikerError> {
@@ -44,7 +43,6 @@ async fn append_waypoint_test<'a>(
         watcher,
         jobs,
         vault,
-        changes,
         store,
         trail_doc_rel: req.trail_doc_rel,
         source_rel: req.source_rel,
@@ -293,7 +291,7 @@ async fn create_trail_writes_trail_doc_and_seeds_waypoints_dir() {
         new_trail_dir: "trails/".into(),
     };
     let outcome =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "my-trail")
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "my-trail")
             .await
             .unwrap();
     assert_eq!(outcome.trail_doc_rel, "trails/my-trail.md");
@@ -305,7 +303,7 @@ async fn create_trail_writes_trail_doc_and_seeds_waypoints_dir() {
 
     // Auto-suffix on collision.
     let outcome2 =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "my-trail")
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "my-trail")
             .await
             .unwrap();
     assert_eq!(outcome2.trail_doc_rel, "trails/my-trail-1.md");
@@ -326,14 +324,14 @@ async fn append_waypoint_writes_waypoint_and_updates_trail_doc() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
 
     // Source note.
     std::fs::create_dir_all(td.path().join("research")).unwrap();
     std::fs::write(td.path().join("research/raptor.md"), "body").unwrap();
 
     let out = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "research/raptor.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -418,7 +416,6 @@ async fn append_waypoint_adopts_indexer_path_id_for_source() {
         &watcher,
         &idx.job_sender(),
         &vault,
-        None,
         &cfg,
         "t",
     )
@@ -426,7 +423,7 @@ async fn append_waypoint_adopts_indexer_path_id_for_source() {
     .unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/source.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -476,11 +473,11 @@ async fn remove_waypoint_drops_entry_and_moves_waypoint_to_trash() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "body").unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -492,7 +489,6 @@ async fn remove_waypoint_drops_entry_and_moves_waypoint_to_trash() {
         &watcher,
         &idx.job_sender(),
         &vault,
-        None,
         &trash,
         &trail.trail_doc_rel,
         &wp.waypoint_id,
@@ -523,11 +519,11 @@ async fn delete_trail_cascades_doc_and_waypoint_dir() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "body").unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let _wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -542,7 +538,6 @@ async fn delete_trail_cascades_doc_and_waypoint_dir() {
         &watcher,
         &idx.job_sender(),
         &vault,
-        None,
         &trash,
         &trail.trail_doc_rel,
     )
@@ -727,10 +722,10 @@ async fn move_note_rewrites_waypoint_source_path() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/a.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -745,8 +740,6 @@ async fn move_note_rewrites_waypoint_source_path() {
     crate::ops::file::move_note(
         &watcher,
         &idx.job_sender(),
-        &vault,
-        None,
         "notes/a.md",
         "notes/b.md",
     )
@@ -805,10 +798,10 @@ async fn move_folder_rewrites_referencing_waypoints() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "oldfolder/x.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -820,7 +813,6 @@ async fn move_folder_rewrites_referencing_waypoints() {
         &watcher,
         &idx.job_sender(),
         &vault,
-        None,
         "oldfolder",
         "newfolder",
     )
@@ -865,10 +857,10 @@ async fn watcher_external_rename_triggers_trails_sweep() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     let mut read_store = Store::open(td.path()).unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "notes/src.md", parent_waypoint_id: None, annotation: None, },
     )
     .await
@@ -965,7 +957,7 @@ async fn append_waypoint_consults_cursor_when_no_explicit_parent() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
 
     std::fs::write(td.path().join("a.md"), "body").unwrap();
     std::fs::write(td.path().join("b.md"), "body").unwrap();
@@ -973,20 +965,20 @@ async fn append_waypoint_consults_cursor_when_no_explicit_parent() {
 
     // Cursor stays put across appends — A and B both land at root.
     let wp_a = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp_b = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Point cursor at A; append C with no explicit parent → should
     // land as a child of A, not of B.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp_a.waypoint_id)).await.unwrap();
     let wp_c = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
@@ -1019,27 +1011,27 @@ async fn append_waypoint_explicit_parent_overrides_cursor() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
 
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     std::fs::write(td.path().join("b.md"), "b").unwrap();
     std::fs::write(td.path().join("c.md"), "b").unwrap();
 
     let wp_a = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp_b = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Cursor = A, explicit parent = B → child of B; cursor stays at A
     // (appends never move the cursor — exclusively user-controlled).
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp_a.waypoint_id)).await.unwrap();
     let wp_c = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: Some(&wp_b.waypoint_id), annotation: None, },
     ).await.unwrap();
 
@@ -1073,18 +1065,18 @@ async fn append_waypoint_does_not_move_cursor() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     std::fs::write(td.path().join("b.md"), "b").unwrap();
     std::fs::write(td.path().join("c.md"), "b").unwrap();
 
     // Three appends with cursor = None → three siblings at root.
     let wp1 = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     let wp2 = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
@@ -1097,10 +1089,10 @@ async fn append_waypoint_does_not_move_cursor() {
     assert!(fm.waypoints[1].waypoints.is_empty());
 
     // Move cursor to wp1; two appends under it become siblings under wp1.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp1.waypoint_id)).await.unwrap();
     let wp3 = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "c.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
@@ -1132,7 +1124,7 @@ async fn append_waypoint_with_stale_cursor_falls_back_to_root() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
 
     // Hand-set a stale cursor by reading + writing the trail-doc.
     let src = std::fs::read_to_string(td.path().join(&trail.trail_doc_rel)).unwrap();
@@ -1143,7 +1135,7 @@ async fn append_waypoint_with_stale_cursor_falls_back_to_root() {
 
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
@@ -1175,17 +1167,17 @@ async fn remove_waypoint_resets_cursor_when_removed() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Move cursor onto wp explicitly, then remove wp → cursor must reset.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp.waypoint_id)).await.unwrap();
     remove_waypoint(
-        &watcher, &idx.job_sender(), &vault, None, &trash,
+        &watcher, &idx.job_sender(), &vault, &trash,
         &trail.trail_doc_rel, &wp.waypoint_id,
     ).await.unwrap();
 
@@ -1212,27 +1204,27 @@ async fn remove_waypoint_resets_cursor_when_ancestor_removed() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     std::fs::write(td.path().join("b.md"), "b").unwrap();
     let wp_y = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Set cursor on wp_y so the next append lands as a child.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp_y.waypoint_id)).await.unwrap();
     let wp_x = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Move cursor onto wp_x — the deeper descendant.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp_x.waypoint_id)).await.unwrap();
 
     // Remove the ancestor wp_y → cascades wp_x → cursor must reset.
     remove_waypoint(
-        &watcher, &idx.job_sender(), &vault, None, &trash,
+        &watcher, &idx.job_sender(), &vault, &trash,
         &trail.trail_doc_rel, &wp_y.waypoint_id,
     ).await.unwrap();
 
@@ -1260,26 +1252,26 @@ async fn remove_waypoint_preserves_cursor_when_sibling_removed() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     std::fs::write(td.path().join("b.md"), "b").unwrap();
 
     let wp_a = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Cursor stays None across appends, so wp_b is a root sibling.
     let wp_b = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "b.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
     // Point cursor at wp_a.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp_a.waypoint_id)).await.unwrap();
 
     // Remove the sibling wp_b → cursor (wp_a) unchanged.
     remove_waypoint(
-        &watcher, &idx.job_sender(), &vault, None, &trash,
+        &watcher, &idx.job_sender(), &vault, &trash,
         &trail.trail_doc_rel, &wp_b.waypoint_id,
     ).await.unwrap();
 
@@ -1305,15 +1297,15 @@ async fn set_append_cursor_round_trip() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
     std::fs::write(td.path().join("a.md"), "b").unwrap();
     let wp = append_waypoint_test(
-        &watcher, &idx.job_sender(), &vault, None, &mut read_store,
+        &watcher, &idx.job_sender(), &vault, &mut read_store,
         AppendWaypointRequest { trail_doc_rel: &trail.trail_doc_rel, source_rel: "a.md", parent_waypoint_id: None, annotation: None, },
     ).await.unwrap();
 
     // Set to None.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, None).await.unwrap();
     let fm = parse_trail_doc(
         &std::fs::read_to_string(td.path().join(&trail.trail_doc_rel)).unwrap()
@@ -1321,7 +1313,7 @@ async fn set_append_cursor_round_trip() {
     assert!(fm.append_under.is_none());
 
     // Set to wp.
-    set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some(&wp.waypoint_id)).await.unwrap();
     let fm = parse_trail_doc(
         &std::fs::read_to_string(td.path().join(&trail.trail_doc_rel)).unwrap()
@@ -1343,9 +1335,9 @@ async fn set_append_cursor_rejects_unknown_id() {
         new_trail_dir: "trails/".into(),
     };
     let trail =
-        create_trail(&watcher, &idx.job_sender(), &vault, None, &cfg, "t").await.unwrap();
+        create_trail(&watcher, &idx.job_sender(), &vault, &cfg, "t").await.unwrap();
 
-    let err = set_append_cursor(&watcher, &idx.job_sender(), &vault, None,
+    let err = set_append_cursor(&watcher, &idx.job_sender(), &vault,
         &trail.trail_doc_rel, Some("01HBOGUS")).await.unwrap_err();
     assert!(matches!(err, HikerError::NotFound(_)),
         "set_append_cursor must reject a waypoint id that doesn't resolve: got {err:?}");
@@ -1364,7 +1356,6 @@ async fn on_note_moved_no_trails_returns_zero() {
         None,
         None,
         &vault,
-        None,
         &mut store,
         "notes/foo.md",
         "notes/bar.md",

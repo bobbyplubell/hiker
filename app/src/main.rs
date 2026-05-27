@@ -18,6 +18,7 @@ mod panels_registry;
 mod profiling;
 mod sidebar;
 mod state;
+mod sync_service;
 mod tab;
 mod tabs;
 mod theme;
@@ -206,13 +207,17 @@ impl eframe::App for HikerApp {
             crate::profile_scope!("drains");
             self.state.drain_fs_events();
             self.state.drain_indexer_events();
+            self.state.drain_sync_events();
+            self.state.drain_fork_diff_results();
+            self.state.reconcile_sync();
             self.state.drain_mutation_events();
         }
 
         {
             crate::profile_scope!("snapshots");
             self.state.refresh_task_snapshot();
-            self.state.refresh_staging_snapshot();
+            self.state.refresh_pending_proposals();
+            self.state.refresh_whole_file_proposals();
             self.state.refresh_skipped_paths();
             self.state.poll_cluster_llm_job();
         }
@@ -430,15 +435,33 @@ fn refresh_skipped_paths(&mut self) {
     state.ui_cache.skipped_paths = snap;
 }
 
-/// Copy the latest staging snapshot out of the pollster's `watch`
-/// channel. Render-loop callers (toolbar badge, buffer banner,
-/// agent-diff toggle, status bar) read `ui_cache.staging_snapshot`
-/// instead of each firing their own `Staging::list_pending` SQLite
-/// query.
-fn refresh_staging_snapshot(&mut self) {
+/// Refresh the per-frame snapshot of the vault's pending agent ops from the
+/// op log. Render-loop callers (toolbar badge, status-bar pending count, the
+/// Patch-review tab badge, and the chat-card live-op-id set) read
+/// `ui_cache.pending_snapshot` instead of each firing their own op-log walk.
+/// The pending count is `op_writes::list_pending_proposals(...).len()`. A
+/// failed walk leaves the prior snapshot in place so a transient I/O hiccup
+/// doesn't blink the badge off.
+fn refresh_pending_proposals(&mut self) {
     let state = self;
-    let snap = state.vault_session.events.staging_snapshot_rx.borrow().clone();
-    state.ui_cache.staging_snapshot = snap;
+    let log = state.vault_session.services.oplog.clone();
+    if let Ok(props) = hiker_core::ops::op_writes::list_pending_proposals(log.as_ref()) {
+        state.ui_cache.pending_snapshot = props;
+    }
+}
+
+/// Refresh the per-frame snapshot of pending whole-file (`write_note`-shaped)
+/// proposals from the op log. The buffer review surface (version dropdown,
+/// pending-rewrite banner, agent-diff toggle) reads
+/// `ui_cache.whole_file_proposals` instead of each firing its own op-log walk.
+/// A failed walk leaves the prior snapshot in place rather than clearing it,
+/// so a transient I/O hiccup doesn't blink the review affordances off.
+fn refresh_whole_file_proposals(&mut self) {
+    let state = self;
+    let log = state.vault_session.services.oplog.clone();
+    if let Ok(props) = hiker_core::ops::op_writes::list_whole_file_proposals(log.as_ref()) {
+        state.ui_cache.whole_file_proposals = props;
+    }
 }
 
 /// Drive the async vault-switch state machine. Called once per frame
@@ -459,6 +482,21 @@ fn progress_vault_switch(
     let current = std::mem::take(&mut state.vault_switch);
     match current {
         VaultSwitchState::Idle => {}
+        VaultSwitchState::Picking(mut rx) => match rx.try_recv() {
+            Ok(Some(path)) => state.request_vault_switch(path),
+            // Dialog dismissed without a choice.
+            Ok(None) => state.vault_switch = VaultSwitchState::Idle,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                // Dialog still open — keep polling without blocking the UI
+                // thread, and force a repaint so we actually get polled
+                // again even when the app is otherwise idle.
+                state.vault_switch = VaultSwitchState::Picking(rx);
+                ctx.request_repaint();
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                state.vault_switch = VaultSwitchState::Idle;
+            }
+        },
         VaultSwitchState::Requested(path) => {
             let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<AppState>>();
             let p = path.clone();
@@ -505,6 +543,49 @@ fn progress_vault_switch(
     }
 }
 
+/// Resolve a folder the user picked into the next switch state: ignore a
+/// re-pick of the current vault, queue the switch outright when no buffer
+/// is dirty, and otherwise raise a confirm modal so unsaved work isn't
+/// discarded silently. (Lifted out of the toolbar action so it can run
+/// when the async picker resolves rather than on the UI thread.)
+fn request_vault_switch(&mut self, path: std::path::PathBuf) {
+    let state = self;
+    if path == state.vault_session.vault_root {
+        state.vault_switch = VaultSwitchState::Idle;
+        return;
+    }
+    let dirty: Vec<String> = state
+        .session
+        .buffers
+        .iter()
+        .filter(|(_, b)| b.is_dirty())
+        .map(|(p, _)| p.clone())
+        .collect();
+    if dirty.is_empty() {
+        state.push_toast(
+            format!("Switching vault to {}", path.display()),
+            crate::state::ToastLevel::Info,
+        );
+        state.vault_switch = VaultSwitchState::Requested(path);
+        return;
+    }
+    let body = format!(
+        "{} unsaved buffer{} will be discarded:\n  {}",
+        dirty.len(),
+        if dirty.len() == 1 { "" } else { "s" },
+        dirty.join("\n  "),
+    );
+    state.session.modal = Some(crate::state::Modal::Confirm {
+        title: "Switch vault?".into(),
+        body,
+        confirm_label: "Discard and switch".into(),
+        cancel_label: "Cancel".into(),
+        danger: true,
+        intent: crate::state::ConfirmIntent::SwitchVault { path },
+    });
+    state.vault_switch = VaultSwitchState::Idle;
+}
+
 /// Pull queued indexer-progress lines into the bounded ring buffer used
 /// by the Index tab.
 fn drain_indexer_events(&mut self) {
@@ -532,6 +613,122 @@ fn drain_indexer_events(&mut self) {
         > crate::state::INDEXER_EVENTS_MAX
     {
         state.vault_session.events.indexer_events.pop_front();
+    }
+}
+
+/// Pull queued sync-progress lines into the bounded ring buffer used by the
+/// Sync tab. Mirrors `drain_indexer_events`.
+fn drain_sync_events(&mut self) {
+    let state = self;
+    let drained: Vec<String> = {
+        let mut rx = state
+            .vault_session
+            .events
+            .sync_events_rx
+            .lock()
+            .unwrap();
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(line);
+        }
+        out
+    };
+    if drained.is_empty() {
+        return;
+    }
+    for line in drained {
+        state.vault_session.events.sync_events.push_back(line);
+    }
+    while state.vault_session.events.sync_events.len()
+        > crate::state::SYNC_EVENTS_MAX
+    {
+        state.vault_session.events.sync_events.pop_front();
+    }
+}
+
+/// Drain on-demand fork-diff fetch results into the Sync page's "view diff"
+/// cache (`panels.sync.fork_diffs`), keyed by the forked doc's path. Mirrors
+/// `drain_sync_events`: a spawned `fetch_fork_diff` task feeds the channel,
+/// this folds each `(path, Ok(text) | Err(msg))` into `Ready` / `Error` so the
+/// render path reads the cache, never the node. [sync-fork-diff]
+fn drain_fork_diff_results(&mut self) {
+    let state = self;
+    let drained: Vec<crate::sync_service::ForkDiffResult> = {
+        let mut rx = state
+            .vault_session
+            .events
+            .fork_diff_rx
+            .lock()
+            .unwrap();
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            out.push(item);
+        }
+        out
+    };
+    for (path, result) in drained {
+        let entry = match result {
+            Ok(text) => crate::panels::sync::ForkDiffState::Ready(text),
+            Err(msg) => crate::panels::sync::ForkDiffState::Error(msg),
+        };
+        state.panels.sync.fork_diffs.insert(path, entry);
+    }
+}
+
+/// Reconcile the live sync engine with `[sync].enabled` every frame — both
+/// directions are live, no vault reopen. Turning the toggle ON builds + spawns
+/// the engine immediately; turning it OFF cancels its responder loop, which
+/// drops the swarm (closing the TCP listener and stopping mDNS). Cheap in
+/// steady state (a config read + an `Option` check); it only does work on a
+/// transition. Runs inside the frame's tokio runtime guard so the engine's
+/// `tokio::spawn` has a reactor. The Settings toggle swaps the in-memory
+/// config, so flipping `[sync]` there trips this on the next frame.
+/// [sync-disable-kill-switch]
+fn reconcile_sync(&mut self) {
+    let state = self;
+    let enabled = state
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.sync.enabled)
+        .unwrap_or(false);
+    let running = state.vault_session.services.sync.is_some();
+    match (enabled, running) {
+        // Live disable: stop the running engine now.
+        (false, true) => {
+            if let Some(svc) = state.vault_session.services.sync.take() {
+                svc.shutdown();
+                state.push_toast(
+                    "Sync disabled — engine stopped",
+                    crate::state::ToastLevel::Info,
+                );
+            }
+        }
+        // Live enable: build + spawn without a reopen. A fresh progress channel
+        // is swapped in — the boot-time one is closed when sync started disabled
+        // — so the Sync page's log reads the live sender.
+        (true, false) => {
+            let section = match state.vault_session.config.read() {
+                Ok(c) => c.sync.clone(),
+                Err(_) => return,
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (fork_tx, fork_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::sync_service::ForkDiffResult>();
+            let oplog = state.vault_session.services.oplog.clone();
+            let vault_root = state.vault_session.vault_root.clone();
+            let cancel = state.vault_session.cancel.clone();
+            let spawner = crate::bootstrap::Spawner { cancel };
+            if let Some(svc) =
+                spawner.spawn_sync_service(&vault_root, oplog, &section, tx, fork_tx)
+            {
+                state.vault_session.events.sync_events_rx = std::sync::Mutex::new(rx);
+                state.vault_session.events.fork_diff_rx = std::sync::Mutex::new(fork_rx);
+                state.vault_session.services.sync = Some(svc);
+                state.push_toast("Sync enabled", crate::state::ToastLevel::Info);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -50,6 +50,19 @@ STRUCTURAL CHECKS — survive renames.
    names heavily, they are one module wearing two hats. Reported as
    coupled pairs.
 
+EXEMPTION — legitimate impl-splits.
+
+Checks 6 (sibling-only) and 7 (super-reach) skip files that are pure
+`impl <ParentType>` continuations: one or more module-level `impl`
+blocks and zero module-level item definitions of their own (no
+fn/struct/enum/trait/type/const/static at column 0). Splitting a large
+type's `impl` across files for length is a legitimate Rust pattern — such
+a file *is* the parent's implementation, not a shard leaning on it, so it
+necessarily reaches into the parent's sibling layers and its methods are
+called wherever the parent type is used (possibly from another crate). A
+fake shard carries its own helper `fn` / `struct` defs and so does not
+qualify.
+
 Tightening or loosening these thresholds is a deliberate posture
 change, not an agent's escape hatch — edit this file with intent.
 """
@@ -121,6 +134,15 @@ SUPER_REACH_MAX = 5
 # When two sibling module directories reference each other heavily,
 # flag the pair. References counted via stem occurrences in source.
 COUPLING_MIN_REFS_EACH_WAY = 4
+
+# Impl-split exemption (see module docstring). A module-level item
+# definition disqualifies a file from the pure-`impl` exemption; a
+# module-level `impl` block at column 0 is what qualifies it.
+TOP_LEVEL_DEF_RE = re.compile(
+    r"^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+\"[^\"]*\"\s+)?(?:fn|struct|enum|trait|type|const|static|union)\b"
+)
+TOP_LEVEL_IMPL_RE = re.compile(r"^(?:unsafe\s+)?impl[<\s]")
 
 
 # ----- file iteration & basic helpers ---------------------------------
@@ -200,6 +222,23 @@ def strip_strings_and_comments(text: str) -> str:
     return "".join(out)
 
 
+def is_pure_impl_split(stripped_text: str) -> bool:
+    """True for a file that is purely a continuation of a parent type's
+    `impl` — one or more module-level `impl` blocks and NO module-level item
+    definitions of its own. Such a file is the parent's implementation split
+    across files for length, not a shard leaning on its parent, so it is
+    exempt from the sibling-only and super-reach checks (see module docstring).
+    Pass the comment/string-stripped source so keywords in comments don't
+    register."""
+    has_impl = False
+    for line in stripped_text.splitlines():
+        if TOP_LEVEL_DEF_RE.match(line):
+            return False
+        if TOP_LEVEL_IMPL_RE.match(line):
+            has_impl = True
+    return has_impl
+
+
 # ----- individual checks ----------------------------------------------
 
 
@@ -276,6 +315,10 @@ def check_min_size(path: Path, rel: str, text: str, failures: list[str]) -> None
 
 def check_super_reach(path: Path, rel: str, text: str, failures: list[str]) -> None:
     if path.name in MOD_ROOTS:
+        return
+    # Legitimate impl-split (pure `impl ParentType`, no own defs) inherently
+    # reaches into the parent's layers — exempt (see module docstring).
+    if is_pure_impl_split(strip_strings_and_comments(text)):
         return
     count = 0
     for line in text.splitlines():
@@ -367,6 +410,10 @@ def check_sibling_only_files(
             continue
         stem = f.stem
         if stem in SIBLING_ONLY_EXEMPT_STEMS:
+            continue
+        # Pure `impl ParentType` continuation — its methods are part of the
+        # parent type's API, not a sibling-serving shard (see module docstring).
+        if is_pure_impl_split(stripped[f]):
             continue
         siblings = by_dir[f.parent]
         if len(siblings) < 3:

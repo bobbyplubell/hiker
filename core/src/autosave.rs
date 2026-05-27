@@ -6,7 +6,7 @@
 //! `index.json` carrying the path↔id map, per-entry content hash, and
 //! the authoritative tab-state snapshot. All filesystem writes for the
 //! autosave directory live here — module discipline mirrors
-//! `core::store` and `core::changes`.
+//! `core::store`.
 //
 // status: autosave-backend-module
 // status: autosave-store-layout

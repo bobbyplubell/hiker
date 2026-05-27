@@ -1,34 +1,14 @@
 //! User-driven file mutations: create / move / delete / restore. Each op
-//! sequences watcher suppression, the relevant `IndexJob`, and a changelog
-//! row authored as `"user"`.
+//! sequences watcher suppression and the relevant `IndexJob`.
 //!
 //! See the module-level doc on `super` for the suppression-and-await
 //! discipline these ops share with the agent and buffer variants.
 
-use std::sync::Arc;
-
-use crate::changes::{ChangeAppend, ChangeOp, Changes};
 use crate::errors::HikerError;
-use crate::hash_string;
 use crate::indexer::{IndexJob, IndexJobTx};
 use crate::trash::{Trash, Entry};
 use crate::vault::Vault;
 use crate::watcher::Watcher;
-
-use super::{append_change_best_effort, read_for_changelog};
-
-/// Hash a file's bytes for the changelog row. UTF-8 paths use the same
-/// `hash_string` as text writes so the same content yields the same hash on
-/// round-trip; non-UTF-8 falls back to a raw blake3 over the bytes.
-fn hash_bytes(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => hash_string(s),
-        // Non-UTF-8 file: hash the raw bytes via blake3 directly. We don't
-        // track this case in chunker dispatch, but the changelog is honest
-        // about content regardless of encoding.
-        Err(_) => blake3::hash(bytes).to_hex().to_string(),
-    }
-}
 
 /// Create an empty new note in `folder` (vault-relative; `""` = vault root)
 /// with an auto-suffixed name following `name_template`. The first free
@@ -44,7 +24,6 @@ pub async fn create_with_suffix(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     folder: &str,
     name_template: &str,
 ) -> Result<String, HikerError> {
@@ -84,23 +63,6 @@ pub async fn create_with_suffix(
     // Created event, not at function entry.
     watcher.suppress(created.clone());
 
-    // Append the changelog row before the index job so the recent-activity
-    // widget can refresh via `hiker:changes-appended` even if the indexer is
-    // still loading the embedder.
-    let empty: &[u8] = &[];
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: &created,
-            op: ChangeOp::Created,
-            author: "user",
-            content_hash: Some(&hash_string("")),
-            content: Some(empty),
-            rename_from: None,
-            metadata: serde_json::json!({}),
-        },
-    );
-
     // Explicitly index the new file (the watcher event was suppressed).
     let _ = jobs
         .send(IndexJob::Upsert {
@@ -118,8 +80,6 @@ pub async fn create_with_suffix(
 pub async fn move_note(
     watcher: &Watcher,
     jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     from: &str,
     to: &str,
 ) -> Result<(), HikerError> {
@@ -143,22 +103,6 @@ pub async fn move_note(
     watcher.suppress(from.to_string());
     watcher.suppress(to.to_string());
 
-    if result.is_ok() {
-        let body = read_for_changelog(vault, to);
-        let hash = body.as_deref().map(hash_bytes);
-        append_change_best_effort(
-            changes,
-            ChangeAppend {
-                path: to,
-                op: ChangeOp::Renamed,
-                author: "user",
-                content_hash: hash.as_deref(),
-                content: body.as_deref(),
-                rename_from: Some(from),
-                metadata: serde_json::json!({}),
-            },
-        );
-    }
     result
 }
 
@@ -175,7 +119,6 @@ pub async fn move_folder(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     from: &str,
     to: &str,
 ) -> Result<(), HikerError> {
@@ -212,27 +155,6 @@ pub async fn move_folder(
         watcher.suppress(format!("{to}/{suffix}"));
     }
 
-    // One Renamed row per affected note — folder renames touch every member.
-    if result.is_ok() {
-        for m in &members {
-            let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
-            let new_path = format!("{to}/{suffix}");
-            let body = read_for_changelog(vault, &new_path);
-            let hash = body.as_deref().map(hash_bytes);
-            append_change_best_effort(
-                changes,
-                ChangeAppend {
-                    path: &new_path,
-                    op: ChangeOp::Renamed,
-                    author: "user",
-                    content_hash: hash.as_deref(),
-                    content: body.as_deref(),
-                    rename_from: Some(m),
-                    metadata: serde_json::json!({}),
-                },
-            );
-        }
-    }
     result
 }
 
@@ -246,7 +168,6 @@ pub async fn delete(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     rel: &str,
 ) -> Result<Entry, HikerError> {
     // Pre-suppress the root + every `.md` member. On Linux/macOS `fs::rename`
@@ -271,45 +192,11 @@ pub async fn delete(
         .map_err(|_| HikerError::Io("indexer dropped delete reply".into()))?;
 
     watcher.suppress(rel.to_string());
-    if let Ok(entry) = &result {
-        if let Some(members) = &entry.members {
-            for m in members {
-                watcher.suppress(m.clone());
-            }
-        }
-        // Append one Deleted row per affected note (members for folder
-        // deletes, just the path for files). Content is NULL for deletes;
-        // rollback walks back to the row before the delete for the prior
-        // content blob.
-        match &entry.members {
-            Some(members) => {
-                for m in members {
-                    append_change_best_effort(
-                        changes,
-                        ChangeAppend {
-                            path: m,
-                            op: ChangeOp::Deleted,
-                            author: "user",
-                            content_hash: None,
-                            content: None,
-                            rename_from: None,
-                            metadata: serde_json::json!({}),
-                        },
-                    );
-                }
-            }
-            None => append_change_best_effort(
-                changes,
-                ChangeAppend {
-                    path: rel,
-                    op: ChangeOp::Deleted,
-                    author: "user",
-                    content_hash: None,
-                    content: None,
-                    rename_from: None,
-                    metadata: serde_json::json!({}),
-                },
-            ),
+    if let Ok(entry) = &result
+        && let Some(members) = &entry.members
+    {
+        for m in members {
+            watcher.suppress(m.clone());
         }
     }
     result
@@ -323,8 +210,6 @@ pub async fn delete(
 pub async fn restore(
     watcher: &Watcher,
     jobs: &IndexJobTx,
-    vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     trash: &Trash,
     id: &str,
 ) -> Result<Entry, HikerError> {
@@ -356,44 +241,6 @@ pub async fn restore(
         if let Some(members) = &entry.members {
             for m in members {
                 watcher.suppress(m.clone());
-            }
-        }
-        // Per spec: restore logs as a fresh `'created'` event (the prior
-        // `'deleted'` row stays in the log; restoration is a new event).
-        match &entry.members {
-            Some(members) => {
-                for m in members {
-                    let body = read_for_changelog(vault, m);
-                    let hash = body.as_deref().map(hash_bytes);
-                    append_change_best_effort(
-                        changes,
-                        ChangeAppend {
-                            path: m,
-                            op: ChangeOp::Created,
-                            author: "user",
-                            content_hash: hash.as_deref(),
-                            content: body.as_deref(),
-                            rename_from: None,
-                            metadata: serde_json::json!({"restored": true}),
-                        },
-                    );
-                }
-            }
-            None => {
-                let body = read_for_changelog(vault, &entry.original_path);
-                let hash = body.as_deref().map(hash_bytes);
-                append_change_best_effort(
-                    changes,
-                    ChangeAppend {
-                        path: &entry.original_path,
-                        op: ChangeOp::Created,
-                        author: "user",
-                        content_hash: hash.as_deref(),
-                        content: body.as_deref(),
-                        rename_from: None,
-                        metadata: serde_json::json!({"restored": true}),
-                    },
-                );
             }
         }
     }

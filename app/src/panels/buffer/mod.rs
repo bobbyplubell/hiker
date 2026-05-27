@@ -3,12 +3,19 @@
 //! non-buffer kinds).
 #![allow(clippy::items_after_test_module)]
 
+pub mod clipboard_menu;
+pub mod conflict;
 pub mod decorations;
 pub mod diff_overlay;
+mod editor_binding;
+mod format;
+pub mod minimap_opts;
+pub mod patch_review;
 pub mod patch_review_pill;
 pub mod scrollbar;
 pub mod show_changes;
 pub mod toolbar_menus;
+pub mod wikilink_nav;
 
 use std::sync::Arc;
 
@@ -20,6 +27,7 @@ use editor_core::theme::light_default;
 use editor_egui::widget::Widget as EditorWidget;
 use editor_egui::minimap::Options as MinimapOptions;
 use editor_egui::minimap::Widget as MinimapWidget;
+use minimap_opts::MinimapOptionsExt;
 use editor_md::admonitions::callout_decorations;
 use editor_md::folds::fold_decorations;
 use editor_md::notes::footnote_decorations;
@@ -48,6 +56,230 @@ use crate::state::{AppState, ToastLevel};
 use crate::theme;
 
 
+/// Buffer-derived inputs the decoration rebuild needs that are *not* the
+/// editor state or view (those arrive as the widget hook's two args). Bundling
+/// them keeps `rebuild_editor_decorations` under the `too_many_arguments` cap
+/// while preserving identical behavior — every field is read exactly where the
+/// old inline block read the matching `buffer.*` field.
+struct DecoRebuildCtx<'a> {
+    cache: &'a mut DecorationCache,
+    folds: &'a std::collections::HashSet<u64>,
+    loaded_text: &'a str,
+    theme: Option<&'a editor_core::theme::Theme>,
+    live_preview: bool,
+    chunk_boundaries: bool,
+    show_whitespace: bool,
+    highlight_trailing_whitespace: bool,
+    diff: Option<&'a diff_overlay::DiffOverlay>,
+    /// Maps a wikilink target (ULID or name) to the note's current title for
+    /// live-title rendering; `None` falls back to plain (non-clickable) link
+    /// pills (read-only previews). status: wikilink-render-live-title
+    resolve_title: Option<&'a editor_md::links::TitleResolver<'a>>,
+}
+
+/// Rebuild every decoration layer for the editor against the *current* doc
+/// state. Invoked through `EditorWidget::with_decoration_rebuild` so it runs
+/// AFTER the widget applies this frame's input but BEFORE it measures heights /
+/// paints — keeping marker-hiding / block decorations aligned with the
+/// post-edit text (no one-frame live-preview flash per keystroke).
+///
+/// `editor` / `view` are the post-edit editor state + view the widget hands
+/// back; everything else rides in `ctx`.
+fn rebuild_editor_decorations(
+    editor: &editor_core::state::Editor,
+    view: &mut editor_view::viewport::ViewState,
+    ctx: &mut DecoRebuildCtx<'_>,
+) {
+    let DecoRebuildCtx {
+        cache,
+        folds,
+        loaded_text,
+        theme,
+        live_preview,
+        chunk_boundaries,
+        show_whitespace,
+        highlight_trailing_whitespace,
+        diff,
+        resolve_title,
+    } = ctx;
+    let theme = *theme;
+    let resolve_title = *resolve_title;
+    // Compute the visible byte range up-front so we can scope paint-only
+    // providers to the viewport.
+    let visible = view.visible_lines();
+    let last_line = editor.doc.len_lines().saturating_sub(1);
+    let visible_start = editor.doc.line_to_byte(visible.start.min(last_line));
+    let visible_end_line = visible.end.min(last_line);
+    let visible_end = if visible_end_line + 1 < editor.doc.len_lines() {
+        editor.doc.line_to_byte(visible_end_line + 1)
+    } else {
+        editor.doc.len_bytes()
+    };
+    let visible_range = visible_start..visible_end;
+
+    // Fingerprint inputs for memoized providers. `content_id` is an Arc
+    // pointer into the rope tree — changes only on doc edits, so idle / pure
+    // scroll frames hit the cache.
+    let doc_id = editor.doc.content_id() as u64;
+    let sel = editor.selection.main().head.offset() as u64;
+    // Layers whose only cursor dependence is "is the cursor on this line?"
+    // (markdown reveal, wikilink reveal) key on the line index instead of
+    // the byte offset — otherwise a selection drag busts the cache on every
+    // byte and reparses the whole doc per frame.
+    let cursor_line = editor.doc.byte_to_line(sel as usize) as u64;
+    // Inlined `folds_hash`: XOR-mix the fold ids in an order-independent
+    // way. Cheap and stable for memoization keys (HashSet iteration order
+    // isn't deterministic).
+    let folds_id: u64 = {
+        let mut h: u64 = 0;
+        for &id in folds.iter() {
+            h ^= id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        h
+    };
+    let vp_lo = visible_start as u64;
+    let vp_hi = visible_end as u64;
+    let vp_fp = mix(vp_lo, vp_hi);
+
+    crate::profile_scope!("rebuild decorations");
+    view.decorations.clear();
+
+    // Per-layer caching follows the same shape everywhere: gate on a flag,
+    // mix a fingerprint, either reuse the cached `Set` or rebuild
+    // it via the supplied closure, then push (optionally with heights for
+    // layers that emit Line decorations the heightmap needs to see).
+    //
+    // `cached!(slot, fp, build, heights?)` keeps the per-layer code to a
+    // single line each. `heights` is the optional fourth arg — when present,
+    // the layer goes through `push_with_heights`; otherwise plain `push`.
+    macro_rules! cached {
+        ($slot:ident, $fp:expr, $build:expr) => {{
+            let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
+            view.decorations.push(v);
+        }};
+        ($slot:ident, $fp:expr, $build:expr, heights) => {{
+            let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
+            view.decorations.push_with_heights(v);
+        }};
+    }
+
+    // active_line is cheap to BUILD, but it's not cheap to *not cache* —
+    // each fresh `RangeSet::from_iter` call hands back a new `Arc`, which
+    // flips `view.decorations.signature` (mix of every layer's
+    // `content_id`). That signature is part of the per-line galley cache
+    // key, so an unstable signature invalidates every visible line's
+    // layout every frame. Cache on `(doc_id, sel)` — the inputs the
+    // provider actually depends on — so idle / pure-scroll frames return
+    // the same Arc and the galley cache holds.
+    cached!(active_line, mix(doc_id, sel), || {
+        active_line_decorations(editor)
+    });
+
+    // Paint-only, viewport-scoped, doc-only-dependent. Gated on its
+    // own View-menu toggle (`view-highlight-trailing-whitespace-toggle`).
+    if *highlight_trailing_whitespace {
+        cached!(trailing_ws, mix(doc_id, vp_fp), || {
+            trailing_whitespace_decorations(editor, Some(&visible_range))
+        });
+    }
+
+    // Index-diff gutter (`compute_diff` parity). Cached on (doc content
+    // id, loaded-text length + ptr hash) — `loaded_text` is only swapped
+    // on disk reads/writes, so its address + length together act as a
+    // cheap identity fingerprint that survives across paints. Without
+    // this cache, every paint runs a full line-level `diff::compute`
+    // over the buffer + on-disk snapshot, which is the dominant scroll
+    // cost on non-trivial files.
+    let loaded_fp = mix(loaded_text.as_ptr() as u64, loaded_text.len() as u64);
+    cached!(index_diff, mix(doc_id, loaded_fp), || {
+        editor.index_diff_decorations(loaded_text)
+    });
+
+    // markdown / fold / fold emit Line decorations with
+    // `hide: true` or `height_scale`, so they go through `push_with_heights`
+    // to reach the heightmap driver. markdown depends on cursor line
+    // (code blocks reveal on cursor-on-line); fold/frontmatter on the fold
+    // set. Live-preview layers stay gated on `buffer.live_preview`; the
+    // structural fold layer is unconditional so manual folds keep working
+    // when previews are off.
+    if *live_preview {
+        cached!(markdown, mix(mix(doc_id, cursor_line), folds_id),
+            || markdown_decorations(editor, theme), heights);
+    }
+    cached!(fold, mix(doc_id, folds_id),
+        || fold_decorations(editor, folds), heights);
+
+    if *live_preview {
+        // wikilink reveals when the cursor isn't on the same line —
+        // selection-dependent on top of doc + viewport.
+        cached!(wikilink, mix(mix(doc_id, cursor_line), vp_fp),
+            || wikilink_decorations(editor, theme, Some(&visible_range), resolve_title));
+        cached!(callout, mix(doc_id, vp_fp),
+            || callout_decorations(editor, theme, Some(&visible_range)));
+    }
+
+    cached!(frontmatter, mix(doc_id, folds_id),
+        || frontmatter_fold(editor, folds, theme), heights);
+
+    if *live_preview {
+        cached!(transclusion, mix(doc_id, vp_fp),
+            || transclusion_decorations(editor, theme, Some(&visible_range)));
+        cached!(footnote, mix(doc_id, vp_fp),
+            || footnote_decorations(editor, theme, Some(&visible_range)));
+        cached!(math, mix(doc_id, vp_fp),
+            || math_decorations(editor, theme, Some(&visible_range)));
+        cached!(mermaid, mix(doc_id, vp_fp),
+            || mermaid_decorations(editor, theme, Some(&visible_range)));
+    }
+
+    // Chunk-boundary visualisation: a gutter marker + faint background at
+    // every chunk start, so the user can see how the indexer slices this
+    // note (`view-show-chunk-boundaries`).
+    if *chunk_boundaries {
+        cached!(chunk_boundaries, doc_id, || {
+            editor.chunk_boundary_decorations()
+        });
+    }
+
+    // Whitespace overlay (view-menu toggle). Doc-dependent only; cache
+    // on doc_id so the layer's Arc stays stable across scroll frames and
+    // doesn't flip `layers_sig`.
+    if *show_whitespace {
+        cached!(special_chars, doc_id, || {
+            let flags = SpecialCharsFlags {
+                tabs: true,
+                spaces: true,
+                nbsp: true,
+                zero_width: true,
+                crlf: true,
+            };
+            special_chars_decorations(editor, flags)
+        });
+    }
+
+    // Diff overlay: view zones for removed lines + line backgrounds for
+    // added/modified ranges, computed once at the top of `show`. Pushed
+    // last so the diff stacks above other decoration layers; goes through
+    // `push_with_heights` because the Block entries reserve space in the
+    // line-height map.
+    if let Some(ov) = diff {
+        view.decorations.push_with_heights(ov.decorations.clone());
+    }
+
+    // Viewport-scoped layers (occurrence highlight, bracket match). Both
+    // are cheap to build, but constructing a fresh `RangeSet` every frame
+    // flips `view.decorations.signature` (Arc-pointer-based content_id)
+    // and forces the per-line galley cache to rebuild every visible row.
+    // Cache them on the inputs the provider actually depends on so the
+    // signature stays stable on idle/scroll frames.
+    cached!(occurrence, mix(mix(doc_id, sel), vp_fp), || {
+        occurrence_decorations(editor, visible_range.clone())
+    });
+    cached!(bracket_match, mix(doc_id, sel), || {
+        bracket_match_decorations(editor, DEFAULT_BRACKETS, 5000)
+    });
+}
+
 /// Combine multiple u64 values into a single fingerprint via splitmix-style
 /// hashing. Order-dependent.
 const fn mix(seed: u64, x: u64) -> u64 {
@@ -62,10 +294,10 @@ const fn mix(seed: u64, x: u64) -> u64 {
 /// them methods on `&mut self` keeps them factored without tripping
 /// `clippy::single_call_fn` (the lint exempts methods with a `self`
 /// receiver).
-struct BufCtx<'a> {
-    ui: &'a mut egui::Ui,
-    app: &'a mut AppState,
-    path: &'a str,
+pub(super) struct BufCtx<'a> {
+    pub(super) ui: &'a mut egui::Ui,
+    pub(super) app: &'a mut AppState,
+    pub(super) path: &'a str,
 }
 
 /// Heading-breadcrumb lookup on a buffer. Standalone trait so the tests
@@ -118,8 +350,27 @@ impl<'a> BufCtx<'a> {
             && matches!(ov.owner, editor_diff::DiffOwner::Agent)
         {
             let cursor_byte = self.cursor_byte();
+            let active_session = self
+                .app
+                .session
+                .buffers
+                .get(self.path)
+                .and_then(|b| b.active_session.clone());
+            // Drift + multi-session metadata for the active document, read
+            // off the op log. The drifted count rides the pill's `(M
+            // drifted)` suffix; the session list backs per-session rows.
+            let pill_meta =
+                Self::pill_meta(self.app, self.path, active_session.as_deref());
             let pill_action = patch_review_pill::Pill { ui: self.ui }
-                .show(&ov.hunks, cursor_byte);
+                .show(&ov.hunks, cursor_byte, &pill_meta);
+            if let Some(sel) = &pill_action.select_session
+                && let Some(buffer) = self.app.session.buffers.get_mut(self.path)
+            {
+                // Switch the active session; the per-frame editor binding's
+                // overlay step recomputes `agent_proposal` from
+                // `materialize_review(new_session)` on the next frame.
+                buffer.active_session = sel.clone();
+            }
             self.apply_pill_action(&pill_action);
         }
 
@@ -153,79 +404,6 @@ impl<'a> BufCtx<'a> {
             .unwrap_or(0)
     }
 
-    /// Resolve a pill bulk action against the hydrated agent proposals on
-    /// this buffer. Accept-all iterates the buffer's `hydrated_proposals`
-    /// list and calls `staging.accept` on each (which writes the
-    /// changes-db audit row and removes the proposal); Reject-all calls
-    /// `staging.reject` on each. After either, the buffer is re-read
-    /// from disk and re-hydrated to reflect the post-action state.
-    fn apply_pill_action(&mut self, action: &patch_review_pill::PillAction) {
-        let app = &mut *self.app;
-        let path: &str = self.path;
-        let proposal_ids: Vec<String> = app
-            .session
-            .buffers
-            .get(path)
-            .map(|b| b.hydrated_proposals.clone())
-            .unwrap_or_default();
-        if action.accept_all && !proposal_ids.is_empty() {
-            let staging = app.vault_session.services.staging.clone();
-            let changes = app.vault_session.services.changes.clone();
-            let (mut ok, mut err) = (0usize, 0usize);
-            for id in &proposal_ids {
-                match staging.accept(id, &app.vault_session.vault, Some(changes.as_ref())) {
-                    Ok(_) => ok += 1,
-                    Err(_) => err += 1,
-                }
-            }
-            Self::reload_and_rehydrate(app, path);
-            app.push_toast(
-                if err == 0 {
-                    format!("Accepted {} hunk{}", ok, if ok == 1 { "" } else { "s" })
-                } else {
-                    format!("Accepted {}, {} failed", ok, err)
-                },
-                if err == 0 { ToastLevel::Info } else { ToastLevel::Error },
-            );
-        }
-        if action.reject_all && !proposal_ids.is_empty() {
-            let staging = app.vault_session.services.staging.clone();
-            let mut n = 0usize;
-            for id in &proposal_ids {
-                if staging.reject(id).is_ok() {
-                    n += 1;
-                }
-            }
-            Self::reload_and_rehydrate(app, path);
-            app.push_toast(
-                format!("Rejected {} hunk{}", n, if n == 1 { "" } else { "s" }),
-                ToastLevel::Info,
-            );
-        }
-        if let Some(byte) = action.scroll_to_byte
-            && let Some(buffer) = app.session.buffers.get_mut(path)
-        {
-            let line = buffer.editor.doc.byte_to_line(byte);
-            let target_y = buffer.view.height_map.y_at_row_top(line) - 24.0;
-            buffer.view.scroll_y = target_y.max(0.0);
-        }
-    }
-
-    /// Re-read disk into the buffer and re-apply the buffer-hydration
-    /// step so the inline diff layer reflects whatever proposals remain
-    /// in `staging.db` after a bulk accept/reject. Called from multiple
-    /// methods on `BufCtx` (apply_pill_action, handle_hunk_accept,
-    /// handle_hunk_reject), so it's not single-call.
-    fn reload_and_rehydrate(app: &mut AppState, path: &str) {
-        let _ = editor_pane::reload_from_disk(app, path);
-        let staging = app.vault_session.services.staging.clone();
-        if let Some(buffer) = app.session.buffers.get_mut(path) {
-            buffer.agent_base = None;
-            buffer.hydrated_proposals.clear();
-            buffer.hydrate_pending_proposals(staging.as_ref());
-        }
-    }
-
     fn show_editor(&mut self, diff: Option<&diff_overlay::DiffOverlay>) {
         let ui = &mut *self.ui;
         let app = &mut *self.app;
@@ -242,6 +420,13 @@ impl<'a> BufCtx<'a> {
     {
         app.push_toast(format!("Save failed: {}", err), ToastLevel::Error);
     }
+
+    // Resolve+apply a panel-level Ctrl-Z / Ctrl-Shift-Z for the active editor
+    // tab BEFORE the buffer is re-borrowed and the widget renders, so the
+    // widget paints the reverted state this frame. Any inverse change set this
+    // produced seeds `txns` below so the editor binding mirrors it into the
+    // `working` layer. See `editor_binding::handle_undo_redo`.
+    let undo_txns = editor_binding::handle_undo_redo(ui, app, path);
 
     // Read scroll speed up-front so the immutable config borrow doesn't
     // collide with the mutable buffer borrow below. The view also reads
@@ -260,195 +445,15 @@ impl<'a> BufCtx<'a> {
     };
     buffer.view.scroll_speed = scroll_speed;
 
-    // Rebuild decoration layers from current state. Most decoration
-    // providers take an Option<&Theme> so they can fall back to a
+    // Decoration layers are rebuilt through the widget's
+    // `with_decoration_rebuild` hook below, so they describe the doc state
+    // AFTER this frame's keystroke is applied (the widget applies input inside
+    // `show`). Building them inline here instead would leave them one edit
+    // behind the painted text — the live-preview "flash per keystroke" bug.
+    // Most decoration providers take an Option<&Theme> so they fall back to a
     // built-in palette when the host hasn't supplied one.
     let theme_owned = light_default();
     let theme = Some(&theme_owned);
-    // Compute the visible byte range up-front so we can scope paint-only
-    // providers to the viewport.
-    let visible = buffer.view.visible_lines();
-    let last_line = buffer.editor.doc.len_lines().saturating_sub(1);
-    let visible_start = buffer
-        .editor
-        .doc
-        .line_to_byte(visible.start.min(last_line));
-    let visible_end_line = visible.end.min(last_line);
-    let visible_end = if visible_end_line + 1 < buffer.editor.doc.len_lines() {
-        buffer.editor.doc.line_to_byte(visible_end_line + 1)
-    } else {
-        buffer.editor.doc.len_bytes()
-    };
-    let visible_range = visible_start..visible_end;
-
-    // Fingerprint inputs for memoized providers. `content_id` is an Arc
-    // pointer into the rope tree — changes only on doc edits, so idle / pure
-    // scroll frames hit the cache.
-    let doc_id = buffer.editor.doc.content_id() as u64;
-    let sel = buffer.editor.selection.main().head.offset() as u64;
-    // Layers whose only cursor dependence is "is the cursor on this line?"
-    // (markdown reveal, wikilink reveal) key on the line index instead of
-    // the byte offset — otherwise a selection drag busts the cache on every
-    // byte and reparses the whole doc per frame.
-    let cursor_line = buffer.editor.doc.byte_to_line(sel as usize) as u64;
-    // Inlined `folds_hash`: XOR-mix the fold ids in an order-independent
-    // way. Cheap and stable for memoization keys (HashSet iteration order
-    // isn't deterministic).
-    let folds_id: u64 = {
-        let mut h: u64 = 0;
-        for &id in &buffer.folds {
-            h ^= id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-        h
-    };
-    let vp_lo = visible_start as u64;
-    let vp_hi = visible_end as u64;
-    let vp_fp = mix(vp_lo, vp_hi);
-    let cache: &mut DecorationCache = &mut buffer.decoration_cache;
-
-    crate::profile_scope!("rebuild decorations");
-    buffer.view.decorations.clear();
-
-    // Per-layer caching follows the same shape everywhere: gate on a flag,
-    // mix a fingerprint, either reuse the cached `Set` or rebuild
-    // it via the supplied closure, then push (optionally with heights for
-    // layers that emit Line decorations the heightmap needs to see).
-    //
-    // `cached!(slot, fp, build, heights?)` keeps the per-layer code to a
-    // single line each. `heights` is the optional fourth arg — when present,
-    // the layer goes through `push_with_heights`; otherwise plain `push`.
-    macro_rules! cached {
-        ($slot:ident, $fp:expr, $build:expr) => {{
-            let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
-            buffer.view.decorations.push(v);
-        }};
-        ($slot:ident, $fp:expr, $build:expr, heights) => {{
-            let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
-            buffer.view.decorations.push_with_heights(v);
-        }};
-    }
-
-    // active_line is cheap to BUILD, but it's not cheap to *not cache* —
-    // each fresh `RangeSet::from_iter` call hands back a new `Arc`, which
-    // flips `view.decorations.signature` (mix of every layer's
-    // `content_id`). That signature is part of the per-line galley cache
-    // key, so an unstable signature invalidates every visible line's
-    // layout every frame. Cache on `(doc_id, sel)` — the inputs the
-    // provider actually depends on — so idle / pure-scroll frames return
-    // the same Arc and the galley cache holds.
-    cached!(active_line, mix(doc_id, sel), || {
-        active_line_decorations(&buffer.editor)
-    });
-
-    // Paint-only, viewport-scoped, doc-only-dependent. Gated on its
-    // own View-menu toggle (`view-highlight-trailing-whitespace-toggle`).
-    if buffer.highlight_trailing_whitespace {
-        cached!(trailing_ws, mix(doc_id, vp_fp), || {
-            trailing_whitespace_decorations(&buffer.editor, Some(&visible_range))
-        });
-    }
-
-    // Index-diff gutter (`compute_diff` parity). Cached on (doc content
-    // id, loaded-text length + ptr hash) — `loaded_text` is only swapped
-    // on disk reads/writes, so its address + length together act as a
-    // cheap identity fingerprint that survives across paints. Without
-    // this cache, every paint runs a full line-level `diff::compute`
-    // over the buffer + on-disk snapshot, which is the dominant scroll
-    // cost on non-trivial files.
-    let loaded_fp = mix(
-        buffer.loaded_text.as_ptr() as u64,
-        buffer.loaded_text.len() as u64,
-    );
-    cached!(index_diff, mix(doc_id, loaded_fp), || {
-        buffer.editor.index_diff_decorations(&buffer.loaded_text)
-    });
-
-    // markdown / fold / fold emit Line decorations with
-    // `hide: true` or `height_scale`, so they go through `push_with_heights`
-    // to reach the heightmap driver. markdown depends on cursor line
-    // (code blocks reveal on cursor-on-line); fold/frontmatter on the fold
-    // set. Live-preview layers stay gated on `buffer.live_preview`; the
-    // structural fold layer is unconditional so manual folds keep working
-    // when previews are off.
-    if buffer.live_preview {
-        cached!(markdown, mix(mix(doc_id, cursor_line), folds_id),
-            || markdown_decorations(&buffer.editor, theme), heights);
-    }
-    cached!(fold, mix(doc_id, folds_id),
-        || fold_decorations(&buffer.editor, &buffer.folds), heights);
-
-    if buffer.live_preview {
-        // wikilink reveals when the cursor isn't on the same line —
-        // selection-dependent on top of doc + viewport.
-        cached!(wikilink, mix(mix(doc_id, cursor_line), vp_fp),
-            || wikilink_decorations(&buffer.editor, theme, Some(&visible_range)));
-        cached!(callout, mix(doc_id, vp_fp),
-            || callout_decorations(&buffer.editor, theme, Some(&visible_range)));
-    }
-
-    cached!(frontmatter, mix(doc_id, folds_id),
-        || frontmatter_fold(&buffer.editor, &buffer.folds, theme), heights);
-
-    if buffer.live_preview {
-        cached!(transclusion, mix(doc_id, vp_fp),
-            || transclusion_decorations(&buffer.editor, theme, Some(&visible_range)));
-        cached!(footnote, mix(doc_id, vp_fp),
-            || footnote_decorations(&buffer.editor, theme, Some(&visible_range)));
-        cached!(math, mix(doc_id, vp_fp),
-            || math_decorations(&buffer.editor, theme, Some(&visible_range)));
-        cached!(mermaid, mix(doc_id, vp_fp),
-            || mermaid_decorations(&buffer.editor, theme, Some(&visible_range)));
-    }
-
-    // Chunk-boundary visualisation: a gutter marker + faint background at
-    // every chunk start, so the user can see how the indexer slices this
-    // note (`view-show-chunk-boundaries`).
-    if buffer.chunk_boundaries {
-        cached!(chunk_boundaries, doc_id, || {
-            buffer.editor.chunk_boundary_decorations()
-        });
-    }
-
-    // Whitespace overlay (view-menu toggle). Doc-dependent only; cache
-    // on doc_id so the layer's Arc stays stable across scroll frames and
-    // doesn't flip `layers_sig`.
-    if buffer.show_whitespace {
-        cached!(special_chars, doc_id, || {
-            let flags = SpecialCharsFlags {
-                tabs: true,
-                spaces: true,
-                nbsp: true,
-                zero_width: true,
-                crlf: true,
-            };
-            special_chars_decorations(&buffer.editor, flags)
-        });
-    }
-
-    // Diff overlay: view zones for removed lines + line backgrounds for
-    // added/modified ranges, computed once at the top of `show`. Pushed
-    // last so the diff stacks above other decoration layers; goes through
-    // `push_with_heights` because the Block entries reserve space in the
-    // line-height map.
-    if let Some(ov) = diff {
-        buffer
-            .view
-            .decorations
-            .push_with_heights(ov.decorations.clone());
-    }
-
-    // Viewport-scoped layers (occurrence highlight, bracket match). Both
-    // are cheap to build, but constructing a fresh `RangeSet` every frame
-    // flips `view.decorations.signature` (Arc-pointer-based content_id)
-    // and forces the per-line galley cache to rebuild every visible row.
-    // Cache them on the inputs the provider actually depends on so the
-    // signature stays stable on idle/scroll frames.
-    cached!(occurrence, mix(mix(doc_id, sel), vp_fp), || {
-        occurrence_decorations(&buffer.editor, visible_range.clone())
-    });
-    cached!(bracket_match, mix(doc_id, sel), || {
-        bracket_match_decorations(&buffer.editor, DEFAULT_BRACKETS, 5000)
-    });
 
     // Render the editor (left) and the structural minimap (right). The
     // minimap reads the same `ViewState.decorations` the editor paints
@@ -466,19 +471,57 @@ impl<'a> BufCtx<'a> {
         None
     };
 
+    // Wikilink live-title resolver, built off an Arc clone so it borrows
+    // neither `app` nor `buffer`. Runs only inside the cached wikilink layer's
+    // rebuild, so the store lock isn't taken per frame.
+    let resolve_title =
+        wikilink_nav::title_resolver(app.vault_session.services.read_store.clone());
+
     let click_buffer = &mut buffer.click_buffer;
     let paint_cache = &mut buffer.paint_cache;
     let body = ui.available_rect_before_wrap();
     let minimap_w: f32 = mini_opts.as_ref().map(|o| o.width).unwrap_or(0.0);
     let split_x = (body.right() - minimap_w).max(body.left());
     let editor_rect = egui::Rect::from_min_max(body.min, egui::pos2(split_x, body.max.y));
+    // Forward half of the editor binding: a fresh sink that collects, in
+    // application order, the change set behind every doc-mutating edit the
+    // widget applies from user input this frame (host-applied doc edits — the
+    // reverse step below — never re-enter this sink, so there is no echo).
+    // Seed the sink with any undo/redo change set resolved above so the
+    // editor binding mirrors it into `working` alongside this frame's typing.
+    let mut txns: Vec<editor_core::transaction::Transaction> = undo_txns;
     {
         crate::profile_scope!("Widget::show");
         let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
-        EditorWidget::new(&mut buffer.editor, &mut buffer.view)
+        // Disjoint field borrows for the decoration-rebuild hook. Bound as
+        // locals BEFORE the widget so the borrow checker sees them as separate
+        // from `&mut buffer.editor` / `&mut buffer.view`, which the widget
+        // (and the hook) take instead. Scoped inside this `{ }` block so the
+        // closure and its captures drop before the minimap reborrows below.
+        let mut deco_ctx = DecoRebuildCtx {
+            cache: &mut buffer.decoration_cache,
+            folds: &buffer.folds,
+            loaded_text: &buffer.loaded_text,
+            theme,
+            live_preview: buffer.live_preview,
+            chunk_boundaries: buffer.chunk_boundaries,
+            show_whitespace: buffer.show_whitespace,
+            highlight_trailing_whitespace: buffer.highlight_trailing_whitespace,
+            diff,
+            resolve_title: Some(&resolve_title),
+        };
+        let mut rebuild =
+            |editor: &editor_core::state::Editor,
+             view: &mut editor_view::viewport::ViewState| {
+                rebuild_editor_decorations(editor, view, &mut deco_ctx);
+            };
+        let editor_resp = EditorWidget::new(&mut buffer.editor, &mut buffer.view)
             .with_click_sink(click_buffer)
             .with_paint_cache(paint_cache)
+            .with_transactions_sink(&mut txns)
+            .with_decoration_rebuild(&mut rebuild)
             .show(&mut editor_ui);
+        clipboard_menu::attach(&editor_resp);
     }
     if let Some(opts) = mini_opts {
         crate::profile_scope!("Widget::show");
@@ -487,6 +530,7 @@ impl<'a> BufCtx<'a> {
         let mut mini_ui = ui.new_child(egui::UiBuilder::new().max_rect(minimap_rect));
         MinimapWidget::new(&buffer.editor, &mut buffer.view)
             .with_options(opts)
+            .with_cache(&mut buffer.minimap_cache)
             .show(&mut mini_ui);
     } else if !buffer.hide_scrollbar {
         // No minimap → draw a thin auto-hiding scrollbar overlay along
@@ -499,7 +543,7 @@ impl<'a> BufCtx<'a> {
     // Pull WidgetClicks for patch-review buttons out of the click buffer
     // BEFORE fold-toggle handling so the click_map mapping is consumed
     // here. Other WidgetClick consumers (none today) would chain here too.
-    let widget_clicks: Vec<u64> = buffer
+    let all_widget_clicks: Vec<u64> = buffer
         .click_buffer
         .iter()
         .filter_map(|c| match c {
@@ -510,14 +554,31 @@ impl<'a> BufCtx<'a> {
     buffer
         .click_buffer
         .retain(|c| !matches!(c, ClickAction::WidgetClick(_)));
+    // Wikilink pills carry the tag bit; everything else is a diff-overlay
+    // button. Split so each consumer only sees its own clicks.
+    let (wikilink_clicks, widget_clicks): (Vec<u64>, Vec<u64>) = all_widget_clicks
+        .into_iter()
+        .partition(|id| id & editor_md::links::WIKILINK_WIDGET_TAG != 0);
+    let mod_click = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
 
     // Apply fold toggles from this frame's clicks.
     buffer.drain_fold_clicks();
 
+    // Run the editor binding for op-log-backed vault buffers: forward this
+    // frame's captured change sets into the `working` layer, pull
+    // `materialize_working` back into the editable buffer, and refresh the
+    // agent suggestion overlay (`agent_proposal`). The `buffer` borrow above
+    // has ended (last use was `drain_fold_clicks`), so the binding can take
+    // `&mut app` freely. Plain disk-only buffers (no op-log doc) fall through.
+    editor_binding::run(app, path, &txns);
+
+    // Wikilink click dispatch: resolve each clicked pill's target and open it.
+    wikilink_nav::handle_clicks(app, ui.ctx(), path, &wikilink_clicks, mod_click);
+
     // Per-hunk overlay-widget click dispatch. The diff overlay maps each
-    // Accept / Reject button id to the proposal(s) it covers; we route
-    // the action through the staging service and then re-hydrate so the
-    // remaining proposals' hunks shift / disappear cleanly.
+    // button id to the pending op id(s) it covers; we flip them through
+    // `op_writes::flip_op_status` and re-materialize the pending-view so the
+    // remaining hunks shift / disappear. Restore writes back to disk directly.
     if let Some(ov) = diff
         && !widget_clicks.is_empty()
     {
@@ -526,11 +587,21 @@ impl<'a> BufCtx<'a> {
             match action.clone() {
                 diff_overlay::HunkAction::Accept(ids) => app.apply_hunk_accept(path, &ids),
                 diff_overlay::HunkAction::Reject(ids) => app.apply_hunk_reject(path, &ids),
+                // Conflict resolutions (op-log-merge-conflict): keep-mine
+                // rejects, keep-both accepts, keep-theirs reverts then accepts.
+                diff_overlay::HunkAction::KeepMine(ids) => app.apply_hunk_reject(path, &ids),
+                diff_overlay::HunkAction::KeepBoth(ids) => app.apply_hunk_accept(path, &ids),
+                diff_overlay::HunkAction::KeepTheirs { op_ids, revert } => {
+                    app.apply_hunk_keep_theirs(path, &op_ids, &revert);
+                }
                 diff_overlay::HunkAction::Restore { path: target, byte_start, byte_end } => {
                     app.apply_hunk_restore(path, &target, byte_start, byte_end);
                 }
             }
         }
+        // A flip mutated the op log; repaint so the next frame's editor
+        // binding re-materializes the buffer / overlay immediately.
+        ui.ctx().request_repaint();
     }
     }
 }
@@ -539,35 +610,12 @@ impl<'a> BufCtx<'a> {
 /// panel because the verbs are entirely UI-driven (the panel surfaces
 /// these via per-hunk Accept / Reject / Restore overlay widgets). Methods
 /// with `&mut self` receivers are exempt from `clippy::single_call_fn`.
+/// (The Agent-owned Accept / Reject verbs live in `patch_review.rs`.)
 impl AppState {
-    /// Per-hunk Accept: dispatch `staging.accept` on every proposal whose
-    /// footprint overlapped the hunk, then reload + re-hydrate so the
-    /// diff layer reflects whatever remains.
-    pub(super) fn apply_hunk_accept(&mut self, path: &str, proposal_ids: &[String]) {
-        let staging = self.vault_session.services.staging.clone();
-        let changes = self.vault_session.services.changes.clone();
-        let (mut ok, mut err) = (0usize, 0usize);
-        for id in proposal_ids {
-            match staging.accept(id, &self.vault_session.vault, Some(changes.as_ref())) {
-                Ok(_) => ok += 1,
-                Err(_) => err += 1,
-            }
-        }
-        BufCtx::reload_and_rehydrate(self, path);
-        self.push_toast(
-            if err == 0 {
-                format!("Accepted {} hunk{}", ok, if ok == 1 { "" } else { "s" })
-            } else {
-                format!("Accepted {}, {} failed", ok, err)
-            },
-            if err == 0 { ToastLevel::Info } else { ToastLevel::Error },
-        );
-    }
-
     /// Per-hunk Restore: write the snapshot buffer's text for
     /// `[byte_start, byte_end)` back to disk at `target_path`, splicing
-    /// it into the current on-disk content. Appends a `Modified` row to
-    /// `changes.db` so the restore is itself an auditable change.
+    /// it into the current on-disk content. Routes through the op log so
+    /// the restore is itself an accepted op the history surfaces show.
     pub(super) fn apply_hunk_restore(
         &mut self,
         buffer_key: &str,
@@ -594,30 +642,20 @@ impl AppState {
                 return;
             }
         };
+        let _ = disk_hash;
         let mut new_text = String::with_capacity(disk_text.len() + snippet.len());
         let safe_start = byte_start.min(disk_text.len());
         let safe_end = byte_end.min(disk_text.len()).max(safe_start);
         new_text.push_str(&disk_text[..safe_start]);
         new_text.push_str(&snippet);
         new_text.push_str(&disk_text[safe_end..]);
-        let new_hash = hiker_core::hash_string(&new_text);
-        match self
-            .vault_session
-            .vault
-            .write_file_checked(target_path, &disk_hash, &new_text)
-        {
-            Ok(_) => {
-                let _ = self.vault_session.services.changes.append(
-                    hiker_core::changes::ChangeAppend {
-                        path: target_path,
-                        op: hiker_core::changes::ChangeOp::Modified,
-                        author: "user",
-                        content_hash: Some(&new_hash),
-                        content: Some(new_text.as_bytes()),
-                        rename_from: None,
-                        metadata: serde_json::json!({ "restored_hunk_range": [byte_start, byte_end] }),
-                    },
-                );
+        match hiker_core::ops::op_writes::user_save(
+            self.vault_session.services.oplog.as_ref(),
+            &self.vault_session.vault,
+            target_path,
+            &new_text,
+        ) {
+            Ok(()) => {
                 self.push_toast(
                     format!("Restored hunk to {}", target_path),
                     ToastLevel::Info,
@@ -625,25 +663,6 @@ impl AppState {
             }
             Err(err) => self.push_toast(format!("Restore failed: {}", err), ToastLevel::Error),
         }
-    }
-
-    /// Per-hunk Reject: dispatch `staging.reject` on every covered
-    /// proposal, then reload + re-hydrate. Reject doesn't append a
-    /// `changes.db` row; the rejected text simply isn't re-applied on
-    /// the next hydration.
-    pub(super) fn apply_hunk_reject(&mut self, path: &str, proposal_ids: &[String]) {
-        let staging = self.vault_session.services.staging.clone();
-        let mut n = 0usize;
-        for id in proposal_ids {
-            if staging.reject(id).is_ok() {
-                n += 1;
-            }
-        }
-        BufCtx::reload_and_rehydrate(self, path);
-        self.push_toast(
-            format!("Rejected {} hunk{}", n, if n == 1 { "" } else { "s" }),
-            ToastLevel::Info,
-        );
     }
 }
 
@@ -657,12 +676,14 @@ fn pending_rewrite_banner(&mut self) {
     let ui = &mut *self.ui;
     let app = &mut *self.app;
     let path: &str = self.path;
-    let staging = app.vault_session.services.staging.clone();
-    // Reads the per-frame cache populated in `main::refresh_staging_snapshot`.
+    // Reads the per-frame op-log cache populated in
+    // `main::refresh_whole_file_proposals`. The most recent whole-file op for
+    // the path is the one surfaced (`note-open-routes-to-pending-review`); the
+    // list is already sorted newest-first.
     let Some(prop) = app
-        .ui_cache.staging_snapshot
+        .ui_cache.whole_file_proposals
         .iter()
-        .find(|p| p.target_path == path && p.action == "write_note")
+        .find(|p| p.target_path == path)
         .cloned()
     else {
         return;
@@ -678,12 +699,16 @@ fn pending_rewrite_banner(&mut self) {
             ui.horizontal(|ui| {
                 ui.add(crate::icons::ICONS.image(crate::icons::Icon::Robot));
                 ui.label(
-                    egui::RichText::new("Agent proposed a full-note rewrite")
-                        .small()
-                        .strong(),
+                    egui::RichText::new(if prop.action == "create" {
+                        "Agent proposed a new note"
+                    } else {
+                        "Agent proposed a full-note rewrite"
+                    })
+                    .small()
+                    .strong(),
                 );
                 ui.label(
-                    egui::RichText::new(format!("({})", &prop.id[..prop.id.len().min(8)]))
+                    egui::RichText::new(format!("({})", &prop.op_id[..prop.op_id.len().min(8)]))
                         .color(theme::muted())
                         .monospace()
                         .small(),
@@ -691,7 +716,21 @@ fn pending_rewrite_banner(&mut self) {
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        if ui.small_button("Accept").clicked() {
+                        // Drifted whole-file ops: Accept disabled, reason in
+                        // tooltip; Reject + View stay active per
+                        // `write-note-review-conflicted-display`.
+                        let accept_resp = ui.add_enabled(
+                            !prop.drifted,
+                            egui::Button::new("Accept").small(),
+                        );
+                        if accept_resp
+                            .on_hover_text(if prop.drifted {
+                                "Proposal drifted from the current note — reject or re-run"
+                            } else {
+                                "Apply this rewrite to the note"
+                            })
+                            .clicked()
+                        {
                             accept = true;
                         }
                         if ui.small_button("Reject").clicked() {
@@ -705,38 +744,25 @@ fn pending_rewrite_banner(&mut self) {
             });
         });
     if accept {
-        let changes = app.vault_session.services.changes.clone();
-        match staging.accept(&prop.id, &app.vault_session.vault, Some(changes.as_ref())) {
-            Ok(o) => app.push_toast(
-                format!("Accepted proposal for {}", o.target_path),
-                ToastLevel::Info,
-            ),
-            Err(err) => app.push_toast(format!("Accept failed: {err}"), ToastLevel::Error),
-        }
+        app.accept_staging_proposal(&prop.op_id, &prop.target_path);
     }
     if reject {
-        match staging.reject(&prop.id) {
-            Ok(()) => app.push_toast(
-                "Proposal rejected".to_string(),
-                ToastLevel::Info,
-            ),
-            Err(err) => app.push_toast(format!("Reject failed: {err}"), ToastLevel::Error),
-        }
+        app.reject_staging_proposal(&prop.op_id, &prop.target_path);
     }
     if view {
         use crate::tab::TabKind;
-        let pid = prop.id.clone();
+        let pid = prop.op_id.clone();
         let target = prop.target_path.clone();
         let pid_for_build = pid.clone();
         app.find_or_open_tab(
             |k| matches!(
                 k,
                 TabKind::Editor {
-                    buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                    buffer: crate::tab::BufferSource::PendingProposal { proposal_id, .. },
                     ..
                 } if *proposal_id == pid
             ),
-            || TabKind::staging_preview(pid_for_build, target),
+            || TabKind::pending_preview(pid_for_build, target),
         );
     }
 }
@@ -782,15 +808,19 @@ fn toolbar(&mut self) {
                 diff_resp.context_menu(|ui| {
                     app.show_diff_source_menu(ui, path);
                 });
-                // Agent-diff toggle: jump to the staging-preview tab when
-                // a write-shaped proposal is in flight against this note.
+                // Agent-diff toggle: jump to the whole-file review-preview
+                // tab when a write-shaped proposal is in flight against this
+                // note. Reads the op-log-backed whole-file-proposal cache
+                // (anchored `edit_note` hunks already review inline via
+                // `agent_proposal`; this button is the whole-file surface).
                 // Mutually-exclusive with the user-diff button above per
                 // `patch-review.md:17-27` — both toggle the same buffer
                 // tab strip into a single diff mode at a time.
-                let has_agent_proposal = app.ui_cache.staging_snapshot.iter().any(|p| {
-                    p.target_path == path
-                        && (p.action == "write_note" || p.action == "edit_note")
-                });
+                let has_agent_proposal = app
+                    .ui_cache
+                    .whole_file_proposals
+                    .iter()
+                    .any(|p| p.target_path == path);
                 ui.add_enabled_ui(has_agent_proposal, |ui| {
                     if ui
                         .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Robot)))
@@ -801,26 +831,28 @@ fn toolbar(&mut self) {
                         })
                         .clicked()
                     {
-                        // Open the staging preview for the first matching
-                        // proposal. Done via singleton tab semantics so
-                        // repeated clicks just focus the existing tab.
-                        if let Some(p) = app.ui_cache.staging_snapshot.iter().find(|p| {
-                            p.target_path == path
-                                && (p.action == "write_note" || p.action == "edit_note")
-                        }) {
+                        // Open the whole-file preview for the first (most
+                        // recent) matching proposal. Done via singleton tab
+                        // semantics so repeated clicks just focus the tab.
+                        if let Some(p) = app
+                            .ui_cache
+                            .whole_file_proposals
+                            .iter()
+                            .find(|p| p.target_path == path)
+                        {
                             use crate::tab::TabKind;
-                            let pid = p.id.clone();
+                            let pid = p.op_id.clone();
                             let tpath = p.target_path.clone();
                             let pid_for_build = pid.clone();
                             app.find_or_open_tab(
                                 |k| matches!(
                                     k,
                                     TabKind::Editor {
-                                        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+                                        buffer: crate::tab::BufferSource::PendingProposal { proposal_id, .. },
                                         ..
                                     } if *proposal_id == pid
                                 ),
-                                || TabKind::staging_preview(pid_for_build, tpath),
+                                || TabKind::pending_preview(pid_for_build, tpath),
                             );
                         }
                     }
@@ -828,12 +860,20 @@ fn toolbar(&mut self) {
                 toolbar_menus::Menus { ui, app, path }.view_options_menu();
                 toolbar_menus::Menus { ui, app, path }.mutations_menu();
 
+                // Markdown formatting button group (bold / italic / … / color).
+                format::FormatBar { ui: &mut *ui, app: &mut *app, path }.render();
+
                 // "Add to trail" pill — legacy `addToTrailPill.ts`,
                 // `trail-add-to-active-from-editor-verb`. Hidden when
                 // no active trail or when the buffer path isn't a
                 // regular indexable extension. Disabled (with tooltip)
                 // when the path is already a waypoint at any depth.
                 BufCtx { ui: &mut *ui, app: &mut *app, path }.add_to_trail_pill();
+
+                // "Add to board…" pill — `board-add-card`. Surfaces when a
+                // regular note is open and at least one board exists; the
+                // menu picks a board + column. Hidden on board-doc rows.
+                BufCtx { ui: &mut *ui, app: &mut *app, path }.add_to_board_pill();
 
                 // Centered mode-controls slot — empty in plain editing mode.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
@@ -859,9 +899,9 @@ fn render_readonly_source_toolbar(&mut self, source: Option<&crate::tab::BufferS
         .and_then(|t| t.kind.diff_source())
         .is_some();
     match source {
-        Some(BufferSource::Snapshot { path, change_id }) => {
+        Some(BufferSource::Snapshot { path, op_id }) => {
             let path = path.clone();
-            let cid = change_id.clone();
+            let cid = op_id.clone();
             if ui
                 .add(
                     egui::Button::image_and_text(
@@ -877,17 +917,31 @@ fn render_readonly_source_toolbar(&mut self, source: Option<&crate::tab::BufferS
             }
             BufCtx { ui: &mut *ui, app: &mut *app, path: key }.render_diff_toggle_button(key, diff_active);
         }
-        Some(BufferSource::StagingProposal { proposal_id, target_path }) => {
+        Some(BufferSource::PendingProposal { proposal_id, target_path }) => {
             let pid = proposal_id.clone();
             let target = target_path.clone();
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("Accept").color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::from_rgb(0x2f, 0x8f, 0x4d)),
+            // Drift: Accept disabled with reason in tooltip, Reject active —
+            // per `write-note-review-conflicted-display`. Read off the
+            // op-log cache so the gate matches the listing.
+            let drifted = app
+                .ui_cache
+                .whole_file_proposals
+                .iter()
+                .find(|p| p.op_id == pid)
+                .is_some_and(|p| p.drifted);
+            let accept_resp = ui.add_enabled(
+                !drifted,
+                egui::Button::new(
+                    egui::RichText::new("Accept").color(egui::Color32::WHITE),
                 )
-                .on_hover_text("Write this proposal to disk")
+                .fill(egui::Color32::from_rgb(0x2f, 0x8f, 0x4d)),
+            );
+            if accept_resp
+                .on_hover_text(if drifted {
+                    "Proposal drifted from the current note — reject or re-run"
+                } else {
+                    "Write this proposal to disk"
+                })
                 .clicked()
             {
                 app.accept_staging_proposal(&pid, &target);
@@ -902,7 +956,7 @@ fn render_readonly_source_toolbar(&mut self, source: Option<&crate::tab::BufferS
                 .on_hover_text("Discard this proposal")
                 .clicked()
             {
-                app.reject_staging_proposal(&pid);
+                app.reject_staging_proposal(&pid, &target);
             }
             BufCtx { ui: &mut *ui, app: &mut *app, path: key }.render_diff_toggle_button(key, diff_active);
         }
@@ -935,49 +989,45 @@ fn render_diff_toggle_button(&mut self, _key: &str, diff_active: bool) {
 /// source-toolbar. Methods on `AppState` so they're exempt from
 /// `clippy::single_call_fn`.
 impl AppState {
-    pub(super) fn restore_snapshot_to_disk(&mut self, path: &str, change_id: &str) {
-        let id: i64 = match change_id.parse() {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-        let bytes = match self.vault_session.services.changes.content_at(id) {
-            Ok(Some(b)) => b,
-            _ => return,
-        };
-        let snapshot_text = String::from_utf8_lossy(&bytes).into_owned();
-        let snapshot_hash = hiker_core::hash_string(&snapshot_text);
-        let (_disk_text, disk_hash) = self
-            .vault_session
-            .vault
-            .read_file_with_hash(path)
-            .unwrap_or_else(|_| (String::new(), String::new()));
-        match self
-            .vault_session
-            .vault
-            .write_file_checked(path, &disk_hash, &snapshot_text)
-        {
-            Ok(_) => {
-                let _ = self.vault_session.services.changes.append(
-                    hiker_core::changes::ChangeAppend {
-                        path,
-                        op: hiker_core::changes::ChangeOp::Modified,
-                        author: "user",
-                        content_hash: Some(&snapshot_hash),
-                        content: Some(snapshot_text.as_bytes()),
-                        rename_from: None,
-                        metadata: serde_json::json!({ "restored_from_change_id": id }),
-                    },
-                );
+    pub(super) fn restore_snapshot_to_disk(&mut self, path: &str, op_id: &str) {
+        let log = self.vault_session.services.oplog.clone();
+        let snapshot_text =
+            match hiker_core::ops::op_writes::content_at_op(log.as_ref(), path, op_id) {
+                Ok(Some(t)) => t,
+                _ => return,
+            };
+        // Restore writes the version content back through the op log: a fresh
+        // `user` op against `accepted` that atomically rewrites the `.md`, so
+        // the restore is itself an accepted op the history surfaces show.
+        match hiker_core::ops::op_writes::user_save(
+            log.as_ref(),
+            &self.vault_session.vault,
+            path,
+            &snapshot_text,
+        ) {
+            Ok(()) => {
                 self.push_toast(format!("Restored snapshot of {}", path), ToastLevel::Info);
             }
             Err(err) => self.push_toast(format!("Restore failed: {}", err), ToastLevel::Error),
         }
     }
 
+    /// Accept a pending whole-file proposal: flip the op to `accepted` via the
+    /// op log (`op_writes::flip_op_status` → `OpLog::accept_pending`), which
+    /// applies its Yrs update to `accepted` and atomically rewrites the `.md`.
+    /// `proposal_id` is the pending op id; `target_path` the note it targets.
+    /// On success, navigate to the target as a preview tab per
+    /// `staging-accept-navigates-to-preview`.
+    ///
+    /// status: write-note-review-surface
     pub(super) fn accept_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
-        let staging = self.vault_session.services.staging.clone();
-        let changes = self.vault_session.services.changes.clone();
-        match staging.accept(proposal_id, &self.vault_session.vault, Some(changes.as_ref())) {
+        let log = self.vault_session.services.oplog.clone();
+        match hiker_core::ops::op_writes::flip_op_status(
+            log.as_ref(),
+            target_path,
+            std::slice::from_ref(&proposal_id.to_string()),
+            /* accept */ true,
+        ) {
             Ok(_) => {
                 self.push_toast(format!("Accepted proposal for {}", target_path), ToastLevel::Info);
                 editor_pane::open_file(self, target_path, /* sticky */ true);
@@ -986,9 +1036,20 @@ impl AppState {
         }
     }
 
-    pub(super) fn reject_staging_proposal(&mut self, proposal_id: &str) {
-        let staging = self.vault_session.services.staging.clone();
-        match staging.reject(proposal_id) {
+    /// Reject a pending whole-file proposal: flip the op to `rejected` via the
+    /// op log (`op_writes::flip_op_status` → `OpLog::reject_pending`), writing
+    /// a rejected audit row and dropping the op from the queue. Disk content is
+    /// untouched.
+    ///
+    /// status: write-note-review-surface
+    pub(super) fn reject_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
+        let log = self.vault_session.services.oplog.clone();
+        match hiker_core::ops::op_writes::flip_op_status(
+            log.as_ref(),
+            target_path,
+            std::slice::from_ref(&proposal_id.to_string()),
+            /* accept */ false,
+        ) {
             Ok(()) => self.push_toast("Proposal rejected".to_string(), ToastLevel::Info),
             Err(err) => self.push_toast(format!("Reject failed: {}", err), ToastLevel::Error),
         }
@@ -1045,6 +1106,18 @@ impl<'a> BufCtx<'a> {
         );
     }
     }
+
+    /// "Add to board…" pill in the editor toolbar — the editor-pane
+    /// counterpart to the file-tree verb (`board-add-card`). Hidden unless
+    /// the open buffer is a regular `.md`/`.txt` note and the vault has at
+    /// least one board; hidden when the buffer is itself a board-doc. The
+    /// menu picks a board + column; a board where the note is already a card
+    /// shows "Already on this board" instead of clickable columns.
+    ///
+    /// status: board-add-card
+    fn add_to_board_pill(&mut self) {
+        crate::panels::board::add_to_board_pill(self.ui, self.app, self.path);
+    }
 }
 
 fn trail_contains_path(waypoints: &[crate::state::Waypoint], path: &str) -> bool {
@@ -1059,73 +1132,6 @@ fn trail_contains_path(waypoints: &[crate::state::Waypoint], path: &str) -> bool
     false
 }
 
-
-/// Persist a `editor.*` view toggle into vault-scoped settings + swap the
-/// merged copy in `AppState::config` so subsequent buffer opens pick up
-/// the change. Mirrors the `set_setting` helper used by the settings tab.
-/// Parse `#RRGGBB` / `#RRGGBBAA` into an egui `Color32`. Falls back to
-/// fully-opaque magenta on a malformed value so a bad config entry is
-/// visually obvious instead of silently transparent.
-fn parse_hex_color(s: &str) -> egui::Color32 {
-    let bytes = s.as_bytes();
-    if !matches!(bytes.first(), Some(b'#')) {
-        return egui::Color32::from_rgb(0xff, 0x00, 0xff);
-    }
-    let hex = &s[1..];
-    let hex_byte = |i: usize| -> Option<u8> {
-        u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()
-    };
-    match hex.len() {
-        6 => {
-            let (Some(r), Some(g), Some(b)) = (hex_byte(0), hex_byte(2), hex_byte(4)) else {
-                return egui::Color32::from_rgb(0xff, 0x00, 0xff);
-            };
-            egui::Color32::from_rgb(r, g, b)
-        }
-        8 => {
-            let (Some(r), Some(g), Some(b), Some(a)) =
-                (hex_byte(0), hex_byte(2), hex_byte(4), hex_byte(6))
-            else {
-                return egui::Color32::from_rgb(0xff, 0x00, 0xff);
-            };
-            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
-        }
-        _ => egui::Color32::from_rgb(0xff, 0x00, 0xff),
-    }
-}
-
-/// Extension trait to read a `MinimapConfig` directly into the egui-side
-/// `MinimapOptions`. Trait methods on `&self` are exempt from
-/// `clippy::single_call_fn` even when only one caller materializes them.
-trait MinimapOptionsExt {
-    fn to_minimap_options(&self) -> MinimapOptions;
-}
-
-impl MinimapOptionsExt for hiker_core::config::sections::MinimapConfig {
-    fn to_minimap_options(&self) -> MinimapOptions {
-        MinimapOptions {
-            width: self.width as f32,
-            bar_padding_left: self.bar_padding_left as f32,
-            bar_padding_right: self.bar_padding_right as f32,
-            bar_corner_radius: self.bar_corner_radius as f32,
-            min_bar_width: self.min_bar_width as f32,
-            bar_gap: (self.bar_gap_tenths as f32) / 10.0,
-            colored: self.colored,
-            show_section_rules: self.show_section_rules,
-            show_viewport: self.show_viewport,
-            show_left_edge: self.show_left_edge,
-            color_heading: parse_hex_color(&self.color_heading),
-            color_code: parse_hex_color(&self.color_code),
-            color_emphasis: parse_hex_color(&self.color_emphasis),
-            color_quote: parse_hex_color(&self.color_quote),
-            color_plain: parse_hex_color(&self.color_plain),
-            color_background: parse_hex_color(&self.color_background),
-            color_section_rule: parse_hex_color(&self.color_section_rule),
-            color_viewport: parse_hex_color(&self.color_viewport),
-            color_viewport_hover: parse_hex_color(&self.color_viewport_hover),
-        }
-    }
-}
 
 fn persist_view_setting(app: &mut AppState, key: &str, value: &serde_json::Value) {
     let label = format!("Save {key} failed");
@@ -1268,17 +1274,24 @@ impl<'a> BufCtx<'a> {
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Left: version dropdown — unifies the active buffer,
-                // changelog snapshots, and any pending agent proposals so
-                // the user can flip between them without leaving the
-                // editor. Spec: status-bar version dropdown spanning the
-                // unified activity feed.
-                let basename = path.rsplit('/').next().unwrap_or(path);
+                // Left: version dropdown — unifies the live buffer, changelog
+                // snapshots, and any pending agent proposals so the user can
+                // flip between them (including back to "Live") without leaving
+                // the tab. The dropdown is keyed on the NOTE path (the buffer's
+                // source path); `path` here is the buffer-map KEY, which is the
+                // note path for a live buffer but a composite key for a snapshot
+                // / proposal preview — so derive the note path from the source.
+                let note_path = app
+                    .session
+                    .buffers
+                    .get(path)
+                    .map_or_else(|| path.to_string(), |b| b.source.path().to_string());
+                let basename = note_path.rsplit('/').next().unwrap_or(&note_path);
                 let label = basename.to_string();
                 if app.session.buffers.get(path).map(super::super::buffer::Buffer::is_dirty).unwrap_or(false) {
                     ui.add(icons::ICONS.current_dot());
                 }
-                toolbar_menus::Menus { ui, app, path }.version_dropdown(&label);
+                toolbar_menus::Menus { ui, app, path: &note_path }.version_dropdown(&label);
 
                 // Center: index status from the indexer, optionally
                 // followed by the heading breadcrumb when the per-buffer
@@ -1308,27 +1321,51 @@ impl<'a> BufCtx<'a> {
                     // diverges from the buffer's current hash, the user
                     // sees a "buffer ahead of index" badge so they know
                     // search hits may be stale.
-                    // Coarse refresh of the indexer's stored hash for
-                    // this buffer. The status bar runs every frame; a
-                    // per-frame SQLite query + std-mutex lock against
-                    // the shared read store contributes measurably to
-                    // scroll latency. The hash only flips when the
-                    // indexer commits a re-index, so a 2s refresh
-                    // window is plenty responsive.
+                    //
+                    // The badge state is *recomputed*, never latched. The
+                    // cached stored-hash is refreshed on a coarse 2s timer
+                    // (a per-frame SQLite query + std-mutex lock against the
+                    // shared read store costs measurable scroll latency, and
+                    // the hash only flips when the indexer commits a
+                    // re-index). The timer alone, however, would leave the
+                    // badge stuck on for up to one window after the index
+                    // catches up — so a refresh is *also* forced the moment
+                    // the indexer reports this path is no longer pending
+                    // (the index just finished). That re-reads the now-equal
+                    // stored hash immediately and clears the badge, instead
+                    // of waiting for / latching on the timer.
                     let path_owned = path.to_string();
                     let now = std::time::Instant::now();
-                    let needs_refresh = app
+                    let indexing_pending = app
+                        .vault_session
+                        .services
+                        .indexer
+                        .is_pending(&path_owned);
+                    // Record the latest pending state and report whether
+                    // indexing just transitioned pending → done for this
+                    // buffer (the latch-breaking edge).
+                    let just_finished_indexing = app
                         .session.buffers
-                        .get(&path_owned)
+                        .get_mut(&path_owned)
                         .map(|b| {
-                            b.index_hash_refreshed_at
-                                .map(|t| {
-                                    now.duration_since(t)
-                                        > std::time::Duration::from_secs(2)
-                                })
-                                .unwrap_or(true)
+                            let edge = b.index_pending_last && !indexing_pending;
+                            b.index_pending_last = indexing_pending;
+                            edge
                         })
                         .unwrap_or(false);
+                    let needs_refresh = just_finished_indexing
+                        || app
+                            .session.buffers
+                            .get(&path_owned)
+                            .map(|b| {
+                                b.index_hash_refreshed_at
+                                    .map(|t| {
+                                        now.duration_since(t)
+                                            > std::time::Duration::from_secs(2)
+                                    })
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(false);
                     if needs_refresh
                         && let Ok(store) = app.vault_session.services.read_store.lock()
                     {
@@ -1344,8 +1381,7 @@ impl<'a> BufCtx<'a> {
                         }
                     }
                     if let Some(buffer) = app.session.buffers.get(&path_owned)
-                        && let Some(idx_hash) = buffer.index_hash_cache.as_deref()
-                        && idx_hash != buffer.current_hash()
+                        && buffer.is_ahead_of_index()
                     {
                         ui.add_space(12.0);
                         ui.add(crate::icons::ICONS.warn());

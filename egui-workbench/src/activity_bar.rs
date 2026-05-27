@@ -90,6 +90,47 @@ impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
     pub const fn set_side(&mut self, side: Side) {
         self.side = side;
     }
+
+    /// Modes currently filtered out of the strip.
+    pub fn hidden(&self) -> &[Mode] {
+        &self.hidden
+    }
+
+    /// Replace the hidden set wholesale (used by layout restore).
+    pub fn set_hidden(&mut self, hidden: Vec<Mode>) {
+        self.hidden = hidden;
+    }
+
+    /// Whether `mode` is currently hidden from the strip.
+    pub fn is_hidden(&self, mode: &Mode) -> bool {
+        self.hidden.iter().any(|m| m == mode)
+    }
+
+    /// Show or hide a single mode.
+    pub fn set_mode_hidden(&mut self, mode: &Mode, hidden: bool) {
+        if hidden {
+            if !self.is_hidden(mode) {
+                self.hidden.push(mode.clone());
+            }
+        } else {
+            self.hidden.retain(|m| m != mode);
+        }
+    }
+
+    /// Clear the hidden set so every host item shows again.
+    pub fn show_all(&mut self) {
+        self.hidden.clear();
+    }
+
+    /// User-preferred item order (empty = host order).
+    pub fn order(&self) -> &[Mode] {
+        &self.order
+    }
+
+    /// Replace the preferred order wholesale (used by layout restore).
+    pub fn set_order(&mut self, order: Vec<Mode>) {
+        self.order = order;
+    }
 }
 
 /// Outcome of a single activity-bar frame. Communicated back to the
@@ -126,6 +167,9 @@ where
     item_h: f32,
     drag_src_id: egui::Id,
     drag_grip_id: egui::Id,
+    /// Full host item list (mode + label), unfiltered by `hidden`.
+    /// Drives the visibility checklist in the context menu.
+    all_items: Vec<(Mode, String)>,
     response: ActivityBarResponse<Mode>,
     _doc: std::marker::PhantomData<Tab>,
 }
@@ -140,6 +184,10 @@ where
     /// `bar.order` and store it back on the bar for this frame.
     fn refresh_items(&mut self) {
         let mut items = self.behavior.activity_items();
+        self.all_items = items
+            .iter()
+            .map(|it| (it.mode.clone(), it.label.clone()))
+            .collect();
         items.retain(|it| !self.bar.hidden.iter().any(|m| m == &it.mode));
         if !self.bar.order.is_empty() {
             let mut sorted: Vec<Item<Mode>> = Vec::with_capacity(items.len());
@@ -258,26 +306,44 @@ where
             self.response.clicked = Some(mode.clone());
         }
         if drag_src.is_none() {
-            self.handle_context_menu(&item_response, &mode);
+            self.handle_context_menu(&item_response, &mode, &label);
         }
     }
 
-    fn handle_context_menu(&mut self, item_response: &egui::Response, mode: &Mode) {
+    fn handle_context_menu(&mut self, item_response: &egui::Response, mode: &Mode, label: &str) {
         let mode_for_menu = mode.clone();
-        let mut hide_this = false;
+        let hide_label = if label.is_empty() {
+            "Hide".to_string()
+        } else {
+            format!("Hide \"{label}\"")
+        };
         item_response.context_menu(|ui| {
-            if ui.button("Hide").clicked() {
-                hide_this = true;
+            if ui.button(hide_label).clicked() {
+                self.bar.set_mode_hidden(&mode_for_menu, true);
+                tracing::debug!("workbench: activity item hidden");
                 ui.close();
             }
             ui.separator();
+            self.visibility_checklist(ui);
+            ui.separator();
             self.behavior.activity_context_menu(ui, &mode_for_menu);
         });
-        if hide_this {
-            if !self.bar.hidden.iter().any(|m| m == mode) {
-                self.bar.hidden.push(mode.clone());
+    }
+
+    /// Render a checkbox per host item (checked = shown). Toggling a box
+    /// flips the mode's membership in `bar.hidden`. Shared by the
+    /// per-item context menu and the empty-strip background menu so the
+    /// list — including hidden items — is reachable from either.
+    fn visibility_checklist(&mut self, ui: &mut egui::Ui) {
+        // Snapshot so we can iterate while mutating `bar.hidden`.
+        let all = self.all_items.clone();
+        for (mode, label) in &all {
+            let mut shown = !self.bar.is_hidden(mode);
+            let text = if label.is_empty() { "(unnamed)" } else { label.as_str() };
+            if ui.checkbox(&mut shown, text).changed() {
+                self.bar.set_mode_hidden(mode, !shown);
+                tracing::debug!(shown, "workbench: activity item visibility toggled");
             }
-            tracing::debug!("workbench: activity item hidden");
         }
     }
 
@@ -385,29 +451,37 @@ where
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.add_space(self.item_padding);
             let count = self.bar.items.len();
-            if count == 0 {
-                return;
-            }
-            let slots = self.allocate_slots(ui);
-            let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
-            self.capture_drag_start(ui, &slots, pointer_pos);
-            let drag_src: Option<usize> = ui.memory(|m| m.data.get_temp(self.drag_src_id));
-            let drag_grip: f32 = ui
-                .memory(|m| m.data.get_temp::<f32>(self.drag_grip_id))
-                .unwrap_or(self.item_h / 2.0);
-            let first_top = slots[0].0.top();
-            let target_idx: Option<usize> = match (drag_src, pointer_pos) {
-                (Some(_), Some(p)) => {
-                    let raw = ((p.y - first_top) / self.item_h).floor();
-                    Some((raw.max(0.0) as usize).min(count - 1))
+            if count > 0 {
+                let slots = self.allocate_slots(ui);
+                let pointer_pos =
+                    ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+                self.capture_drag_start(ui, &slots, pointer_pos);
+                let drag_src: Option<usize> = ui.memory(|m| m.data.get_temp(self.drag_src_id));
+                let drag_grip: f32 = ui
+                    .memory(|m| m.data.get_temp::<f32>(self.drag_grip_id))
+                    .unwrap_or(self.item_h / 2.0);
+                let first_top = slots[0].0.top();
+                let target_idx: Option<usize> = match (drag_src, pointer_pos) {
+                    (Some(_), Some(p)) => {
+                        let raw = ((p.y - first_top) / self.item_h).floor();
+                        Some((raw.max(0.0) as usize).min(count - 1))
+                    }
+                    _ => None,
+                };
+                for (idx, slot) in slots.iter().enumerate() {
+                    self.render_item(ui, idx, slot, drag_src, target_idx);
                 }
-                _ => None,
-            };
-            for (idx, slot) in slots.iter().enumerate() {
-                self.render_item(ui, idx, slot, drag_src, target_idx);
+                self.paint_ghost(ui, &slots, drag_src, target_idx, drag_grip, pointer_pos);
+                self.finish_drag(ui, drag_src, target_idx);
             }
-            self.paint_ghost(ui, &slots, drag_src, target_idx, drag_grip, pointer_pos);
-            self.finish_drag(ui, drag_src, target_idx);
+            // Claim the remaining strip area for the visibility menu so a
+            // right-click on empty space — including when every item is
+            // hidden — still surfaces the checklist that restores items.
+            let remaining = ui.available_size_before_wrap();
+            if remaining.x > 0.0 && remaining.y > 0.0 {
+                let bg = ui.allocate_response(remaining, Sense::click());
+                bg.context_menu(|ui| self.visibility_checklist(ui));
+            }
         });
         self.response
     }
@@ -441,6 +515,7 @@ impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
             item_h,
             drag_src_id,
             drag_grip_id,
+            all_items: Vec::new(),
             response: ActivityBarResponse::default(),
             _doc: std::marker::PhantomData,
         };

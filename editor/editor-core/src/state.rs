@@ -220,12 +220,34 @@ impl Editor {
                         while back > 0 && !text.is_char_boundary(back) {
                             back -= 1;
                         }
+                        // If deleting a '\n' that is preceded by '\r', extend
+                        // back one more byte so the whole CRLF pair is removed
+                        // as a single unit.
+                        if &text[back..start] == "\n" && back > 0 && text.as_bytes()[back - 1] == b'\r' {
+                            back -= 1;
+                        }
                         (back..start, String::new())
                     }
                 } else {
                     (r.range(), String::new())
                 }
             })
+            .collect();
+        edits.sort_by_key(|(r, _)| r.start);
+        edits.dedup_by_key(|(r, _)| r.clone());
+        let changes = Set::of(self.doc.len_bytes(), edits);
+        Transaction::new(changes).with_edit_type(EditType::Delete)
+    }
+
+    /// Delete the given byte ranges in a single transaction; empty ranges are
+    /// dropped. Used by line-wise cut, where the caller passes the selection
+    /// range when non-empty and the whole-line range when empty, so the bytes
+    /// deleted match the bytes copied to the clipboard.
+    pub fn delete_ranges(&self, ranges: &[std::ops::Range<usize>]) -> Transaction {
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = ranges
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| (r.clone(), String::new()))
             .collect();
         edits.sort_by_key(|(r, _)| r.start);
         edits.dedup_by_key(|(r, _)| r.clone());
@@ -262,37 +284,49 @@ impl Editor {
     }
 
     pub fn undo(&self) -> Option<Editor> {
-        let mut hist = self.history.clone();
-        let tx = hist.undo()?;
-        let new_doc = tx.changes.apply(&self.doc);
-        let selection = tx.selection.unwrap_or_else(|| self.selection.map(&tx.changes));
-        Some(Editor {
-            doc: new_doc,
-            selection,
-            history: hist,
-            compartments: self.compartments.clone(),
-            listeners: self.listeners.clone(),
-            change_filters: self.change_filters.clone(),
-            transaction_filters: self.transaction_filters.clone(),
-            transaction_extenders: self.transaction_extenders.clone(),
-        })
+        self.undo_with_changes().map(|(editor, _)| editor)
     }
 
     pub fn redo(&self) -> Option<Editor> {
+        self.redo_with_changes().map(|(editor, _)| editor)
+    }
+
+    /// Like [`undo`](Self::undo) but also returns the inverse change set that
+    /// was applied, so a host binding can mirror the undo into a higher layer
+    /// (e.g. a CRDT `working` layer) instead of having the doc silently revert.
+    /// Without this, an undo that only updates `editor.doc` is invisible to the
+    /// binding and gets clobbered on the next reverse pass. Returns `None` when
+    /// there is nothing to undo.
+    pub fn undo_with_changes(&self) -> Option<(Editor, Transaction)> {
+        let mut hist = self.history.clone();
+        let tx = hist.undo()?;
+        Some((self.apply_history_tx(&tx, hist), tx))
+    }
+
+    /// Redo counterpart of [`undo_with_changes`](Self::undo_with_changes).
+    pub fn redo_with_changes(&self) -> Option<(Editor, Transaction)> {
         let mut hist = self.history.clone();
         let tx = hist.redo()?;
+        Some((self.apply_history_tx(&tx, hist), tx))
+    }
+
+    /// Build the post-undo/redo `Editor`: apply the history transaction's
+    /// change set to the doc, move the selection through it (or use the
+    /// transaction's recorded selection), and carry the already-advanced
+    /// `history` cursor. History is *not* re-recorded — this is navigation.
+    fn apply_history_tx(&self, tx: &Transaction, history: crate::history::History) -> Editor {
         let new_doc = tx.changes.apply(&self.doc);
-        let selection = tx.selection.unwrap_or_else(|| self.selection.map(&tx.changes));
-        Some(Editor {
+        let selection = tx.selection.clone().unwrap_or_else(|| self.selection.map(&tx.changes));
+        Editor {
             doc: new_doc,
             selection,
-            history: hist,
+            history,
             compartments: self.compartments.clone(),
             listeners: self.listeners.clone(),
             change_filters: self.change_filters.clone(),
             transaction_filters: self.transaction_filters.clone(),
             transaction_extenders: self.transaction_extenders.clone(),
-        })
+        }
     }
 }
 
@@ -377,6 +411,29 @@ mod tests {
 
         let s3 = s2.redo().unwrap();
         assert_eq!(s3.doc.to_string(), "hello world");
+    }
+
+    #[test]
+    fn backspace_crlf_deletes_both_bytes() {
+        // Caret is right after the \n (byte offset 3 in "a\r\nb").
+        // One backspace must remove the entire \r\n pair, yielding "ab".
+        let mut s = Editor::new("a\r\nb");
+        s.selection = Selection::single(3); // after '\n'
+        let tx = s.delete_at_selections();
+        let s2 = s.apply(tx);
+        assert_eq!(s2.doc.to_string(), "ab");
+        assert_eq!(s2.selection.main().start(), 1);
+    }
+
+    #[test]
+    fn backspace_lf_only_deletes_one_byte() {
+        // Lone LF must still delete only the '\n', yielding "ab".
+        let mut s = Editor::new("a\nb");
+        s.selection = Selection::single(2); // after '\n'
+        let tx = s.delete_at_selections();
+        let s2 = s.apply(tx);
+        assert_eq!(s2.doc.to_string(), "ab");
+        assert_eq!(s2.selection.main().start(), 1);
     }
 
     #[test]

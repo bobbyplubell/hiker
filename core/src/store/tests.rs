@@ -3,7 +3,9 @@ use rusqlite::{params, Connection};
 use super::{Store, DEFAULT_EMBED_DIM, SCHEMA_VERSION};
 use crate::chunker::Chunk;
 use crate::store::error::Error;
-use crate::store::dto::{new_id, NoteUpsert, WaypointRow};
+use crate::store::dto::{
+    new_id, MetaEntry, MetaFilter, NoteOrder, NoteQuery, NoteUpsert, OrderDir, WaypointRow,
+};
 use crate::test_helpers::test_store as fresh_store;
 use tempfile::tempdir;
 
@@ -631,4 +633,217 @@ fn at_autocomplete_skips_skipped_rows() {
         .unwrap();
     let hits = store.at_autocomplete("", 10).unwrap();
     assert!(hits.iter().all(|h| h.basename != "huge"));
+}
+
+// ---- note metadata index (store-note-metadata-index / store-note-query) ----
+
+/// Create an indexed note at `path` with `mtime` and the given metadata
+/// entries; returns its id. Empty chunks — the metadata index doesn't need
+/// embeddings.
+fn put_note(
+    store: &mut Store,
+    path: &str,
+    mtime: i64,
+    meta: &[(&str, &str, Option<f64>)],
+) -> String {
+    let id = new_id();
+    store
+        .upsert_note(&NoteUpsert {
+            id: &id,
+            path,
+            content_hash: "h",
+            mtime,
+            size: 1,
+            indexed_at: 0,
+            embedder_version: "test",
+            chunks: Vec::new(),
+        })
+        .unwrap();
+    let entries: Vec<MetaEntry> = meta
+        .iter()
+        .map(|(k, v, n)| MetaEntry {
+            key: (*k).to_string(),
+            value: (*v).to_string(),
+            num: *n,
+        })
+        .collect();
+    store.replace_note_metadata(&id, &entries).unwrap();
+    id
+}
+
+#[test]
+fn query_notes_equals_and_tag_membership() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(
+        &mut store,
+        "projects/a.md",
+        100,
+        &[("status", "active", None), ("tags", "project", None), ("tags", "rust", None)],
+    );
+    put_note(
+        &mut store,
+        "projects/b.md",
+        200,
+        &[("status", "done", None), ("tags", "project", None)],
+    );
+    put_note(&mut store, "notes/c.md", 300, &[("tags", "idea", None)]);
+
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "status".into(),
+            value: "active".into(),
+        }],
+        ..Default::default()
+    };
+    let res = store.query_notes(&q).unwrap();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].note_id, a);
+
+    // Tag membership is just Equals on the list key.
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "tags".into(),
+            value: "project".into(),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(store.query_notes(&q).unwrap().len(), 2);
+}
+
+#[test]
+fn query_notes_multi_filter_folder_order_limit() {
+    let (_dir, mut store) = fresh_store();
+    put_note(
+        &mut store,
+        "projects/a.md",
+        100,
+        &[("status", "active", None), ("tags", "project", None)],
+    );
+    let b = put_note(
+        &mut store,
+        "projects/b.md",
+        300,
+        &[("status", "active", None), ("tags", "project", None)],
+    );
+    // Same metadata but outside the folder — must be excluded.
+    put_note(
+        &mut store,
+        "archive/old.md",
+        999,
+        &[("status", "active", None), ("tags", "project", None)],
+    );
+
+    let q = NoteQuery {
+        filters: vec![
+            MetaFilter::Equals {
+                key: "status".into(),
+                value: "active".into(),
+            },
+            MetaFilter::Equals {
+                key: "tags".into(),
+                value: "project".into(),
+            },
+        ],
+        folder: Some("projects".into()),
+        order: Some(NoteOrder::Mtime { dir: OrderDir::Desc }),
+        limit: Some(1),
+        select: vec![],
+    };
+    let res = store.query_notes(&q).unwrap();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].note_id, b); // newest within projects/
+}
+
+#[test]
+fn query_notes_num_range_and_meta_order() {
+    let (_dir, mut store) = fresh_store();
+    put_note(&mut store, "a.md", 1, &[("priority", "1", Some(1.0))]);
+    let b = put_note(&mut store, "b.md", 1, &[("priority", "5", Some(5.0))]);
+    let c = put_note(&mut store, "c.md", 1, &[("priority", "3", Some(3.0))]);
+
+    let q = NoteQuery {
+        filters: vec![MetaFilter::NumRange {
+            key: "priority".into(),
+            min: Some(3.0),
+            max: None,
+        }],
+        order: Some(NoteOrder::MetaNum {
+            key: "priority".into(),
+            dir: OrderDir::Desc,
+        }),
+        ..Default::default()
+    };
+    let res = store.query_notes(&q).unwrap();
+    let ids: Vec<String> = res.into_iter().map(|r| r.note_id).collect();
+    assert_eq!(ids, vec![b, c]); // 5 then 3; priority 1 filtered out
+}
+
+#[test]
+fn query_notes_select_projects_fields() {
+    let (_dir, mut store) = fresh_store();
+    put_note(
+        &mut store,
+        "a.md",
+        1,
+        &[("status", "active", None), ("tags", "x", None), ("tags", "y", None)],
+    );
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Exists {
+            key: "status".into(),
+        }],
+        select: vec!["status".into(), "tags".into()],
+        ..Default::default()
+    };
+    let res = store.query_notes(&q).unwrap();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].fields.get("status").map(String::as_str), Some("active"));
+    // Multi-valued key joins for display.
+    assert_eq!(res[0].fields.get("tags").map(String::as_str), Some("x, y"));
+}
+
+#[test]
+fn delete_note_clears_metadata() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(&mut store, "a.md", 1, &[("status", "active", None)]);
+    store.delete_note(&a).unwrap();
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Exists {
+            key: "status".into(),
+        }],
+        ..Default::default()
+    };
+    assert!(store.query_notes(&q).unwrap().is_empty());
+}
+
+#[test]
+fn replace_note_metadata_overwrites_prior() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(&mut store, "a.md", 1, &[("status", "active", None)]);
+    // Re-derive with a different status (simulates an edit + re-ingest).
+    store
+        .replace_note_metadata(
+            &a,
+            &[MetaEntry {
+                key: "status".into(),
+                value: "done".into(),
+                num: None,
+            }],
+        )
+        .unwrap();
+    let active = NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "status".into(),
+            value: "active".into(),
+        }],
+        ..Default::default()
+    };
+    let done = NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "status".into(),
+            value: "done".into(),
+        }],
+        ..Default::default()
+    };
+    assert!(store.query_notes(&active).unwrap().is_empty());
+    assert_eq!(store.query_notes(&done).unwrap().len(), 1);
 }

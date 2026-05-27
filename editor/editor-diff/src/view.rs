@@ -258,6 +258,7 @@ pub fn unified_decorations_opts(
                         fg: None,
                         gutter_marker: Some(GutterMarker::DiffRemoved),
                         marks: Vec::new(),
+                        strikethrough: true,
                     });
                 }
                 let block = BlockDeco {
@@ -305,6 +306,7 @@ pub fn unified_decorations_opts(
                             fg: None,
                             gutter_marker: Some(GutterMarker::DiffRemoved),
                             marks: Vec::new(),
+                            strikethrough: true,
                         });
                     }
                     let block = BlockDeco {
@@ -338,11 +340,44 @@ pub fn unified_decorations_opts(
                                 pal.added_bg,
                                 GutterMarker::DiffModified,
                             );
-                            // Skip the per-character insert marks when the
-                            // intraline toggle is off — line-level
-                            // emphasis is enough.
+                            let cd = char_diff(l, r);
+                            // Removed side: the old line isn't in the buffer, so
+                            // show it as a phantom block above its replacement —
+                            // otherwise a paired in-line replace renders only the
+                            // green inserts and the deleted text is invisible. The
+                            // per-character delete/insert marks ride the intraline
+                            // toggle; the line itself always shows.
+                            let removed_marks: Vec<(std::ops::Range<usize>, Color)> = if intraline
+                            {
+                                cd.deletes
+                                    .iter()
+                                    .filter(|d| d.start < d.end)
+                                    .map(|d| (d.clone(), pal.word_removed))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            push_block_at(
+                                &mut entries,
+                                right_rope,
+                                line_idx,
+                                BlockDeco {
+                                    side: BlockSide::Above,
+                                    height: line_height,
+                                    kind: BlockKind::Text {
+                                        lines: vec![BlockTextLine {
+                                            text: SmolStr::from(l),
+                                            bg: Some(pal.removed_bg),
+                                            fg: None,
+                                            gutter_marker: Some(GutterMarker::DiffRemoved),
+                                            marks: removed_marks,
+                                            strikethrough: true,
+                                        }],
+                                    },
+                                },
+                            );
+                            // Added side: per-character insert marks (intraline only).
                             if intraline {
-                                let cd = char_diff(l, r);
                                 let right_byte_start = byte_of_line(right_rope, line_idx);
                                 for ins in &cd.inserts {
                                     let s = right_byte_start + ins.start;
@@ -358,9 +393,6 @@ pub fn unified_decorations_opts(
                                         ));
                                     }
                                 }
-                            } else {
-                                let _ = l;
-                                let _ = r;
                             }
                         }
                         LinePair::Removed { .. } => {}
@@ -370,6 +402,221 @@ pub fn unified_decorations_opts(
         }
     }
     RangeSet::from_iter(entries)
+}
+
+/// Mirror of `unified_decorations_opts` for "suggestion mode": the editable
+/// buffer holds the OLD text (diff LEFT side) and we overlay an agent's
+/// proposed NEW text (diff RIGHT side) on top, Google-Docs style. Hunks are
+/// `diff_lines(buffer_text, proposal_text)`, so `hunk.left_lines` index the
+/// buffer and `hunk.right_lines` index the proposal.
+///
+///   - Added  → the proposed lines aren't in the buffer, so they ride a green
+///     phantom `Text` block injected above `hunk.left_lines.start`.
+///   - Removed → the lines are real buffer text the agent wants to drop, so
+///     mark them with a red line bg plus a struck-through `Mark`.
+///   - Modified → both: strike the real old buffer lines AND ghost the new
+///     proposal lines as a green block (no per-line pairing refinement). When
+///     `intraline` is set, paired lines also get per-character delete marks on
+///     the buffer side; the line-level strike always shows.
+pub fn proposal_decorations(
+    buffer_rope: &Rope,
+    proposal_text: &str,
+    hunks: &[Hunk],
+    line_height: f32,
+    theme: Option<&Theme>,
+    intraline: bool,
+) -> DecorationSet {
+    let pal = DiffPalette::from_theme(theme);
+    let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
+    let proposal_lines_all = split_lines(proposal_text);
+
+    for hunk in hunks {
+        match hunk.kind {
+            HunkKind::Context => {}
+            HunkKind::Added => {
+                push_proposal_block(
+                    &mut entries,
+                    buffer_rope,
+                    hunk.left_lines.start,
+                    &proposal_lines_all,
+                    &hunk.right_lines,
+                    line_height,
+                    &pal,
+                );
+            }
+            HunkKind::Removed => {
+                strike_buffer_lines(
+                    &mut entries,
+                    buffer_rope,
+                    &hunk.left_lines,
+                    &GutterMarker::DiffRemoved,
+                    &pal,
+                );
+            }
+            HunkKind::Modified => {
+                strike_buffer_lines(
+                    &mut entries,
+                    buffer_rope,
+                    &hunk.left_lines,
+                    &GutterMarker::DiffModified,
+                    &pal,
+                );
+                if intraline {
+                    intraline_removed_marks(
+                        &mut entries,
+                        buffer_rope,
+                        &hunk.left_lines,
+                        &proposal_lines_all,
+                        &hunk.right_lines,
+                        &pal,
+                    );
+                }
+                push_proposal_block(
+                    &mut entries,
+                    buffer_rope,
+                    hunk.left_lines.start,
+                    &proposal_lines_all,
+                    &hunk.right_lines,
+                    line_height,
+                    &pal,
+                );
+            }
+        }
+    }
+    RangeSet::from_iter(entries)
+}
+
+/// Split text into buffer-style lines (drops the trailing empty line that a
+/// final newline produces), matching how `unified_decorations_opts` splits its
+/// `left_text` into `left_lines_all`.
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            out.push(&text[start..i]);
+            start = i + 1;
+        }
+    }
+    if start <= text.len() {
+        out.push(&text[start..]);
+    }
+    if matches!(out.last(), Some(last) if last.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// Mark real buffer lines the agent proposes to remove: a red `Line` bg + the
+/// given gutter marker, plus a struck-through `Mark` over each line's byte
+/// range so the deleted text reads as crossed out.
+fn strike_buffer_lines(
+    entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
+    buffer_rope: &Rope,
+    lines: &std::ops::Range<usize>,
+    marker: &GutterMarker,
+    pal: &DiffPalette,
+) {
+    line_bg(entries, buffer_rope, lines, pal.removed_bg, marker);
+    for line in lines.clone() {
+        if line >= buffer_rope.len_lines() {
+            break;
+        }
+        let start = buffer_rope.line_to_byte(line);
+        let raw_end = if line + 1 < buffer_rope.len_lines() {
+            buffer_rope.line_to_byte(line + 1)
+        } else {
+            buffer_rope.len_bytes()
+        };
+        // Don't strike the trailing newline byte (if any) — only the text.
+        let end = if raw_end > start && buffer_rope.line_str(line).ends_with('\n') {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        if start < end {
+            entries.push((
+                start..end,
+                Decoration::Mark(MarkStyle {
+                    strikethrough: true,
+                    bg: Some(pal.word_removed),
+                    ..MarkStyle::default()
+                }),
+            ));
+        }
+    }
+}
+
+/// Inject the proposed (new) lines as a green phantom `Text` block above the
+/// buffer line where the insertion lands. The text isn't in the buffer, so it
+/// can only be shown as a block.
+fn push_proposal_block(
+    entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
+    buffer_rope: &Rope,
+    buffer_line: usize,
+    proposal_lines_all: &[&str],
+    right_lines: &std::ops::Range<usize>,
+    line_height: f32,
+    pal: &DiffPalette,
+) {
+    let mut lines = Vec::with_capacity(right_lines.len());
+    for ri in right_lines.clone() {
+        let text = proposal_lines_all.get(ri).copied().unwrap_or("");
+        lines.push(BlockTextLine {
+            text: SmolStr::from(text),
+            bg: Some(pal.added_bg),
+            fg: None,
+            gutter_marker: Some(GutterMarker::DiffAdded),
+            marks: Vec::new(),
+            strikethrough: false,
+        });
+    }
+    let block = BlockDeco {
+        side: BlockSide::Above,
+        height: right_lines.len() as f32 * line_height,
+        kind: BlockKind::Text { lines },
+    };
+    push_block_at(entries, buffer_rope, buffer_line, block);
+}
+
+/// For a Modified hunk, char-diff each buffer line against its positional
+/// counterpart in the proposal and emit word-removed `Mark`s over the deleted
+/// substrings in the buffer. Positional pairing (line N to line N) keeps this
+/// simple — no similarity refinement.
+fn intraline_removed_marks(
+    entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
+    buffer_rope: &Rope,
+    left_lines: &std::ops::Range<usize>,
+    proposal_lines_all: &[&str],
+    right_lines: &std::ops::Range<usize>,
+    pal: &DiffPalette,
+) {
+    for (offset, line) in left_lines.clone().enumerate() {
+        if line >= buffer_rope.len_lines() {
+            break;
+        }
+        let old = buffer_rope.line_str(line);
+        let old = old.strip_suffix('\n').unwrap_or(&old);
+        let new = proposal_lines_all
+            .get(right_lines.start + offset)
+            .copied()
+            .unwrap_or("");
+        let line_start = byte_of_line(buffer_rope, line);
+        for del in char_diff(old, new).deletes {
+            let s = line_start + del.start;
+            let e = (line_start + del.end).min(buffer_rope.len_bytes());
+            if s < e {
+                entries.push((
+                    s..e,
+                    Decoration::Mark(MarkStyle {
+                        strikethrough: true,
+                        bg: Some(pal.word_removed),
+                        ..MarkStyle::default()
+                    }),
+                ));
+            }
+        }
+    }
 }
 
 fn line_bg_one(
@@ -534,5 +781,145 @@ mod intraline_tests {
         let on_set =
             unified_decorations_opts(&rope, left, &hunks, 18.0, None, true);
         assert_eq!(count_mark_decos(&default_set), count_mark_decos(&on_set));
+    }
+
+    /// Concatenated text of every removed-line phantom block
+    /// (`BlockSide::Above` + `BlockKind::Text`) in the set.
+    fn removed_block_texts(set: &DecorationSet) -> Vec<String> {
+        set.iter_all()
+            .filter_map(|(_, d)| match d {
+                Decoration::Block(BlockDeco {
+                    side: BlockSide::Above,
+                    kind: BlockKind::Text { lines },
+                    ..
+                }) => Some(
+                    lines
+                        .iter()
+                        .map(|l| l.text.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: a *similar*-line replace pairs as a Modified line
+    /// (similarity >= 0.5). The deleted text isn't in the buffer, so it must
+    /// surface as a removed-line block above its replacement — otherwise the
+    /// unified inline view shows only the green inserts and the removal is
+    /// invisible. Holds with the intraline toggle both on and off (the line
+    /// always shows; only the per-character marks ride the toggle).
+    #[test]
+    fn modified_line_renders_removed_text_block() {
+        let left = "alpha\nBody text here.\ncharlie\n";
+        let right = "alpha\nBody text now.\ncharlie\n";
+        let hunks = diff_lines(left, right);
+        let rope = Rope::from_str(right);
+        for intraline in [true, false] {
+            let set = unified_decorations_opts(&rope, left, &hunks, 18.0, None, intraline);
+            let removed = removed_block_texts(&set);
+            assert!(
+                removed.iter().any(|t| t.contains("Body text here.")),
+                "intraline={intraline}: removed block missing old line text; got {removed:?}",
+            );
+            // Removed-line text is struck through (in addition to its red bg).
+            let all_struck = set.iter_all().all(|(_, d)| match d {
+                Decoration::Block(BlockDeco {
+                    side: BlockSide::Above,
+                    kind: BlockKind::Text { lines },
+                    ..
+                }) => lines.iter().all(|l| l.strikethrough),
+                _ => true,
+            });
+            assert!(all_struck, "intraline={intraline}: removed-line block not struck through");
+        }
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+    use editor_core::diff::lines as diff_lines;
+    use editor_core::rope::Rope;
+
+    /// Count struck-through `Mark` decorations — these mark real buffer lines
+    /// the agent proposes to delete.
+    fn count_strike_marks(set: &DecorationSet) -> usize {
+        set.iter_all()
+            .filter(|(_, d)| matches!(d, Decoration::Mark(m) if m.strikethrough))
+            .count()
+    }
+
+    /// Concatenated text of every added phantom block (`BlockSide::Above` +
+    /// `BlockKind::Text`) in the set, paired with whether its lines are struck.
+    fn added_blocks(set: &DecorationSet) -> Vec<(String, bool)> {
+        set.iter_all()
+            .filter_map(|(_, d)| match d {
+                Decoration::Block(BlockDeco {
+                    side: BlockSide::Above,
+                    kind: BlockKind::Text { lines },
+                    ..
+                }) => Some((
+                    lines.iter().map(|l| l.text.to_string()).collect::<Vec<_>>().join("\n"),
+                    lines.iter().any(|l| l.strikethrough),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_insertion_makes_unstruck_block_no_strike_mark() {
+        // Proposal adds a line; the buffer (old side) doesn't have it.
+        let buffer = "alpha\ncharlie\n";
+        let proposal = "alpha\nbravo\ncharlie\n";
+        let hunks = diff_lines(buffer, proposal);
+        let rope = Rope::from_str(buffer);
+        let set = proposal_decorations(&rope, proposal, &hunks, 18.0, None, true);
+
+        let blocks = added_blocks(&set);
+        assert!(
+            blocks.iter().any(|(t, _)| t.contains("bravo")),
+            "inserted line missing from phantom block; got {blocks:?}",
+        );
+        assert!(
+            blocks.iter().all(|(_, struck)| !*struck),
+            "inserted phantom block lines must not be struck through; got {blocks:?}",
+        );
+        assert_eq!(
+            count_strike_marks(&set),
+            0,
+            "a pure insertion must not produce strikethrough Marks",
+        );
+    }
+
+    #[test]
+    fn agent_deletion_strikes_buffer_line_no_added_block() {
+        // Proposal drops a line that lives in the buffer.
+        let buffer = "alpha\nbravo\ncharlie\n";
+        let proposal = "alpha\ncharlie\n";
+        let hunks = diff_lines(buffer, proposal);
+        let rope = Rope::from_str(buffer);
+        let set = proposal_decorations(&rope, proposal, &hunks, 18.0, None, true);
+
+        assert!(
+            count_strike_marks(&set) >= 1,
+            "a deletion must strike the real buffer line",
+        );
+        assert!(
+            added_blocks(&set).is_empty(),
+            "a pure deletion must not inject an added phantom block; got {:?}",
+            added_blocks(&set),
+        );
+    }
+
+    #[test]
+    fn identical_input_is_empty() {
+        let buffer = "alpha\nbravo\ncharlie\n";
+        let hunks = diff_lines(buffer, buffer);
+        let rope = Rope::from_str(buffer);
+        let set = proposal_decorations(&rope, buffer, &hunks, 18.0, None, true);
+        assert_eq!(set.iter_all().count(), 0, "context-only diff emits no decorations");
     }
 }

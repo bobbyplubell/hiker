@@ -6,8 +6,43 @@
 //! preview-slot rule.
 
 use crate::buffer::Buffer;
-use crate::state::{nav_push, AppState, ToastLevel};
+use crate::state::{nav_push, AppState, NavTarget, ToastLevel};
 use crate::tab::{Tab, TabId, TabKind};
+
+/// Load the live vault buffer for `rel` into the buffer map if it isn't already
+/// cached. Returns `false` (after a toast) when the file can't be read. The
+/// buffer opens on its disk text (= `materialize_accepted` when the doc is
+/// seeded); the per-frame editor binding then keeps `editor.doc` equal to
+/// `materialize_working` and renders pending agent ops as the suggestion
+/// overlay (per `op-log-editor-binding`).
+///
+/// `pub(crate)` so non-tab hosts (e.g. the board pane's in-tab Markdown view,
+/// `board-view-toggle`) can load the buffer before rendering the editor
+/// widget inline without opening a separate buffer tab.
+pub(crate) fn ensure_vault_buffer_loaded(state: &mut AppState, rel: &str) -> bool {
+    if state.session.buffers.contains_key(rel) {
+        return true;
+    }
+    match state.vault_session.vault.read_file_with_hash(rel) {
+        Ok((contents, hash)) => {
+            let cfg_guard = state.vault_session.config.read().ok();
+            let buf = Buffer::with_config_and_vault(
+                rel.to_string(),
+                &contents,
+                hash,
+                cfg_guard.as_deref(),
+                Some(state.vault_session.vault.clone()),
+            );
+            drop(cfg_guard);
+            state.session.buffers.insert(rel.to_string(), buf);
+            true
+        }
+        Err(err) => {
+            state.push_toast(format!("Failed to open {}: {}", rel, err), ToastLevel::Error);
+            false
+        }
+    }
+}
 
 /// Open the file at `rel` as a buffer tab. If `sticky`, the tab is created
 /// sticky (Mod-click / "Keep open" / drag); otherwise it lands in the
@@ -30,37 +65,8 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     }
 
     // Load contents into memory if not already cached.
-    if !state.session.buffers.contains_key(rel) {
-        match state.vault_session.vault.read_file_with_hash(rel) {
-            Ok((contents, hash)) => {
-                let cfg_guard = state.vault_session.config.read().ok();
-                let mut buf = Buffer::with_config_and_vault(
-                    rel.to_string(),
-                    &contents,
-                    hash,
-                    cfg_guard.as_deref(),
-                    Some(state.vault_session.vault.clone()),
-                );
-                drop(cfg_guard);
-                // Apply pending `edit_note` proposals into the live buffer
-                // and snapshot the pre-apply disk text as `agent_base`. The
-                // inline diff overlay then renders `DiffLayer(agent_base,
-                // current, Agent)` so the agent's changes appear as a diff
-                // the user can accept-all / reject-all via the file pill.
-                // Per `patch-review-buffer-hydration`.
-                buf.hydrate_pending_proposals(
-                    state.vault_session.services.staging.as_ref(),
-                );
-                state.session.buffers.insert(rel.to_string(), buf);
-            }
-            Err(err) => {
-                state.push_toast(
-                    format!("Failed to open {}: {}", rel, err),
-                    ToastLevel::Error,
-                );
-                return;
-            }
-        }
+    if !ensure_vault_buffer_loaded(state, rel) {
+        return;
     }
 
     // Replace preview slot if a non-sticky open and a preview exists.
@@ -104,7 +110,7 @@ impl AppState {
     }
 }
 
-/// Load a read-only preview buffer (snapshot blob / staging proposal /
+/// Load a read-only preview buffer (snapshot blob / pending proposal /
 /// trash entry) into `state.session.buffers` under its composite key.
 /// Idempotent: re-calling for the same source is a no-op once loaded.
 /// Returns the storage key callers use to look the buffer up later.
@@ -118,29 +124,33 @@ pub fn ensure_readonly_buffer_loaded(
         return Some(key);
     }
     let contents = match source {
-        BufferSource::Snapshot { change_id, .. } => {
-            let id = change_id.parse::<i64>().ok()?;
-            let bytes = state
-                .vault_session
-                .services
-                .changes
-                .content_at(id)
+        BufferSource::Snapshot { op_id, path } => {
+            // The version's content materialized from the op log at `op_id`.
+            let log = state.vault_session.services.oplog.as_ref();
+            hiker_core::ops::op_writes::content_at_op(log, path, op_id)
                 .ok()
-                .flatten()?;
-            String::from_utf8(bytes).ok()?
+                .flatten()?
         }
-        BufferSource::StagingProposal { proposal_id, .. } => state
-            .vault_session
-            .services
-            .staging
-            .content(proposal_id)
-            .ok()?,
+        BufferSource::PendingProposal { proposal_id, target_path } => {
+            // The proposal content is the op-log pending-op materialization:
+            // `materialize(accepted + just this op)`. Read through the op-log
+            // seam rather than a legacy pending store.
+            let log = state.vault_session.services.oplog.as_ref();
+            hiker_core::ops::op_writes::proposal_materializations(
+                log,
+                target_path,
+                proposal_id,
+            )
+            .ok()
+            .flatten()
+            .map(|(_accepted, proposed)| proposed)?
+        }
         BufferSource::Trash { trash_path, .. } => std::fs::read_to_string(trash_path).ok()?,
         BufferSource::Vault { .. } => return None,
     };
     let cfg_guard = state.vault_session.config.read().ok();
     // Read-only buffer fronting a non-vault `BufferSource` (snapshot blob,
-    // staging proposal, trash entry). `read_only = true` no-ops editing
+    // pending proposal, trash entry). `read_only = true` no-ops editing
     // commands; the save path already short-circuits non-`Vault` sources.
     let buf = {
         let path = source.path().to_string();
@@ -172,19 +182,104 @@ pub fn ensure_readonly_buffer_loaded(
 /// new buffers landed permanently after each Back press and the user
 /// ended up with a strip full of regular tabs instead of preview reuse.
 pub fn nav_go(state: &mut AppState, delta: i32) {
-    let Some(idx) = state.session.nav.idx else {
-        return;
+    let target = match delta.cmp(&0) {
+        std::cmp::Ordering::Less => state.session.nav.back(),
+        std::cmp::Ordering::Greater => state.session.nav.forward(),
+        std::cmp::Ordering::Equal => None,
     };
-    let next = idx as i32 + delta;
-    if next < 0 || next as usize >= state.session.nav.history.len() {
+    let Some(target) = target else { return };
+    // `locked` so the restoration's `open_file` / tab swap doesn't push a new
+    // nav entry on top of the one we just moved to.
+    state.session.nav.locked = true;
+    navigate_to(state, &target);
+    state.session.nav.locked = false;
+}
+
+/// Restore a nav target into the active editor view.
+fn navigate_to(state: &mut AppState, target: &NavTarget) {
+    match target {
+        NavTarget::File(path) => {
+            // Backing out of a snapshot/preview we swapped into the active tab:
+            // revert that tab in place rather than focusing / opening a separate
+            // tab (so the round-trip lands back exactly where it started).
+            if revert_active_preview_to_file(state, path) {
+                return;
+            }
+            open_file(state, path, /* sticky */ false);
+        }
+        NavTarget::Snapshot { path, op_id } => {
+            set_active_tab_kind(state, TabKind::snapshot_preview(path.clone(), op_id.clone()));
+        }
+    }
+}
+
+/// Open a historical snapshot in the *active* tab, in place, and record it on
+/// the nav stack so Back returns to the live file. The active tab's content
+/// swaps to the read-only snapshot view; the live buffer keeps its own
+/// buffer-map key, so reverting (Back / "Live") is lossless.
+pub fn open_snapshot_in_tab(state: &mut AppState, path: &str, op_id: &str) {
+    if !state.session.nav.locked {
+        state.session.nav.push(NavTarget::Snapshot {
+            path: path.to_string(),
+            op_id: op_id.to_string(),
+        });
+    }
+    set_active_tab_kind(state, TabKind::snapshot_preview(path.to_string(), op_id.to_string()));
+}
+
+/// Swap the active tab back to the live vault buffer for `path`, in place, and
+/// record it on the nav stack (the version-dropdown "Live" pick).
+pub fn open_live_in_tab(state: &mut AppState, path: &str) {
+    if !ensure_vault_buffer_loaded(state, path) {
         return;
     }
-    let next_idx = next as usize;
-    let path = state.session.nav.history[next_idx].clone();
-    state.session.nav.idx = Some(next_idx);
-    state.session.nav.locked = true;
-    open_file(state, &path, /* sticky */ false);
-    state.session.nav.locked = false;
+    if !state.session.nav.locked {
+        state.session.nav.push(NavTarget::File(path.to_string()));
+    }
+    set_active_tab_kind(state, TabKind::vault_buffer(path.to_string()));
+}
+
+/// Swap the active tab's kind in place. No-op when there's no active tab.
+fn set_active_tab_kind(state: &mut AppState, kind: TabKind) {
+    if let Some(active) = state.session.active_tab
+        && let Some(tab) = state.session.tabs.iter_mut().find(|t| t.id == active)
+    {
+        tab.kind = kind;
+    }
+}
+
+/// If the active tab is a read-only preview (snapshot / proposal) of `path`,
+/// revert it to the live vault buffer in place and return `true`. Used by
+/// Back so leaving a snapshot lands back on the same tab's live buffer.
+/// (`vault_path()` only matches `Vault` sources, so a snapshot tab is matched
+/// by its buffer source's own path instead.)
+fn revert_active_preview_to_file(state: &mut AppState, path: &str) -> bool {
+    use crate::tab::BufferSource;
+    let Some(active) = state.session.active_tab else { return false };
+    // Immutable check first so the borrow is released before `ensure_*` takes
+    // `&mut state`.
+    let is_preview_of_path = state
+        .session
+        .tabs
+        .iter()
+        .find(|t| t.id == active)
+        .is_some_and(|t| {
+            matches!(
+                &t.kind,
+                TabKind::Editor { buffer, .. }
+                    if buffer.path() == path && !matches!(buffer, BufferSource::Vault { .. })
+            )
+        });
+    if !is_preview_of_path {
+        return false;
+    }
+    // Make sure the live buffer exists before swapping the tab to it (it may
+    // not if the preview was opened as a fresh tab from Home / Changes).
+    if !ensure_vault_buffer_loaded(state, path) {
+        return false;
+    }
+    set_active_tab_kind(state, TabKind::vault_buffer(path.to_string()));
+    true
 }
 
 impl AppState {
@@ -198,21 +293,26 @@ impl AppState {
     }
 }
 
-/// Save the buffer at `rel` to disk. Updates loaded_hash on success.
-/// Returns Ok(()) even for clean buffers (no-op); errors only when write
-/// fails. Drift conflicts (file changed on disk between load and save)
-/// open the `Modal::DiskDrift` resolution dialog and return Ok(()) — the
-/// modal owns the next-step decision (`pre-write-drift-check`).
+/// Save the buffer at `rel` to disk. Folds the user's uncommitted `working`
+/// layer into `accepted` via `commit_working` (per `op-log.md`'s "Disk write
+/// invariant"), which atomically rewrites the `.md`. Returns Ok(()) even for
+/// clean buffers (no-op); errors only when the commit fails.
 ///
-/// On success, also records the write to the changelog (`changes.db`) so
-/// the status-bar version dropdown and activity feed see a snapshot —
-/// without this, every user save vanished from history and the dropdown
-/// was empty for buffers the user had been editing all session.
+/// The agent's `pending` ops are untouched — they live outside `working` and
+/// `accepted`, so the save can't carry one to disk: the "saved without
+/// reviewing" failure mode is gone. After commit, the buffer's `loaded_hash` /
+/// `loaded_text` advance to the committed text so `is_dirty()` clears.
+/// Because `working` is CRDT-merged, the old disk-drift modal for user saves
+/// is superseded; external-edit reconciliation is handled separately by the
+/// watcher (`op_writes::external_edit`).
+///
+/// On success, the op log records the commit (an accepted `user` op) so the
+/// status-bar version dropdown and activity feed see a snapshot.
 pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     let Some(buffer) = state.session.buffers.get(rel) else {
         return Err("buffer not found".to_string());
     };
-    // Read-only preview buffers (snapshot / staging / trash) have no save
+    // Read-only preview buffers (snapshot / pending / trash) have no save
     // path — their verbs are Restore / Accept / Reject in the toolbar.
     if !matches!(&buffer.source, crate::tab::BufferSource::Vault { .. }) {
         return Ok(());
@@ -220,63 +320,105 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     if !buffer.is_dirty() {
         return Ok(());
     }
-    // Per `patch-review-hydrate-dehydrate`: refuse to save while there are
-    // unresolved hydrated proposals — accepting each hunk is what writes
-    // the `changes.db` audit row, and bypassing that via Save would skip
-    // the audit. The user must walk the hunks (or Reject all) first.
-    if !buffer.hydrated_proposals.is_empty() {
-        let n = buffer.hydrated_proposals.len();
-        return Err(format!(
-            "{} pending agent {} for this buffer — accept or reject each hunk before saving",
-            n,
-            if n == 1 { "proposal" } else { "proposals" },
-        ));
-    }
-    let text = buffer.current_text();
-    let expected = buffer.loaded_hash.clone();
+    let log = &state.vault_session.services.oplog;
+    let Some(doc_id) = log.doc_id_for_path(rel).map_err(|e| e.to_string())? else {
+        return Err(format!("no op-log document for {}", rel));
+    };
+    // Fold the `working` layer into `accepted` (atomic `.md` rewrite). The
+    // forward binding already mirrored the user's typing into `working`, so
+    // the committed content is exactly the editable buffer text.
+    let mut text = buffer.current_text();
 
-    // Pre-write baseline: capture the on-disk state before we overwrite
-    // it so rollback has a row to land on. `ensure_baseline` is a no-op
-    // if a row already exists for this path.
-    {
-        let changes = state.vault_session.services.changes.clone();
-        if let Ok((pre_text, pre_hash)) = state.vault_session.vault.read_file_with_hash(rel)
-            && let Err(e) = changes.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
-        {
-            tracing::warn!(error = %e, path = %rel, "changes: ensure_baseline failed (save_buffer)");
+    // Normalize hand-typed / external wikilinks to the durable id form before
+    // committing: resolve each name target, stamp it, rewrite to
+    // `[[<ulid>|<display>]]`. The cheap parse pre-check keeps the common
+    // save (no name-form links) off the store lock + async bridge entirely.
+    // status: wikilink-name-normalize
+    let needs_normalize = hiker_core::wikilink::parse_links(&text)
+        .iter()
+        .any(|l| !l.is_id_form() && !l.target.is_empty());
+    if needs_normalize {
+        if let Some(normalized) = normalize_wikilinks_blocking(state, rel, &text) {
+            if normalized != text {
+                // Update the working layer + the visible editor doc so the
+                // commit folds the id-form text and the cursor stays valid.
+                let _ = state
+                    .vault_session
+                    .services
+                    .oplog
+                    .apply_user_text(&doc_id, &normalized);
+                if let Some(b) = state.session.buffers.get_mut(rel) {
+                    b.set_doc_clamping_selection(&normalized);
+                }
+                text = normalized;
+            }
         }
     }
-
-    match state.vault_session.vault.write_file_checked(rel, &expected, &text) {
-        Ok(new_hash) => {
-            let c = state.vault_session.services.changes.clone();
-            if let Err(e) = c.append(hiker_core::changes::ChangeAppend {
-                    path: rel,
-                    op: hiker_core::changes::ChangeOp::Modified,
-                    author: "user",
-                    content_hash: Some(&new_hash),
-                    content: Some(text.as_bytes()),
-                    rename_from: None,
-                    metadata: serde_json::json!({}),
-                })
-            {
-                tracing::warn!(error = %e, path = %rel, "changes: append failed (save_buffer)");
-            }
+    let log = &state.vault_session.services.oplog;
+    match log.commit_working(&doc_id) {
+        Ok(_) => {
+            let new_hash = hiker_core::hash_string(&text);
             if let Some(b) = state.session.buffers.get_mut(rel) {
+                // The committed text is the buffer's clean, in-sync-with-
+                // `accepted` baseline; advancing both clears `is_dirty()`.
                 b.loaded_hash = new_hash;
-                b.loaded_text = text.clone();
+                b.loaded_text = text;
+            }
+            // Auto-reject-on-drift (`op-log-status-states`): the commit just
+            // advanced `accepted`, so any pending agent op anchored to the
+            // changed region may have drifted. When `[op-log]
+            // auto_reject_on_drift` is set, flip those to rejected immediately.
+            let auto_reject = state
+                .vault_session
+                .config
+                .read()
+                .map(|c| c.op_log.auto_reject_on_drift)
+                .unwrap_or(false);
+            if auto_reject
+                && let Err(e) = hiker_core::ops::op_writes::auto_reject_drifted(
+                    &state.vault_session.services.oplog,
+                    rel,
+                    true,
+                )
+            {
+                tracing::warn!(error = %e, path = %rel, "oplog: auto-reject-on-drift failed");
             }
             state.push_toast(format!("Saved {}", rel), ToastLevel::Info);
             Ok(())
         }
-        Err(hiker_core::errors::HikerError::DiskDrift { .. }) => {
-            state.session.modal = Some(crate::state::Modal::DiskDrift {
-                path: rel.to_string(),
-                in_buffer_text: text,
-            });
-            Ok(())
-        }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Run the async wikilink id-form normalizer (`core::ops::buffer::
+/// normalize_wikilinks`) to completion on the frame's tokio runtime. A fresh
+/// reader `Store` is opened for the call rather than locking the shared
+/// `read_store` across the `.await` (the trail-stamping seam does the same — a
+/// `MutexGuard` held across an await point is the anti-pattern the indexer's
+/// fresh-connection model exists to avoid). Returns the rewritten text, or
+/// `None` (after a warn log) when there's no runtime or the pass errors — in
+/// which case the save proceeds with the user's text unchanged.
+fn normalize_wikilinks_blocking(state: &AppState, rel: &str, text: &str) -> Option<String> {
+    let watcher = state.vault_session.services.watcher.clone();
+    let jobs = state.vault_session.services.indexer.job_sender();
+    let vault = state.vault_session.vault.clone();
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let mut store = match hiker_core::store::Store::open(vault.root()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %rel, "wikilink normalize: open store failed");
+            return None;
+        }
+    };
+    let result = handle.block_on(hiker_core::ops::buffer::normalize_wikilinks(
+        &watcher, &jobs, &vault, &mut store, rel, text,
+    ));
+    match result {
+        Ok(out) => Some(out),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %rel, "wikilink normalize-on-save failed");
+            None
+        }
     }
 }
 
@@ -286,39 +428,17 @@ impl AppState {
 /// the drift modal.
 pub fn force_save(&mut self, rel: &str, text: &str) -> Result<(), String> {
     let state = self;
-    // Re-read the on-disk hash so the second `write_file_checked` call
-    // succeeds. If the file vanished entirely we still want to write.
-    let pre_state = state.vault_session.vault.read_file_with_hash(rel).ok();
-    let current_hash = pre_state
-        .as_ref()
-        .map(|(_, h)| h.clone())
-        .unwrap_or_default();
-    {
-        let changes = state.vault_session.services.changes.clone();
-        if let Some((pre_text, pre_hash)) = pre_state.as_ref()
-            && let Err(e) = changes.ensure_baseline(rel, "user", pre_text.as_bytes(), pre_hash)
-        {
-            tracing::warn!(error = %e, path = %rel, "changes: ensure_baseline failed (force_save)");
-        }
-    }
-    let new_hash = state
-        .vault_session
-        .vault
-        .write_file_checked(rel, &current_hash, text)
-        .map_err(|e| e.to_string())?;
-    let c = state.vault_session.services.changes.clone();
-    if let Err(e) = c.append(hiker_core::changes::ChangeAppend {
-            path: rel,
-            op: hiker_core::changes::ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&new_hash),
-            content: Some(text.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"forced": true}),
-        })
-    {
-        tracing::warn!(error = %e, path = %rel, "changes: append failed (force_save)");
-    }
+    // Route the forced write through the op log: `user_save` applies the
+    // edit to `accepted` and writes the materialized `.md`. No drift check
+    // here — the user already chose to overwrite via "Keep mine".
+    hiker_core::ops::op_writes::user_save(
+        &state.vault_session.services.oplog,
+        &state.vault_session.vault,
+        rel,
+        text,
+    )
+    .map_err(|e| e.to_string())?;
+    let new_hash = hiker_core::hash_string(text);
     if let Some(b) = state.session.buffers.get_mut(rel) {
         b.loaded_hash = new_hash;
         b.loaded_text = text.to_string();
@@ -381,7 +501,7 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
 
     // Drop any read-only preview buffer this tab was the last referrer
     // for. Vault buffers were already removed above by vault_path; this
-    // covers the snapshot / staging / trash buffers stored under the
+    // covers the snapshot / pending / trash buffers stored under the
     // composite keys produced by `buffer_key_for_source`.
     if let crate::tab::TabKind::Editor { buffer, .. } = &removed.kind
         && !matches!(buffer, crate::tab::BufferSource::Vault { .. })

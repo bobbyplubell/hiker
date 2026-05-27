@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "notes-query",
+  "name": "Notes Query",
+  "version": "0.1.0",
+  "description": "Live tables of notes filtered by tag, folder, and frontmatter fields.",
+  "author": "hiker",
+  "permissions": ["read:notes", "read:metadata", "ui:sidebar-panel"],
+  "ui": {
+    "sidebar_panels": [{ "id": "query", "title": "Query", "icon": "table" }]
+  },
+  "entry": "plugin.wasm"
+}

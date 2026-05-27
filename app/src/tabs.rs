@@ -348,12 +348,14 @@ impl<'a> HikerBehavior<'a> {
             TabKind::Settings => panels::settings::show(ui, self.app),
             TabKind::Properties { path } => panels::properties::show(ui, self.app, &path),
             TabKind::Graph => panels::graph::show(ui, self.app),
+            TabKind::Board { path } => panels::board::show(ui, self.app, id, &path, self.rt),
             TabKind::Agent { session_id } => {
                 panels::agent::show(ui, self.app, &session_id, self.rt)
             }
             TabKind::PatchReview => panels::patch_review::show(ui, self.app),
             TabKind::Plugins => panels::plugins::show(ui, self.app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, self.app, self.rt),
+            TabKind::Sync => panels::sync::show(ui, self.app, self.rt),
             TabKind::Changes => panels::changes::show(ui, self.app),
             TabKind::ClusterReview { config_json } => {
                 panels::cluster_review::show(ui, self.app, id, &config_json)

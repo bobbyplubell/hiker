@@ -31,6 +31,12 @@ pub struct EditorArea<Tab: Document> {
     /// Most recently focused group (the one user actions like
     /// "close active tab" target). May be `None` when the tree is empty.
     pub(crate) focused_group: Option<TileId>,
+    /// Last-seen active tab handle per group. `tab_ui` consults this to
+    /// scroll a freshly-activated tab into view exactly once (on the
+    /// activation-change frame), so the horizontal tab-strip `ScrollArea`
+    /// reveals a new/just-selected tab without fighting manual scrolling
+    /// on subsequent frames.
+    pub(crate) last_active_per_group: HashMap<TileId, TabId>,
     _marker: PhantomData<Tab>,
 }
 
@@ -40,6 +46,7 @@ impl<Tab: Document> Default for EditorArea<Tab> {
             tree: Tree::empty(egui::Id::new("egui_workbench::editor_tree")),
             entries: HashMap::new(),
             focused_group: None,
+            last_active_per_group: HashMap::new(),
             _marker: PhantomData,
         }
     }
@@ -59,6 +66,7 @@ impl<Tab: Document> EditorArea<Tab> {
             tree: Tree::empty(id),
             entries: HashMap::new(),
             focused_group: None,
+            last_active_per_group: HashMap::new(),
             _marker: PhantomData,
         }
     }
@@ -105,6 +113,9 @@ impl<Tab: Document> EditorArea<Tab> {
         self.tree = tree;
         self.entries = entries;
         self.focused_group = tree_adapter::first_tabs_container(&self.tree);
+        // New tree → previously-seen active handles no longer apply; clear
+        // so a restored active tab scrolls into view on its first frame.
+        self.last_active_per_group.clear();
     }
 
     /// Iterate over open tabs.
@@ -302,6 +313,7 @@ impl<Tab: Document> EditorArea<Tab> {
             focused_group,
             pane_to_group,
             pending_focus: None,
+            last_active_per_group: &mut self.last_active_per_group,
             _mode: PhantomData,
         };
         tree.ui(&mut adapter, ui);
@@ -436,6 +448,21 @@ pub(crate) struct DriveOutcome {
     pub pending_promote: Vec<TabId>,
 }
 
+/// Whether the active tab should be scrolled into the tab strip's view
+/// this frame. True only when `this_tab` is the active tab in its group
+/// (`is_active`) and the group's previously-seen active handle (`prev`)
+/// differs from it — i.e. activation just changed (new tab opened or a
+/// different tab selected). Returning `false` once `prev == Some(this_tab)`
+/// is what keeps the auto-scroll from firing every frame and overriding
+/// the user's manual horizontal scrolling.
+pub(crate) fn should_scroll_active_into_view(
+    is_active: bool,
+    prev: Option<TabId>,
+    this_tab: TabId,
+) -> bool {
+    is_active && prev != Some(this_tab)
+}
+
 /// Per-frame `egui_tiles::Behavior` adapter. Holds borrows of the
 /// payload map (so `pane_ui` can look up the tab) and the host
 /// behavior. Constructed and dropped within a single `Tree::ui` call.
@@ -472,6 +499,11 @@ where
     /// Pane → owning Tabs container, precomputed before `tree.ui()` so
     /// `pane_ui` can resolve its parent group cheaply.
     pub pane_to_group: HashMap<TileId, TileId>,
+    /// Persistent (cross-frame) last-seen active tab per group. `tab_ui`
+    /// reads + updates this to scroll a just-activated tab into view only
+    /// on the frame its activation changed — see
+    /// [`EditorArea::last_active_per_group`].
+    pub last_active_per_group: &'a mut HashMap<TileId, TabId>,
     /// Group the user clicked on this frame, if any — the workbench
     /// promotes this to `focused_group` post-frame so per-group commands
     /// (close-active, focus-next, etc.) target what the user just touched.
@@ -766,6 +798,21 @@ where
             self.pending_promote.push(handle);
         }
 
+        // Scroll a just-activated tab into view. egui_tiles lays out tabs
+        // inside a horizontal `ScrollArea`; a newly-opened/selected tab can
+        // land off-screen to the right. Calling `scroll_to_me` only on the
+        // frame the group's active handle changed reveals it once without
+        // overriding the user's manual horizontal scroll on later frames.
+        if let Some(group) = self.pane_to_group.get(&tile_id).copied() {
+            let prev = self.last_active_per_group.get(&group).copied();
+            if should_scroll_active_into_view(state.active, prev, handle) {
+                tab_response.scroll_to_me(None);
+            }
+            if state.active {
+                self.last_active_per_group.insert(group, handle);
+            }
+        }
+
         self.on_tab_button(tiles, tile_id, tab_response)
     }
 
@@ -917,6 +964,35 @@ where
         if let Some(child) = activate {
             self.pending_tab_activations.push((tile_id, child));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_scroll_active_into_view, TabId};
+
+    #[test]
+    fn inactive_tab_never_scrolls() {
+        // A non-active tab never scrolls itself into view, regardless of
+        // what the group's previously-seen active handle was.
+        assert!(!should_scroll_active_into_view(false, None, TabId(1)));
+        assert!(!should_scroll_active_into_view(false, Some(TabId(2)), TabId(1)));
+        assert!(!should_scroll_active_into_view(false, Some(TabId(1)), TabId(1)));
+    }
+
+    #[test]
+    fn newly_active_tab_scrolls_once() {
+        // First time we see this tab as active for its group (no prior, or
+        // a different prior) → scroll it in.
+        assert!(should_scroll_active_into_view(true, None, TabId(1)));
+        assert!(should_scroll_active_into_view(true, Some(TabId(2)), TabId(1)));
+    }
+
+    #[test]
+    fn active_tab_does_not_rescroll_on_steady_frames() {
+        // Once the group's last-seen active handle equals this tab, the
+        // activation hasn't changed — stay put so manual scroll wins.
+        assert!(!should_scroll_active_into_view(true, Some(TabId(1)), TabId(1)));
     }
 }
 

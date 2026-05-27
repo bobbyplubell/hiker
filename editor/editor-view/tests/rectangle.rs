@@ -12,7 +12,9 @@ use editor_view::events::MouseEvent;
 use editor_view::viewport::DragState;
 use editor_view::viewport::ViewState;
 fn x_for_col(view: &ViewState, col: usize) -> f32 {
-    let char_w = view.font_size * 0.55;
+    // Mirror the x->byte mapper's fallback glyph width (`font_size * 0.6`)
+    // used when no measured monospace width has been seeded on the wrap map.
+    let char_w = view.font_size * 0.6;
     view.gutter_width + col as f32 * char_w
 }
 
@@ -39,7 +41,7 @@ fn alt_drag_creates_one_range_per_row_at_same_columns() {
         click_count: 1,
     };
     let act = handle_mouse_with_mods(&state, &mut view, &down, alt);
-    if let Action::Replace(s) = act {
+    if let Action::Replace { state: s, .. } = act {
         state = s;
     }
     assert!(matches!(view.drag, DragState::RectangleSelecting { .. }));
@@ -51,7 +53,7 @@ fn alt_drag_creates_one_range_per_row_at_same_columns() {
         button: MouseButton::Left,
     };
     let act = handle_mouse_with_mods(&state, &mut view, &drag, alt);
-    if let Action::Replace(s) = act {
+    if let Action::Replace { state: s, .. } = act {
         state = s;
     }
 

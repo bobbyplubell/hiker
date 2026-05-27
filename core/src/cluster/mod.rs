@@ -170,7 +170,7 @@ pub struct PlacementMatch {
 /// caller hands `place_beam_descent` a function from node-id → node so
 /// the tree can live behind whatever storage shape the consumer
 /// prefers (in-memory map, sqlite row lookup, etc.). Keeps this module
-/// free of trees.db assumptions.
+/// free of tree-store assumptions.
 pub trait TreeView {
     fn root(&self) -> &NodeId;
     fn get(&self, id: &NodeId) -> Option<&Node>;

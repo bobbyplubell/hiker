@@ -2,6 +2,7 @@
 //! direct selection / scroll mutations on the [`ViewState`].
 
 use editor_core::change::Set as ChangeSet;
+use editor_core::decoration::Decoration;
 use editor_core::transaction::EditType;
 
 use editor_core::state::Editor as EditorState;
@@ -24,13 +25,48 @@ use crate::viewport::{ClickAction, DragState, ViewState};
 /// Outcome of handling one input event.
 pub enum Action {
     /// Replace the editor state with the given new state.
-    Replace(EditorState),
+    ///
+    /// `tx` carries the change set that produced `state`, when one was built
+    /// from user input — the forward half of the editor binding the host can
+    /// mirror into a higher layer. Doc-mutating arms set `Some(tx)`;
+    /// selection-only arms (and history navigation like undo/redo, where no
+    /// fresh change set was authored) set `None`. The host treats `tx` as an
+    /// optional side channel: applying `state` is unconditional, emitting `tx`
+    /// is opt-in.
+    Replace {
+        state: EditorState,
+        tx: Option<Transaction>,
+    },
     /// Just touch the view (scroll changed, drag updated, etc.).
     None,
     /// Request a clipboard write.
     Copy(String),
+    /// Cut: write `text` to the clipboard *and* replace the editor with
+    /// the post-delete `state`. A single `Action` can only carry one
+    /// outcome, so cut — which both copies and edits — needs its own
+    /// variant rather than being forced to choose between `Copy` and
+    /// `Replace`. The host consumes all three: clipboard write, state swap,
+    /// and `tx` (the deletion's change set, mirrored into the binding's
+    /// `working` layer just like a `Replace` tx — without it the cut would
+    /// only touch `editor.doc` and get reverted on the next reverse pass).
+    Cut { text: String, state: EditorState, tx: Transaction },
     /// Click landed on a clickable decoration zone (e.g. an Expander).
     Click(ClickAction),
+}
+
+impl Action {
+    /// Doc-mutating replace: a freshly-built change set produced `state`.
+    /// `tx` rides along so the host can mirror the applied edit.
+    const fn doc(state: EditorState, tx: Transaction) -> Self {
+        Self::Replace { state, tx: Some(tx) }
+    }
+
+    /// Replace that carries no emittable change set — selection-only edits and
+    /// history navigation (undo / redo), where the new state didn't come from a
+    /// user-authored change set this handler built.
+    const fn state_only(state: EditorState) -> Self {
+        Self::Replace { state, tx: None }
+    }
 }
 
 /// Command-handler context: bundles the immutable editor state and mutable
@@ -93,7 +129,8 @@ pub fn handle(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> 
                     Action::None
                 } else {
                     let tx = state.insert_at_selections(text);
-                    Action::Replace(state.apply(tx))
+                    let new_state = state.apply(tx.clone());
+                    Action::doc(new_state, tx)
                 }
             }
         },
@@ -103,21 +140,34 @@ pub fn handle(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> 
             Action::None
         }
         InputEvent::Focus(_) => Action::None,
-        InputEvent::Paste(s) => insert_text(state, view, s),
+        InputEvent::Paste(s) => {
+            // Let a language provider rewrite the pasted text first — e.g. the
+            // markdown indenter strips a leading `- ` bullet when the caret
+            // already sits right after a list-item bullet, so the buffer's
+            // existing marker isn't doubled.
+            if let Some(provider) = view.indent_provider.clone() {
+                if let Some(rewritten) = provider.on_paste(state, s) {
+                    return insert_text(state, view, &rewritten);
+                }
+            }
+            insert_text(state, view, s)
+        }
         InputEvent::Copy => copy_selection(state),
         InputEvent::Cut => {
-            let copy = copy_selection(state);
-            if let Action::Copy(text) = copy {
-                let tx = state.delete_at_selections();
-                let new_state = state.apply(tx);
+            // Reuse the exact text `copy_selection` would put on the
+            // clipboard (selection, or whole line when empty), then delete
+            // *those same bytes*. Cut and copy share `cut_range` so the line
+            // copied on an empty selection is also the line deleted (a plain
+            // `delete_at_selections` would only backspace one char). Both
+            // halves ride out on `Action::Cut` so the clipboard write isn't
+            // dropped — the bug this fixes.
+            if let Action::Copy(text) = copy_selection(state) {
+                let ranges: Vec<_> =
+                    state.selection.ranges().iter().map(|r| cut_range(state, r)).collect();
+                let tx = state.delete_ranges(&ranges);
+                let new_state = state.apply(tx.clone());
                 view.touch();
-                // Return the copy then apply state by chaining via a small trick:
-                // we can only return one Action, so prefer the state replace and
-                // ship the copy via a side return.
-                // Hack for v1: handle cut via two steps in the widget instead.
-                view.touch();
-                let _ = text;
-                return Action::Replace(new_state);
+                return Action::Cut { text, state: new_state, tx };
             }
             Action::None
         }
@@ -161,11 +211,11 @@ fn handle_motion_key(
     let action = match key {
         Key::Named(NamedKey::ArrowUp) if mods.alt && mods.primary() => {
             let sel = multicursor::add_vertical_cursor(state, false);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::ArrowDown) if mods.alt && mods.primary() => {
             let sel = multicursor::add_vertical_cursor(state, true);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::ArrowLeft) => {
             let layers = view.decorations.layers.as_slice();
@@ -174,7 +224,7 @@ fn handle_motion_key(
             } else {
                 motion::move_char(state, Left, extend, layers)
             };
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::ArrowRight) => {
             let layers = view.decorations.layers.as_slice();
@@ -183,29 +233,29 @@ fn handle_motion_key(
             } else {
                 motion::move_char(state, Right, extend, layers)
             };
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::ArrowUp) => {
             let wrap = if view.wrap_map.enabled() { Some(&view.wrap_map) } else { None };
             let sel = motion::move_vertical_wrapped(state, Up, extend, 1, wrap);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::ArrowDown) => {
             let wrap = if view.wrap_map.enabled() { Some(&view.wrap_map) } else { None };
             let sel = motion::move_vertical_wrapped(state, Down, extend, 1, wrap);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::PageUp) => {
             let lines = ((view.height / view.line_height).floor() as usize).max(1);
             let wrap = if view.wrap_map.enabled() { Some(&view.wrap_map) } else { None };
             let sel = motion::move_vertical_wrapped(state, Up, extend, lines, wrap);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::PageDown) => {
             let lines = ((view.height / view.line_height).floor() as usize).max(1);
             let wrap = if view.wrap_map.enabled() { Some(&view.wrap_map) } else { None };
             let sel = motion::move_vertical_wrapped(state, Down, extend, lines, wrap);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::Home) => {
             let sel = if mods.primary() {
@@ -213,7 +263,7 @@ fn handle_motion_key(
             } else {
                 motion::move_line_edge(state, false, extend)
             };
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Named(NamedKey::End) => {
             let sel = if mods.primary() {
@@ -221,7 +271,7 @@ fn handle_motion_key(
             } else {
                 motion::move_line_edge(state, true, extend)
             };
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         _ => return None,
     };
@@ -271,24 +321,36 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
 
     match key {
         Key::Named(NamedKey::Backspace) => {
-            let tx = state.delete_at_selections();
-            Action::Replace(apply_with_snippet(state, view, tx))
+            let tx = backspace_outdent(state).unwrap_or_else(|| state.delete_at_selections());
+            Action::doc(apply_with_snippet(state, view, tx.clone()), tx)
         }
         Key::Named(NamedKey::Delete) => {
             let tx = (Cmd { state, view }).delete_forward();
-            Action::Replace(apply_with_snippet(state, view, tx))
+            Action::doc(apply_with_snippet(state, view, tx.clone()), tx)
         }
         Key::Named(NamedKey::Enter) if mods.is_empty() => {
             if let Some(provider) = view.indent_provider.clone() {
                 if let Some(tx) = provider.on_enter(state) {
-                    return Action::Replace(state.apply(tx));
+                    return Action::doc(state.apply(tx.clone()), tx);
                 }
             }
             insert_text(state, view, "\n")
         }
         Key::Named(NamedKey::Enter) if mods.shift => insert_text(state, view, "\n"),
-        Key::Named(NamedKey::Tab) if mods.is_empty() => (Cmd { state, view }).indent_tab(),
+        Key::Named(NamedKey::Tab) if mods.is_empty() => {
+            if let Some(provider) = view.indent_provider.clone() {
+                if let Some(tx) = provider.on_tab(state) {
+                    return Action::doc(state.apply(tx.clone()), tx);
+                }
+            }
+            (Cmd { state, view }).indent_tab()
+        }
         Key::Named(NamedKey::Tab) if mods.shift && !mods.primary() && !mods.alt => {
+            if let Some(provider) = view.indent_provider.clone() {
+                if let Some(tx) = provider.on_shift_tab(state) {
+                    return Action::doc(state.apply(tx.clone()), tx);
+                }
+            }
             (Cmd { state, view }).shift_tab_outdent()
         }
         // Note: don't handle plain Space here. egui emits BOTH a Key
@@ -298,40 +360,40 @@ fn handle_key(state: &EditorState, view: &mut ViewState, key: Key, mods: Modifie
         // are intercepted higher up in `app::keybinds`.
         Key::Char('a') | Key::Char('A') if mods.primary_only() => {
             let sel = motion::select_all(state);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         Key::Char('z') | Key::Char('Z') if mods.primary_only() => {
-            if let Some(next) = state.undo() {
-                Action::Replace(next)
-            } else {
-                Action::None
+            // Undo carries its inverse change set so the host binding mirrors
+            // it into the `working` layer; a tx-less undo would only touch
+            // `editor.doc` and get reverted on the next reverse pass.
+            match state.undo_with_changes() {
+                Some((next, tx)) => Action::doc(next, tx),
+                None => Action::None,
             }
         }
         Key::Char('z') | Key::Char('Z') if mods.primary() && mods.shift && !mods.alt => {
-            if let Some(next) = state.redo() {
-                Action::Replace(next)
-            } else {
-                Action::None
+            match state.redo_with_changes() {
+                Some((next, tx)) => Action::doc(next, tx),
+                None => Action::None,
             }
         }
         Key::Char('y') | Key::Char('Y') if mods.primary_only() => {
-            if let Some(next) = state.redo() {
-                Action::Replace(next)
-            } else {
-                Action::None
+            match state.redo_with_changes() {
+                Some((next, tx)) => Action::doc(next, tx),
+                None => Action::None,
             }
         }
         Key::Char('c') | Key::Char('C') if mods.primary_only() => copy_selection(state),
         // Cmd-D / Ctrl-D — add next occurrence of selection.
         Key::Char('d') | Key::Char('D') if mods.primary_only() => {
             let sel = multicursor::add_next_occurrence(state);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         // Escape collapses to the main cursor.
         Key::Named(NamedKey::Escape) => {
             let main = state.selection.main().head.offset();
             let sel = editor_core::selection::Selection::single(main);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         _ => Action::None,
     }
@@ -351,7 +413,7 @@ fn insert_text(state: &EditorState, view: &mut ViewState, s: &str) -> Action {
         && state.selection.ranges().iter().all(editor_core::selection::SelRange::is_empty)
     {
         if let Some(tx) = crate::pairs::autopair_skip(state, saved_skip, s) {
-            return Action::Replace(apply_with_snippet(state, view, tx));
+            return Action::doc(apply_with_snippet(state, view, tx.clone()), tx);
         }
     }
 
@@ -360,7 +422,7 @@ fn insert_text(state: &EditorState, view: &mut ViewState, s: &str) -> Action {
         && state.selection.ranges().iter().all(editor_core::selection::SelRange::is_empty)
     {
         if let Some(tx) = crate::pairs::autopair_transform(state, s) {
-            let new_state = apply_with_snippet(state, view, tx);
+            let new_state = apply_with_snippet(state, view, tx.clone());
             // Record the skip marker: cursor is between open and close, so the
             // close char ends one char-len past the cursor.
             if let Some(first) = s.chars().next() {
@@ -373,18 +435,18 @@ fn insert_text(state: &EditorState, view: &mut ViewState, s: &str) -> Action {
                 }
             }
             maybe_open_completion(&new_state, view, s);
-            return Action::Replace(new_state);
+            return Action::doc(new_state, tx);
         }
     }
     let tx = state.insert_at_selections(s);
-    let new_state = apply_with_snippet(state, view, tx);
+    let new_state = apply_with_snippet(state, view, tx.clone());
     if s.chars().count() == 1 {
         maybe_open_completion(&new_state, view, s);
     } else if view.completion.active {
         // Multi-char paste closes the popup.
         view.completion.close();
     }
-    Action::Replace(new_state)
+    Action::doc(new_state, tx)
 }
 
 /// If `s` is a single character that any registered source advertises as a
@@ -499,7 +561,7 @@ fn handle_completion_key(
                 view.completion.query.pop();
                 // Apply the backspace to the doc, then refilter.
                 let tx = state.delete_at_selections();
-                let new_state = state.apply(tx);
+                let new_state = state.apply(tx.clone());
                 let pos = new_state.selection.main().head.offset();
                 let items = gather_matches(&new_state, view, pos);
                 if items.is_empty() {
@@ -508,7 +570,7 @@ fn handle_completion_key(
                     view.completion.items = items;
                     view.completion.selected = 0;
                 }
-                Some(Action::Replace(new_state))
+                Some(Action::doc(new_state, tx))
             }
         }
         _ => None,
@@ -543,7 +605,7 @@ fn commit_completion(&mut self) -> Action {
     let changes = ChangeSet::of(state.doc.len_bytes(), edits);
     let tx = Transaction::new(changes).with_edit_type(EditType::Input);
     view.completion.close();
-    Action::Replace(state.apply(tx))
+    Action::doc(state.apply(tx.clone()), tx)
 }
 
 }
@@ -558,10 +620,8 @@ pub fn expand_snippet(
 ) -> Action {
     let pos = range.start;
     let (tx, mut snip_state) = snip.expand(state, pos, Some(range));
-    let changes = tx.changes.clone();
-    let after = state.apply(tx);
     // Anchors were built against positions in the new doc, so no mapping needed.
-    let _ = changes;
+    let after = state.apply(tx.clone());
     let sel = snippets::selection_for_stop(&snip_state, 0)
         .unwrap_or_else(|| Selection::single(pos + snip.text().len()));
     let with_sel = Transaction::new(ChangeSet::empty(after.doc.len_bytes())).with_selection(sel);
@@ -571,7 +631,49 @@ pub fn expand_snippet(
         snip_state.cancel();
     }
     view.snippet = snip_state;
-    Action::Replace(after)
+    // The doc-mutating change is the snippet insert `tx`; the trailing
+    // selection set carries no content change.
+    Action::doc(after, tx)
+}
+
+/// Width of one indentation step, matching what [`Cmd::indent_tab`] inserts.
+const TAB_WIDTH: usize = 4;
+
+/// Backspace over a full tab-width group of leading indentation spaces.
+///
+/// Returns a delete-transaction when the caret is a single empty selection
+/// sitting in its line's leading indentation, that indentation is made up
+/// entirely of spaces, and the run of spaces before the caret is a non-zero
+/// multiple of [`TAB_WIDTH`]. In that case one whole tab-width group is
+/// removed instead of a single space. Returns `None` in every other case
+/// (mid-line text, a tab character in the run, a partial group, a non-empty
+/// or multi-range selection) so the caller falls back to single-char delete.
+fn backspace_outdent(state: &EditorState) -> Option<Transaction> {
+    if state.selection.ranges().len() != 1 {
+        return None;
+    }
+    let main = state.selection.main();
+    if !main.is_empty() {
+        return None;
+    }
+    let cursor = main.head.offset();
+    let line = state.doc.byte_to_line(cursor);
+    let line_start = state.doc.line_to_byte(line);
+    // Bytes between the line start and the caret must all be spaces — i.e. the
+    // caret sits inside the leading indentation, not after any content. A tab
+    // in the run disqualifies grouping (its visual width is ambiguous).
+    let prefix = &state.doc.line_str(line)[..cursor - line_start];
+    if prefix.is_empty() || !prefix.bytes().all(|b| b == b' ') {
+        return None;
+    }
+    // Only group when the whitespace run is a whole number of tab widths;
+    // otherwise a single backspace lands the caret on a tab-width boundary.
+    if prefix.len() % TAB_WIDTH != 0 {
+        return None;
+    }
+    let edits = vec![(cursor - TAB_WIDTH..cursor, String::new())];
+    let changes = ChangeSet::of(state.doc.len_bytes(), edits);
+    Some(Transaction::new(changes).with_edit_type(EditType::Delete))
 }
 
 impl<'a> Cmd<'a> {
@@ -603,40 +705,44 @@ fn advance_snippet(&mut self, delta: i32) -> Action {
     let state = self.state;
     let view = &mut *self.view;
     // First, sync any mirrors at the *current* stop into the doc before moving.
+    // That sync is the only content change here; the stop-advance itself is a
+    // selection-only set. Carry the sync tx so the host can mirror it.
     let mut working = state.clone();
-    if let Some(tx) = snippets::mirror_sync(&working, &view.snippet) {
+    let synced = snippets::mirror_sync(&working, &view.snippet);
+    if let Some(tx) = synced.clone() {
         let changes = tx.changes.clone();
         working = working.apply(tx);
         snippets::map_through(&mut view.snippet, &changes);
     }
+    let replace = |state| Action::Replace { state, tx: synced.clone() };
     let n = view.snippet.stops.len() as i32;
     if n == 0 {
         view.snippet.cancel();
-        return Action::Replace(working);
+        return replace(working);
     }
     let next = view.snippet.current as i32 + delta;
     if next < 0 || next >= n {
         // Past the final stop — cancel and leave caret where the doc has it.
         view.snippet.cancel();
-        return Action::Replace(working);
+        return replace(working);
     }
     view.snippet.current = next as usize;
     let sel = match snippets::selection_for_stop(&view.snippet, view.snippet.current) {
         Some(s) => s,
         None => {
             view.snippet.cancel();
-            return Action::Replace(working);
+            return replace(working);
         }
     };
     let tx = Transaction::new(ChangeSet::empty(working.doc.len_bytes())).with_selection(sel);
-    Action::Replace(working.apply(tx))
+    replace(working.apply(tx))
 }
 
-/// Tab: insert 4 spaces at every caret. SPEC §9.14 leaves the smarter
-/// "indent the entire selected block" for a future revision; the v1 rule is
-/// "insert 4 spaces at the caret" regardless of column.
+/// Tab: insert one tab-width of spaces at every caret. SPEC §9.14 leaves the
+/// smarter "indent the entire selected block" for a future revision; the v1
+/// rule is "insert a tab-width of spaces at the caret" regardless of column.
 fn indent_tab(&mut self) -> Action {
-    insert_text(self.state, self.view, "    ")
+    insert_text(self.state, self.view, &" ".repeat(TAB_WIDTH))
 }
 
 /// Shift-Tab: for every line that intersects the selection, remove up to 4
@@ -680,7 +786,7 @@ fn shift_tab_outdent(&mut self) -> Action {
     edits.sort_by_key(|(r, _)| r.start);
     let changes = ChangeSet::of(state.doc.len_bytes(), edits);
     let tx = Transaction::new(changes).with_edit_type(EditType::Indent);
-    Action::Replace(state.apply(tx))
+    Action::doc(state.apply(tx.clone()), tx)
 }
 
 fn delete_forward(&self) -> Transaction {
@@ -711,25 +817,31 @@ fn delete_forward(&self) -> Transaction {
 
 }
 
+/// Byte range copied/cut for one selection range: the range itself when
+/// non-empty, else the whole line including its trailing newline (VSCode
+/// line-wise copy/cut with no selection). Shared by copy and cut so the two
+/// always agree on which bytes are involved.
+fn cut_range(state: &EditorState, r: &SelRange) -> std::ops::Range<usize> {
+    if !r.is_empty() {
+        return r.range();
+    }
+    let line = state.doc.byte_to_line(r.start());
+    let start = state.doc.line_to_byte(line);
+    let end = if line + 1 < state.doc.len_lines() {
+        state.doc.line_to_byte(line + 1)
+    } else {
+        state.doc.len_bytes()
+    };
+    start..end
+}
+
 fn copy_selection(state: &EditorState) -> Action {
     let mut out = String::new();
     for (i, r) in state.selection.ranges().iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        if !r.is_empty() {
-            out.push_str(&state.doc.slice(r.range()).to_string());
-        } else {
-            // VSCode: with no selection, copy the whole line including newline.
-            let line = state.doc.byte_to_line(r.start());
-            let start = state.doc.line_to_byte(line);
-            let end = if line + 1 < state.doc.len_lines() {
-                state.doc.line_to_byte(line + 1)
-            } else {
-                state.doc.len_bytes()
-            };
-            out.push_str(&state.doc.slice(start..end).to_string());
-        }
+        out.push_str(&state.doc.slice(cut_range(state, r)).to_string());
     }
     Action::Copy(out)
 }
@@ -809,7 +921,7 @@ fn mouse_down(
         && !pos_in_any_nonempty_range(state, pos)
     {
         view.drag = DragState::RectangleSelecting { start_xy: (x, y) };
-        return Action::Replace(apply_selection(state, Selection::single(pos)));
+        return Action::state_only(apply_selection(state, Selection::single(pos)));
     }
 
     view.drag = DragState::MaybeSelecting { anchor: pos };
@@ -849,7 +961,7 @@ fn mouse_down(
         }
         _ => Selection::single(pos),
     };
-    Action::Replace(apply_selection(state, sel))
+    Action::state_only(apply_selection(state, sel))
 }
 
 fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
@@ -860,7 +972,7 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
             view.touch();
             let head = view_to_buffer(state, view, x, y);
             let sel = Selection::from_range(SelRange::new(anchor, head));
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         DragState::MaybeDraggingSelection { start, threshold } => {
             let dx = x - start.0;
@@ -910,7 +1022,7 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
                 .min(state.doc.len_lines().saturating_sub(1));
             let main = cur_line.saturating_sub(line_lo).min(ranges.len() - 1);
             let sel = Selection::from_ranges(ranges, main);
-            Action::Replace(apply_selection(state, sel))
+            Action::state_only(apply_selection(state, sel))
         }
         DragState::Idle => Action::None,
     }
@@ -919,9 +1031,10 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
 }
 
 /// Map a widget-local `x` to a byte offset on buffer `line`. Mirrors
-/// `view_to_buffer`'s x→column approximation (mono-width using
-/// `font_size * 0.55`), but takes the line explicitly so callers building
-/// rectangle selections can iterate rows without recomputing y mapping.
+/// `view_to_buffer`'s x→column approximation, including the live-preview
+/// adjustments for header lines (hidden leading markers + scaled glyphs);
+/// takes the line explicitly so callers building rectangle selections can
+/// iterate rows without recomputing y mapping.
 pub fn view_to_buffer_at_line(
     state: &EditorState,
     view: &ViewState,
@@ -933,17 +1046,104 @@ pub fn view_to_buffer_at_line(
     let line_text = state.doc.line_str(line);
     // Strip any trailing newline so the column never lands past EOL.
     let text_no_nl = line_text.trim_end_matches('\n');
-    let col_x = (x - view.gutter_width).max(0.0);
-    let approx_char_w = view.font_size * 0.55;
-    let col = ((col_x / approx_char_w).round() as usize).min(text_no_nl.chars().count());
-    let mut byte = 0usize;
-    for (i, (b, _)) in text_no_nl.char_indices().enumerate() {
-        if i == col {
-            return line_start + b;
+    let col_x = (x - view.content_origin_x()).max(0.0);
+    line_start + col_x_to_line_byte(view, line_start, text_no_nl, true, col_x)
+}
+
+/// Effective glyph width used for x→column mapping, accounting for the
+/// per-line live-preview font scale (headings render at `font_scale`× the
+/// base monospace cell). Mirrors the renderer's per-line scale probe in
+/// `prewrap_visible`: the max `Mark.font_scale` covering the line.
+fn line_font_scale(view: &ViewState, line_start: usize, line_text: &str) -> f32 {
+    let probe = line_start..(line_start + line_text.len()).max(line_start + 1);
+    let mut scale = 1.0_f32;
+    for layer in &view.decorations.layers {
+        for (_r, deco) in layer.iter_overlapping(probe.clone()) {
+            if let Decoration::Mark(ms) = deco
+                && let Some(s) = ms.font_scale
+                && s > scale
+            {
+                scale = s;
+            }
         }
-        byte = b + text_no_nl[b..].chars().next().map(char::len_utf8).unwrap_or(0);
     }
-    line_start + byte
+    scale
+}
+
+/// Byte length of the run of hidden `Replace` markers anchored at the start of
+/// the line (e.g. a heading's `## ` prefix, which renders zero-width in live
+/// preview). Used to skip those source bytes when mapping a click to a byte:
+/// the click lands on the first *visible* glyph, which is the content after
+/// the marker, not the marker itself. Only contiguous hidden replacements
+/// starting exactly at `line_start` count; mid-line replacements (inline-code
+/// backticks, emphasis stars) are left to the verbatim column walk since the
+/// glyphs around them still occupy their source columns closely enough.
+fn leading_hidden_bytes(view: &ViewState, line_start: usize, line_len: usize) -> usize {
+    let mut covered = 0usize;
+    // Re-scan from the growing frontier so multiple stacked hidden replacements
+    // (rare, but possible) chain into one contiguous skipped prefix.
+    loop {
+        let frontier = line_start + covered;
+        let mut grew = false;
+        for layer in &view.decorations.layers {
+            for (r, deco) in layer.iter_overlapping(frontier..frontier + 1) {
+                let hidden = matches!(
+                    deco,
+                    Decoration::Replace { display } if display.as_ref().is_none_or(smol_str::SmolStr::is_empty)
+                );
+                if !(hidden && r.start <= frontier && r.end > frontier) {
+                    continue;
+                }
+                let end_local = (r.end - line_start).min(line_len);
+                if end_local > covered {
+                    covered = end_local;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return covered;
+        }
+    }
+}
+
+/// Map a text-area `col_x` to a line-local byte offset for one (visual) line
+/// of source `text`. Folds in the live-preview header adjustments: glyphs are
+/// scaled by the line's `font_scale`, and a hidden leading marker run is
+/// skipped so the first visible glyph maps to the first content byte rather
+/// than the marker. `at_line_start` is false for soft-wrap continuation rows,
+/// where there is no leading marker to skip.
+fn col_x_to_line_byte(
+    view: &ViewState,
+    line_start: usize,
+    text: &str,
+    at_line_start: bool,
+    col_x: f32,
+) -> usize {
+    let measured = view.wrap_map.char_width();
+    let base_char_w = if measured > 0.5 { measured } else { view.font_size * 0.6 };
+    let scale = line_font_scale(view, line_start, text);
+    let eff_char_w = (base_char_w * scale).max(0.5);
+    let raw_hidden = if at_line_start {
+        leading_hidden_bytes(view, line_start, text.len()).min(text.len())
+    } else {
+        0
+    };
+    // Snap the hidden length down to a char boundary defensively.
+    let mut hidden = raw_hidden;
+    while hidden > 0 && !text.is_char_boundary(hidden) {
+        hidden -= 1;
+    }
+    let visible = &text[hidden..];
+    let col = ((col_x / eff_char_w).round() as usize).min(visible.chars().count());
+    let mut byte = visible.len();
+    for (i, (b, _)) in visible.char_indices().enumerate() {
+        if i == col {
+            byte = b;
+            break;
+        }
+    }
+    hidden + byte
 }
 
 impl<'a> Cmd<'a> {
@@ -982,14 +1182,14 @@ fn mouse_up(&mut self, x: f32, y: f32) -> Action {
                 .with_edit_type(EditType::Other)
                 .with_selection(new_sel);
             view.touch();
-            Action::Replace(state.apply(tx))
+            Action::doc(state.apply(tx.clone()), tx)
         }
         DragState::MaybeDraggingSelection { .. } => {
             // No drag occurred — treat as a plain click: collapse the
             // selection to a single caret at the clicked position.
             let pos = view_to_buffer(state, view, x, y);
             view.touch();
-            Action::Replace(apply_selection(state, Selection::single(pos)))
+            Action::state_only(apply_selection(state, Selection::single(pos)))
         }
         _ => Action::None,
     }
@@ -1012,8 +1212,10 @@ fn scroll_by(view: &mut ViewState, delta_y: f32) {
 }
 
 /// Map widget-local (x, y) to a byte offset in the doc. `x` is widget-local
-/// (including gutter); the host must subtract the gutter before passing if it
-/// wants text-area coordinates. The view's `gutter_width` is used to clamp.
+/// (including gutter); the mapper subtracts the view's current content origin
+/// ([`ViewState::content_origin_x`]) — the gutter width with line numbers on,
+/// or a small pad when the gutter is hidden — so the column is measured from
+/// where the text actually starts regardless of the show-line-numbers toggle.
 pub fn view_to_buffer(state: &EditorState, view: &ViewState, x: f32, y: f32) -> usize {
     let line_y = y + view.scroll_y;
     let line = view.height_map.line_at_y(line_y).min(state.doc.len_lines() - 1);
@@ -1038,28 +1240,18 @@ pub fn view_to_buffer(state: &EditorState, view: &ViewState, x: f32, y: f32) -> 
     };
     let vline_text = &line_text[vline_start_byte..vline_end_byte];
 
-    let col_x = (x - view.gutter_width).max(0.0);
-    // Use the measured monospace "M" width that the renderer cached on
-    // `wrap_map` from a real font layout. The previous
-    // `font_size * 0.55` heuristic systematically mispredicted column
-    // positions on every line and got worse for any line whose galley
-    // measured differently from the heuristic — clicks landed several
-    // characters off the pointer, especially on long lines.
-    let measured = view.wrap_map.char_width();
-    let approx_char_w = if measured > 0.5 {
-        measured
-    } else {
-        view.font_size * 0.6
-    };
-    let col = ((col_x / approx_char_w).round() as usize).min(vline_text.chars().count());
-    let mut byte = 0usize;
-    for (i, (b, _)) in vline_text.char_indices().enumerate() {
-        if i == col {
-            return line_start + vline_start_byte + b;
-        }
-        byte = b + vline_text[b..].chars().next().map(char::len_utf8).unwrap_or(0);
-    }
-    line_start + vline_start_byte + byte
+    let col_x = (x - view.content_origin_x()).max(0.0);
+    // Map x→byte through the shared mapper. It uses the measured monospace
+    // "M" width the renderer cached on `wrap_map` from a real font layout
+    // (the previous `font_size * 0.55` heuristic mispredicted column
+    // positions, worsening on long lines), and additionally folds in the
+    // live-preview header adjustments: glyphs scaled by the line's
+    // `font_scale` and a hidden leading marker run (`## `) skipped so the
+    // click lands on the first visible glyph. Only the first visual row of a
+    // buffer line carries the leading marker.
+    let at_line_start = vline_start_byte == 0;
+    let local = col_x_to_line_byte(view, line_start, vline_text, at_line_start, col_x);
+    line_start + vline_start_byte + local
 }
 
 /// Helper exposed for backends that need to construct text-insertion actions
@@ -1067,4 +1259,126 @@ pub fn view_to_buffer(state: &EditorState, view: &ViewState, x: f32, y: f32) -> 
 /// from key events).
 pub fn insert_smol(state: &EditorState, view: &mut ViewState, s: &SmolStr) -> Action {
     insert_text(state, view, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor_core::decoration::{Decoration, MarkStyle};
+    use editor_core::rangeset::RangeSet;
+
+    /// Build a view whose decorations mirror what the markdown live-preview
+    /// provider emits for an ATX header line: a hidden `Replace` over the
+    /// `## ` prefix and a scaled `Mark` over the whole heading. `char_width`
+    /// is seeded so the x→byte mapper has a real glyph width to divide by.
+    fn header_view(prefix_len: usize, heading_range: std::ops::Range<usize>, scale: f32) -> ViewState {
+        let mut view = ViewState::default();
+        view.wrap_map.set_char_width(10.0);
+        let entries = vec![
+            (
+                heading_range.start..heading_range.start + prefix_len,
+                Decoration::Replace { display: None },
+            ),
+            (
+                heading_range,
+                Decoration::Mark(MarkStyle { font_scale: Some(scale), bold: true, ..MarkStyle::default() }),
+            ),
+        ];
+        view.decorations.push(RangeSet::from_iter(entries));
+        view
+    }
+
+    /// A click on a header line must land on the first *content* glyph, not on
+    /// the hidden `## ` marker, and must use the scaled glyph width. Before the
+    /// fix the mapper counted columns into the source text (including the
+    /// marker) at the base width, so clicks landed `prefix_len` bytes early and
+    /// drifted further the wider the click x.
+    #[test]
+    fn header_click_skips_hidden_marker_and_scales() {
+        let doc = "## Heading\n";
+        let state = EditorState::new(doc);
+        // H2 scale; prefix "## " is 3 bytes; "Heading" starts at byte 3.
+        let view = header_view(3, 0..10, 1.6);
+        let gutter = view.gutter_width;
+        let eff_w = 10.0 * 1.6; // base char width * font scale
+
+        // Click at the left edge of the content -> the 'H' at byte 3.
+        assert_eq!(view_to_buffer_at_line(&state, &view, gutter + 0.0, 0), 3);
+        // Click roughly over the 3rd visible glyph -> byte 3 + 2 = 5 ('a').
+        let x = gutter + eff_w * 2.0;
+        assert_eq!(view_to_buffer_at_line(&state, &view, x, 0), 5);
+        // Click well past the end clamps to end of "Heading" (byte 10).
+        let x_far = gutter + eff_w * 50.0;
+        assert_eq!(view_to_buffer_at_line(&state, &view, x_far, 0), 10);
+    }
+
+    /// Control: with no decorations the mapper is the plain monospace column
+    /// walk — same click x lands at a different (un-skipped, un-scaled) byte.
+    #[test]
+    fn plain_line_click_uses_base_width_no_skip() {
+        let doc = "Heading\n";
+        let state = EditorState::new(doc);
+        let mut view = ViewState::default();
+        view.wrap_map.set_char_width(10.0);
+        let gutter = view.gutter_width;
+        // Click ~2 base-width glyphs in -> byte 2 ('a'), no +3 marker skip.
+        assert_eq!(view_to_buffer_at_line(&state, &view, gutter + 20.0, 0), 2);
+    }
+
+    /// A bare DecorationSet with no `font_scale`/`Replace` must leave the
+    /// mapping identical to the undecorated case (scale defaults to 1.0,
+    /// hidden prefix is 0). Guards against the scale/skip helpers firing on
+    /// non-header lines that merely carry inline marks.
+    #[test]
+    fn inline_mark_without_scale_does_not_shift() {
+        let doc = "abcdefgh\n";
+        let state = EditorState::new(doc);
+        let mut view = ViewState::default();
+        view.wrap_map.set_char_width(10.0);
+        let entries = vec![(
+            2..5,
+            Decoration::Mark(MarkStyle { italic: true, ..MarkStyle::default() }),
+        )];
+        view.decorations.push(RangeSet::from_iter(entries));
+        let gutter = view.gutter_width;
+        assert_eq!(view_to_buffer_at_line(&state, &view, gutter + 30.0, 0), 3);
+    }
+
+    /// The content origin (what the click→byte mapper subtracts and the painter
+    /// adds) tracks the show-line-numbers toggle: full gutter width when shown,
+    /// the small pad when hidden. Regression for `bug-gutter-toggle-mouse-offset`,
+    /// where the inverse mapper unconditionally subtracted `gutter_width` so
+    /// clicks with the gutter off landed `gutter_width - pad` px too far left.
+    #[test]
+    fn content_origin_tracks_gutter_toggle() {
+        let mut view = ViewState::default();
+        assert!(!view.hide_gutter);
+        assert_eq!(view.content_origin_x(), view.gutter_width);
+        view.hide_gutter = true;
+        assert_eq!(view.content_origin_x(), crate::viewport::HIDDEN_GUTTER_PAD);
+        // Sanity: hidden pad is far smaller than the normal gutter, which is
+        // exactly the offset the old code mis-applied.
+        assert!(view.content_origin_x() < view.gutter_width);
+    }
+
+    /// With the gutter hidden, a click at a given widget-local x must map to the
+    /// SAME byte the painter would place under the pointer — i.e. the column is
+    /// measured from the hidden-gutter pad, not from the full gutter width.
+    #[test]
+    fn click_maps_consistently_with_gutter_hidden() {
+        let doc = "abcdefgh\n";
+        let state = EditorState::new(doc);
+        let mut view = ViewState::default();
+        view.wrap_map.set_char_width(10.0);
+        view.hide_gutter = true;
+        // Painter draws the first glyph at `content_origin_x()`. A click two
+        // glyph-widths past it lands on byte 2 ('c').
+        let x = view.content_origin_x() + 20.0;
+        assert_eq!(view_to_buffer_at_line(&state, &view, x, 0), 2);
+        // The same widget-local x with the gutter SHOWN (origin = gutter_width)
+        // would be left of the text and clamp to byte 0 — proving the mapper now
+        // honors the toggle rather than assuming a fixed gutter width.
+        view.hide_gutter = false;
+        assert_eq!(view_to_buffer_at_line(&state, &view, x, 0), 0);
+    }
 }

@@ -98,6 +98,13 @@ impl EligibleKey {
                 .as_f64()
                 .map(|f| (0.25..=10.0).contains(&f))
                 .unwrap_or(false),
+            (ValueType::CompactThreshold, J::Number(n)) => n
+                .as_f64()
+                .map(|f| (1.0..=64.0).contains(&f))
+                .unwrap_or(false),
+            (ValueType::SyncMode, J::String(s)) => {
+                matches!(s.as_str(), "peer" | "server" | "both")
+            }
             _ => false,
         }
     }
@@ -230,6 +237,12 @@ pub(super) enum ValueType {
     MinimapBarGap,
     /// Editor scroll-wheel multiplier: `0.25..=10.0`.
     ScrollSpeed,
+    /// `[op-log] compact_threshold` — Yrs-snapshot size multiple over the
+    /// materialized content size that triggers compaction. `1.0..=64.0`
+    /// (a multiple below 1.0 would compact constantly).
+    CompactThreshold,
+    /// `peer | server | both` for `[sync] mode`. status: sync-config-section.
+    SyncMode,
 }
 
 pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -245,6 +258,7 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.show_minimap",           ty: ValueType::Bool },
     EligibleKey { path: "editor.hide_scrollbar",         ty: ValueType::Bool },
     EligibleKey { path: "editor.scroll_speed",           ty: ValueType::ScrollSpeed },
+    EligibleKey { path: "editor.minimap.style",                ty: ValueType::String },
     EligibleKey { path: "editor.minimap.width",                ty: ValueType::MinimapWidth },
     EligibleKey { path: "editor.minimap.bar_padding_left",     ty: ValueType::MinimapPad },
     EligibleKey { path: "editor.minimap.bar_padding_right",    ty: ValueType::MinimapPad },
@@ -281,6 +295,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },
     // status: trails-default-location
     EligibleKey { path: "trails.new_trail_dir",          ty: ValueType::String },
+    // status: board-default-location
+    EligibleKey { path: "boards.new_board_dir",          ty: ValueType::String },
     // status: note-id-stamping
     EligibleKey { path: "indexing.id_stamping",          ty: ValueType::IdStamping },
     // status: embedder-model-selectable
@@ -346,6 +362,10 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
+    // status: board-mcp-tools
+    EligibleKey { path: "mcp.tools.boards_list_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_get_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_card_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -358,9 +378,22 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // ACP section. The agent can be overridden per vault.
     // Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
-    // status: staging-config-section
-    EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
-    EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
+    // status: op-log-config-section
+    EligibleKey { path: "op-log.metadata_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "op-log.rejected_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "op-log.auto_reject_on_drift",      ty: ValueType::Bool },
+    EligibleKey { path: "op-log.review_required",           ty: ValueType::Bool },
+    EligibleKey { path: "op-log.compact_threshold",         ty: ValueType::CompactThreshold },
+    // status: sync-config-section
+    // [sync] is per-vault — the config lives in the vault TOML per
+    // docs/sync.md §`[sync]` config section. Secrets (the per-vault
+    // content key + per-device private key) are user-scope and never
+    // appear here — the same posture as `[llm].api_key`.
+    EligibleKey { path: "sync.enabled",                     ty: ValueType::Bool },
+    EligibleKey { path: "sync.mode",                        ty: ValueType::SyncMode },
+    EligibleKey { path: "sync.server_url",                  ty: ValueType::String },
+    EligibleKey { path: "sync.discovery",                   ty: ValueType::Bool },
+    EligibleKey { path: "sync.devices",                     ty: ValueType::StringArray },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },
@@ -415,6 +448,10 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.set_frontmatter_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
+    // status: board-mcp-tools
+    EligibleKey { path: "mcp.tools.boards_list_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_get_enabled",      ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_card_enabled", ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -426,9 +463,12 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
     // ACP section. Also eligible at user scope for a global default.
     EligibleKey { path: "acp.command",                      ty: ValueType::String },
-    // status: staging-config-section
-    EligibleKey { path: "staging.auto_reject_on_conflict",  ty: ValueType::Bool },
-    EligibleKey { path: "staging.retention_days",           ty: ValueType::PositiveInt },
+    // status: op-log-config-section
+    EligibleKey { path: "op-log.metadata_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "op-log.rejected_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "op-log.auto_reject_on_drift",      ty: ValueType::Bool },
+    EligibleKey { path: "op-log.review_required",           ty: ValueType::Bool },
+    EligibleKey { path: "op-log.compact_threshold",         ty: ValueType::CompactThreshold },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },

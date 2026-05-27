@@ -1195,6 +1195,125 @@ pub struct Revision {
 Adds `earlier(duration)` / `later(duration)` navigation. New edits after an
 undo create a sibling instead of dropping the redo branch.
 
+### 16.6.18 Minimap (SPEC §9.23)
+
+`editor-egui::minimap`. The strip is a host-facing widget over `&EditorState
++ &mut ViewState` (same shape as the main `Widget`). The original renderer
+issued one `rect_filled` per visible line **every frame**; that's the scroll
+jank SPEC §8 forbids. The fix and the new glyph style are the same move:
+rasterize the strip into an offscreen image once, upload it as a single egui
+texture, and paint one quad — rebuilding only when inputs that affect pixels
+change, never on scroll.
+
+**Texture-backed renderer.** A host-owned `MinimapImage` cache replaces the
+per-frame draw loop:
+```rust
+pub struct MinimapImage {
+    tex: Option<egui::TextureHandle>,
+    key: u64,            // rebuild fingerprint (below)
+    size: [usize; 2],    // strip pixel dims the tex was built at
+}
+```
+Rebuild fingerprint mixes `doc.content_id()`, `decorations.signature`, a
+theme/`Options` hash, the strip's pixel `W×H`, and the selected `style`. On a
+frame where the key is unchanged the widget just paints the cached texture +
+the live overlay (thumb, selection/search marks, interaction); on a change it
+re-rasterizes a fresh `egui::ColorImage`, uploads via
+`ui.ctx().load_texture(...)` (or `tex.set(...)`), and repaints. This keeps
+the egui-side type off `ViewState` exactly like `PaintCache` / the existing
+`minimap::Cache` do — the cache lives on the host `Buffer`, threaded in via
+`.with_image_cache(...)`.
+
+**Projection (shared, unchanged).** Keep the current `height_map`-driven
+mapping: `scale = strip_h / total_content`, per-line `y = y_at_text(line) *
+scale`, `h = text_height(line) * scale`. This preserves lockstep with wrap /
+heading scale / hidden lines. The rasterizer walks lines and writes each
+line's pixel rows `[y, y+h)` into the buffer. When `total_content` exceeds the
+strip, rows collapse/blend (VSCode `MinimapSamplingState`-style downsampling
+falls out of the projection naturally — multiple lines map to one pixel row).
+Texture height is bounded to the strip, so it never approaches GPU max-texture
+limits.
+
+**Bars style** (`MinimapStyle::Bars`): port the existing
+`measure_lines` + `classify_lines` (`LineMetrics`, `LineKind`) — already memoized
+by `minimap::Cache` — but write the bar/indent rects, section rules, and mark
+strips **into the pixel buffer** instead of issuing `painter.rect_filled`.
+Same look, now O(1) per frame.
+
+**Glyphs style** (`MinimapStyle::Glyphs`, default): a VSCode-style glyph
+atlas built by reading back egui's *own* rasterization — no new dependency
+(`ab_glyph` is already transitive):
+```rust
+struct GlyphAtlas {
+    cw: usize, ch: usize,          // shared line-box cell (≈ advance × font line-height, ×2 SS)
+    cov: Vec<f32>,                 // coverage per cell pixel, indexed by ASCII 0x20..=0x7E
+    advance: f32, font_size: f32,  // cache key + per-column step
+}
+```
+Build: lay out printable ASCII once at the editor font size; snapshot the
+font atlas (`ui.fonts(|f| f.image())` → `ColorImage`, coverage in alpha) and,
+for each glyph, **rasterize it into a shared line-box cell at its true
+baseline** — for each cell pixel, map to a point in `[0,advance]×[0,font_h]`,
+test whether it lands in the glyph's bitmap rect (`glyph.pos + uv_rect.offset`,
+size `uv_rect.size` — epaint's own placement formula, `pos.y` = baseline) and
+sample the atlas there. This preserves x-height/cap-height/descenders and a
+common baseline, so the text reads correctly; **do NOT** stretch each glyph's
+tight bbox to fill the cell (every letter ends up the same height → mush).
+Cache keyed on `font_size`; rebuilds only when it changes. Non-ASCII → block
+fallback.
+Rasterize a line: take the per-span fg colors from the same `LineLayout`
+the editor paints (`widget::layout` segments carry the resolved
+`Color32`), and for each char blit `sprite[ch] * fg` into the buffer at the
+char's x-cell (`alpha * fg over bg`). Indentation, density, and syntax color
+are all preserved → a true miniature.
+
+**Live preview + soft-wrap.** When lines are ≥ ~2px tall (i.e. not a huge
+doc collapsing to density), glyph rendering goes through the editor's
+*display* model rather than raw `doc.line_str`: `widget::layout::display_rows`
+reuses `LineLayoutBuilder` per visual row (split by `view.wrap_map`'s
+`vlines`) and flattens the decorated segments to `(display_text, fg,
+is_widget)` runs — so hidden markdown markers, heading styling, and list
+bullet/checkbox widgets render exactly as the editor shows them, and a line
+that soft-wraps into N rows occupies N minimap rows. Below ~2px it falls back
+to the cheap per-line decimated path (glyphs are sub-pixel; only density
+reads). Heading rows are taller *and* wider: markdown emits both
+`Line{height_scale}` and `Mark{font_scale}`, so each display row recovers its
+font scale (`row_h / (line_h·scale)`) and widens the glyph advance by it —
+otherwise headings stretch tall-and-thin. To keep the cell from over-magnifying
+short docs, the glyph atlas
+cell adapts to the font (`cw≈advance`, `ch≈advance·1.7`) so the blit is ~1:1
+when the doc fits and a clean downscale when it doesn't, and plain ink uses
+`color_plain` unmultiplied to full opacity with a coverage contrast curve so
+small text doesn't wash out.
+
+**Uniform scale.** Bars keep the fit-to-height projection (fill the strip).
+Glyphs use `content_scale = min(strip_h/total_content, usable_w/wrap_width)`
+so wrapped rows fit the strip width without vertical stretching; a short doc's
+glyph strip occupies the top at true aspect. The chosen scale is computed once
+in `show` and shared by the texture and the live overlays (thumb / marks /
+press-to-scroll) so they stay aligned. The texture rebuild fingerprint folds
+in `total_content` + `wrap_map.width()`/`enabled()` so an editor-width reflow
+rebuilds the strip.
+
+**Overlays stay live (cheap, off-texture):** the viewport thumb, the
+selection / search marks, and all interaction (click/drag-to-scroll via
+`is_pointer_button_down_on`, wheel routed through `command::handle(Scroll)`)
+remain per-frame painter calls / event handling exactly as today — they
+depend on scroll position, so baking them into the texture would force a
+rebuild on every scroll frame.
+
+**Config & host wiring.** Add `style: MinimapStyle` to
+`minimap::Options`; host maps it from a new `MinimapConfig.style` field
+(`core/src/config/sections.rs`, default `glyphs`) in `to_minimap_options`
+(`app/src/panels/buffer/mod.rs`). The bar palette knobs stay; glyph mode
+ignores bar-specific ones.
+
+**Tests** (`editor-egui`): atlas downsample produces expected alpha for a
+known glyph box; the rebuild fingerprint moves iff one of its inputs moves
+(and *not* on a pure scroll); projection mapping matches the pre-rework
+`y_at_text`/`text_height` math; existing bar classification tests carry over.
+Pixel fidelity needs an in-app eyeball.
+
 ---
 
 ## 17. Open questions to resolve during implementation

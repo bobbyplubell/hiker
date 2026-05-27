@@ -32,8 +32,8 @@ mod patch;
 pub mod sections;
 
 use sections::{
-    AcpConfig, EditorConfig, IndexingConfig, LlmConfig, McpConfig, SearchConfig, StagingConfig,
-    SuggestionsConfig, TasksConfig, TrailsConfig, VaultConfig,
+    AcpConfig, BoardsConfig, EditorConfig, IndexingConfig, LlmConfig, McpConfig, OpLogConfig,
+    SearchConfig, SuggestionsConfig, SyncSection, TasksConfig, TrailsConfig, VaultConfig,
 };
 
 use io::{atomic_write, deep_merge, display_path, write_defaults};
@@ -91,9 +91,15 @@ pub struct Config {
     #[serde(default)]
     pub trails: TrailsConfig,
     #[serde(default)]
-    pub acp: AcpConfig,
+    pub boards: BoardsConfig,
     #[serde(default)]
-    pub staging: StagingConfig,
+    pub acp: AcpConfig,
+    /// status: op-log-config-section
+    #[serde(default, rename = "op-log")]
+    pub op_log: OpLogConfig,
+    /// status: sync-config-section
+    #[serde(default)]
+    pub sync: SyncSection,
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
     #[serde(default)]
@@ -128,8 +134,10 @@ impl Default for Config {
             llm: LlmConfig::default(),
             tasks: TasksConfig::default(),
             trails: TrailsConfig::default(),
+            boards: BoardsConfig::default(),
             acp: AcpConfig::default(),
-            staging: StagingConfig::default(),
+            op_log: OpLogConfig::default(),
+            sync: SyncSection::default(),
             suggestions: SuggestionsConfig::default(),
             ui: Ui::default(),
         }

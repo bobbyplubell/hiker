@@ -11,7 +11,7 @@ Tree construction and edits are composed from three primitive operations. The cl
 
 | Op | Signature | Effect |
 | --- | --- | --- |
-| **Split** | `Trees::split_cluster(target, params)` | Partitions a target cluster's leaves into child sub-clusters using `params.algorithm`. The target can be a real `cluster_nodes` row or a virtual root containing every note in the build scope. Recursive sub-splits are governed by `leaf_min_size` / `leaf_cohesion_threshold`. [cluster-op-split] |
+| **Split** | `Trees::split_cluster(target, params)` | Partitions a target cluster's leaves into child sub-clusters using `params.algorithm`. The target can be a real cluster node or a virtual root containing every note in the build scope. Recursive sub-splits are governed by `leaf_min_size` / `leaf_cohesion_threshold`. [cluster-op-split] |
 | **Summarize** | `Trees::summarize(scope, params)` | Generates `name` + `summary` for every cluster matching `scope`. Decoupled from Split — clusters Split produces have placeholder names until Summarize runs against them. Idempotent on `StaleOrUnfilled`. [cluster-op-summarize-sweep] |
 | **Roll-up** | `Trees::rollup(input_node_ids, params)` | Embeds each input cluster's `summary` text via `Embedder::embed_batch`, partitions those summary embeddings, and inserts the resulting groups as a new parent layer above the inputs. Requires every input cluster to have a non-empty `summary` (errors `MissingSummary { node_id }` otherwise). [cluster-op-rollup] |
 
@@ -31,7 +31,7 @@ Algorithm choice drives the partition step inside Split (see §"Algorithm choice
 
 Recursive sub-split — when Split is invoked with `recurse: true`, each newly-produced child whose member count exceeds `leaf_min_size` (default 5) and whose intra-cluster cohesion radius exceeds `leaf_cohesion_threshold` (default 0.15) is itself Split. Branches stop when either threshold trips. The recipe (below) sets `recurse: true`; the cluster editor's row-menu "Split" verb uses `recurse: false` (one level only). [cluster-op-split]
 
-History row op `split` snapshots the prior subtree for undo per `cluster-editor-undo-redo`.
+The `split` op's reverse edit snapshots the prior subtree for undo per `cluster-editor-undo-redo`.
 
 ### Summarize
 
@@ -86,18 +86,14 @@ Steps:
 1. Validate every `input_node_id` exists in the same tree and carries a non-empty `summary`. Errors `MissingSummary { node_id }` on the first violation. The caller's responsibility to run `Summarize` first.
 2. For each input cluster, embed its `summary` text via `Embedder::embed_batch`. The summary embedding's dim is whatever the loaded embedder reports (`embedder-dim-from-model`); the result is stored only in memory for the partition step, not persisted.
 3. Run the partition algorithm (`partition` for HDBSCAN, `partition_leiden` for Leiden) over the summary embeddings.
-4. For each resulting community, insert a new `cluster_nodes` row at the layer above the inputs. Each new parent's `members` = the input clusters that landed in its community; their `parent_id` is updated to point at the new parent. The new parents have placeholder names (`new_layer_name_pattern.unwrap_or("Group {n}")`); a subsequent `Summarize { Subset(new_parent_ids) }` invocation fills them in.
+4. For each resulting community, insert a new cluster node at the layer above the inputs. Each new parent's members = the input clusters that landed in its community; their `parent` is updated to point at the new parent. The new parents have placeholder names (`new_layer_name_pattern.unwrap_or("Group {n}")`); a subsequent `Summarize { Subset(new_parent_ids) }` invocation fills them in.
 5. The new parents' `centroid` is the L2-normalized mean of their input clusters' summary embeddings. `radius` is the 90th-percentile cosine distance from centroid to inputs. `confidence` is inherited from the partition's confidence metric (HDBSCAN stability or Leiden modularity contribution).
 
 If the partition produces a single community, Roll-up returns `Refused { reason: "all inputs landed in one community" }` without inserting any rows — a single super-parent is uninformative. The user can lower the algorithm's resolution (Leiden) or `min_cluster_size` (HDBSCAN) and re-invoke. Symmetrically, when every input lands in its own singleton community, Roll-up returns `Refused { reason: "no inputs merged" }`.
 
 Roll-up does not recurse on its own — one invocation produces at most one new layer. The user runs Roll-up again over the new parents if they want a deeper hierarchy. [cluster-op-rollup]
 
-History row op `rollup` snapshots the prior `parent_id`s of the inputs + the new parent rows so undo restores the original top-level structure.
-
-### Why top-down divisive Split rather than recursive bottom-up Roll-up as the default build
-
-The recipe builds the initial tree via recursive `Split` from the virtual root, not via recursive `Roll-up` from leaf clusters. Top-down at each sub-split clusters real note embeddings within a narrower scope, which Leiden and HDBSCAN both handle well. Recursive Roll-up would require running `Summarize` at every level before the next Roll-up, doubling the LLM dependency surface and forcing a strict naming-blocks-structure ordering. Roll-up stays available as an explicit verb when the user wants to coarsen an already-named tree; the default doesn't depend on it.
+The `rollup` op's reverse edit snapshots the prior `parent`s of the inputs + the new parent nodes so undo restores the original top-level structure.
 
 
 ## Build recipe
@@ -118,7 +114,7 @@ The recipe builds the initial tree via recursive `Split` from the virtual root, 
 
 [cluster-build-recipe]
 
-Steps 1 and 2 are gated separately in the review tab — the structural pass (Run clustering) is step 1 alone; Confirm-and-name is step 1 followed by step 2; Confirm-no-naming is step 1 alone with the result persisted. Step 3 is invoked from the cluster editor's toolbar after the tree is persisted (not from the review tab); doing so during the build is unnecessary since top-down divisive Split already produces a hierarchical shape.
+Steps 1 and 2 are gated separately in the review tab — the structural pass (Run clustering) is step 1 alone; Confirm-and-name is step 1 followed by step 2; Confirm-no-naming is step 1 alone with the result persisted. Step 3 is invoked from the cluster editor's toolbar after the tree is persisted (not from the review tab); doing so during the build is unnecessary since top-down divisive Split already produces a hierarchical shape. The build uses top-down Split rather than recursive Roll-up because Roll-up would force a Summarize at every level (doubling the LLM dependency); Roll-up stays an explicit verb for coarsening an already-named tree.
 
 Top-down divisive parameters that the recipe sets on the Split call:
 
@@ -126,7 +122,7 @@ Top-down divisive parameters that the recipe sets on the Split call:
 - **`leaf_min_size`** — recursive sub-split stops when a child has fewer members than this. Default `5`. On `ClusterParams`.
 - **`leaf_cohesion_threshold`** — recursive sub-split stops when a child's intra-cluster cohesion radius (90th-percentile cosine distance from members to centroid) is below this. Default `0.15`. On `ClusterParams`.
 
-The previously-used `min_clusters_to_recurse` knob is removed — the recursion termination criterion is now per-branch (member count / cohesion), not per-level (cardinality). Persisted `cluster_trees.method` JSON for trees built before the recipe lands deserializes with the field absent and is treated as "use the new defaults" via `#[serde(default)]`. Saved trees do not store `min_clusters_to_recurse` going forward.
+The previously-used `min_clusters_to_recurse` knob is removed — the recursion termination criterion is now per-branch (member count / cohesion), not per-level (cardinality). Persisted `method` frontmatter for trees built before the recipe lands deserializes with the field absent and is treated as "use the new defaults" via `#[serde(default)]`. Saved trees do not store `min_clusters_to_recurse` going forward.
 
 Surviving / changed knobs at a glance:
 
@@ -167,7 +163,7 @@ Every Split operates on note-level embeddings, regardless of where in the tree i
 
 The note embedding is the mean of the note's chunk embeddings, weighted by chunk byte length. Computed inline by the indexer's per-file upsert and persisted on the `notes` row (`note_embedding BLOB`) in the same transaction as the chunks. Refreshed on every upsert so the pool tracks the chunk set; notes with no chunks leave the column NULL and are excluded from clustering. Cheap — a vector mean over typically <20 chunks — and avoids spending a separate embedder pass on each note. [cluster-note-embeddings]
 
-Why mean-pool rather than embed the full note text directly: the default embedder `bge-small`'s context window is 512 tokens (~2000 characters). A note longer than that gets silently truncated by the embedder, and personal-vault notes commonly exceed this — anything longer than a couple of paragraphs. Mean-pool over chunks sidesteps the limit entirely (each chunk is ~1200 chars by the chunker's cap, so each chunk fits), and the resulting representation already reflects the chunker's heading-bounded structure. There is no practical max note size for clustering with mean-pool.
+Mean-pool rather than embedding the full note text directly: `bge-small`'s 512-token (~2000 char) context silently truncates longer notes, and personal-vault notes routinely exceed that. Mean-pool over chunks (each ~1200 chars, so each fits) sidesteps the limit and reflects the chunker's heading-bounded structure — no practical max note size.
 
 When the user selects a long-context embedder via `embedder-model-selectable` (`bge-m3` at 8k tokens, `embedding-gemma-300m` at 2k), direct full-note embed becomes viable for most notes; mean-pool stays as the fallback for outliers that still exceed the model's context. Implementing the direct-embed path is deferred — the mean-pool path already works for every model and isn't observably wrong; the direct-embed quality win is a follow-up that lands when there's evidence the difference matters. [cluster-note-embeddings-direct-long-context]
 
@@ -182,7 +178,7 @@ Empty notes (no chunks) get no embedding and are excluded from clustering — th
 
 Modularity-optimization community detection over a kNN cosine-similarity graph. Every node lands in some community; small communities (below `min_cluster_size`) post-flag as outliers. [cluster-leiden]
 
-Why default: Leiden handles the personal-vault scale gracefully — loose `bge-small` embeddings often produce 0–1 cohesive HDBSCAN cluster + everything-as-outliers (a useless suggestion surface), where Leiden produces 5–20 communities reflecting the natural topical structure. The configuration parameter γ is a direct granularity knob, giving the build recipe the lever it needs for both the coarse top-level pass (`top_level_resolution`, default `0.3`) and the finer sub-splits (`resolution`, default `1.0`).
+Default because loose `bge-small` embeddings often give HDBSCAN 0–1 cohesive clusters plus everything-as-outliers, while Leiden produces 5–20 communities reflecting the topical structure. γ is a direct granularity knob for both the coarse top-level pass (`top_level_resolution` `0.3`) and the finer sub-splits (`resolution` `1.0`).
 
 Pipeline: [cluster-leiden-knn-graph]
 
@@ -255,10 +251,10 @@ Resolution rules:
 - `Folder(rel)` — every note whose path is under `rel` at the time of the build. Empty subfolders are ignored; notes added under `rel` after the build do not retroactively join.
 - `Notes(ids)` — exactly the listed notes; missing ids are silently dropped (a note may have been deleted between selection and build).
 
-**Source-type filter** [cluster-build-scope-source-types]. Each variant carries an optional `source_types: Vec<String>` of canonical lower-case extensions. The build-pass + triage classifier only see notes whose extension is in the list; `"md"` covers both `.md` and `.markdown` (the indexer treats them as the same source type per `INDEXABLE_EXTENSIONS`). An empty vec is the legacy "every indexable extension" posture and is what every pre-feature persisted tree's `scope_json` deserializes to. Surfaced in the clustering review tab's config section as checkboxes (Markdown / Plain text), default both on. Enforced in two places:
+**Source-type filter** [cluster-build-scope-source-types]. Each variant carries an optional `source_types: Vec<String>` of canonical lower-case extensions. The build-pass + triage classifier only see notes whose extension is in the list; `"md"` covers both `.md` and `.markdown` (the indexer treats them as the same source type per `INDEXABLE_EXTENSIONS`). An empty vec is the legacy "every indexable extension" posture and is what every pre-feature persisted tree's `scope` frontmatter deserializes to. Surfaced in the clustering review tab's config section as checkboxes (Markdown / Plain text), default both on. Enforced in two places:
 
 1. `notes_for_scope` (the build-pass resolver) filters resolved paths via `BuildScope::matches_path` before reading embeddings — a tree built with `source_types = ["md"]` simply never sees `.txt` notes.
-2. `triage_all_saved_trees` (the on-save classifier) deserializes each saved tree's `scope_json` and skips trees whose `source_types` filter rejects the saved note's path. A `.txt` note save against a Markdown-only triage tree no-ops; the same note save against a mixed-type tree fires normally.
+2. `triage_all_saved_trees` (the on-save classifier) reads each saved tree's `scope` frontmatter and skips trees whose `source_types` filter rejects the saved note's path. A `.txt` note save against a Markdown-only triage tree no-ops; the same note save against a mixed-type tree fires normally.
 
 The clustering algorithm itself is unaware of scope — `BuildScope` is resolved into a `Vec<NoteId>` by `core::cluster::build_tree`'s caller-facing entry, the recursive pass operates on whatever embeddings are handed in. The `min_cluster_size` fallback for small vaults (`<50 notes` → skip with "vault is too small") applies per-scope: a `Folder` scope with three notes gets the same skip message.
 
@@ -316,26 +312,24 @@ Skip clustering entirely. Walk the filesystem under the build scope; produce a `
 
 [cluster-build-from-folders]
 
-Why it exists: users with already-organized vaults want a saved Evergreen tree built on their actual structure, not on what the partitioner thinks the structure should be. Triage against a folder-derived tree is just "find the most similar existing folder and put the new note there" — the obvious thing, made explicit. Avoids the "I already organized my vault; why does the AI want to re-organize it" friction.
+For users with already-organized vaults: build the Evergreen tree on their actual folders rather than the partitioner's guess. Triage then just finds the most similar existing folder for a new note.
 
-The output `ClusterTree` shape is identical to the `Cluster` method's — same `ClusterNode` type, same downstream consumers. The cluster editor doesn't distinguish how a tree was built once it exists; reshape operations (merge / split / move-note) work the same way. Splitting a folder-derived node re-runs HDBSCAN against just that node's members — a folder-derived tree can grow cluster-derived subtrees through user editing without ceremony. The `meta.json` (now `cluster_trees.method` column) records the original build method for reference and re-build. [cluster-build-from-folders-uniform-output]
+The output `ClusterTree` shape is identical to the `Cluster` method's — same `ClusterNode` type, same downstream consumers. The cluster editor doesn't distinguish how a tree was built once it exists; reshape operations (merge / split / move-note) work the same way. Splitting a folder-derived node re-runs HDBSCAN against just that node's members — a folder-derived tree can grow cluster-derived subtrees through user editing without ceremony. The `method` frontmatter records the original build method for reference and re-build. [cluster-build-from-folders-uniform-output]
 
 ### FromFolders live-update
 
-A saved FromFolders Evergreen tree tracks the filesystem. When a note moves between folders (user drag-drop in the file tree, accepted `move_note` staging row from any surface, manual `hiker mv`, external rename caught by the watcher), `core::trees` updates the affected `cluster_nodes` rows in place — the leaf's `parent_id` flips to the new folder's node id. Cluster nodes for newly-created folders are added on the fly; emptied folders' nodes are dropped (unless they carry an explicit policy, in which case they're kept as empty placeholders so the user's rule survives a transient empty state).
+A saved FromFolders Evergreen tree tracks the filesystem. When a note moves between folders (user drag-drop in the file tree, accepted `move_note` staging row from any surface, manual `hiker mv`, external rename caught by the watcher), `core::trees` updates the affected nodes in the tree's frontmatter in place — the leaf's `parent` flips to the new folder's node id. Cluster nodes for newly-created folders are added on the fly; emptied folders' nodes are dropped (unless they carry an explicit policy, in which case they're kept as empty placeholders so the user's rule survives a transient empty state).
 
-The trigger is the same `hiker:file-changed` rename event the indexer already consumes; `core::trees` subscribes alongside it. The update is incremental — no re-build, no re-summarization, no LLM call. Centroids are recomputed for affected clusters (cheap: a vector mean over members). [cluster-build-from-folders-live-update]
+The trigger is the same watcher file events rename event the indexer already consumes; `core::trees` subscribes alongside it. The update is incremental — no re-build, no re-summarization, no LLM call. Centroids are recomputed for affected clusters (cheap: a vector mean over members). [cluster-build-from-folders-live-update]
 
 **Staleness counter.** Each cluster node carries a `summary_membership_churn` integer (initialized to 0 at summary-generation time). Every leaf insert or remove within a cluster's subtree increments the counter on that cluster and all its ancestors. The counter is the user-visible "your summary may be out of date" signal — surfaced as a `↻ N` badge on the node's row in the cluster editor and as a soft-tinted node color in the graph view. The counter resets to 0 when the user runs Regenerate on that node. [cluster-build-from-folders-summary-staleness]
-
-Why a counter rather than a stale-bool: a single move barely shifts a 30-note cluster's meaning, but ten moves probably do. The integer lets the user calibrate when to regenerate (`↻ 1` is noise; `↻ 12` is a real drift signal). A bool would force the user to either over-regenerate or ignore real drift. Embedding-distance drift was considered as an alternative metric but rejected as overkill for v1 — the counter ships first, distance-based staleness can replace it later if churn proves too coarse.
 
 The counter applies to FromFolders trees primarily, where filesystem moves drive churn. `Cluster`-method trees use the same field for reshape operations (move-note-between-clusters / merge / split via the cluster editor) — same column, same UI treatment. The counter is also the staleness signal consumed by `cluster-op-summarize-sweep`'s `StaleOrUnfilled` scope: a Summarize sweep runs the LLM on exactly the clusters with `summary_membership_churn > 0 OR summary IS NULL`. [cluster-summary-staleness-counter]
 
 
 ### Re-building Evergreen trees
 
-A saved Evergreen tree records both its scope and method on the `cluster_trees` row. The "Re-build" action in the cluster editor (per `cluster-editor-mode-menu`) runs `build_tree(scope, method, params)` again with the saved parameters, producing a fresh tree. The user reviews the diff (deferred per `cluster-editor-tree-diff-view`) or accepts the new tree as the active Evergreen, retiring the previous one to the vault's trash. [cluster-build-rebuild]
+A saved Evergreen tree records both its scope and method in its `.md` frontmatter. The "Re-build" action in the cluster editor (per `cluster-editor-mode-menu`) runs `build_tree(scope, method, params)` again with the saved parameters, producing a fresh tree. The user reviews the diff (deferred per `cluster-editor-tree-diff-view`) or accepts the new tree as the active Evergreen, retiring the previous one to the vault's trash. [cluster-build-rebuild]
 
 
 ## Placement classifier: beam-K=2 descent
@@ -361,7 +355,7 @@ Algorithm:
   margin     = top-1 cosine − top-2 cosine        // among the final K leaves
 ```
 
-Tunables (per-saved-tree, on the `cluster_trees` row):
+Tunables (per-saved-tree, in the `.md` frontmatter):
 
 - `beam_width` (`K`) — default `2`. `K=1` is the cheap fallback ("greedy"); `K=3+` is robust but rarely needed at vault scale.
 - `min_confidence` — default `0.55` (cosine). Matches below this threshold route to the outlier bucket if `include_outliers = true`; otherwise still apply at low confidence (per-policy `require_review = true` handles the gating).
@@ -369,7 +363,7 @@ Tunables (per-saved-tree, on the `cluster_trees` row):
 
 Cost: `O(K · branching · depth)` cosines, ≈ a few hundred dot products on a 10k-vault tree. Microseconds; no LLM. The classifier is the per-note path; the full build pass is the rare batch path.
 
-Why beam over greedy (`K=1`): the failure mode of greedy is "the top cluster at level 1 was *almost* right but the true target sits in a sibling subtree the query barely missed." `K=2` recovers the silent miss for trivial cost. RAPTOR's tree-traversal mode uses this exact pattern; the broader hierarchical-retrieval literature backs the choice. Collapsed-tree scoring (compare to every node flat) is more accurate but loses the speedup; deferred.
+Beam over greedy (`K=1`): greedy can pick an almost-right top cluster while the true target sits in a sibling subtree it barely missed; `K=2` recovers that for trivial cost. Collapsed-tree scoring (compare to every node flat) is more accurate but loses the speedup; deferred.
 
 `hiker mv` and drag-and-drop-move are *not* this. Manual user moves don't re-classify against the tree; they're authoritative. The classifier fires only on new-note-on-save and the modified-rerun pathways.
 
@@ -394,20 +388,6 @@ The build pipeline produces a `ClusterTree` (shape below). `suggestions.md` cons
 - **Saved-tree triage** — user saves a generated tree as a classifier; new notes get routed against it via greedy centroid descent (`cluster-place-beam-descent`), with confidence-tiered behavior (auto-apply / queue-for-review / leave-in-inbox).
 
 The build engine is unaware of which flow consumes its output — same algorithm, same `ClusterTree`. See `suggestions.md` for everything downstream.
-
-
-## Why notes (not chunks) at the leaf level — and what chunk-level clustering is good for instead
-
-Note-level clustering at the leaf level is the right default because the curated tree's leaves are notes — placement is per-note, navigation is per-note, the user's mental model of "where does this thing live" is per-note. A tree of chunks would index a different abstraction than the one users navigate.
-
-That said, chunk-level clustering has real uses as a *parallel* feature, not a replacement:
-
-- **Cross-note thread surfacing** — chunks from different notes that cluster tightly together are evidence of a thread that crosses several notes. Useful as a "you might be writing about X across these places" hint, not as input to an auto-built trail (trails are user-authored only — see `design.md`). [cluster-chunk-thread-hint]
-- **Multi-topic flagging** — a note whose chunks scatter across many distinct clusters is a candidate for splitting. Useful as a soft suggestion, not an auto-action. [cluster-chunk-multitopic-flag]
-- **Section reorganization** — chunk clusters *within* a single note suggest heading reorganization.
-
-None of these are in scope for the v1-of-clustering pass. Listed here so the chunk-level signal isn't forgotten when the note-level pipeline is in place.
-
 
 ## Summarization
 

@@ -2,7 +2,10 @@
 
 ## 0.1.0 — Initial release
 
-- Activity bar with reorderable, badged icon items and per-item Hide.
+- Activity bar with reorderable, badged icon items, per-item Hide, and a
+  right-click visibility checklist (checkbox per item, reachable from the
+  empty strip) that toggles each item's visibility. Hidden set + item
+  order persist through `WorkbenchLayout`.
 - Primary + secondary side bars, resizable, swappable left/right.
 - Editor area with tabbed groups, splits, drag-to-reorder, focused
   group indicator.

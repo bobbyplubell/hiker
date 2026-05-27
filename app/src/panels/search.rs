@@ -157,52 +157,12 @@ impl View<'_> {
     }
 }
 
-/// All search-mode toggles, per-mode option pickers, and the
-/// Limit/Types/Order filters. Lifted out of the inline header rows and
-/// served from a right-click on the search icon. Caller sets `run`
-/// when any control changes so the panel re-fires the query.
-fn search_options_menu(
-    ui: &mut egui::Ui,
-    app: &mut AppState,
-    run: &mut bool,
-) {
-    use hiker_core::config::sections::RecencyBias;
-
-    // Mode toggles.
-    ui.label(egui::RichText::new("Modes").strong().small());
-    if ui
-        .checkbox(&mut app.panels.search.lexical_on, "Lexical")
-        .on_hover_text("Substring / token matches from the index")
-        .changed()
-    {
-        *run = true;
-    }
-    if ui
-        .checkbox(&mut app.panels.search.semantic_on, "Semantic")
-        .on_hover_text("Embedding-based similarity")
-        .changed()
-    {
-        *run = true;
-    }
-    ui.horizontal(|ui| {
-        if ui.small_button("Only lexical").clicked() {
-            app.panels.search.lexical_on = true;
-            app.panels.search.semantic_on = false;
-            *run = true;
-        }
-        if ui.small_button("Only semantic").clicked() {
-            app.panels.search.semantic_on = true;
-            app.panels.search.lexical_on = false;
-            *run = true;
-        }
-        if ui.small_button("Both").clicked() {
-            app.panels.search.lexical_on = true;
-            app.panels.search.semantic_on = true;
-            *run = true;
-        }
-    });
-
-    ui.separator();
+/// Lexical-mode option picker, anchored under the `Aa` toggle's
+/// right-click (`search-lexical-options`). Case sensitivity, diacritics,
+/// prefix and phrase matching — every row persists per-vault to
+/// `search.lexical.*`. Caller sets `run` when any control changes so the
+/// panel re-fires the query.
+fn lexical_options_menu(ui: &mut egui::Ui, app: &mut AppState, run: &mut bool) {
     ui.label(egui::RichText::new("Lexical options").strong().small());
     let mut lex = app.panels.search.lexical_opts;
     let mut lex_changed = false;
@@ -229,8 +189,14 @@ fn search_options_menu(
         persist_search_setting(app, "search.lexical.phrase_mode", &serde_json::json!(lex.phrase_mode));
         *run = true;
     }
+}
 
-    ui.separator();
+/// Semantic-mode option picker, anchored under the brain toggle's
+/// right-click (`search-semantic-options`). Minimum-similarity floor and
+/// recency bias, persisted per-vault to `search.semantic.*`.
+fn semantic_options_menu(ui: &mut egui::Ui, app: &mut AppState, run: &mut bool) {
+    use hiker_core::config::sections::RecencyBias;
+
     ui.label(egui::RichText::new("Semantic options").strong().small());
     let mut sem = app.panels.search.semantic_opts;
     let mut sem_changed = false;
@@ -272,6 +238,48 @@ fn search_options_menu(
         );
         *run = true;
     }
+}
+
+/// Cross-mode controls served from the magnifying-glass right-click: the
+/// Only-lexical / Only-semantic / Both convenience switches plus the
+/// Limit / Types / Order filters that apply regardless of which backends
+/// are active. Per-mode tuning lives on the toggles themselves
+/// (`lexical_options_menu` / `semantic_options_menu`).
+fn filters_menu(ui: &mut egui::Ui, app: &mut AppState, run: &mut bool) {
+    // Mode toggles — duplicate the left-click flip on the toggle buttons
+    // so the menu is a complete control surface on its own.
+    ui.label(egui::RichText::new("Modes").strong().small());
+    if ui
+        .checkbox(&mut app.panels.search.lexical_on, "Lexical")
+        .on_hover_text("Substring / token matches from the index")
+        .changed()
+    {
+        *run = true;
+    }
+    if ui
+        .checkbox(&mut app.panels.search.semantic_on, "Semantic")
+        .on_hover_text("Embedding-based similarity")
+        .changed()
+    {
+        *run = true;
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Only lexical").clicked() {
+            app.panels.search.lexical_on = true;
+            app.panels.search.semantic_on = false;
+            *run = true;
+        }
+        if ui.small_button("Only semantic").clicked() {
+            app.panels.search.semantic_on = true;
+            app.panels.search.lexical_on = false;
+            *run = true;
+        }
+        if ui.small_button("Both").clicked() {
+            app.panels.search.lexical_on = true;
+            app.panels.search.semantic_on = true;
+            *run = true;
+        }
+    });
 
     ui.separator();
     ui.label(egui::RichText::new("Filters").strong().small());
@@ -325,55 +333,86 @@ impl View<'_> {
     let mut run = false;
     let mut run_search_immediate = false;
     ui.horizontal(|ui| {
-        // Magnifying glass doubles as the options menu trigger
-        // (right-click). All the previously-inline rows (Lexical /
-        // Semantic toggles + their options, Limit, Types, Order) live
-        // inside this popup so the panel header stays one line tall.
+        // Magnifying glass carries the cross-mode controls (mode
+        // convenience switches + Limit / Types / Order) on right-click, so
+        // the header stays one line tall. Per-mode tuning lives on the two
+        // toggles to its right.
         let icon_resp = ui
             .add(crate::icons::ICONS.image(crate::icons::Icon::Search).sense(egui::Sense::click()))
-            .on_hover_text("Right-click for search options");
+            .on_hover_text("Right-click for filters");
         icon_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run);
+            filters_menu(ui, app, &mut run);
         });
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut app.panels.search.query)
-                .hint_text("Search vault…"),
-        );
-        // Inline mode toggles (per the legacy TS UI's
-        // toggleLexicalBtn/toggleSemanticBtn). Right-click on either still
-        // opens the full options menu for per-mode tuning.
-        let lex_on = app.panels.search.lexical_on;
-        let lex_resp = ui
-            .selectable_label(lex_on, "Lex")
-            .on_hover_text("Lexical: substring / token matches");
-        if lex_resp.clicked() {
-            app.panels.search.lexical_on = !lex_on;
-            persist_search_setting(
-                app,
-                "search.modes.lexical",
-                &serde_json::json!(app.panels.search.lexical_on),
-            );
-            run = true;
-        }
-        lex_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run);
-        });
-        let sem_on = app.panels.search.semantic_on;
-        let sem_resp = ui
-            .selectable_label(sem_on, "Sem")
-            .on_hover_text("Semantic: embedding similarity");
-        if sem_resp.clicked() {
-            app.panels.search.semantic_on = !sem_on;
-            persist_search_setting(
-                app,
-                "search.modes.semantic",
-                &serde_json::json!(app.panels.search.semantic_on),
-            );
-            run = true;
-        }
-        sem_resp.context_menu(|ui| {
-            search_options_menu(ui, app, &mut run);
-        });
+        // Lay the row out so the toggles reserve their width on the right
+        // and the text input fills whatever's left — otherwise a full-width
+        // input pushes the toggles past the panel edge, where the
+        // vertical-only ScrollArea clips them out of sight. Right-to-left
+        // places the semantic toggle rightmost, then lexical to its left,
+        // then the input claims the remaining space.
+        let resp = ui
+            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Icon-only mode toggles per `search-mode-toggles`: brain
+                // glyph for semantic, `Aa` typographic glyph for lexical.
+                // Left-click flips the mode on/off; right-click opens that
+                // mode's own option menu (`search-mode-options-menu`).
+                let sem_on = app.panels.search.semantic_on;
+                let sem_resp = ui
+                    .add(
+                        egui::ImageButton::new(
+                            crate::icons::ICONS.image(crate::icons::Icon::Brain),
+                        )
+                        .selected(sem_on),
+                    )
+                    .on_hover_text("Semantic search");
+                if sem_resp.clicked() {
+                    app.panels.search.semantic_on = !sem_on;
+                    persist_search_setting(
+                        app,
+                        "search.modes.semantic",
+                        &serde_json::json!(app.panels.search.semantic_on),
+                    );
+                    run = true;
+                }
+                sem_resp.context_menu(|ui| {
+                    semantic_options_menu(ui, app, &mut run);
+                });
+                let lex_on = app.panels.search.lexical_on;
+                // Match the brain toggle's active treatment: when on, the
+                // button carries the selection fill + accent border so the
+                // pressed state reads at a glance. A bare `selectable_label`
+                // only paints the (near-transparent) selection fill with no
+                // border, so its active state is invisible on the light
+                // panel — only the default hover shade showed.
+                let mut lex_btn = egui::Button::new(egui::RichText::new("Aa").strong());
+                if lex_on {
+                    lex_btn = lex_btn
+                        .fill(ui.visuals().selection.bg_fill)
+                        .stroke(ui.visuals().selection.stroke);
+                }
+                let lex_resp = ui.add(lex_btn).on_hover_text("Lexical search");
+                if lex_resp.clicked() {
+                    app.panels.search.lexical_on = !lex_on;
+                    persist_search_setting(
+                        app,
+                        "search.modes.lexical",
+                        &serde_json::json!(app.panels.search.lexical_on),
+                    );
+                    run = true;
+                }
+                lex_resp.context_menu(|ui| {
+                    lexical_options_menu(ui, app, &mut run);
+                });
+                // Input fills the width left after the toggles.
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.panels.search.query)
+                        .hint_text("Search vault…")
+                        .desired_width(ui.available_width()),
+                )
+            })
+            .inner;
+        // Record the search box's id so the editor panel can tell when this
+        // field (not the editor) owns keyboard focus and should keep Ctrl-Z.
+        app.ui.search_input_id = Some(resp.id);
         if app.panels.search.focus_query_next_frame {
             app.panels.search.focus_query_next_frame = false;
             resp.request_focus();
@@ -444,8 +483,9 @@ impl View<'_> {
     // Drop the local reborrow so the run block below can take `self`
     // again (needed by `run_query`).
     let _ = (ui, app);
-    // Search-mode toggles + advanced filters live in the magnifying-glass
-    // context menu (see `search_options_menu`); the header stays minimal.
+    // Per-mode options live on the two toggles (`lexical_options_menu` /
+    // `semantic_options_menu`); cross-mode filters live on the
+    // magnifying-glass menu (`filters_menu`). The header stays minimal.
     if run {
         let q = self.app.panels.search.query.clone();
         self.app.panels.search.query_epoch =

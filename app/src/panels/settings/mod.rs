@@ -1,7 +1,7 @@
 //! Settings tab. Scope-aware (User / Vault) form over `core::config::Config`.
 //!
 //! Each section is a collapsing group. Common knobs (vault tree, indexing
-//! model, llm provider, mcp, staging) render typed widgets and persist
+//! model, llm provider, mcp) render typed widgets and persist
 //! through `Config::set`. Less-used sections fall back to a raw-TOML view of
 //! the per-scope file so users can still hand-edit without leaving the tab.
 
@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 
 use hiker_core::config::{Config, SettingsScope};
-use hiker_core::config::sections::{IdStampingMode, RecencyBias, TreeSortBy, WorkerPreferenceCfg};
+use hiker_core::config::sections::{IdStampingMode, RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
 use crate::theme;
@@ -151,12 +151,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                 ctx.indexing_section();
                 ctx.llm_section();
                 ctx.mcp_section();
-                ctx.staging_section();
                 ctx.editor_section();
                 ctx.search_section();
                 ctx.tasks_section();
                 ctx.acp_section();
                 ctx.trails_section();
+                ctx.sync_section();
                 ctx.suggestions_section();
             }
 
@@ -410,16 +410,6 @@ fn mcp_section(&mut self) {
         });
 }
 
-fn staging_section(&mut self) {
-    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
-    egui::CollapsingHeader::new("Staging")
-        .default_open(true)
-        .show(ui, |ui| {
-            bool_row(ui, app, st, "Auto-reject on conflict", "staging.auto_reject_on_conflict", snap.staging.auto_reject_on_conflict);
-            int_row(ui, app, st, "Retention (days)", "staging.retention_days", &IntField { current: snap.staging.retention_days as u64, min: 1, max: u32::MAX as u64 });
-        });
-}
-
 fn editor_section(&mut self) {
     let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     if matches!(st.scope, Scope::User) {
@@ -466,7 +456,13 @@ fn editor_section(&mut self) {
                 0.05,
             );
             ui.collapsing("Minimap customization", |ui| {
+                use hiker_core::config::sections::MinimapStyle;
                 let m = &e.minimap;
+                enum_combo(ui, app, st, "Style", "editor.minimap.style", m.style, &[
+                    (MinimapStyle::Glyphs, "Glyphs (scaled text)", "glyphs"),
+                    (MinimapStyle::Bars, "Bars (structural)", "bars"),
+                ]);
+                help(ui, "Glyphs renders a literal mini-version of the text; bars is the structural overview. Bar-* options below apply to the bars style.");
                 ui.label(egui::RichText::new("Layout").color(theme::muted()).small());
                 int_row(ui, app, st, "Width (px)", "editor.minimap.width", &IntField { current: m.width as u64, min: 16, max: 300 });
                 int_row(ui, app, st, "Bar padding left (px)", "editor.minimap.bar_padding_left", &IntField { current: m.bar_padding_left as u64, min: 0, max: 24 });
@@ -589,6 +585,67 @@ fn trails_section(&mut self) {
         .default_open(false)
         .show(ui, |ui| {
             string_row(ui, app, st, "New trail directory", "trails.new_trail_dir", &snap.trails.new_trail_dir);
+        });
+}
+
+fn sync_section(&mut self) {
+    // status: sync-config-section
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
+    if matches!(st.scope, Scope::User) {
+        // [sync] is per-vault (the config lives in the vault TOML). Show a
+        // hint instead of the form, mirroring the editor/search sections.
+        egui::CollapsingHeader::new("Sync")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Sync settings live in vault scope.")
+                        .color(theme::muted())
+                        .small(),
+                );
+            });
+        return;
+    }
+    egui::CollapsingHeader::new("Sync")
+        .default_open(false)
+        .show(ui, |ui| {
+            let s = &snap.sync;
+            bool_row(ui, app, st, "Enabled", "sync.enabled", s.enabled);
+            enum_combo(
+                ui, app, st,
+                "Mode",
+                "sync.mode",
+                s.mode,
+                &[
+                    (SyncMode::Peer, "Peer (P2P/LAN)", "peer"),
+                    (SyncMode::Server, "Server relay", "server"),
+                    (SyncMode::Both, "Both", "both"),
+                ],
+            );
+            string_row(ui, app, st, "Server URL", "sync.server_url", &s.server_url);
+            bool_row(ui, app, st, "Discovery", "sync.discovery", s.discovery);
+
+            // Enrolled devices are read-only here — enrollment (the
+            // fingerprint swap) happens on the Sync page, not in settings.
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Enrolled devices ({})", s.devices.len()))
+                    .color(theme::muted())
+                    .small(),
+            );
+            if s.devices.is_empty() {
+                help(ui, "No devices enrolled yet.");
+            } else {
+                for fp in &s.devices {
+                    ui.label(egui::RichText::new(fp).monospace().small());
+                }
+            }
+            help(ui, "Enroll devices on the Sync page; this list is read-only.");
+
+            ui.add_space(4.0);
+            help(
+                ui,
+                "Secrets (device key + per-vault content key) live in user scope and never travel with the synced vault.",
+            );
         });
 }
 

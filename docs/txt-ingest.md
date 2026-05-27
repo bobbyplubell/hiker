@@ -13,7 +13,7 @@ The headline decisions:
 
 ## Editor rendering
 
-`.txt` files open in the same editor as `.md` files. The CodeMirror language compartment (per `editor.md`'s extension order) is set to `markdown()` by default for `.txt` too. Live preview, syntax highlighting, list autocomplete, etc. all behave as if the file were `.md`.
+`.txt` files open in the same editor as `.md` files. The editor applies the markdown decoration/styling providers to `.txt` by default too. Live preview, syntax highlighting, list autocomplete, etc. all behave as if the file were `.md`.
 
 Per-vault config flag in `vault/.hiker/config.toml`:
 
@@ -113,7 +113,7 @@ Listed for forward-pointer / "we considered this":
 
 - **TextTiling** (Hearst 1997) — deterministic semantic-cohesion-based chunk boundaries via sliding window of bag-of-words cosine similarity. Useful when Layer 1 + 2 produce poor boundaries on long unbroken prose.
 - **Embedder-based semantic boundaries** — embed sentences with the existing embedder, place chunk boundaries where similarity to the running chunk centroid drops below a threshold. Reuses the embedder we already have but adds N embed calls per file just for chunking.
-- **LLM rewrite to markdown** — most flexible, most expensive, lossy in subtle ways. Lands as `editor.md`'s `note-mutation-reformat-as-markdown` action; routes through `core::tasks` per `task-queue.md` (single-shot `Direct`-shape task). Result lands in the active editor buffer as a single CM6 transaction; user saves to accept or Ctrl-Z to revert. Opt-in user action, not an ingest default.
+- **LLM rewrite to markdown** — most flexible, most expensive, lossy in subtle ways. Lands as `editor.md`'s `note-mutation-reformat-as-markdown` action; routes through `core::tasks` per `task-queue.md` (single-shot `Direct`-shape task). Result lands in the active editor buffer as a single editor transaction; user saves to accept or Ctrl-Z to revert. Opt-in user action, not an ingest default.
 - **Content-shape fingerprinting** — a per-note structural fingerprint (code-byte share, detected languages, table/list/link density, heading count, frontmatter presence) computed deterministically from the chunk pass. Tells you *what shape* a note is — mostly code, mostly prose, link-heavy, tabular — without understanding what it's about. Cheap to compute (no LLM, no embedder), unlocks UI badges, search filters, and a clustering signal, and would let the chunker pick a strategy by shape (e.g. code-heavy `.txt` skips Layer 2 and uses line-packed chunks). Not specced; speculative until there's a concrete use that justifies the surface.
 
 These are not on the v1 roadmap. Reach for one only when the cheap layers prove inadequate on real content.

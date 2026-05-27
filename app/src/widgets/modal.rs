@@ -55,6 +55,9 @@ pub fn modal(&mut self, ctx: &egui::Context) {
         Modal::DiskDrift { path, in_buffer_text } => {
             app.disk_drift_dialog(ctx, path, in_buffer_text);
         }
+        Modal::PathConflict { path, recorded_id, current_path_id, target } => {
+            app.path_conflict_dialog(ctx, path, recorded_id, current_path_id, target);
+        }
     }
 }
 }
@@ -528,4 +531,125 @@ fn apply_discard(app: &mut AppState, path: &str) {
             crate::state::ToastLevel::Error,
         );
     }
+}
+
+// ===========================================================================
+// Path-conflict modal (Keep mine / Repoint / Break)
+// ===========================================================================
+
+#[derive(Clone, Copy)]
+enum ConflictChoice {
+    KeepMine,
+    Repoint,
+    Break,
+    Cancel,
+}
+
+impl AppState {
+/// Resolve a stored double-link `PathConflict`: the recorded path now points
+/// at a note with a different ULID than the one recorded. Three branches,
+/// reused across every reference surface (`target`):
+///   - **Keep mine** — leave the stored reference as-is (it stays a broken/
+///     orphan-style card until the note it recorded reappears).
+///   - **Repoint** — rewrite the stored path to the note now at `path`,
+///     adopting its current identity (one `user_save` op).
+///   - **Break** — remove the reference (card / waypoint) entirely.
+///
+/// status: trail-path-conflict-modal
+/// status: board-card-references
+fn path_conflict_dialog(
+    &mut self,
+    ctx: &egui::Context,
+    path: String,
+    recorded_id: String,
+    current_path_id: String,
+    target: crate::state::PathConflictTarget,
+) {
+    let app = self;
+    let mut decision: Option<ConflictChoice> = None;
+    let mut open = true;
+    egui::Window::new("Reference conflict")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "The note at {path} is no longer the one this reference recorded."
+            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "recorded id {recorded_id} - current note id {current_path_id}"
+                ))
+                .small()
+                .monospace()
+                .color(egui::Color32::from_rgb(0xb9, 0x6a, 0x6a)),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Keep mine").on_hover_text(
+                    "Leave the reference unchanged (stays broken until the recorded note returns)",
+                ).clicked() {
+                    decision = Some(ConflictChoice::KeepMine);
+                }
+                if ui.button("Repoint").on_hover_text(
+                    "Rewrite the reference to the note now at this path",
+                ).clicked() {
+                    decision = Some(ConflictChoice::Repoint);
+                }
+                let break_btn = egui::Button::new(
+                    egui::RichText::new("Break").color(egui::Color32::WHITE).strong(),
+                )
+                .fill(egui::Color32::from_rgb(0xc0, 0x39, 0x2b));
+                if ui.add(break_btn).on_hover_text("Remove the reference").clicked() {
+                    decision = Some(ConflictChoice::Break);
+                }
+                if ui.button("Cancel").clicked() {
+                    decision = Some(ConflictChoice::Cancel);
+                }
+            });
+        });
+
+    match decision {
+        Some(ConflictChoice::KeepMine) | Some(ConflictChoice::Cancel) => {}
+        Some(ConflictChoice::Repoint) => app.apply_conflict_repoint(&path, &target),
+        Some(ConflictChoice::Break) => app.apply_conflict_break(&target),
+        None if !open => {}
+        None => {
+            app.session.modal = Some(Modal::PathConflict {
+                path,
+                recorded_id,
+                current_path_id,
+                target,
+            });
+        }
+    }
+}
+
+/// "Repoint": rewrite the reference's stored path to the note now at `path`.
+/// For a board card this is a board-doc frontmatter `user_save` via the
+/// board ops (the card's id stays; only the path half is adopted from the
+/// current note — actually a fresh `{id,path}` for the note now there).
+fn apply_conflict_repoint(
+    &mut self,
+    path: &str,
+    target: &crate::state::PathConflictTarget,
+) {
+    use crate::state::PathConflictTarget;
+    match target {
+        PathConflictTarget::BoardCard { board_rel, card_id } => {
+            crate::panels::board::repoint_card(self, board_rel, card_id, path);
+        }
+    }
+}
+
+/// "Break": remove the conflicting reference entirely.
+fn apply_conflict_break(&mut self, target: &crate::state::PathConflictTarget) {
+    use crate::state::PathConflictTarget;
+    match target {
+        PathConflictTarget::BoardCard { board_rel, card_id } => {
+            crate::panels::board::break_card(self, board_rel, card_id);
+        }
+    }
+}
 }

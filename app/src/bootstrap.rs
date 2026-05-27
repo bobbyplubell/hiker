@@ -1,8 +1,8 @@
 //! Vault-open recipe. Constructs `AppState` from a vault path.
 //!
 //! Wires the long-lived subsystems hiker needs to be useful (store,
-//! changes, staging, trees, activity, watcher, indexer, autosave). The
-//! direct LLM worker + MCP server layer on top.
+//! op log, trees, activity, watcher, indexer, autosave). The direct LLM
+//! worker + MCP server layer on top.
 //!
 //! Spawned background tasks (watcher relay, indexer progress forwarder,
 //! direct LLM worker) all clone the `VaultSession.cancel` token so the
@@ -21,11 +21,10 @@ use tokio_util::sync::CancellationToken;
 use hiker_core::activity::Activity;
 use hiker_core::audit::AgentLog;
 use hiker_core::autosave::Autosave;
-use hiker_core::changes::Changes;
 use hiker_core::config::Config;
 use hiker_core::embed::FastembedEmbedder;
 use hiker_core::indexer::{route_watcher_events, start, Handle};
-use hiker_core::staging::Staging;
+use hiker_core::oplog::OpLog;
 use hiker_core::store::Store;
 use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::tasks::types::TaskRecord;
@@ -99,8 +98,8 @@ impl McpStarter {
 /// Each spawn is a method (not an inlined block) so its loop body counts
 /// toward `Spawner`'s complexity rather than `open_vault`'s, while staying
 /// exempt from `single_call_fn` as an inherent method.
-struct Spawner {
-    cancel: CancellationToken,
+pub(crate) struct Spawner {
+    pub(crate) cancel: CancellationToken,
 }
 
 /// The already-spawned relay channel ends the UI drains each frame:
@@ -111,16 +110,20 @@ struct RelayChannels {
     ev_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     mut_rx: tokio::sync::mpsc::UnboundedReceiver<MutationEvent>,
     mut_tx: tokio::sync::mpsc::UnboundedSender<MutationEvent>,
+    sync_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Receiver for on-demand fork-diff fetch results (`sync-fork-diff`):
+    /// `(path, Ok(their_text) | Err(message))`, drained each frame into the
+    /// Sync page's fork-diff cache. Held even when sync is disabled (the channel
+    /// just stays empty), like `sync_rx`.
+    fork_diff_rx: tokio::sync::mpsc::UnboundedReceiver<crate::sync_service::ForkDiffResult>,
 }
 
 /// Inputs for `Spawner::snapshot_poller`: the read-side handles to poll
 /// plus the watch senders the UI reads.
 struct SnapshotChannels {
     tasks: Arc<TaskQueue>,
-    staging: Arc<Staging>,
     read_store: Arc<Mutex<Store>>,
     task_snap_tx: watch::Sender<Vec<TaskRecord>>,
-    staging_snap_tx: watch::Sender<Vec<hiker_core::staging::types::Proposal>>,
     skipped_snap_tx: watch::Sender<HashSet<String>>,
 }
 
@@ -152,6 +155,214 @@ impl Spawner {
         fs_rx
     }
 
+    /// Set up the watcher fan-out for a vault session: the app-state relay
+    /// (returns the `fs_rx` the UI drains) plus the op-log external-edit
+    /// reconciliation relay. Both subscribe to the same broadcast and are
+    /// torn down on `cancel`. Bundled so `open_vault` stays a single call
+    /// site and the relay-loop complexity counts toward `Spawner`.
+    fn watcher_relays(
+        &self,
+        watcher: &Arc<Watcher>,
+        oplog: Arc<hiker_core::oplog::OpLog>,
+        vault: Arc<hiker_core::vault::Vault>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<hiker_core::watcher::FileEvent> {
+        let fs_rx = self.watcher_relay(watcher.subscribe());
+        self.oplog_external_sync_relay(watcher.subscribe(), oplog, vault);
+        fs_rx
+    }
+
+    /// External-edit-sync relay (`op-log-external-edit-sync`). Subscribes to
+    /// the watcher and, for every `.md` Created/Modified event hiker didn't
+    /// initiate (the watcher already drops self-writes via
+    /// `watcher-suppress-self-writes` before broadcasting), reconciles the
+    /// new disk bytes into `accepted` through `core::ops::op_writes`. The
+    /// substrate compares disk against `materialize(accepted)`: equal →
+    /// ignored as a self-write echo (the safety net); different → applied as
+    /// an `author=external` text delta. Mirrors `watcher_relay`'s shape; one
+    /// spawned task per vault session, torn down on `cancel`.
+    fn oplog_external_sync_relay(
+        &self,
+        mut sub: tokio::sync::broadcast::Receiver<hiker_core::watcher::FileEvent>,
+        oplog: Arc<hiker_core::oplog::OpLog>,
+        vault: Arc<hiker_core::vault::Vault>,
+    ) {
+        use hiker_core::watcher::FileEvent;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    recv = sub.recv() => match recv {
+                        Ok(FileEvent::Created { path } | FileEvent::Modified { path }) => {
+                            if !hiker_core::indexer::is_indexable_path(&path) {
+                                continue;
+                            }
+                            match hiker_core::ops::op_writes::external_edit(&oplog, &vault, &path) {
+                                Ok(true) => tracing::debug!(%path, "external-edit-sync: reconciled disk change"),
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(%path, error = %e, "external-edit-sync failed"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        // Lagged: events were dropped. A missed external edit
+                        // is caught by the editor's pre-write drift check; no
+                        // forced reconcile needed here.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
+                }
+            }
+        });
+    }
+
+    /// Build the live sync engine and spawn its responder loop, when
+    /// `[sync].enabled`. Mirrors `oplog_external_sync_relay`'s spawn shape:
+    /// one tokio task per vault session, torn down on `cancel`. The task
+    /// `listen`s on the configured/default addr, records the bound address,
+    /// then drives the swarm event loop as a responder (answering enrolled
+    /// peers) in short windows so the shared node lock is released between
+    /// turns and a UI-spawned `force_sync`/`discover` can interleave.
+    ///
+    /// Returns the constructed service (stored on `Services`), or `None` when
+    /// sync is disabled or the key store can't be opened — both non-fatal.
+    pub(crate) fn spawn_sync_service(
+        &self,
+        vault_root: &std::path::Path,
+        oplog: Arc<hiker_core::oplog::OpLog>,
+        section: &hiker_core::config::sections::SyncSection,
+        sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        fork_diff_tx: crate::sync_service::ForkDiffSender,
+    ) -> Option<Arc<crate::sync_service::SyncService>> {
+        if !section.enabled {
+            return None;
+        }
+        let service = match crate::sync_service::SyncService::new(
+            vault_root,
+            oplog,
+            section,
+            sync_tx,
+            fork_diff_tx,
+        ) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "sync: failed to build service (non-fatal)");
+                return None;
+            }
+        };
+
+        let node = service.node();
+        let events_tx = service.events_tx();
+        let svc = service.clone();
+        let cancel = self.cancel.clone();
+        // Per-service kill switch (the live `[sync].enabled = false` path),
+        // in addition to the session-wide cancel (vault switch / close).
+        let svc_cancel = service.cancel_token();
+        tokio::spawn(async move {
+            // Start listening; resolve the OS-assigned port.
+            {
+                let mut node = node.lock().await;
+                match node
+                    .listen(crate::sync_service::DEFAULT_LISTEN_ADDR)
+                    .await
+                {
+                    Ok(addr) => {
+                        let _ = events_tx.send(format!("sync: listening on {addr}"));
+                        svc.set_listen_addr(addr);
+                    }
+                    Err(e) => {
+                        let _ = events_tx.send(format!("sync: listen failed — {e}"));
+                        return;
+                    }
+                }
+            }
+
+            // Auto-sync driver, folded into the responder loop so it never
+            // fights the responder for the node lock — both interleave by
+            // yielding the lock between turns. Three triggers fire a round:
+            //   * startup: one round shortly after `listen` succeeds, so a
+            //     device that just came online catches up immediately.
+            //   * periodic: the `AUTO_SYNC_INTERVAL` tick.
+            //   * on-discovery: a new enrolled peer surfaced via mDNS in the
+            //     responder window (`take_newly_discovered`).
+            // `[sync].enabled` already gated building the whole task; the
+            // cancel tokens below stop it (kill switch / vault swap). Rounds
+            // run when server-mode is usable, or LAN discovery is on; with
+            // discovery off and no server, the driver still ticks but every
+            // round is a benign no-op (no known peers → `Ok(None)`, silent).
+            // ~15s: cheap (manifest/state-vector exchange, deltas only) and
+            // quiet on empty rounds; a config knob is a future nicety.
+            const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
+            // Startup delay: let the listener settle + give mDNS a beat to
+            // surface a peer before the first round.
+            const STARTUP_DELAY: Duration = Duration::from_secs(2);
+            let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The interval's first tick fires immediately; consume it so the
+            // *periodic* arm doesn't double up with the explicit startup round.
+            interval.tick().await;
+            let startup = tokio::time::sleep(STARTUP_DELAY);
+            tokio::pin!(startup);
+            let mut did_startup = false;
+
+            // Responder loop: drive the swarm in short windows, releasing the
+            // node lock between turns so UI-spawned dialer work and the
+            // auto-sync rounds below can take it.
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = svc_cancel.cancelled() => break,
+                    _ = &mut startup, if !did_startup => {
+                        did_startup = true;
+                        svc.auto_sync_round().await;
+                    }
+                    _ = interval.tick() => {
+                        svc.auto_sync_round().await;
+                    }
+                    _ = async {
+                        let newly_discovered = {
+                            let mut node = node.lock().await;
+                            // Short window so the node lock is held only briefly
+                            // between turns — a UI-spawned action that needs the
+                            // lock (enroll / import / resolve) waits at most this
+                            // long, not half a second.
+                            if let Err(e) = node.run(Duration::from_millis(120)).await {
+                                tracing::warn!(error = %e, "sync: responder run window failed");
+                            }
+                            // Mirror the node-derived state the page renders
+                            // (enrolled LAN peers + blocked docs) into `Shared`
+                            // while we hold the lock (cheap sync reads), so the
+                            // egui render path never locks the node itself.
+                            svc.fold_discovered(node.discovered_peers());
+                            svc.fold_blocked(node.blocked_docs());
+                            // Mirror the unenrolled-seen LAN peers for the page,
+                            // and emit a one-time log line per newly-seen one so
+                            // the user sees a hiker instance is reachable but
+                            // needs enrolling. [sync-mdns-discovery]
+                            svc.fold_seen_unenrolled(node.seen_unenrolled());
+                            for peer in node.take_newly_seen_unenrolled() {
+                                let _ = events_tx.send(format!(
+                                    "sync: discovered un-enrolled peer {peer} on LAN — \
+                                     enroll its fingerprint to sync"
+                                ));
+                            }
+                            node.take_newly_discovered()
+                        };
+                        // Yield so a waiting dialer can grab the lock between
+                        // the responder window and any on-discovery round.
+                        tokio::task::yield_now().await;
+                        if newly_discovered {
+                            // A new enrolled peer just appeared — sync with it
+                            // promptly rather than waiting for the next tick.
+                            svc.auto_sync_round().await;
+                        }
+                    } => {}
+                }
+            }
+        });
+
+        Some(service)
+    }
+
     /// Indexer progress forwarder. Formats each `ProgressEvent` to a status
     /// line and forwards it onto an unbounded channel the UI drains.
     fn indexer_progress_relay(
@@ -178,9 +389,11 @@ impl Spawner {
         ev_rx
     }
 
-    /// Snapshot pollster: tasks + staging every 200ms; the read-store-
-    /// locked skipped-paths query every ~3s. First tick fires immediately
-    /// so the very first UI frame sees a populated cache. Exits on `cancel`.
+    /// Snapshot pollster: tasks every 200ms; the read-store-locked
+    /// skipped-paths query every ~3s. First tick fires immediately so the
+    /// very first UI frame sees a populated cache. Exits on `cancel`. (The
+    /// pending-op badge feed reads the op log directly each frame in
+    /// `main::refresh_pending_proposals` — it isn't polled here.)
     fn snapshot_poller(&self, ch: SnapshotChannels) {
         let cancel = self.cancel.clone();
         const TICK: Duration = Duration::from_millis(200);
@@ -194,15 +407,6 @@ impl Spawner {
             loop {
                 let snap = ch.tasks.snapshot().await;
                 let _ = ch.task_snap_tx.send(snap);
-
-                match ch.staging.list_pending() {
-                    Ok(v) => {
-                        let _ = ch.staging_snap_tx.send(v);
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "poller: staging.list_pending failed");
-                    }
-                }
 
                 if last_skipped.elapsed() >= SKIPPED_INTERVAL {
                     match ch.read_store.lock() {
@@ -267,21 +471,16 @@ impl Spawner {
     fn build_vault_events(
         &self,
         tasks: &Arc<TaskQueue>,
-        staging: &Arc<Staging>,
         read_store: &Arc<Mutex<Store>>,
         relays: RelayChannels,
     ) -> VaultEvents {
         let (task_snap_tx, task_snap_rx) = watch::channel::<Vec<TaskRecord>>(Vec::new());
-        let (staging_snap_tx, staging_snap_rx) =
-            watch::channel::<Vec<hiker_core::staging::types::Proposal>>(Vec::new());
         let (skipped_snap_tx, skipped_snap_rx) = watch::channel::<HashSet<String>>(HashSet::new());
 
         self.snapshot_poller(SnapshotChannels {
             tasks: tasks.clone(),
-            staging: staging.clone(),
             read_store: read_store.clone(),
             task_snap_tx,
-            staging_snap_tx,
             skipped_snap_tx,
         });
 
@@ -291,11 +490,111 @@ impl Spawner {
             mutation_events: Mutex::new(relays.mut_rx),
             mutation_events_tx: relays.mut_tx,
             indexer_events: VecDeque::new(),
+            sync_events_rx: Mutex::new(relays.sync_rx),
+            sync_events: VecDeque::new(),
+            fork_diff_rx: Mutex::new(relays.fork_diff_rx),
             task_snapshot_rx: task_snap_rx,
-            staging_snapshot_rx: staging_snap_rx,
             skipped_paths_rx: skipped_snap_rx,
         }
     }
+}
+
+/// Open the vault's op log and seed it from the on-disk notes on first
+/// open. The op log is the CRDT write substrate every producer rides on
+/// (`op-log-ops-producer-helpers`); the seed (`op-log-doc-id-bootstrap`)
+/// mints a doc per existing note and is idempotent — already-mapped notes
+/// are skipped — so subsequent opens are a cheap walk. The compaction
+/// threshold comes from `[op-log] compact_threshold`. A bootstrap seed
+/// failure is non-fatal (logged) so a single unreadable note can't block
+/// the whole vault opening.
+fn open_and_seed_oplog(
+    root: &std::path::Path,
+    vault: &Vault,
+    config: &std::sync::RwLock<Config>,
+) -> Result<Arc<OpLog>> {
+    let compact_threshold = config
+        .read()
+        .map(|c| c.op_log.compact_threshold)
+        .unwrap_or(4.0);
+    let oplog = Arc::new(
+        OpLog::open_with_threshold(root, compact_threshold).with_context(|| "open op log")?,
+    );
+    match hiker_core::ops::op_writes::bootstrap(vault, &oplog) {
+        Ok(n) if n > 0 => tracing::info!(seeded = n, "oplog: seeded documents on first open"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "oplog: bootstrap seed failed (non-fatal)"),
+    }
+    run_oplog_retention_gc_on_open(&oplog, config);
+    Ok(oplog)
+}
+
+/// On-open retention GC (`op-log-retention`): drop accepted/rejected
+/// side-table rows past their `[op-log]` retention horizons. Compaction of
+/// the `.yrs` snapshots already ran inside `OpLog::open_with_threshold`, so
+/// this only covers the side-table sweep. Failures are logged, not fatal —
+/// a vault still opens with stale metadata rows.
+fn run_oplog_retention_gc_on_open(oplog: &Arc<OpLog>, config: &std::sync::RwLock<Config>) {
+    let (meta_days, rejected_days) = config
+        .read()
+        .map(|c| {
+            (
+                c.op_log.metadata_retention_days,
+                c.op_log.rejected_retention_days,
+            )
+        })
+        .unwrap_or((365, 14));
+    match hiker_core::ops::op_writes::run_retention_gc(oplog, meta_days, rejected_days) {
+        Ok((a, r)) if a + r > 0 => {
+            tracing::info!(accepted_dropped = a, rejected_dropped = r, "oplog: retention GC on open")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "oplog: retention GC failed (non-fatal)"),
+    }
+}
+
+/// Load the persisted session state for a freshly-opened vault: crash-recovery
+/// entries, the saved tab snapshot, and the trails list. Any missing or
+/// malformed file degrades to an empty value so a fresh vault still opens
+/// cleanly.
+fn load_persisted_session(
+    autosave: &Autosave,
+    root: &std::path::Path,
+) -> (
+    Vec<hiker_core::autosave::RecoveredEntry>,
+    Option<hiker_core::autosave::TabState>,
+    Vec<crate::state::Trail>,
+) {
+    let recovery_entries = autosave.recover().unwrap_or_default();
+    let tab_state = autosave.load_tab_state().ok().flatten();
+    // Read `<root>/.hiker/trails.json`; any failure (missing file / bad JSON)
+    // becomes an empty list.
+    let trails = {
+        let path = root.join(".hiker/trails.json");
+        std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<crate::state::Trail>>(&bytes).ok())
+            .unwrap_or_default()
+    };
+    (recovery_entries, tab_state, trails)
+}
+
+/// Build the plugin host for a vault and load its enabled, hash-pinned
+/// plugins (per-plugin failures logged, not fatal). The host API reads through
+/// the shared index store so `notes.query` hits the same structured index as
+/// the rest of the app.
+fn build_plugin_host(
+    read_store: &Arc<Mutex<Store>>,
+    vault_root: &std::path::Path,
+) -> hiker_core::plugins::PluginHost {
+    let mut host = hiker_core::plugins::PluginHost::with_wasmi(Arc::new(
+        hiker_core::plugins::dispatch::StoreHostApi {
+            store: read_store.clone(),
+        },
+    ));
+    for (id, err) in host.load_enabled(vault_root) {
+        tracing::warn!(plugin = %id, error = %err, "plugin failed to load");
+    }
+    host
 }
 
 pub async fn open_vault(root: PathBuf) -> Result<AppState> {
@@ -312,23 +611,21 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     });
     let config = Arc::new(std::sync::RwLock::new(config));
 
-    // Long-lived subsystems. Order matters: store comes before changes/
-    // staging since they all live under .hiker/, and the read store is
-    // shared by indexer and any read-side commands.
+    // Long-lived subsystems. The read store is shared by the indexer and
+    // any read-side commands; everything lives under `.hiker/`.
     let read_store = Arc::new(Mutex::new(
         Store::open(&root).with_context(|| "open read store")?,
     ));
 
-    let changes = Arc::new(
-        Changes::open(&root).with_context(|| "open changes log")?,
-    );
-    let staging = Arc::new(
-        Staging::open(&root).with_context(|| "open staging")?,
-    );
+    let oplog = open_and_seed_oplog(&root, &vault, &config)?;
+
     let trees = Arc::new(
-        Db::open(&root).with_context(|| "open trees db")?,
+        Db::new(oplog.clone(), vault.clone()).with_context(|| "open trees store")?,
     );
-    let activity = Arc::new(Activity::new(changes.clone(), staging.clone()));
+    // Activity feed projects over the op log: accepted ops → change rows,
+    // pending ops → pending proposal rows. The op log is the sole changelog
+    // substrate.
+    let activity = Arc::new(Activity::new(oplog.clone()));
     let autosave = Arc::new(
         Autosave::open(&root).with_context(|| "open autosave")?,
     );
@@ -353,7 +650,9 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         },
     );
     indexer.attach_watcher(watcher.clone());
-    indexer.attach_changes(changes.clone());
+    // Let the indexer's move / delete jobs record renames + tombstones in the
+    // op log so `doc-index.db` follows file moves and deletes reach history.
+    indexer.attach_oplog(oplog.clone());
 
     // Wire watcher → indexer router so file events drive re-indexing.
     let _router = route_watcher_events(watcher.subscribe(), indexer.job_sender());
@@ -375,8 +674,8 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // `open_vault`'s.
     let spawner = Spawner { cancel: cancel.clone() };
 
-    // Watcher → app-state relay.
-    let fs_rx = spawner.watcher_relay(watcher.subscribe());
+    // Watcher fan-out: app-state relay + op-log external-edit reconciliation.
+    let fs_rx = spawner.watcher_relays(&watcher, oplog.clone(), vault.clone());
 
     // Indexer progress forwarder.
     let indexer_arc = Arc::new(indexer);
@@ -385,6 +684,17 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // Channel for note-mutation outcomes.
     let (mut_tx, mut_rx) =
         tokio::sync::mpsc::unbounded_channel::<MutationEvent>();
+
+    // Channel for sync progress lines. Created up-front (even when sync is
+    // disabled) so `VaultEvents` always holds both ends; the tx is also handed
+    // to the sync service so its async tasks can push.
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Channel for on-demand fork-diff fetch results (`sync-fork-diff`). Created
+    // up-front like `sync_tx`; the tx is handed to the sync service so its
+    // fetch task can deliver `(path, Ok(text) | Err(msg))` back to the UI.
+    let (fork_diff_tx, fork_diff_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::sync_service::ForkDiffResult>();
 
     // Audit log + task queue: shared dependencies for MCP + agent loop.
     let audit = Arc::new(AgentLog::new(
@@ -415,7 +725,6 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         read_store: read_store.clone(),
         jobs: indexer_arc.job_sender(),
         watcher: watcher.clone(),
-        changes: changes.clone(),
         embedder_provider: indexer_arc.embedder_provider(),
         config: mcp_cfg.clone(),
         tools: mcp_tools_cfg.clone(),
@@ -423,38 +732,45 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         tasks: tasks.clone(),
         tasks_config: tasks_cfg,
         llm_enabled: config.read().map(|c| c.llm.enabled).unwrap_or(false),
-        staging: staging.clone(),
+        oplog: Some(oplog.clone()),
     }).await;
 
-    // Crash recovery + persisted tab snapshot for the new Session.
-    let recovery_entries = autosave.recover().unwrap_or_default();
-    let tab_state = autosave.load_tab_state().ok().flatten();
-    // Inlined `load_trails`: read `<root>/.hiker/trails.json`; treat
-    // any failure (missing file / bad JSON) as an empty list so a fresh
-    // vault opens cleanly.
-    let trails: Vec<crate::state::Trail> = {
-        let path = root.join(".hiker/trails.json");
-        std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<crate::state::Trail>>(&bytes).ok())
-            .unwrap_or_default()
-    };
+    // Crash recovery, persisted tab snapshot, and trails for the new Session.
+    let (recovery_entries, tab_state, trails) = load_persisted_session(&autosave, &root);
+
+    // Live sync engine: built + responder-spawned only when `[sync].enabled`.
+    // When disabled, `None` — no keys, no swarm, no listener. The `sync_tx`
+    // end is also stashed in `VaultEvents` so the UI drains the progress ring.
+    let sync_section = config.read().map(|c| c.sync.clone()).unwrap_or_default();
+    let sync = spawner.spawn_sync_service(
+        &root,
+        oplog.clone(),
+        &sync_section,
+        sync_tx.clone(),
+        fork_diff_tx.clone(),
+    );
 
     // Wire the UI `watch` channels + snapshot pollster and fold them in
     // with the relay channels (a `Spawner` method, so its wiring counts
     // toward `Spawner`, not `open_vault`).
     let events = spawner.build_vault_events(
         &tasks,
-        &staging,
         &read_store,
-        RelayChannels { fs_rx, ev_rx, mut_rx, mut_tx },
+        RelayChannels { fs_rx, ev_rx, mut_rx, mut_tx, sync_rx, fork_diff_rx },
     );
+    // `sync_tx` / `fork_diff_tx` were handed to the sync service (when enabled)
+    // above; drop our copies so each channel closes cleanly if no service holds
+    // a sender.
+    drop(sync_tx);
+    drop(fork_diff_tx);
+
+    // Plugin host: load the enabled, hash-pinned WASM plugins for this vault.
+    let plugins = build_plugin_host(&read_store, &root);
 
     // Assemble the compartments.
     let services = Services {
         read_store,
-        changes,
-        staging,
+        oplog,
         trees,
         activity,
         autosave,
@@ -464,6 +780,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         tasks,
         mcp,
         mcp_tools_cfg,
+        sync,
     };
     let vault_session = VaultSession {
         vault: vault.clone(),
@@ -472,6 +789,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         services,
         events,
         cancel,
+        plugins,
     };
 
     let modal = if !recovery_entries.is_empty() {
@@ -610,9 +928,15 @@ impl AppState {
             ":queue" => Some(TabKind::Queue),
             ":settings" => Some(TabKind::Settings),
             ":graph" => Some(TabKind::Graph),
+            // status: board-view
+            // Per-doc board tab: the persist key is `board:<doc-path>`.
+            p if p.starts_with("board:") => {
+                Some(TabKind::Board { path: p["board:".len()..].to_string() })
+            }
             ":patch_review" => Some(TabKind::PatchReview),
             ":plugins" => Some(TabKind::Plugins),
             ":indexer" => Some(TabKind::IndexerDetail),
+            ":sync" => Some(TabKind::Sync),
             // `:agent_changes` is the legacy persist key; map it forward
             // to the unified `Changes` tab so old workspaces restore cleanly.
             ":changes" | ":agent_changes" => Some(TabKind::Changes),

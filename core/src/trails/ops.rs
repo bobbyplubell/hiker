@@ -4,14 +4,10 @@
 //! `trails::mod` focused on types + read-only helpers; everything that
 //! writes to disk lives here.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
-use crate::changes::{ChangeAppend, ChangeOp, Changes};
 use crate::config::sections::TrailsConfig;
 use crate::errors::HikerError;
-use crate::hash_string;
 use crate::indexer::{IndexJob, IndexJobTx};
 use crate::store::dto::new_id;
 use crate::store::Store;
@@ -22,7 +18,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::{
-    append_change_best_effort, collect_descendant_ids, find_waypoint, find_waypoint_mut,
+    collect_descendant_ids, find_waypoint, find_waypoint_mut,
     parse_trail_doc_for, parse_waypoint, remove_waypoint_from_tree, short_id_of,
     waypoint_filename, waypoints_dir_for, write_trail_doc_frontmatter,
     write_waypoint_frontmatter, DoubleLinkRef, WaypointEntry, WaypointFrontmatter,
@@ -62,9 +58,8 @@ pub struct RemoveWaypointOutcome {
 
 /// Create a new trail. Mints a ULID, writes the trail-doc to
 /// `<new_trail_dir>/<name>.md` (auto-suffixed on collision), seeds the
-/// hidden `.hiker/trails/<trail-id>/waypoints/` directory, appends a
-/// `'created'` changes row (`author='user'`), and re-indexes the
-/// trail-doc.
+/// hidden `.hiker/trails/<trail-id>/waypoints/` directory, and re-indexes
+/// the trail-doc.
 ///
 /// `name` is used verbatim as the basename; the function appends
 /// `-N.md` (1..1000) only when there is a collision, mirroring
@@ -76,7 +71,6 @@ pub async fn create_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     config: &TrailsConfig,
     name: &str,
 ) -> Result<CreateTrailOutcome, HikerError> {
@@ -142,19 +136,6 @@ pub async fn create_trail(
     // Re-suppress so the TTL window starts close to the notify event.
     watcher.suppress(trail_doc_rel.clone());
 
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: &trail_doc_rel,
-            op: ChangeOp::Created,
-            author: "user",
-            content_hash: Some(&hash_string(&body)),
-            content: Some(body.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trails.create_trail"}),
-        },
-    );
-
     let _ = jobs
         .send(IndexJob::Upsert {
             rel_path: trail_doc_rel.clone(),
@@ -179,11 +160,10 @@ pub async fn create_trail(
 /// 4. Appends an entry to the trail-doc's `hiker.waypoints` and
 ///    rewrites it.
 /// 5. Suppresses the watcher around both writes and re-indexes both.
-/// 6. Appends one `'created'` and one `'modified'` row to changes.
 ///
 /// status: waypoint-note-shape
 /// status: trail-empty-waypoint-body
-/// Borrowed bundle of inputs to `append_waypoint`. Bundles the four
+/// Borrowed bundle of inputs to `append_waypoint`. Bundles the three
 /// vault-side handles plus the mutable `store` so the function stays
 /// under the `too_many_arguments` threshold without losing the explicit
 /// `&mut Store` lifetime that the underlying id-stamping helper needs.
@@ -191,7 +171,6 @@ pub struct AppendWaypointArgs<'a> {
     pub watcher: &'a Watcher,
     pub jobs: &'a IndexJobTx,
     pub vault: &'a Vault,
-    pub changes: Option<&'a Arc<Changes>>,
     pub store: &'a mut Store,
     pub trail_doc_rel: &'a str,
     pub source_rel: &'a str,
@@ -206,7 +185,6 @@ pub async fn append_waypoint(
         watcher,
         jobs,
         vault,
-        changes,
         store,
         trail_doc_rel,
         source_rel,
@@ -219,7 +197,7 @@ pub async fn append_waypoint(
     // Trails-mode rendering — see
     // `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`).
     let source_id =
-        crate::ops::buffer::ensure_note_id_stamped(watcher, jobs, vault, changes, store, source_rel)
+        crate::ops::buffer::ensure_note_id_stamped(watcher, jobs, vault, store, source_rel)
             .await?;
 
     // 2. Read the trail-doc.
@@ -310,19 +288,6 @@ pub async fn append_waypoint(
     vault.write_file(&waypoint_rel, &waypoint_body)?;
     watcher.suppress(waypoint_rel.clone());
 
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: &waypoint_rel,
-            op: ChangeOp::Created,
-            author: "user",
-            content_hash: Some(&hash_string(&waypoint_body)),
-            content: Some(waypoint_body.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trails.append_waypoint"}),
-        },
-    );
-
     let _ = jobs
         .send(IndexJob::Upsert {
             rel_path: waypoint_rel.clone(),
@@ -390,19 +355,6 @@ pub async fn append_waypoint(
     vault.write_file(trail_doc_rel, &new_trail_src)?;
     watcher.suppress(trail_doc_rel.to_string());
 
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: trail_doc_rel,
-            op: ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&hash_string(&new_trail_src)),
-            content: Some(new_trail_src.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trails.append_waypoint"}),
-        },
-    );
-
     let _ = jobs
         .send(IndexJob::Upsert {
             rel_path: trail_doc_rel.to_string(),
@@ -426,7 +378,6 @@ pub async fn remove_waypoint(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     _trash: &Trash,
     trail_doc_rel: &str,
     waypoint_id: &str,
@@ -476,13 +427,12 @@ pub async fn remove_waypoint(
         })?;
 
     // Cascade-delete every waypoint-note (target + descendants) via
-    // `core::ops::delete` so each lands in trash with its own
-    // `'deleted'` changes row. Errors are surfaced after the pass — the
-    // first failure short-circuits but the caller knows nothing about
-    // partial success in v1; revisit if real use surfaces it.
+    // `core::ops::delete` so each lands in trash. Errors are surfaced after
+    // the pass — the first failure short-circuits but the caller knows
+    // nothing about partial success in v1; revisit if real use surfaces it.
     for rel in &removed_paths {
         let _entry =
-            crate::ops::file::delete(watcher, jobs, vault, changes, rel).await?;
+            crate::ops::file::delete(watcher, jobs, vault, rel).await?;
     }
 
     // Rewrite the trail-doc.
@@ -491,19 +441,6 @@ pub async fn remove_waypoint(
     watcher.suppress(trail_doc_rel.to_string());
     vault.write_file(trail_doc_rel, &new_trail_src)?;
     watcher.suppress(trail_doc_rel.to_string());
-
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: trail_doc_rel,
-            op: ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&hash_string(&new_trail_src)),
-            content: Some(new_trail_src.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trails.remove_waypoint"}),
-        },
-    );
 
     let _ = jobs
         .send(IndexJob::Upsert {
@@ -554,7 +491,6 @@ pub async fn delete_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     _trash: &Trash,
     trail_doc_rel: &str,
 ) -> Result<Entry, HikerError> {
@@ -577,7 +513,7 @@ pub async fn delete_trail(
         }
     };
 
-    let entry = crate::ops::file::delete(watcher, jobs, vault, changes, trail_doc_rel).await?;
+    let entry = crate::ops::file::delete(watcher, jobs, vault, trail_doc_rel).await?;
 
     if let Some(tid) = trail_id {
         let waypoint_dir = waypoints_dir_for(&tid);
@@ -591,7 +527,7 @@ pub async fn delete_trail(
             // are deferred — for v1 the trail-doc and the waypoint dir
             // become two separate trash entries; the user restores both.
             if let Err(e) =
-                crate::ops::file::delete(watcher, jobs, vault, changes, &trail_root).await
+                crate::ops::file::delete(watcher, jobs, vault, &trail_root).await
             {
                 tracing::warn!(error = %e, trail_id = %tid,
                     "delete_trail: cascade delete of waypoint dir failed");
@@ -620,8 +556,7 @@ pub enum ResolutionOutcome {
     /// either way no rewrite is needed.
     Resolved { rel_path: String, id: String },
     /// ULID resolves but to a different path than the recorded one.
-    /// Caller rewrites the rel-path to `canonical_path` and appends a
-    /// `core::changes` row tagged `author='user'`.
+    /// Caller rewrites the rel-path to `canonical_path`.
     SelfHeal {
         canonical_path: String,
         id: String,
@@ -721,23 +656,19 @@ pub fn resolve_reference(
 ///
 /// Watcher suppression is applied around each rewrite (when a watcher
 /// is attached) so notify can't surface a stale Modified event for the
-/// path the indexer is about to re-ingest. Each touched file gets one
-/// `core::changes` row (`author='user'`,
-/// `metadata.reason='trail-auto-update-on-note-move'`) and an
-/// `IndexJob::Upsert` is enqueued so the derived `trail_waypoints` rows
-/// re-derive cleanly.
+/// path the indexer is about to re-ingest. Each touched file enqueues an
+/// `IndexJob::Upsert` so the derived `trail_waypoints` rows re-derive
+/// cleanly.
 ///
 /// Errors anywhere inside are logged via `tracing::warn!` but never
-/// propagated up — the move's own changelog row already landed and
-/// rolling back partial trails work is more complex than v1 needs.
-/// Returns the count of files actually rewritten.
+/// propagated up — rolling back partial trails work is more complex than
+/// v1 needs. Returns the count of files actually rewritten.
 ///
 /// status: trail-auto-update-on-note-move
 pub async fn on_note_moved(
     watcher: Option<&Watcher>,
     jobs: Option<&IndexJobTx>,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     store: &mut Store,
     old_rel: &str,
     new_rel: &str,
@@ -768,7 +699,7 @@ pub async fn on_note_moved(
         None => Vec::new(),
     };
 
-    let rctx = RewriteCtx { watcher, jobs, vault, changes };
+    let rctx = RewriteCtx { watcher, jobs, vault };
     let mut touched: usize = 0;
     touched += rctx.fan_out_source_moved(&containing, new_rel).await;
     touched += rctx.fan_out_trail_doc_moved(&waypoints_of_trail, new_rel).await;
@@ -778,12 +709,11 @@ pub async fn on_note_moved(
 
 /// Borrow-bundle for the three path-rewrite helpers in `on_note_moved`.
 /// Methods on this struct stay exempt from `single_call_fn` and share the
-/// suppression / changelog plumbing without repeating four-arg signatures.
+/// suppression plumbing without repeating three-arg signatures.
 struct RewriteCtx<'a> {
     watcher: Option<&'a Watcher>,
     jobs: Option<&'a IndexJobTx>,
     vault: &'a Vault,
-    changes: Option<&'a Arc<Changes>>,
 }
 
 impl<'a> RewriteCtx<'a> {
@@ -895,8 +825,8 @@ impl<'a> RewriteCtx<'a> {
         fm.references.path = new_source_rel.to_string();
         let new_src = write_waypoint_frontmatter(&src, &fm)
             .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
-        write_with_suppress_and_log(
-            self.watcher, self.jobs, self.vault, self.changes, waypoint_rel, &new_src,
+        write_with_suppress_and_reindex(
+            self.watcher, self.jobs, self.vault, waypoint_rel, &new_src,
         )
         .await
     }
@@ -917,8 +847,8 @@ impl<'a> RewriteCtx<'a> {
         fm.in_trail.path = new_trail_doc_rel.to_string();
         let new_src = write_waypoint_frontmatter(&src, &fm)
             .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
-        write_with_suppress_and_log(
-            self.watcher, self.jobs, self.vault, self.changes, waypoint_rel, &new_src,
+        write_with_suppress_and_reindex(
+            self.watcher, self.jobs, self.vault, waypoint_rel, &new_src,
         )
         .await
     }
@@ -934,7 +864,6 @@ impl<'a> RewriteCtx<'a> {
         let vault = self.vault;
         let watcher = self.watcher;
         let jobs = self.jobs;
-        let changes = self.changes;
     let src = vault.read_file(trail_doc_rel)?;
     let mut fm = parse_trail_doc_for(trail_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
@@ -959,21 +888,20 @@ impl<'a> RewriteCtx<'a> {
     }
         let new_src = write_trail_doc_frontmatter(&src, &fm)
             .map_err(|e| HikerError::Io(format!("write trail-doc: {e}")))?;
-        write_with_suppress_and_log(
-            watcher, jobs, vault, changes, trail_doc_rel, &new_src,
+        write_with_suppress_and_reindex(
+            watcher, jobs, vault, trail_doc_rel, &new_src,
         )
         .await
     }
 }
 
 /// Common: pre-suppress watcher → write file → re-suppress watcher →
-/// changelog append → enqueue reindex. Mirrors the suppression pattern
-/// used by `append_waypoint` and friends.
-async fn write_with_suppress_and_log(
+/// enqueue reindex. Mirrors the suppression pattern used by
+/// `append_waypoint` and friends.
+async fn write_with_suppress_and_reindex(
     watcher: Option<&Watcher>,
     jobs: Option<&IndexJobTx>,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     rel: &str,
     new_src: &str,
 ) -> Result<(), HikerError> {
@@ -984,18 +912,6 @@ async fn write_with_suppress_and_log(
     if let Some(w) = watcher {
         w.suppress(rel.to_string());
     }
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: rel,
-            op: ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&hash_string(new_src)),
-            content: Some(new_src.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trail-auto-update-on-note-move"}),
-        },
-    );
     if let Some(j) = jobs {
         let _ = j
             .send(IndexJob::Upsert {
@@ -1017,7 +933,6 @@ pub async fn stamp_last_activated_at(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     trail_doc_rel: &str,
 ) -> Result<(), HikerError> {
     let src = vault.read_file(trail_doc_rel)?;
@@ -1034,19 +949,6 @@ pub async fn stamp_last_activated_at(
     vault.write_file(trail_doc_rel, &new_src)?;
     watcher.suppress(trail_doc_rel.to_string());
 
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: trail_doc_rel,
-            op: ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&hash_string(&new_src)),
-            content: Some(new_src.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trails.set_active"}),
-        },
-    );
-
     let _ = jobs
         .send(IndexJob::Upsert {
             rel_path: trail_doc_rel.to_string(),
@@ -1061,16 +963,13 @@ pub async fn stamp_last_activated_at(
 /// MUST resolve to a waypoint anywhere in the trail-doc's tree — we
 /// refuse to silently write a stale cursor.
 ///
-/// Same suppress + write + changes-append + reindex pattern every other
-/// trails op uses. One `core::changes` row per file write, tagged
-/// `metadata.reason = "trail-append-cursor"`.
+/// Same suppress + write + reindex pattern every other trails op uses.
 ///
 /// status: trail-append-cursor
 pub async fn set_append_cursor(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     trail_doc_rel: &str,
     waypoint_id: Option<&str>,
 ) -> Result<(), HikerError> {
@@ -1093,19 +992,6 @@ pub async fn set_append_cursor(
     watcher.suppress(trail_doc_rel.to_string());
     vault.write_file(trail_doc_rel, &new_src)?;
     watcher.suppress(trail_doc_rel.to_string());
-
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: trail_doc_rel,
-            op: ChangeOp::Modified,
-            author: "user",
-            content_hash: Some(&hash_string(&new_src)),
-            content: Some(new_src.as_bytes()),
-            rename_from: None,
-            metadata: serde_json::json!({"reason": "trail-append-cursor"}),
-        },
-    );
 
     let _ = jobs
         .send(IndexJob::Upsert {

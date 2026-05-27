@@ -89,6 +89,30 @@ pub enum DragState {
 /// `None` lets the default newline-insert path run.
 pub trait IndentProvider: Send + Sync {
     fn on_enter(&self, state: &EditorState) -> Option<Transaction>;
+
+    /// Hook for the Tab key. When the caret sits on a list item, the provider
+    /// can increase the list's nesting/indentation; returning `None` lets the
+    /// default "insert a tab-width of spaces" path run.
+    fn on_tab(&self, _state: &EditorState) -> Option<Transaction> {
+        None
+    }
+
+    /// Hook for the Shift-Tab key. When the caret sits on a list item, the
+    /// provider can decrease the list's nesting/indentation; returning `None`
+    /// lets the default outdent path run.
+    fn on_shift_tab(&self, _state: &EditorState) -> Option<Transaction> {
+        None
+    }
+
+    /// Hook for paste. When the caret sits immediately after a list-item
+    /// bullet and the pasted text's first line opens with the same bullet
+    /// marker, the provider returns the pasted text with that leading marker
+    /// stripped so the buffer's existing bullet isn't doubled. Returning
+    /// `None` (the default, and the case for non-list context or unrelated
+    /// pasted text) lets the original paste text insert verbatim.
+    fn on_paste(&self, _state: &EditorState, _pasted: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,11 +121,12 @@ pub struct DecorationLayers {
     /// stack on top of earlier ones for marks; later layers override for
     /// line/replace).
     pub layers: Vec<DecorationSet>,
-    /// Indices into `layers` of sets that may carry height-affecting entries
+    /// Indices into `layers` of sets that carry height-affecting entries
     /// (`Line.hide`, `Line.height_scale`, `Block`, `BlockWidget`). The
     /// heightmap driver only scans these layers; the painter still walks
-    /// every layer. Pushing via [`Self::push`] marks a layer paint-only; use
-    /// [`Self::push_with_heights`] when the layer may emit height entries.
+    /// every layer. [`Self::push`] populates this automatically from each
+    /// set's [`DecorationSet::affects_height`], so callers never have to pick
+    /// the right push method.
     pub height_indices: Vec<usize>,
     /// Order-sensitive fingerprint over the content_ids of every pushed set.
     /// Equal signatures across frames mean the same exact sets were pushed in
@@ -121,13 +146,24 @@ impl DecorationLayers {
         self.signature = 0;
         self.height_signature = 0;
     }
-    /// Push a paint-only decoration layer (no height-affecting entries).
+    /// Push a decoration layer, routing it to the heightmap driver iff the set
+    /// reports [`DecorationSet::affects_height`]. The flag is computed once at
+    /// set construction (see [`editor_core::rangeset::HeightAffecting`]), so a
+    /// height-affecting decoration is always visible to the heightmap driver
+    /// regardless of how the caller obtained the set — and a paint-only set
+    /// never costs the driver a scan.
     pub fn push(&mut self, set: DecorationSet) {
-        self.signature = mix_u64(self.signature, set.content_id() as u64);
-        self.layers.push(set);
+        if set.affects_height() {
+            self.push_with_heights(set);
+        } else {
+            self.signature = mix_u64(self.signature, set.content_id() as u64);
+            self.layers.push(set);
+        }
     }
-    /// Push a layer that may contain height-affecting entries. The heightmap
-    /// driver will scan this layer.
+    /// Push a layer onto a height-tracked slot unconditionally. Prefer
+    /// [`Self::push`], which auto-routes; this remains as an explicit override
+    /// for hosts that want a paint-only set scanned by the heightmap driver
+    /// anyway (rare).
     pub fn push_with_heights(&mut self, set: DecorationSet) {
         self.height_indices.push(self.layers.len());
         let id = set.content_id() as u64;
@@ -303,9 +339,29 @@ impl Default for ViewState {
     }
 }
 
+/// Left pad (px) between the widget edge and the text when the gutter is
+/// hidden. A few pixels so glyphs don't kiss the border. The painter offsets
+/// the text by this much with the gutter off; the click→byte inverse must
+/// subtract the same amount, hence it lives here as the shared source of truth.
+pub const HIDDEN_GUTTER_PAD: f32 = 4.0;
+
 impl ViewState {
     pub fn touch(&mut self) {
         self.last_interaction = Instant::now();
+    }
+
+    /// X offset of the text content from the widget's left edge. This is the
+    /// full gutter width with line numbers on, or [`HIDDEN_GUTTER_PAD`] when the
+    /// gutter is hidden (line numbers off). The painter adds this to the rect's
+    /// left edge to place text; the click→byte inverse subtracts it from the
+    /// widget-local x. One source of truth so the two never diverge when the
+    /// show-line-numbers toggle flips `hide_gutter`.
+    pub const fn content_origin_x(&self) -> f32 {
+        if self.hide_gutter {
+            HIDDEN_GUTTER_PAD
+        } else {
+            self.gutter_width
+        }
     }
 
     pub fn sync_to(&mut self, state: &EditorState) {
@@ -424,6 +480,49 @@ impl HeightMap {
             self.prefix_index.clear();
             self.prefix_dirty = false;
         }
+    }
+
+    /// Reconcile the line count WITHOUT clearing the existing overrides.
+    ///
+    /// [`Self::sync_to_lines`] drops every override on a line-count change so
+    /// the next measure pass re-emits them from fresh decorations. That's the
+    /// right behaviour on a normal measure, but on an edit frame the host's
+    /// decorations are stale (built against the pre-edit doc), so re-emitting
+    /// would mis-place heights for one frame. This keeps the prior overrides
+    /// in place — correct for every line whose index didn't move, and a far
+    /// better one-frame approximation than collapsing scaled rows to base —
+    /// and only adjusts `total` for the default-height rows added/removed at
+    /// the tail. Overrides past the new end are pruned. Used only for the
+    /// stale-decoration deferral in the egui widget's measure pass.
+    pub fn set_line_count(&mut self, line_count: usize, default_height: f32) {
+        let height_changed = (self.default_height - default_height).abs() > f32::EPSILON;
+        if height_changed {
+            // A base-height change reinterprets every override; fall back to
+            // the clearing path so the next fresh pass re-emits.
+            self.sync_to_lines(line_count, default_height);
+            return;
+        }
+        if self.line_count == line_count {
+            return;
+        }
+        // Drop overrides at or past the new end and subtract their non-default
+        // contribution; they no longer correspond to a line.
+        let mut delta: f32 = 0.0;
+        let stale: Vec<usize> = self
+            .overrides
+            .range(line_count..)
+            .map(|(l, _)| *l)
+            .collect();
+        for l in stale {
+            if let Some(o) = self.overrides.remove(&l) {
+                delta += o.full_height(self.default_height) - self.default_height;
+            }
+        }
+        // Adjust total for the change in the count of default-height rows.
+        let row_delta = (line_count as f32 - self.line_count as f32) * self.default_height;
+        self.line_count = line_count;
+        self.total += row_delta - delta;
+        self.prefix_dirty = true;
     }
 
     fn entry_mut(&mut self, line: usize) -> &mut LineOverride {
@@ -704,5 +803,72 @@ impl HeightMap {
         let into_gap = (y - gap_start_y).max(0.0);
         let n = (into_gap / self.default_height) as usize;
         (gap_start_line + n).min(self.line_count.saturating_sub(1))
+    }
+}
+
+#[cfg(test)]
+mod height_map_tests {
+    use super::HeightMap;
+
+    fn map_with_heading() -> HeightMap {
+        // 10 lines, base 18.0; line 5 is a "heading" at 2× height.
+        let mut m = HeightMap::default();
+        m.sync_to_lines(10, 18.0);
+        m.set_line_height(5, 36.0);
+        m.recompute();
+        m
+    }
+
+    #[test]
+    fn set_line_count_preserves_overrides_on_same_count() {
+        // Mirrors the common keystroke case: a char inserted on one line
+        // doesn't change the line count, so the stale-frame reconcile must be
+        // a complete no-op for the heights below the cursor.
+        let mut m = map_with_heading();
+        let before_total = m.total_height();
+        let before_h5 = m.text_height(5);
+        m.set_line_count(10, 18.0);
+        m.recompute();
+        assert_eq!(m.text_height(5), before_h5, "heading height must survive");
+        assert_eq!(m.total_height(), before_total, "total must be unchanged");
+    }
+
+    #[test]
+    fn set_line_count_keeps_override_when_a_line_is_added() {
+        // A newline edit grows the line count. The stale-frame reconcile must
+        // keep the existing heading override (so it doesn't collapse to base
+        // for one frame) and only add one default-height row to the total.
+        let mut m = map_with_heading();
+        let before_total = m.total_height();
+        m.set_line_count(11, 18.0);
+        m.recompute();
+        assert_eq!(m.text_height(5), 36.0, "heading override must persist");
+        assert_eq!(
+            m.total_height(),
+            before_total + 18.0,
+            "total grows by exactly one base row"
+        );
+    }
+
+    #[test]
+    fn set_line_count_prunes_overrides_past_new_end() {
+        // Shrinking past an override drops it and reclaims its extra height.
+        let mut m = map_with_heading();
+        let before_total = m.total_height();
+        m.set_line_count(5, 18.0); // line 5 (the heading) no longer exists
+        m.recompute();
+        // Removed 5 base rows (lines 5..10) AND the heading's +18 extra.
+        assert_eq!(m.total_height(), before_total - 5.0 * 18.0 - 18.0);
+        assert_eq!(m.text_height(4), 18.0);
+    }
+
+    #[test]
+    fn sync_to_lines_still_clears_on_count_change() {
+        // The destructive path (used on fresh measure passes) keeps its
+        // documented behaviour: a count change drops every override.
+        let mut m = map_with_heading();
+        m.sync_to_lines(11, 18.0);
+        assert_eq!(m.text_height(5), 18.0, "override cleared by sync_to_lines");
+        assert_eq!(m.total_height(), 11.0 * 18.0);
     }
 }

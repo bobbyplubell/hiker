@@ -28,7 +28,13 @@ impl Theme {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4a, 0x52, 0x5e));
 
     let accent = egui::Color32::from_rgb(0x2f, 0x6f, 0xed);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(0xb8, 0xd1, 0xff, 0x99);
+    // Selection highlight: accent blue at ~44 % opacity (unmultiplied).
+    // The old value used pre-multiplied RGBA with very diluted channels,
+    // producing a near-invisible tint on the light panel background (#f4f6f8).
+    // This raises contrast so selections are clearly readable across all
+    // text inputs and the editor without being visually heavy.
+    style.visuals.selection.bg_fill =
+        egui::Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xed, 0x70);
     style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
     style.visuals.hyperlink_color = accent;
 

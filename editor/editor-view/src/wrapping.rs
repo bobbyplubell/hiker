@@ -8,13 +8,32 @@
 //! `WrapMap` is invalidated by:
 //!   - width changes (`set_width`)
 //!   - char-width changes (`set_char_width`, on font size change)
-//!   - per-line content changes (`invalidate_line`, by the painter when it
-//!     detects the line's content hash has changed)
+//!   - per-line content changes — detected lazily by `get_or_compute`, which
+//!     re-wraps a line whenever the current text hash, width, or font scale no
+//!     longer matches its cached entry. (`invalidate_line` exists for explicit
+//!     eviction but the per-frame prewrap relies on the hash check instead.)
 //!
 //! When wrapping is disabled, the map contains a single VLine per buffer line
 //! with no breaks; the rest of the view layer is wrap-agnostic.
 
 use smallvec::SmallVec;
+
+/// A run of source bytes whose *rendered* width differs from its raw character
+/// count, because a live-preview `Replace` decoration hides or substitutes it:
+/// a hidden marker (`cols == 0`, e.g. the `**` of bold or the `<span …>` tag of
+/// a color span) or a replaced glyph (`cols == display.chars().count()`, e.g. a
+/// list marker rendered as `• `). Offsets are line-local bytes.
+///
+/// Soft-wrap counts `cols` (not the raw byte span) for these ranges so a line
+/// breaks at the column the user actually sees — without this, a long hidden
+/// span tag consumes wrap budget it never paints. The span is treated as
+/// atomic: a break never lands inside it.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct VisualSpan {
+    pub start: u32,
+    pub end: u32,
+    pub cols: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct WrappedLine {
@@ -157,13 +176,19 @@ impl WrapMap {
         line: usize,
         line_text: F,
         scale: f32,
+        spans: &[VisualSpan],
     ) -> &WrappedLine {
         self.ensure_capacity(line + 1);
         let text = line_text(line);
+        // Hash the text AND the visual spans: the spans encode the line's
+        // live-preview reveal state (markers hidden off the cursor line, shown
+        // on it), so moving the cursor onto/off the line must re-wrap even
+        // though the underlying bytes are unchanged.
         let h = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             text.hash(&mut hasher);
+            spans.hash(&mut hasher);
             hasher.finish()
         };
         let dirty = {
@@ -175,7 +200,7 @@ impl WrapMap {
         };
         if dirty {
             let mut new_w =
-                compute_wraps(&text, self.char_width, self.width, self.enabled, scale);
+                compute_wraps(&text, self.char_width, self.width, self.enabled, scale, spans);
             new_w.text_hash = h;
             self.lines[line] = new_w;
         }
@@ -198,12 +223,20 @@ impl WrapMap {
 /// a single VLine spanning the whole text. `scale` scales the effective
 /// char width up (heading lines render larger than the base monospace cell,
 /// so they fit fewer characters per visual row).
+///
+/// `spans` describes ranges whose rendered width differs from their raw char
+/// count (live-preview hidden markers / replaced glyphs); see [`VisualSpan`].
+/// Each is counted as `cols` visible columns and treated as an atomic unit so a
+/// break never lands inside one. `breaks`/`vlines` stay in *real* (source) byte
+/// coordinates regardless — the renderer slices the real line by these ranges
+/// and re-applies the decorations.
 pub fn compute_wraps(
     text: &str,
     char_width: f32,
     max_width: f32,
     enabled: bool,
     scale: f32,
+    spans: &[VisualSpan],
 ) -> WrappedLine {
     if !enabled || char_width <= 0.0 || max_width <= 0.0 {
         let mut vlines: SmallVec<[(u32, u32); 4]> = SmallVec::new();
@@ -219,31 +252,55 @@ pub fn compute_wraps(
     let scale = scale.max(0.01);
     let effective_cw = char_width * scale;
     let max_chars = ((max_width / effective_cw).floor() as usize).max(1);
-    let bytes = text.as_bytes();
+
+    // Visible columns of a span that starts exactly at byte `i`, plus the
+    // source byte length to advance — or `None` when `i` isn't a span start.
+    let span_at = |i: usize| -> Option<(usize, usize)> {
+        spans
+            .iter()
+            .find(|s| s.start as usize == i)
+            .map(|s| (s.cols as usize, (s.end - s.start) as usize))
+    };
+    // Visible columns in the real byte range [from, to) — char count, with each
+    // fully-contained span's source chars swapped for its `cols`. Used to
+    // re-tally the new row after a deferred (word-boundary) break.
+    let cols_in = |from: usize, to: usize| -> usize {
+        let mut c = text[from..to].chars().count();
+        for s in spans {
+            let (ss, se) = (s.start as usize, s.end as usize);
+            if ss >= from && se <= to {
+                c = c - text[ss..se].chars().count() + s.cols as usize;
+            }
+        }
+        c
+    };
+
     let mut breaks: SmallVec<[u32; 4]> = SmallVec::new();
     let mut vlines: SmallVec<[(u32, u32); 4]> = SmallVec::new();
-
     let mut row_start: usize = 0;
-    let mut row_char_count: usize = 0;
+    let mut row_cols: usize = 0;
     let mut last_space_byte: Option<usize> = None;
 
     let mut i = 0;
-    while i < bytes.len() {
+    while i < text.len() {
         if !text.is_char_boundary(i) {
             i += 1;
             continue;
         }
-        let ch = text[i..].chars().next().unwrap();
-        let ch_len = ch.len_utf8();
-
-        if ch == ' ' || ch == '\t' {
+        // A unit is either a whole atomic span or a single char.
+        let (unit_cols, unit_len, is_space) = match span_at(i) {
+            Some((cols, len)) => (cols, len, false),
+            None => {
+                let ch = text[i..].chars().next().unwrap();
+                (1, ch.len_utf8(), ch == ' ' || ch == '\t')
+            }
+        };
+        if is_space {
             last_space_byte = Some(i);
         }
-
-        if row_char_count + 1 > max_chars {
-            // Only consider a space-break that's BEFORE the current position;
-            // a space marked at this same `i` (we're currently sitting on it)
-            // can't be the break point since `sp + 1 > i`.
+        if row_cols + unit_cols > max_chars {
+            // Prefer the last space strictly before the current unit; otherwise
+            // hard-break right before it (never inside a span).
             let break_byte = match last_space_byte {
                 Some(sp) if sp >= row_start && sp < i => sp + 1,
                 _ => i,
@@ -252,20 +309,18 @@ pub fn compute_wraps(
                 vlines.push((row_start as u32, break_byte as u32));
                 breaks.push(break_byte as u32);
                 row_start = break_byte;
-                // Chars consumed so far on the new row (text[row_start..i] plus
-                // the current char we're about to count).
-                row_char_count = text[row_start..i].chars().count() + 1;
+                row_cols = cols_in(break_byte, i) + unit_cols;
                 last_space_byte = None;
             } else {
-                row_char_count += 1;
+                row_cols += unit_cols;
             }
         } else {
-            row_char_count += 1;
+            row_cols += unit_cols;
         }
-        i += ch_len;
+        i += unit_len;
     }
 
-    vlines.push((row_start as u32, bytes.len() as u32));
+    vlines.push((row_start as u32, text.len() as u32));
     if vlines.is_empty() {
         vlines.push((0, 0));
     }
@@ -279,19 +334,19 @@ mod tests {
 
     #[test]
     fn disabled_returns_single_vline() {
-        let w = compute_wraps("hello world this is long", 7.0, 50.0, false, 1.0);
+        let w = compute_wraps("hello world this is long", 7.0, 50.0, false, 1.0, &[]);
         assert_eq!(w.visual_count(), 1);
     }
 
     #[test]
     fn empty_line_one_vline() {
-        let w = compute_wraps("", 7.0, 100.0, true, 1.0);
+        let w = compute_wraps("", 7.0, 100.0, true, 1.0, &[]);
         assert_eq!(w.visual_count(), 1);
     }
 
     #[test]
     fn short_line_one_vline() {
-        let w = compute_wraps("hello", 7.0, 200.0, true, 1.0);
+        let w = compute_wraps("hello", 7.0, 200.0, true, 1.0, &[]);
         assert_eq!(w.visual_count(), 1);
         assert_eq!(w.vline_range(0), (0, 5));
     }
@@ -300,7 +355,7 @@ mod tests {
     fn wraps_at_word_boundary() {
         // 7px/char, 60px width → ~8 chars per line.
         // "hello world this is" → breaks at " world", " this", " is"
-        let w = compute_wraps("hello world this is", 7.0, 60.0, true, 1.0);
+        let w = compute_wraps("hello world this is", 7.0, 60.0, true, 1.0, &[]);
         assert!(w.visual_count() >= 2);
         // First VLine should end at the space after "hello" or similar.
         let (start, end) = w.vline_range(0);
@@ -312,13 +367,47 @@ mod tests {
     #[test]
     fn break_inside_long_word_when_no_space() {
         // "abcdefghij" with 4-char width → must break inside the word.
-        let w = compute_wraps("abcdefghij", 7.0, 28.0, true, 1.0);
+        let w = compute_wraps("abcdefghij", 7.0, 28.0, true, 1.0, &[]);
         assert!(w.visual_count() >= 2);
     }
 
     #[test]
+    fn hidden_span_does_not_consume_wrap_width() {
+        // A line whose visible text is short ("red") but whose source carries a
+        // long hidden color-span tag must NOT wrap: the hidden bytes contribute
+        // zero columns. 7px/char, 280px → 40 cols/row.
+        let src = "<span style=\"color:#2e5e3a\">red</span>";
+        let open_end = src.find('>').unwrap() + 1; // end of opening tag
+        let close_start = src.find("</span>").unwrap();
+        let spans = [
+            VisualSpan { start: 0, end: open_end as u32, cols: 0 },
+            VisualSpan { start: close_start as u32, end: src.len() as u32, cols: 0 },
+        ];
+        // Without span-awareness the 38-char source would exceed... actually fit
+        // 40 cols; shrink the width so the raw length WOULD wrap but the visible
+        // 3 cols don't. 280px/38chars vs a 70px width → 10 cols/row.
+        let raw = compute_wraps(src, 7.0, 70.0, true, 1.0, &[]);
+        let visible = compute_wraps(src, 7.0, 70.0, true, 1.0, &spans);
+        assert!(raw.visual_count() > 1, "raw source overflows the narrow width");
+        assert_eq!(visible.visual_count(), 1, "the 3 visible columns fit on one row");
+    }
+
+    #[test]
+    fn replaced_span_counts_display_columns() {
+        // A list marker `1234567. ` (9 source chars) rendered as `- ` (2 cols).
+        // Width = 6 cols/row. With the source counted it wraps; as 2 cols it
+        // fits with the following short word.
+        let src = "1234567. ab";
+        let spans = [VisualSpan { start: 0, end: 9, cols: 2 }];
+        let w = compute_wraps(src, 7.0, 42.0, true, 1.0, &spans);
+        // "- ab" == 4 visible cols ≤ 6 → single row, range covers the real bytes.
+        assert_eq!(w.visual_count(), 1);
+        assert_eq!(w.vline_range(0), (0, src.len()));
+    }
+
+    #[test]
     fn vline_at_byte_finds_correct_row() {
-        let w = compute_wraps("hello world this is", 7.0, 60.0, true, 1.0);
+        let w = compute_wraps("hello world this is", 7.0, 60.0, true, 1.0, &[]);
         // byte 0 is in vline 0 at local 0
         assert_eq!(w.vline_at_byte(0), (0, 0));
         // last byte should land in the final vline
@@ -332,8 +421,8 @@ mod tests {
         // 7px base char width, 280px max → 40 chars/row at scale 1.0.
         // Text is 21 chars: fits on one line at scale 1.0.
         // At scale=2.0 effective char width is 14px → 20 chars/row → needs to break.
-        let base = compute_wraps("abcdefghij klmnopqrst", 7.0, 280.0, true, 1.0);
-        let scaled = compute_wraps("abcdefghij klmnopqrst", 7.0, 280.0, true, 2.0);
+        let base = compute_wraps("abcdefghij klmnopqrst", 7.0, 280.0, true, 1.0, &[]);
+        let scaled = compute_wraps("abcdefghij klmnopqrst", 7.0, 280.0, true, 2.0, &[]);
         assert_eq!(base.visual_count(), 1, "base 1.0 scale fits on one line");
         assert!(
             scaled.visual_count() > base.visual_count(),
@@ -352,8 +441,8 @@ mod tests {
         map.set_width(280.0);
         map.set_char_width(7.0);
         let text = "abcdefghij klmnopqrst".to_string();
-        let one = map.get_or_compute(0, |_| text.clone(), 1.0).visual_count();
-        let two = map.get_or_compute(0, |_| text.clone(), 2.0).visual_count();
+        let one = map.get_or_compute(0, |_| text.clone(), 1.0, &[]).visual_count();
+        let two = map.get_or_compute(0, |_| text.clone(), 2.0, &[]).visual_count();
         assert_eq!(one, 1, "scale 1.0 single line");
         assert!(two > 1, "scale 2.0 should re-wrap into multiple vlines, got {two}");
     }

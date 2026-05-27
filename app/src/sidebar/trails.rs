@@ -98,8 +98,10 @@ pub(crate) fn render(&mut self) {
         .and_then(|t| t.buffer_path().map(str::to_string));
 
     let mut actions = TrailActions::default();
-    // "Drop here for start of trail" zone above the first card.
-    self.head_drop_zone(&mut actions);
+    // Reorder via drag-and-drop: dropping in a card's top edge band inserts
+    // before it (top band of the first card = trail head), the bottom edge
+    // band inserts after it (bottom band of the last card = trail tail), and
+    // the middle band nests as a child. See `resolve_drop` / `drop_band`.
     self.render_waypoints(
         &snapshot.1,
         cursor_path.as_deref(),
@@ -107,8 +109,6 @@ pub(crate) fn render(&mut self) {
         &mut Vec::new(),
         &mut actions,
     );
-    // "Drop here for end of trail" zone below the last card.
-    self.tail_drop_zone(&mut actions);
     self.apply_actions(&visible_id, actions);
 }
 
@@ -581,30 +581,6 @@ fn write_and_open_trail_doc(&mut self, trail_id: &str) {
     crate::editor_pane::open_file(state, &rel, false);
 }
 
-/// Drop strip above the first waypoint — releasing a dragged card here
-/// makes it the new head of the trail.
-fn head_drop_zone(&mut self, actions: &mut TrailActions) {
-    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 2));
-    let (_, payload) = self.ui.dnd_drop_zone::<String, _>(frame, |ui| {
-        ui.allocate_response(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-    });
-    if let Some(src) = payload {
-        actions.move_op = Some(((*src).clone(), crate::state::MoveOp::Head));
-    }
-}
-
-/// Drop strip below the last waypoint — releasing a dragged card here
-/// makes it the new tail of the trail.
-fn tail_drop_zone(&mut self, actions: &mut TrailActions) {
-    let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(0, 4));
-    let (_, payload) = self.ui.dnd_drop_zone::<String, _>(frame, |ui| {
-        ui.allocate_response(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
-    });
-    if let Some(src) = payload {
-        actions.move_op = Some(((*src).clone(), crate::state::MoveOp::Tail));
-    }
-}
-
 }
 
 // ===== free helpers =====
@@ -932,8 +908,11 @@ impl WaypointView<'_> {
     }
 
     /// Resolve a card's drop payload + whole-frame click into open/move
-    /// verbs. Top-half drops reorder before the card; bottom-half drops
-    /// nest under it. Self-drops are ignored.
+    /// verbs. The pointer's vertical band within the card decides placement
+    /// (`drop_band`): top edge inserts a sibling before, bottom edge a
+    /// sibling after, the middle nests as a child. While a drag hovers the
+    /// card, paints a single insertion-line (above/below) or outline (into)
+    /// so the target is visible before release. Self-drops are ignored.
     fn resolve_drop(
         &mut self,
         wp: &Waypoint,
@@ -942,16 +921,26 @@ impl WaypointView<'_> {
         exists: bool,
         actions: &mut TrailActions,
     ) {
+        let card_rect = drag_resp.rect;
+        let pointer_y = self
+            .ui
+            .input(|i| i.pointer.interact_pos())
+            .map(|p| p.y)
+            .unwrap_or(card_rect.center().y);
+        let band = drop_band(pointer_y, card_rect.top(), card_rect.bottom());
+
+        // Live feedback while a waypoint is being dragged over this card.
+        let dragging =
+            egui::DragAndDrop::has_payload_of_type::<String>(self.ui.ctx());
+        if dragging && self.ui.rect_contains_pointer(card_rect) {
+            self.paint_drop_indicator(card_rect, band);
+        }
+
         if let Some(src) = drop_payload {
-            let card_rect = drag_resp.rect;
-            let pointer_y = self.ui
-                .input(|i| i.pointer.interact_pos())
-                .map(|p| p.y)
-                .unwrap_or(card_rect.center().y);
-            let op = if pointer_y < card_rect.center().y {
-                crate::state::MoveOp::Before(wp.path.clone())
-            } else {
-                crate::state::MoveOp::Child(wp.path.clone())
+            let op = match band {
+                DropBand::Above => crate::state::MoveOp::Before(wp.path.clone()),
+                DropBand::Below => crate::state::MoveOp::After(wp.path.clone()),
+                DropBand::Into => crate::state::MoveOp::Child(wp.path.clone()),
             };
             if (*src) != wp.path {
                 actions.move_op = Some(((*src).clone(), op));
@@ -959,6 +948,36 @@ impl WaypointView<'_> {
         }
         if exists && drag_resp.clicked() {
             actions.open = Some(wp.path.clone());
+        }
+    }
+
+    /// Paint the drag-target hint for `band` over `card_rect`: a horizontal
+    /// insertion line at the card's top or bottom edge for sibling drops, or
+    /// a full-card outline for a nest-as-child drop.
+    fn paint_drop_indicator(&self, card_rect: egui::Rect, band: DropBand) {
+        let painter = self.ui.painter();
+        let accent = theme::accent();
+        match band {
+            DropBand::Above | DropBand::Below => {
+                let y = if band == DropBand::Above {
+                    card_rect.top()
+                } else {
+                    card_rect.bottom()
+                };
+                painter.hline(
+                    card_rect.x_range(),
+                    y,
+                    egui::Stroke::new(2.0, accent),
+                );
+            }
+            DropBand::Into => {
+                painter.rect_stroke(
+                    card_rect,
+                    2.0,
+                    egui::Stroke::new(1.5, accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
         }
     }
 
@@ -1057,6 +1076,73 @@ fn descendant_count(waypoints: &[Waypoint], path: &str) -> usize {
         }
     }
     0
+}
+
+/// Where a drag-release over a waypoint card lands relative to that card.
+/// Decided purely from the pointer's vertical position within the row rect:
+/// the top edge band inserts the dragged waypoint as a sibling *before* the
+/// card, the bottom edge band as a sibling *after* it, and the wide middle
+/// band nests it as a child (side-trail re-parent). The above/below bands
+/// replace the old discrete head/tail drop strips — dropping in the top band
+/// of the first card lands at the trail head, the bottom band of the last
+/// card at the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropBand {
+    Above,
+    Into,
+    Below,
+}
+
+/// Fraction of a card's height claimed by each edge band (top/bottom). The
+/// middle `1 - 2*EDGE` is the nest-as-child zone. 0.3 keeps "above/below"
+/// the dominant gesture (the bug owner's ask) while leaving a comfortable
+/// central target for re-parenting into a side trail.
+const DROP_EDGE_FRACTION: f32 = 0.3;
+
+/// Decide the drop band from the pointer's y against a row rect. Pure so it
+/// can be unit-tested without an egui context. Degenerate (zero-height)
+/// rects fall back to a top/bottom split at the midpoint with no middle band.
+fn drop_band(pointer_y: f32, top: f32, bottom: f32) -> DropBand {
+    let height = bottom - top;
+    if height <= 0.0 {
+        return if pointer_y < top { DropBand::Above } else { DropBand::Below };
+    }
+    let edge = height * DROP_EDGE_FRACTION;
+    if pointer_y < top + edge {
+        DropBand::Above
+    } else if pointer_y > bottom - edge {
+        DropBand::Below
+    } else {
+        DropBand::Into
+    }
+}
+
+#[cfg(test)]
+mod drop_band_tests {
+    use super::{drop_band, DropBand};
+
+    // Row spanning y in [100, 200]; edge bands are the top/bottom 30px.
+    #[test]
+    fn top_edge_is_above() {
+        assert_eq!(drop_band(105.0, 100.0, 200.0), DropBand::Above);
+        assert_eq!(drop_band(129.0, 100.0, 200.0), DropBand::Above);
+    }
+    #[test]
+    fn bottom_edge_is_below() {
+        assert_eq!(drop_band(195.0, 100.0, 200.0), DropBand::Below);
+        assert_eq!(drop_band(171.0, 100.0, 200.0), DropBand::Below);
+    }
+    #[test]
+    fn middle_is_into() {
+        assert_eq!(drop_band(150.0, 100.0, 200.0), DropBand::Into);
+        assert_eq!(drop_band(131.0, 100.0, 200.0), DropBand::Into);
+        assert_eq!(drop_band(169.0, 100.0, 200.0), DropBand::Into);
+    }
+    #[test]
+    fn degenerate_rect_splits_at_top() {
+        assert_eq!(drop_band(99.0, 100.0, 100.0), DropBand::Above);
+        assert_eq!(drop_band(101.0, 100.0, 100.0), DropBand::Below);
+    }
 }
 
 /// Mirrors the legacy `removeWaypoint` flow: fetch the cascade size,

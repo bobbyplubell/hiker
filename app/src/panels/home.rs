@@ -4,12 +4,44 @@
 //! render inline).
 #![allow(clippy::items_after_test_module)]
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
+
+use hiker_core::activity::ChangeRow;
 
 use crate::editor_pane;
 use crate::state::AppState;
 use crate::tab::{HomeDetail, Tab, TabKind};
 use crate::theme;
+
+/// How long a cached snapshot-feed read stays fresh. The feed is a SQLite
+/// metadata query under the vault-wide op-log lock; running it every frame
+/// (the home tab repaints continuously) was a visible lag source. Snapshots
+/// only change on accept / commit / rollback, so a sub-second refresh is
+/// imperceptible while cutting ~59 of every 60 queries.
+const SNAPSHOT_REFRESH: Duration = Duration::from_millis(750);
+
+/// Per-tab local state for the Home surface. Currently just the throttled
+/// snapshot-feed cache (see [`SNAPSHOT_REFRESH`]).
+#[derive(Default)]
+pub struct State {
+    snapshots: Option<SnapshotCache>,
+}
+
+struct SnapshotCache {
+    limit: usize,
+    fetched_at: Instant,
+    rows: Vec<ChangeRow>,
+}
+
+impl State {
+    /// Invalidate the cache so the next frame re-reads the feed — call after an
+    /// action that changes the snapshot list (e.g. a rollback).
+    pub fn invalidate_snapshots(&mut self) {
+        self.snapshots = None;
+    }
+}
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Home");
@@ -121,13 +153,13 @@ pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
 }
 
 impl AppState {
-    /// Render every changes-log entry touching `path`, newest-first. Each
-    /// row shows timestamp, author, action, and the content hash so the
-    /// user can see what changed between versions.
+    /// Render every accepted op touching `path`, newest-first. Each row
+    /// shows timestamp, author, and action so the user can see what
+    /// changed between versions.
     fn render_path_history(&mut self, ui: &mut egui::Ui, path: &str) {
     let app = self;
-    let changes = app.vault_session.services.changes.clone();
-    let rows = match changes.history_for_path(path, 200) {
+    let log = app.vault_session.services.oplog.clone();
+    let rows = match hiker_core::ops::op_writes::path_history(log.as_ref(), path, 200) {
         Ok(v) => v,
         Err(err) => {
             ui.label(
@@ -161,7 +193,7 @@ impl AppState {
         .id_salt(("home-activity-history", path.to_string()))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for row in &rows {
+            for (i, row) in rows.iter().enumerate() {
                 egui::Frame::default()
                     .fill(theme::active_bg())
                     .inner_margin(egui::Margin::symmetric(6, 4))
@@ -173,16 +205,17 @@ impl AppState {
                                     .monospace(),
                             );
                             ui.label(
-                                egui::RichText::new(&row.author)
+                                egui::RichText::new(row.author.as_wire())
                                     .small()
                                     .color(theme::muted()),
                             );
                             ui.label(
-                                egui::RichText::new(format!("{:?}", row.op))
+                                egui::RichText::new(&row.op_kind)
                                     .small()
                                     .strong(),
                             );
-                            if row.is_current {
+                            // Newest-first: index 0 is the on-disk version.
+                            if i == 0 {
                                 ui.label(
                                     egui::RichText::new("current")
                                         .small()
@@ -190,11 +223,7 @@ impl AppState {
                                 );
                             }
                         });
-                        let hash = row
-                            .content_hash
-                            .as_deref()
-                            .unwrap_or("(no hash)");
-                        let short = &hash[..hash.len().min(12)];
+                        let short = &row.op_id[..row.op_id.len().min(12)];
                         ui.label(
                             egui::RichText::new(short)
                                 .small()
@@ -208,9 +237,26 @@ impl AppState {
     }
 }
 
+/// Read the snapshot feed through the throttled cache: re-query only when the
+/// cache is empty, the requested `limit` changed, or it has gone stale (see
+/// [`SNAPSHOT_REFRESH`]). Returns owned rows (a cheap clone of a small list)
+/// so the caller can render + dispatch `&mut app` clicks without holding the
+/// panel-state borrow.
+fn snapshot_rows(app: &mut AppState, limit: usize) -> Result<Vec<ChangeRow>, String> {
+    let now = Instant::now();
+    let fresh = app.panels.home.snapshots.as_ref().is_some_and(|c| {
+        c.limit == limit && now.duration_since(c.fetched_at) < SNAPSHOT_REFRESH
+    });
+    if !fresh {
+        let feed = hiker_core::activity::AcceptedFeed::new(&app.vault_session.services.oplog);
+        let rows = feed.recent(limit).map_err(|e| e.to_string())?;
+        app.panels.home.snapshots = Some(SnapshotCache { limit, fetched_at: now, rows });
+    }
+    Ok(app.panels.home.snapshots.as_ref().map(|c| c.rows.clone()).unwrap_or_default())
+}
+
 fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
-    let changes = app.vault_session.services.changes.clone();
-    let rows = match changes.recent(limit) {
+    let rows = match snapshot_rows(app, limit) {
         Ok(v) => v,
         Err(err) => {
             ui.label(
@@ -235,86 +281,81 @@ fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
         .max_height(220.0)
         .show(ui, |ui| {
             for row in rows {
+                // The op-log projection carries the ulid `op_id` in
+                // `metadata` (the `id` field holds `timestamp_ms`).
+                let Some(op_id) = row
+                    .metadata
+                    .get("op_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
                 let ts = format_timestamp(row.timestamp_ms);
-                let label = format!("{}  #{}  {}", ts, row.id, row.path);
+                let short = &op_id[..op_id.len().min(8)];
+                let label = format!("{}  {}  {}", ts, short, row.path);
                 if ui
                     .selectable_label(false, label)
                     .on_hover_text("Open snapshot preview")
                     .clicked()
                 {
-                    app.open_snapshot(&row.path, row.id);
+                    app.open_snapshot(&row.path, &op_id);
                 }
             }
         });
 }
 
 impl AppState {
-    fn open_snapshot(&mut self, path: &str, change_id: i64) {
+    fn open_snapshot(&mut self, path: &str, op_id: &str) {
         use crate::tab::{Tab, TabKind};
         let id = self.next_tab_id();
         self.session.tabs.push(Tab {
             id,
-            kind: TabKind::snapshot_preview(path.to_string(), change_id.to_string()),
+            kind: TabKind::snapshot_preview(path.to_string(), op_id.to_string()),
             sticky: true,
         });
         self.session.active_tab = Some(id);
     }
 }
 
-/// Roll a file back to the content of the most recent change before
-/// `change_id`. Mirrors the legacy `rollback_change` command: pulls
-/// the prior bytes from `changes.previous_content_for_path`, writes them
-/// to disk via the drift-aware `write_file_checked`, and appends a new
-/// change row stamped with `rolled_back_from`.
+/// Roll a file back to the content of its previous accepted version.
+/// Pulls the prior content from `previous_accepted_content` and writes it
+/// through the op log via `user_save` — a fresh `user` op that becomes the
+/// newest accepted version (the original op stays in the log).
 impl AppState {
-    pub(crate) fn rollback_change(&mut self, path: &str, change_id: i64) {
+    pub(crate) fn rollback_change(&mut self, path: &str) {
     use crate::state::ToastLevel;
     let app = self;
-    let changes = app.vault_session.services.changes.clone();
-    let prior = match changes.previous_content_for_path(path, change_id) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            app.push_toast(
-                format!("No earlier version of {} on record", path),
-                ToastLevel::Error,
-            );
-            return;
-        }
-        Err(err) => {
-            app.push_toast(format!("Rollback lookup failed: {err}"), ToastLevel::Error);
-            return;
-        }
-    };
-    let prior_content = match String::from_utf8(prior.1) {
-        Ok(s) => s,
-        Err(err) => {
-            app.push_toast(format!("Rollback target not UTF-8: {err}"), ToastLevel::Error);
-            return;
-        }
-    };
-    let current_hash = match app.vault_session.vault.read_file(path) {
-        Ok(text) => hiker_core::hash_string(&text),
-        Err(_) => String::new(),
-    };
-    let new_hash = match app.vault_session.vault.write_file_checked(path, &current_hash, &prior_content) {
-        Ok(h) => h,
-        Err(err) => {
-            app.push_toast(format!("Rollback write failed: {err}"), ToastLevel::Error);
-            return;
-        }
-    };
-    if let Err(err) = changes.append(hiker_core::changes::ChangeAppend {
+    let log = app.vault_session.services.oplog.clone();
+    let prior =
+        match hiker_core::ops::op_writes::previous_accepted_content(log.as_ref(), path) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                app.push_toast(
+                    format!("No earlier version of {} on record", path),
+                    ToastLevel::Error,
+                );
+                return;
+            }
+            Err(err) => {
+                app.push_toast(format!("Rollback lookup failed: {err}"), ToastLevel::Error);
+                return;
+            }
+        };
+    let prior_content = prior.1;
+    if let Err(err) = hiker_core::ops::op_writes::user_save(
+        log.as_ref(),
+        &app.vault_session.vault,
         path,
-        op: hiker_core::changes::ChangeOp::Modified,
-        author: "user",
-        content_hash: Some(&new_hash),
-        content: Some(prior_content.as_bytes()),
-        rename_from: None,
-        metadata: serde_json::json!({"rolled_back_from": change_id}),
-    }) {
-        tracing::warn!(error = %err, "rollback: append changes row failed");
+        &prior_content,
+    ) {
+        app.push_toast(format!("Rollback write failed: {err}"), ToastLevel::Error);
+        return;
     }
     app.push_toast(format!("Rolled back {}", path), ToastLevel::Info);
+    // The accepted feed just changed — drop the throttled cache so the
+    // snapshots list reflects the rollback on the next frame.
+    app.panels.home.invalidate_snapshots();
     }
 }
 

@@ -18,7 +18,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     let abs = app.vault_session.vault_root.join(path);
     let meta = std::fs::metadata(&abs).ok();
 
-    // Indexer-backed metadata: pulled from the read store + changes db so we
+    // Indexer-backed metadata: pulled from the read store + op log so we
     // surface the same fields the legacy `note_properties` command did
     // (note id, content hash, indexed_at, embedder version, chunk count,
     // last_accessed_at, change count, skipped state). The read store may be
@@ -29,10 +29,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         .lock()
         .ok()
         .and_then(|s| s.note_properties(path).ok().flatten());
-    let change_count: Option<i64> = app
-        .vault_session.services.changes
-        .count_for_path(path)
-        .ok();
+    let change_count: Option<i64> = hiker_core::ops::op_writes::path_history(
+        &app.vault_session.services.oplog,
+        path,
+        usize::MAX,
+    )
+    .ok()
+    .map(|rows| rows.len() as i64);
 
     // Resolve buffer body or read from disk as a fallback.
     let body = match app.session.buffers.get(path) {

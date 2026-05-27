@@ -116,4 +116,41 @@ impl AppState {
         }
     }
     }
+
+    /// Create a new board via `core::board::create_board` (default columns,
+    /// `[boards] new_board_dir` placement) and open it in the board view.
+    /// The cross-type new-item picker (`sidebar-new-item-button`) routes
+    /// here. Runs synchronously on the frame's tokio runtime.
+    ///
+    /// status: board-create
+    pub fn new_board(&mut self) {
+        let state = self;
+        let watcher = state.vault_session.services.watcher.clone();
+        let jobs = state.vault_session.services.indexer.job_sender();
+        let vault = state.vault_session.vault.clone();
+        let cfg = state
+            .vault_session
+            .config
+            .read()
+            .map(|c| c.boards.clone())
+            .unwrap_or_default();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            state.push_toast("New board failed: no runtime", ToastLevel::Error);
+            return;
+        };
+        let result = handle
+            .block_on(async { hiker_core::boards::ops::create_board(&watcher, &jobs, &vault, &cfg, "new-board").await });
+        match result {
+            Ok(outcome) => {
+                state.session.sidebar.dir_cache.clear();
+                // Open in the board view with inline-rename active so the
+                // user names it before submitting (mirrors new-trail /
+                // new-file). status: board-create
+                crate::panels::board::open_for_rename(state, &outcome.board_doc_rel);
+            }
+            Err(err) => {
+                state.push_toast(format!("New board failed: {err}"), ToastLevel::Error);
+            }
+        }
+    }
 }

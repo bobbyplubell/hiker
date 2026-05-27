@@ -34,7 +34,7 @@ impl CompletionSource for FakeSource {
 }
 
 fn drive(state: &mut EditorState, view: &mut ViewState, ev: &InputEvent) {
-    if let Action::Replace(next) = command::handle(state, view, ev) {
+    if let Action::Replace { state: next, .. } = command::handle(state, view, ev) {
         *state = next;
     }
 }

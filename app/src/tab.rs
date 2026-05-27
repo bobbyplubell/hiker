@@ -7,7 +7,7 @@
 //!
 //! The `Editor` variant is the only buffer-backed kind: it carries a
 //! `BufferSource` (what's *in* the editor — a vault file, a snapshot blob,
-//! a staging proposal, or a trash entry) plus an optional `DiffSource`
+//! a pending proposal, or a trash entry) plus an optional `DiffSource`
 //! (the comparison target when diff mode is active). Diff is a mode of
 //! this tab, not a separate kind.
 
@@ -50,10 +50,11 @@ pub struct Tab {
 pub enum BufferSource {
     /// Vault file — editable, dirty-tracked, autosaved.
     Vault { path: String },
-    /// Historical snapshot from `changes.db` — read-only.
-    Snapshot { path: String, change_id: String },
-    /// Staging proposal content — read-only.
-    StagingProposal { proposal_id: String, target_path: String },
+    /// Historical version materialized from the op log — read-only.
+    /// `op_id` is the accepted op (ulid) the content is reconstructed at.
+    Snapshot { path: String, op_id: String },
+    /// Pending op-log proposal content — read-only.
+    PendingProposal { proposal_id: String, target_path: String },
     /// Trash entry — read-only.
     Trash { trash_path: String, original_path: String },
 }
@@ -65,7 +66,7 @@ impl BufferSource {
         match self {
             BufferSource::Vault { path } => path,
             BufferSource::Snapshot { path, .. } => path,
-            BufferSource::StagingProposal { target_path, .. } => target_path,
+            BufferSource::PendingProposal { target_path, .. } => target_path,
             BufferSource::Trash { original_path, .. } => original_path,
         }
     }
@@ -80,11 +81,12 @@ pub enum DiffSource {
     Disk { path: String },
     /// Another open buffer's live text.
     LiveBuffer { path: String },
-    /// `changes.db` row content (`content_at(change_id)`); `path` is the
-    /// vault-relative path the change touched, retained for restore.
-    ChangesDb { change_id: String, path: String },
-    /// Staging proposal's stored before-text or content.
-    StagingProposal { proposal_id: String },
+    /// A historical version's content materialized from the op log
+    /// (`content_at_op(path, op_id)`); `path` is the vault-relative path
+    /// the op touched, retained for restore.
+    HistoryVersion { op_id: String, path: String },
+    /// Pending op-log proposal's stored before-text or content.
+    PendingProposal { proposal_id: String },
     /// Trashed file content.
     Trash { trash_path: String },
     /// Empty rope (e.g. comparing a new-note proposal against "no file").
@@ -108,6 +110,13 @@ pub enum TabKind {
     Properties { path: String },
     /// Vault-wide graph view (deferred — placeholder for v1).
     Graph,
+    /// Board: a per-doc kanban view over a curated board-doc at `path`.
+    /// Columns + card refs come from the board-doc frontmatter; a card move
+    /// rewrites that frontmatter via the op-log. Per-doc (like the cluster
+    /// tabs), not a singleton. See `docs/kanban.md`.
+    ///
+    /// status: board-view
+    Board { path: String },
     /// Chat session as a full tab (vs. docked at bottom of discovery).
     Agent { session_id: String },
     /// Patch review: lists pending staging proposals with accept/reject.
@@ -116,9 +125,11 @@ pub enum TabKind {
     Plugins,
     /// Indexer detail / control: model id, status, reindex.
     IndexerDetail,
-    /// Unified activity / changes feed: every pending staging proposal
-    /// plus every committed `changes.db` row, with author + op + source
-    /// filter chips.
+    /// Sync detail / control: device fingerprint, enrollment, force-sync,
+    /// discovery, recent synced items.
+    Sync,
+    /// Unified activity / changes feed: every pending op-log proposal
+    /// plus every accepted op, with author + op + source filter chips.
     Changes,
     /// Cluster Review tab: two-phase preview-then-persist for a fresh
     /// cluster build over the vault. Payload is the build configuration;
@@ -132,7 +143,7 @@ pub enum TabKind {
 #[derive(Debug, Clone)]
 pub enum HomeDetail {
     Snapshots,
-    /// Per-row version history view: lists every changes-log entry that
+    /// Per-row version history view: lists every accepted op that
     /// touched the given vault-relative path, newest first.
     ActivityRow { path: String },
 }
@@ -147,23 +158,23 @@ impl TabKind {
     }
 
     /// Construct a snapshot-preview editor tab. The buffer holds the
-    /// snapshot's content read-only; the diff layer shows how the
-    /// snapshot differs from the current on-disk text of the same path.
-    pub fn snapshot_preview(path: impl Into<String>, change_id: impl Into<String>) -> Self {
+    /// version's content read-only; the diff layer shows how the
+    /// version differs from the current on-disk text of the same path.
+    pub fn snapshot_preview(path: impl Into<String>, op_id: impl Into<String>) -> Self {
         let p = path.into();
         TabKind::Editor {
-            buffer: BufferSource::Snapshot { path: p.clone(), change_id: change_id.into() },
+            buffer: BufferSource::Snapshot { path: p.clone(), op_id: op_id.into() },
             diff: Some(DiffSource::Disk { path: p }),
         }
     }
 
-    /// Construct a staging-proposal review tab. The buffer holds the
+    /// Construct a pending-proposal review tab. The buffer holds the
     /// proposed full-file content read-only; the diff layer shows how it
     /// would change the current on-disk text of the target path.
-    pub fn staging_preview(proposal_id: impl Into<String>, target_path: impl Into<String>) -> Self {
+    pub fn pending_preview(proposal_id: impl Into<String>, target_path: impl Into<String>) -> Self {
         let t = target_path.into();
         TabKind::Editor {
-            buffer: BufferSource::StagingProposal {
+            buffer: BufferSource::PendingProposal {
                 proposal_id: proposal_id.into(),
                 target_path: t.clone(),
             },
@@ -198,7 +209,7 @@ impl TabKind {
                 BufferSource::Snapshot { path, .. } => {
                     format!("Snapshot · {}", path_basename(path))
                 }
-                BufferSource::StagingProposal { target_path, .. } => {
+                BufferSource::PendingProposal { target_path, .. } => {
                     format!("Staging · {}", path_basename(target_path))
                 }
                 BufferSource::Trash { original_path, .. } => {
@@ -219,10 +230,12 @@ impl TabKind {
             TabKind::Settings => "Settings".to_string(),
             TabKind::Properties { path } => format!("Properties · {}", path_basename(path)),
             TabKind::Graph => "Graph".to_string(),
+            TabKind::Board { path } => format!("Board · {}", path_basename(path)),
             TabKind::Agent { .. } => "Chat".to_string(),
             TabKind::PatchReview => "Patch review".to_string(),
             TabKind::Plugins => "Plugins".to_string(),
             TabKind::IndexerDetail => "Index".to_string(),
+            TabKind::Sync => "Sync".to_string(),
             TabKind::Changes => "Changes".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
@@ -238,7 +251,7 @@ impl TabKind {
             TabKind::Editor { buffer, .. } => match buffer {
                 BufferSource::Vault { .. } => icons::ICONS.image(crate::icons::Icon::File),
                 BufferSource::Snapshot { .. } => icons::ICONS.image(crate::icons::Icon::Clock),
-                BufferSource::StagingProposal { .. } => icons::ICONS.image(crate::icons::Icon::Edit),
+                BufferSource::PendingProposal { .. } => icons::ICONS.image(crate::icons::Icon::Edit),
                 BufferSource::Trash { .. } => icons::ICONS.image(crate::icons::Icon::Trash),
             },
             TabKind::Home => icons::ICONS.image(crate::icons::Icon::Home),
@@ -248,10 +261,14 @@ impl TabKind {
             TabKind::Settings => icons::ICONS.image(crate::icons::Icon::Settings),
             TabKind::Properties { .. } => icons::ICONS.image(crate::icons::Icon::Info),
             TabKind::Graph => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::Board { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
             TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
             TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
             TabKind::Plugins => icons::ICONS.image(crate::icons::Icon::Plugin),
             TabKind::IndexerDetail => icons::ICONS.image(crate::icons::Icon::Compass),
+            // No dedicated sync glyph in the icon set; `Restore` is the
+            // circular-arrow "refresh" mark, the closest fit for sync.
+            TabKind::Sync => icons::ICONS.image(crate::icons::Icon::Restore),
             TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
@@ -289,9 +306,15 @@ impl Tab {
             TabKind::Queue => (":queue".into(), "queue".into()),
             TabKind::Settings => (":settings".into(), "settings".into()),
             TabKind::Graph => (":graph".into(), "graph".into()),
+            // Board tabs are per-doc: persist the board-doc path so the
+            // tab reopens in board view on restore (the "board:" prefix
+            // disambiguates from a plain buffer tab on the same path).
+            // status: board-view
+            TabKind::Board { path } => (format!("board:{path}"), "board".into()),
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
             TabKind::Plugins => (":plugins".into(), "plugins".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
+            TabKind::Sync => (":sync".into(), "sync".into()),
             TabKind::Changes => (":changes".into(), "changes".into()),
             // Variants intentionally skipped: HomeDetail, non-Vault Editor
             // buffers, Editor tabs with diff active, QueueDetail,

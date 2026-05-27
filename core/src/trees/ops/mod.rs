@@ -2,8 +2,8 @@
 //! contains `impl Db` methods grouped by their op family, one file per
 //! family.
 //!
-//! All SQL goes through the helpers re-exported by `super::storage`; no
-//! file in this directory imports `rusqlite::*` directly.
+//! Every op composes the in-memory `TreeDoc` helpers + `Db::mutate` from
+//! `super::store`; no file in this directory talks to disk directly.
 //!
 //! The Rollup and Summarize-sweep ops live in this module root rather than
 //! in their own files: they are forward-looking ops-framework code with no

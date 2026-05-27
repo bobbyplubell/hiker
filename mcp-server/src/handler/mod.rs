@@ -4,11 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use hiker_core::changes::Changes;
 use hiker_core::config::sections::McpConfig;
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
-use hiker_core::staging::Staging;
 use hiker_core::store::Store;
 use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::vault::Vault;
@@ -33,7 +31,6 @@ pub struct HikerState {
     pub read_store: Arc<Mutex<Store>>,
     pub jobs: IndexJobTx,
     pub watcher: Arc<Watcher>,
-    pub changes: Arc<Changes>,
     pub embedder_provider: Arc<dyn Fn() -> Option<Arc<dyn Embedder>> + Send + Sync>,
     pub config: McpConfig,
     /// status: mcp-tool-toggles
@@ -42,13 +39,13 @@ pub struct HikerState {
     /// `set_setting` command swaps the contents in place so flips in
     /// the settings UI apply without a vault restart.
     pub tools: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
-    /// Shared staging instance for proposal-based writes (see
-    /// docs/settings.md "## Staging review"). When `[mcp.tools]
-    /// .review_required` is true, write tools route through
-    /// `staging.propose()`.
+    /// The vault's op log, when open. Agent write tools route their edits
+    /// into the pending queue here via `core::ops::op_writes`
+    /// (`op-log-ops-producer-helpers`). Review-mode writes stage a pending
+    /// op the user accepts/rejects in the hiker UI.
     ///
     /// status: staging-review-pending-response
-    pub staging: Arc<Staging>,
+    pub oplog: Option<Arc<hiker_core::oplog::OpLog>>,
     pub audit: Arc<Log>,
     /// Shared task queue. When `[mcp] enabled`, the `task_*` tools are
     /// advertised; the queue itself lives in the UI layer and is plumbed
@@ -98,9 +95,10 @@ impl ServerHandler for App {
                  Write: write_note, edit_note, set_frontmatter, apply_tag, remove_tag. \
                  Review mode: when the server is configured with review_required = true, write tools STAGE a \
                  proposal instead of writing to disk — the response carries `status: \"staged\"` and a \
-                 `staging_id`, and the affected file will NOT be readable via get_note until the user accepts \
-                 the proposal in the hiker UI. If a write returns staged and a follow-up get_note returns \
-                 1002 not_found, that is expected; the write is pending human review, not lost.",
+                 `staging_id`. A follow-up get_note reflects your own staged edits (you read your pending \
+                 replica), but the change does not reach disk for the user until they accept the proposal in \
+                 the hiker UI. A brand-new note that does not yet exist on disk still returns 1002 not_found \
+                 from get_note until accepted; that is expected, the write is pending human review, not lost.",
             )
     }
 }

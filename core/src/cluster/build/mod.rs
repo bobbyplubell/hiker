@@ -66,7 +66,7 @@ pub fn tree(
     })
 }
 
-/// Convenience: build a fresh tree and persist it into `trees.db`. The
+/// Convenience: build a fresh tree and persist it as a tree `.md`. The
 /// resulting `cluster_trees` row + `cluster_nodes` rows are written
 /// under one transaction (per `cluster-editor-draft-persistence` —
 /// every node is editable from the moment it lands). Returns the new

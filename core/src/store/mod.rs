@@ -15,7 +15,10 @@ pub mod dto;
 pub mod vec;
 
 mod notes;
+mod boards;
+mod centroids;
 mod chunks;
+mod metadata;
 mod search;
 mod trails;
 
@@ -58,7 +61,21 @@ use vec::read_chunk_vecs_dim;
 /// of the note's chunk embeddings — see `cluster-note-embeddings` in
 /// `clustering.md`). Cleared whenever the note's chunks change so it
 /// stays consistent with the live chunk-vecs table.
-pub const SCHEMA_VERSION: i32 = 7;
+///
+/// v8 added the `note_meta` derived metadata index (flattened
+/// frontmatter, one row per scalar / list element) backing structured
+/// `query_notes` queries over tags / lifecycle / author / arbitrary
+/// frontmatter fields. Re-derived from frontmatter on every ingest
+/// (mirrors `trail_waypoints`); cleared on skip / delete. See
+/// `docs/index.md` — `store-note-metadata-index`.
+///
+/// v9 added the `board_cards` derived index table (one row per card on a
+/// board) for fast `boards_containing_note(note)` and `cards_of(board)`
+/// lookups, plus the auto-update-on-move path. Re-derived from each
+/// board-doc's `hiker.columns` frontmatter on ingest (clear-by-board +
+/// re-insert), cleared on board-doc delete. See `docs/kanban.md`
+/// §"Indexer integration" — `board-cards-derived-table`.
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Default embedding dimension — matches the v1 default model
 /// (`bge-small-en-v1.5`). Used as the initial `chunk_vecs` column width on
@@ -197,6 +214,26 @@ impl Store {
             CREATE INDEX IF NOT EXISTS trail_waypoints_source_path     ON trail_waypoints(source_path);
             CREATE INDEX IF NOT EXISTS trail_waypoints_parent_waypoint ON trail_waypoints(parent_waypoint_id);
 
+            -- status: board-cards-derived-table
+            -- Derived index of board cards. Re-derived from each board-doc's
+            -- `hiker.columns` frontmatter on ingest (clear-by-board +
+            -- re-insert), cleared on board-doc delete. `card_note_id` may be
+            -- empty: a card may reference a source note that hasn't been
+            -- ingested (or stamped) yet. Rowid PK (no declared key) since a
+            -- board re-derive replaces the whole row set atomically.
+            CREATE TABLE IF NOT EXISTS board_cards (
+                board_id        TEXT NOT NULL,
+                board_path      TEXT NOT NULL,
+                card_note_id    TEXT NOT NULL DEFAULT '',
+                card_note_path  TEXT NOT NULL,
+                column_name     TEXT NOT NULL,
+                ordinal         INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS board_cards_board_id   ON board_cards(board_id);
+            CREATE INDEX IF NOT EXISTS board_cards_note_id    ON board_cards(card_note_id);
+            CREATE INDEX IF NOT EXISTS board_cards_note_path  ON board_cards(card_note_path);
+            CREATE INDEX IF NOT EXISTS board_cards_board_path ON board_cards(board_path);
+
             -- status: store-rebuild-chunk-vecs-on-dim-change
             -- Tiny key/value sidecar for store-wide metadata. Today the only
             -- key is `chunk_vecs_dim` (the live embedding dim, set by
@@ -210,6 +247,42 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- status: trees-centroids-index
+            -- Derived cluster-tree centroids. Cluster trees are per-tree
+            -- `.md` files (`trees-md-store`); their centroids (packed
+            -- little-endian f32) are a recomputable index cache kept here
+            -- rather than bloating the synced markdown. Keyed by
+            -- (tree_id, node_id); read by the placement classifier
+            -- (`cluster-place-beam-descent`). Added without a schema-version
+            -- bump — `CREATE TABLE IF NOT EXISTS` makes it forward-compatible
+            -- with older dbs (a missing centroid is recomputed from members).
+            CREATE TABLE IF NOT EXISTS cluster_centroids (
+                tree_id  TEXT NOT NULL,
+                node_id  TEXT NOT NULL,
+                centroid BLOB NOT NULL,
+                PRIMARY KEY (tree_id, node_id)
+            );
+
+            -- status: store-note-metadata-index
+            -- Derived per-note metadata index. Holds the note's frontmatter
+            -- flattened to (key, value) rows: nested maps use dotted keys
+            -- (`hiker.author`), list elements explode to one row each
+            -- (`tags` → N rows). `num` mirrors `value` for YAML numbers /
+            -- bools (NULL for strings) so range filters and numeric ordering
+            -- work without parsing text at query time. Re-derived from
+            -- frontmatter on every ingest (mirrors `trail_waypoints`);
+            -- cleared on skip / delete. Backs `query_notes` — structured
+            -- retrieval over tags / lifecycle / author / arbitrary fields.
+            CREATE TABLE IF NOT EXISTS note_meta (
+                note_id TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL,
+                num     REAL
+            );
+            CREATE INDEX IF NOT EXISTS note_meta_note      ON note_meta(note_id);
+            CREATE INDEX IF NOT EXISTS note_meta_key_value ON note_meta(key, value);
+            CREATE INDEX IF NOT EXISTS note_meta_key_num   ON note_meta(key, num);
             "#,
             dim = dim_arg,
         ))?;

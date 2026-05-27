@@ -14,7 +14,7 @@ fn wikilink_with_alias_emits_replace_and_mark_when_cursor_off_line() {
     let mut state = EditorState::new(src);
     // Cursor on line 0 — so line 1 (the wikilink) should be collapsed.
     state.selection = Selection::single(0);
-    let set = wikilink_decorations(&state, None, None);
+    let set = wikilink_decorations(&state, None, None, None);
 
     let link_start = src.find("[[").unwrap();
     let link_end = src.find("]]").unwrap() + 2;
@@ -48,11 +48,54 @@ fn wikilink_with_alias_emits_replace_and_mark_when_cursor_off_line() {
 }
 
 #[test]
+fn wikilink_with_resolver_emits_clickable_live_title_widget() {
+    use editor_md::links::WIKILINK_WIDGET_TAG;
+    let src = "intro line\nsee [[01HRX3ABCDEFGHJKMNPQRSTVWX|stale]] later\n";
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(0); // cursor off the link line
+    // Resolver returns the *current* title, ignoring the stored "stale".
+    let resolve = |target: &str| -> Option<String> {
+        (target == "01HRX3ABCDEFGHJKMNPQRSTVWX").then(|| "Live Title".to_string())
+    };
+    let set = wikilink_decorations(&state, None, None, Some(&resolve));
+    let link_start = src.find("[[").unwrap();
+    let widget = set.iter_overlapping(0..src.len()).find_map(|(range, d)| match d {
+        Decoration::InlineWidget { widget, .. } if range.start == link_start => Some(widget.clone()),
+        _ => None,
+    });
+    let widget = widget.expect("expected an InlineWidget pill for the resolved link");
+    assert!(widget.handles_click(), "wikilink pill must be clickable");
+    assert_eq!(widget.widget_id(), WIKILINK_WIDGET_TAG | link_start as u64);
+    let disp = widget.display().expect("pill renders as text");
+    assert_eq!(disp.text.as_str(), "Live Title", "live title overrides stored display");
+}
+
+#[test]
+fn wikilink_unresolved_target_renders_distinctly() {
+    use editor_md::links::COLOR_WIKILINK_UNRESOLVED;
+    let src = "x\nsee [[01HRX3ABCDEFGHJKMNPQRSTVWX|fallback]] end\n";
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(0);
+    let resolve = |_t: &str| -> Option<String> { None }; // nothing resolves
+    let set = wikilink_decorations(&state, None, None, Some(&resolve));
+    let link_start = src.find("[[").unwrap();
+    let disp = set
+        .iter_overlapping(0..src.len())
+        .find_map(|(range, d)| match d {
+            Decoration::InlineWidget { widget, .. } if range.start == link_start => widget.display(),
+            _ => None,
+        })
+        .expect("unresolved link still renders a pill");
+    assert_eq!(disp.text.as_str(), "fallback", "falls back to stored display");
+    assert_eq!(disp.fg, Some(COLOR_WIKILINK_UNRESOLVED), "unresolved uses the broken-link color");
+}
+
+#[test]
 fn wikilink_on_cursor_line_skips_replace() {
     let src = "see [[Target]] now\n";
     let mut state = EditorState::new(src);
     state.selection = Selection::single(0); // line 0 is the wikilink line
-    let set = wikilink_decorations(&state, None, None);
+    let set = wikilink_decorations(&state, None, None, None);
     let any_replace = set
         .iter_overlapping(0..src.len())
         .any(|(_, d)| matches!(d, Decoration::Replace { .. }));

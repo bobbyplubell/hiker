@@ -8,7 +8,7 @@ The headline decisions:
 - **Two mode toggles next to the input — semantic and lexical.** Both on by default = hybrid via reciprocal rank fusion. One on = single-source results, no fusion step. Both off = input disabled with a "pick a mode" hint; explicit failure beats silent fallback. State persists per-vault. [search-mode-toggles, search-modes-both-off-disabled, search-mode-state-persisted]
 - **Type-ahead with 250ms debounce.** Each keystroke advances an epoch number; in-flight queries that come back stamped stale get dropped before render. Same pattern the related-notes refresh already uses. [search-typeahead-debounce]
 - **SQLite FTS5 is the lexical backend, behind a swappable trait.** One database file, no second index lifecycle, no separate schema-version dance. Tantivy can swap in later as a single targeted change if ranking quality ever becomes a complaint — the engine trait is the seam. [search-engine-trait, search-fts5-lexical]
-- **Ctrl-Space focuses the search input on every platform.** Same on macOS — Cmd-Space is Spotlight; we don't take it. Opens the discovery panel if collapsed. The keybind registry overrides the CM6 default that would otherwise fire `startCompletion` inside the editor. [search-keybind-ctrl-space]
+- **Ctrl-Space focuses the search input on every platform.** Same on macOS — Cmd-Space is Spotlight; we don't take it. Opens the discovery panel if collapsed. The keybind registry takes precedence over the editor's own Ctrl-Space (start-autocomplete) binding inside the editor. [search-keybind-ctrl-space]
 
 
 ## Discovery panel
@@ -42,7 +42,7 @@ Behavior:
 - **Empty query** — search-results section not rendered; Related-notes takes the whole panel (identical to v1). [search-empty-collapses-results]
 - **Non-empty query** — both sections visible, both expanded by default. Chevron collapses either; state persists per-vault via `settings-write-back` (`settings-section-vault`). [search-section-collapsible]
 - **Section headers carry live counts.** "Search results (8)" updates as type-ahead returns; "Related notes (5)" updates on active-file change. Subtle in-section spinner while a query is in flight. [search-section-counts, search-loading-shimmer]
-- **Related stays bound to the active editor file** even when search is active. Searching is exploration, editing is anchored. Rebinding Related to the top search hit was considered and rejected — it muddies "what is this section about" and steals an affordance the user already relies on. [search-related-stays-bound]
+- **Related stays bound to the active editor file** even when search is active. Searching is exploration, editing is anchored. [search-related-stays-bound]
 
 The toggle button on the editor toolbar still flips the panel open/closed (existing `panel-toggle-buttons`); only the panel's contents change.
 
@@ -83,7 +83,7 @@ Anchored under the `Aa` toggle. Rows: [search-lexical-options]
 - **Prefix match** (default off) — rewrite each whitespace-separated query token to `token*` before FTS5's `MATCH` (so `auto` matches `automation`). FTS5 supports the prefix operator natively, so it's a query-string transform, no schema change. Default off keeps current exact-token matching to avoid silently changing precision. [search-lexical-prefix-match]
 - **Phrase mode** (default off) — wrap the entire query in double quotes before FTS5, forcing exact-phrase matching. When off, FTS5's standard implicit-AND token semantics apply. Mutually exclusive with prefix match in practice (FTS5 ignores `*` inside a quoted phrase); the menu doesn't enforce that — checking both just yields phrase semantics, with a subtle hint in the prefix-match row tooltip. [search-lexical-phrase-mode]
 
-Rejected for v2: a "stemming on/off" toggle. FTS5's tokenizer is configured at table-creation time; offering it as a per-query toggle would require a second FTS5 table with porter-stemmer tokenization, doubling write cost and on-disk size. If users actually want stemming, it's a one-line tokenizer change at schema bump, not a runtime knob.
+No stemming toggle: FTS5's tokenizer is fixed at table-creation time, so a per-query flip would need a second porter-stemmer FTS5 table (double write cost + disk). Stemming, if wanted, is a one-line tokenizer change at a schema bump, not a runtime knob.
 
 
 ### Semantic options menu
@@ -94,7 +94,7 @@ Anchored under the brain toggle. Rows: [search-semantic-options]
 - **Top-k override** (numeric input, 5–100, default 25, matches `PER_BACKEND_TOP_K`) — affects only the semantic side; lexical stays at 25. Enables a wider semantic net without touching the global budget. Capped at 100 to keep the panel responsive (sqlite-vec scan cost). [search-semantic-top-k-override]
 - **Recency bias** (radio `Off` / `Mild` / `Strong`, default Off) — fuses mtime-rank into the semantic score via the same RRF shape as cross-mode fusion: `score = 1/(k + sim_rank) + w · 1/(k + recency_rank)`, where `w` is `0.0` / `0.5` / `1.0` and `recency_rank` is the note's position sorted by `notes.mtime DESC`. Default Off — hiker doesn't otherwise privilege recent files in retrieval; recency boost should be a deliberate choice, not a silent default. [search-semantic-recency-bias]
 
-Rejected for v2: an embedder/model picker in this menu. Choosing an embedder is a vault-level decision tied to the existing embedding index — switching mid-session would invalidate every cached vector. That belongs in `embedder-config-section` (a config-file restart, with the existing reindex flow), not a per-query toggle.
+No embedder/model picker here: switching embedders invalidates every cached vector, so it's a vault-level decision in `embedder-config-section` (config + reindex), not a per-query toggle.
 
 
 ## Type-ahead
@@ -128,7 +128,7 @@ Cards are visually distinct from flat list rows: subtle bordered frame, small in
 
 ## Keyboard model
 
-- **Ctrl-Space** — focuses the search input; opens the discovery panel if collapsed. Same on macOS — we deliberately don't take Cmd-Space (Spotlight). Registers at document level (`keybind-registry` pattern) with precedence to win over CM6's default `Ctrl-Space → startCompletion` inside the editor. Hiker doesn't lean on autocomplete in v2; revisit if a wikilinks-completion feature ever needs the binding back. [search-keybind-ctrl-space]
+- **Ctrl-Space** — focuses the search input; opens the discovery panel if collapsed. Same on macOS — we deliberately don't take Cmd-Space (Spotlight). Registers at document level (`keybind-registry` pattern) with precedence to win over the editor's own `Ctrl-Space` (start-autocomplete) binding inside the editor. Hiker doesn't lean on autocomplete in v2; revisit if a wikilinks-completion feature ever needs the binding back. [search-keybind-ctrl-space]
 - **↑ / ↓** — moves the active result within whichever section has focus. ↑ at the top of Related jumps to the bottom of Search results; ↓ at the bottom of Search results jumps to the top of Related. Stops at the panel boundaries.
 - **Enter** — opens the focused result.
 - **Tab** — moves focus from input → search results → related → out of panel.
@@ -283,9 +283,9 @@ Slugs registered as `planned` so future work plugs in cleanly:
 
 ## Out of scope
 
-- **In-file find / replace.** That's a within-buffer affordance; CM6 has `@codemirror/search` for it. Different feature, different keybind (Cmd/Ctrl-F when it lands), no overlap with vault-wide search.
+- **In-file find / replace.** That's a within-buffer affordance the editor provides on its own. Different feature, different keybind (Cmd/Ctrl-F when it lands), no overlap with vault-wide search.
 - **Search-and-replace across the vault.** Destructive bulk edit is its own feature with its own confirmation/undo story. Search is read-only.
 - **Saved searches as durable infrastructure.** That's the collections feature in `design.md`'s auto-organization layer; this doc leaves the seam (`search-result-pin-as-collection`) and stops there.
-- **Highlighting matches inside the open editor.** Implementable via CM6 decorations, but it's a different surface (editor view) and a different cognitive model (where am I, vs. what's in the vault). Possibly worth doing later — not a v2 concern.
+- **Highlighting matches inside the open editor.** Implementable via editor decorations, but it's a different surface (editor view) and a different cognitive model (where am I, vs. what's in the vault). Possibly worth doing later — not a v2 concern.
 - **Query syntax** beyond what FTS5 natively understands. v2 passes the user's input straight to FTS5's `MATCH`, which already handles `"phrase queries"`, `term1 OR term2`, `NEAR()`, etc. We don't add a hiker-specific DSL on top.
 - **Single-row context-menu mutations** (right-click a result → delete this one note). The tree's context menu is the canonical place for per-note destructive actions; duplicating it in the discovery panel splits the mental model. *Bulk* actions across a whole result set or a multi-selected subset are explicitly *deferred*, not out of scope — see `search-bulk-action-tag` / `search-bulk-action-move` above.

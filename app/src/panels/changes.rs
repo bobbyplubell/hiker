@@ -1,15 +1,15 @@
-//! Unified activity / changes feed: every committed `changes.db` row plus
-//! every pending `staging.db` proposal, in one tab with author / source /
-//! op filter chips. Supersedes the old `agent_changes` tab (which was a
-//! strict subset filtered to `author LIKE 'agent:%'`) and absorbs the
-//! home-page "recent activity" widget so there's one canonical view.
+//! Unified activity / changes feed: every accepted op (committed change) plus
+//! every pending agent op, projected from the op log by `core::activity`, in
+//! one tab with author / source / op filter chips. Supersedes the old
+//! `agent_changes` tab (which was a strict subset filtered to
+//! `author LIKE 'agent:%'`) and absorbs the home-page "recent activity"
+//! widget so there's one canonical view.
 
 use eframe::egui;
 
 use hiker_core::activity::{
-    Filter, Payload, Source, Summary,
+    ChangeOp, Filter, Payload, Source, Summary,
 };
-use hiker_core::changes::ChangeOp;
 
 use crate::editor_pane;
 use crate::state::AppState;
@@ -18,7 +18,7 @@ use crate::theme;
 
 /// Author-side filter applied on top of the activity feed. `All` skips
 /// the predicate; the others narrow by the `author` column on change
-/// rows (staging rows match only when `Source::Pending` is in scope —
+/// rows (pending rows match only when `Source::PendingOnly` is in scope —
 /// they don't have a meaningful "author" beyond the producer surface).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorFilter {
@@ -26,6 +26,7 @@ pub enum AuthorFilter {
     User,
     Agent,
     Auto,
+    Sync,
 }
 
 impl AuthorFilter {
@@ -35,6 +36,7 @@ impl AuthorFilter {
             AuthorFilter::User => Some("user"),
             AuthorFilter::Agent => Some("agent:%"),
             AuthorFilter::Auto => Some("auto:%"),
+            AuthorFilter::Sync => Some("sync:%"),
         }
     }
     const fn label(self) -> &'static str {
@@ -43,6 +45,7 @@ impl AuthorFilter {
             AuthorFilter::User => "User",
             AuthorFilter::Agent => "Agent",
             AuthorFilter::Auto => "Auto",
+            AuthorFilter::Sync => "Synced",
         }
     }
 }
@@ -59,7 +62,7 @@ impl SourceFilter {
         match self {
             SourceFilter::All => Source::Merged,
             SourceFilter::Committed => Source::ChangesOnly,
-            SourceFilter::Pending => Source::StagingOnly,
+            SourceFilter::Pending => Source::PendingOnly,
         }
     }
     const fn label(self) -> &'static str {
@@ -123,10 +126,13 @@ impl Default for FilterState {
 /// renderer and the dispatcher (both `AppState` methods below) can share it.
 enum Action {
     Open(String),
-    Diff { path: String, change_id: String },
-    Inspect(String),
+    Diff { path: String, op_id: String },
+    /// Open the pending op's proposal-preview tab. `op_id` is the op-log
+    /// pending op id (the `PendingItem.id` the activity feed already carries);
+    /// `target_path` is its resolved vault-relative path.
+    Inspect { op_id: String, target_path: String },
     ViewHistory(String),
-    Rollback { path: String, change_id: i64 },
+    Rollback { path: String },
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
@@ -180,10 +186,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         .into_iter()
         .filter(|row| match &row.summary {
             Summary::Change { op } => filter_state.op.matches(*op),
-            // Staging rows don't have a `ChangeOp` — they show only when
+            // Pending rows don't have a `ChangeOp` — they show only when
             // the op filter is "All". Any narrower op picker excludes
             // them (you're asking for committed-op-X by definition).
-            Summary::Staging { .. } => matches!(filter_state.op, OpFilter::All),
+            Summary::Pending { .. } => matches!(filter_state.op, OpFilter::All),
         })
         .collect();
 
@@ -251,7 +257,7 @@ impl AppState {
                     ChangeOp::Renamed => egui::Color32::from_rgb(0x9a, 0x5f, 0x1f),
                 },
             ),
-            Summary::Staging { surface, action } => (
+            Summary::Pending { surface, action } => (
                 format!("staged · {surface}/{action}"),
                 theme::warn(),
             ),
@@ -260,9 +266,17 @@ impl AppState {
             egui::Color32::from_rgb(0x6a, 0x4f, 0x8f)
         } else if row.author.starts_with("auto:") {
             egui::Color32::from_rgb(0x5f, 0x7f, 0x5f)
+        } else if row.author.starts_with("sync:") {
+            theme::accent()
         } else {
             theme::muted()
         };
+        // Synced ops carry their origin device as `sync:<device>`. The op
+        // itself still renders as its real op above; this is provenance only.
+        let synced_from = row
+            .author
+            .strip_prefix("sync:")
+            .filter(|d| !d.is_empty());
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(ts).color(theme::muted()).small(),
@@ -280,43 +294,66 @@ impl AppState {
                     .small()
                     .strong(),
             );
+            if let Some(device) = synced_from {
+                // Prefer the local alias for the source device; fall back to a
+                // short fingerprint prefix when there's no service / no alias.
+                let label = self
+                    .vault_session
+                    .services
+                    .sync
+                    .as_ref()
+                    .and_then(|svc| svc.device_alias(device))
+                    .unwrap_or_else(|| short_fingerprint(device));
+                ui.label(
+                    egui::RichText::new(format!("synced from {label}"))
+                        .color(theme::accent())
+                        .small(),
+                );
+            }
             let open_resp = ui.small_button("Open");
             if open_resp.clicked() {
                 action = Some(Action::Open(row.path.clone()));
             }
             match &row.payload {
                 Payload::Change(c) => {
-                    if c.content_hash.is_some()
+                    // The ulid `op_id` lives in `metadata` (the `id` field
+                    // holds `timestamp_ms`); diff needs it to materialize the
+                    // version off the op log.
+                    let op_id = c
+                        .metadata
+                        .get("op_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(op_id) = op_id
                         && ui.small_button("View diff").clicked()
                     {
                         action = Some(Action::Diff {
                             path: row.path.clone(),
-                            change_id: c.id.to_string(),
+                            op_id,
                         });
                     }
                 }
-                Payload::Staging(s) => {
+                Payload::Pending(s) => {
                     if ui.small_button("Review").clicked() {
-                        action = Some(Action::Inspect(s.id.clone()));
+                        action = Some(Action::Inspect {
+                            op_id: s.id.clone(),
+                            target_path: s.target_path.clone(),
+                        });
                     }
                 }
             }
             let row_path = row.path.clone();
-            let rollback_target: Option<i64> = match &row.payload {
-                Payload::Change(c) => Some(c.id),
-                _ => None,
-            };
+            let is_change = matches!(&row.payload, Payload::Change(_));
             open_resp.context_menu(|ui| {
                 if ui.button("View history for this note").clicked() {
                     action = Some(Action::ViewHistory(row_path.clone()));
                     ui.close();
                 }
-                if let Some(change_id) = rollback_target
+                if is_change
                     && ui.button("Roll back to previous version").clicked()
                 {
                     action = Some(Action::Rollback {
                         path: row_path.clone(),
-                        change_id,
                     });
                     ui.close();
                 }
@@ -332,20 +369,20 @@ impl AppState {
             Action::Open(path) => {
                 editor_pane::open_file(self, &path, /* sticky */ true);
             }
-            Action::Diff { path, change_id } => {
+            Action::Diff { path, op_id } => {
                 if let Some(existing) = self.session.tabs.iter().find(|t| matches!(
                     &t.kind,
                     TabKind::Editor {
-                        buffer: crate::tab::BufferSource::Snapshot { path: p, change_id: c },
+                        buffer: crate::tab::BufferSource::Snapshot { path: p, op_id: c },
                         ..
-                    } if p == &path && c == &change_id
+                    } if p == &path && c == &op_id
                 )) {
                     self.session.active_tab = Some(existing.id);
                 } else {
                     let id = self.next_tab_id();
                     self.session.tabs.push(Tab {
                         id,
-                        kind: TabKind::snapshot_preview(path, change_id),
+                        kind: TabKind::snapshot_preview(path, op_id),
                         sticky: true,
                     });
                     self.session.active_tab = Some(id);
@@ -357,30 +394,26 @@ impl AppState {
                     crate::tab::HomeDetail::ActivityRow { path },
                 );
             }
-            Action::Rollback { path, change_id } => {
-                self.rollback_change(&path, change_id);
+            Action::Rollback { path } => {
+                self.rollback_change(&path);
             }
-            Action::Inspect(proposal_id) => {
-                // Walk the staging service so we can resolve the target
-                // path — staging IDs are opaque elsewhere in the UI.
-                let staging = self.vault_session.services.staging.clone();
-                if let Ok(list) = staging.list(&Default::default())
-                    && let Some(p) = list.into_iter().find(|p| p.id == proposal_id)
-                {
-                    let pid = p.id.clone();
-                    let target = p.target_path.clone();
-                    let pid_for_build = pid.clone();
-                    self.find_or_open_tab(
-                        |k| matches!(
-                            k,
-                            TabKind::Editor {
-                                buffer: crate::tab::BufferSource::StagingProposal { proposal_id: q, .. },
-                                ..
-                            } if *q == pid
-                        ),
-                        || TabKind::staging_preview(pid_for_build, target),
-                    );
-                }
+            Action::Inspect { op_id, target_path } => {
+                // The activity feed already resolves the op id + path off the
+                // op log (`PendingItem`), so the preview tab opens directly —
+                // no pending-store lookup. The proposal-preview buffer materializes
+                // through `op_writes::proposal_materializations`.
+                let pid = op_id.clone();
+                let pid_for_build = op_id.clone();
+                self.find_or_open_tab(
+                    |k| matches!(
+                        k,
+                        TabKind::Editor {
+                            buffer: crate::tab::BufferSource::PendingProposal { proposal_id: q, .. },
+                            ..
+                        } if *q == pid
+                    ),
+                    || TabKind::pending_preview(pid_for_build, target_path),
+                );
             }
         }
     }
@@ -410,6 +443,7 @@ impl FilterState {
                 AuthorFilter::User,
                 AuthorFilter::Agent,
                 AuthorFilter::Auto,
+                AuthorFilter::Sync,
             ],
             |a: AuthorFilter| a.label(),
         );
@@ -428,6 +462,19 @@ impl FilterState {
             |o: OpFilter| o.label(),
         );
     });
+    }
+}
+
+/// A short, human-glanceable form of a device fingerprint for provenance when
+/// no alias is set: the leading characters with an ellipsis. The full string is
+/// available elsewhere (the Sync page) for enrollment.
+fn short_fingerprint(fp: &str) -> String {
+    const HEAD: usize = 10;
+    if fp.chars().count() <= HEAD {
+        fp.to_string()
+    } else {
+        let head: String = fp.chars().take(HEAD).collect();
+        format!("{head}\u{2026}")
     }
 }
 

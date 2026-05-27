@@ -176,7 +176,7 @@ impl eframe::App for App {
             .push(fold_decorations(&self.state, &self.folds));
         self.view
             .decorations
-            .push(wikilink_decorations(&self.state, theme, None));
+            .push(wikilink_decorations(&self.state, theme, None, None));
         self.view
             .decorations
             .push(callout_decorations(&self.state, theme, None));

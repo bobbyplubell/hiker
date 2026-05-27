@@ -164,3 +164,76 @@ fn mermaid_block_emits_per_line_bg() {
         "non-mermaid fence should not be decorated"
     );
 }
+
+// ── highlight (`==text==`) + colored `<span>` live-preview rendering ────────
+
+#[test]
+fn highlight_marks_inner_and_hides_equals_off_cursor_line() {
+    let src = "first\nthis is ==marked== text\n";
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(0); // cursor on line 0, off the highlight
+    let set = editor_md::styling::markdown_decorations(&state, None);
+
+    let inner_start = src.find("marked").unwrap();
+    let inner_end = inner_start + "marked".len();
+    let mut has_bg = false;
+    let mut hidden_open = false;
+    let mut hidden_close = false;
+    for (range, dec) in set.iter_overlapping(0..src.len()) {
+        match dec {
+            Decoration::Mark(m)
+                if range.start == inner_start && range.end == inner_end && m.bg.is_some() =>
+            {
+                has_bg = true;
+            }
+            Decoration::Replace { display: None } if range.end == inner_start => hidden_open = true,
+            Decoration::Replace { display: None } if range.start == inner_end => hidden_close = true,
+            _ => {}
+        }
+    }
+    assert!(has_bg, "expected a highlight background over the inner text");
+    assert!(hidden_open && hidden_close, "expected both == markers hidden off the cursor line");
+}
+
+#[test]
+fn highlight_reveals_equals_on_cursor_line() {
+    let src = "this is ==marked== text\n";
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(src.find("marked").unwrap()); // cursor inside
+    let set = editor_md::styling::markdown_decorations(&state, None);
+    let any_hidden = set
+        .iter_overlapping(0..src.len())
+        .any(|(_, d)| matches!(d, Decoration::Replace { display: None }));
+    assert!(!any_hidden, "markers stay visible while the cursor is on the line");
+}
+
+#[test]
+fn highlight_inside_inline_code_is_ignored() {
+    let src = "a `==x==` b\n";
+    let state = EditorState::new(src);
+    let set = editor_md::styling::markdown_decorations(&state, None);
+    // The only Mark with a bg here should be the code background, never a
+    // highlight over `x` — the scan must skip code regions.
+    let highlight_over_x = set.iter_overlapping(0..src.len()).any(|(range, d)| {
+        matches!(d, Decoration::Mark(m) if m.bg.is_some())
+            && src.get(range.clone()) == Some("x")
+    });
+    assert!(!highlight_over_x, "highlight scan must skip inline code");
+}
+
+#[test]
+fn color_span_marks_inner_with_parsed_color() {
+    let src = "go <span style=\"color:#2e5e3a\">green</span> now\n";
+    let mut state = EditorState::new(src);
+    state.selection = Selection::single(0); // off the span line? same line; put at 0 (line 0)
+    let set = editor_md::styling::markdown_decorations(&state, None);
+    let inner_start = src.find("green").unwrap();
+    let inner_end = inner_start + "green".len();
+    let colored = set.iter_overlapping(0..src.len()).any(|(range, d)| {
+        matches!(d, Decoration::Mark(m)
+            if m.fg == Some(editor_core::decoration::Color::rgb(0x2e, 0x5e, 0x3a)))
+            && range.start == inner_start
+            && range.end == inner_end
+    });
+    assert!(colored, "expected the inner text colored with the span's hex");
+}

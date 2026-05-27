@@ -24,7 +24,7 @@ impl Document for PTab {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 enum PMode {
     Files,
     Search,
@@ -77,6 +77,40 @@ fn layout_round_trip_preserves_tabs() {
 
     // Panel tab is also restored.
     assert_eq!(wb2.panel_area.tab_count(), 1);
+}
+
+#[test]
+fn hidden_and_order_round_trip() {
+    let mut wb = Workbench::<PTab, PMode>::new();
+    wb.activity_bar.set_hidden(vec![PMode::Search]);
+    wb.activity_bar.set_order(vec![PMode::Search, PMode::Files]);
+
+    let json = serde_json::to_string(&wb.layout()).expect("serialise");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+    let layout2 = migrate(parsed).expect("migrate v1");
+
+    let mut wb2 = Workbench::<PTab, PMode>::new();
+    wb2.apply_layout(layout2).expect("apply layout");
+
+    assert!(wb2.activity_bar.is_hidden(&PMode::Search));
+    assert!(!wb2.activity_bar.is_hidden(&PMode::Files));
+    assert_eq!(wb2.activity_bar.order(), &[PMode::Search, PMode::Files]);
+}
+
+#[test]
+fn layout_without_visibility_fields_defaults_empty() {
+    // A pre-existing layout JSON omits the new fields; they must default
+    // rather than fail the migrate.
+    let mut wb = Workbench::<PTab, PMode>::new();
+    let mut value = serde_json::to_value(wb.layout()).expect("serialise");
+    let obj = value.as_object_mut().expect("object");
+    obj.remove("hidden_activities");
+    obj.remove("activity_order");
+
+    let layout = migrate(value).expect("migrate without visibility fields");
+    wb.apply_layout(layout).expect("apply layout");
+    assert!(wb.activity_bar.hidden().is_empty());
+    assert!(wb.activity_bar.order().is_empty());
 }
 
 #[test]

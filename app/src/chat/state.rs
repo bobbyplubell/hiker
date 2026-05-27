@@ -31,13 +31,13 @@ pub struct ToolCard {
     /// Some(_) once the tool returned; None while still in flight.
     pub result: Option<String>,
     pub ok: bool,
-    /// Pending staging proposal IDs surfaced by the tool result. Populated
-    /// when MCP runs in `review_required` mode and the response carries
-    /// `status: "staged"` + `staging_id` (write_note / set_frontmatter /
-    /// apply_tag / remove_tag) or `staging_ids` (edit_note). Drives the
-    /// Accept / Reject buttons rendered on the card per
-    /// `agent-write-review-mode`.
-    pub staging_ids: Vec<String>,
+    /// Whether this tool call produced a pending op-log write (a write/edit
+    /// tool that returned `status: "written"` or `"staged"`). The card's
+    /// Accept / Reject buttons resolve the live pending ops for `target_path`
+    /// off the op log at render time (`agent-write-review-mode`); read-only
+    /// tools (`search_notes`, `get_note`) leave this `false` so they never
+    /// surface review affordances even when they touch the same path.
+    pub produced_write: bool,
     /// Vault-relative path the tool acted on, sniffed from the result
     /// payload. Drives the header-click "open the affected note" UX from
     /// `ui/src/chat/toolCard.ts` (`TouchedNoteRouting`).
@@ -129,6 +129,11 @@ pub struct ChatRegistry {
     /// finishes/errors. Drives the chat panel's Stop button
     /// (`chat-panel-stop-button`).
     pub stop_signals: HashMap<String, StopSignal>,
+    /// Read-only editor instances backing markdown previews inside tool
+    /// cards, keyed by `session:turn:field`. Persisted here (not on the
+    /// cloned `ChatSession`/`ToolCard`) so each preview keeps its
+    /// measured content height and built decoration layer across frames.
+    pub md_previews: crate::chat::md_preview::Cache,
 }
 
 impl ChatRegistry {
@@ -141,6 +146,7 @@ impl ChatRegistry {
             rx: Mutex::new(rx),
             drafts: HashMap::new(),
             stop_signals: HashMap::new(),
+            md_previews: HashMap::new(),
         }
     }
 
@@ -207,30 +213,23 @@ mod sniff_tests {
     }
 
     #[test]
-    fn staging_ids_single() {
+    fn produced_write_true_for_written_and_staged() {
         let reg = ChatRegistry::default();
-        let v =
-            reg.sniff_staging_ids(r#"{"status":"staged","staging_id":"01HXAB"}"#);
-        assert_eq!(v, vec!["01HXAB".to_string()]);
+        // Direct mode (default): the edit staged into the op-log pending
+        // queue and the result reports `written` — the card should offer
+        // review.
+        assert!(reg.result_produced_write(r#"{"status":"written"}"#));
+        // Legacy review mode still reports `staged`.
+        assert!(reg.result_produced_write(r#"{"status":"staged","staging_id":"01HXAB"}"#));
     }
 
     #[test]
-    fn staging_ids_multiple_for_edit_note() {
+    fn produced_write_false_for_reads_and_garbage() {
         let reg = ChatRegistry::default();
-        let v = reg.sniff_staging_ids(
-            r#"{"status":"staged","staging_ids":["01A","01B","01C"]}"#,
-        );
-        assert_eq!(v, vec!["01A".to_string(), "01B".to_string(), "01C".to_string()]);
-    }
-
-    #[test]
-    fn staging_ids_empty_when_not_staged() {
-        let reg = ChatRegistry::default();
-        // status: "written" means the write went straight to disk; no
-        // proposal id should surface in the chat card.
-        assert!(reg.sniff_staging_ids(r#"{"status":"written"}"#).is_empty());
-        assert!(reg.sniff_staging_ids(r#"{"hits":[]}"#).is_empty());
-        assert!(reg.sniff_staging_ids("garbage").is_empty());
+        // Read-only tool results carry no write status.
+        assert!(!reg.result_produced_write(r#"{"hits":[]}"#));
+        assert!(!reg.result_produced_write("garbage"));
+        assert!(!reg.result_produced_write(""));
     }
 }
 
@@ -262,29 +261,23 @@ fn sniff_target_path_from_result(&self, result_json: &str) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-/// Extract staging proposal IDs from a write-shaped tool result. Looks
-/// for both `staging_id` (single, used by write_note / set_frontmatter
-/// / apply_tag / remove_tag) and `staging_ids` (array, used by
-/// edit_note when each patch hunk stages independently).
-fn sniff_staging_ids(&self, result_json: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Whether a tool result indicates the call produced a pending note-edit
+/// write. Write/edit tools (`write_note`, `edit_note`, `set_frontmatter`,
+/// `apply_tag`, `remove_tag`) return `status: "written"` (direct mode, which
+/// stages the edit into the op log's pending queue per
+/// `op-log-ops-producer-helpers`) or `status: "staged"` (legacy review mode).
+/// Read-only tools carry no such status, so this returns `false` and their
+/// cards never surface Accept / Reject. The actual op ids are resolved off the
+/// op log by `target_path` at render time — the result payload doesn't carry
+/// them, so this is just the "did this card write?" gate.
+fn result_produced_write(&self, result_json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(result_json) else {
-        return out;
+        return false;
     };
-    if v.get("status").and_then(|s| s.as_str()) != Some("staged") {
-        return out;
-    }
-    if let Some(arr) = v.get("staging_ids").and_then(|a| a.as_array()) {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                out.push(s.to_string());
-            }
-        }
-    }
-    if let Some(s) = v.get("staging_id").and_then(|s| s.as_str()) {
-        out.push(s.to_string());
-    }
-    out
+    matches!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("written" | "staged")
+    )
 }
 
 /// Drain the reply-event channel and fold each event into the
@@ -343,14 +336,14 @@ pub fn pump_events(&mut self) {
                             args,
                             result: None,
                             ok: true,
-                            staging_ids: Vec::new(),
+                            produced_write: false,
                             target_path,
                         }),
                     });
                 }
             }
             ChatEvent::ToolResult { session_id, name, ok, result } => {
-                let staging_ids = reg.sniff_staging_ids(&result);
+                let produced_write = reg.result_produced_write(&result);
                 let result_target = reg.sniff_target_path_from_result(&result);
                 if let Some(s) = reg.sessions.get_mut(&session_id) {
                     // Find the most-recent in-flight tool card matching
@@ -365,7 +358,7 @@ pub fn pump_events(&mut self) {
                         {
                             tool.result = Some(result.clone());
                             tool.ok = ok;
-                            tool.staging_ids = staging_ids.clone();
+                            tool.produced_write = produced_write;
                             if tool.target_path.is_none() {
                                 tool.target_path = result_target.clone();
                             }
@@ -382,7 +375,7 @@ pub fn pump_events(&mut self) {
                                 args: String::new(),
                                 result: Some(result),
                                 ok,
-                                staging_ids,
+                                produced_write,
                                 target_path: result_target,
                             }),
                         });

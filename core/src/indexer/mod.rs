@@ -207,9 +207,13 @@ pub struct Handle {
     /// empty — `core::trails::on_note_moved` handles the missing-watcher
     /// case as a best-effort no-suppress write.
     watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    /// Late-bound changelog reference. Same shape as `watcher_cell` —
-    /// optional so CLI / tests can run without a changelog.
-    changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>>,
+    /// Late-bound op-log handle. Filled by the host via `attach_oplog` after
+    /// both the indexer and the op log have opened. The file-lifecycle jobs
+    /// (`Move` / `MoveFolder` / `DeleteNote`) record the rename / tombstone in
+    /// the op log through this so the `doc-index.db` mapping follows the move
+    /// and the history feed sees deletes. CLI / tests without an op log leave
+    /// it empty and the jobs skip the op-log update.
+    oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
 }
 
 /// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
@@ -352,12 +356,12 @@ impl Handle {
         }
     }
 
-    /// Late-bind the changelog used by the trails auto-update path.
-    ///
-    /// status: trail-auto-update-on-note-move
-    pub fn attach_changes(&self, changes: Arc<crate::changes::Changes>) {
-        if self.changes_cell.set(changes).is_err() {
-            tracing::warn!("indexer: changes_cell already attached; ignoring");
+    /// Late-bind the op-log handle so the file-lifecycle jobs can record
+    /// renames / tombstones. The host calls this after both the indexer and
+    /// the op log have opened. Idempotent first-write-wins per `OnceCell`.
+    pub fn attach_oplog(&self, oplog: Arc<crate::oplog::OpLog>) {
+        if self.oplog_cell.set(oplog).is_err() {
+            tracing::warn!("indexer: oplog_cell already attached; ignoring");
         }
     }
 
@@ -439,7 +443,7 @@ where
     });
 
     let watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>> = Arc::new(OnceCell::new());
-    let changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>> = Arc::new(OnceCell::new());
+    let oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>> = Arc::new(OnceCell::new());
 
     let progress_for_task = progress_tx.clone();
     let pending_for_task = pending.clone();
@@ -453,7 +457,7 @@ where
         pending: pending.clone(),
     };
     let watcher_cell_for_task = watcher_cell.clone();
-    let changes_cell_for_task = changes_cell.clone();
+    let oplog_cell_for_task = oplog_cell.clone();
     let join = tokio::spawn(
         crate::indexer::scheduler::IndexerLoop {
             vault,
@@ -467,7 +471,7 @@ where
             embedder_cell: embedder_cell_for_task,
             self_tx,
             watcher_cell: watcher_cell_for_task,
-            changes_cell: changes_cell_for_task,
+            oplog_cell: oplog_cell_for_task,
             tasks,
         }
         .run(),
@@ -481,7 +485,7 @@ where
         pending,
         embedder: embedder_cell,
         watcher_cell,
-        changes_cell,
+        oplog_cell,
     }
 }
 

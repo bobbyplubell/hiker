@@ -1,20 +1,21 @@
-//! Cluster-tree storage. See `docs/cluster-editor.md` §"Tree storage:
-//! `trees.db`" and `docs/clustering.md` for the full spec.
+//! Cluster-tree store. See `docs/cluster-editor.md` §"Tree storage:
+//! per-tree `.md` files" and `docs/clustering.md` for the full spec.
 //!
-//! `core::trees` owns `vault/.hiker/trees.db` — a SQLite database with
-//! three tables (`cluster_trees`, `cluster_nodes`, `cluster_tree_history`).
-//! Mirrors the module-discipline pattern used by `core::store`,
-//! `core::staging`, and `core::changes`: every rusqlite import lives in
-//! the `storage` submodule, callers consume plain Rust types only. Pre-1.0
-//! schema policy is delete-on-bump (no migration code).
+//! `core::trees` owns the per-tree markdown documents under
+//! `vault/.hiker/trees/<tree-id>.md` (`trees-md-store`). The full structure
+//! lives in the `hiker` frontmatter; edits load the tree, mutate it in
+//! memory, and rewrite only the frontmatter fence through the op-log working
+//! layer — each edit lands as a `SetFrontmatter` op. Mirrors the
+//! module-discipline pattern of `core::trails`: all frontmatter
+//! (de)serialization stays behind this boundary, callers consume plain Rust
+//! types only. No SQLite, no schema-version file, no migration code.
 //!
 //! Submodule layout (per `trees-module-discipline`):
 //!
 //! - `types`         — public DTOs (`Db`, `EditableNode`, `NodeKind`, …)
-//! - `storage`       — rusqlite + schema + CRUD + SQL helpers (the **only**
-//!   submodule that imports `rusqlite::params` /
-//!   `OptionalExtension` / `Connection`)
-//! - `history`       — append/pop/read history + `record_*` helpers
+//! - `store`         — frontmatter load/serialize, the in-memory `TreeDoc`,
+//!   op-log writes, and the basic CRUD
+//! - `history`       — in-memory session undo/redo log + `record_*` helpers
 //! - `ops::edit`     — `rename` / `set_summary` / `set_policy` /
 //!   `auto_set_name_summary`
 //! - `ops::move_node`— `move_node` / `reparent_many` / `promote_outlier`
@@ -23,30 +24,34 @@
 //! - `ops::folder_rename` — `update_for_folder_rename`
 //! - `ops::split`    — `split_cluster` + recursive helper
 //! - `ops` (root)    — `plan_summarize_sweep` (Summarize sweep) +
-//!   `validate_rollup_inputs` / `apply_rollup` (Rollup); forward-looking
-//!   ops with no in-tree caller yet, so they stay in the module root per
-//!   `check-splits.py` rule #6 rather than in standalone files
+//!   `validate_rollup_inputs` / `apply_rollup` (Rollup)
 //!
-//! status: trees-db
-//! status: trees-db-schema
+//! status: trees-md-store
+//! status: trees-md-frontmatter
+//! status: trees-edit-setfrontmatter
 //! status: trees-module-discipline
 //! status: cluster-editor-tree-shape
 //! status: cluster-editor-edit-history
 
 pub mod history;
 pub mod ops;
-pub mod storage;
+pub mod store;
 pub mod types;
 
 
 #[cfg(test)]
 mod tests {
     use super::types::{Db, NodeInsert, NodeKind, NodePolicy, TreeInsert};
+    use crate::oplog::OpLog;
+    use crate::vault::Vault;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn open_tmp() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
-        let trees = Db::open(dir.path()).unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let oplog = Arc::new(OpLog::open(dir.path()).unwrap());
+        let trees = Db::new(oplog, vault).unwrap();
         (dir, trees)
     }
 
@@ -120,11 +125,127 @@ mod tests {
             .unwrap();
         let root = trees.get_node(&tree_id, "root").unwrap().unwrap();
         assert_eq!(root.kind, NodeKind::Cluster);
+        // Centroids round-trip through `index.db`'s `cluster_centroids`
+        // (`trees-centroids-index`), not the `.md` — `insert_nodes` persists
+        // them and `load` fills them back onto the hydrated node.
         assert_eq!(root.centroid.as_ref().unwrap().len(), 3);
         let kids = trees.children_of(&tree_id, Some("root")).unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].id, "leaf1");
         assert_eq!(kids[0].note_ref.as_deref(), Some("note-a"));
+    }
+
+    // Regression: deleting a tree then creating one at the same path must work.
+    // `delete_tree` tombstones the op-log doc but keeps the `path → doc_id`
+    // mapping, so the recreate resolves the tombstoned doc — the content write
+    // has to resurrect it or the `.md` is never written and `load` fails.
+    #[test]
+    fn recreate_tree_after_delete_at_same_path() {
+        let (_d, trees) = open_tmp();
+        let mk = || {
+            trees
+                .insert_tree(TreeInsert {
+                    id: Some("fixed-id".into()),
+                    name: "t".into(),
+                    source: "review:confirm".into(),
+                    state: "draft".into(),
+                    scope_json: "{}".into(),
+                    method_json: "{}".into(),
+                    vault_snapshot: None,
+                })
+                .unwrap()
+        };
+        let inserts = [NodeInsert {
+            node_id: "root".into(),
+            parent_id: None,
+            kind: NodeKind::Cluster,
+            note_id: None,
+            name: "Root".into(),
+            summary: String::new(),
+            user_edited_name: false,
+            user_edited_summary: false,
+            policy: None,
+            centroid: None,
+            confidence: 1.0,
+            summary_membership_churn: 0,
+        }];
+        let id = mk();
+        trees.insert_nodes(&id, &inserts).unwrap();
+        trees.delete_tree(&id).unwrap();
+        let id2 = mk();
+        trees.insert_nodes(&id2, &inserts).unwrap();
+        let nodes = trees
+            .list_nodes(&id2)
+            .unwrap_or_else(|e| panic!("list_nodes after recreate failed: {e}"));
+        assert_eq!(nodes.len(), 1);
+    }
+
+    // Regression: confirming a clustering run persists a tree, then the
+    // cluster sidebar re-lists it. With a realistic node count the two-step
+    // `insert_tree` (empty `nodes: []`) → `insert_nodes` (populated block)
+    // save exercised an op-log diff that produced overlapping spans and
+    // corrupted the frontmatter (`nodes:` lost its trailing newline), so the
+    // reload failed with `TreeNotFound` — surfaced as a "tree could not be
+    // found" toast right after Confirm. See `oplog::doc::multi_span_delta`.
+    #[test]
+    fn confirm_persists_tree_loadable_by_sidebar() {
+        let (_d, trees) = open_tmp();
+        // Mirror cluster_review::confirm: id:None (generated ULID).
+        let tree_id = trees
+            .insert_tree(TreeInsert {
+                id: None,
+                name: "Semantic · 2026-05-25 12:00".into(),
+                source: "review:confirm".into(),
+                state: "draft".into(),
+                scope_json: "{\"kind\":\"vault\"}".into(),
+                method_json: "{\"kind\":\"cluster\"}".into(),
+                vault_snapshot: None,
+            })
+            .unwrap();
+        let mut inserts = vec![NodeInsert {
+            node_id: "root".into(),
+            parent_id: None,
+            kind: NodeKind::Cluster,
+            note_id: None,
+            name: "Vault: notes & ideas".into(),
+            summary: String::new(),
+            user_edited_name: false,
+            user_edited_summary: false,
+            policy: None,
+            centroid: Some(vec![0.1, 0.2, 0.3]),
+            confidence: 1.0,
+            summary_membership_churn: 0,
+        }];
+        // A realistic clustering result has many nodes — the size that
+        // triggered the diff corruption.
+        for i in 0..80 {
+            inserts.push(NodeInsert {
+                node_id: format!("n{i}"),
+                parent_id: Some("root".into()),
+                kind: if i % 5 == 0 { NodeKind::Cluster } else { NodeKind::Leaf },
+                note_id: Some(format!("note-{i}")),
+                name: format!("Cluster #{i}: misc stuff and things"),
+                summary: format!("summary line {i}\nwith a second line: colon"),
+                user_edited_name: false,
+                user_edited_summary: false,
+                policy: None,
+                centroid: None,
+                confidence: 0.9,
+                summary_membership_churn: 0,
+            });
+        }
+        let want = inserts.len();
+        trees.insert_nodes(&tree_id, &inserts).unwrap();
+        // Mirror the sidebar hydrate: list_trees + list_nodes(selected).
+        let rows = trees.list_trees().unwrap();
+        assert!(
+            rows.iter().any(|r| r.id == tree_id),
+            "list_trees missing the just-created tree {tree_id}"
+        );
+        let nodes = trees
+            .list_nodes(&tree_id)
+            .unwrap_or_else(|e| panic!("list_nodes failed: {e}"));
+        assert_eq!(nodes.len(), want);
     }
 
     #[test]

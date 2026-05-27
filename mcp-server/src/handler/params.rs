@@ -174,6 +174,27 @@ pub struct ApplyTag {
     pub tag: String,
 }
 
+// ---------- board tool params (status: board-mcp-tools) ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardsList {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardGet {
+    /// Vault-relative path of the board-doc to fetch.
+    pub rel_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardAddCard {
+    /// Vault-relative path of the board-doc to add the card to.
+    pub board_rel_path: String,
+    /// Name of the column to append the card to.
+    pub column: String,
+    /// Vault-relative path of the note to add as a card.
+    pub source_rel_path: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorityParam {
@@ -532,6 +553,30 @@ impl Serialize for ApplyTag {
         let mut m = s.serialize_struct("ApplyTag", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("tag", &self.tag)?;
+        m.end()
+    }
+}
+impl Serialize for BoardsList {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        s.serialize_struct("BoardsList", 0)?.end()
+    }
+}
+impl Serialize for BoardGet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardGet", 1)?;
+        m.serialize_field("rel_path", &self.rel_path)?;
+        m.end()
+    }
+}
+impl Serialize for BoardAddCard {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardAddCard", 3)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("column", &self.column)?;
+        m.serialize_field("source_rel_path", &self.source_rel_path)?;
         m.end()
     }
 }

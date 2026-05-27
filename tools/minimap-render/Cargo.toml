@@ -1,0 +1,22 @@
+[package]
+name = "minimap-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "minimap-render"
+path = "src/main.rs"
+
+[dependencies]
+# Renders the minimap with the SAME code the app runs (`editor-egui::minimap::
+# render_to_image`) — no copy/paste drift. egui supplies the headless font
+# rasterization the glyph atlas reads back; `image` writes the PNG.
+egui = { workspace = true }
+editor-core.workspace = true
+editor-view.workspace = true
+editor-egui.workspace = true
+editor-md.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -9,7 +9,7 @@ v1 goal: open a note, see a panel listing semantically related notes from the sa
 
 Single SQLite database at `vault/.hiker/index.db`. Vectors via the `sqlite-vec` extension, FTS via SQLite's built-in FTS5 (used in v2; schema reserved here so v1 doesn't migrate). One file per vault, regenerable from content — never the source of truth, only a cache. [store-schema-v1]
 
-Why sqlite-vec over LanceDB for v1: one transaction across vectors + future FTS, single-file backup, brute-force search is fine at this scale (10k–500k chunks), small dep footprint. Revisit if a vault ever pushes past ~500k chunks or needs ANN.
+Brute-force search over sqlite-vec is fine at this scale (10k–500k chunks); one transaction spans vectors and future FTS, and the whole store is a single-file backup. Revisit ANN if a vault pushes past ~500k chunks.
 
 Schema (initial):
 
@@ -72,7 +72,7 @@ Notes:
 
 All sqlite-vec / rusqlite usage is confined to a single `core::store` module (start as `core/src/store.rs`; split into `core/src/store/sqlite.rs` etc. if/when a second backend lands). Everything outside `store` — ingest, search, related, CLI handlers — interacts via a narrow API of plain Rust types: `upsert_note`, `delete_note`, `rename_note`, `get_note_chunks`, `knn_chunks`, returning owned structs (`ChunkHit`, `NoteRow`, ...) not driver types. [store-module-discipline]
 
-Why: the v1 store choice (sqlite-vec) is a defensible default, not a permanent commitment. LanceDB becomes interesting if vault size pushes past brute-force KNN comfort, or if Lance's native versioning starts pulling weight against the design.md versioned-sources flow. Keeping SQL inside one module makes that swap a 1–2 day rewrite of one file, not a codebase-wide grep. Cost of the discipline is near-zero now; cost of *not* having it scales with every callsite that learns to write SQL directly.
+Keeping all SQL inside one module makes swapping the store backend a one-file rewrite, not a codebase-wide grep. The cost of the discipline is near-zero now; not having it scales with every callsite that learns to write SQL directly.
 
 Specifically forbidden outside `store`: importing `rusqlite`, returning `rusqlite::Row` or `sqlite_vec`-specific types, embedding SQL strings in handler code. The trait/struct boundary is the whole point.
 
@@ -119,7 +119,7 @@ Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never bl
 
 **CPU-bound boundary.** fastembed-rs is synchronous and CPU-heavy. Both model load (multi-second on first call) and `embed_batch` must run via `tokio::task::spawn_blocking` (or on a dedicated `std::thread` driven by an mpsc channel). Calling them directly inside an async context will block one of tokio's worker threads and starve other tasks. The indexer task awaits the spawn_blocking handle to keep its mpsc-driven loop async-shaped while the actual work runs on the blocking pool. [embedder-spawn-blocking]
 
-**Module discipline (mirrors the store):** all fastembed-rs usage lives in `core::embed` (single `core/src/embed.rs`, splittable later). Outside the module, code calls `Embedder::embed_batch(&[String]) -> Vec<Vec<f32>>` and treats it as opaque. No fastembed types leak past the boundary. Reasoning: the embedder is at least as likely to be swapped as the store — a future user might want a cloud embedder (Voyage, OpenAI), a different local model (candle + a custom checkpoint), or a multilingual model (`bge-m3`). v1 ships fastembed-only with no fallback; the trait shape is what makes future fallbacks cheap. [embedder-module-discipline]
+**Module discipline (mirrors the store):** all fastembed-rs usage lives in `core::embed` (single `core/src/embed.rs`, splittable later). Outside the module, code calls `Embedder::embed_batch(&[String]) -> Vec<Vec<f32>>` and treats it as opaque. No fastembed types leak past the boundary. The embedder is at least as likely to be swapped as the store (cloud, a different local model, multilingual), and the trait shape is what makes future backends cheap. v1 ships fastembed-only, no fallback. [embedder-module-discipline]
 
 **Model storage:** downloaded model files live under the platform data dir (Linux `~/.local/share/hiker/models/`, macOS `~/Library/Application Support/hiker/models/`, Windows `%APPDATA%\hiker\models\`). Use the `directories` crate; do not roll path logic by hand. Treated as durable data rather than cache because re-downloading 30MB on a slow or metered connection is a real cost; users may still delete the directory and the app re-downloads on next launch. [embedder-platform-data-dir]
 
@@ -136,25 +136,13 @@ The `chunk_vecs` vec0 virtual table fixes its embedding column width at `CREATE`
 - The rebuild path: `DROP TABLE chunk_vecs` → recreate with the new `float[N]` → clear `notes.note_embedding` (different-dim packed f32s are garbage at the new dim) → clear `notes.embedder_version` so the existing per-note re-embed trigger (`embedder-version-tag`) picks them all up on the next ingest pass. Schema-version bump *not* required — the rebuild is observable through the dim mismatch itself, and the `notes` / `chunks` shapes don't change.
 - Reading the on-disk dim: sqlite-vec doesn't expose the vec0 column dim through `PRAGMA table_info` (the declared type slot comes back empty). The store keeps a small `meta(key, value)` sidecar table and writes the active dim into a `chunk_vecs_dim` row whenever `chunk_vecs` is created or recreated. `Store::open` reads it from there; missing row + existing `chunk_vecs` is treated as the legacy 384 case and migrated.
 
-Why drop-and-recreate rather than ALTER: vec0 doesn't support column-type changes, and there's no useful data to preserve — every chunk has to be re-embedded anyway because the embeddings themselves are dim-incompatible. Faster to truncate than to migrate vectors that will all be overwritten.
+Drop-and-recreate rather than ALTER: vec0 has no column-type change, and every chunk re-embeds anyway (dim-incompatible), so there's nothing worth migrating.
 
 ### Alternative embedder backends (cloud / Ollama)
 
 The `Embedder` trait that hides fastembed-rs also hides any other backend. A second concrete impl, `core::embed::LlmEmbedder`, wraps the [`llm`](https://crates.io/crates/llm) crate's `EmbeddingProvider` trait — providing access to OpenAI, Ollama, Google, Cohere, Mistral, and HuggingFace embedding models. Same trait, same interface, indexer code doesn't change. [embedder-llm-crate-backed]
 
-Why offer this alongside fastembed:
-
-- **Quality ceiling.** OpenAI `text-embedding-3-large` (3072-dim), Voyage v3, Cohere `embed-v4` etc. are noticeably better than bge-small for nuanced retrieval and non-English content.
-- **Bigger chunks.** Cloud embedders accept 8k+ tokens vs. fastembed's 512 cap.
-- **No model download** for users on metered connections / slow disk who already have an Ollama server or are happy paying for cloud calls.
-- **Ollama specifically** lets users who already run Ollama for chat features (basic agent loop or external ACP agent — see `llm.md`) reuse the runtime for embeddings via models like `nomic-embed-text` or `mxbai-embed-large`. One runtime, multiple consumers.
-
-Why fastembed stays the default:
-
-- Volume — embeddings fire on every chunk on every ingest, so cloud bandwidth and per-call cost are real. A 10k-note vault is 50k embedding calls.
-- Privacy — sending every chunk's content to a cloud provider is a sharper concern than occasional generative LLM use.
-- Offline — fastembed works without network; cloud embedders don't (Ollama works offline if the server runs locally).
-- Zero config required for first-run — fastembed downloads its own model, no API key.
+fastembed stays the default (zero-config first run, no per-call cost, offline, no cloud egress of every chunk); cloud / Ollama backends are opt-in for quality, longer chunks, or reusing an existing Ollama runtime.
 
 Config in `[embedder]` in user/vault TOML, same shape as `[llm]`: [embedder-config-section]
 
@@ -191,6 +179,8 @@ Triggered three ways, all funnel into the same upsert path:
 2. **Watcher event** — single file changed/created/deleted/renamed (see `watcher.md`). [ingest-watcher-driven]
 3. **Manual** — `hiker reindex [path]` CLI subcommand and a future "reindex" UI button. [ingest-manual-cli]
 
+The startup scan and watcher additionally enqueue *extract* jobs for non-md sources per `extract.md`'s trigger model (`extract-trigger-auto-glob` / `extract-trigger-on-demand`); those produce sidecar `.md` files that re-enter this same upsert path.
+
 Per-file pipeline:
 
 ```
@@ -205,7 +195,7 @@ read file → compute blake3 hash → if hash matches notes.content_hash AND
                                                  insert new chunks + vecs
                                                  update path_ids
                                                COMMIT
-         → emit `hiker:reindex-progress` event
+         → emit indexer-progress events
 ```
 [ingest-tx-upsert, ingest-progress-events, cluster-note-embeddings]
 
@@ -241,13 +231,25 @@ The full algorithm lives behind a single `Store::related_notes(source_note_id, t
 Latency budget: the panel updates on file-open and on save (debounced 500ms). Brute-force KNN over a 100k-chunk vault should be <100ms; if it isn't, that's the signal to add an ANN index, not before.
 
 
+## Structured metadata index
+
+A queryable index over each note's frontmatter, backing *structured* retrieval — "notes tagged `project` with `status: active`, newest first" — distinct from the semantic / lexical content indexes. Powers `search-tag-scope` and the plugin query archetype (`plugins.md`'s `notes.query` host call).
+
+- **`note_meta` table.** The note's frontmatter flattened to `(note_id, key, value, num)` rows: nested maps use dotted keys (`hiker.author`), list elements explode to one row each (`tags: [a, b]` → two rows), null values are skipped. `num` mirrors `value` for YAML numbers / bools so range filters and numeric ordering need no parse at query time. Re-derived from frontmatter on every ingest (mirrors `trail_waypoints`), cleared on skip / delete. Entries are capped per note to bound pathological frontmatter. [store-note-metadata-index]
+- **`query_notes(NoteQuery)`.** Structured query: AND-ed filters (`Equals` / `Exists` / `NumRange`), a `folder` subtree restriction, `order` (mtime / path / a meta key's numeric or text value), `limit`, and a `select` projection that packs chosen keys into each row's `fields`. Each filter compiles to an EXISTS subquery against `note_meta`; every user-supplied string is a bound parameter, never interpolated. Skipped notes are excluded. [store-note-query]
+
+Tags ride this index as `Equals { key: "tags", value: "<tag>" }` — there is no separate tag table; list-valued frontmatter is simply multiple rows under one key. Lifecycle (`hiker.archived` …), authorship (`hiker.author`), and source type (`hiker.type`) are likewise plain frontmatter keys, so the lifecycle / authorship / source-type filters from `design.md` fall out of the same query surface with no new structure.
+
+Schema bumps to v8 (the `note_meta` table); per `store-version-fail-loud` the bump is handled by deleting `.hiker/index.db` and re-indexing until real-data use begins.
+
+
 ## Command surface (v1 additions)
 
 Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_hash`, `write_file_checked`). v1 adds three:
 
 - `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [cmd-related-notes]
 - `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. `queued` here is the mpsc-channel depth, which sits at ~1 during a `FullScan` because that handler processes per-file Upserts inline. The indexer-detail panel surfaces work-remaining via `IndexerHandle::pending_count()` instead (the size of the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start) so the user sees a number that counts down from N to 0 across the scan. [cmd-index-status, indexer-detail-pending-counter]
-- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via `hiker:reindex-progress` events. [cmd-index]
+- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via indexer-progress events. [cmd-index]
 - `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
 
 `RelatedHit` shape (note-level, since the v1 panel renders by note):
@@ -272,21 +274,21 @@ The `notes` row already answers "is this file indexed" — presence + non-zero c
 
 - **Unsupported** — the extension has no chunker (`is_indexable_path` returns false). Derivable client-side from the path; no store row required. The indexer never sees the file.
 - **Skipped** — a chunker exists but ingest refused: file exceeded the 5MB sanity cap, failed UTF-8 decode, or (future) hit a corrupted-source signal. The indexer records the attempt as a `notes` row with a `skipped` flag set and a short `skip_reason` string. Storing the row (rather than dropping silently) is what lets the UI distinguish "skipped on purpose" from "never seen."
-- **Queued** — the file is in the indexer's mpsc queue or actively processing. Transient; not stored — exposed via `hiker:reindex-progress` events.
+- **Queued** — the file is in the indexer's mpsc queue or actively processing. Transient; not stored — exposed via indexer-progress events.
 
 Schema addition (v1 schema bumps to `user_version = 2`): `notes.skipped` (BOOLEAN, default 0) and `notes.skip_reason` (TEXT, NULL when not skipped). Per the migration policy in `store-version-fail-loud`, the bump is handled by deleting `.hiker/index.db` and re-indexing until real-data use begins.
 
 Surface:
 
 - `index_state_for(path: String) -> IndexState` command. Returns `Indexed`, `Unsupported`, `Skipped { reason: String }`, or `Queued`. One path lookup; cheap enough for the tree to call lazily on render of visible rows. The skip reason is a stable, short, human-readable string (`"file too large"`, `"not UTF-8"`) used directly in tooltips and the status bar — no translation layer. [cmd-file-index-state]
-- `hiker:reindex-progress` events (per `ingest-progress-events`) carry per-file transitions, so the tree flips rows from Queued → Indexed (or Skipped) without polling.
+- indexer-progress events (per `ingest-progress-events`) carry per-file transitions, so the tree flips rows from Queued → Indexed (or Skipped) without polling.
 
 Indexer logic: when ingest decides to skip a file, write the `notes` row with `skipped = 1` and a reason; do not chunk, do not embed. A subsequent successful re-ingest of the same path clears the flag. Deletes cascade as before (`ingest-delete-cascade`).
 
 
 ## Reindex verbs
 
-`cmd-index` already covers the mechanics — `IndexScope::All` for full rescan and `IndexScope::Path` for one file. v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
+`cmd-index` covers the mechanics; v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
 
 - **Reindex all** — `index(IndexScope::All)` with the `force` flag set: bypasses the content-hash + embedder-version short-circuit so every note re-embeds even when nothing changed. The button is the user's explicit "redo all the work" verb; without `force` the click would be a no-op on a clean vault. The first-launch / vault-open startup scan and watcher-driven Upserts still default to `force=false` so the cheap-when-nothing-changed path keeps applying to ambient ingest. [reindex-all-action]
 - **Reindex this file** — `index(IndexScope::Path(currentPath))` with `force=true` for the same reason. Greyed when no file is active. [reindex-current-file-action]

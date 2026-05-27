@@ -424,13 +424,13 @@ fn add_action_picker(ui: &mut egui::Ui, mut pick: impl FnMut(&'static str)) {
 
 /// Hamburger "More actions" composite. Mirrors the legacy
 /// `actions_menu` shape: lists the open-tab actions and "New chat
-/// session", with a combined queue+staging badge on the trigger.
+/// session", with a combined queue+pending badge on the trigger.
 impl AppState {
 fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
     let state = self;
     let queue_count = state.pending_task_count();
-    let staging_count = state.pending_staging_count();
-    let total = queue_count + staging_count;
+    let pending_count = state.pending_proposal_count();
+    let total = queue_count + pending_count;
     let trigger = ui.horizontal(|ui| {
         let r = ui.add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Menu)));
         if total > 0 {
@@ -461,12 +461,16 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             open_singleton_tab(state, TabKind::Graph);
             ui.close();
         }
-        if tab_menu_row(ui, &TabKind::PatchReview, staging_count) {
+        if tab_menu_row(ui, &TabKind::PatchReview, pending_count) {
             open_singleton_tab(state, TabKind::PatchReview);
             ui.close();
         }
         if tab_menu_row(ui, &TabKind::Changes, 0) {
             open_singleton_tab(state, TabKind::Changes);
+            ui.close();
+        }
+        if tab_menu_row(ui, &TabKind::Sync, 0) {
+            open_singleton_tab(state, TabKind::Sync);
             ui.close();
         }
         if tab_menu_row(ui, &TabKind::Plugins, 0) {
@@ -513,8 +517,8 @@ fn menu_row(ui: &mut egui::Ui, image: egui::Image<'_>, label: &str, count: usize
 }
 
 impl AppState {
-fn pending_staging_count(&self) -> usize {
-    self.ui_cache.staging_snapshot.len()
+fn pending_proposal_count(&self) -> usize {
+    self.ui_cache.pending_snapshot.len()
 }
 
 fn pending_task_count(&self) -> usize {

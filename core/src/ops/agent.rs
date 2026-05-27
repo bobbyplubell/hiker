@@ -1,42 +1,34 @@
 //! Agent-side writes: full-body `write_note` plus the
 //! frontmatter-only helpers (`set_frontmatter`, `apply_tag`,
-//! `remove_tag`). Each appends a changelog row authored as
-//! `agent:<client_id>` so the rollback substrate distinguishes agent vs.
-//! user writes.
-//!
-//! When review mode is on, MCP routes writes through
-//! `core::staging` first; this module only runs once the user has
-//! accepted the proposal (or `review_required=false`).
+//! `remove_tag`). Each queues a pending op-log op authored as
+//! `agent:<client_id>` so the review surfaces and rollback substrate
+//! distinguish agent vs. user writes.
 
-use std::sync::Arc;
-
-use crate::changes::{ChangeAppend, ChangeOp, Changes};
 use crate::errors::HikerError;
 use crate::hash_string;
 use crate::indexer::{IndexJob, IndexJobTx};
 use crate::vault::Vault;
 use crate::watcher::Watcher;
 
-use super::append_change_best_effort;
-
-/// Borrowed bundle for the four agent_* write helpers. The first six
-/// arguments are identical across `write_note`,
-/// `set_frontmatter`, `apply_tag`, and `remove_tag`;
-/// bundling them keeps the signatures (and call sites) under the
-/// `too_many_arguments` threshold without changing any behavior.
+/// Borrowed bundle for the four agent_* write helpers. The arguments are
+/// identical across `write_note`, `set_frontmatter`, `apply_tag`, and
+/// `remove_tag`; bundling them keeps the signatures (and call sites) under
+/// the `too_many_arguments` threshold without changing any behavior.
 pub struct WriteCtx<'a> {
     pub watcher: &'a Watcher,
     pub jobs: &'a IndexJobTx,
     pub vault: &'a Vault,
-    pub changes: Option<&'a Arc<Changes>>,
+    /// The op log this vault session rides on, when open. Agent writes
+    /// queue as pending ops here (`op-log-ops-producer-helpers`). `None` for
+    /// callers with no op log open (early CLI, some tests).
+    pub op_log: Option<&'a super::op_writes::OpLogHandle>,
     pub client_id: &'a str,
-    pub tool: &'a str,
 }
 
 /// Agent write of a note's full body. Routes through the indexer so the
-/// post-write upsert runs against the same writer the UI uses; appends an
-/// `author='agent:<client_id>'` changelog row with the post-write content
-/// blob (rollback substrate per `mcp.md`'s authorship + audit-trail spec).
+/// post-write upsert runs against the same writer the UI uses; queues an
+/// `author='agent:<client_id>'` pending op-log op (the rollback / review
+/// substrate per `mcp.md`'s authorship + audit-trail spec).
 ///
 /// `expected_hash` enables drift-aware writes (`write_file_checked` shape):
 /// `Some(h)` runs the on-disk hash compare and errors `DiskDrift` if the
@@ -52,17 +44,6 @@ pub async fn write_note(
 ) -> Result<String, HikerError> {
     ctx.watcher.suppress(rel.to_string());
 
-    // Snapshot the pre-write content as a baseline if this is the first time
-    // hiker has touched the path (mirrors the UI's `ensure_baseline` hook on
-    // user saves so rollback of an agent-authored save has somewhere to go).
-    if let (Some(c), Ok((pre_text, pre_hash))) = (ctx.changes, ctx.vault.read_file_with_hash(rel))
-        && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
-    {
-        tracing::warn!(error = %e, "changes: ensure_baseline failed (agent write)");
-    }
-
-    let abs = ctx.vault.abs_path(rel)?;
-    let existed = abs.exists();
     let new_hash = match expected_hash {
         Some(h) => ctx.vault.write_file_checked(rel, h, content)?,
         None => {
@@ -75,21 +56,21 @@ pub async fn write_note(
     // post-write event.
     ctx.watcher.suppress(rel.to_string());
 
-    let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
-    let author = format!("agent:{}", ctx.client_id);
-    let metadata = serde_json::json!({"tool": ctx.tool});
-    append_change_best_effort(
-        ctx.changes,
-        ChangeAppend {
-            path: rel,
-            op,
-            author: &author,
-            content_hash: Some(&new_hash),
-            content: Some(content.as_bytes()),
-            rename_from: None,
-            metadata,
-        },
-    );
+    // Record the agent edit in the op log's pending queue when one is open.
+    // Whole-body rewrite (`old_str = None`); the op stays pending until the
+    // user accepts via `flip_op_status`. Best-effort: a staging failure logs.
+    if let Some(op_log) = ctx.op_log
+        && let Err(e) = super::op_writes::stage_agent_edits(
+            op_log,
+            ctx.vault,
+            ctx.client_id,
+            "mcp-tool-call",
+            rel,
+            &[super::op_writes::AgentEdit { old_str: None, new_str: content.to_string() }],
+        )
+    {
+        tracing::warn!(error = %e, path = %rel, "op-log: stage_pending failed (agent write)");
+    }
 
     // Re-index the new content so search/related see the agent's changes.
     let _ = ctx

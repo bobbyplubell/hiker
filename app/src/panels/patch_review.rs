@@ -1,5 +1,11 @@
-//! Patch review tab: lists pending staging proposals with per-row
-//! accept/reject + view-diff actions. Backed by `Staging::list_pending`.
+//! Patch review tab: the cross-vault listing of pending agent ops with
+//! per-row + bulk accept/reject and a view-diff action. Backed by the op log
+//! (`op_writes::list_pending_proposals` to list, `op_writes::flip_op_status`
+//! to accept/reject) — the sibling surface to the in-buffer inline patch
+//! review (`patch-review.md`). Drifted ops disable Accept per
+//! `patch-review-conflicted-accept-disabled`; Reject stays active.
+//
+// status: write-note-review-surface
 
 use eframe::egui;
 
@@ -11,12 +17,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Patch review");
     ui.add_space(4.0);
 
-    let staging = app.vault_session.services.staging.clone();
+    let log = app.vault_session.services.oplog.clone();
 
-    let proposals = match staging.list_pending() {
+    let proposals = match hiker_core::ops::op_writes::list_pending_proposals(log.as_ref()) {
         Ok(v) => v,
         Err(err) => {
-            ui.colored_label(egui::Color32::RED, format!("staging list: {}", err));
+            ui.colored_label(egui::Color32::RED, format!("op-log list: {}", err));
             return;
         }
     };
@@ -32,16 +38,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         return;
     }
 
-    let changes = app.vault_session.services.changes.clone();
     let mut to_view: Option<(String, String)> = None;
-    let mut to_accept: Option<String> = None;
-    let mut to_reject: Option<String> = None;
+    // Each accept/reject carries (op_id, target_path) so `flip_op_status`
+    // can resolve the op's doc id.
+    let mut to_accept: Option<(String, String)> = None;
+    let mut to_reject: Option<(String, String)> = None;
     let mut accept_all = false;
     let mut reject_all = false;
 
-    // Bulk action bar (`staging-bulk-apply-reject`). Mirrors the legacy
-    // patch-review tab header where the user can blast through all pending
-    // proposals when satisfied or clear the queue when starting over.
+    // Bulk action bar. Mirrors the inline file pill's Accept all / Reject all
+    // (`patch-review-file-pill`): blast through every non-drifted proposal
+    // when satisfied, or clear the whole queue (drifted included) when
+    // starting over.
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!("{} pending", proposals.len()))
@@ -87,10 +95,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                             ui.vertical(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{}  · {}  · {}",
-                                        &p.id[..p.id.len().min(8)],
+                                        "{}  · {}  · {}{}",
+                                        &p.op_id[..p.op_id.len().min(8)],
                                         p.surface,
                                         p.action,
+                                        if p.drifted { "  · drifted" } else { "" },
                                     ))
                                     .strong(),
                                 );
@@ -117,20 +126,28 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::image_and_text(
-                                                crate::icons::ICONS.primary_check(),
-                                                egui::RichText::new("Accept")
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(egui::Color32::from_rgb(
-                                                0x2f, 0x8f, 0x4d,
-                                            )),
+                                    // Accept disabled for drifted ops
+                                    // (`patch-review-conflicted-accept-disabled`).
+                                    let accept = ui.add_enabled(
+                                        !p.drifted,
+                                        egui::Button::image_and_text(
+                                            crate::icons::ICONS.primary_check(),
+                                            egui::RichText::new("Accept")
+                                                .color(egui::Color32::WHITE),
                                         )
-                                        .clicked()
-                                    {
-                                        to_accept = Some(p.id.clone());
+                                        .fill(egui::Color32::from_rgb(
+                                            0x2f, 0x8f, 0x4d,
+                                        )),
+                                    );
+                                    if p.drifted {
+                                        accept.on_hover_text(
+                                            "Drifted: the note changed since this edit was proposed",
+                                        );
+                                    } else if accept.clicked() {
+                                        to_accept = Some((
+                                            p.op_id.clone(),
+                                            p.target_path.clone(),
+                                        ));
                                     }
                                     if ui
                                         .add(
@@ -145,11 +162,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                         )
                                         .clicked()
                                     {
-                                        to_reject = Some(p.id.clone());
+                                        to_reject = Some((
+                                            p.op_id.clone(),
+                                            p.target_path.clone(),
+                                        ));
                                     }
                                     if ui.button("View diff").clicked() {
                                         to_view = Some((
-                                            p.id.clone(),
+                                            p.op_id.clone(),
                                             p.target_path.clone(),
                                         ));
                                     }
@@ -161,62 +181,97 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
             }
         });
 
-    if let Some((proposal_id, target_path)) = to_view {
-        app.open_singleton_tab(TabKind::staging_preview(proposal_id, target_path));
+    if let Some((op_id, target_path)) = to_view {
+        app.open_singleton_tab(TabKind::pending_preview(op_id, target_path));
     }
-    if let Some(id) = to_accept {
-        match staging.accept(&id, &app.vault_session.vault, Some(changes.as_ref())) {
-            Ok(o) => app.push_toast(
-                format!("Accepted proposal for {}", o.target_path),
-                ToastLevel::Info,
-            ),
-            Err(err) => app.push_toast(
-                format!("Accept failed: {}", err),
-                ToastLevel::Error,
-            ),
-        }
+    if let Some((op_id, target_path)) = to_accept {
+        flip_one(app, &op_id, &target_path, /* accept */ true);
     }
-    if let Some(id) = to_reject {
-        match staging.reject(&id) {
-            Ok(()) => app.push_toast("Proposal rejected", ToastLevel::Info),
-            Err(err) => app.push_toast(
-                format!("Reject failed: {}", err),
-                ToastLevel::Error,
-            ),
-        }
+    if let Some((op_id, target_path)) = to_reject {
+        flip_one(app, &op_id, &target_path, /* accept */ false);
     }
     if accept_all {
-        let filter = hiker_core::staging::types::Filter::default();
-        match staging.accept_all(&filter, &app.vault_session.vault, Some(changes.as_ref())) {
-            Ok(outcomes) => app.push_toast(
-                format!("Accepted {} proposal(s)", outcomes.len()),
-                ToastLevel::Info,
-            ),
-            Err(err) => app.push_toast(
-                format!("Accept-all failed: {}", err),
-                ToastLevel::Error,
-            ),
-        }
+        apply_bulk_flip(app, &proposals, /* accept */ true);
     }
     if reject_all {
-        let mut n = 0usize;
-        for p in &proposals {
-            if staging.reject(&p.id).is_ok() {
-                n += 1;
-            }
+        apply_bulk_flip(app, &proposals, /* accept */ false);
+    }
+}
+
+/// Flip every proposal in `proposals` through `op_writes::flip_op_status`,
+/// then toast the count. Accept-all skips drifted ops (they can't apply
+/// against current accepted state, per `patch-review-file-pill`); Reject-all
+/// covers drifted ops too. The single bulk-verb path the file-pill's
+/// Accept-all / Reject-all mirror.
+fn apply_bulk_flip(
+    app: &mut AppState,
+    proposals: &[hiker_core::ops::op_writes::PendingProposal],
+    accept: bool,
+) {
+    let log = app.vault_session.services.oplog.clone();
+    let mut n = 0usize;
+    let mut skipped = 0usize;
+    for p in proposals {
+        if accept && p.drifted {
+            skipped += 1;
+            continue;
         }
-        app.push_toast(format!("Rejected {} proposal(s)", n), ToastLevel::Info);
+        if hiker_core::ops::op_writes::flip_op_status(
+            log.as_ref(),
+            &p.target_path,
+            std::slice::from_ref(&p.op_id),
+            accept,
+        )
+        .is_ok()
+        {
+            n += 1;
+        }
+    }
+    if accept {
+        let suffix = if skipped > 0 {
+            format!(" ({skipped} drifted skipped)")
+        } else {
+            String::new()
+        };
+        app.push_toast(format!("Accepted {n} proposal(s){suffix}"), ToastLevel::Info);
+    } else {
+        app.push_toast(format!("Rejected {n} proposal(s)"), ToastLevel::Info);
+    }
+}
+
+/// Flip a single op via `op_writes::flip_op_status` and toast the result.
+fn flip_one(app: &mut AppState, op_id: &str, target_path: &str, accept: bool) {
+    let log = app.vault_session.services.oplog.clone();
+    let ids = [op_id.to_string()];
+    let res = hiker_core::ops::op_writes::flip_op_status(
+        log.as_ref(),
+        target_path,
+        &ids,
+        accept,
+    );
+    match (res, accept) {
+        (Ok(()), true) => app.push_toast(
+            format!("Accepted proposal for {target_path}"),
+            ToastLevel::Info,
+        ),
+        (Ok(()), false) => app.push_toast("Proposal rejected", ToastLevel::Info),
+        (Err(err), true) => {
+            app.push_toast(format!("Accept failed: {}", err), ToastLevel::Error)
+        }
+        (Err(err), false) => {
+            app.push_toast(format!("Reject failed: {}", err), ToastLevel::Error)
+        }
     }
 }
 
 impl AppState {
     /// Match the toolbar's open-singleton semantics: focus an existing tab
-    /// by discriminant, except for staging-proposal previews which carry a
-    /// payload — there we keep one tab per `proposal_id`.
+    /// by discriminant, except for proposal previews which carry a payload —
+    /// there we keep one tab per op id.
     fn open_singleton_tab(&mut self, kind: TabKind) {
     let state = self;
     if let TabKind::Editor {
-        buffer: crate::tab::BufferSource::StagingProposal { proposal_id, .. },
+        buffer: crate::tab::BufferSource::PendingProposal { proposal_id, .. },
         ..
     } = &kind
     {
@@ -224,7 +279,7 @@ impl AppState {
             matches!(
                 &t.kind,
                 TabKind::Editor {
-                    buffer: crate::tab::BufferSource::StagingProposal { proposal_id: pid, .. },
+                    buffer: crate::tab::BufferSource::PendingProposal { proposal_id: pid, .. },
                     ..
                 } if pid == proposal_id
             )

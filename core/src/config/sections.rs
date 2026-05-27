@@ -33,7 +33,7 @@ pub struct SuggestionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriageConfig {
-    /// When `true`, every triage match stays pending in `staging.db`
+    /// When `true`, every triage match stays pending in the op log
     /// until the user accepts. When `false`, `auto-*` matches auto-accept
     /// at insert time. Live-applied.
     #[serde(default = "no")]
@@ -83,36 +83,112 @@ fn default_triage_scope() -> String {
     "inbox/".to_string()
 }
 
-/// `[staging]` section. Behavior that applies regardless of which producer
-/// staged a proposal. See `docs/settings.md` §`[staging]` config section.
+/// `[op-log]` section. Tunables for the `core::oplog` substrate (the CRDT
+/// op log that owns every write). See `docs/op-log.md` §`[op-log]` config section.
 ///
-/// status: staging-config-section
+/// status: op-log-config-section
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StagingConfig {
-    /// When `true`, the `applyable → conflicted` state transition
-    /// immediately invokes `reject(id)`. Live-applied. Default false.
-    ///
-    /// status: staging-auto-reject-on-conflict
+pub struct OpLogConfig {
+    /// GC age threshold (days) for `op_metadata.status='accepted'` rows.
+    /// The Yrs Doc content lives forever (it IS the document); only the
+    /// side-table author/timestamp data is bounded.
+    #[serde(default = "default_metadata_retention_days")]
+    pub metadata_retention_days: u32,
+    /// Faster GC age threshold (days) for `status='rejected'` rows.
+    #[serde(default = "default_rejected_retention_days")]
+    pub rejected_retention_days: u32,
+    /// When a pending op's anchor no longer resolves, flip it to rejected
+    /// automatically.
     #[serde(default = "no")]
-    pub auto_reject_on_conflict: bool,
-    /// GC age threshold consumed by `Staging::gc` on vault open. Lifts the
-    /// previously-hardcoded 14-day value.
-    #[serde(default = "default_staging_retention_days")]
-    pub retention_days: u32,
+    pub auto_reject_on_drift: bool,
+    /// Default `status` for agent-authored ops (`true` = require review).
+    /// Surface-specific overrides (`[mcp.tools]`, `[llm.background]`) win.
+    #[serde(default = "yes")]
+    pub review_required: bool,
+    /// Yrs Doc size multiple over the materialized size that triggers
+    /// compaction on vault open.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f32,
 }
 
-impl Default for StagingConfig {
+impl Default for OpLogConfig {
     fn default() -> Self {
         Self {
-            auto_reject_on_conflict: false,
-            retention_days: default_staging_retention_days(),
+            metadata_retention_days: default_metadata_retention_days(),
+            rejected_retention_days: default_rejected_retention_days(),
+            auto_reject_on_drift: false,
+            review_required: true,
+            compact_threshold: default_compact_threshold(),
         }
     }
 }
 
-const fn default_staging_retention_days() -> u32 {
+const fn default_metadata_retention_days() -> u32 {
+    365
+}
+
+const fn default_rejected_retention_days() -> u32 {
     14
+}
+
+const fn default_compact_threshold() -> f32 {
+    4.0
+}
+
+/// `[sync]` section. Per-vault multi-device sync policy for the op log.
+/// See `docs/sync.md` §`[sync]` config section.
+///
+/// Carries **no secrets**: the per-vault content key and the per-device
+/// private key are user-scope and stored outside this config — never in
+/// the synced vault TOML — the same eligibility rule as `[llm].api_key`.
+/// See `sync-secrets-user-scope`.
+///
+/// status: sync-config-section
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSection {
+    /// Master switch. Opt in per vault; default off so an un-enrolled
+    /// vault never advertises or connects.
+    #[serde(default = "no")]
+    pub enabled: bool,
+    /// Topology this vault participates in (`peer` / `server` / `both`).
+    #[serde(default)]
+    pub mode: SyncMode,
+    /// Relay / hub multiaddr or URL when using the decoupled server.
+    /// Empty = no server configured (P2P / LAN only).
+    #[serde(default)]
+    pub server_url: String,
+    /// Allow the manual, time-boxed mDNS discovery window. Discovery only
+    /// supplies IP:port candidates; it never substitutes for enrollment.
+    #[serde(default = "yes")]
+    pub discovery: bool,
+    /// Enrolled device fingerprints (Syncthing-Device-ID style strings).
+    #[serde(default)]
+    pub devices: Vec<String>,
+}
+
+impl Default for SyncSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SyncMode::default(),
+            server_url: String::new(),
+            discovery: true,
+            devices: Vec::new(),
+        }
+    }
+}
+
+/// Sync topology. `Peer` = direct P2P / LAN only (default); `Server` =
+/// route through a relay / hub; `Both` = participate in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    #[default]
+    Peer,
+    Server,
+    Both,
 }
 
 /// `[trails]` section. Configures trail-doc placement and other vault-wide
@@ -139,6 +215,32 @@ impl Default for TrailsConfig {
 
 fn default_new_trail_dir() -> String {
     "trails/".to_string()
+}
+
+/// `[boards]` section. Mirrors `[trails]`: default placement for newly
+/// created board-docs. See `docs/kanban.md` §"Creating a board".
+///
+/// status: board-default-location
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoardsConfig {
+    /// Default directory for newly-created board-docs. Vault-relative.
+    /// Empty string places boards at vault root. Auto-created on first
+    /// board. Vault-scope eligible per `settings-write-back`.
+    #[serde(default = "default_new_board_dir")]
+    pub new_board_dir: String,
+}
+
+impl Default for BoardsConfig {
+    fn default() -> Self {
+        Self {
+            new_board_dir: default_new_board_dir(),
+        }
+    }
+}
+
+fn default_new_board_dir() -> String {
+    "boards/".to_string()
 }
 
 /// `[acp]` section. Configures the optional Agent Client Protocol backend
@@ -317,8 +419,8 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmBackgroundConfig {
-    /// When true, debounced background LLM features write to staging
-    /// instead of mutating frontmatter directly. Default false (off).
+    /// When true, debounced background LLM features stage a pending op log
+    /// op instead of mutating frontmatter directly. Default false (off).
     #[serde(default = "no")]
     pub review_required: bool,
 }
@@ -506,11 +608,11 @@ pub struct McpToolsConfig {
     pub allow_redacted_lookup: bool,
     // status: agent-write-review-mode
     /// When true, MCP write tools (`write_note`, `edit_note`,
-    /// `set_frontmatter`, `apply_tag`, `remove_tag`) route through
-    /// `core::staging::propose()` so the user reviews each change before
-    /// it lands on disk. Default true — the in-buffer patch-review surface
-    /// expects edits as staging proposals; turning this off bypasses the
-    /// review UI and writes straight to disk + changelog.
+    /// `set_frontmatter`, `apply_tag`, `remove_tag`) stage a pending op log
+    /// op so the user reviews each change before it lands on disk. Default
+    /// true — the in-buffer patch-review surface expects edits as pending
+    /// ops; turning this off bypasses the review UI and writes straight to
+    /// disk.
     #[serde(default = "yes")]
     pub review_required: bool,
     // Per-tool toggles (status: mcp-tool-toggles). Default true.
@@ -524,6 +626,11 @@ pub struct McpToolsConfig {
     #[serde(default = "yes")] pub set_frontmatter_enabled: bool,
     #[serde(default = "yes")] pub apply_tag_enabled: bool,
     #[serde(default = "yes")] pub remove_tag_enabled: bool,
+    // Board tools (status: board-mcp-tools). Reads + one write
+    // (`board_add_card`, also gated by `writes_enabled`):
+    #[serde(default = "yes")] pub boards_list_enabled: bool,
+    #[serde(default = "yes")] pub board_get_enabled: bool,
+    #[serde(default = "yes")] pub board_add_card_enabled: bool,
     // Task-queue tools (also gated by `[tasks] expose_to_chat_agent`
     // for the in-process chat agent path):
     #[serde(default = "yes")] pub task_checkout_enabled: bool,
@@ -539,7 +646,12 @@ impl McpToolsConfig {
     pub fn tool_allowed(&self, name: &str) -> bool {
         let is_write = matches!(
             name,
-            "write_note" | "edit_note" | "set_frontmatter" | "apply_tag" | "remove_tag"
+            "write_note"
+                | "edit_note"
+                | "set_frontmatter"
+                | "apply_tag"
+                | "remove_tag"
+                | "board_add_card"
         );
         if is_write && !self.writes_enabled {
             return false;
@@ -553,6 +665,9 @@ impl McpToolsConfig {
             "set_frontmatter" => self.set_frontmatter_enabled,
             "apply_tag" => self.apply_tag_enabled,
             "remove_tag" => self.remove_tag_enabled,
+            "boards_list" => self.boards_list_enabled,
+            "board_get" => self.board_get_enabled,
+            "board_add_card" => self.board_add_card_enabled,
             "task_checkout" => self.task_checkout_enabled,
             "task_submit" => self.task_submit_enabled,
             "task_fail" => self.task_fail_enabled,
@@ -577,6 +692,9 @@ impl Default for McpToolsConfig {
             set_frontmatter_enabled: true,
             apply_tag_enabled: true,
             remove_tag_enabled: true,
+            boards_list_enabled: true,
+            board_get_enabled: true,
+            board_add_card_enabled: true,
             task_checkout_enabled: true,
             task_submit_enabled: true,
             task_fail_enabled: true,
@@ -812,9 +930,24 @@ impl Default for EditorConfig {
 /// the right of the editor body. All defaults match the unconfigured
 /// look so absence of `[editor.minimap]` in TOML produces the same
 /// minimap a fresh install would draw.
+/// Which minimap renderer to use. `glyphs` is a literal scaled-down view of
+/// the text (one cell per character); `bars` is the structural abstraction
+/// (one bar per line). Both are rasterized to a single cached texture, so
+/// the choice is purely visual — neither costs per-line draw work per frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MinimapStyle {
+    #[default]
+    Glyphs,
+    Bars,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MinimapConfig {
+    /// Which renderer to use (`glyphs` or `bars`).
+    #[serde(default)]
+    pub style: MinimapStyle,
     /// Strip width in pixels.
     #[serde(default = "minimap_default_width")]
     pub width: u16,
@@ -889,6 +1022,7 @@ fn minimap_default_color_viewport_hover() -> String { "#3c64b432".into() }
 impl Default for MinimapConfig {
     fn default() -> Self {
         Self {
+            style: MinimapStyle::default(),
             width: minimap_default_width(),
             bar_padding_left: minimap_default_pad(),
             bar_padding_right: minimap_default_pad(),

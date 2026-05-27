@@ -5,22 +5,17 @@
 //! Also hosts `ensure_note_id_stamped` — the user-initiated `hiker.id`
 //! stamping path that trail waypoints and the (planned) lazy id-stamping
 //! mode ride. It belongs here rather than in `file` because it shares
-//! the same `frontmatter`-merge / changelog-row shape as the buffer
-//! commit path and reuses the private helpers below.
-
-use std::sync::Arc;
+//! the same `frontmatter`-merge shape as the buffer commit path and
+//! reuses the private helpers below.
 
 use serde::{Deserialize, Serialize};
 
-use crate::changes::{ChangeAppend, ChangeOp, Changes};
 use crate::errors::HikerError;
 use crate::hash_string;
 use crate::indexer::{IndexJob, IndexJobTx};
 use crate::store::Store;
 use crate::vault::Vault;
 use crate::watcher::Watcher;
-
-use super::append_change_best_effort;
 
 /// Opaque buffer-identity token issued by `open_for_edit` and rotated by
 /// every successful `commit` / drift resolution. Wraps the path the
@@ -140,30 +135,20 @@ pub fn open_for_edit(vault: &Vault, rel: &str) -> Result<OpenForEditOutcome, Hik
 
 /// Write a buffer's new text using the drift-check encoded in `token`.
 ///
-/// On success, appends a `'modified'` (or `'created'` if the file didn't
-/// exist) row to the changelog with `extra_metadata` merged in, and
-/// returns `Written { new_hash, token }` — the new token replaces the
-/// caller's prior one for the next commit.
+/// On success returns `Written { new_hash, token }` — the new token
+/// replaces the caller's prior one for the next commit.
 ///
 /// On drift, returns `DriftDetected { current_disk_text, current_hash }`
 /// instead of erroring. The adapter renders its modal and dispatches to
 /// `resolve_drift` with the user's choice. Other I/O errors propagate as
 /// before.
-///
-/// `extra_metadata` carries one-shot context (e.g.
-/// `{ "mutation": "<kind>" }` per `note-mutation-stash-changes-tag`); a
-/// non-object value is treated as `{}` to match the existing
-/// command shape.
 pub fn commit(
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     token: &Token,
     new_text: &str,
-    extra_metadata: serde_json::Value,
 ) -> Result<CommitOutcome, HikerError> {
     let rel = token.path();
     let abs = vault.abs_path(rel)?;
-    let existed = abs.exists();
 
     // Drift inspection: re-read disk and compare its hash to the token's
     // captured hash. On mismatch we surface the on-disk state to the
@@ -192,37 +177,8 @@ pub fn commit(
         Err(e) => return Err(e.into()),
     }
 
-    // Baseline-on-first-save: snapshot the pre-write state if no
-    // changelog row exists for this path yet, so rollback has somewhere
-    // to go. No-op when a row already exists. Read failures fall through
-    // silently — better to log a baseline-less write than to refuse it.
-    if existed
-        && let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel))
-        && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
-    {
-        tracing::warn!(error = %e, "changes: ensure_baseline failed (commit)");
-    }
-
     vault.write_file(rel, new_text)?;
     let new_hash = hash_string(new_text);
-
-    let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
-    let metadata = match extra_metadata {
-        serde_json::Value::Object(_) => extra_metadata,
-        _ => serde_json::json!({}),
-    };
-    append_change_best_effort(
-        changes,
-        ChangeAppend {
-            path: rel,
-            op,
-            author: "user",
-            content_hash: Some(&new_hash),
-            content: Some(new_text.as_bytes()),
-            rename_from: None,
-            metadata,
-        },
-    );
 
     Ok(CommitOutcome::Written {
         new_hash: new_hash.clone(),
@@ -234,49 +190,22 @@ pub fn commit(
 /// focus stay in the adapter; this is the typed surface for the action
 /// each branch represents.
 ///
-/// - `KeepMine` — unconditional write of `new_text`, append a changelog
-///   row, return `Written { new_hash, token }`.
+/// - `KeepMine` — unconditional write of `new_text`, return
+///   `Written { new_hash, token }`.
 /// - `TakeTheirs` — read disk, return `TookTheirs { contents, token }`.
-///   No write, no changelog row. Caller reseeds its buffer.
+///   No write. Caller reseeds its buffer.
 /// - `Cancel` — no-op. Caller leaves the buffer dirty so the next commit
 ///   re-prompts.
 pub fn resolve_drift(
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     rel: &str,
     choice: DriftChoice,
     new_text: &str,
-    extra_metadata: serde_json::Value,
 ) -> Result<DriftResolution, HikerError> {
     match choice {
         DriftChoice::KeepMine => {
-            let abs = vault.abs_path(rel)?;
-            let existed = abs.exists();
-            if existed
-                && let (Some(c), Ok((pre_text, pre_hash))) = (changes, vault.read_file_with_hash(rel))
-                && let Err(e) = c.ensure_baseline(rel, "user", pre_text.as_bytes(), &pre_hash)
-            {
-                tracing::warn!(error = %e, "changes: ensure_baseline failed (resolve_drift keep_mine)");
-            }
             vault.write_file(rel, new_text)?;
             let new_hash = hash_string(new_text);
-            let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
-            let metadata = match extra_metadata {
-                serde_json::Value::Object(_) => extra_metadata,
-                _ => serde_json::json!({}),
-            };
-            append_change_best_effort(
-                changes,
-                ChangeAppend {
-                    path: rel,
-                    op,
-                    author: "user",
-                    content_hash: Some(&new_hash),
-                    content: Some(new_text.as_bytes()),
-                    rename_from: None,
-                    metadata,
-                },
-            );
             Ok(DriftResolution::Written {
                 new_hash: new_hash.clone(),
                 token: Token::new(rel, &new_hash),
@@ -329,7 +258,6 @@ pub async fn ensure_note_id_stamped(
     watcher: &Watcher,
     jobs: &IndexJobTx,
     vault: &Vault,
-    changes: Option<&Arc<Changes>>,
     store: &mut Store,
     rel: &str,
 ) -> Result<String, HikerError> {
@@ -337,7 +265,6 @@ pub async fn ensure_note_id_stamped(
         watcher,
         jobs,
         vault,
-        changes,
         store,
         rel,
     }
@@ -353,7 +280,6 @@ struct IdStamper<'a> {
     watcher: &'a Watcher,
     jobs: &'a IndexJobTx,
     vault: &'a Vault,
-    changes: Option<&'a Arc<Changes>>,
     store: &'a mut Store,
     rel: &'a str,
 }
@@ -439,38 +365,13 @@ impl<'a> IdStamper<'a> {
             .map_err(|e| HikerError::Io(format!("frontmatter: {e}")))
     }
 
-    /// Mirror `set_frontmatter`'s shape: suppress the watcher around
-    /// the write so notify can't surface a stale event,
-    /// baseline-snapshot if first touch, append a
-    /// `'modified'`/`'created'` changelog row, then re-suppress +
+    /// Mirror `set_frontmatter`'s shape: suppress the watcher around the
+    /// write so notify can't surface a stale event, then re-suppress +
     /// re-index.
     async fn write_and_record(&self, merged: &str) -> Result<(), HikerError> {
         self.watcher.suppress(self.rel.to_string());
-        if let (Some(c), Ok((pre_text, pre_hash))) =
-            (self.changes, self.vault.read_file_with_hash(self.rel))
-            && let Err(e) = c.ensure_baseline(self.rel, "user", pre_text.as_bytes(), &pre_hash)
-        {
-            tracing::warn!(error = %e, "changes: ensure_baseline failed (id stamp)");
-        }
-        let abs = self.vault.abs_path(self.rel)?;
-        let existed = abs.exists();
         self.vault.write_file(self.rel, merged)?;
-        let new_hash = hash_string(merged);
         self.watcher.suppress(self.rel.to_string());
-        let op = if existed { ChangeOp::Modified } else { ChangeOp::Created };
-        let metadata = serde_json::json!({"reason": "note-id-stamping"});
-        append_change_best_effort(
-            self.changes,
-            ChangeAppend {
-                path: self.rel,
-                op,
-                author: "user",
-                content_hash: Some(&new_hash),
-                content: Some(merged.as_bytes()),
-                rename_from: None,
-                metadata,
-            },
-        );
         let _ = self
             .jobs
             .send(IndexJob::Upsert {
@@ -480,5 +381,72 @@ impl<'a> IdStamper<'a> {
             .await;
         Ok(())
     }
+}
+
+/// Normalize hand-typed / external wikilinks in `text` to the durable id form.
+///
+/// Every `[[Name]]` / `[[Name|alias]]` whose target is a name (not already a
+/// ULID) is resolved by unique title match (`wikilink::resolve_name`); on a
+/// unique hit the target note's `hiker.id` is stamped via
+/// [`ensure_note_id_stamped`] (the lazy `note-id-stamping` trigger) and the
+/// link is rewritten to `[[<ulid>|<display>]]`. Ambiguous or unmatched names
+/// are left untouched so they stay unresolved rather than being guessed.
+///
+/// Returns the rewritten text (identical to the input when nothing resolved).
+/// Self-links — a name resolving to `rel` itself — are skipped so stamping
+/// doesn't race the in-flight save of the same file. status: wikilink-name-normalize
+pub async fn normalize_wikilinks(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    store: &mut Store,
+    rel: &str,
+    text: &str,
+) -> Result<String, HikerError> {
+    let pending: Vec<crate::wikilink::ParsedLink> = crate::wikilink::parse_links(text)
+        .into_iter()
+        .filter(|l| !l.is_id_form() && !l.target.is_empty())
+        .collect();
+    if pending.is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let paths = vault.walk_indexable_files("")?;
+    // Cache name→ulid so multiple links to one note stamp it only once.
+    let mut stamped: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // (span, replacement) collected then applied right-to-left so byte offsets
+    // stay valid as we splice.
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+
+    for link in pending {
+        let crate::wikilink::NameResolution::Unique(target_path) =
+            crate::wikilink::resolve_name(&paths, &link.target)
+        else {
+            continue;
+        };
+        if target_path == rel {
+            continue; // self-link; don't stamp the file we're saving
+        }
+        let ulid = match stamped.get(&target_path) {
+            Some(id) => id.clone(),
+            None => {
+                let id = ensure_note_id_stamped(watcher, jobs, vault, store, &target_path).await?;
+                stamped.insert(target_path.clone(), id.clone());
+                id
+            }
+        };
+        let display = link.display.clone().unwrap_or_else(|| link.target.clone());
+        edits.push((link.span.clone(), format!("[[{ulid}|{display}]]")));
+    }
+
+    if edits.is_empty() {
+        return Ok(text.to_string());
+    }
+    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut out = text.to_string();
+    for (span, replacement) in edits {
+        out.replace_range(span, &replacement);
+    }
+    Ok(out)
 }
 

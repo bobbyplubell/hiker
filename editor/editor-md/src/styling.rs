@@ -30,6 +30,8 @@ pub const COLOR_CODE_BG: Color = Color::rgba(120, 120, 120, 30);
 pub const COLOR_QUOTE_BG: Color = Color::rgba(120, 120, 120, 20);
 pub const COLOR_QUOTE_BAR: Color = Color::rgb(140, 140, 160);
 pub const COLOR_HEADING_RULE: Color = Color::rgba(120, 120, 140, 50);
+/// Background painted behind `==highlight==` spans (a soft highlighter amber).
+pub const COLOR_HIGHLIGHT_BG: Color = Color::rgba(232, 207, 91, 90);
 
 #[derive(Clone, Copy)]
 struct MdPalette {
@@ -142,6 +144,10 @@ impl<'a> MdScan<'a> {
             .into_offset_iter()
             .collect();
 
+        // Byte ranges where the `==highlight==` / color-span scans must not
+        // fire: inline code and fenced/indented code blocks. Collected as we
+        // walk the event stream, then handed to `scan_marks` below.
+        let mut protected: Vec<std::ops::Range<usize>> = Vec::new();
         let mut stack: Vec<(Tag, std::ops::Range<usize>)> = Vec::new();
         for (event, byte_range) in events {
             if self.in_frontmatter(&byte_range) {
@@ -155,10 +161,14 @@ impl<'a> MdScan<'a> {
                 Event::End(end_tag) => {
                     if let Some((tag, start_range)) = stack.pop() {
                         let span = start_range.start..byte_range.end;
+                        if matches!(tag, Tag::CodeBlock(_)) {
+                            protected.push(span.clone());
+                        }
                         self.handle_end(&tag, end_tag, span);
                     }
                 }
                 Event::Code(_) => {
+                    protected.push(byte_range.clone());
                     // Inline code: style the whole span and hide the backticks.
                     let inner = strip_marker(self.text, &byte_range, '`');
                     if let Some(inner) = inner {
@@ -202,6 +212,99 @@ impl<'a> MdScan<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // Non-CommonMark inline extensions (`==highlight==`, colored `<span>`s).
+        // Run after the pulldown pass so they can skip code regions the parser
+        // already classified.
+        self.scan_highlights(&protected);
+        self.scan_color_spans(&protected);
+    }
+
+    /// True if `span` overlaps any protected (code) range or the frontmatter.
+    fn is_protected(&self, span: &std::ops::Range<usize>, protected: &[std::ops::Range<usize>]) -> bool {
+        self.in_frontmatter(span)
+            || protected.iter().any(|p| span.start < p.end && span.end > p.start)
+    }
+
+    /// Style `==highlight==` spans: an amber background over the inner text,
+    /// with the `==` markers hidden when the cursor is off the line (matching
+    /// how emphasis / strong markers reveal on the cursor line).
+    fn scan_highlights(&mut self, protected: &[std::ops::Range<usize>]) {
+        let bytes = self.text.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if !(bytes[i] == b'=' && bytes[i + 1] == b'=') {
+                i += 1;
+                continue;
+            }
+            let open = i;
+            let inner_start = i + 2;
+            // Find the closing `==` on the same line.
+            let mut j = inner_start;
+            let mut close = None;
+            while j + 1 < bytes.len() && bytes[j] != b'\n' {
+                if bytes[j] == b'=' && bytes[j + 1] == b'=' {
+                    close = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            match close {
+                Some(c) if c > inner_start && !self.is_protected(&(open..c + 2), protected) => {
+                    self.entries.push((
+                        inner_start..c,
+                        Decoration::Mark(MarkStyle {
+                            bg: Some(COLOR_HIGHLIGHT_BG),
+                            ..MarkStyle::default()
+                        }),
+                    ));
+                    if !self.on_cursor_line(open..c + 2) {
+                        self.entries.push((open..inner_start, Decoration::Replace { display: None }));
+                        self.entries.push((c..c + 2, Decoration::Replace { display: None }));
+                    }
+                    i = c + 2;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// Style `<span style="color:#rrggbb">…</span>` spans: paint the inner text
+    /// with the parsed color and hide the surrounding tags off the cursor line.
+    fn scan_color_spans(&mut self, protected: &[std::ops::Range<usize>]) {
+        const OPEN: &str = "<span style=\"color:";
+        let text = self.text;
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(OPEN) {
+            let open = from + rel;
+            let val_start = open + OPEN.len();
+            // Opening tag: `…color:VALUE">`.
+            let Some(q_rel) = text[val_start..].find('"') else { break };
+            let value = &text[val_start..val_start + q_rel];
+            let after_q = val_start + q_rel;
+            if !text[after_q..].starts_with("\">") {
+                from = val_start;
+                continue;
+            }
+            let inner_start = after_q + 2;
+            let Some(close_rel) = text[inner_start..].find("</span>") else { break };
+            let inner_end = inner_start + close_rel;
+            let close_end = inner_end + "</span>".len();
+            let span = open..close_end;
+            if let Some(color) = parse_hex_color(value.trim())
+                && !self.is_protected(&span, protected)
+            {
+                self.entries.push((
+                    inner_start..inner_end,
+                    Decoration::Mark(MarkStyle { fg: Some(color), ..MarkStyle::default() }),
+                ));
+                if !self.on_cursor_line(span.clone()) {
+                    self.entries.push((open..inner_start, Decoration::Replace { display: None }));
+                    self.entries.push((inner_end..close_end, Decoration::Replace { display: None }));
+                }
+            }
+            from = close_end.max(val_start);
         }
     }
 
@@ -341,13 +444,20 @@ impl<'a> MdScan<'a> {
     fn style_fenced_code_block(&mut self, range: &std::ops::Range<usize>) {
         let block_active = self.on_cursor_line(range.clone());
         let line_starts = self.collect_line_starts(range);
-        let first_ls = line_starts.first().copied();
-        let last_ls = line_starts.last().copied();
         let pal = self.pal;
-        for &ls in &line_starts {
+        for (idx, &ls) in line_starts.iter().enumerate() {
             let line_text = read_line_at(self.text, ls);
             let line_end = ls + line_text.len();
-            let is_fence = Some(ls) == first_ls || Some(ls) == last_ls;
+            // A line is a fence delimiter only when it consists solely of the
+            // fence run (plus optional info string on the block's opening line,
+            // plus trailing whitespace). The opening line — the first line of
+            // pulldown-cmark's block range — may carry an info string
+            // (` ```rust `); every other fence line must be the bare run.
+            // Lines that merely *contain* a triple-backtick alongside other
+            // content (Splunk inline comments, prose) are body, never fences,
+            // so an unterminated block's trailing body lines aren't mistaken
+            // for a closer and multi-block documents pair independently.
+            let is_fence = is_fence_line(line_text, idx == 0);
             if is_fence {
                 if !block_active {
                     self.entries.push((
@@ -584,6 +694,51 @@ fn strip_marker_double(text: &str, range: &std::ops::Range<usize>, marker: &str)
         return None;
     }
     Some(range.start + marker.len()..range.end - marker.len())
+}
+
+/// True when `line` is a code-fence delimiter: after trimming surrounding
+/// whitespace it begins with a run of 3+ identical fence characters
+/// (`` ` `` or `~`) and the remainder is a valid info string for that
+/// position. A *closing* fence (`allow_info == false`) must be the bare run
+/// — nothing may follow it. An *opening* fence (`allow_info == true`) may
+/// carry an info string, but a backtick info string may not itself contain
+/// a backtick (CommonMark), which is what keeps inline `` ```x``` `` lines
+/// out of the fence path.
+fn is_fence_line(line: &str, allow_info: bool) -> bool {
+    let trimmed = line.trim();
+    let fence_char = match trimmed.as_bytes().first() {
+        Some(b'`') => '`',
+        Some(b'~') => '~',
+        _ => return false,
+    };
+    let run = trimmed.chars().take_while(|&c| c == fence_char).count();
+    if run < 3 {
+        return false;
+    }
+    let info = trimmed[run..].trim();
+    if info.is_empty() {
+        return true;
+    }
+    // Non-empty trailing content: only an opening fence may carry it, and a
+    // backtick fence's info string may never contain a backtick.
+    allow_info && !(fence_char == '`' && info.contains('`'))
+}
+
+/// Parse a `#rgb` / `#rrggbb` CSS hex color into a [`Color`]. Returns `None`
+/// for any other form (named colors, `rgb()`, etc.) — the color button only
+/// ever emits hex, so unknown forms simply render unstyled.
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let h = value.strip_prefix('#')?;
+    let byte = |r: std::ops::Range<usize>| u8::from_str_radix(h.get(r)?, 16).ok();
+    match h.len() {
+        6 => Some(Color::rgb(byte(0..2)?, byte(2..4)?, byte(4..6)?)),
+        3 => {
+            // `#rgb` → each nibble doubled (`#abc` == `#aabbcc`).
+            let nib = |i: usize| u8::from_str_radix(h.get(i..i + 1)?, 16).ok().map(|v| v * 17);
+            Some(Color::rgb(nib(0)?, nib(1)?, nib(2)?))
+        }
+        _ => None,
+    }
 }
 
 fn read_line_at(text: &str, line_start: usize) -> &str {

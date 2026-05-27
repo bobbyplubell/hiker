@@ -1,6 +1,6 @@
 use super::*;
 use super::io::deep_merge;
-use super::sections::TreeSortBy;
+use super::sections::{SyncMode, TreeSortBy};
 use std::fs;
 use tempfile::tempdir;
 
@@ -123,6 +123,225 @@ fn write_back_patches_in_place_preserving_comments() {
     let raw = fs::read_to_string(&vault_path).unwrap();
     assert!(raw.contains("# my preferred toggles"), "comment lost: {raw}");
     assert!(raw.contains("live_preview = false"), "value not patched: {raw}");
+}
+
+#[test]
+fn editor_view_toggles_persist_and_reload() {
+    // The full set of write-back-eligible `[editor]` view toggles must
+    // survive a `Config::set` → `Config::load` round-trip, so a View-menu
+    // flip is still in effect after a relaunch. Each key is flipped away
+    // from its in-code default and then read back through the normal load
+    // path (strict-load, deep-merge, validation).
+    let dir = tempdir().unwrap();
+    let defaults = EditorConfig::default();
+    // (key, value-to-write, default-it-must-differ-from) for every bool
+    // toggle the View menu persists via `persist_view_setting`.
+    let flips: &[(&str, bool, bool)] = &[
+        ("editor.render_txt_as_markdown", false, defaults.render_txt_as_markdown),
+        ("editor.live_preview", false, defaults.live_preview),
+        ("editor.word_wrap", false, defaults.word_wrap),
+        ("editor.show_line_numbers", false, defaults.show_line_numbers),
+        ("editor.show_whitespace", true, defaults.show_whitespace),
+        ("editor.highlight_trailing_whitespace", true, defaults.highlight_trailing_whitespace),
+        ("editor.show_chunk_boundaries", true, defaults.show_chunk_boundaries),
+        ("editor.hide_frontmatter", true, defaults.hide_frontmatter),
+        ("editor.intraline_diff", true, defaults.intraline_diff),
+        ("editor.show_minimap", false, defaults.show_minimap),
+        ("editor.hide_scrollbar", true, defaults.hide_scrollbar),
+    ];
+    for (key, value, default) in flips {
+        assert_ne!(value, default, "flip for {key} must differ from its default");
+        Config::set(SettingsScope::Vault, key, &serde_json::Value::Bool(*value), dir.path())
+            .unwrap_or_else(|e| panic!("set {key} failed: {e}"));
+    }
+    // Fresh load from disk — the relaunch path. None of the flips may
+    // revert to their default.
+    let cfg = Config::load(dir.path()).unwrap();
+    let e = &cfg.editor;
+    assert!(!e.render_txt_as_markdown);
+    assert!(!e.live_preview);
+    assert!(!e.word_wrap);
+    assert!(!e.show_line_numbers);
+    assert!(e.show_whitespace);
+    assert!(e.highlight_trailing_whitespace);
+    assert!(e.show_chunk_boundaries);
+    assert!(e.hide_frontmatter);
+    assert!(e.intraline_diff);
+    assert!(!e.show_minimap);
+    assert!(e.hide_scrollbar);
+}
+
+#[test]
+fn op_log_section_round_trips() {
+    // status: op-log-config-section
+    // The whole `[op-log]` section must survive a serialize → parse round
+    // trip with its renamed (`op-log`) table key. Mirrors `defaults_round_trip`.
+    let cfg = Config::default();
+    let s = toml::to_string_pretty(&cfg).unwrap();
+    assert!(s.contains("[op-log]"), "section key not renamed: {s}");
+    let back: Config = toml::from_str(&s).unwrap();
+    assert_eq!(back.op_log.metadata_retention_days, 365);
+    assert_eq!(back.op_log.rejected_retention_days, 14);
+    assert!(!back.op_log.auto_reject_on_drift);
+    assert!(back.op_log.review_required);
+    assert!((back.op_log.compact_threshold - 4.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn op_log_keys_persist_and_reload() {
+    // status: op-log-config-section
+    // Every write-back-eligible `[op-log]` key must survive a
+    // `Config::set` → `Config::load` round-trip, flipped away from its
+    // in-code default. Mirrors `editor_view_toggles_persist_and_reload`.
+    let dir = tempdir().unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "op-log.metadata_retention_days",
+        &serde_json::json!(30),
+        dir.path(),
+    )
+    .unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "op-log.rejected_retention_days",
+        &serde_json::json!(7),
+        dir.path(),
+    )
+    .unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "op-log.auto_reject_on_drift",
+        &serde_json::Value::Bool(true),
+        dir.path(),
+    )
+    .unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "op-log.review_required",
+        &serde_json::Value::Bool(false),
+        dir.path(),
+    )
+    .unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "op-log.compact_threshold",
+        &serde_json::json!(8.0),
+        dir.path(),
+    )
+    .unwrap();
+    let cfg = Config::load(dir.path()).unwrap();
+    assert_eq!(cfg.op_log.metadata_retention_days, 30);
+    assert_eq!(cfg.op_log.rejected_retention_days, 7);
+    assert!(cfg.op_log.auto_reject_on_drift);
+    assert!(!cfg.op_log.review_required);
+    assert!((cfg.op_log.compact_threshold - 8.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn sync_section_round_trips_and_overrides() {
+    // status: sync-config-section
+    // Defaults apply when `[sync]` is absent; a full override block
+    // (mode = "server", an enrolled device, enabled = true) parses into
+    // the expected struct. Mirrors `op_log_section_round_trips`.
+
+    // Absent section → documented defaults.
+    let cfg: Config = toml::from_str("schema_version = 1\n").unwrap();
+    assert!(!cfg.sync.enabled);
+    assert_eq!(cfg.sync.mode, SyncMode::Peer);
+    assert!(cfg.sync.server_url.is_empty());
+    assert!(cfg.sync.discovery);
+    assert!(cfg.sync.devices.is_empty());
+
+    // Defaults survive a serialize → parse round trip.
+    let s = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(s.contains("[sync]"), "section missing: {s}");
+    let back: Config = toml::from_str(&s).unwrap();
+    assert!(!back.sync.enabled);
+    assert_eq!(back.sync.mode, SyncMode::Peer);
+
+    // Override block parses with snake_case mode + a device fingerprint.
+    let over: Config = toml::from_str(
+        r#"schema_version = 1
+[sync]
+enabled = true
+mode = "server"
+server_url = "/dns4/hub.example/tcp/4001"
+discovery = false
+devices = ["ABCDEFG-HIJKLMN"]
+"#,
+    )
+    .unwrap();
+    assert!(over.sync.enabled);
+    assert_eq!(over.sync.mode, SyncMode::Server);
+    assert_eq!(over.sync.server_url, "/dns4/hub.example/tcp/4001");
+    assert!(!over.sync.discovery);
+    assert_eq!(over.sync.devices, vec!["ABCDEFG-HIJKLMN".to_string()]);
+}
+
+#[test]
+fn op_log_compact_threshold_rejects_below_one() {
+    // status: op-log-config-section
+    let dir = tempdir().unwrap();
+    assert!(Config::set(
+        SettingsScope::Vault,
+        "op-log.compact_threshold",
+        &serde_json::json!(0.5),
+        dir.path(),
+    )
+    .is_err());
+}
+
+#[test]
+fn write_back_sync_mode_validates_allowed_values() {
+    // status: sync-config-section
+    // Mirrors the `vault.tree.sort_by` enum-as-string precedent: a member
+    // of the allowed set (`peer`/`server`/`both`) is accepted and lands on
+    // the typed field; anything else is rejected by the eligibility path.
+    let dir = tempdir().unwrap();
+    let cfg = Config::set(
+        SettingsScope::Vault,
+        "sync.mode",
+        &serde_json::Value::String("server".into()),
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(cfg.sync.mode, SyncMode::Server);
+
+    let err = Config::set(
+        SettingsScope::Vault,
+        "sync.mode",
+        &serde_json::Value::String("bogus".into()),
+        dir.path(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("invalid value"));
+}
+
+#[test]
+fn write_back_sync_keys_eligible_at_vault_scope() {
+    // status: sync-config-section
+    // The non-secret `[sync]` keys persist through the write-back path.
+    let dir = tempdir().unwrap();
+    Config::set(SettingsScope::Vault, "sync.enabled", &serde_json::Value::Bool(true), dir.path()).unwrap();
+    Config::set(SettingsScope::Vault, "sync.discovery", &serde_json::Value::Bool(false), dir.path()).unwrap();
+    Config::set(
+        SettingsScope::Vault,
+        "sync.server_url",
+        &serde_json::Value::String("/dns4/hub.example/tcp/4001".into()),
+        dir.path(),
+    )
+    .unwrap();
+    let cfg = Config::set(
+        SettingsScope::Vault,
+        "sync.devices",
+        &serde_json::json!(["ABCDEFG-HIJKLMN"]),
+        dir.path(),
+    )
+    .unwrap();
+    assert!(cfg.sync.enabled);
+    assert!(!cfg.sync.discovery);
+    assert_eq!(cfg.sync.server_url, "/dns4/hub.example/tcp/4001");
+    assert_eq!(cfg.sync.devices, vec!["ABCDEFG-HIJKLMN".to_string()]);
 }
 
 #[test]

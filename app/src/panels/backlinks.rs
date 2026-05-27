@@ -116,13 +116,23 @@ impl View<'_> {
         }
     }
 
-    /// Scan every indexable note in the vault for `[[Target]]` wikilinks
-    /// whose target resolves to `active`. Returns a deduped list of source
-    /// paths. Resolution is intentionally lenient: a wikilink matches if
-    /// its target equals `active`, `active` with `.md` stripped, the
-    /// basename of `active`, or the basename without extension.
+    /// Scan every indexable note in the vault for wikilinks pointing at
+    /// `active`, matching both link forms: an id-form `[[<ulid>|…]]` whose
+    /// ULID equals `active`'s stamped id (resolved through the store's
+    /// `path → id` table, so it survives target moves), and a name-form
+    /// `[[Name]]` whose target equals `active`, `active` with `.md` stripped,
+    /// the basename, or the basename without extension. Returns a deduped
+    /// list of source paths. status: wikilink-backlinks
     fn scan_backlinks(&self, active: &str) -> Vec<String> {
-        let targets = self.wikilink_target_aliases(active);
+        let active_ulid = self
+            .app
+            .vault_session
+            .services
+            .read_store
+            .lock()
+            .ok()
+            .and_then(|s| s.id_for_path(active).ok().flatten());
+        let aliases = self.wikilink_target_aliases(active);
         let Ok(paths) = self.app.vault_session.vault.walk_indexable_files("") else {
             return Vec::new();
         };
@@ -134,7 +144,14 @@ impl View<'_> {
             let Ok(body) = self.app.vault_session.vault.read_file(&rel) else {
                 continue;
             };
-            if self.has_wikilink_to(&body, &targets) {
+            let links_here = hiker_core::wikilink::parse_links(&body).into_iter().any(|l| {
+                if l.is_id_form() {
+                    active_ulid.as_deref() == Some(l.target.as_str())
+                } else {
+                    aliases.iter().any(|a| a == &l.target)
+                }
+            });
+            if links_here {
                 out.push(rel);
             }
         }
@@ -155,33 +172,4 @@ impl View<'_> {
         v
     }
 
-    fn has_wikilink_to(&self, body: &str, targets: &[String]) -> bool {
-        // Cheap byte scan for `[[target]]` (with optional `|alias`). We
-        // avoid a regex dependency in this hot path.
-        let bytes = body.as_bytes();
-        let mut i = 0;
-        while i + 3 < bytes.len() {
-            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-                let inner_start = i + 2;
-                let mut j = inner_start;
-                while j + 1 < bytes.len()
-                    && !(bytes[j] == b']' && bytes[j + 1] == b']')
-                    && bytes[j] != b'\n'
-                {
-                    j += 1;
-                }
-                if j + 1 < bytes.len() && bytes[j] == b']' && bytes[j + 1] == b']' {
-                    let target = &body[inner_start..j];
-                    let target = target.split('|').next().unwrap_or(target).trim();
-                    if !target.is_empty() && targets.iter().any(|t| t == target) {
-                        return true;
-                    }
-                    i = j + 2;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        false
-    }
 }

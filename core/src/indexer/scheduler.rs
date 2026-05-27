@@ -35,7 +35,7 @@ where
     pub embedder_cell: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     pub self_tx: IndexJobTx,
     pub watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    pub changes_cell: Arc<OnceCell<Arc<crate::changes::Changes>>>,
+    pub oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
     pub tasks: Option<EmbedderLoadTaskPlumbing>,
 }
 
@@ -56,7 +56,7 @@ pub(super) async fn run(self) {
         embedder_cell,
         self_tx,
         watcher_cell,
-        changes_cell,
+        oplog_cell,
         tasks,
     } = self;
     let tasks_queue: Option<Arc<crate::tasks::queue::Queue>> = tasks.as_ref().map(|p| p.queue.clone());
@@ -74,7 +74,7 @@ pub(super) async fn run(self) {
         embedder_cell: &embedder_cell,
         self_tx: &self_tx,
         watcher_cell: &watcher_cell,
-        changes_cell: &changes_cell,
+        oplog_cell: &oplog_cell,
         tasks_queue: tasks_queue.as_ref(),
     };
 
@@ -121,7 +121,7 @@ struct LoopState<'a> {
     embedder_cell: &'a Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     self_tx: &'a IndexJobTx,
     watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    changes_cell: &'a Arc<OnceCell<Arc<crate::changes::Changes>>>,
+    oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
     tasks_queue: Option<&'a Arc<crate::tasks::queue::Queue>>,
 }
 
@@ -295,7 +295,7 @@ impl<'a> LoopState<'a> {
                     pending: self.pending,
                     self_tx: self.self_tx,
                     watcher_cell: self.watcher_cell,
-                    changes_cell: self.changes_cell,
+                    oplog_cell: self.oplog_cell,
                 };
                 handle_simple_job(&ctx, store, other).await;
             }
@@ -359,7 +359,7 @@ impl<'a> LoopState<'a> {
                 pending: self.pending,
                 self_tx: self.self_tx,
                 watcher_cell: self.watcher_cell,
-                changes_cell: self.changes_cell,
+                oplog_cell: self.oplog_cell,
             };
             handle_simple_job(&ctx, store, j).await;
             update_total_notes(self.status, store);

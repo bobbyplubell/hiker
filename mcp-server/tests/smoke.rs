@@ -9,12 +9,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use hiker_core::changes::Changes;
 use hiker_core::chunker::Chunk;
 use hiker_core::config::sections::{McpAuditConfig, McpConfig, McpToolsConfig};
 use hiker_core::embed::{Error, Embedder};
 use hiker_core::indexer::{start as start_indexer, Handle};
-use hiker_core::staging::Staging;
 use hiker_core::store::dto::{new_id, NoteUpsert};
 use hiker_core::store::Store;
 use hiker_core::vault::Vault;
@@ -50,7 +48,6 @@ async fn boot(config: McpConfig) -> Booted {
     let store = Store::open(td.path()).unwrap();
     let read_store = Arc::new(Mutex::new(Store::open(td.path()).unwrap()));
     let watcher = Arc::new(Watcher::start(td.path()).unwrap());
-    let changes = Arc::new(Changes::open(td.path()).unwrap());
     let idx = start_indexer(vault.clone(), store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     });
@@ -62,22 +59,21 @@ async fn boot(config: McpConfig) -> Booted {
         hiker_core::config::sections::TasksConfig::default(),
     ));
     let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
-    let staging = std::sync::Arc::new(Staging::open(td.path()).unwrap());
+    let oplog = std::sync::Arc::new(hiker_core::oplog::OpLog::open(td.path()).unwrap());
     let deps = McpDeps {
         vault,
         vault_root: td.path().to_path_buf(),
         read_store: read_store.clone(),
         jobs: idx.job_sender(),
         watcher,
-        changes,
         embedder_provider: idx.embedder_provider(),
         config,
         tools: mcp_tools,
-        staging,
         audit,
         tasks,
         tasks_config: hiker_core::config::sections::TasksConfig::default(),
         llm_enabled: false,
+        oplog: Some(oplog),
     };
     let handle = start(deps).await.expect("start mcp");
     let url = handle.url();
@@ -162,9 +158,37 @@ async fn server_lists_expected_tools() {
         "set_frontmatter",
         "apply_tag",
         "remove_tag",
+        "boards_list",
+        "board_get",
+        "board_add_card",
     ] {
         assert!(tools.contains(&expected.to_string()), "missing {expected} in {tools:?}");
     }
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_get_returns_columns_and_cards() {
+    let b = boot(McpConfig::default()).await;
+    // Hand-write a board-doc; `board_get` reads the file directly and
+    // resolves each card against the index (an unindexed card resolves as an
+    // orphan, which is fine for this read-path assertion).
+    std::fs::create_dir_all(b.td.path().join("boards")).unwrap();
+    let board_src = "---\nhiker:\n  kind: board\n  id: 01BOARD\n  columns:\n    - name: Todo\n      cards:\n        - { id: 01CARD, path: \"note.md\" }\n    - name: Done\n      cards: []\n---\n# Roadmap\n\nframing\n";
+    std::fs::write(b.td.path().join("boards/roadmap.md"), board_src).unwrap();
+
+    let resp = call_tool(&b, "board_get", serde_json::json!({
+        "rel_path": "boards/roadmap.md",
+    })).await;
+    let s = structured(&resp);
+    assert_eq!(s["rel_path"], "boards/roadmap.md");
+    assert_eq!(s["board_id"], "01BOARD");
+    let columns = s["columns"].as_array().expect("columns array");
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0]["name"], "Todo");
+    assert_eq!(columns[0]["cards"].as_array().unwrap().len(), 1);
+    assert_eq!(columns[1]["name"], "Done");
+    assert!(columns[1]["cards"].as_array().unwrap().is_empty());
     shutdown(b).await;
 }
 
@@ -263,6 +287,72 @@ async fn get_note_snippet_falls_back_to_head_when_unindexed() {
     assert_eq!(s["detail"], "snippet");
     assert!(s["snippet"].as_str().unwrap().starts_with("head of file content"));
     assert!(s["heading_path"].is_null());
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_note_reflects_agents_own_staged_write() {
+    // op-log-agent-replica: in review mode a staged write never touches disk,
+    // but the authoring agent's get_note must read its own pending replica
+    // (accepted + the agent's queued ops) so a follow-up read sees the edit.
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: true, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+    std::fs::write(b.td.path().join("a.md"), "original body\n").unwrap();
+
+    let resp = call_tool(&b, "write_note", serde_json::json!({
+        "rel_path": "a.md",
+        "content": "agent rewrote this\n",
+    })).await;
+    assert_eq!(structured(&resp)["status"], "staged", "resp: {resp}");
+
+    // Disk still holds the pre-edit content (nothing accepted).
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "original body\n");
+
+    // The agent's own read reflects its staged edit.
+    let resp = call_tool(&b, "get_note", serde_json::json!({
+        "rel_path": "a.md",
+        "detail": "full",
+    })).await;
+    assert_eq!(
+        structured(&resp)["content"], "agent rewrote this\n",
+        "agent get_note should return its own pending replica: {resp}",
+    );
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_note_reflects_agents_own_staged_edit() {
+    // Same agent-replica guarantee for an anchored edit_note staged for review.
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: true, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+    std::fs::write(b.td.path().join("a.md"), "hello foo world\n").unwrap();
+
+    let resp = call_tool(&b, "edit_note", serde_json::json!({
+        "rel_path": "a.md",
+        "edits": [{"old_str": "foo", "new_str": "FOO"}],
+    })).await;
+    assert_eq!(structured(&resp)["status"], "staged", "resp: {resp}");
+
+    // Disk unchanged until accept.
+    let on_disk = std::fs::read_to_string(b.td.path().join("a.md")).unwrap();
+    assert_eq!(on_disk, "hello foo world\n");
+
+    // The agent reads its own staged replacement.
+    let resp = call_tool(&b, "get_note", serde_json::json!({
+        "rel_path": "a.md",
+        "detail": "full",
+    })).await;
+    assert_eq!(
+        structured(&resp)["content"], "hello FOO world\n",
+        "agent get_note should reflect its staged edit: {resp}",
+    );
     shutdown(b).await;
 }
 

@@ -51,7 +51,7 @@ fn wikilink_replace_consolidates_to_one_segment() {
     let doc = "Wikilink: [[Home]] in prose.\nsecond line\n";
     let mut state = EditorState::new(doc);
     state.selection = editor_core::selection::Selection::single(doc.len());
-    let set = wikilink_decorations(&state, None, None);
+    let set = wikilink_decorations(&state, None, None, None);
     // Find the Replace decoration's range.
     let replace_range = set
         .iter_all()
@@ -81,7 +81,7 @@ fn widget_consolidates_replace_segments() {
     let mut state = EditorState::new(doc);
     state.selection = editor_core::selection::Selection::single(doc.len());
     let mut view = ViewState::default();
-    view.decorations.push(wikilink_decorations(&state, None, None));
+    view.decorations.push(wikilink_decorations(&state, None, None, None));
     run_one_frame(&mut state, &mut view);
 }
 
@@ -137,5 +137,75 @@ fn mouse_wheel_events_are_not_translated() {
     assert!(
         translated.is_none(),
         "MouseWheel events should pass through to smooth_scroll_delta, not translate to InputEvent::Scroll"
+    );
+}
+
+/// Regression (`bug-all-tabs-scroll-together`): egui's `smooth_scroll_delta`
+/// is a single global per-frame value. With split editor panes, only the
+/// hovered pane should consume a wheel spin — but the widget used to also
+/// scroll on `has_focus()`, so a focused-but-not-hovered pane scrolled in
+/// lockstep with the hovered one (every visible editor moving together).
+///
+/// This drives one editor widget, grants it focus, then sends a wheel delta
+/// while the pointer sits OUTSIDE the widget rect (so `hovered()` is false but
+/// `has_focus()` is true). `scroll_y` must stay put: a focused, non-hovered
+/// editor must not consume the global scroll delta.
+#[test]
+fn focused_but_unhovered_editor_does_not_scroll() {
+    // A doc tall enough that scrolling is actually possible at 600px height.
+    let doc = (0..200).map(|i| format!("line {i}\n")).collect::<String>();
+    let mut state = EditorState::new(&doc);
+    let mut view = ViewState::default();
+
+    // The closure holds `&mut view` for the harness's lifetime, so observe
+    // `scroll_y` from inside the closure via a Cell rather than reading `view`
+    // directly after each frame.
+    let observed = std::cell::Cell::new(0.0_f32);
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 600.0))
+        .build_ui(|ui| {
+            EditorWidget::new(&mut state, &mut view).show(ui);
+            observed.set(view.scroll_y);
+        });
+    harness.run();
+
+    // Grant focus: press + release inside the widget rect.
+    let inside = egui::pos2(100.0, 100.0);
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: inside,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: inside,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    harness.run();
+    harness.run();
+
+    let scroll_before = observed.get();
+
+    // Move the pointer well outside the widget (negative coords) so the
+    // widget is focused but NOT hovered, then send a downward wheel spin.
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(egui::pos2(-50.0, -50.0)));
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -10.0),
+        modifiers: Default::default(),
+    });
+    harness.run();
+
+    let scroll_after = observed.get();
+
+    assert_eq!(
+        scroll_before, scroll_after,
+        "a focused but non-hovered editor must not consume the global scroll delta \
+         (scroll_y moved from {scroll_before} to {scroll_after})"
     );
 }

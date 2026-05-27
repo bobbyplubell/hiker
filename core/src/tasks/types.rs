@@ -51,7 +51,7 @@ pub enum TaskKind {
     /// Per-cluster LLM summarize task (RAPTOR build or user-triggered
     /// regenerate). Payload identifies the tree + node + level so the
     /// worker can look up members and resolve the output back into
-    /// `trees.db`. status: task-queue-raptor-summarize
+    /// the tree's `.md`. status: task-queue-raptor-summarize
     RaptorSummarize {
         tree_id: String,
         cluster_node_id: String,
