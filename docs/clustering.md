@@ -1,8 +1,8 @@
 # Clustering
 
-How Hiker builds a hierarchical tree of topics from an unorganized vault. This doc covers the *build* side only — turning embeddings into a tree of nodes with names. The tree is consumed by `suggestions.md`, which uses it as a recommendation engine (one-shot reorganization proposals + saved-tree inbox triage); it is **not** durable infrastructure that owns the user's organization. Per-note placement provenance, manual-vs-auto stickiness, durable cluster IDs, and a parallel curated-tree-vs-filesystem mental model are explicitly out of scope — see `design.md`'s "Auto-organization suggestions" section.
+How Hiker builds a hierarchical tree of topics from an unorganized vault. This doc covers the *build* side only — turning embeddings into a tree of named clusters. The tree is consumed by `cluster-editor.md` as a durable, user-authored organizational layer whose per-cluster policies (Tag / Move / Freeze) drive tagging and moving of notes. The filesystem still holds the notes' bytes — a Move policy really renames the file, a Tag policy really writes frontmatter — but the tree is the organizing structure the user curates over them.
 
-Not built in v1. Lands alongside the suggestions surface (post-v1, after the related-notes panel proves the index pipeline). Speccing now because (a) the build algorithm shapes what suggestions look like, (b) it determines the cost model that decides whether a one-shot run takes seconds or minutes, and (c) it's the thing the synthetic-corpus eval (`qa.md`) is supposed to validate.
+Not built in v1. Lands alongside the cluster editor (post-v1, after the related-notes panel proves the index pipeline). Speccing now because (a) the build algorithm shapes the trees the cluster editor surfaces, (b) it determines the cost model that decides whether a build run takes seconds or minutes, and (c) it's the thing the synthetic-corpus eval (`qa.md`) is supposed to validate.
 
 
 ## Operations framework
@@ -17,25 +17,25 @@ Tree construction and edits are composed from three primitive operations. The cl
 
 The headline framing decisions:
 
-- **Split is top-down divisive.** A Split against the virtual root produces a coarse top-level partition; recursive sub-splits descend into each top-level child's members. At each sub-split, the algorithm operates on actual note embeddings within the parent's member set, not on geometric centroids. The pathology of clustering already-distinct cluster centroids (centroids of well-separated clusters are by construction well-separated, so no partition algorithm finds structure at the parent level) doesn't arise — each Split level sees the right granularity of data. [cluster-op-split]
-- **Summarize is its own op, never run implicitly by Split.** Split produces unnamed clusters with `name = "Cluster N"` placeholders. The user invokes Summarize explicitly via the cluster editor (per-node, multi-select subset, or scope-driven sweep), or the build recipe composes Split + Summarize as a canned recipe. This separation lets the user defer or skip LLM-naming entirely (run on a `[llm].enabled = false` vault, name clusters by hand, or batch-name later). [cluster-op-summarize-sweep]
-- **Roll-up is the way to grow a parent layer.** When the user wants to coarsen an already-named tree's top level, they invoke Roll-up over the top-level cluster ids. Roll-up clusters the summary *embeddings* (not centroids of member embeddings) so the new parent layer reflects semantic similarity between *what the clusters are about*, not geometric similarity between their members. This is the RAPTOR-shaped step, available as an explicit user action rather than a step baked into every build. [cluster-op-rollup]
+- **Split is flat by default; recursion is opt-in.** A Split against the virtual root produces a single coarse top-level partition and stops — the legible default. The user deepens deliberately: a per-cluster **manual** Split (one more level under that cluster), or an **auto-recurse** mode that descends every branch to a chosen depth or until a cohesion threshold trips. At each sub-split the algorithm operates on actual note embeddings within the parent's member set, not on geometric centroids, so the pathology of clustering already-distinct centroids never arises — each Split level sees the right granularity of data. [cluster-op-split, cluster-recursion-modes]
+- **Summarize is its own op, never run implicitly by Split.** Split produces unnamed clusters with `name = "Cluster N"` placeholders. The user invokes Summarize explicitly via the cluster editor (per-node, multi-select subset, or scope-driven sweep), or the build recipe composes Split + Summarize as a canned recipe. Naming runs **deterministically** (extractive keywords / the most-central note's title) by default or via an LLM, so the whole loop can run with `[llm].enabled = false`. [cluster-op-summarize-sweep, cluster-name-deterministic]
+- **Roll-up grows a parent layer — the dual of Split.** Coarsen a tree by grouping clusters under new parents: **manually** (wrap a selected set of clusters under one new parent — no algorithm), or **automatically** (cluster the clusters). What gets clustered is the chosen **representation** (`cluster-representation`): centroids by default (always available), the clusters' summary embeddings when named (semantic), or a deterministic lexical vector. Roll-up adds at most one layer per invocation. [cluster-op-rollup, cluster-op-wrap]
 
 ### Split
 
-`Split` partitions a target cluster's leaves into sub-clusters and reparents the leaves under the new children. The target's own row is preserved (id, name, summary, user-edit flags, policy); only its descendants change.
+`Split` partitions a target cluster's leaves into sub-clusters and reparents the leaves under the new children. The target's own row is preserved (name, summary, policy); only its descendants change.
 
-Inputs: `target_node_id` (or a virtual-root sentinel for the build scope), `ClusterParams` (algorithm + per-algorithm tunables, plus the recipe's leaf stop conditions when invoked recursively).
+Inputs: `target_node_id` (or a virtual-root sentinel for the build scope), `ClusterParams` (algorithm + per-algorithm tunables + the `representation` to partition over + a `recursion` mode + the leaf stop conditions used by the Auto mode).
 
-Algorithm choice drives the partition step inside Split (see §"Algorithm choices" below). Leiden is the default; HDBSCAN, Hybrid, and a GMM stub are selectable.
+Algorithm choice drives the partition step inside Split (see §"Algorithm choices" below); the `representation` (see §"Representation") decides what each unit is reduced to before partitioning. Leiden is the default algorithm; HDBSCAN, Hybrid, and a GMM stub are selectable.
 
-Recursive sub-split — when Split is invoked with `recurse: true`, each newly-produced child whose member count exceeds `leaf_min_size` (default 5) and whose intra-cluster cohesion radius exceeds `leaf_cohesion_threshold` (default 0.15) is itself Split. Branches stop when either threshold trips. The recipe (below) sets `recurse: true`; the cluster editor's row-menu "Split" verb uses `recurse: false` (one level only). [cluster-op-split]
+Recursion mode — Split takes one of three modes: **Flat** (default — partition once and stop), **Manual** (the cluster editor's row-menu "Split" verb — one level under the target), or **Auto** (descend every branch until a stop condition trips: a fixed `max_depth`, or per-branch member count below `leaf_min_size` (default 5) / cohesion radius below `leaf_cohesion_threshold` (default 0.15)). The build recipe defaults to Flat; the user opts into Auto in the review tab or deepens by hand afterward. [cluster-op-split, cluster-recursion-modes]
 
 The `split` op's reverse edit snapshots the prior subtree for undo per `cluster-editor-undo-redo`.
 
 ### Summarize
 
-`Summarize` generates `name` + `summary` for every cluster matching `scope`. One LLM call per cluster, batched through the task queue.
+`Summarize` generates `name` + `summary` for every cluster matching `scope`. Runs deterministically (no LLM) by default, or one LLM call per cluster batched through the task queue.
 
 ```rust
 enum SummarizeScope {
@@ -48,20 +48,22 @@ struct SummarizeParams {
     scope: SummarizeScope,
     subtree_root: Option<ClusterId>,      // None = whole tree; constrains All / StaleOrUnfilled
     recursive: bool,                      // default true; only relevant for subtree_root != None
-    summarize: SummarizeMode,             // None / Template / Llm
-    overwrite_user_edited: bool,          // default false
+    mode: SummarizeMode,                  // None / Extractive (default) / Llm
+    force: bool,                          // default false: skip clusters whose name isn't a placeholder
 }
 ```
 
 Scope semantics:
 
 - **`All`** — every cluster row in the (sub)tree.
-- **`StaleOrUnfilled`** — every cluster row where `summary_membership_churn > 0 OR summary IS NULL OR name IS NULL`. The staleness counter (`cluster-summary-staleness-counter`) is the load-bearing infrastructure; every reshape op already bumps it, so this scope is a no-op once everything is fresh.
+- **`StaleOrUnfilled`** — every cluster row where `summary_membership_churn > 0 OR summary is empty OR name is a `Cluster N` placeholder`. The staleness counter (`cluster-summary-staleness-counter`) is the load-bearing infrastructure; every reshape op already bumps it, so this scope is a no-op once everything is fresh.
 - **`Subset { ids }`** — exactly the listed cluster ids; useful for "Summarize this one cluster" (single-element subset) and "Summarize selected" (multi-select subset). Out-of-tree ids are silently dropped.
 
-`overwrite_user_edited` defaults to `false`: clusters whose `user_edited_name` or `user_edited_summary` flag is set get skipped. Set to `true` for explicit per-node Regenerate. The flag composes with `scope` — a `Subset` summarize with `overwrite_user_edited = false` against a user-edited node is a no-op (returns `SkippedUserEdited`).
+`force` defaults to `false`: a cluster whose name is *not* a `Cluster N` placeholder is left alone — its name was given by the user or a prior naming pass. Set `force = true` for explicit per-node Regenerate. The guard composes with `scope` — a `Subset` summarize with `force = false` against an already-named cluster is a no-op (returns `SkippedNamed`).
 
-`SummarizeMode::None` short-circuits without invoking the summarizer; the cluster keeps its placeholder name. This is the path used by the build recipe when the user wants Split + Roll-up without naming.
+`SummarizeMode::None` short-circuits without invoking the summarizer; the cluster keeps its placeholder name. This is the path used when the user wants structure without naming.
+
+`SummarizeMode::Extractive` is the deterministic default: a cluster's name comes from the top TF-IDF / KeyBERT-style terms over its members (document-frequency drawn from the existing lexical/FTS index, not a bespoke corpus), with the most-central member note's title as the fallback; the summary is a short extractive blurb. No model, instant, reproducible. Paired with a deterministic `representation` (`cluster-representation`), the entire structural + naming loop runs with `[llm]` disabled. `SummarizeMode::Llm` is the optional upgrade. [cluster-name-deterministic]
 
 Queue integration: every `Summarize` invocation enqueues one `TaskKind::ClusterSummarize { tree_id, scope_kind, n_targets }` row that the user can watch in the queue. Per-cluster `RaptorSummarize` tasks (already specced as `cluster-editor-regenerate-via-task-queue`) are the fan-out underneath. [cluster-op-summarize-sweep]
 
@@ -69,11 +71,12 @@ Bottom-up submission ordering carries over from `cluster-editor-regenerate-via-t
 
 ### Roll-up
 
-`Roll-up` grows a new parent layer over a set of existing clusters by clustering the *summary embeddings* (not the geometric centroids of member embeddings).
+`Roll-up` grows a new parent layer over a set of existing clusters by clustering their chosen **representation** (`cluster-representation`) — centroids by default, summary embeddings or a lexical vector optionally.
 
 ```rust
 struct RollupParams {
     input_node_ids: Vec<ClusterId>,
+    representation: Representation,        // centroid (default) / summary-embedding / lexical (cluster-representation)
     algorithm: ClusterAlgorithm,          // same as Split
     leiden: LeidenParams,
     min_cluster_size: u32,                // for HDBSCAN
@@ -83,11 +86,11 @@ struct RollupParams {
 
 Steps:
 
-1. Validate every `input_node_id` exists in the same tree and carries a non-empty `summary`. Errors `MissingSummary { node_id }` on the first violation. The caller's responsibility to run `Summarize` first.
-2. For each input cluster, embed its `summary` text via `Embedder::embed_batch`. The summary embedding's dim is whatever the loaded embedder reports (`embedder-dim-from-model`); the result is stored only in memory for the partition step, not persisted.
+1. Validate every `input_node_id` exists in the same tree. When `representation = SummaryEmbedding`, additionally require a non-empty `summary` on each input (errors `MissingSummary { node_id }`, so the caller runs `Summarize` first); the centroid and lexical representations have no such precondition.
+2. Build each input's representation vector (`cluster-representation`): its cached centroid, its summary embedding (embed the `summary` text via `Embedder::embed_batch`), or its lexical vector. Stored only in memory for the partition step, not persisted.
 3. Run the partition algorithm (`partition` for HDBSCAN, `partition_leiden` for Leiden) over the summary embeddings.
 4. For each resulting community, insert a new cluster node at the layer above the inputs. Each new parent's members = the input clusters that landed in its community; their `parent` is updated to point at the new parent. The new parents have placeholder names (`new_layer_name_pattern.unwrap_or("Group {n}")`); a subsequent `Summarize { Subset(new_parent_ids) }` invocation fills them in.
-5. The new parents' `centroid` is the L2-normalized mean of their input clusters' summary embeddings. `radius` is the 90th-percentile cosine distance from centroid to inputs. `confidence` is inherited from the partition's confidence metric (HDBSCAN stability or Leiden modularity contribution).
+5. The new parents' `centroid` is the L2-normalized mean of their input clusters' representation vectors. `radius` is the 90th-percentile cosine distance from centroid to inputs. `confidence` is inherited from the partition's confidence metric (HDBSCAN stability or Leiden modularity contribution).
 
 If the partition produces a single community, Roll-up returns `Refused { reason: "all inputs landed in one community" }` without inserting any rows — a single super-parent is uninformative. The user can lower the algorithm's resolution (Leiden) or `min_cluster_size` (HDBSCAN) and re-invoke. Symmetrically, when every input lands in its own singleton community, Roll-up returns `Refused { reason: "no inputs merged" }`.
 
@@ -95,28 +98,30 @@ Roll-up does not recurse on its own — one invocation produces at most one new 
 
 The `rollup` op's reverse edit snapshots the prior `parent`s of the inputs + the new parent nodes so undo restores the original top-level structure.
 
+**Manual wrap.** Selecting a set of clusters and wrapping them under one new parent is a pure structural edit — no algorithm, no representation: insert a parent node, reparent the selected clusters under it, leave a placeholder name. The dual of a manual Split, and the by-hand counterpart to automatic Roll-up. [cluster-op-wrap]
+
 
 ## Build recipe
 
 "Build a tree from scratch" is a composition of the three ops, not a monolithic algorithm. The clustering review tab (`cluster-review-tab` in `cluster-editor.md`) drives the recipe:
 
 ```
-1. Split { target: virtual_root(scope), params: ClusterParams { recurse: true, ... } }
-   → produces a tree of leaf clusters with placeholder names
+1. Split { target: virtual_root(scope), params: { recursion: Flat (default), representation, ... } }
+   → a single-level partition of leaf clusters with placeholder names
+   (opt into recursion: Auto for a deeper tree in one pass, or deepen by hand later)
 
-2. Summarize { scope: All, subtree_root: None, summarize: <user choice> }
-   → fills name + summary on every cluster row
+2. Name { scope: All, mode: Extractive (default) | Llm | None }
+   → fills name + summary on every cluster
 
-3. (Optional, default off) Rollup { input_node_ids: top_level_cluster_ids, ... }
-   → grows a parent layer above the initial top level when the user wants
-     additional hierarchy depth
+3. (Optional) Rollup and/or per-cluster manual Split
+   → grow the hierarchy up or down, where the user wants it
 ```
 
 [cluster-build-recipe]
 
-Steps 1 and 2 are gated separately in the review tab — the structural pass (Run clustering) is step 1 alone; Confirm-and-name is step 1 followed by step 2; Confirm-no-naming is step 1 alone with the result persisted. Step 3 is invoked from the cluster editor's toolbar after the tree is persisted (not from the review tab); doing so during the build is unnecessary since top-down divisive Split already produces a hierarchical shape. The build uses top-down Split rather than recursive Roll-up because Roll-up would force a Summarize at every level (doubling the LLM dependency); Roll-up stays an explicit verb for coarsening an already-named tree.
+Steps 1 and 2 are gated separately in the review tab — the structural pass (Run clustering) is step 1 alone; Confirm names via step 2 (deterministic by default, or LLM, or skipped). The result is flat unless the user chose `recursion: Auto`. Deepening — down via manual or auto Split, up via Roll-up or a manual wrap — happens afterward from the cluster editor, so the user grows the hierarchy exactly where they want it rather than all at once. Down-recursion uses divisive Split rather than recursive Roll-up because Roll-up over summary embeddings would force a Summarize at every level (doubling the naming dependency); Roll-up stays the explicit coarsening verb.
 
-Top-down divisive parameters that the recipe sets on the Split call:
+Parameters for the top-level split and (when chosen) Auto recursion:
 
 - **`top_level_resolution`** (Leiden only) — γ override for the *first* Split call against the virtual root. Default `0.3`, lower than the default `1.0` used at sub-splits. Lower γ produces coarser, fewer communities at the top level (target: 3–8 broad clusters). Recursive sub-splits revert to `LeidenParams.resolution` for finer structure. Lives on `LeidenParams` as a new field with `#[serde(default = "default_leiden_top_resolution")]`. [cluster-leiden-params]
 - **`leaf_min_size`** — recursive sub-split stops when a child has fewer members than this. Default `5`. On `ClusterParams`.
@@ -133,9 +138,12 @@ Surviving / changed knobs at a glance:
 | `min_clusters_to_recurse` | **removed** | replaced by per-branch leaf conditions |
 | `summary_confidence_threshold` | survives | marks below-threshold clusters as "uncertain" in the review surface |
 | `include_outliers` | survives | controls force-routing of outliers at the top-level Split |
-| `disable_recursion` | survives | when `true`, Split runs once and returns; equivalent to `recurse: false` on the top-level Split |
-| `leaf_min_size` | new | recursive Split stop condition |
-| `leaf_cohesion_threshold` | new | recursive Split stop condition |
+| `recursion` | new | mode: Flat (default — single split) / Manual / Auto |
+| `leaf_min_size` | new | Auto-recursion stop condition (per-branch member count) |
+| `leaf_cohesion_threshold` | new | Auto-recursion stop condition (per-branch cohesion radius) |
+| `max_depth` | new | Auto-recursion depth cap |
+| `representation` | new | what each unit is reduced to before partitioning — centroid / summary / lexical (`cluster-representation`) |
+| `naming mode` | new | None / Extractive (default) / Llm (`cluster-name-deterministic`) |
 | `leiden.top_level_resolution` | new | first-Split γ override; recursive sub-splits use `leiden.resolution` |
 | `leiden.resolution` | survives | sub-split γ |
 | `leiden.k_nearest`, `edge_weight_floor`, `iterations`, `min_cluster_size` | survive | unchanged |
@@ -233,6 +241,23 @@ HDBSCAN runs first; outliers get reassigned to the nearest cohesive cluster's ce
 `cluster.algorithm` lives in `vault/.hiker/config.toml` as a per-vault default; the clustering review tab's Advanced disclosure overrides it per build. Per-vault rather than per-user — different vaults have different shapes (a structured reference vault vs. a fleeting-thoughts journal cluster very differently). [cluster-algorithm-selectable]
 
 
+## Representation
+
+`representation` decides what each *unit* is reduced to before the partition algorithm sees it. It is orthogonal to the algorithm (which decides *how* to partition) and to direction: Split's units are notes, Roll-up's units are clusters. One routine, `cluster(units, representation, method)`, services both. [cluster-representation]
+
+Three representations, each with a distinct character:
+
+| Representation | Vector | Character |
+| --- | --- | --- |
+| **Centroid** (default) | L2-normalized mean of the unit's member embeddings (a note's chunk-pool, a cluster's members) | Semantic, geometric, always available, no LLM. The honest default |
+| **Summary embedding** | the embedding of the unit's name/summary text | Semantic by *what it's about* — groups the way a human framed it. Needs naming first, so it's natural for Roll-up (clusters are named) and a costly opt-in for Split (notes aren't) |
+| **Lexical (deterministic)** | a TF-IDF / sparse term vector over the unit's text (document-frequency from the existing lexical/FTS index) | Literal, not semantic — groups by shared terms. Reproducible across runs, the most explainable ("these share *mitochondria*"), model-free. The fast/stable lane |
+
+Availability is unit-dependent: Summary-embedding lights up only when the units are named. The default is Centroid for both Split and Roll-up; the user overrides per action in the review tab or per Roll-up verb, with the tree's last choice inherited. Mixing representations within one tree is allowed but costs legibility, so the inherited default keeps most trees uniform. [cluster-representation]
+
+The lexical representation pairs with `SummarizeMode::Extractive` (`cluster-name-deterministic`) for a complete model-free path: deterministic structure *and* deterministic names, the whole loop running with `[llm]` disabled. Signal *fusion* — a representation that blends lexical + embedding + link-graph + tags with weights — is deferred; it slots into this same parameter as a composite representation when it lands. [cluster-representation-fusion]
+
+
 ## Build scope
 
 `core::cluster::build_tree(scope, method, params)` takes a `BuildScope` describing which notes participate in the build pass, a `BuildMethod` selecting how the tree is constructed, and method-specific parameters. The cluster editor's "Suggest reorganization" action picks all three at invocation time (per `cluster-review-tab-config-section`); saved Evergreen trees record them so triage knows which notes the tree classifies and how to rebuild against fresh data. [cluster-build-scope, cluster-build-method]
@@ -273,15 +298,17 @@ enum BuildMethod {
 
 struct ClusterParams {
     algorithm: ClusterAlgorithm,    // leiden (default) / hdbscan / gmm / hybrid (cluster-algorithm-selectable)
+    representation: Representation,  // centroid (default) / summary / lexical (cluster-representation)
     leiden: LeidenParams,           // Leiden-only knobs incl. top_level_resolution
     min_cluster_size: u32,          // HDBSCAN tunable
     min_samples: Option<u32>,       // HDBSCAN tunable; None → defaults to min_cluster_size
-    leaf_min_size: u32,             // recursive Split stops below this member count (default 5)
-    leaf_cohesion_threshold: f32,   // recursive Split stops below this radius (default 0.15)
+    recursion: RecursionMode,       // Flat (default) / Manual / Auto (cluster-recursion-modes)
+    max_depth: u32,                 // Auto-recursion depth cap
+    leaf_min_size: u32,             // Auto-recursion stops below this member count (default 5)
+    leaf_cohesion_threshold: f32,   // Auto-recursion stops below this radius (default 0.15)
     summary_confidence_threshold: f32, // marks clusters "uncertain" below this
     include_outliers: bool,         // when false, force-routes outliers into nearest cluster
-    summarize: SummarizeMode,       // llm / template / none — invoked by Summarize op, not by Split
-    disable_recursion: bool,        // when true, Split runs once and stops (per cluster-review-tab-disable-recursion)
+    naming: SummarizeMode,          // none / extractive (default) / llm — applied by the Name step, not Split
 }
 
 struct FolderDeriveParams {
@@ -382,16 +409,16 @@ Most of the time only `Place` runs — every new note gets a home cheaply. `Buil
 
 ## What consumes the tree
 
-The build pipeline produces a `ClusterTree` (shape below). `suggestions.md` consumes it as a recommendation engine — *not* as durable infrastructure that owns the user's organization. Two flows downstream:
+The build pipeline produces a `ClusterTree` (shape below). `cluster-editor.md` consumes it as a durable, user-authored organizational layer: the user reviews, reshapes, and names the tree, then attaches per-cluster policies that drive tagging and moving. Two flows downstream:
 
-- **One-shot reorganization** — generate a tree, render it as a markdown proposal with checkboxes, user picks what to apply (folder moves and/or frontmatter tags). Tree is ephemeral; nothing persists except the user's accepted actions.
-- **Saved-tree triage** — user saves a generated tree as a classifier; new notes get routed against it via greedy centroid descent (`cluster-place-beam-descent`), with confidence-tiered behavior (auto-apply / queue-for-review / leave-in-inbox).
+- **One-shot Apply** — the user reviews a built tree in the cluster editor, sets per-cluster policies, and applies them; each policied leaf emits a pending op (folder move and/or frontmatter tag) the user batch-reviews.
+- **Saved-tree triage** — the user saves a tree as the active classifier; new notes get routed against it via greedy centroid descent (`cluster-place-beam-descent`), with each match resolved through the matched node's policy.
 
-The build engine is unaware of which flow consumes its output — same algorithm, same `ClusterTree`. See `suggestions.md` for everything downstream.
+The build engine is unaware of which flow consumes its output — same algorithm, same `ClusterTree`. See `cluster-editor.md` for everything downstream.
 
 ## Summarization
 
-One LLM call per cluster per level. Input: cluster member titles + per-note summaries (or per-cluster summaries at higher levels). Output: a short cluster summary (1–3 sentences) and a proposed name (3–6 words). [cluster-summarize-llm, cluster-name-from-summary]
+Naming runs deterministically by default and via an LLM optionally. Both take the same input — cluster member titles + per-note summaries (or per-cluster summaries at higher levels) — and produce a short cluster summary (1–3 sentences) and a proposed name (3–6 words). The deterministic path (`SummarizeMode::Extractive`, `cluster-name-deterministic`) derives the name from the top TF-IDF / KeyBERT-style terms over the members, with the most-central note's title as fallback; the LLM path runs the prompt below. [cluster-summarize-llm, cluster-name-from-summary, cluster-name-deterministic]
 
 Prompt shape (sketch):
 
@@ -412,11 +439,11 @@ Return strict JSON: {"name": ..., "summary": ..., "confidence": ...}
 
 For a leaf cluster, the per-note summary input comes from the existing `Summary` enrichment (`design.md:293`) — already cached on the note's frontmatter or in the store. For a parent cluster (anything with children that are themselves clusters), the inputs are the child clusters' summaries; same prompt, no special-casing.
 
-Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the suggestions flow shows it but flags it for explicit review before applying.
+Confidence below a threshold (default 0.5) marks the cluster as "uncertain" — the cluster editor shows it but flags it for explicit review before applying.
 
-**Routing per `llm.md`:** cluster summarization is a *fan-out* feature (one prompt per cluster, scope determined pre-batch by the cluster set). Calls flow through `core::llm` direct — no agent loop, no ACP. The summarizer's pluggable surface (`core::cluster::Summarizer` trait) is a thin layer *on top of* `core::llm`: the trait owns the prompt template, member-formatting, and JSON parsing; the LLM call itself goes through `core::llm`. Same discipline pattern as embedder and store. `LlmSummarizer` is the only LLM-backed production impl; the build pipeline also supports `SummarizeMode::None` as a fully-supported *structural pass* — no `Summarizer` is invoked, names default to `"Cluster N"` placeholders, and the build runs end-to-end without `[llm] enabled`. The clustering review tab (`cluster-editor.md` § Clustering review tab) drives Run on this path and only fires the LLM-backed naming at Confirm time.
+**Routing per `llm.md`:** cluster summarization is a *fan-out* feature (one prompt per cluster, scope determined pre-batch by the cluster set). Calls flow through `core::llm` direct — no agent loop, no ACP. The summarizer's pluggable surface (`core::cluster::Summarizer` trait) is a thin layer *on top of* `core::llm`: the trait owns the prompt template, member-formatting, and JSON parsing; the LLM call itself goes through `core::llm`. Same discipline pattern as embedder and store. Two production impls sit behind the trait: `ExtractiveSummarizer` (the deterministic default — no `core::llm` call, document-frequency from the lexical/FTS index) and `LlmSummarizer` (the opt-in upgrade). `SummarizeMode::None` is also fully supported — no `Summarizer` is invoked, names stay `"Cluster N"` placeholders, and the build runs end-to-end without `[llm] enabled`. The clustering review tab (`cluster-editor.md` § Clustering review tab) drives Run on the structural pass and applies the chosen naming mode at Confirm time.
 
-Model choice: provider/model are user-configured in `[llm]` per `llm.md`; a small local model via Ollama (e.g. `qwen2.5:3b`) is enough — cluster naming is easier than freeform writing. The Confirm-and-name path requires `[llm] enabled = true` because it submits `RaptorSummarize` tasks that route through `core::llm`; the structural pass (Run, before Confirm) is LLM-optional and works even when `[llm]` is disabled — names land as placeholders and the cluster editor becomes the source of truth for naming.
+Model choice (LLM naming only): provider/model are user-configured in `[llm]` per `llm.md`; a small local model via Ollama (e.g. `qwen2.5:3b`) is enough — cluster naming is easier than freeform writing. Only `SummarizeMode::Llm` requires `[llm] enabled = true`; the structural pass and deterministic naming both run with `[llm]` disabled, and the cluster editor is always available for hand-naming.
 
 
 ## Cost model
@@ -438,13 +465,13 @@ The structural pass alone (Split, no LLM) is interactive — sub-second on small
 
 ## When it runs
 
-- **`hiker suggest`** (one-shot) — explicit user command, runs the full pipeline once, output goes to `suggestions.md`'s proposal flow.
-- **Saved-tree triage** does *not* re-run the build pipeline. Triage uses the cheap greedy-descent classifier (`cluster-place-beam-descent`) against an already-saved tree; only `hiker suggest save` and re-running `hiker suggest` regenerate the tree itself.
-- **Never automatic.** No background build pass, no on-save trigger for the full pipeline. Triage *can* run on note save (per `suggestions.md`) but that's the cheap classifier, not a re-cluster.
+- **New tree** (build) — explicit user action from the cluster editor's clustering review tab, runs the full pipeline once; the result lands as a tree the user reviews and curates (per `cluster-editor.md`).
+- **Saved-tree triage** does *not* re-run the build pipeline. Triage uses the cheap greedy-descent classifier (`cluster-place-beam-descent`) against an already-saved tree; only saving a tree as triage and an explicit Re-build regenerate the tree itself.
+- **Never automatic.** No background build pass, no on-save trigger for the full pipeline. Triage *can* run on note save (per `cluster-editor.md`) but that's the cheap classifier, not a re-cluster.
 - **Watcher does not drive the build.** Watcher events drive the *index* (chunk/embed updates); they don't drive the tree.
 
 
-## Output: what suggestions consume
+## Output: the `ClusterTree`
 
 The cluster pass produces a `ClusterTree`: [cluster-tree-output]
 
@@ -465,21 +492,20 @@ struct ClusterNode {
 }
 ```
 
-`suggestions.md` consumes this shape — rendering the markdown proposal for one-shot review, or persisting a slimmed-down version (centroids + names + target folders/tags) as the saved-tree classifier. Cluster IDs are *not* expected to be stable across runs; the rejection-history bookkeeping in `suggestions.md` keys on member-set fingerprints, not cluster IDs.
+`cluster-editor.md` consumes this shape — the user reviews and reshapes it, attaches policies, and saves it as a triage classifier (centroids + names + per-cluster policies). Cluster IDs are *not* expected to be stable across runs; durable cluster identity is the tree document's position-and-name in the outline (per `cluster-editor.md`), not the build pass's ephemeral per-run ids.
 
 
 ## Module discipline
 
 All clustering logic lives in `core::cluster`. Outside the module: `partition()` returns plain assignments, `build_tree()` returns a `ClusterTree` of plain Rust types. No HDBSCAN-crate types leak past the boundary. Same reasoning as `core::store` and `core::embed` — algorithm choice is a defensible default, not a permanent commitment, and the future swap (GMM, agglomerative, leiden) should be a one-file rewrite. [cluster-module-discipline]
 
-Summarization is its own module (`core::summarize`) since it has independent failure modes (LLM unavailable, slow, low-quality) and an independent swap surface (local model vs cloud vs template fallback).
+Summarization is its own module (`core::summarize`) since it has independent failure modes (LLM unavailable, slow, low-quality) and an independent swap surface (local model vs cloud vs extractive fallback).
 
 
 ## Out of scope
 
 - Online incremental clustering of the *full* tree. The cheap online path is greedy descent against an already-built saved tree (`cluster-place-beam-descent`, used by triage) — that's not a rebuild, it's a classifier.
 - Multi-axis trees (one tree per type — semantic, temporal, entity). Single semantic tree only at first; the multi-axis idea from `design.md:215` is a later concern.
-- Durable cluster identity across runs. Each build run produces a fresh tree; rejection-history bookkeeping happens at the per-suggestion level in `suggestions.md`, not at the cluster-id level.
-- A parallel "curated tree" mental model alongside the filesystem. The filesystem is the only source of truth for organization; the build engine is a recommendation tool, not a structural overlay.
+- Durable cluster identity carried by the *build pass*. Each build run produces a fresh tree with ephemeral per-run ids; the durable identity lives in the tree document (its outline position-and-name), owned by `cluster-editor.md`, not in the build output.
 - Cross-vault clustering. One tree per vault.
 - Trail discovery from clusters. Trails are user-authored only by design (see `design.md`); the clustering pipeline never proposes them.

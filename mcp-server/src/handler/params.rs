@@ -174,6 +174,24 @@ pub struct ApplyTag {
     pub tag: String,
 }
 
+// ---------- UI-context tool params ----------
+
+/// Empty-args param for `get_active_note` — kept as a struct (rather than
+/// `()`) so the dispatch arm and the rmcp `#[tool]` macro see a consistent
+/// shape with the rest of the surface.
+///
+/// status: mcp-tool-get-active-note
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetActiveNote {}
+
+/// status: mcp-tool-get-open-notes
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetOpenNotes {}
+
+/// status: mcp-tool-get-selection
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetSelection {}
+
 // ---------- board tool params (status: board-mcp-tools) ----------
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -193,6 +211,91 @@ pub struct BoardAddCard {
     pub column: String,
     /// Vault-relative path of the note to add as a card.
     pub source_rel_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardCreate {
+    /// Basename for the new board-doc. Placed under `[boards] new_board_dir`;
+    /// auto-suffixed `-N` on collision.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardAddTextCard {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Name of the column to append the freeform card to.
+    pub column: String,
+    /// The freeform card's text.
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardMoveCard {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Board-local card id (from `board_get`).
+    pub card_id: String,
+    /// Destination column name.
+    pub to_column: String,
+    /// Target index in the destination column; appends at the tail when
+    /// omitted or out of range.
+    #[serde(default)]
+    pub to_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardSetCardText {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Board-local card id of the freeform card to rewrite.
+    pub card_id: String,
+    /// New text.
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardRemoveCard {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Board-local card id to remove (the referenced note is untouched).
+    pub card_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardAddColumn {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Name of the new column (appended at the tail).
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardRenameColumn {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Current column name.
+    pub old_name: String,
+    /// New column name.
+    pub new_name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardReorderColumn {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Name of the column to move.
+    pub name: String,
+    /// Target index in the column order (clamps to the tail).
+    pub to_index: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BoardDeleteColumn {
+    /// Vault-relative path of the board-doc.
+    pub board_rel_path: String,
+    /// Name of the column to delete (drops its card refs; notes untouched).
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -577,6 +680,92 @@ impl Serialize for BoardAddCard {
         m.serialize_field("board_rel_path", &self.board_rel_path)?;
         m.serialize_field("column", &self.column)?;
         m.serialize_field("source_rel_path", &self.source_rel_path)?;
+        m.end()
+    }
+}
+impl Serialize for BoardCreate {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardCreate", 1)?;
+        m.serialize_field("name", &self.name)?;
+        m.end()
+    }
+}
+impl Serialize for BoardAddTextCard {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardAddTextCard", 3)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("column", &self.column)?;
+        m.serialize_field("text", &self.text)?;
+        m.end()
+    }
+}
+impl Serialize for BoardMoveCard {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardMoveCard", 4)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("card_id", &self.card_id)?;
+        m.serialize_field("to_column", &self.to_column)?;
+        m.serialize_field("to_index", &self.to_index)?;
+        m.end()
+    }
+}
+impl Serialize for BoardSetCardText {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardSetCardText", 3)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("card_id", &self.card_id)?;
+        m.serialize_field("text", &self.text)?;
+        m.end()
+    }
+}
+impl Serialize for BoardRemoveCard {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardRemoveCard", 2)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("card_id", &self.card_id)?;
+        m.end()
+    }
+}
+impl Serialize for BoardAddColumn {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardAddColumn", 2)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("name", &self.name)?;
+        m.end()
+    }
+}
+impl Serialize for BoardRenameColumn {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardRenameColumn", 3)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("old_name", &self.old_name)?;
+        m.serialize_field("new_name", &self.new_name)?;
+        m.end()
+    }
+}
+impl Serialize for BoardReorderColumn {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardReorderColumn", 3)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("name", &self.name)?;
+        m.serialize_field("to_index", &self.to_index)?;
+        m.end()
+    }
+}
+impl Serialize for BoardDeleteColumn {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("BoardDeleteColumn", 2)?;
+        m.serialize_field("board_rel_path", &self.board_rel_path)?;
+        m.serialize_field("name", &self.name)?;
         m.end()
     }
 }

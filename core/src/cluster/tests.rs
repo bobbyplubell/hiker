@@ -5,10 +5,11 @@ use crate::cluster::build::stream::build_tree_structural_streaming;
 use crate::cluster::build::{persist, tree};
 use crate::cluster::tree::place_beam_descent;
 use crate::cluster::{
-    plan_sample_merge, Algorithm, Assignment, BuildError, BuildEvent, BuildMethod, BuildScope,
-    Error, FolderDeriveParams, InMemoryTree, LeidenParams, Node, NoteInput, Params, Phase,
-    SampleMergePlan, SummarizeInput, SummarizeMode, Summarizer, SummaryOutput, OUTLIER_LABEL,
-    SAMPLE_MERGE_BATCH_SIZE, SAMPLE_MERGE_BATCH_THRESHOLD, SAMPLE_MERGE_MEMBER_CAP,
+    detect_reading_order_chain, plan_sample_merge, Algorithm, Assignment, BuildError, BuildEvent,
+    BuildMethod, BuildScope, ChainCandidate, Error, FolderDeriveParams, InMemoryTree, LeidenParams,
+    Node, NoteInput, Params, Phase, SampleMergePlan, SummarizeInput, SummarizeMode, Summarizer,
+    SummaryOutput, MAX_CHAIN_LEN, MIN_CHAIN_LEN, OUTLIER_LABEL, SAMPLE_MERGE_BATCH_SIZE,
+    SAMPLE_MERGE_BATCH_THRESHOLD, SAMPLE_MERGE_MEMBER_CAP,
 };
 
 /// Test-only stand-in for the production `LlmSummarizer`. Returns a
@@ -579,4 +580,40 @@ fn beam_descent_k1_is_greedy() {
     let tree = mk_tree();
     let m = place_beam_descent(&[1.0, 0.0], &tree, 1).unwrap();
     assert!(m.leaf_node_id == "A1" || m.leaf_node_id == "A2");
+}
+
+// ── Reading-order-chain detection (trail-draft-from-clustering) ────────
+
+fn cc(note_id: &str, order_key: i64) -> ChainCandidate {
+    ChainCandidate { note_id: note_id.to_string(), order_key }
+}
+
+#[test]
+fn chain_detected_and_sorted_by_order_key() {
+    // Out-of-input-order candidates with distinct, dense keys form a chain
+    // ordered ascending by key.
+    let cands = vec![cc("c", 30), cc("a", 10), cc("b", 20)];
+    let chain = detect_reading_order_chain(&cands).expect("dense distinct keys = chain");
+    assert_eq!(chain.ordered_note_ids, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn chain_declines_below_min_len() {
+    let cands = vec![cc("a", 10), cc("b", 20)];
+    assert!(detect_reading_order_chain(&cands).is_none(), "2 < MIN_CHAIN_LEN");
+    assert_eq!(MIN_CHAIN_LEN, 3);
+}
+
+#[test]
+fn chain_declines_above_max_len() {
+    let cands: Vec<ChainCandidate> =
+        (0..(MAX_CHAIN_LEN as i64 + 1)).map(|k| cc(&format!("n{k}"), k)).collect();
+    assert!(detect_reading_order_chain(&cands).is_none(), "oversized cluster declines");
+}
+
+#[test]
+fn chain_declines_on_duplicate_key() {
+    // Two notes claim the same slot → ambiguous → decline (conservative).
+    let cands = vec![cc("a", 10), cc("b", 10), cc("c", 30)];
+    assert!(detect_reading_order_chain(&cands).is_none(), "duplicate key = ambiguous");
 }

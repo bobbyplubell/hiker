@@ -163,6 +163,55 @@ fn two_separate_blocks_both_classified_and_prose_between_is_not() {
     assert_eq!(hidden_fences, 4, "both blocks' fences pair independently");
 }
 
+// --- fenced-code syntax highlighting (editor-code-syntax-highlight) ---
+
+#[test]
+fn fenced_rust_block_emits_per_token_color_marks() {
+    // A known language (rust) should produce at least one Mark with fg set
+    // somewhere inside the block body — the syntax highlighter ran and at
+    // least one token matched the palette.
+    let src = "```rust\nfn main() { let x = 1; }\n```\n";
+    let set = decorations_cursor_at_end(src);
+    let body_start = src.find("fn main").unwrap();
+    let body_end = src.find("\n```\n").unwrap();
+    let has_color = set
+        .iter_overlapping(body_start..body_end)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.fg.is_some() && s.monospace));
+    assert!(has_color, "rust block should have at least one colored, monospace Mark");
+}
+
+#[test]
+fn fenced_unknown_lang_does_not_emit_colors() {
+    // An unknown info string ("notalang") should produce no colored Marks
+    // inside the block body — body still renders as plain monospace.
+    let src = "```notalang\nfn main() { let x = 1; }\n```\n";
+    let set = decorations_cursor_at_end(src);
+    let body_start = src.find("fn main").unwrap();
+    let body_end = src.find("\n```\n").unwrap();
+    let any_color = set
+        .iter_overlapping(body_start..body_end)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.fg.is_some()));
+    assert!(!any_color, "unknown-lang block must not produce colored Marks");
+}
+
+#[test]
+fn frontmatter_body_is_monospace_and_muted() {
+    // YAML frontmatter at the top of a file renders as plain monospace,
+    // with no per-token highlighting (the syntax highlighter operates on
+    // fenced blocks only, not on frontmatter).
+    let src = "---\ntitle: hello\ntags: [a, b]\n---\n\nbody\n";
+    let set = decorations_cursor_at_end(src);
+    let fm_inside = src.find("title").unwrap();
+    let mono = set
+        .iter_overlapping(fm_inside..fm_inside + 5)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.monospace));
+    assert!(mono, "frontmatter body must be monospace");
+    let colored = set
+        .iter_overlapping(fm_inside..fm_inside + 5)
+        .any(|(_, d)| matches!(d, Decoration::Mark(s) if s.fg.is_some()));
+    assert!(!colored, "frontmatter must not be syntax-highlighted");
+}
+
 #[test]
 fn tilde_fences_are_supported() {
     let src = "~~~\ntilde body\n~~~\n";

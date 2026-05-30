@@ -1133,3 +1133,100 @@ fn unreadable_pending_queue_is_tolerated() {
     assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, "hello earth\n");
 }
 
+#[test]
+fn bug_sync_accept_pending_trusts_metadata_newpath() {
+    // status: bug-sync-accept-pending-trusts-metadata-newpath
+    //
+    // `accept_pending` uses the pending op's `metadata["new_path"]` to repoint
+    // the path index, but uses the post-apply Yrs `meta.path` to choose where
+    // the `.md` lands on disk. When the two disagree (corrupted `.pending`,
+    // producer bug, manual edit) the index and the on-disk file desync: the
+    // file is written at the Yrs path but the index points elsewhere.
+    //
+    // We construct the disagreement by mutating the JSON `.pending` file after
+    // staging — leaving the Yrs update bytes (which advance `meta.path` to
+    // `notes/b.md`) untouched, but rewriting `metadata.new_path` to
+    // `notes/c.md`. Reopen so `ensure_loaded` re-reads the queue, then accept.
+    let dir = tempdir().unwrap();
+    let doc_id = {
+        let log = OpLog::open(dir.path()).unwrap();
+        let id = log
+            .create_document("notes/a.md", "note", "alpha\n", &Author::User)
+            .unwrap();
+        let _ = log
+            .stage_pending_renames(
+                &[(id.clone(), "notes/b.md".to_string())],
+                &auto_cluster_ctx(),
+            )
+            .unwrap();
+        id
+    };
+
+    // Mutate the on-disk .pending: change metadata.new_path to a third path
+    // while leaving op_kind (which carries `from`) and the yrs_update bytes
+    // (which mutate meta.path to "notes/b.md") untouched.
+    let pending_path = dir
+        .path()
+        .join(".hiker")
+        .join("oplog")
+        .join(format!("{doc_id}.pending"));
+    let bytes = std::fs::read(&pending_path).unwrap();
+    let mut ops: Vec<super::shapes::PendingOp> =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ops.len(), 1);
+    let op_id = ops[0].op_id.clone();
+    if let serde_json::Value::Object(map) = &mut ops[0].metadata {
+        map.insert(
+            "new_path".to_string(),
+            serde_json::Value::String("notes/c.md".to_string()),
+        );
+    } else {
+        panic!("expected metadata object");
+    }
+    std::fs::write(&pending_path, serde_json::to_vec(&ops).unwrap()).unwrap();
+
+    // Reopen so the in-memory cache is rebuilt from the mutated file.
+    let log = OpLog::open(dir.path()).unwrap();
+    // Sanity: the mutation round-tripped.
+    let reloaded = log.pending_ops(&doc_id).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(
+        reloaded[0]
+            .metadata
+            .get("new_path")
+            .and_then(|v| v.as_str()),
+        Some("notes/c.md")
+    );
+
+    log.accept_pending(&doc_id, &op_id).unwrap();
+
+    // The Yrs update advances meta.path to `notes/b.md`, so the .md must land
+    // there — and the index must agree.
+    assert!(
+        dir.path().join("notes/b.md").exists(),
+        ".md should be written at the post-apply Yrs path"
+    );
+    assert!(
+        !dir.path().join("notes/c.md").exists(),
+        ".md must not be written at the (corrupted) metadata path"
+    );
+    assert_eq!(
+        log.path_for_doc(&doc_id).unwrap().as_deref(),
+        Some("notes/b.md"),
+        "path_for_doc must follow the actual Yrs meta.path"
+    );
+    // Desync symptom: with the bug, the index was repointed using
+    // metadata.new_path (`notes/c.md`), so the post-apply Yrs path resolves
+    // to None and the corrupted path resolves to the doc instead.
+    assert_eq!(
+        log.doc_id_for_path("notes/b.md").unwrap().as_deref(),
+        Some(doc_id.as_str()),
+        "doc_id_for_path on the Yrs path must resolve — bug: index was repointed to metadata.new_path"
+    );
+    assert_eq!(
+        log.doc_id_for_path("notes/c.md").unwrap(),
+        None,
+        "the corrupted metadata path must NOT be in the index"
+    );
+}
+

@@ -3,10 +3,12 @@
 //! non-buffer kinds).
 #![allow(clippy::items_after_test_module)]
 
+pub mod breadcrumb;
 pub mod clipboard_menu;
 pub mod conflict;
 pub mod decorations;
 pub mod diff_overlay;
+pub mod find;
 mod editor_binding;
 mod format;
 pub mod minimap_opts;
@@ -161,6 +163,17 @@ fn rebuild_editor_decorations(
             let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
             view.decorations.push_with_heights(v);
         }};
+        // Viewport-scoped paint-only layers: rebuilt fresh each frame with
+        // `vp_fp` in the cache key, so their Arc churns on every scroll. We
+        // route them through `push_viewport_scoped` so that churn flips
+        // `decorations.signature` (still invalidates the minimap / per-line
+        // galley cache where the visible-band content really did change) but
+        // *not* `decorations.geometry_epoch` — letting the wrap cache skip
+        // the off-viewport rescan on pure scroll.
+        ($slot:ident, $fp:expr, $build:expr, vp_scoped) => {{
+            let v = DecorationCache::get_or_compute(&mut cache.$slot, $fp, $build);
+            view.decorations.push_viewport_scoped(v);
+        }};
     }
 
     // active_line is cheap to BUILD, but it's not cheap to *not cache* —
@@ -173,14 +186,14 @@ fn rebuild_editor_decorations(
     // the same Arc and the galley cache holds.
     cached!(active_line, mix(doc_id, sel), || {
         active_line_decorations(editor)
-    });
+    }, vp_scoped);
 
     // Paint-only, viewport-scoped, doc-only-dependent. Gated on its
     // own View-menu toggle (`view-highlight-trailing-whitespace-toggle`).
     if *highlight_trailing_whitespace {
         cached!(trailing_ws, mix(doc_id, vp_fp), || {
             trailing_whitespace_decorations(editor, Some(&visible_range))
-        });
+        }, vp_scoped);
     }
 
     // Index-diff gutter (`compute_diff` parity). Cached on (doc content
@@ -213,9 +226,9 @@ fn rebuild_editor_decorations(
         // wikilink reveals when the cursor isn't on the same line —
         // selection-dependent on top of doc + viewport.
         cached!(wikilink, mix(mix(doc_id, cursor_line), vp_fp),
-            || wikilink_decorations(editor, theme, Some(&visible_range), resolve_title));
+            || wikilink_decorations(editor, theme, Some(&visible_range), resolve_title), vp_scoped);
         cached!(callout, mix(doc_id, vp_fp),
-            || callout_decorations(editor, theme, Some(&visible_range)));
+            || callout_decorations(editor, theme, Some(&visible_range)), vp_scoped);
     }
 
     cached!(frontmatter, mix(doc_id, folds_id),
@@ -223,13 +236,13 @@ fn rebuild_editor_decorations(
 
     if *live_preview {
         cached!(transclusion, mix(doc_id, vp_fp),
-            || transclusion_decorations(editor, theme, Some(&visible_range)));
+            || transclusion_decorations(editor, theme, Some(&visible_range)), vp_scoped);
         cached!(footnote, mix(doc_id, vp_fp),
-            || footnote_decorations(editor, theme, Some(&visible_range)));
+            || footnote_decorations(editor, theme, Some(&visible_range)), vp_scoped);
         cached!(math, mix(doc_id, vp_fp),
-            || math_decorations(editor, theme, Some(&visible_range)));
+            || math_decorations(editor, theme, Some(&visible_range)), vp_scoped);
         cached!(mermaid, mix(doc_id, vp_fp),
-            || mermaid_decorations(editor, theme, Some(&visible_range)));
+            || mermaid_decorations(editor, theme, Some(&visible_range)), vp_scoped);
     }
 
     // Chunk-boundary visualisation: a gutter marker + faint background at
@@ -266,6 +279,13 @@ fn rebuild_editor_decorations(
         view.decorations.push_with_heights(ov.decorations.clone());
     }
 
+    // Find-in-note match highlights (`editor-find-in-note`). Pure
+    // paint layer driven off `view.search`; recomputed each frame
+    // because the match list is small and the call is gated on
+    // `search.active`. Pushed before occurrence / bracket-match so it
+    // layers cleanly under cursor-derived emphasis.
+    find::push_decorations(editor, view);
+
     // Viewport-scoped layers (occurrence highlight, bracket match). Both
     // are cheap to build, but constructing a fresh `RangeSet` every frame
     // flips `view.decorations.signature` (Arc-pointer-based content_id)
@@ -274,10 +294,15 @@ fn rebuild_editor_decorations(
     // signature stays stable on idle/scroll frames.
     cached!(occurrence, mix(mix(doc_id, sel), vp_fp), || {
         occurrence_decorations(editor, visible_range.clone())
-    });
+    }, vp_scoped);
+    // bracket_match is doc+selection-keyed (not viewport-scoped), but it's
+    // paint-only and changes on every cursor move; routing it through the
+    // viewport-scoped lane keeps cursor moves from forcing a full prewrap of
+    // the whole document (matching the behavior of all the other
+    // selection/cursor-derived layers).
     cached!(bracket_match, mix(doc_id, sel), || {
         bracket_match_decorations(editor, DEFAULT_BRACKETS, 5000)
-    });
+    }, vp_scoped);
 }
 
 /// Combine multiple u64 values into a single fingerprint via splitmix-style
@@ -300,13 +325,7 @@ pub(super) struct BufCtx<'a> {
     pub(super) path: &'a str,
 }
 
-/// Heading-breadcrumb lookup on a buffer. Standalone trait so the tests
-/// can call it without going through the panel context.
-trait HeadingBreadcrumb {
-    /// Walk the document from the start up through the cursor's line
-    /// and return a `>`-joined breadcrumb of the active heading stack.
-    fn heading_breadcrumb(&self) -> String;
-}
+use breadcrumb::HeadingBreadcrumb;
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -321,8 +340,41 @@ impl<'a> BufCtx<'a> {
     /// Top-level buffer-panel body: toolbar, optional pending-rewrite
     /// banner, inline diff overlay, then the editor itself.
     fn show(&mut self) {
+        // Reader / focus view (`editor-reader-view`): hide the buffer
+        // panel's own toolbar + status bar + pending-rewrite banner. The
+        // editor canvas is the only thing visible. Window-level chrome
+        // (top toolbar, side bars, status bar) is hidden by the workbench
+        // host — see `main::update`.
+        let reader = self
+            .app
+            .session
+            .buffers
+            .get(self.path)
+            .map(|b| b.reader_view)
+            .unwrap_or(false);
+
+        // Esc exits reader view on the active buffer. Consume so it
+        // doesn't reach the editor (would otherwise clear selection).
+        if reader
+            && self.ui.input_mut(|i| {
+                i.consume_key(eframe::egui::Modifiers::NONE, eframe::egui::Key::Escape)
+            })
+            && let Some(buf) = self.app.session.buffers.get_mut(self.path)
+        {
+            buf.reader_view = false;
+            return;
+        }
+
+        // Find bar pinned to the top of the buffer panel (above the
+        // toolbar) — `editor-find-in-note`. The bar is hidden by default;
+        // open via Mod-F.
+        find::render_bar(self.ui, self.app, self.path);
+        find::tick_rebuild(self.app, self.path);
+
         // Toolbar across the top of the buffer tab body.
-        self.toolbar();
+        if !reader {
+            self.toolbar();
+        }
 
         // Pending-rewrite banner: thin row that surfaces a write-shaped
         // proposal targeting this note. Only meaningful for vault
@@ -335,7 +387,7 @@ impl<'a> BufCtx<'a> {
             .get(self.path)
             .map(|b| matches!(&b.source, crate::tab::BufferSource::Vault { .. }))
             .unwrap_or(false);
-        if is_vault {
+        if is_vault && !reader {
             self.pending_rewrite_banner();
         }
 
@@ -428,22 +480,41 @@ impl<'a> BufCtx<'a> {
     // `working` layer. See `editor_binding::handle_undo_redo`.
     let undo_txns = editor_binding::handle_undo_redo(ui, app, path);
 
-    // Read scroll speed up-front so the immutable config borrow doesn't
-    // collide with the mutable buffer borrow below. The view also reads
-    // this each frame so changing the setting takes effect immediately.
-    let scroll_speed = app
-        .vault_session
-        .config
-        .read()
-        .map(|c| c.editor.scroll_speed)
-        .unwrap_or(1.0)
-        .max(0.0);
+    // Read live editor settings that the view mirrors per-frame up front under
+    // a single short-lived config read lock, so the mutable buffer borrow below
+    // doesn't collide with the immutable config borrow. The click patterns are
+    // cloned only when they actually differ from the buffer's cached source —
+    // string compare under the read lock keeps the steady-state path
+    // allocation-free. status: click-select-pattern
+    let (scroll_speed, click_patch) = {
+        let buffer_view = app.session.buffers.get(path);
+        app.vault_session
+            .config
+            .read()
+            .map(|c| {
+                let speed = c.editor.scroll_speed.max(0.0);
+                let patch = buffer_view.map(|b| {
+                    let dbl = (c.editor.double_click_pattern != b.click_patterns.double_src)
+                        .then(|| c.editor.double_click_pattern.clone());
+                    let trp = (c.editor.triple_click_pattern != b.click_patterns.triple_src)
+                        .then(|| c.editor.triple_click_pattern.clone());
+                    (dbl, trp)
+                });
+                (speed, patch)
+            })
+            .unwrap_or((1.0, None))
+    };
 
     let Some(buffer) = app.session.buffers.get_mut(path) else {
         ui.label(format!("buffer {} not loaded", path));
         return;
     };
     buffer.view.scroll_speed = scroll_speed;
+    if let Some((dbl, trp)) = click_patch {
+        // Recompiles only the regex(es) the user actually edited; takes effect
+        // this frame so close-and-reopen isn't needed.
+        buffer.sync_click_patterns(dbl, trp);
+    }
 
     // Decoration layers are rebuilt through the widget's
     // `with_decoration_rebuild` hook below, so they describe the doc state
@@ -462,7 +533,8 @@ impl<'a> BufCtx<'a> {
     // Resolve minimap options from the live config snapshot. Cheap each
     // frame — a few field copies + 9 hex parses. Hex parses default back
     // to the built-in palette if the user typed something invalid.
-    let mini_opts: Option<MinimapOptions> = if buffer.show_minimap {
+    let reader = buffer.reader_view;
+    let mini_opts: Option<MinimapOptions> = if buffer.show_minimap && !reader {
         app.vault_session.config
             .read()
             .ok()
@@ -470,6 +542,13 @@ impl<'a> BufCtx<'a> {
     } else {
         None
     };
+    // Reader view also hides the gutter (line numbers / fold chevrons /
+    // diff markers) so only the prose canvas remains. Save the prior
+    // hide-gutter state so we can restore it when reader view exits.
+    let prev_hide_gutter = buffer.view.hide_gutter;
+    if reader {
+        buffer.view.hide_gutter = true;
+    }
 
     // Wikilink live-title resolver, built off an Arc clone so it borrows
     // neither `app` nor `buffer`. Runs only inside the cached wikilink layer's
@@ -540,6 +619,23 @@ impl<'a> BufCtx<'a> {
         scrollbar::AutoScrollbar { ui, view: &mut buffer.view, editor_rect }.paint();
     }
 
+    // Snapshot the wikilink-tagged click zones now while the buffer
+    // borrow is still live — `wikilink_nav::track_hover` reads them
+    // below after the borrow ends, and it needs widget-local rects to
+    // hit-test the pointer. Tiny copy: at most a few dozen pills are
+    // in the viewport at once. [wikilink-hover-preview]
+    let wikilink_zones: Vec<editor_view::viewport::ClickZone> = buffer
+        .view
+        .click_zones
+        .iter()
+        .filter(|z| matches!(
+            z.action,
+            ClickAction::WidgetClick(id)
+                if id & editor_md::links::WIKILINK_WIDGET_TAG != 0,
+        ))
+        .cloned()
+        .collect();
+
     // Pull WidgetClicks for patch-review buttons out of the click buffer
     // BEFORE fold-toggle handling so the click_map mapping is consumed
     // here. Other WidgetClick consumers (none today) would chain here too.
@@ -564,6 +660,13 @@ impl<'a> BufCtx<'a> {
     // Apply fold toggles from this frame's clicks.
     buffer.drain_fold_clicks();
 
+    // Restore the gutter-hidden flag if reader view temporarily
+    // overrode it (so flipping reader view off this same frame puts
+    // the gutter back without losing the user's persisted preference).
+    if reader {
+        buffer.view.hide_gutter = prev_hide_gutter;
+    }
+
     // Run the editor binding for op-log-backed vault buffers: forward this
     // frame's captured change sets into the `working` layer, pull
     // `materialize_working` back into the editable buffer, and refresh the
@@ -574,6 +677,11 @@ impl<'a> BufCtx<'a> {
 
     // Wikilink click dispatch: resolve each clicked pill's target and open it.
     wikilink_nav::handle_clicks(app, ui.ctx(), path, &wikilink_clicks, mod_click);
+
+    // Wikilink hover-preview lifecycle: timer + cached body + scrollable
+    // overlay card. Reads the painter's per-frame zones snapshotted
+    // above. [wikilink-hover-preview]
+    wikilink_nav::track_hover(app, ui.ctx(), path, editor_rect, &wikilink_zones);
 
     // Per-hunk overlay-widget click dispatch. The diff overlay maps each
     // button id to the pending op id(s) it covers; we flip them through
@@ -870,11 +978,6 @@ fn toolbar(&mut self) {
                 // when the path is already a waypoint at any depth.
                 BufCtx { ui: &mut *ui, app: &mut *app, path }.add_to_trail_pill();
 
-                // "Add to board…" pill — `board-add-card`. Surfaces when a
-                // regular note is open and at least one board exists; the
-                // menu picks a board + column. Hidden on board-doc rows.
-                BufCtx { ui: &mut *ui, app: &mut *app, path }.add_to_board_pill();
-
                 // Centered mode-controls slot — empty in plain editing mode.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
                     // (right side reserved for future view-mode badges)
@@ -1106,18 +1209,6 @@ impl<'a> BufCtx<'a> {
         );
     }
     }
-
-    /// "Add to board…" pill in the editor toolbar — the editor-pane
-    /// counterpart to the file-tree verb (`board-add-card`). Hidden unless
-    /// the open buffer is a regular `.md`/`.txt` note and the vault has at
-    /// least one board; hidden when the buffer is itself a board-doc. The
-    /// menu picks a board + column; a board where the note is already a card
-    /// shows "Already on this board" instead of clickable columns.
-    ///
-    /// status: board-add-card
-    fn add_to_board_pill(&mut self) {
-        crate::panels::board::add_to_board_pill(self.ui, self.app, self.path);
-    }
 }
 
 fn trail_contains_path(waypoints: &[crate::state::Waypoint], path: &str) -> bool {
@@ -1162,94 +1253,6 @@ pub(super) fn open_diff_vs_disk(app: &mut AppState, path: &str) {
             Some(_) => None,
             None => Some(DiffSource::Disk { path: path.to_string() }),
         };
-    }
-}
-
-impl HeadingBreadcrumb for crate::buffer::Buffer {
-    fn heading_breadcrumb(&self) -> String {
-        let cursor_line = self
-            .editor
-            .doc
-            .byte_to_line(self.editor.selection.main().head.byte as usize);
-        let mut stack: Vec<(u8, String)> = Vec::new();
-        let total_lines = self.editor.doc.len_lines();
-        for line_idx in 0..=cursor_line {
-            let start = self.editor.doc.line_to_byte(line_idx);
-            let end = if line_idx + 1 < total_lines {
-                self.editor.doc.line_to_byte(line_idx + 1)
-            } else {
-                self.editor.doc.len_bytes()
-            };
-            let line: String = self.editor.doc.slice(start..end).to_string();
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix('#') {
-                let mut depth: u8 = 1;
-                let mut chars = rest.chars();
-                for c in chars.by_ref() {
-                    if c == '#' && depth < 6 {
-                        depth += 1;
-                    } else if c == ' ' || c == '\t' {
-                        break;
-                    } else {
-                        depth = 0;
-                        break;
-                    }
-                }
-                if depth == 0 {
-                    continue;
-                }
-                let title = chars.as_str().trim_end_matches(['\n', '\r']).trim();
-                stack.retain(|(d, _)| *d < depth);
-                stack.push((depth, title.to_string()));
-            }
-        }
-        stack.into_iter().map(|(_, t)| t).collect::<Vec<_>>().join(" /")
-    }
-}
-
-#[cfg(test)]
-mod breadcrumb_tests {
-    use super::*;
-    use crate::buffer::Buffer;
-
-    fn make(text: &str, cursor_byte: usize) -> Buffer {
-        let mut buf = Buffer::with_config_and_vault(
-            "test.md".to_string(),
-            text,
-            String::new(),
-            None,
-            None,
-        );
-        buf.editor.selection = editor_core::selection::Selection::single(cursor_byte);
-        buf
-    }
-
-    #[test]
-    fn empty_when_no_headings() {
-        let buf = make("just some text\nno heads here\n", 0);
-        assert_eq!(buf.heading_breadcrumb(), "");
-    }
-
-    #[test]
-    fn picks_up_h1() {
-        let buf = make("# Title\nbody\n", 9); // cursor on `body`
-        assert_eq!(buf.heading_breadcrumb(), "Title");
-    }
-
-    #[test]
-    fn stacks_deeper_headings() {
-        let text = "# A\n## B\n### C\nbody\n";
-        let byte = text.find("body").unwrap();
-        let buf = make(text, byte);
-        assert_eq!(buf.heading_breadcrumb(), "A /B /C");
-    }
-
-    #[test]
-    fn higher_heading_resets_deeper_stack() {
-        let text = "# A\n## B\n### C\n## D\nbody\n";
-        let byte = text.find("body").unwrap();
-        let buf = make(text, byte);
-        assert_eq!(buf.heading_breadcrumb(), "A /D");
     }
 }
 

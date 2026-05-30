@@ -238,9 +238,14 @@ async fn run(self) {
                     }
                 }
                 Event::Error { message, .. } => {
-                    let _ = tx_for_events.send(ChatEvent::Delta {
+                    // Route turn errors to `ChatEvent::Error` (not `Delta`) so
+                    // the error consumer in `chat::state` fires: it clears the
+                    // streaming buffer, records the failure as a distinct
+                    // assistant turn, and clears the pending flag. Surfacing
+                    // errors as plain deltas left that consumer unreachable.
+                    let _ = tx_for_events.send(ChatEvent::Error {
                         session_id: session_for_events.clone(),
-                        text: format!("\n\n(error: {message})"),
+                        message,
                     });
                 }
                 Event::ToolCallStart { call_id, tool_name, .. } => {

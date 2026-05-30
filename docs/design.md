@@ -27,7 +27,7 @@ A Reor-like personal notes + knowledge system, all-Rust.
 
 Live preview: per-frame decoration providers in `app/src/panels/buffer.rs` produce `DecorationSet` layers fingerprint-cached on `(doc_id, selection, folds, viewport, theme)`. Decoration kinds: `Mark`, `Line`, `Replace { display }`, `Block`, `Widget`. The markdown provider walks the buffer with `pulldown-cmark`; `Replace` fades syntax markers, `Mark`/`Line` styles content, and a decoration is suppressed when its line overlaps a selection so clicking in reveals raw markers. Widgets handle images, math, wikilink pills, callouts.
 
-Wikilinks: the markdown decoration provider emits a widget for `[[id]]` / `[[id|display]]`; click resolves via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`). Full spec: `wikilinks.md` (id form, name-normalize authoring, render-from-live-title, stamping, backlinks).
+Wikilinks: the markdown decoration provider emits a widget for `[[Name]]` / `[[folder/Name]]`; click resolves the path via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`). Full spec: `wikilinks.md` (path form, autocomplete, render-from-live-title, rename-rewrite, backlinks).
 
 Other components:
 
@@ -185,23 +185,25 @@ Query pipeline (compose as needed):
 User-authored layer on top of the automatic indexes:
 
 - Collections / saved queries (named groupings — tags, folder globs, manual note IDs + order)
-- Auto-generated reorganization suggestions and inbox triage — see "Auto-organization suggestions" below, and `suggestions.md` for the full surface
+- Tree-driven auto-organization and inbox triage — durable cluster trees with per-cluster Tag / Move policies — see "Auto-organization" below, and `cluster-editor.md` for the full surface
 - Pinned anchors / landmarks (other notes get a "nearest landmark" tag in embedding space)
 - Trails: ordered, named sequences of notes with per-waypoint annotations and side-trail branches (the waypoint list is a tree). Curated — the user owns every accepted trail, but the clustering pipeline and MCP agents may propose drafts into a trail-scoped review queue. Full surface in `trails.md`.
 
   **Drag-and-drop ingestion (deferred).** Trails should accept items dragged in from outside the trails panel — primarily file rows from the Files panel, and eventually note tabs and search-result cards. The drop target semantics match the in-panel reorder DnD already shipped: dropping onto the top half of a waypoint card inserts the new waypoint as a sibling before it; dropping onto the bottom half nests it as a child; dropping on the head / tail strips lands it at the start / end of the trail. Implementation is deferred — the in-panel reorder lands first; cross-panel ingestion piggybacks on the same drop zones once a uniform "vault path" drag payload is in place across panels. [trails-dnd-ingestion]
 
 
-## Auto-organization suggestions
+## Auto-organization
 
-Hiker's clustering pipeline (`clustering.md`) is consumed as a *recommendation engine*, not as durable infrastructure that owns the user's organization. The user organizes their vault; the AI suggests improvements; neither pretends to own the layout. Two flows live on the same engine:
+Hiker's clustering pipeline (`clustering.md`) produces **trees** — a durable, user-authored organizing layer curated over the notes. Each cluster can carry a **policy** (Tag / Move / Freeze) that drives real changes: a Move policy renames the file into a folder, a Tag policy writes the note's frontmatter. The filesystem still holds the notes' bytes; the tree is the structure organizing them, and several trees can overlap the same vault (e.g. one by project, one by topic). The cluster editor is the surface (`cluster-editor.md`).
 
-- **One-shot reorganization** — user runs `hiker suggest`, gets a markdown proposal of moves and tags, picks what to apply. Tree is ephemeral; nothing persists except the user's accepted actions and a small rejection log. Each suggestion can be applied as a folder move (filesystem rename) or as a frontmatter tag — the user picks per cluster, with per-note overrides.
-- **Saved-tree triage** — user saves a generated tree as a classifier. New notes (default scope: `inbox/`) get auto-routed against it via greedy centroid descent. Confidence-tiered behavior: high → auto-apply with toast + 10s Undo, medium → queue for review, low → leave in inbox.
+Two ways policies fire:
 
-Triage will not move a note out of any folder *other* than the configured triage scope — the worst case for an over-eager classifier is "wrong subfolder under inbox," never "your important note got moved out from under you." That's the load-bearing safety rule.
+- **One-shot Apply** — build (or hand-author) a tree, assign policies, and Apply: each policied leaf produces a reviewable move/tag op. Reversible; nothing touches the vault until you accept.
+- **Saved-tree triage** — save a tree as a classifier. New notes (default scope: `inbox/`) get routed against it via centroid descent (`cluster-place-beam-descent`) and the matched cluster's policy fires. Matches stay **pending for review by default** (`[triage].review_required = true`); auto-apply is the per-tree opt-in once a classifier is trusted.
 
-There is no per-note `hiker.placement` provenance, no parallel curated-tree-vs-filesystem mental model, and no durable cluster identity carried across runs. The filesystem (and, in tag-mode, frontmatter tags) is the only source of truth. See `suggestions.md` for the full surface — proposal file format, apply mechanic, tag-field configurability, triage thresholds, and the deferred folder-pinning escape hatch.
+Triage will not move a note out of any folder *other* than the configured scope — the worst case for an over-eager classifier is "wrong subfolder under `inbox/`," never "your important note got moved out from under you." That's the load-bearing safety rule.
+
+See `cluster-editor.md` for the full surface — the policy model, apply + batch review, tag-field configurability, and triage scope/scheduling.
 
 
 ## Enrichment pipeline
@@ -222,7 +224,7 @@ Stages (each independent, opt-in per-vault):
 - Type classification — runs as a facet of auto-tag (`type:lecture`, `type:meeting`, `type:recipe`, `type:reference`, ...). Not a separate pipeline; reuses auto-tag machinery and vocabulary file.
 - Entity extraction — NER over note content; populates the entity index. Coreference resolution (Lamport / Leslie Lamport / L. Lamport → one entity) handled with embedding-similarity merging, conservative on auto-merge to avoid false positives.
 - Reference extraction — extracts URLs, file paths, hashes, mentioned artifacts (firmware blobs, ROM images, binaries, datasheet IDs) into a `references:` frontmatter list. Lightweight — pattern-matching primarily, no academic citation parsing. Each reference is resolvable: a hash matches a file in `.hiker/refs/`, a URL matches a scraped reference doc, a path matches an external-file note. References become queryable typed edges.
-- Triage routing — runs the saved-tree classifier (see `suggestions.md`) on notes saved within the configured triage scope. Either moves the file or writes a frontmatter tag (per the saved tree's per-cluster mode), or leaves it alone — never writes a `hiker.placement` field, never auto-overrides anything outside the triage scope.
+- Triage routing — runs the saved-tree classifier (see `cluster-editor.md`) on notes saved within the configured triage scope. Either moves the file or writes a frontmatter tag (per the saved tree's per-cluster mode), or leaves it alone — never writes a `hiker.placement` field, never auto-overrides anything outside the triage scope.
 - Summary — short LLM-generated digest at note level (1–3 sentences) and optionally cluster level. Cached in frontmatter as `hiker.summary` (and on cluster nodes in the tree config). Refreshed on content change. Used as the cheap "what's in this" representation for MCP progressive disclosure, UI hover previews, and cluster overviews — distinct from chunk-level retrieval, which is the full text in pieces.
 
 Each stage records its version in the note's frontmatter (`hiker.enrichment.<stage>: <version>`) so future re-runs can detect stale enrichment. Bumping a stage's version forces re-enrichment naturally.

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 editor-core.workspace = true
 tree-sitter.workspace = true
+streaming-iterator = "0.1"
 smol_str.workspace = true
 smallvec.workspace = true
 

@@ -65,6 +65,14 @@ pub(super) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum IndexJob {
+    /// Routed from `FileEvent::Created` for indexable extensions. Runs
+    /// the inbox-rules pass (if any rules are configured) before falling
+    /// through to a normal `Upsert` so any rule-driven move lands in the
+    /// store at the new path rather than the original inbox path. With
+    /// no rules configured the handler is equivalent to a plain Upsert.
+    ///
+    /// status: inbox-rules
+    Created { rel_path: String },
     /// Index a single file. `force = true` bypasses the content_hash +
     /// embedder_version short-circuit so an explicit user reindex actually
     /// re-embeds even when bytes are unchanged.
@@ -160,6 +168,18 @@ pub enum ProgressEvent {
     Renamed { from: String, to: String },
     ScanComplete { scanned: u32, queued: u32 },
     Error { path: Option<String>, message: String },
+    /// An `[inbox]` rule fired on a freshly-created file. Emitted before
+    /// the post-move Upsert so the app can surface a toast immediately;
+    /// the toast text typically reads "Moved to X / tagged Y".
+    ///
+    /// status: inbox-rules
+    InboxApplied {
+        rule_index: u32,
+        original_path: String,
+        final_path: String,
+        moved_to: Option<String>,
+        tagged: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -214,6 +234,13 @@ pub struct Handle {
     /// and the history feed sees deletes. CLI / tests without an op log leave
     /// it empty and the jobs skip the op-log update.
     oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    /// Late-bound inbox rule list, compiled once at vault open from
+    /// `[inbox]` config. Filled by the host via `attach_inbox_rules`
+    /// after `Config::load` succeeds. CLI / tests without inbox routing
+    /// leave it empty and the `Created` job degrades to a plain Upsert.
+    ///
+    /// status: inbox-rules
+    inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>>,
 }
 
 /// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
@@ -229,8 +256,11 @@ impl IndexJobTx {
         &self,
         job: IndexJob,
     ) -> Result<(), mpsc::error::SendError<IndexJob>> {
-        if let IndexJob::Upsert { rel_path, .. } = &job {
-            self.pending.lock().unwrap().insert(rel_path.clone());
+        match &job {
+            IndexJob::Upsert { rel_path, .. } | IndexJob::Created { rel_path } => {
+                self.pending.lock().unwrap().insert(rel_path.clone());
+            }
+            _ => {}
         }
         self.tx.send(job).await
     }
@@ -244,8 +274,11 @@ impl Handle {
     }
 
     pub async fn enqueue(&self, job: IndexJob) -> Result<(), Error> {
-        if let IndexJob::Upsert { rel_path, .. } = &job {
-            self.pending.lock().unwrap().insert(rel_path.clone());
+        match &job {
+            IndexJob::Upsert { rel_path, .. } | IndexJob::Created { rel_path } => {
+                self.pending.lock().unwrap().insert(rel_path.clone());
+            }
+            _ => {}
         }
         self.tx().send(job).await.map_err(|_| Error::SendFailed)
     }
@@ -365,6 +398,17 @@ impl Handle {
         }
     }
 
+    /// Late-bind the inbox rule list so `IndexJob::Created` runs the
+    /// rule pass before the upsert lands. Host calls this once at vault
+    /// open after `Config::load`. Idempotent first-write-wins.
+    ///
+    /// status: inbox-rules
+    pub fn attach_inbox_rules(&self, rules: Arc<crate::inbox::Rules>) {
+        if self.inbox_cell.set(rules).is_err() {
+            tracing::warn!("indexer: inbox_cell already attached; ignoring");
+        }
+    }
+
     /// Stop the indexer task gracefully and wait for it to finish.
     pub async fn shutdown(mut self) {
         // Drop the held sender so the task's `recv()` returns `None`. Any
@@ -444,6 +488,7 @@ where
 
     let watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>> = Arc::new(OnceCell::new());
     let oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>> = Arc::new(OnceCell::new());
+    let inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>> = Arc::new(OnceCell::new());
 
     let progress_for_task = progress_tx.clone();
     let pending_for_task = pending.clone();
@@ -458,6 +503,7 @@ where
     };
     let watcher_cell_for_task = watcher_cell.clone();
     let oplog_cell_for_task = oplog_cell.clone();
+    let inbox_cell_for_task = inbox_cell.clone();
     let join = tokio::spawn(
         crate::indexer::scheduler::IndexerLoop {
             vault,
@@ -472,6 +518,7 @@ where
             self_tx,
             watcher_cell: watcher_cell_for_task,
             oplog_cell: oplog_cell_for_task,
+            inbox_cell: inbox_cell_for_task,
             tasks,
         }
         .run(),
@@ -486,6 +533,7 @@ where
         embedder: embedder_cell,
         watcher_cell,
         oplog_cell,
+        inbox_cell,
     }
 }
 
@@ -628,7 +676,17 @@ pub async fn route_watcher_events(
         match rx.recv().await {
             Ok(ev) => {
                 let job = match ev {
-                    FileEvent::Created { path } | FileEvent::Modified { path } => {
+                    FileEvent::Created { path } => {
+                        if !is_indexable_path(&path) {
+                            continue;
+                        }
+                        // status: inbox-rules
+                        // Route Created through the inbox-rules hook so a
+                        // configured rule can move / tag the file before the
+                        // store sees its original path.
+                        IndexJob::Created { rel_path: path }
+                    }
+                    FileEvent::Modified { path } => {
                         if !is_indexable_path(&path) {
                             continue;
                         }
@@ -739,17 +797,8 @@ pub(super) fn update_total_notes(status: &watch::Sender<IndexStatus>, store: &St
     }
 }
 
-/// Read `hiker.id` from a note's frontmatter, returning None if there's
-/// no frontmatter, no `hiker:` block, or no `id:` field. Used by
-/// `process_upsert` to keep `path_ids` in lockstep with whatever id the
-/// file already declares — avoids the "two ULIDs for one note" failure
-/// mode that produced
-/// `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`.
-pub(super) fn frontmatter_hiker_id(contents: &str) -> Option<String> {
-    let split = crate::frontmatter::split(contents);
-    let fm = split.frontmatter?;
-    let serde_yml::Value::Mapping(map) = fm else { return None };
-    let serde_yml::Value::Mapping(hiker) = map.get("hiker")? else { return None };
-    hiker.get("id")?.as_str().map(std::string::ToString::to_string)
-}
+// `frontmatter_hiker_id` retired with `note-id-stamping`. Under
+// path-as-identity (`store-id-from-oplog`), `notes.id` is sourced from
+// the op-log's `doc-index.db` rather than from the note's frontmatter,
+// so the empty-`path_ids` fallback that read this helper is gone.
 

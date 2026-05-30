@@ -73,8 +73,11 @@ Per-vault toggles for the editor pane and View menu. All optional; each has an i
 | `show_chunk_boundaries` | bool | `false` | Initial state of `view-show-chunk-boundaries`; debugging-grade view, off by default |
 | `intraline_diff` | bool | `false` | Initial state of `view-intraline-diff-toggle`; off keeps the existing line-level rendering. See `diff.md`'s "Diff style" section |
 | `tab_size` | u8 | `2` | Editor indent width — spaces inserted per Tab / list-indent step |
+| `system_font` | string | platform UI default | Font for non-editor chrome (toolbars, menus, sidebar, status bar, tabs). Per `editor-three-fonts` |
+| `editor_font` | string | platform proportional default | Font for the editor canvas's prose body. Per `editor-three-fonts` |
+| `code_font` | string | platform monospace default | Font for fenced code blocks AND frontmatter blocks (per `editor-frontmatter-rendering-fix`) AND inline code AND the diff layer's code-shaped hunks. Per `editor-three-fonts` |
 
-Theme and font family/size are intentionally excluded from v1 — they need a UI to be discoverable and the TOML-only surface isn't the right home for them. They're listed in "Deferred" below. Crash-recovery autosave (`autosave.md`) is on with a fixed 5s tick and has no config surface in v1; an `[autosave]` section can land later if a workflow asks.
+Font family rides the three font slots above per `editor-three-fonts`; per-slot **size** is intentionally excluded from v1 (theme tokens own size) and is listed in "Deferred" below. Theme is also deferred. Crash-recovery autosave (`autosave.md`) is on with a fixed 5s tick and has no config surface in v1; an `[autosave]` section can land later if a workflow asks.
 
 ### [indexing] [settings-section-indexing]
 
@@ -126,13 +129,38 @@ Behavior on Cancel: the dropdown reverts to the previous value; no write occurs.
 
 The warning is only on the **settings UI** path. Hand-edits to the vault TOML don't surface a warning — strict-load picks up the new value on the *next launch*, the embedder loads at the new model id, and the re-embed runs. (Hot-reload is a UI-driven path only; the TOML hand-edit case is rare enough that "restart to apply" is acceptable, same posture as the rest of `settings-load-once-at-startup`.) Documented in the inline "Notes" comment of the auto-created TOML.
 
-### [extract] [settings-section-extract]
+### [extract] (deferred — lands when `core::extract` ships) [settings-section-extract]
+
+> **Deferred — not yet loaded.** There is no `ExtractConfig` field on the
+> strict-load `Config` struct (`core/src/config/mod.rs`), so a well-formed
+> `[extract]` table in a live vault's TOML currently aborts vault open with a
+> `HikerError::Config` ("unknown field") under `settings-strict-load`. The
+> schema below is the *planned* shape; it lands with the extract feature. Until
+> then, do not add an `[extract]` table to a vault TOML.
 
 Extraction tunables (`extract.md`). Vault-level is the natural scope (which folders hold extractable sources is per-vault), with a user-level default fine for the common case.
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
 | `auto_globs` | array of strings | `[]` | Folders/globs whose non-md sources auto-extract on appear/change (`extract-trigger-auto-glob`). gitignore-style globs over vault-relative paths; replaces, doesn't concatenate, per the array-merge rule. Default empty = no auto-extraction; non-md elsewhere extracts only on the explicit "Make searchable" action (`extract-trigger-on-demand`) |
+
+### [inbox] [settings-section-inbox]
+
+Deterministic auto-organization rules for newly-created notes. Per-vault only (rules are vault content). Full behavior spec lives in `docs/inbox-rules.md`; the schema below is what the loader reads.
+
+| Key | Type | Default | Notes |
+| --- | ---- | ------- | ----- |
+| `rules` | array of tables | `[]` | Ordered list of `{ match, action }` entries; first match wins. See `inbox-rules` |
+
+Each `rules[i]` entry is a table:
+
+```toml
+[[inbox.rules]]
+match = { basename = "^TODO-.*", body = "^#"  }   # any of: basename regex, body regex, both; AND-combined when both present
+action = { move_to = "inbox/todos/", add_tag = "todo" }   # one or both of move_to / add_tag
+```
+
+Strict-load rejects malformed entries (invalid regex, missing both `move_to` and `add_tag`). Default empty array = no auto-organization, all new notes land at their original create path.
 
 ### [vault] [settings-section-vault]
 
@@ -307,7 +335,7 @@ No green/red. All Accept/Reject use the existing muted token system and the same
 
 ### Storage
 
-Accepted state lives in `.hiker/oplog/<doc-id>.yrs` (the document's Yrs CRDT state); pending ops queue separately in `<doc-id>.pending` as serialized Yrs updates paired with side-table metadata. Storage layout, op shapes, drift detection, and the two-doc model are all specced in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-two-doc-model`, `op-log-status-states`). The `[staging]` config section is replaced by `[op-log]` per `op-log-config-section`.
+Accepted state lives in `.hiker/oplog/<doc-id>.yrs` (the document's Yrs CRDT state); pending ops queue separately in `<doc-id>.pending` as serialized Yrs updates paired with side-table metadata. Storage layout, op shapes, drift detection, and the layered model are all specced in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-layered-model`, `op-log-status-states`). The `[staging]` config section is replaced by `[op-log]` per `op-log-config-section`.
 
 There is no separate staging database, no `staging.db` schema, no proposal table. Pending ops are queryable via `core::oplog::query({ status: Pending, ... })` — the same query surface every other consumer reads.
 

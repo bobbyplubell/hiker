@@ -11,16 +11,22 @@ categories = ["gui"]
 
 [features]
 default = ["serde"]
-# Enable serde derives on all persistable types (WorkbenchLayout, TabState, etc.)
-# and egui_tiles' own serde feature so layouts round-trip through JSON.
-serde = ["dep:serde", "dep:serde_json", "egui_tiles/serde"]
+# Enable serde derives on persistable layout types (WorkbenchLayout, TabState,
+# etc.) and egui_tiles' own serde feature so layouts round-trip through JSON.
+# `serde_json` is now an unconditional dep because the feature registry
+# (`feature::ActionError`, `Feature::dispatch_action`) needs `serde_json::Value`
+# on its public surface regardless of the `serde` cargo feature.
+serde = ["dep:serde", "egui_tiles/serde"]
 
 [dependencies]
 egui.workspace = true
 egui_extras.workspace = true
 egui_tiles.workspace = true
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+# Wire type for `feature::ActionError` and `Feature::dispatch_action` args /
+# results. Not optional: the registry is part of this crate's public surface.
+serde_json = { workspace = true }
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

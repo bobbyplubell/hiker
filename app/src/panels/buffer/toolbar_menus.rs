@@ -183,6 +183,22 @@ impl Menus<'_> {
                 &serde_json::json!(intraline_diff),
             );
         }
+        ui.separator();
+        // Reader / focus view (`editor-reader-view`). Per-buffer flip;
+        // hides every chrome region around the editor canvas. Also bound
+        // to `editor.reader-view` (Mod-Shift-R).
+        let mut reader_view = false;
+        if let Some(buffer) = app.session.buffers.get(path) {
+            reader_view = buffer.reader_view;
+        }
+        if ui
+            .checkbox(&mut reader_view, "Reader view")
+            .on_hover_text("Hide all chrome and render the editor full-bleed (editor-reader-view)")
+            .changed()
+            && let Some(buffer) = app.session.buffers.get_mut(path)
+        {
+            buffer.reader_view = reader_view;
+        }
         if ui
             .checkbox(&mut heading_breadcrumb, "Show heading breadcrumb")
             .on_hover_text("Display the cursor's heading path in the status bar (view-heading-breadcrumb-toggle)")

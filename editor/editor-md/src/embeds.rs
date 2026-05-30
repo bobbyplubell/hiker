@@ -1,4 +1,4 @@
-//! Obsidian-style transclusion decorations: `![[Target]]` and
+//! Transclusion decorations: `![[Target]]` and
 //! `![[Target#section]]`.
 //!
 //! When the cursor is not on the same line as a transclusion, the entire

@@ -2,11 +2,10 @@
 //!
 //! A board-doc is a regular markdown note with `hiker.kind: board` in its
 //! frontmatter; the frontmatter owns an ordered list of user-named
-//! columns, each an ordered list of card references. The board-doc is to a
-//! note-card what a trail-doc is to a waypoint — so this module mirrors
-//! `core::trails` and reuses its reference-resolution + auto-update-on-move
-//! machinery (`DoubleLinkRef`, `resolve_reference`, the `rewrite_*`
-//! helpers).
+//! columns, each an ordered list of card references. The board-doc is to
+//! a note-card what a trail-doc is to a waypoint — so this module mirrors
+//! `core::trails` and reuses its path-based reference resolution
+//! (`resolve_reference`, the `rewrite_*` helpers).
 //!
 //! Per-spec (`docs/kanban.md` §"Board-doc shape"), a non-`.md` file with
 //! `hiker.kind: board` is NOT a board — callers verify the extension
@@ -21,32 +20,72 @@ use thiserror::Error;
 
 use crate::errors::HikerError;
 use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
+use crate::oplog::OpLog;
 use crate::store::Store;
 use crate::trails::ops::{resolve_reference, ResolutionOutcome};
-use crate::trails::DoubleLinkRef;
 use crate::vault::Vault;
 
 pub mod ops;
 #[cfg(test)]
 mod tests;
 
-/// One column of a board: a user-named, ordered list of card references.
-/// Empty columns render — the column set is explicit, never inferred from
-/// the cards present.
+/// A single card on a board. Either a **note card** — a vault-relative
+/// path to a note, resolved via the path-based reference machinery — or
+/// a **freeform card** — `{ card_id, text }` carrying its own text with
+/// no note ref. Presence of `text` without `path` discriminates on parse.
+///
+/// Under path-as-identity (`board-card-references`) a note card carries
+/// only its path; there is no id half. A freeform card keeps its
+/// `card_id` because the same column may hold two freeform cards with
+/// identical text, and move/reorder/remove need a stable handle to name
+/// the one being touched.
+///
+/// status: board-card-references
+/// status: board-freeform-card
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardCard {
+    /// A card referencing a note by its vault-relative path.
+    Note { path: String },
+    /// A freeform card carrying its own text and a card-local
+    /// disambiguator id. The id never surfaces to the user.
+    Text { card_id: String, text: String },
+}
+
+impl BoardCard {
+    /// The card's vault-relative path, for note cards only. `None` for
+    /// freeform cards (they reference no note).
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            BoardCard::Note { path } => Some(path),
+            BoardCard::Text { .. } => None,
+        }
+    }
+
+    /// The freeform card's internal disambiguator id; `None` for a note
+    /// card (note cards are addressed by their `path`).
+    pub fn card_id(&self) -> Option<&str> {
+        match self {
+            BoardCard::Text { card_id, .. } => Some(card_id),
+            BoardCard::Note { .. } => None,
+        }
+    }
+}
+
+/// One column of a board: a user-named, ordered list of cards. Empty
+/// columns render — the column set is explicit, never inferred from the
+/// cards present.
 ///
 /// status: board-column-model
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
-    #[serde(default)]
-    pub cards: Vec<DoubleLinkRef>,
+    pub cards: Vec<BoardCard>,
     /// Optional per-column WIP (work-in-progress) limit. When set, the
     /// board view shows the column's count against this cap and flags
     /// overflow. `None` is omitted from the serialized frontmatter so
     /// columns without a limit round-trip unchanged.
     ///
     /// status: board-wip-limits
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wip_limit: Option<usize>,
 }
 
@@ -58,25 +97,23 @@ pub struct Column {
 ///
 /// status: board-doc-shape
 /// status: board-column-model
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
-    pub id: String,
-    #[serde(default)]
     pub columns: Vec<Column>,
 }
 
 impl Board {
-    /// True if any column already holds a card pointing at `note_rel` (by
-    /// path) or `note_id` (by ULID, when non-empty). Drives the
-    /// per-board idempotency check for `add_card` and the
+    /// True if any column already holds a card pointing at `note_rel`.
+    /// Drives the per-board idempotency check for `add_card` and the
     /// "Already on this board" verb state.
     ///
     /// status: board-add-card
-    pub fn contains_note(&self, note_id: &str, note_rel: &str) -> bool {
+    pub fn contains_note(&self, note_rel: &str) -> bool {
         self.columns.iter().any(|c| {
-            c.cards
-                .iter()
-                .any(|card| card.path == note_rel || (!note_id.is_empty() && card.id == note_id))
+            c.cards.iter().any(|card| match card {
+                BoardCard::Note { path } => path == note_rel,
+                BoardCard::Text { .. } => false,
+            })
         })
     }
 
@@ -129,19 +166,13 @@ pub fn parse_board(source: &str) -> Result<Board, Error> {
         });
     }
 
-    let id = hiker_map
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or(Error::MissingField("hiker.id"))?
-        .to_string();
-
     let columns = match hiker_map.get("columns") {
         None => Vec::new(),
         Some(YamlValue::Sequence(seq)) => seq.iter().filter_map(parse_column).collect(),
         Some(_) => return Err(Error::MissingField("hiker.columns")),
     };
 
-    Ok(Board { id, columns })
+    Ok(Board { columns })
 }
 
 /// Path-aware wrapper around `parse_board`: rejects non-`.md` extensions
@@ -168,11 +199,37 @@ fn parse_column(v: &YamlValue) -> Option<Column> {
     Some(Column { name, cards, wip_limit })
 }
 
-fn parse_card(v: &YamlValue) -> Option<DoubleLinkRef> {
+/// Parse one card map. A `path` key → a note card (`{ path }`); a
+/// `text` key with no `path` and a `card_id` → a freeform card
+/// (`{ card_id, text }`). Mints nothing — a card with neither key is
+/// dropped. Under path-as-identity (`board-card-references`) note cards
+/// no longer carry an `id` half; the parser silently accepts (and drops)
+/// a legacy `id:` sibling so existing board-docs round-trip.
+///
+/// status: board-card-references
+/// status: board-freeform-card
+fn parse_card(v: &YamlValue) -> Option<BoardCard> {
     let YamlValue::Mapping(m) = v else { return None };
-    let id = m.get("id")?.as_str()?.to_string();
-    let path = m.get("path")?.as_str()?.to_string();
-    Some(DoubleLinkRef { id, path })
+    if let Some(path) = m.get("path").and_then(YamlValue::as_str) {
+        return Some(BoardCard::Note {
+            path: path.to_string(),
+        });
+    }
+    if let Some(text) = m.get("text").and_then(YamlValue::as_str) {
+        // `card_id` is the freeform card's internal disambiguator.
+        // Legacy board-docs may have used `id:`; honor that for
+        // round-trip but prefer the new `card_id` when both are present.
+        let card_id = m
+            .get("card_id")
+            .or_else(|| m.get("id"))
+            .and_then(YamlValue::as_str)?
+            .to_string();
+        return Some(BoardCard::Text {
+            card_id,
+            text: text.to_string(),
+        });
+    }
+    None
 }
 
 /// Serialize a board-doc frontmatter back into the source. Preserves
@@ -192,7 +249,9 @@ pub fn write_board_frontmatter(body_source: &str, board: &Board) -> Result<Strin
     }
     let mut hiker_patch = serde_json::Map::new();
     hiker_patch.insert("kind".into(), serde_json::Value::String("board".into()));
-    hiker_patch.insert("id".into(), serde_json::Value::String(board.id.clone()));
+    // status: board-doc-shape
+    // No `hiker.id` — the board's storage key is the op-log's `doc_id`
+    // for the board-doc's path; kept in `doc-index.db` not the file.
     hiker_patch.insert(
         "columns".into(),
         serde_json::Value::Array(board.columns.iter().map(column_to_json).collect()),
@@ -201,11 +260,13 @@ pub fn write_board_frontmatter(body_source: &str, board: &Board) -> Result<Strin
     // `merge_json_into_yaml` deep-merges maps but *replaces* arrays — so
     // the existing `columns` array is fully overwritten with the new one.
     // Strip the pre-existing `hiker.columns` first so no stale entries
-    // linger if the merge ever changes its array policy.
+    // linger if the merge ever changes its array policy. Also strip any
+    // legacy `hiker.id` so rewriting an old board-doc drops the field.
     if let YamlValue::Mapping(top) = &mut existing
         && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
     {
         hiker.remove("columns");
+        hiker.remove("id");
     }
     merge_json_into_yaml(&mut existing, patch);
     Ok(assemble(&existing, split_view.body)?)
@@ -215,7 +276,16 @@ fn column_to_json(c: &Column) -> serde_json::Value {
     let cards: Vec<_> = c
         .cards
         .iter()
-        .map(|card| serde_json::json!({ "id": card.id, "path": card.path }))
+        .map(|card| match card {
+            // status: board-card-references / board-freeform-card —
+            // note card serializes `{ path }`; freeform card serializes
+            // `{ card_id, text }`. Presence of `path` vs `text`
+            // discriminates on parse.
+            BoardCard::Note { path } => serde_json::json!({ "path": path }),
+            BoardCard::Text { card_id, text } => {
+                serde_json::json!({ "card_id": card_id, "text": text })
+            }
+        })
         .collect();
     let mut obj = serde_json::Map::new();
     obj.insert("name".into(), serde_json::Value::String(c.name.clone()));
@@ -244,16 +314,40 @@ pub struct BoardListItem {
     pub card_count: u32,
 }
 
-/// One card of a resolved board, post reference-resolution. `title` is the
-/// referenced note's display title; `resolution` reports whether the
-/// double-link resolves, self-heals, conflicts, or is broken (orphan).
+/// One card of a resolved board. For a **note card**, `title` is the
+/// referenced note's display title, `path` is its recorded vault path,
+/// and `resolution` reports whether the path resolves or is orphaned. For
+/// a **freeform card**, `title` is the card's own text, `path` is `None`,
+/// and `resolution` is `None` (no note ref to resolve). `card_id` is
+/// `None` for note cards (they're addressed by `path`) and `Some` for
+/// freeform cards.
 ///
 /// status: board-card-references
+/// status: board-freeform-card
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedCard {
-    pub card_ref: DoubleLinkRef,
+    /// Freeform card's internal disambiguator; `None` for note cards.
+    pub card_id: Option<String>,
+    /// The recorded vault path for a note card; `None` for freeform.
+    pub path: Option<String>,
+    /// The card's own text for a freeform card; `None` for a note card.
+    pub text: Option<String>,
     pub title: String,
-    pub resolution: ResolutionOutcome,
+    /// `None` for a freeform card — it resolves to itself, no note ref.
+    pub resolution: Option<ResolutionOutcome>,
+}
+
+impl ResolvedCard {
+    /// Polymorphic handle for move/reorder/remove: the note card's
+    /// vault path or the freeform card's `card_id`. Returns an empty
+    /// `&str` only for a malformed resolved card (neither half set);
+    /// in normal use one of the two is always populated.
+    pub fn handle(&self) -> &str {
+        self.path
+            .as_deref()
+            .or(self.card_id.as_deref())
+            .unwrap_or("")
+    }
 }
 
 /// One column of a resolved board.
@@ -284,7 +378,11 @@ pub struct BoardDetail {
 /// `.md` file; rows that parse Ok are board-docs.
 ///
 /// status: board-many-to-many
-pub fn list(vault: &Vault, store: &Store) -> Result<Vec<BoardListItem>, HikerError> {
+pub fn list(
+    vault: &Vault,
+    store: &Store,
+    log: &OpLog,
+) -> Result<Vec<BoardListItem>, HikerError> {
     let paths = store
         .all_note_paths()
         .map_err(|e| HikerError::Io(e.to_string()))?;
@@ -296,9 +394,14 @@ pub fn list(vault: &Vault, store: &Store) -> Result<Vec<BoardListItem>, HikerErr
         let Ok(src) = vault.read_file(&rel) else { continue };
         let Ok(board) = parse_board_for(&rel, &src) else { continue };
         let card_count: u32 = board.columns.iter().map(|c| c.cards.len() as u32).sum();
+        // status: store-id-from-oplog
+        let board_id = match log.doc_id_for_path(&rel) {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
         out.push(BoardListItem {
             rel_path: rel.clone(),
-            board_id: board.id,
+            board_id,
             title: {
                 let base = rel.rsplit('/').next().unwrap_or(&rel);
                 base.strip_suffix(".md").unwrap_or(base).to_string()
@@ -320,6 +423,7 @@ pub fn list(vault: &Vault, store: &Store) -> Result<Vec<BoardListItem>, HikerErr
 pub fn get_board(
     vault: &Vault,
     store: &Store,
+    log: &OpLog,
     board_doc_rel: &str,
 ) -> Result<BoardDetail, HikerError> {
     let src = vault.read_file(board_doc_rel)?;
@@ -333,35 +437,23 @@ pub fn get_board(
         .map(|col| ResolvedColumn {
             name: col.name.clone(),
             wip_limit: col.wip_limit,
-            cards: col
-                .cards
-                .iter()
-                .map(|card| {
-                    let resolution =
-                        resolve_reference(store, vault, card).unwrap_or(ResolutionOutcome::Orphan);
-                    // Display title: the canonical path's basename when the
-                    // card resolves / self-heals; the recorded path's
-                    // basename otherwise.
-                    let title_path = match &resolution {
-                        ResolutionOutcome::Resolved { rel_path, .. } => rel_path.clone(),
-                        ResolutionOutcome::SelfHeal { canonical_path, .. } => {
-                            canonical_path.clone()
-                        }
-                        _ => card.path.clone(),
-                    };
-                    ResolvedCard {
-                        card_ref: card.clone(),
-                        title: title_of(&title_path),
-                        resolution,
-                    }
-                })
-                .collect(),
+            cards: col.cards.iter().map(|card| resolve_card(store, vault, card)).collect(),
         })
         .collect();
 
+    // status: store-id-from-oplog
+    let board_id = log
+        .doc_id_for_path(board_doc_rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?
+        .ok_or_else(|| {
+            HikerError::NotFound(format!(
+                "op-log doc_id missing for board-doc: {board_doc_rel}"
+            ))
+        })?;
+
     Ok(BoardDetail {
         rel_path: board_doc_rel.to_string(),
-        board_id: board.id,
+        board_id,
         body,
         columns,
     })
@@ -389,6 +481,7 @@ pub struct ContainingNoteHit {
 pub fn containing_note_with_paths(
     vault: &Vault,
     store: &Store,
+    log: &OpLog,
     source_rel: &str,
 ) -> Result<Vec<ContainingNoteHit>, HikerError> {
     let hits = store
@@ -397,7 +490,7 @@ pub fn containing_note_with_paths(
     if hits.is_empty() {
         return Ok(Vec::new());
     }
-    let listing = list(vault, store)?;
+    let listing = list(vault, store, log)?;
     let mut by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for b in &listing {
         by_id.insert(b.board_id.as_str(), b.rel_path.as_str());
@@ -429,7 +522,6 @@ pub fn containing_note_with_paths(
 /// status: board-mcp-tools
 pub fn add_card_preview(
     vault: &Vault,
-    store: &Store,
     board_doc_rel: &str,
     column_name: &str,
     source_rel: &str,
@@ -437,23 +529,49 @@ pub fn add_card_preview(
     let src = vault.read_file(board_doc_rel)?;
     let mut board = parse_board_for(board_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse board-doc: {e}")))?;
-    let source_id = store
-        .id_for_path(source_rel)
-        .map_err(|e| HikerError::Io(e.to_string()))?
-        .unwrap_or_default();
-    if board.contains_note(&source_id, source_rel) {
+    if board.contains_note(source_rel) {
         return Ok(None);
     }
     let col_idx = board
         .column_index(column_name)
         .ok_or_else(|| HikerError::NotFound(format!("column: {column_name}")))?;
-    board.columns[col_idx].cards.push(DoubleLinkRef {
-        id: source_id,
+    board.columns[col_idx].cards.push(BoardCard::Note {
         path: source_rel.to_string(),
     });
     let new_src = write_board_frontmatter(&src, &board)
         .map_err(|e| HikerError::Io(format!("rewrite board-doc: {e}")))?;
     Ok(Some(new_src))
+}
+
+/// Resolve one card for the board view. A note card runs through the trails
+/// reference machinery (resolve / self-heal / conflict / orphan); a freeform
+/// card resolves to itself — its title is its own text and there is no
+/// `ResolutionOutcome`.
+///
+/// status: board-freeform-card
+fn resolve_card(store: &Store, vault: &Vault, card: &BoardCard) -> ResolvedCard {
+    match card {
+        BoardCard::Text { card_id, text } => ResolvedCard {
+            card_id: Some(card_id.clone()),
+            path: None,
+            text: Some(text.clone()),
+            title: text.clone(),
+            resolution: None,
+        },
+        BoardCard::Note { path } => {
+            let resolution = resolve_reference(store, vault, path)
+                .unwrap_or(ResolutionOutcome::Orphan);
+            // Display title: the path's basename (resolved or not — under
+            // path-as-identity there's no self-heal canonical fallback).
+            ResolvedCard {
+                card_id: None,
+                path: Some(path.clone()),
+                text: None,
+                title: title_of(path),
+                resolution: Some(resolution),
+            }
+        }
+    }
 }
 
 /// Display title from a vault-relative path: basename without `.md`.
@@ -472,7 +590,7 @@ fn title_of(rel: &str) -> String {
 pub async fn on_note_moved(
     watcher: Option<&crate::watcher::Watcher>,
     jobs: Option<&crate::indexer::IndexJobTx>,
-    log: Option<&crate::oplog::OpLog>,
+    log: Option<&OpLog>,
     vault: &Vault,
     store: &mut Store,
     old_rel: &str,

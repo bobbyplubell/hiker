@@ -114,6 +114,18 @@ pub struct WrapMap {
     /// Whether wrapping is on at all. When false, every line is treated as a
     /// single VLine with no breaks.
     enabled: bool,
+    /// Fingerprint of the inputs that determine every line's wrap, restricted
+    /// to ones whose change implies *some* off-viewport line could now wrap
+    /// differently: doc content_id, the full-document decoration epoch, and
+    /// width/char_width/enabled. Viewport-scoped layers are deliberately
+    /// excluded — they only cover visible lines.
+    ///
+    /// Compared by [`Self::walk_range`] against the inputs of the previous
+    /// prewrap pass: if it matches and the line count is unchanged, only the
+    /// union of last and current visible bands needs rescanning.
+    last_geo_key: u64,
+    last_total_lines: usize,
+    last_viewport: (usize, usize),
 }
 
 impl WrapMap {
@@ -152,6 +164,51 @@ impl WrapMap {
 
     pub fn invalidate_all(&mut self) {
         self.lines.clear();
+        // Force the next `walk_range` to take the full-rescan branch — any
+        // cached partial-walk state is meaningless once the per-line entries
+        // are gone.
+        self.last_geo_key = 0;
+        self.last_total_lines = 0;
+        self.last_viewport = (usize::MAX, usize::MAX);
+    }
+
+    /// Decide which line range `prewrap_visible` must rescan this frame, given
+    /// the geometry inputs that drive every line's wrap.
+    ///
+    /// On a pure scroll (geo_key + line count unchanged from last walk), the
+    /// only lines whose spans could have shifted are those whose
+    /// viewport-scoped decoration coverage just changed — i.e. the union of
+    /// last frame's and this frame's visible band. Lines outside that union
+    /// were covered by the same set of layers in both frames (full-doc layers,
+    /// which are stable while `geo_key` is stable; no viewport-scoped layer
+    /// covered them in either frame), so their cached wraps are still valid.
+    ///
+    /// On any geometry change (doc edit, full-doc decoration change, width /
+    /// char-width / enabled change, line-count change) the full document is
+    /// returned and the cached walk state is reset.
+    ///
+    /// Always updates the stored last-walk state so the *next* call sees
+    /// today's inputs as "last frame's".
+    pub fn walk_range(
+        &mut self,
+        geo_key: u64,
+        total_lines: usize,
+        viewport: (usize, usize),
+    ) -> std::ops::Range<usize> {
+        let full = geo_key != self.last_geo_key
+            || total_lines != self.last_total_lines
+            || self.last_viewport == (usize::MAX, usize::MAX);
+        let range = if full {
+            0..total_lines
+        } else {
+            let (lo_a, hi_a) = self.last_viewport;
+            let (lo_b, hi_b) = viewport;
+            lo_a.min(lo_b)..hi_a.max(hi_b).min(total_lines)
+        };
+        self.last_geo_key = geo_key;
+        self.last_total_lines = total_lines;
+        self.last_viewport = viewport;
+        range
     }
 
     pub fn invalidate_line(&mut self, line: usize) {
@@ -171,15 +228,20 @@ impl WrapMap {
     /// changes. `scale` is the line's effective font scale (e.g. headings
     /// > 1.0) — caller computes it from the decoration layers covering the
     /// > line so the wrap accounts for the actual rendered character width.
-    pub fn get_or_compute<F: Fn(usize) -> String>(
+    ///
+    /// `text` is borrowed, not produced by a closure: the hash below reads it
+    /// unconditionally, so a lazy closure never avoided materializing it. The
+    /// caller already holds the line string (it scans the same line for spans),
+    /// so passing it through avoids a redundant per-line rope slice + alloc on
+    /// every scroll frame.
+    pub fn get_or_compute(
         &mut self,
         line: usize,
-        line_text: F,
+        text: &str,
         scale: f32,
         spans: &[VisualSpan],
     ) -> &WrappedLine {
         self.ensure_capacity(line + 1);
-        let text = line_text(line);
         // Hash the text AND the visual spans: the spans encode the line's
         // live-preview reveal state (markers hidden off the cursor line, shown
         // on it), so moving the cursor onto/off the line must re-wrap even
@@ -200,7 +262,7 @@ impl WrapMap {
         };
         if dirty {
             let mut new_w =
-                compute_wraps(&text, self.char_width, self.width, self.enabled, scale, spans);
+                compute_wraps(text, self.char_width, self.width, self.enabled, scale, spans);
             new_w.text_hash = h;
             self.lines[line] = new_w;
         }
@@ -441,8 +503,8 @@ mod tests {
         map.set_width(280.0);
         map.set_char_width(7.0);
         let text = "abcdefghij klmnopqrst".to_string();
-        let one = map.get_or_compute(0, |_| text.clone(), 1.0, &[]).visual_count();
-        let two = map.get_or_compute(0, |_| text.clone(), 2.0, &[]).visual_count();
+        let one = map.get_or_compute(0, &text, 1.0, &[]).visual_count();
+        let two = map.get_or_compute(0, &text, 2.0, &[]).visual_count();
         assert_eq!(one, 1, "scale 1.0 single line");
         assert!(two > 1, "scale 2.0 should re-wrap into multiple vlines, got {two}");
     }

@@ -368,23 +368,46 @@ pub(crate) fn skip_frontmatter(source: &str) -> &str {
 
 /// Paint a small preview card anchored near `anchor` (typically the
 /// hovered node's screen position). Placement nudges the card to keep
-/// it inside `canvas`. Shared between the vault graph and cluster
-/// graph panels.
+/// it inside `canvas`. Shared between the vault graph, cluster graph,
+/// and wikilink-hover panels.
 pub(crate) fn paint_preview_card(
     painter: &egui::Painter,
     canvas: egui::Rect,
     title: &str,
     body: &str,
     anchor: egui::Pos2,
-) {
+) -> Option<egui::Rect> {
+    paint_preview_card_with(painter, canvas, title, body, anchor, 0.0).map(|p| p.card_rect)
+}
+
+/// Returned geometry from [`paint_preview_card_with`]. Lets a caller
+/// implement scrollable bodies (clamp `scroll_y` against
+/// `max_scroll_y`) and hit-test the pointer against `card_rect`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreviewCardGeometry {
+    pub card_rect: egui::Rect,
+    pub max_scroll_y: f32,
+}
+
+/// Variant of [`paint_preview_card`] supporting a vertical scroll
+/// offset on the body. Callers managing their own hover lifecycle
+/// (the wikilink preview) feed in a clamped `scroll_y` per frame.
+pub(crate) fn paint_preview_card_with(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    title: &str,
+    body: &str,
+    anchor: egui::Pos2,
+    scroll_y: f32,
+) -> Option<PreviewCardGeometry> {
     let pad = 8.0;
     let max_size = egui::vec2(320.0, 180.0);
     let card_size = max_size.min(canvas.size() - egui::vec2(pad * 2.0, pad * 2.0));
     if card_size.x < 80.0 || card_size.y < 60.0 {
-        return;
+        return None;
     }
     // Try bottom-right of cursor first; flip to other quadrants if it
-    // would clip the canvas. 14px offset clears the node circle.
+    // would clip the canvas. 14px offset clears the node circle / pill.
     let offset = egui::vec2(14.0, 14.0);
     let mut min = anchor + offset;
     if min.x + card_size.x > canvas.right() - pad {
@@ -425,7 +448,7 @@ pub(crate) fn paint_preview_card(
 
     let body_top = inner.left_top() + egui::vec2(0.0, title_size.y + 6.0);
     if body_top.y >= inner.bottom() {
-        return; // title alone filled the card
+        return Some(PreviewCardGeometry { card_rect, max_scroll_y: 0.0 });
     }
     let body_rect = egui::Rect::from_min_max(body_top, inner.right_bottom());
     let body_galley = painter.layout(
@@ -434,8 +457,16 @@ pub(crate) fn paint_preview_card(
         body_color,
         body_rect.width(),
     );
+    let body_h = body_galley.size().y;
+    let max_scroll_y = (body_h - body_rect.height()).max(0.0);
+    let scroll_clamped = scroll_y.clamp(0.0, max_scroll_y);
     let clip_painter = painter.with_clip_rect(body_rect);
-    clip_painter.galley(body_rect.left_top(), body_galley, body_color);
+    clip_painter.galley(
+        body_rect.left_top() - egui::vec2(0.0, scroll_clamped),
+        body_galley,
+        body_color,
+    );
+    Some(PreviewCardGeometry { card_rect, max_scroll_y })
 }
 
 impl State {

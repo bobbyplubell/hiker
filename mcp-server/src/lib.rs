@@ -18,6 +18,7 @@ pub mod agent_bridge;
 pub mod audit;
 pub mod discovery;
 pub mod handler;
+pub mod ui_context;
 
 
 use std::net::SocketAddr;
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hiker_core::audit::AgentLog;
-use hiker_core::config::sections::{McpConfig, TasksConfig};
+use hiker_core::config::sections::{BoardsConfig, McpConfig, TasksConfig};
 use hiker_core::embed::Embedder;
 use hiker_core::indexer::IndexJobTx;
 use hiker_core::store::Store;
@@ -71,6 +72,11 @@ pub struct McpDeps {
     /// `[tasks]` config — drives lease defaults + the chat-agent
     /// expose toggle.
     pub tasks_config: TasksConfig,
+    /// `[boards]` config — supplies `new_board_dir` for the
+    /// `board_create` tool's default placement.
+    ///
+    /// status: board-mcp-tools
+    pub boards_config: BoardsConfig,
     /// Mirror of `[llm] enabled`. The `task_*` tools guard on this; with
     /// LLM disabled, the queue's purpose is gone, so the tools answer
     /// `1004 disabled` rather than letting external agents check work
@@ -83,6 +89,12 @@ pub struct McpDeps {
     ///
     /// status: agent-write-review-mode
     pub oplog: Option<Arc<hiker_core::oplog::OpLog>>,
+    /// status: mcp-tool-get-active-note, mcp-tool-get-open-notes,
+    /// mcp-tool-get-selection
+    ///
+    /// Live UI-context snapshot the host populates each frame. The MCP
+    /// handler only reads from it.
+    pub ui_context: crate::ui_context::Shared,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +231,8 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         max_lease_secs: deps.tasks_config.lease.max_secs,
         expose_tasks_to_chat_agent: deps.tasks_config.expose_to_chat_agent,
         llm_enabled: deps.llm_enabled,
+        boards_config: deps.boards_config,
+        ui_context: deps.ui_context,
     });
     let factory_state = handler_state.clone();
     let service: StreamableHttpService<handler::App, LocalSessionManager> =

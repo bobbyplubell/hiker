@@ -9,53 +9,64 @@ use editor_md::meta::frontmatter_fold;
 use editor_md::links::wikilink_decorations;
 use editor_md::meta::FRONTMATTER_FOLD_ID;
 #[test]
-fn wikilink_with_alias_emits_replace_and_mark_when_cursor_off_line() {
-    let src = "first line\nsee [[Target Page|the page]] later\n";
-    let mut state = EditorState::new(src);
-    // Cursor on line 0 — so line 1 (the wikilink) should be collapsed.
-    state.selection = Selection::single(0);
-    let set = wikilink_decorations(&state, None, None, None);
+fn wikilink_path_form_emits_replace_and_mark_when_cursor_off_line() {
+    // Under path-form (`wikilink-path-form`) both a bare basename and an
+    // explicit vault-relative path are valid bodies; both should collapse to
+    // a Replace + Mark when the cursor is off the link's line. There is no
+    // `|alias` half — the body is the target verbatim and its label.
+    for src in [
+        "first line\nsee [[Name]] later\n",
+        "first line\nsee [[folder/sub/Name]] later\n",
+    ] {
+        let mut state = EditorState::new(src);
+        // Cursor on line 0 — so line 1 (the wikilink) should be collapsed.
+        state.selection = Selection::single(0);
+        let set = wikilink_decorations(&state, None, None, None);
 
-    let link_start = src.find("[[").unwrap();
-    let link_end = src.find("]]").unwrap() + 2;
-    let alias_start = src.find("the page").unwrap();
-    let alias_end = alias_start + "the page".len();
+        let link_start = src.find("[[").unwrap();
+        let link_end = src.find("]]").unwrap() + 2;
+        let body = &src[link_start + 2..link_end - 2];
+        let body_start = link_start + 2;
+        let body_end = body_start + body.len();
 
-    let mut has_replace = false;
-    let mut has_mark = false;
-    for (range, dec) in set.iter_overlapping(0..src.len()) {
-        match dec {
-            Decoration::Replace { display: Some(s) }
-                if range.start == link_start
-                    && range.end == link_end
-                    && s.as_str() == "the page" =>
-            {
-                has_replace = true;
+        let mut has_replace = false;
+        let mut has_mark = false;
+        for (range, dec) in set.iter_overlapping(0..src.len()) {
+            match dec {
+                Decoration::Replace { display: Some(s) }
+                    if range.start == link_start
+                        && range.end == link_end
+                        && s.as_str() == body =>
+                {
+                    has_replace = true;
+                }
+                Decoration::Mark(m)
+                    if range.start == body_start
+                        && range.end == body_end
+                        && m.underline
+                        && m.fg.is_some() =>
+                {
+                    has_mark = true;
+                }
+                _ => {}
             }
-            Decoration::Mark(m)
-                if range.start == alias_start
-                    && range.end == alias_end
-                    && m.underline
-                    && m.fg.is_some() =>
-            {
-                has_mark = true;
-            }
-            _ => {}
         }
+        assert!(has_replace, "expected Replace covering [[...]] for {src:?}");
+        assert!(has_mark, "expected underlined Mark on body text for {src:?}");
     }
-    assert!(has_replace, "expected Replace covering [[...|...]]");
-    assert!(has_mark, "expected underlined Mark on alias text");
 }
 
 #[test]
 fn wikilink_with_resolver_emits_clickable_live_title_widget() {
     use editor_md::links::WIKILINK_WIDGET_TAG;
-    let src = "intro line\nsee [[01HRX3ABCDEFGHJKMNPQRSTVWX|stale]] later\n";
+    // Path-form: the body is the target the resolver receives. The resolver
+    // maps a path (bare basename here, uniquely identifies the target) to its
+    // current title — basename or frontmatter `title`, the resolver's pick.
+    let src = "intro line\nsee [[meeting]] later\n";
     let mut state = EditorState::new(src);
     state.selection = Selection::single(0); // cursor off the link line
-    // Resolver returns the *current* title, ignoring the stored "stale".
     let resolve = |target: &str| -> Option<String> {
-        (target == "01HRX3ABCDEFGHJKMNPQRSTVWX").then(|| "Live Title".to_string())
+        (target == "meeting").then(|| "Weekly Sync".to_string())
     };
     let set = wikilink_decorations(&state, None, None, Some(&resolve));
     let link_start = src.find("[[").unwrap();
@@ -67,27 +78,50 @@ fn wikilink_with_resolver_emits_clickable_live_title_widget() {
     assert!(widget.handles_click(), "wikilink pill must be clickable");
     assert_eq!(widget.widget_id(), WIKILINK_WIDGET_TAG | link_start as u64);
     let disp = widget.display().expect("pill renders as text");
-    assert_eq!(disp.text.as_str(), "Live Title", "live title overrides stored display");
+    assert_eq!(
+        disp.text.as_str(),
+        "Weekly Sync",
+        "resolver's current title drives the pill label",
+    );
 }
 
 #[test]
 fn wikilink_unresolved_target_renders_distinctly() {
     use editor_md::links::COLOR_WIKILINK_UNRESOLVED;
-    let src = "x\nsee [[01HRX3ABCDEFGHJKMNPQRSTVWX|fallback]] end\n";
-    let mut state = EditorState::new(src);
-    state.selection = Selection::single(0);
-    let resolve = |_t: &str| -> Option<String> { None }; // nothing resolves
-    let set = wikilink_decorations(&state, None, None, Some(&resolve));
-    let link_start = src.find("[[").unwrap();
-    let disp = set
-        .iter_overlapping(0..src.len())
-        .find_map(|(range, d)| match d {
-            Decoration::InlineWidget { widget, .. } if range.start == link_start => widget.display(),
-            _ => None,
-        })
-        .expect("unresolved link still renders a pill");
-    assert_eq!(disp.text.as_str(), "fallback", "falls back to stored display");
-    assert_eq!(disp.fg, Some(COLOR_WIKILINK_UNRESOLVED), "unresolved uses the broken-link color");
+    // Both a bare-name link with no match and an explicit-path link with no
+    // file behind it should render in the unresolved style and fall back to
+    // the raw path the user typed. [wikilink-unresolved]
+    for src in [
+        "x\nsee [[NoSuchNote]] end\n",
+        "x\nsee [[folder/missing]] end\n",
+    ] {
+        let mut state = EditorState::new(src);
+        state.selection = Selection::single(0);
+        let resolve = |_t: &str| -> Option<String> { None }; // nothing resolves
+        let set = wikilink_decorations(&state, None, None, Some(&resolve));
+        let link_start = src.find("[[").unwrap();
+        let link_end = src.find("]]").unwrap() + 2;
+        let body = &src[link_start + 2..link_end - 2];
+        let disp = set
+            .iter_overlapping(0..src.len())
+            .find_map(|(range, d)| match d {
+                Decoration::InlineWidget { widget, .. } if range.start == link_start => {
+                    widget.display()
+                }
+                _ => None,
+            })
+            .expect("unresolved link still renders a pill");
+        assert_eq!(
+            disp.text.as_str(),
+            body,
+            "unresolved pill falls back to the raw target",
+        );
+        assert_eq!(
+            disp.fg,
+            Some(COLOR_WIKILINK_UNRESOLVED),
+            "unresolved uses the broken-link color for {src:?}",
+        );
+    }
 }
 
 #[test]

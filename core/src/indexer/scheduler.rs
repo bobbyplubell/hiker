@@ -36,6 +36,8 @@ where
     pub self_tx: IndexJobTx,
     pub watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     pub oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    /// status: inbox-rules
+    pub inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>>,
     pub tasks: Option<EmbedderLoadTaskPlumbing>,
 }
 
@@ -57,6 +59,7 @@ pub(super) async fn run(self) {
         self_tx,
         watcher_cell,
         oplog_cell,
+        inbox_cell,
         tasks,
     } = self;
     let tasks_queue: Option<Arc<crate::tasks::queue::Queue>> = tasks.as_ref().map(|p| p.queue.clone());
@@ -75,6 +78,7 @@ pub(super) async fn run(self) {
         self_tx: &self_tx,
         watcher_cell: &watcher_cell,
         oplog_cell: &oplog_cell,
+        inbox_cell: &inbox_cell,
         tasks_queue: tasks_queue.as_ref(),
     };
 
@@ -122,6 +126,8 @@ struct LoopState<'a> {
     self_tx: &'a IndexJobTx,
     watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    /// status: inbox-rules
+    inbox_cell: &'a Arc<OnceCell<Arc<crate::inbox::Rules>>>,
     tasks_queue: Option<&'a Arc<crate::tasks::queue::Queue>>,
 }
 
@@ -189,7 +195,9 @@ impl<'a> LoopState<'a> {
     async fn drain_pending_on_failure(&self, rx: &mut mpsc::Receiver<IndexJob>) {
         while let Some(job) = rx.recv().await {
             let path = match job {
-                IndexJob::Upsert { rel_path, .. } | IndexJob::Delete { rel_path } => Some(rel_path),
+                IndexJob::Upsert { rel_path, .. }
+                | IndexJob::Created { rel_path }
+                | IndexJob::Delete { rel_path } => Some(rel_path),
                 IndexJob::Rename { to, .. } => Some(to),
                 IndexJob::Move { reply, .. } => {
                     let _ = reply.send(Err(crate::errors::HikerError::Io("embedder unavailable".into())));
@@ -296,6 +304,7 @@ impl<'a> LoopState<'a> {
                     self_tx: self.self_tx,
                     watcher_cell: self.watcher_cell,
                     oplog_cell: self.oplog_cell,
+                    inbox_cell: self.inbox_cell,
                 };
                 handle_simple_job(&ctx, store, other).await;
             }
@@ -360,6 +369,7 @@ impl<'a> LoopState<'a> {
                 self_tx: self.self_tx,
                 watcher_cell: self.watcher_cell,
                 oplog_cell: self.oplog_cell,
+                inbox_cell: self.inbox_cell,
             };
             handle_simple_job(&ctx, store, j).await;
             update_total_notes(self.status, store);

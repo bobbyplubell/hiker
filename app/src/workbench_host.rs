@@ -24,9 +24,10 @@ use egui_workbench::behavior::Host;
 use egui_workbench::theme::Palette;
 use crate::icons;
 use crate::panels;
+use crate::clusters;
 use crate::panels_registry::{
-    PANEL_BACKLINKS, PANEL_CHAT, PANEL_CLUSTERS, PANEL_FILES, PANEL_RELATED, PANEL_SEARCH,
-    PANEL_TRAILS, PanelRegistry,
+    PANEL_BACKLINKS, PANEL_CHAT, PANEL_CLUSTERS, PANEL_FILES, PANEL_RELATED, PANEL_SEARCH, PANEL_TRASH,
+    PANEL_TRAILS, PANEL_VAULT, PanelRegistry,
 };
 use crate::state::AppState;
 use crate::tab::{TabId, TabKind};
@@ -38,20 +39,39 @@ pub enum HikerMode {
     Files,
     Clusters,
     Trails,
+    Vault,
     Search,
     Related,
     Backlinks,
+    Trash,
 }
 
 impl HikerMode {
+    /// All sidebar modes, in activity-bar order. Used by the
+    /// multi-region split control to offer each as a pinnable region.
+    const fn all() -> [HikerMode; 8] {
+        [
+            HikerMode::Files,
+            HikerMode::Clusters,
+            HikerMode::Trails,
+            HikerMode::Vault,
+            HikerMode::Search,
+            HikerMode::Related,
+            HikerMode::Backlinks,
+            HikerMode::Trash,
+        ]
+    }
+
     const fn label(&self) -> &'static str {
         match self {
             HikerMode::Files => "Files",
             HikerMode::Clusters => "Clusters",
             HikerMode::Trails => "Trails",
+            HikerMode::Vault => "Vault",
             HikerMode::Search => "Search",
             HikerMode::Related => "Related",
             HikerMode::Backlinks => "Backlinks",
+            HikerMode::Trash => "Trash",
         }
     }
 
@@ -60,9 +80,29 @@ impl HikerMode {
             HikerMode::Files => PANEL_FILES,
             HikerMode::Clusters => PANEL_CLUSTERS,
             HikerMode::Trails => PANEL_TRAILS,
+            HikerMode::Vault => PANEL_VAULT,
             HikerMode::Search => PANEL_SEARCH,
             HikerMode::Related => PANEL_RELATED,
             HikerMode::Backlinks => PANEL_BACKLINKS,
+            HikerMode::Trash => PANEL_TRASH,
+        }
+    }
+
+    /// Inverse of [`HikerMode::panel_id`]: resolve a registered panel id
+    /// back to the activity-bar mode that hosts it in the primary side
+    /// bar, if any. `PANEL_CHAT` lives in the secondary side bar and has
+    /// no activity mode, so it returns `None`.
+    pub fn from_panel_id(panel_id: &str) -> Option<HikerMode> {
+        match panel_id {
+            PANEL_FILES => Some(HikerMode::Files),
+            PANEL_CLUSTERS => Some(HikerMode::Clusters),
+            PANEL_TRAILS => Some(HikerMode::Trails),
+            PANEL_VAULT => Some(HikerMode::Vault),
+            PANEL_SEARCH => Some(HikerMode::Search),
+            PANEL_RELATED => Some(HikerMode::Related),
+            PANEL_BACKLINKS => Some(HikerMode::Backlinks),
+            PANEL_TRASH => Some(HikerMode::Trash),
+            _ => None,
         }
     }
 
@@ -71,9 +111,11 @@ impl HikerMode {
             HikerMode::Files => icons::ICONS.image(crate::icons::Icon::Folder),
             HikerMode::Clusters => icons::ICONS.image(crate::icons::Icon::ClusterTree),
             HikerMode::Trails => icons::ICONS.trail(),
+            HikerMode::Vault => icons::ICONS.image(crate::icons::Icon::Vault),
             HikerMode::Search => icons::ICONS.image(crate::icons::Icon::Search),
             HikerMode::Related => icons::ICONS.image(crate::icons::Icon::Graph),
             HikerMode::Backlinks => icons::ICONS.image(crate::icons::Icon::Bookmark),
+            HikerMode::Trash => icons::ICONS.image(crate::icons::Icon::Trash),
         }
     }
 }
@@ -113,8 +155,7 @@ impl Document for HikerWbTab {
 /// Sync `app.session.tabs` into the workbench's editor area. Opens
 /// workbench tabs for newly-added `Session::tabs` entries, closes
 /// workbench tabs whose backing `TabId` is gone, and refreshes the
-/// cached label / dirty marker for survivors. Mirrors the role of
-/// `tabs::reconcile_dock` for the legacy dock layout.
+/// cached label / dirty marker for survivors.
 impl AppState {
 
 pub fn sync_workbench_tabs(&mut self) {
@@ -266,25 +307,49 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
         // guard either calls `editor_pane::close_tab` (synchronous
         // remove from `Session::tabs`) or surfaces the dirty-close
         // modal (close happens later on user confirmation).
-        crate::tabs::close_tab_with_dirty_guard(self.app, tab.id);
+        crate::editor_pane::close_tab_with_dirty_guard(self.app, tab.id);
         false
     }
 
     fn activity_items(&self) -> Vec<Item<HikerMode>> {
-        [
-            HikerMode::Files,
-            HikerMode::Clusters,
-            HikerMode::Trails,
-            HikerMode::Search,
-            HikerMode::Related,
-            HikerMode::Backlinks,
-        ]
-        .into_iter()
-        .map(|m| Item {
-            label: m.label().to_string(),
-            icon: Some(m.icon()),
-            mode: m,
-            badge: None,
+        // Hardcoded mode list below. Plus: any feature that opts into
+        // an `ActivityItem` override surfaces from the registry at the
+        // tail. Phase 2 has no overrides yet (Clusters/Trails ride the
+        // hardcoded modes); the iteration is wired so Phase 3 plugins
+        // can drop in. [feature-consumer-activity-bar]
+        let _override_items: Vec<()> = self
+            .app
+            .features
+            .iter()
+            .filter_map(|f| f.activity_bar().map(|_| ()))
+            .collect();
+        // Visible item list:
+        // Files/Trails/Search/Related/Backlinks still come from the
+        // hardcoded list (they haven't migrated to the feature registry
+        // yet — Phase 2+). Each hardcoded mode's icon/label resolves
+        // from the registry when its feature id has migrated, so the
+        // visible affordance for `clusters` is driven by
+        // `feature::Feature::{label,icon}` instead of `HikerMode`'s
+        // inherent table. `feature-consumer-sidebar`.
+        HikerMode::all()
+            .into_iter()
+            .map(|m| {
+            let feature_id = match m {
+                HikerMode::Clusters => Some("clusters"),
+                HikerMode::Trails => Some("trails"),
+                HikerMode::Vault => Some("vault"),
+                _ => None,
+            };
+            let (label, icon) = feature_id
+                .and_then(|id| self.app.features.by_id(id))
+                .map(|f| (f.label().to_string(), f.icon()))
+                .unwrap_or_else(|| (m.label().to_string(), m.icon()));
+            Item {
+                label,
+                icon: Some(icon),
+                mode: m,
+                badge: None,
+            }
         })
         .collect()
     }
@@ -300,6 +365,7 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
             ui.weak(format!("(panel '{}' missing)", mode.panel_id()));
         }
     }
+
 
     fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
         if matches!(mode, HikerMode::Files) {
@@ -326,12 +392,43 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
                 }
             });
         }
+
     }
 
     fn side_bar_actions_menu(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
+        if matches!(mode, HikerMode::Trash) {
+            // status: feature-trash-panel
+            let count = hiker_core::trash::Trash::open(&self.app.vault_session.vault_root)
+                .list_from_disk()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let enabled = count > 0;
+            if ui
+                .add_enabled(enabled, egui::Button::new("Empty trash"))
+                .clicked()
+            {
+                self.app.session.modal = Some(crate::state::Modal::Confirm {
+                    title: "Empty trash".to_string(),
+                    body: format!(
+                        "Permanently delete all {count} items in the trash? This can't be undone."
+                    ),
+                    confirm_label: "Empty trash".to_string(),
+                    cancel_label: "Cancel".to_string(),
+                    danger: true,
+                    intent: crate::state::ConfirmIntent::EmptyTrash,
+                });
+                ui.close();
+            }
+            return;
+        }
+        if matches!(mode, HikerMode::Vault) {
+            // Vault-mode `⋯`: the lens / grouping picker. status: vault-view-mode
+            crate::vault_view::actions_menu(ui, self.app);
+            return;
+        }
         if matches!(mode, HikerMode::Files) {
             if ui.button("Refresh tree").clicked() {
-                self.app.session.sidebar.dir_cache.clear();
+                self.app.session.file_tree.dir_cache.clear();
                 self.app.push_toast("File tree refreshed", crate::state::ToastLevel::Info);
                 ui.close();
             }
@@ -365,7 +462,7 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
                         TreeSortBy::MtimeAsc => "mtime_asc",
                     };
                     self.app.persist_tree_sort(s);
-                    self.app.session.sidebar.dir_cache.clear();
+                    self.app.session.file_tree.dir_cache.clear();
                     ui.close();
                 }
             }
@@ -531,6 +628,7 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::Properties { path } => panels::properties::show(ui, app, path),
             TabKind::Graph => panels::graph::show(ui, app),
             TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
+            TabKind::BoardsIndex => panels::boards_index::show(ui, app),
             TabKind::Agent { session_id } => panels::agent::show(ui, app, session_id, rt),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
             TabKind::Plugins => panels::plugins::show(ui, app),
@@ -538,7 +636,7 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::Sync => panels::sync::show(ui, app, rt),
             TabKind::Changes => panels::changes::show(ui, app),
             TabKind::ClusterReview { config_json } => {
-                panels::cluster_review::show(ui, app, tab_id, config_json)
+                clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
         }

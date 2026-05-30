@@ -343,6 +343,15 @@ impl<'a> MdScan<'a> {
     fn handle_start(&mut self, tag: &Tag, range: &std::ops::Range<usize>) {
         match tag {
             Tag::Heading { level, .. } => {
+                // A lone `-`/`=` being typed as a new (sub-)list item makes
+                // pulldown parse it as a Setext underline of the line above.
+                // Suppress heading scale/bold so the preceding item stops
+                // flashing at heading size while the sub-item is formed; a real
+                // Setext heading carries its title text in the same range, so it
+                // keeps its styling.
+                if self.setext_heading_in_list(range) {
+                    return;
+                }
                 let scale = self.heading_scale(*level);
                 self.entries.push((
                     range.clone(),
@@ -381,10 +390,11 @@ impl<'a> MdScan<'a> {
                 // Indented (4-space) blocks are too easy to trigger accidentally
                 // in prose and aren't what users mean when they want "code"
                 // styling.
-                if !matches!(kind, pulldown_cmark::CodeBlockKind::Fenced(_)) {
-                    return;
-                }
-                self.style_fenced_code_block(range);
+                let lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info.to_string(),
+                    pulldown_cmark::CodeBlockKind::Indented => return,
+                };
+                self.style_fenced_code_block(range, &lang);
             }
             _ => {}
         }
@@ -441,10 +451,12 @@ impl<'a> MdScan<'a> {
         }
     }
 
-    fn style_fenced_code_block(&mut self, range: &std::ops::Range<usize>) {
+    fn style_fenced_code_block(&mut self, range: &std::ops::Range<usize>, lang: &str) {
         let block_active = self.on_cursor_line(range.clone());
         let line_starts = self.collect_line_starts(range);
         let pal = self.pal;
+        let mut body_start: Option<usize> = None;
+        let mut body_end: usize = range.start;
         for (idx, &ls) in line_starts.iter().enumerate() {
             let line_text = read_line_at(self.text, ls);
             let line_end = ls + line_text.len();
@@ -488,6 +500,27 @@ impl<'a> MdScan<'a> {
                         ..MarkStyle::default()
                     }),
                 ));
+                if body_start.is_none() {
+                    body_start = Some(ls);
+                }
+                body_end = line_end;
+            }
+        }
+        // Syntax-highlight pass over the block body. Skipped if the language
+        // isn't recognised (tokenize_block returns empty) or there's no body.
+        if let Some(start) = body_start {
+            if body_end > start && body_end <= self.text.len() {
+                let content = &self.text[start..body_end];
+                for (range, color) in crate::syntax::tokenize_block(lang, content, start) {
+                    self.entries.push((
+                        range,
+                        Decoration::Mark(MarkStyle {
+                            monospace: true,
+                            fg: Some(color),
+                            ..MarkStyle::default()
+                        }),
+                    ));
+                }
             }
         }
     }
@@ -600,6 +633,35 @@ impl<'a> MdScan<'a> {
             .bytes()
             .take_while(|&b| b == b'#')
             .count()
+    }
+
+    /// True when a heading event is actually a lone `-`/`=` being typed as a new
+    /// (sub-)list item, which pulldown parses as a one-character Setext
+    /// underline of the line above — not a genuine heading.
+    ///
+    /// Indenting a new bullet beneath a list item makes the buffer transiently
+    /// read `- item one\n  -\n`; pulldown then continues the paragraph into a
+    /// Setext H2 whose source range spans both the title line and the lone
+    /// underline (e.g. `item one\n  -`). The discriminator is the *underline*
+    /// (the heading range's last line): a real Setext underline is always a run
+    /// of 3+ `-`/`=` (people write `---`/`===`), whereas the nascent-list shape
+    /// is a single `-`/`=` (plus optional indentation / trailing space). A
+    /// one-character underline is never an intentional Setext heading, so
+    /// suppressing it stops the preceding list item flashing at heading size
+    /// while the sub-item is formed. ATX (`# title`) is excluded by the leading
+    /// `#`; frontmatter is already suppressed upstream by `in_frontmatter`.
+    fn setext_heading_in_list(&self, range: &std::ops::Range<usize>) -> bool {
+        // ATX (`# title`) is never a Setext misparse.
+        if self.leading_hash_count(range.start) > 0 {
+            return false;
+        }
+        let src = &self.text[range.start..range.end.min(self.text.len())];
+        // The underline is the final non-empty line of the heading's source.
+        let underline = src.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let trimmed = underline.trim();
+        // A genuine underline is a run of 3+ identical chars; the nascent-list
+        // misparse is a lone single `-`/`=`.
+        trimmed == "-" || trimmed == "="
     }
 
     fn find_link_label(&self, range: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
@@ -748,4 +810,102 @@ fn read_line_at(text: &str, line_start: usize) -> &str {
         end += 1;
     }
     &text[line_start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor_core::decoration::Decoration;
+    use editor_core::state::Editor as EditorState;
+
+    /// Run the markdown decoration pass over `src` with the cursor at the very
+    /// start of the document (so off-line suppression applies to later lines).
+    fn decos(src: &str) -> Vec<Decoration> {
+        let state = EditorState::new(src);
+        let set = markdown_decorations(&state, None);
+        set.iter_all().map(|(_, d)| d.clone()).collect()
+    }
+
+    /// True if any decoration applies heading scale/bold styling: either a
+    /// `Line` with a `height_scale` above 1.0 or a bold `Mark` with a
+    /// `font_scale` above 1.0. Heading styling is the only producer of those.
+    fn has_heading(decos: &[Decoration]) -> bool {
+        decos.iter().any(|d| match d {
+            Decoration::Line(l) => l.height_scale.is_some_and(|s| s > 1.0),
+            Decoration::Mark(m) => m.bold && m.font_scale.is_some_and(|s| s > 1.0),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn atx_heading_is_styled() {
+        // Regression guard: a real ATX heading must still get heading styling.
+        assert!(has_heading(&decos("## Heading\n")), "ATX heading must be styled");
+    }
+
+    #[test]
+    fn setext_h2_underline_styled_at_top_level() {
+        // Regression guard: a genuine top-level Setext heading (`Title\n-----`)
+        // is not inside a list and must keep its H2 styling.
+        assert!(
+            has_heading(&decos("Title\n-----\n")),
+            "top-level Setext H2 heading must be styled"
+        );
+    }
+
+    #[test]
+    fn setext_h1_underline_styled_at_top_level() {
+        assert!(
+            has_heading(&decos("Title\n=====\n")),
+            "top-level Setext H1 heading must be styled"
+        );
+    }
+
+    #[test]
+    fn setext_underline_from_list_subitem_not_heading() {
+        // While typing an indented sub-bullet the buffer is `- item one\n  -\n`.
+        // pulldown lazily reparses the item paragraph as a Setext H2 spanning
+        // the list line; the preceding item must NOT render at heading size.
+        assert!(
+            !has_heading(&decos("- item one\n  -\n")),
+            "list sub-item underline must not style a heading"
+        );
+    }
+
+    #[test]
+    fn setext_underline_from_list_subitem_trailing_space_not_heading() {
+        // Pressing space after the bullet (`- `) leaves a trailing space on the
+        // nascent underline line; it must still be treated as a list sub-item.
+        assert!(
+            !has_heading(&decos("- item one\n  - ")),
+            "list sub-item underline with trailing space must not style a heading"
+        );
+    }
+
+    #[test]
+    fn setext_underline_from_list_subitem_cursor_off_line() {
+        // Same trap, with another line following so the cursor (at offset 0) is
+        // clearly off the misparsed heading line.
+        assert!(
+            !has_heading(&decos("- item one\n  -\nmore\n")),
+            "list sub-item underline must not style a heading"
+        );
+    }
+
+    #[test]
+    fn setext_eq_underline_from_list_subitem_not_heading() {
+        // The `=` underline (would-be H1) variant inside a list.
+        assert!(
+            !has_heading(&decos("- item one\n  =\n")),
+            "list sub-item `=` underline must not style a heading"
+        );
+    }
+
+    #[test]
+    fn setext_underline_from_ordered_list_subitem_not_heading() {
+        assert!(
+            !has_heading(&decos("1. item one\n   -\n")),
+            "ordered list sub-item underline must not style a heading"
+        );
+    }
 }

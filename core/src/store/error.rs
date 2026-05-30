@@ -18,6 +18,52 @@ pub enum Error {
 
 impl From<Error> for HikerError {
     fn from(e: Error) -> Self {
-        HikerError::Io(e.to_string())
+        // Mirror the op-log mapper's discipline (`ops/op_writes.rs::map_err`):
+        // preserve the variant shape the kind-tagged frontend keys on. A
+        // store-side "note not found" must reach the UI as `not_found`, not be
+        // flattened to `io`. `HikerError` has no schema/dimension variants, so
+        // those structural failures stay io-shaped (they're internal-state
+        // faults, not user-addressable inputs).
+        match e {
+            Error::NotFound(_) => HikerError::NotFound(e.to_string()),
+            Error::VersionMismatch { .. }
+            | Error::EmbedDim { .. }
+            | Error::Sqlite(_)
+            | Error::Io(_) => HikerError::Io(e.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_store_errors_keep_their_shape_through_hikererror() {
+        // A store-side "note not found" must reach the frontend as the
+        // NotFound variant, not be flattened to Io (the bug this guards).
+        assert!(matches!(
+            HikerError::from(Error::NotFound("foo.md".into())),
+            HikerError::NotFound(_)
+        ));
+        // Schema/dimension/io faults stay io-shaped.
+        assert!(matches!(
+            HikerError::from(Error::VersionMismatch {
+                found: 1,
+                expected: 2
+            }),
+            HikerError::Io(_)
+        ));
+        assert!(matches!(
+            HikerError::from(Error::EmbedDim {
+                got: 384,
+                expected: 768
+            }),
+            HikerError::Io(_)
+        ));
+        assert!(matches!(
+            HikerError::from(Error::Io(std::io::Error::other("disk"))),
+            HikerError::Io(_)
+        ));
     }
 }

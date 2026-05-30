@@ -108,7 +108,7 @@ pub(crate) fn sort_header(&mut self) {
             &serde_json::Value::String(wire.to_string()),
             "Sort change failed",
         );
-        state.session.sidebar.dir_cache.clear();
+        state.session.file_tree.dir_cache.clear();
     }
 }
 
@@ -118,7 +118,7 @@ pub(crate) fn sort_header(&mut self) {
 /// expands the parent. Matches the legacy `count_notes_in` semantics
 /// (markdown-shaped files only).
 fn count_direct_files(&self, rel: &str) -> usize {
-    let Some(entries) = self.state.session.sidebar.dir_cache.get(rel) else {
+    let Some(entries) = self.state.session.file_tree.dir_cache.get(rel) else {
         return 0;
     };
     entries
@@ -136,25 +136,25 @@ pub(crate) fn show_dir(&mut self, rel: &str, depth: usize) {
     // has expanded (cheapest correct eviction; the rest get rebuilt on
     // next render).
     const MAX_DIR_CACHE_ENTRIES: usize = 512;
-    if !state.session.sidebar.dir_cache.contains_key(rel) {
-        if state.session.sidebar.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
-            let expanded = state.session.sidebar.expanded.clone();
+    if !state.session.file_tree.dir_cache.contains_key(rel) {
+        if state.session.file_tree.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
+            let expanded = state.session.file_tree.expanded.clone();
             state
                 .session
-                .sidebar
+                .file_tree
                 .dir_cache
                 .retain(|k, _| expanded.contains(k) || k.is_empty());
             // If still over cap (every cached dir is currently
             // expanded), fall back to a full clear. Re-listing is
             // cheap; this branch only fires when the user has 500+
             // dirs expanded simultaneously, which is pathological.
-            if state.session.sidebar.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
-                state.session.sidebar.dir_cache.clear();
+            if state.session.file_tree.dir_cache.len() >= MAX_DIR_CACHE_ENTRIES {
+                state.session.file_tree.dir_cache.clear();
             }
         }
         match state.vault_session.vault.list_dir(rel, default_sort(&state.vault_session.config)) {
             Ok(entries) => {
-                state.session.sidebar.dir_cache.insert(rel.to_string(), entries);
+                state.session.file_tree.dir_cache.insert(rel.to_string(), entries);
             }
             Err(err) => {
                 ui.colored_label(
@@ -168,7 +168,7 @@ pub(crate) fn show_dir(&mut self, rel: &str, depth: usize) {
 
     // Clone the entries out so we can mutate state below without
     // overlapping borrows.
-    let entries = self.state.session.sidebar.dir_cache.get(rel).cloned().unwrap_or_default();
+    let entries = self.state.session.file_tree.dir_cache.get(rel).cloned().unwrap_or_default();
 
     for entry in entries {
         match entry.kind {
@@ -179,7 +179,7 @@ pub(crate) fn show_dir(&mut self, rel: &str, depth: usize) {
 }
 
 fn render_dir_row(&mut self, entry: &DirEntryDto, depth: usize) {
-    let expanded = self.state.session.sidebar.expanded.contains(&entry.rel_path);
+    let expanded = self.state.session.file_tree.expanded.contains(&entry.rel_path);
     // Direct-child file count hint (`count_notes_in` parity). Cached on
     // the same dir_cache the listing renders from, so showing the count
     // is essentially free. Only the first depth is counted — recursing
@@ -205,19 +205,23 @@ fn render_dir_row(&mut self, entry: &DirEntryDto, depth: usize) {
 
     if resp.clicked() {
         if expanded {
-            self.state.session.sidebar.expanded.remove(&entry.rel_path);
+            self.state.session.file_tree.expanded.remove(&entry.rel_path);
         } else {
-            self.state.session.sidebar.expanded.insert(entry.rel_path.clone());
+            self.state.session.file_tree.expanded.insert(entry.rel_path.clone());
         }
-        self.state.session.sidebar.selected_folder = Some(entry.rel_path.clone());
+        self.state.session.file_tree.selected_folder = Some(entry.rel_path.clone());
     }
     if expanded {
         self.show_dir(&entry.rel_path, depth + 1);
     }
 }
 
-/// Move a vault-relative path into the destination folder via
-/// `vault::move_note` (which handles store + watcher updates atomically).
+/// Move a vault-relative path into the destination folder. A file move routes
+/// through the indexer-driven `core::ops::file::move_note` (op-log rename +
+/// wikilink / trail-waypoint / board-card referrer rewrites + watcher
+/// suppression); a folder move routes through `core::ops::file::move_folder`
+/// (bulk store remap of every member). Both are the full ops, not the bare
+/// `vault::move_note` that only does fs-rename + store remap.
 fn move_into_folder(&mut self, src: &str, dest_dir: &str) {
     let state = &mut *self.state;
     let basename = basename_of(src);
@@ -229,30 +233,42 @@ fn move_into_folder(&mut self, src: &str, dest_dir: &str) {
     if dest == src {
         return;
     }
-    let store_mutex = state.vault_session.services.read_store.clone();
+    // A dragged folder must move via `move_folder`; a file via `move_note`.
+    // The dir cache row carries the kind, but the drag payload is just the
+    // path — resolve the kind from disk so a re-parented subtree keeps its
+    // members indexed.
+    let is_dir = state
+        .vault_session
+        .vault
+        .abs_path(src)
+        .map(|p| p.is_dir())
+        .unwrap_or(false);
     let watcher = state.vault_session.services.watcher.clone();
-    let mut store = match store_mutex.lock() {
-        Ok(s) => s,
-        Err(_) => return,
+    let jobs = state.vault_session.services.indexer.job_sender();
+    let vault = state.vault_session.vault.clone();
+    let src_owned = src.to_string();
+    let dest_owned = dest.clone();
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            if is_dir {
+                hiker_core::ops::file::move_folder(&watcher, &jobs, &vault, &src_owned, &dest_owned)
+                    .await
+            } else {
+                hiker_core::ops::file::move_note(&watcher, &jobs, &src_owned, &dest_owned).await
+            }
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
     };
-    if let Err(err) = hiker_core::vault::move_note(
-        &state.vault_session.vault,
-        &mut store,
-        Some(watcher.as_ref()),
-        src,
-        &dest,
-    ) {
-        drop(store);
+    if let Err(err) = result {
         state.push_toast(
             format!("Move failed: {}", err),
             crate::state::ToastLevel::Error,
         );
         return;
     }
-    drop(store);
     let src_parent = src.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    state.session.sidebar.dir_cache.remove(src_parent);
-    state.session.sidebar.dir_cache.remove(dest_dir);
+    state.session.file_tree.dir_cache.remove(src_parent);
+    state.session.file_tree.dir_cache.remove(dest_dir);
     if let Some(buf) = state.session.buffers.remove(src) {
         let mut moved = buf;
         moved.path = dest.clone();
@@ -277,7 +293,7 @@ fn move_into_folder(&mut self, src: &str, dest_dir: &str) {
 fn render_file_row(&mut self, entry: &DirEntryDto, depth: usize) {
     // Inline-rename mode preempts the regular row render. Drafts live in
     // egui memory keyed by the row's rel_path, so this stays out of
-    // SidebarState (which a parallel cluster-editor port is editing).
+    // FileTreeState (which a parallel cluster-editor port is editing).
     if let Some(draft) = self.rename_draft_for(&entry.rel_path) {
         self.rename_row(entry, depth, draft);
         return;
@@ -307,9 +323,9 @@ fn render_file_row(&mut self, entry: &DirEntryDto, depth: usize) {
     // Honour a pending reveal-from-discovery: when our row matches the
     // sidebar's scroll_target one-shot, ask egui to bring us into view and
     // clear the target so subsequent frames don't keep re-scrolling.
-    if self.state.session.sidebar.scroll_target.as_deref() == Some(entry.rel_path.as_str()) {
+    if self.state.session.file_tree.scroll_target.as_deref() == Some(entry.rel_path.as_str()) {
         resp.scroll_to_me(Some(egui::Align::Center));
-        self.state.session.sidebar.scroll_target = None;
+        self.state.session.file_tree.scroll_target = None;
     }
     // Drag payload: vault-relative source path. Drop targets are
     // rendered on folder rows below.
@@ -449,8 +465,8 @@ fn run_file_verb(&mut self, verb: FileVerb, rel: &str) {
         FileVerb::Open => editor_pane::open_file(self.state, rel, true),
         FileVerb::Rename => {
             self.start_rename(rel);
-            self.state.session.sidebar.renaming = Some(rel.to_string());
-            self.state.session.sidebar.renaming_text = basename_of(rel).to_string();
+            self.state.session.file_tree.renaming = Some(rel.to_string());
+            self.state.session.file_tree.renaming_text = basename_of(rel).to_string();
         }
         FileVerb::Duplicate => self.duplicate_file(rel),
         FileVerb::Reveal => self.reveal_in_file_manager(rel),
@@ -607,30 +623,30 @@ fn commit_rename(&mut self, from: &str, draft: &str) {
     } else {
         format!("{}/{}", parent, draft)
     };
-    let store_mutex = state.vault_session.services.read_store.clone();
+    // Route through the indexer-driven `core::ops::file::move_note` (same path
+    // as file delete) so the op-log rename + referrer rewrites (wikilinks /
+    // trail waypoints / board cards) and watcher suppression all run — not the
+    // bare `vault::move_note` that only does fs-rename + store remap.
     let watcher = state.vault_session.services.watcher.clone();
-    let mut store = match store_mutex.lock() {
-        Ok(s) => s,
-        Err(_) => return,
+    let jobs = state.vault_session.services.indexer.job_sender();
+    let from_owned = from.to_string();
+    let to_owned = to.clone();
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::ops::file::move_note(&watcher, &jobs, &from_owned, &to_owned).await
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
     };
-    if let Err(err) = hiker_core::vault::move_note(
-        &state.vault_session.vault,
-        &mut store,
-        Some(watcher.as_ref()),
-        from,
-        &to,
-    ) {
-        drop(store);
+    if let Err(err) = result {
         state.push_toast(
             format!("Rename failed: {}", err),
             crate::state::ToastLevel::Error,
         );
         return;
     }
-    drop(store);
 
     // Cache invalidation + buffer/tab path swap.
-    state.session.sidebar.dir_cache.remove(parent);
+    state.session.file_tree.dir_cache.remove(parent);
     if let Some(buf) = state.session.buffers.remove(from) {
         let mut moved = buf;
         moved.path = to.clone();
@@ -699,8 +715,11 @@ fn open_properties(&mut self, rel: &str) {
 fn duplicate_file(&mut self, rel: &str) {
     let state = &mut *self.state;
     // Read the source body, choose a `<stem>-copy-N.<ext>` target in the
-    // same dir, write via vault::create_note + write_file. Vault layer
-    // handles parent-dir creation + collision checks.
+    // same dir, then create + seed it via the indexer-driven
+    // `core::ops::file::create_at` (watcher suppression + `IndexJob::Upsert`)
+    // rather than the bare `vault::create_note` + `write_file`, so the copy is
+    // indexed without a duplicate watcher-driven ingest — same discipline as
+    // the `+` new-item button.
     let body = match state.vault_session.vault.read_file(rel) {
         Ok(s) => s,
         Err(err) => {
@@ -736,7 +755,17 @@ fn duplicate_file(&mut self, rel: &str) {
     } else {
         format!("{}/{}", parent, chosen)
     };
-    let actual = match state.vault_session.vault.create_note(&target) {
+    let watcher = state.vault_session.services.watcher.clone();
+    let jobs = state.vault_session.services.indexer.job_sender();
+    let vault = state.vault_session.vault.clone();
+    let target_owned = target.clone();
+    let actual = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::ops::file::create_at(&watcher, &jobs, &vault, &target_owned, &body).await
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
+    };
+    let actual = match actual {
         Ok(p) => p,
         Err(err) => {
             state.push_toast(
@@ -746,14 +775,7 @@ fn duplicate_file(&mut self, rel: &str) {
             return;
         }
     };
-    if let Err(err) = state.vault_session.vault.write_file(&actual, &body) {
-        state.push_toast(
-            format!("Duplicate write failed: {}", err),
-            crate::state::ToastLevel::Error,
-        );
-        return;
-    }
-    state.session.sidebar.dir_cache.remove(parent);
+    state.session.file_tree.dir_cache.remove(parent);
     state.push_toast(
         format!("Duplicated -> {}", actual),
         crate::state::ToastLevel::Info,
@@ -822,221 +844,15 @@ fn row_button(&mut self, label: &str, depth: usize, active: bool) -> egui::Respo
 /// title row (wired through `Host::side_bar_action_buttons` /
 /// `side_bar_actions_menu`).
 pub(crate) fn show(&mut self) {
-    let avail_height = self.ui.available_height();
-    let trash_row_height = 28.0;
     egui::ScrollArea::vertical()
         .id_salt("panel-files-body")
-        .max_height((avail_height - trash_row_height).max(60.0))
         .auto_shrink([false, false])
         .show(self.ui, |ui| {
             let mut view = FilesView { ui, state: self.state };
             view.sort_header();
             view.show_dir("", 0);
         });
-    self.ui.separator();
-    self.trash_bin();
 }
-
-/// Trash bin pinned at the bottom of the Files panel. Shows a collapsible
-/// listing built from the on-disk trash directory + manifest; each entry
-/// offers Restore and Purge actions, plus a batch "Empty" verb. Part of
-/// the Files panel body (it used to be pinned across every sidebar mode);
-/// lives here as a `FilesView` method so it shares the panel's receiver.
-fn trash_bin(&mut self) {
-    use hiker_core::trash::Trash;
-    let ui = &mut *self.ui;
-    let state = &mut *self.state;
-    let trash = Trash::open(&state.vault_session.vault_root);
-    let items = trash.list_from_disk().unwrap_or_default();
-    let count = items.len();
-
-    let label = if count == 0 {
-        "Trash".to_string()
-    } else {
-        format!("Trash ({})", count)
-    };
-    let chevron_icon = if state.session.sidebar.trash_expanded {
-        icons::ICONS.image(crate::icons::Icon::Expand)
-    } else {
-        icons::ICONS.image(crate::icons::Icon::Collapse)
-    };
-
-    let mut empty_clicked = false;
-    let row = ui.horizontal(|ui| {
-        let resp_chev = ui.add(egui::Button::image(chevron_icon).frame(false).small());
-        let resp_trash = ui.add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Trash)).frame(false).small());
-        let resp_lbl = ui.add(
-            egui::Label::new(egui::RichText::new(label).size(13.0))
-                .sense(egui::Sense::click()),
-        );
-        let mut toggle = resp_chev.clicked() || resp_trash.clicked() || resp_lbl.clicked();
-        // "Empty trash" batch action — right-aligned, only when the bin
-        // is non-empty. Mirrors `tree-trash-empty` in design.md.
-        if count > 0 {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("Empty").small()).small())
-                    .on_hover_text("Permanently delete every item in the bin")
-                    .clicked()
-                {
-                    empty_clicked = true;
-                    // Don't fold trash open just because the user clicked
-                    // the inline button on a folded header.
-                    toggle = false;
-                }
-            });
-        }
-        toggle
-    });
-    if row.inner {
-        state.session.sidebar.trash_expanded = !state.session.sidebar.trash_expanded;
-    }
-    if empty_clicked {
-        // Route through the confirm modal so an accidental click doesn't
-        // wipe weeks of trash. The confirm callback walks the trash list
-        // and purges each entry.
-        state.session.modal = Some(crate::state::Modal::Confirm {
-            title: "Empty trash".to_string(),
-            body: format!(
-                "Permanently delete all {count} items in the trash? This can't be undone."
-            ),
-            confirm_label: "Empty trash".to_string(),
-            cancel_label: "Cancel".to_string(),
-            danger: true,
-            intent: crate::state::ConfirmIntent::EmptyTrash,
-        });
-    }
-
-    if !state.session.sidebar.trash_expanded {
-        return;
-    }
-
-    if items.is_empty() {
-        ui.indent("trash-contents", |ui| {
-            ui.label(
-                egui::RichText::new("(empty)")
-                    .color(theme::muted())
-                    .small(),
-            );
-        });
-        return;
-    }
-
-    // Collect actions to apply after the render to avoid mutable-borrow
-    // overlap with `state` inside the row closure.
-    enum Action {
-        Restore { id: String },
-        Purge { trashed_name: String },
-    }
-    let mut pending: Option<Action> = None;
-
-    ui.indent("trash-contents", |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("trash-list")
-            .max_height(180.0)
-            .show(ui, |ui| {
-                for item in &items {
-                    let basename = item
-                        .original_path
-                        .as_deref()
-                        .unwrap_or(&item.trashed_name)
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&item.trashed_name);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(basename).small());
-                        ui.label(
-                            egui::RichText::new(TrashTimeFmt.format_ts(item.deleted_at))
-                                .color(theme::muted())
-                                .small(),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let purge = egui::Button::new(
-                                    egui::RichText::new("Purge").small(),
-                                )
-                                .small();
-                                if ui.add(purge).on_hover_text("Delete forever").clicked() {
-                                    pending = Some(Action::Purge {
-                                        trashed_name: item.trashed_name.clone(),
-                                    });
-                                }
-                                if let Some(id) = &item.id {
-                                    let restore = egui::Button::new(
-                                        egui::RichText::new("Restore").small(),
-                                    )
-                                    .small();
-                                    if ui.add(restore).clicked() {
-                                        pending = Some(Action::Restore { id: id.clone() });
-                                    }
-                                }
-                            },
-                        );
-                    });
-                }
-            });
-    });
-
-    let Some(action) = pending else { return };
-    match action {
-        Action::Restore { id } => {
-            let trash = Trash::open(&state.vault_session.vault_root);
-            match hiker_core::vault::restore_note(
-                &state.vault_session.vault,
-                Some(state.vault_session.services.watcher.as_ref()),
-                &trash,
-                &id,
-            ) {
-                Ok(entry) => {
-                    let parent = entry
-                        .original_path
-                        .rsplit_once('/')
-                        .map(|(p, _)| p)
-                        .unwrap_or("");
-                    state.session.sidebar.dir_cache.remove(parent);
-                    state.push_toast(
-                        format!("Restored {}", entry.original_path),
-                        crate::state::ToastLevel::Info,
-                    );
-                }
-                Err(err) => state.push_toast(
-                    format!("Restore failed: {}", err),
-                    crate::state::ToastLevel::Error,
-                ),
-            }
-        }
-        Action::Purge { trashed_name } => {
-            let trash = Trash::open(&state.vault_session.vault_root);
-            match trash.permanent_delete(&trashed_name) {
-                Ok(()) => state.push_toast(
-                    format!("Purged {}", trashed_name),
-                    crate::state::ToastLevel::Info,
-                ),
-                Err(err) => state.push_toast(
-                    format!("Purge failed: {}", err),
-                    crate::state::ToastLevel::Error,
-                ),
-            }
-        }
-    }
-}
-}
-
-/// Zero-sized timestamp formatter for trash rows. An inherent method (not
-/// a free fn) so the single caller above doesn't trip `single_call_fn`.
-struct TrashTimeFmt;
-
-impl TrashTimeFmt {
-    fn format_ts(self, unix_secs: i64) -> String {
-    use time::OffsetDateTime;
-    use time::macros::format_description;
-    let Ok(t) = OffsetDateTime::from_unix_timestamp(unix_secs) else {
-        return String::new();
-    };
-    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]");
-    t.format(fmt).unwrap_or_default()
-    }
 }
 
 // ----- free helpers (shared by multiple methods / pure) -----

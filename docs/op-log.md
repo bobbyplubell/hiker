@@ -4,7 +4,7 @@ The single substrate every write rides on. One Yrs document per hiker document p
 
 The headline decisions:
 
-- **One Yrs `Doc` per hiker document.** Native markdown notes have a Yrs Doc keyed by the note's `doc_id`. Non-md sources (PDF, image, audio, external) have Yrs Docs keyed by the *sidecar* — the .md alongside the source (or the `.hiker/external/<id>--slug.md` for external-pointer mode per `design.md`'s "Source-derived notes"). Sidecars are the unit of CRDT history; the underlying source is read-only as far as the log is concerned. [op-log-document-identity, op-log-sidecar-document]
+- **One Yrs `Doc` per hiker document.** Native markdown notes have a Yrs Doc keyed by the note's `doc_id` — a ULID minted on first ingest, kept only in the op-log's internal `path → doc_id` mapping (`doc-index.db`) and never stamped into the note file. The note's user-facing identity is its vault path; the `doc_id` is an implementation detail that keeps op-log history stable across renames (rename updates the mapping; the `doc_id` itself never changes). **`doc_id` is the single internal ULID per document.** The indexer's `notes.id`, every chunk's `note_id` FK, and any other internal handle that needs a stable per-document identifier all use this same ULID — read from `doc-index.db` via `oplog::doc_id_for_path`. No subsystem mints its own parallel id. Non-md sources (PDF, image, audio, external) have Yrs Docs keyed by the *sidecar* — the .md alongside the source (or the `.hiker/external/<id>--slug.md` for external-pointer mode per `design.md`'s "Source-derived notes"). Sidecars are the unit of CRDT history; the underlying source is read-only as far as the log is concerned. [op-log-document-identity, op-log-sidecar-document]
 - **Yrs is the CRDT library, and the whole `.md` file is one `Y.Text`.** Mature Rust port of Yjs. The document's entire markdown text — frontmatter fence and body together — is a single `Y.Text`; frontmatter gets no structural modeling. Fine-grained character-level merge handles concurrent edits anywhere in the file (each save is diffed into minimal localized ops, so only changed bytes carry CRDT operations). Each Doc's Yrs `client_id` is the per-replica identifier the CRDT uses to keep concurrent edits distinct and merge them deterministically; *who* authored an op (user / agent / external / remote device) is recorded separately in the side-table `author` field, not inferred from the `client_id`. Frontmatter as a `Y.Map` would buy concurrent set-union on list fields like `tags`, but that benefit can't be exercised until cross-device sync ships, while the structural round-trip would corrupt frontmatter *today* — reordered keys, dropped comments, coerced scalars, phantom watcher diffs. Plaintext keeps `materialize()` byte-identical to disk and matches the editor's existing rope buffer. [op-log-yrs-backed]
 - **Markdown on disk is canonical.** For every native-md note and every sidecar, the on-disk `.md` file equals the materialization of the document's *accepted* Yrs state. Copying the vault's markdown out gives the latest accepted state with no separate state to ship alongside. [op-log-disk-canonical]
 - **Layered model: `accepted` + `working` + `pending`.** The buffer renders the merge of three CRDT op layers — committed `accepted` (on disk, synced), the user's uncommitted `working` edits, and the agent's `pending` proposals. User typing and agent proposals coexist in one buffer; Save commits `working`, Accept commits a `pending` op (immediately, even for closed files), Reject drops it. [op-log-layered-model]
@@ -21,15 +21,19 @@ The headline decisions:
 
 A document is whatever owns one Yrs Doc + one pending queue. Three kinds:
 
-| Source location | Source type | Document is             | Yrs Doc keyed by |
-| --------------- | ----------- | ----------------------- | ---------------- |
-| Vault-internal  | markdown    | the `.md` file itself   | `doc_id` (ulid)  |
-| Vault-internal  | non-md      | the sidecar `<src>.md`  | sidecar's `doc_id` |
-| External        | any         | `.hiker/external/<id>--slug.md` | sidecar's `doc_id` |
+| Source location | Source type | Document is             | User-facing identity | Internal Yrs Doc key |
+| --------------- | ----------- | ----------------------- | -------------------- | ---------------------- |
+| Vault-internal  | markdown    | the `.md` file itself   | vault path           | `doc_id` (ulid)        |
+| Vault-internal  | non-md      | the sidecar `<src>.md`  | sidecar's vault path | sidecar's `doc_id`     |
+| External        | any         | `.hiker/external/<id>--slug.md` | TODO              | sidecar's `doc_id`     |
 
 [op-log-document-identity, op-log-sidecar-document]
 
-Native markdown notes: the file on disk is the document. Sidecars decouple user-edited content (the sidecar `.md`) from source (PDF, image, etc.); the Yrs Doc applies to the sidecar.
+Native markdown notes: the file on disk is the document. Users reference notes by their vault path; the op-log keeps a separate `path → doc_id` mapping (`doc-index.db`) so the Yrs Doc and its history survive renames without any user-facing identifier changing. Sidecars decouple user-edited content (the sidecar `.md`) from source (PDF, image, etc.); the Yrs Doc applies to the sidecar.
+
+<!-- TODO: external-source documents currently identified by an internal `<id>--slug.md` filename + a separate `hiker.source_ref` external-handle scheme. Decision pending on whether to keep external sources in scope at all under the path-as-id model. Don't rework this row until that decision is made. -->
+
+**Rename updates the mapping, not the doc_id.** When a note is renamed (`move-note-core-cmd`, `drag-and-drop-move`, external rename via watcher), `doc-index.db` rewrites the `path → doc_id` entry — the new path now maps to the same `doc_id`, and the Yrs Doc continues unchanged. The op-log records the rename as a logical op (`OpKind::Rename { from }`); no replay of history happens.
 
 **External handles** for source pointers outside the vault use a logical scheme that survives device differences: [op-log-external-handle]
 
@@ -244,7 +248,9 @@ Paths are the key in the vault; the op log keys on `doc_id`. The first open seed
 2. Create the note's Yrs Doc: one `Create` op, then a `Replace` inserting the file's current on-disk bytes as the initial `text` state. Set `meta.kind` and `meta.path`. Author the seed ops `user` — the existing file is the user's accepted state.
 3. Persist `<doc-id>.yrs` and the `op_metadata` rows. The on-disk `.md` is already equal to `materialize(accepted)` by construction, so no rewrite happens.
 
-The seed is idempotent: a path already mapped in `doc-index.db` is skipped, so subsequent opens are a cheap walk. `index.db` (search/embeddings, per `index.md`) is a separate, independently-regenerable store.
+The seed is idempotent: a path already mapped in `doc-index.db` is skipped, so subsequent opens are a cheap walk.
+
+**Op-log bootstraps before the indexer.** `index.db` (search/embeddings, per `index.md`) is a separate, independently-regenerable store, but it shares the ULID space: when the indexer upserts a note, it reads `doc_id` from `doc-index.db` and uses it as `notes.id`. The indexer never mints document ids of its own. This is what enforces "one ULID per document" across the whole system. [op-log-bootstraps-first]
 
 
 ## Materialization
@@ -424,7 +430,7 @@ The `author` field is recorded in `op_metadata` for every Yrs operation range hi
 - `agent:<client-id>` — an MCP-attached agent's tool call. `<client-id>` from MCP handshake.
 - `external` — file on disk changed outside hiker; reconciled via the external-edit-sync path.
 - `extractor:<plugin-id>` — a source extractor re-ran. Preserves the future WASM-extractor case without committing to it now.
-- `auto:<producer>` — write from internal automation (`auto:triage` per `suggestions.md`); the producer is the author whether the write was unattended or user-reviewed (`metadata.auto_accepted` distinguishes them).
+- `auto:<producer>` — write from internal automation (`auto:triage` per `cluster-editor.md`); the producer is the author whether the write was unattended or user-reviewed (`metadata.auto_accepted` distinguishes them).
 - `sync:<device-id>` — Yrs operations received from another device via the sync transport.
 
 Class prefix supports wildcard (`author LIKE 'agent:%'`) and exact (`author = 'agent:claude-code'`) queries.
@@ -572,6 +578,6 @@ Sync transport, encryption, conflict copies, key management — the remaining sy
 - `design.md` "Source-derived notes" — sidecar architecture this composes with.
 - `sync.md` — the sync transport / enrollment / server layer this substrate enables.
 - `mcp.md` — agent tool calls produce pending Yrs updates with `author=agent:<client-id>`.
-- `suggestions.md` — triage auto-accepts ride `author=auto:triage`.
+- `cluster-editor.md` — triage auto-accepts ride `author=auto:triage`.
 - `settings.md` — the `[op-log]` config section above.
 - `cluster-editor.md` — cluster trees are per-tree `.md` files riding this substrate like any other markdown document; tree edits are `SetFrontmatter` ops on the tree doc.

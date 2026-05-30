@@ -42,6 +42,56 @@ fn content_hash_populated_and_history_set_accumulates() {
 }
 
 #[test]
+fn recent_history_hashes_are_newest_first_and_stable() {
+    // status: bug-sync-history-hashset-truncation-nondet
+    //
+    // The sync manifest ships only a bounded recent window of a doc's content
+    // hashes (`recent_doc_history_hashes(doc, N)`), which the transport later
+    // truncates/compares. For two devices to classify lineage the same way
+    // every round, that window must be the *most-recent* N by recency and be
+    // identical across repeated calls — a `HashSet`'s unspecified iteration
+    // order broke both. This asserts the ordered-Vec contract directly at the
+    // op-log boundary (the transport-level regression test drives the manifest
+    // path; this one pins the substrate verb it rests on).
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("a.md", "note", "v0\n", &Author::User)
+        .unwrap();
+
+    // Apply well over a typical window (32) of distinct accepted states, in a
+    // known order. Each whole-file save advances accepted and stamps a fresh
+    // content_hash row.
+    const TOTAL: usize = 40;
+    let mut order: Vec<String> = vec![hash("v0\n")]; // the create's hash, oldest
+    for i in 1..=TOTAL {
+        let text = format!("v{i}\n");
+        assert!(log.apply_user_text(&doc_id, &text).unwrap(), "edit {i} should advance");
+        order.push(hash(&text));
+    }
+    // Newest-first expectation: reverse insertion order.
+    let mut newest_first = order.clone();
+    newest_first.reverse();
+
+    // The full (unbounded) recent list is newest-first and exact.
+    let all = log
+        .recent_doc_history_hashes(&doc_id, order.len() + 10)
+        .unwrap();
+    assert_eq!(all, newest_first, "recent hashes must be newest-first by recency");
+    assert_eq!(all.first(), Some(&hash(&format!("v{TOTAL}\n"))), "newest leads");
+    assert_eq!(all.last(), Some(&hash("v0\n")), "oldest (the create) trails");
+
+    // A bounded window of 32 is exactly the most-recent 32, and stable across
+    // repeated calls (the property the HashSet path could not guarantee).
+    const WINDOW: usize = 32;
+    let win_a = log.recent_doc_history_hashes(&doc_id, WINDOW).unwrap();
+    let win_b = log.recent_doc_history_hashes(&doc_id, WINDOW).unwrap();
+    assert_eq!(win_a.len(), WINDOW);
+    assert_eq!(win_a, win_b, "the recent window must be deterministic across calls");
+    assert_eq!(win_a, newest_first[..WINDOW], "window is the most-recent N by recency");
+}
+
+#[test]
 fn rejected_op_carries_no_content_hash() {
     // A rejected op never lands in `accepted`, so it has no materialized
     // content and contributes nothing to the history set.
@@ -148,6 +198,47 @@ fn apply_remote_update_noop_when_no_new_ops() {
 }
 
 #[test]
+fn bug_sync_clock_range_records_local_cid() {
+    // status: bug-sync-clock-range-records-local-cid
+    //
+    // `apply_remote_update` captures `cid = local.accepted.client_id()` and
+    // brackets the merge with `state_clock(accepted, cid)` pre/post. But the
+    // peer's update authors ops under the *peer's* client_id, so the local
+    // cid's clock does not advance — the recorded `(yrs_client_id,
+    // yrs_clock_lo, yrs_clock_hi)` describes a zero-width range that does not
+    // correspond to any real op. The recorded row should instead reflect the
+    // span of ops the update actually introduced (peer's client id, lo<hi).
+    let (_da, log_a, doc_a, _db, log_b, doc_b) = shared_lineage();
+
+    // A authors an edit — these ops live under A's client id.
+    let edited = "# Shared\n\nline one EDITED\nline two\n";
+    assert!(log_a.apply_user_text(&doc_a, edited).unwrap());
+
+    // B applies A's delta.
+    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
+    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
+    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+
+    // The sync row B recorded for this receive.
+    let hist = log_b.doc_history(&doc_b, 50).unwrap();
+    let row = hist
+        .iter()
+        .find(|m| matches!(&m.author, Author::Sync(d) if d == "deviceA"))
+        .expect("expected a sync:deviceA-authored row on B");
+
+    // The bug: the captured clock range is zero-width because the local cid's
+    // clock didn't advance — the peer's ops landed under the peer's cid.
+    assert!(
+        row.yrs_clock_hi > row.yrs_clock_lo,
+        "recorded clock range is zero-width ({}..{}): the row does not describe \
+         any real op (apply_remote_update captured the LOCAL cid's clock, but \
+         the peer-authored ops advanced the PEER's clock)",
+        row.yrs_clock_lo,
+        row.yrs_clock_hi,
+    );
+}
+
+#[test]
 fn adopt_lineage_preserves_local_divergence() {
     // status: sync-lineage-adoption
     // B has a local edit before binding; adopting A's lineage must keep both
@@ -182,4 +273,133 @@ fn adopt_lineage_preserves_local_divergence() {
     // Disk reflects the merged accepted state.
     let on_disk = std::fs::read_to_string(dir_b.path().join("shared.md")).unwrap();
     assert_eq!(on_disk, merged);
+}
+
+#[test]
+fn bug_sync_remote_rename_overwrites_collision() {
+    // status: bug-sync-remote-rename-overwrites-collision
+    //
+    // `apply_remote_update` blindly calls `meta::repoint_doc` when a remote
+    // update's merge advances `meta.path`. `repoint_doc` silently overwrites a
+    // path mapping owned by a *different* local doc — and the subsequent
+    // `write_md_file` clobbers that other doc's `.md` on disk. The expected
+    // behavior (mirroring `accept_pending`'s pre-check) is to refuse the path
+    // repoint and surface a Fork-style block, or route to a conflict-sibling
+    // path. Either way, the local doc-X at `notes/foo.md` and its on-disk
+    // content must be preserved.
+    let dir_local = tempdir().unwrap();
+    let log_local = OpLog::open(dir_local.path()).unwrap();
+    // doc-X owns `notes/foo.md` locally; its disk content is distinctive.
+    let local_x_text = "LOCAL DOC X CONTENT\n";
+    let doc_x = log_local
+        .create_document("notes/foo.md", "note", local_x_text, &Author::User)
+        .unwrap();
+    // doc-Y lives at a different path locally; the peer will rename it.
+    let local_y_text = "PEER WILL RENAME ME\n";
+    let doc_y = log_local
+        .create_document("notes/bar.md", "note", local_y_text, &Author::User)
+        .unwrap();
+
+    // Peer log: independently has doc-Y at the same path with the same content,
+    // adopts the local's lineage for doc-Y, then renames bar.md → foo.md.
+    let dir_peer = tempdir().unwrap();
+    let log_peer = OpLog::open(dir_peer.path()).unwrap();
+    let doc_y_peer = log_peer
+        .create_document("notes/bar.md", "note", local_y_text, &Author::User)
+        .unwrap();
+    let canonical = log_local.export_state(&doc_y).unwrap();
+    log_peer.adopt_lineage(&doc_y_peer, &canonical).unwrap();
+    // Peer renames its copy of doc-Y to the path that doc-X owns locally.
+    log_peer
+        .rename_document(&doc_y_peer, "notes/foo.md", &Author::User)
+        .unwrap();
+
+    // Local pulls the peer's delta for doc-Y. The delta carries a `meta.path`
+    // advance to `notes/foo.md` — which collides with doc-X's path.
+    let local_y_sv = log_local.state_vector_bytes(&doc_y).unwrap();
+    let delta = log_peer.export_since(&doc_y_peer, &local_y_sv).unwrap();
+    let result = log_local.apply_remote_update(&doc_y, &delta, "peer-device");
+
+    // Expected fix: the collision is detected — either by returning an Err, or
+    // by NOT performing the destructive overwrite (e.g. routing to a sibling
+    // conflict path). Either way, doc-X's on-disk `.md` and path mapping must
+    // be preserved.
+    let foo_on_disk = std::fs::read_to_string(dir_local.path().join("notes/foo.md"))
+        .expect("doc-X's notes/foo.md should still exist on disk");
+    assert_eq!(
+        foo_on_disk, local_x_text,
+        "BUG: doc-X's `.md` at notes/foo.md was overwritten with doc-Y's content. \
+         apply_remote_update silently repointed the path mapping and wrote \
+         doc-Y's materialized text over doc-X's file. result={:?}",
+        result,
+    );
+    // Optional stronger assertion: the path-index still resolves to doc-X.
+    assert_eq!(
+        log_local.doc_id_for_path("notes/foo.md").unwrap().as_deref(),
+        Some(doc_x.as_str()),
+        "BUG: doc_index path mapping for notes/foo.md was silently repointed to doc-Y, \
+         orphaning doc-X. result={:?}",
+        result,
+    );
+}
+
+#[test]
+fn bug_sync_adopt_lineage_discards_working() {
+    // status: bug-sync-adopt-lineage-discards-working
+    //
+    // `adopt_lineage` reads `local_text` from `accepted` only and then drops
+    // `working`. The doc-comment claims uncommitted edits "fold back in via
+    // the merge" — they don't, because `working` was never read. A user with
+    // uncommitted typing at the moment a peer's canonical lineage is adopted
+    // silently loses that typing.
+    let seed = "alpha\nbeta\ngamma\n";
+    let dir_local = tempdir().unwrap();
+    let log_local = OpLog::open(dir_local.path()).unwrap();
+    let doc_local = log_local
+        .create_document("shared.md", "note", seed, &Author::User)
+        .unwrap();
+
+    // Uncommitted user typing on the working overlay: modifies line 2.
+    // Replace "beta" (4 bytes, starting at offset 6) with "beta MODIFIED-BY-USER".
+    let accepted_text = log_local.materialize_accepted(&doc_local).unwrap().text;
+    let beta_start = accepted_text.find("beta").expect("seed contains beta");
+    log_local
+        .apply_working_edit(&doc_local, beta_start, "beta".len(), "beta MODIFIED-BY-USER")
+        .unwrap();
+    // Sanity: working materializes with the edit; accepted is still the seed.
+    assert_eq!(
+        log_local.materialize_working(&doc_local).unwrap().text,
+        "alpha\nbeta MODIFIED-BY-USER\ngamma\n"
+    );
+    assert_eq!(log_local.materialize_accepted(&doc_local).unwrap().text, seed);
+
+    // Peer's canonical state: same seed, but with a disjoint edit on line 3.
+    let dir_peer = tempdir().unwrap();
+    let log_peer = OpLog::open(dir_peer.path()).unwrap();
+    let doc_peer = log_peer
+        .create_document("shared.md", "note", seed, &Author::User)
+        .unwrap();
+    let peer_text = "alpha\nbeta\ngamma EXTENDED-BY-PEER\n";
+    assert!(log_peer.apply_user_text(&doc_peer, peer_text).unwrap());
+    let canonical = log_peer.export_state(&doc_peer).unwrap();
+
+    // Adopt the peer's lineage. The three-way merge should see:
+    //   base   = "alpha\nbeta\ngamma\n"          (shared seed)
+    //   ours   = "alpha\nbeta MODIFIED-BY-USER\ngamma\n"   (working overlay)
+    //   theirs = "alpha\nbeta\ngamma EXTENDED-BY-PEER\n"   (peer canonical)
+    // → merged: "alpha\nbeta MODIFIED-BY-USER\ngamma EXTENDED-BY-PEER\n"
+    log_local.adopt_lineage(&doc_local, &canonical).unwrap();
+
+    let after = log_local.materialize_accepted(&doc_local).unwrap().text;
+    assert!(
+        after.contains("EXTENDED-BY-PEER"),
+        "lost peer's canonical edit: {after:?}"
+    );
+    assert!(
+        after.contains("MODIFIED-BY-USER"),
+        "lost user's uncommitted working edit: {after:?} \
+         (bug: adopt_lineage reads from accepted only and drops `working`, \
+         so the user's in-progress typing is silently discarded instead of \
+         being folded into the three-way merge as the doc-comment claims)"
+    );
 }

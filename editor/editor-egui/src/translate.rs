@@ -122,19 +122,28 @@ pub fn pointer_mouse_events(
     // on release after a short press, and `drag_started_by()` only fires
     // after a small motion deadzone — both would make the caret lag /
     // jump.
-    let (pressed, released, down, double, triple) = ctx.input(|i| {
+    let (pressed, released, down) = ctx.input(|i| {
         (
             i.pointer.primary_pressed(),
             i.pointer.primary_released(),
             i.pointer.primary_down(),
-            i.pointer.button_double_clicked(egui::PointerButton::Primary),
-            i.pointer.button_triple_clicked(egui::PointerButton::Primary),
         )
     });
     let over = response.contains_pointer();
 
     if pressed && over {
-        let cc = if triple { 3 } else if double { 2 } else { 1 };
+        // egui only reports double/triple clicks on the RELEASE frame, but we
+        // emit `Down` (which carries the click count that drives word/line
+        // selection) on the PRESS frame — so reading egui's flags here always
+        // saw `1`. Count successive presses ourselves, keyed per widget in
+        // egui temp memory: presses close in time and space chain 1→2→3.
+        let now = ctx.input(|i| i.time);
+        let id = response.id.with("editor-multiclick");
+        let prev = ctx.data(|d| d.get_temp::<ClickTracker>(id));
+        let cc = next_click_count(prev, now, x, y);
+        ctx.data_mut(|d| {
+            d.insert_temp(id, ClickTracker { last_time: now, last_x: x, last_y: y, count: cc });
+        });
         out.push(MouseEvent::Down { button: MouseButton::Left, x, y, click_count: cc });
     }
     // Emit Drag every frame the button is held AND we know we have an
@@ -152,4 +161,74 @@ pub fn pointer_mouse_events(
         out.push(MouseEvent::Up { button: MouseButton::Left, x, y });
     }
     out
+}
+
+/// Per-widget press-time multi-click state, stashed in egui temp memory. Lets
+/// us derive the click count when emitting `Down` on the press frame, since
+/// egui's own double/triple-click flags only go true on release.
+#[derive(Clone, Copy)]
+struct ClickTracker {
+    last_time: f64,
+    last_x: f32,
+    last_y: f32,
+    count: u8,
+}
+
+/// Max seconds between presses for them to chain into a multi-click, and max
+/// pointer travel (px) allowed between them. Mirror egui's own click
+/// thresholds closely enough that the feel matches.
+const MULTICLICK_DELAY: f64 = 0.3;
+const MULTICLICK_DIST: f32 = 6.0;
+
+/// Click count for a press at (`now`, `x`, `y`) given the previous press.
+/// Chains 1→2→3 then wraps back to 1 when presses are close in time and space;
+/// resets to 1 when the gap is too long or the pointer moved too far.
+fn next_click_count(prev: Option<ClickTracker>, now: f64, x: f32, y: f32) -> u8 {
+    match prev {
+        Some(p)
+            if now - p.last_time <= MULTICLICK_DELAY
+                && (x - p.last_x).abs() <= MULTICLICK_DIST
+                && (y - p.last_y).abs() <= MULTICLICK_DIST =>
+        {
+            if p.count >= 3 { 1 } else { p.count + 1 }
+        }
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod multiclick_tests {
+    use super::{next_click_count, ClickTracker};
+
+    fn tracker(count: u8, last_time: f64) -> ClickTracker {
+        ClickTracker { last_time, last_x: 10.0, last_y: 10.0, count }
+    }
+
+    #[test]
+    fn first_press_is_single() {
+        assert_eq!(next_click_count(None, 1.0, 10.0, 10.0), 1);
+    }
+
+    #[test]
+    fn rapid_presses_chain_then_wrap() {
+        // 1 → 2 → 3 → 1 when each press is within the delay + distance.
+        let c1 = next_click_count(None, 1.00, 10.0, 10.0);
+        assert_eq!(c1, 1);
+        let c2 = next_click_count(Some(tracker(c1, 1.00)), 1.10, 11.0, 10.0);
+        assert_eq!(c2, 2);
+        let c3 = next_click_count(Some(tracker(c2, 1.10)), 1.20, 10.0, 11.0);
+        assert_eq!(c3, 3);
+        let c4 = next_click_count(Some(tracker(c3, 1.20)), 1.30, 10.0, 10.0);
+        assert_eq!(c4, 1, "fourth rapid press wraps back to single");
+    }
+
+    #[test]
+    fn slow_second_press_resets_to_single() {
+        assert_eq!(next_click_count(Some(tracker(1, 1.0)), 1.0 + 0.5, 10.0, 10.0), 1);
+    }
+
+    #[test]
+    fn moved_far_resets_to_single() {
+        assert_eq!(next_click_count(Some(tracker(1, 1.0)), 1.05, 40.0, 10.0), 1);
+    }
 }

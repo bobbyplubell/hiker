@@ -20,20 +20,6 @@ pub struct TabId(pub u64);
 /// so layout files survive panel-registry shuffles.
 pub type PanelId = &'static str;
 
-/// A node mounted inside the central `DockState`. Buffer / page tabs
-/// reference `Session::tabs` by id; panels reference the panel registry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum DockTab {
-    Tab(TabId),
-    Panel(String),
-}
-
-impl DockTab {
-    pub fn panel(id: PanelId) -> Self {
-        DockTab::Panel(id.to_string())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Tab {
     pub id: TabId,
@@ -117,6 +103,13 @@ pub enum TabKind {
     ///
     /// status: board-view
     Board { path: String },
+    /// Boards index: a singleton meta-page listing every board-doc in the
+    /// vault (title + column/card counts) with click-to-open, New board,
+    /// and per-row Delete. A non-buffer app-page like Home / Queue, since
+    /// boards are per-doc and have no single home tab. See `docs/kanban.md`.
+    ///
+    /// status: board-index-page
+    BoardsIndex,
     /// Chat session as a full tab (vs. docked at bottom of discovery).
     Agent { session_id: String },
     /// Patch review: lists pending staging proposals with accept/reject.
@@ -182,6 +175,21 @@ impl TabKind {
         }
     }
 
+    /// Construct a read-only trash-preview editor tab. The buffer holds
+    /// the trashed file's on-disk content; no diff layer.
+    pub fn trash_preview(
+        trash_path: impl Into<String>,
+        original_path: impl Into<String>,
+    ) -> Self {
+        TabKind::Editor {
+            buffer: BufferSource::Trash {
+                trash_path: trash_path.into(),
+                original_path: original_path.into(),
+            },
+            diff: None,
+        }
+    }
+
     /// Returns the underlying vault-file path if this is an editable vault
     /// buffer (i.e. `Editor { buffer: Vault { path }, .. }`).
     pub fn vault_path(&self) -> Option<&str> {
@@ -231,6 +239,7 @@ impl TabKind {
             TabKind::Properties { path } => format!("Properties · {}", path_basename(path)),
             TabKind::Graph => "Graph".to_string(),
             TabKind::Board { path } => format!("Board · {}", path_basename(path)),
+            TabKind::BoardsIndex => "Boards".to_string(),
             TabKind::Agent { .. } => "Chat".to_string(),
             TabKind::PatchReview => "Patch review".to_string(),
             TabKind::Plugins => "Plugins".to_string(),
@@ -262,6 +271,7 @@ impl TabKind {
             TabKind::Properties { .. } => icons::ICONS.image(crate::icons::Icon::Info),
             TabKind::Graph => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::Board { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
+            TabKind::BoardsIndex => icons::ICONS.image(crate::icons::Icon::Clipboard),
             TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
             TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
             TabKind::Plugins => icons::ICONS.image(crate::icons::Icon::Plugin),
@@ -311,6 +321,8 @@ impl Tab {
             // disambiguates from a plain buffer tab on the same path).
             // status: board-view
             TabKind::Board { path } => (format!("board:{path}"), "board".into()),
+            // Singleton Boards index page. status: board-index-page
+            TabKind::BoardsIndex => (":boards_index".into(), "boards_index".into()),
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
             TabKind::Plugins => (":plugins".into(), "plugins".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),

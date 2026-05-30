@@ -298,7 +298,7 @@ pub fn rebuild_and_persist(
 /// module (e.g. the `cluster_persist_built_tree` command that drives
 /// the clustering review tab's Confirm-and-name step).
 ///
-/// status: cluster-review-tab-confirm-and-name
+/// status: cluster-review-tab-confirm-single-path
 pub fn result_to_node_inserts_pub(tree: &BuiltClusterTree) -> Vec<NodeInsert> {
     result_to_node_inserts(tree)
 }

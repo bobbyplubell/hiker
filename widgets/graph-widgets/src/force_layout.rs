@@ -43,7 +43,7 @@ use std::time::Duration;
 use eframe::egui::Vec2;
 
 /// Tunable parameters for the ForceAtlas2 layout. The defaults match
-/// what graphology-layout-forceatlas2 uses for "Obsidian-style" graph
+/// what graphology-layout-forceatlas2 uses for force-directed graph
 /// visuals (modest gravity, linear attraction, degree-distributed
 /// outbound attraction so hubs don't get dragged around).
 pub struct LayoutParams {

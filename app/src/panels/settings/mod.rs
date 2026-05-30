@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 
 use hiker_core::config::{Config, SettingsScope};
-use hiker_core::config::sections::{IdStampingMode, RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
+use hiker_core::config::sections::{RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
 use crate::theme;
@@ -319,16 +319,10 @@ fn indexing_section(&mut self) {
             });
             help(ui, "Changing the model re-embeds the entire vault on next index pass.");
 
-            enum_combo(
-                ui, app, st,
-                "Note ID stamping",
-                "indexing.id_stamping",
-                snap.indexing.id_stamping,
-                &[
-                    (IdStampingMode::Lazy, "Lazy (stamp on reference)", "lazy"),
-                    (IdStampingMode::All, "All (stamp every note)", "all"),
-                ],
-            );
+            // Note-ID-stamping setting retired with `note-id-stamping` —
+            // under path-as-identity (`store-id-from-oplog`), notes are
+            // addressed by their vault path and the op-log keeps an
+            // internal `path → doc_id` map. There's nothing to stamp.
         });
 }
 
@@ -494,10 +488,26 @@ fn editor_section(&mut self) {
                     .small()
                     .color(theme::muted()),
             );
-            string_row(ui, app, st, "System font", "editor.font_system", &e.font_system);
-            string_row(ui, app, st, "Editor font", "editor.font_editor", &e.font_editor);
-            string_row(ui, app, st, "Code font", "editor.font_code", &e.font_code);
-            help(ui, "Restart required to pick up font changes.");
+            font_row(ui, app, st, "System font", "editor.font_system", &e.font_system);
+            font_row(ui, app, st, "Editor font", "editor.font_editor", &e.font_editor);
+            font_row(ui, app, st, "Code font", "editor.font_code", &e.font_code);
+            help(ui, "Font changes apply live; unresolved paths fall back to the platform default.");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Preview")
+                    .small()
+                    .color(theme::muted()),
+            );
+            render_font_preview(ui);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Click selection (regex matches the line under the cursor)")
+                    .small()
+                    .color(theme::muted()),
+            );
+            string_row(ui, app, st, "Double-click pattern", "editor.double_click_pattern", &e.double_click_pattern);
+            string_row(ui, app, st, "Triple-click pattern", "editor.triple_click_pattern", &e.triple_click_pattern);
+            help(ui, r#"Defaults: "\w+" (Unicode word, so foo-bar splits at "-") and ".*\n?" (whole line incl. newline). Try "[\w-]+" to select hyphenated words whole, or "\S+" for runs of non-whitespace. Empty resets to default; an invalid regex falls back to default. Takes effect on the next click in any open buffer."#);
         });
 }
 
@@ -713,6 +723,116 @@ fn string_row(
             commit(app, st.scope, key, &serde_json::Value::String(draft.clone()));
         }
         let _ = commit_now;
+    });
+}
+
+/// Font-path row: a `string_row` plus a red "Font not installed" hint
+/// when the path is non-empty and doesn't resolve to a readable file.
+/// Backs the `editor-three-fonts` settings UI's unresolved-marker rule.
+fn font_row(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    st: &mut SettingsUi,
+    label: &str,
+    key: &str,
+    current: &str,
+) {
+    string_row(ui, app, st, label, key, current);
+    if !current.is_empty() && !std::path::Path::new(current).is_file() {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Font not installed")
+                    .small()
+                    .color(egui::Color32::from_rgb(200, 64, 64)),
+            );
+        });
+    }
+}
+
+/// Small read-only markdown preview rendered with the live editor stack
+/// so the user can see their font picks applied in context (body prose
+/// uses `editor_font`, code spans + frontmatter + fenced blocks use
+/// `code_font`). The font slots are live-applied via
+/// `AppState::refresh_user_fonts` so flipping a setting reflects here on
+/// the next frame.
+///
+/// status: editor-three-fonts
+fn render_font_preview(ui: &mut egui::Ui) {
+    use editor_core::state::Editor as EditorState;
+    use editor_core::theme::light_default;
+    use editor_egui::widget::Widget as EditorWidget;
+    use editor_md::styling::markdown_decorations;
+    use editor_view::viewport::ViewState;
+    use std::cell::RefCell;
+
+    /// Frame-persistent preview backing. `thread_local!` keeps the editor
+    /// + view state alive across frames so the layout cache doesn't get
+    /// thrown away every paint — but it costs nothing when settings isn't
+    /// shown. Read-only by construction.
+    struct Backing {
+        editor: EditorState,
+        view: ViewState,
+    }
+
+    thread_local! {
+        static CACHE: RefCell<Option<Backing>> = const { RefCell::new(None) };
+    }
+
+    // Content exercising every font slot: a body-size paragraph (editor
+    // font), inline `code` (code font), a fenced code block (code font),
+    // and a leading YAML frontmatter block (code font, body size — per
+    // `editor-frontmatter-rendering-fix`).
+    const SAMPLE: &str = "\
+---
+title: Font preview
+tags: [demo]
+---
+
+The quick brown fox jumps over the lazy dog. Body prose uses the editor font; inline `code spans` use the code font.
+
+```rust
+fn main() {
+    println!(\"hello, world\");
+}
+```
+";
+
+    CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut editor = EditorState::new(SAMPLE);
+            // Park the cursor at end of doc so no line reveals its raw
+            // markdown markers (same trick the chat md_preview uses).
+            editor.selection = editor_core::selection::Selection::single(editor.doc.len_bytes());
+            let mut view = ViewState {
+                read_only: true,
+                hide_gutter: true,
+                ..ViewState::default()
+            };
+            view.wrap_map.set_enabled(true);
+            let theme = light_default();
+            view.decorations.clear();
+            view.decorations.push(markdown_decorations(&editor, Some(&theme)));
+            *slot = Some(Backing { editor, view });
+        }
+        let backing = slot.as_mut().unwrap();
+        // Allocate a fixed-ish height — preview content is ~10 lines.
+        let width = ui.available_width();
+        let intrinsic = backing.view.height_map.total_height();
+        let height = if intrinsic <= 0.0 {
+            // First-frame estimate; settles on the next paint.
+            (SAMPLE.lines().count() as f32) * backing.view.line_height + 16.0
+        } else {
+            intrinsic.min(280.0)
+        };
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        EditorWidget::new(&mut backing.editor, &mut backing.view).show(&mut child);
+        if intrinsic <= 0.0 {
+            ui.ctx().request_repaint();
+        }
     });
 }
 

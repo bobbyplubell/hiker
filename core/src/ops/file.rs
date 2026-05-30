@@ -19,7 +19,7 @@ use crate::watcher::Watcher;
 /// the op — the app's tree button passes `"new-note"`; CLI / MCP can pass
 /// `"untitled"`, `"capture-2026-05-07"`, etc.
 ///
-/// status: create-note-button
+/// status: create-note-core-cmd
 pub async fn create_with_suffix(
     watcher: &Watcher,
     jobs: &IndexJobTx,
@@ -64,6 +64,45 @@ pub async fn create_with_suffix(
     watcher.suppress(created.clone());
 
     // Explicitly index the new file (the watcher event was suppressed).
+    let _ = jobs
+        .send(IndexJob::Upsert {
+            rel_path: created.clone(),
+            force: false,
+        })
+        .await;
+    Ok(created)
+}
+
+/// Create a note at an exact vault-relative `rel` path, optionally seeding it
+/// with `content` (empty string = blank note). Suppresses the watcher and
+/// enqueues an `IndexJob::Upsert` so the new file is indexed without a
+/// duplicate watcher-driven ingest — the same discipline as
+/// `create_with_suffix`, but for callers that need a specific path (a
+/// wikilink target whose name must resolve the link, a duplicate that must
+/// carry the source's bytes).
+///
+/// Errors `AlreadyExists` if a file is already at `rel`, leaving the caller to
+/// decide whether to retry with a different name.
+///
+/// status: create-note-core-cmd
+pub async fn create_at(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    rel: &str,
+    content: &str,
+) -> Result<String, HikerError> {
+    watcher.suppress(rel.to_string());
+    let created = vault.create_note(rel)?;
+    if !content.is_empty() {
+        watcher.suppress(created.clone());
+        vault.write_file(&created, content)?;
+    }
+    // Re-suppress so the TTL window starts close to when notify surfaces the
+    // Created/Modified events, not at function entry.
+    watcher.suppress(created.clone());
+
+    // Explicitly index the new file (the watcher events were suppressed).
     let _ = jobs
         .send(IndexJob::Upsert {
             rel_path: created.clone(),

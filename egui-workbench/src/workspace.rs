@@ -121,6 +121,10 @@ impl Default for OpenTabOptions {
 pub struct Workbench<Tab: Document, Mode: Clone + Eq + Hash + 'static> {
     pub activity_bar: ActivityBar<Mode>,
     pub primary_side_bar: SideBar,
+    /// Primary side-panel region as a VSCode-style accordion of
+    /// collapsible feature sections. The activity bar switches/focuses
+    /// sections here; headers drag to reorder. [feature-multi-region-sidebar]
+    pub primary_panels: crate::side_panel_stack::SidePanelStack<Mode>,
     pub secondary_side_bar: SideBar,
     pub editor_area: EditorArea<Tab>,
     pub panel_area: PanelArea<Tab>,
@@ -137,6 +141,7 @@ impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Default for Workbench<Tab
         Self {
             activity_bar: ActivityBar::default(),
             primary_side_bar: SideBar::new(Side::Left),
+            primary_panels: crate::side_panel_stack::SidePanelStack::new(),
             secondary_side_bar: SideBar {
                 side: Side::Right,
                 visible: false,
@@ -586,30 +591,37 @@ impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
                 .show(ctx, |ui| {
                     let resp = self.activity_bar.show::<Tab, _>(ui, &theme, behavior);
                     if let Some(mode) = resp.clicked {
-                        // Click semantics: same activity already active
-                        // → toggle side bar visibility; otherwise →
-                        // switch to that mode (and ensure side bar
-                        // visible).
-                        if self.activity_bar.active.as_ref() == Some(&mode) {
-                            self.primary_side_bar.toggle();
+                        // VSCode switch semantics: clicking the focused
+                        // section's icon hides the side bar; clicking any
+                        // other icon switches that section into focus
+                        // (replacing the focused section in place, never
+                        // adding a split). The activity-bar highlight
+                        // tracks the focused section.
+                        let was_focused = self.primary_panels.focused.as_ref() == Some(&mode);
+                        if was_focused && self.primary_side_bar.visible {
+                            self.primary_side_bar.visible = false;
                         } else {
-                            self.activity_bar.active = Some(mode);
+                            self.primary_panels.switch(mode);
                             self.primary_side_bar.visible = true;
                         }
+                        self.activity_bar.active = self.primary_panels.focused.clone();
+                    }
+                    if let Some(mode) = resp.dropped_out {
+                        // Dragged an activity icon into the window → add it
+                        // as a new accordion section (VSCode "drag a view
+                        // into the sidebar"). [feature-multi-region-sidebar]
+                        self.primary_panels.add_section(mode);
+                        self.activity_bar.active = self.primary_panels.focused.clone();
+                        self.primary_side_bar.visible = true;
                     }
                 });
         }
 
-        // 3) Primary side bar — activity-driven.
-        show_side_bar::<Tab, _, _>(
-            &mut self.primary_side_bar,
-            ctx,
-            "egui_workbench::primary_side_bar",
-            &theme,
-            behavior,
-            self.activity_bar.active.as_ref(),
-            SideBarRole::Primary,
-        );
+        // 3) Primary side bar — activity-driven, backed by the accordion
+        //    `side_panel_stack`: one or more collapsible feature sections,
+        //    each header a drag handle for reordering. A lone section
+        //    looks identical to the old single side bar.
+        self.show_primary_side_bar(ctx, &theme, behavior);
 
         // 4) Secondary side bar — fixed host content, independent of
         //    the active activity.
@@ -662,6 +674,70 @@ impl<Tab: Document, Mode: Clone + Eq + Hash + 'static> Workbench<Tab, Mode> {
             .show(ctx, |ui| {
                 self.show_editor_area(ui, behavior, &theme);
             });
+    }
+
+    /// Switch the primary side region to show `mode` as a focused
+    /// section and ensure the side bar is visible. Used by hosts for the
+    /// initial panel + single-panel programmatic switches.
+    /// [feature-multi-region-sidebar]
+    pub fn open_primary_panel(&mut self, mode: Mode) {
+        self.primary_panels.switch(mode);
+        self.activity_bar.active = self.primary_panels.focused.clone();
+        self.primary_side_bar.visible = true;
+    }
+
+    /// Add `mode` as an additional accordion section below the focused
+    /// one (the multi-panel path), making the side bar visible.
+    pub fn add_primary_panel(&mut self, mode: Mode) {
+        self.primary_panels.add_section(mode);
+        self.activity_bar.active = self.primary_panels.focused.clone();
+        self.primary_side_bar.visible = true;
+    }
+
+    /// Replace the open primary-panel set wholesale (layout restore).
+    pub fn set_primary_panels(&mut self, modes: &[Mode]) {
+        self.primary_panels.set_open(modes);
+        self.activity_bar.active = self.primary_panels.focused.clone();
+        self.primary_side_bar.visible = !self.primary_panels.is_empty();
+    }
+
+    /// Render the primary side bar: the accordion of feature sections
+    /// inside a resizable `SidePanel`. A header click syncs the
+    /// activity-bar highlight to the focused section.
+    fn show_primary_side_bar(
+        &mut self,
+        ctx: &egui::Context,
+        theme: &crate::theme::Palette,
+        behavior: &mut impl Host<Tab, Mode>,
+    ) {
+        let bar = &mut self.primary_side_bar;
+        if !bar.visible || self.primary_panels.is_empty() {
+            return;
+        }
+        let frame = Frame::side_top_panel(&ctx.style()).fill(theme.side_bar_bg);
+        let panel = match bar.side {
+            crate::side_bar::Side::Left => egui::SidePanel::left("egui_workbench::primary_side_bar"),
+            crate::side_bar::Side::Right => {
+                egui::SidePanel::right("egui_workbench::primary_side_bar")
+            }
+        };
+        let clamped = bar.width.clamp(bar.min_width, bar.max_width);
+        let response = panel
+            .frame(frame)
+            .resizable(true)
+            .default_width(clamped)
+            .min_width(bar.min_width)
+            .max_width(bar.max_width)
+            .show(ctx, |ui| {
+                if let Some(clicked) = self.primary_panels.ui::<Tab, _>(ui, theme, behavior) {
+                    self.activity_bar.active = Some(clicked);
+                }
+            });
+        let actual = response.response.rect.width();
+        let new_width = actual.clamp(bar.min_width, bar.max_width);
+        if (new_width - bar.width).abs() > 0.5 {
+            bar.width = new_width;
+        }
     }
 
     fn show_panel_area(

@@ -17,6 +17,7 @@ use hiker_core::store::dto::{new_id, NoteUpsert};
 use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
+use hiker_mcp::ui_context::{ActiveBuffer, OpenBufferTab, Shared, Snapshot};
 use hiker_mcp::{start, McpDeps, McpServerHandle};
 use tempfile::TempDir;
 
@@ -40,6 +41,9 @@ struct Booted {
     url: String,
     idx: Handle,
     read_store: Arc<Mutex<Store>>,
+    vault: Vault,
+    oplog: std::sync::Arc<hiker_core::oplog::OpLog>,
+    ui_context: Shared,
 }
 
 async fn boot(config: McpConfig) -> Booted {
@@ -60,8 +64,9 @@ async fn boot(config: McpConfig) -> Booted {
     ));
     let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
     let oplog = std::sync::Arc::new(hiker_core::oplog::OpLog::open(td.path()).unwrap());
+    let ui_context = hiker_mcp::ui_context::shared_empty();
     let deps = McpDeps {
-        vault,
+        vault: vault.clone(),
         vault_root: td.path().to_path_buf(),
         read_store: read_store.clone(),
         jobs: idx.job_sender(),
@@ -72,8 +77,10 @@ async fn boot(config: McpConfig) -> Booted {
         audit,
         tasks,
         tasks_config: hiker_core::config::sections::TasksConfig::default(),
+        boards_config: hiker_core::config::sections::BoardsConfig::default(),
         llm_enabled: false,
-        oplog: Some(oplog),
+        oplog: Some(oplog.clone()),
+        ui_context: ui_context.clone(),
     };
     let handle = start(deps).await.expect("start mcp");
     let url = handle.url();
@@ -101,7 +108,7 @@ async fn boot(config: McpConfig) -> Booted {
     assert_eq!(resp.status(), 200);
     let _ = resp.text().await.unwrap();
 
-    Booted { td, handle, client, url, idx, read_store }
+    Booted { td, handle, client, url, idx, read_store, vault, oplog, ui_context }
 }
 
 async fn rpc(b: &Booted, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -161,9 +168,111 @@ async fn server_lists_expected_tools() {
         "boards_list",
         "board_get",
         "board_add_card",
+        "board_create",
+        "board_add_text_card",
+        "board_move_card",
+        "board_set_card_text",
+        "board_remove_card",
+        "board_add_column",
+        "board_rename_column",
+        "board_reorder_column",
+        "board_delete_column",
     ] {
         assert!(tools.contains(&expected.to_string()), "missing {expected} in {tools:?}");
     }
+    shutdown(b).await;
+}
+
+/// Direct-mode (review off) round-trip across the new board write tools:
+/// create a board, add a text card, move it to another column, add+rename a
+/// column, then assert the result via `board_get`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_write_tools_round_trip_direct() {
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+
+    // Create the board (default Todo/Doing/Done under boards/).
+    let created = call_tool(&b, "board_create", serde_json::json!({ "name": "plan" })).await;
+    let cs = structured(&created);
+    assert_eq!(cs["status"], "written");
+    let rel = cs["rel_path"].as_str().unwrap().to_string();
+    assert_eq!(rel, "boards/plan.md");
+
+    // Add a freeform text card to Todo; capture its card_id.
+    let added = call_tool(&b, "board_add_text_card", serde_json::json!({
+        "board_rel_path": rel,
+        "column": "Todo",
+        "text": "ship boards",
+    })).await;
+    let as_ = structured(&added);
+    assert_eq!(as_["status"], "written");
+    let card_id = as_["card_id"].as_str().unwrap().to_string();
+
+    // Move it to Doing.
+    let moved = call_tool(&b, "board_move_card", serde_json::json!({
+        "board_rel_path": rel,
+        "card_id": card_id,
+        "to_column": "Doing",
+    })).await;
+    assert_eq!(structured(&moved)["status"], "written");
+
+    // Add a column, then rename it.
+    let added_col = call_tool(&b, "board_add_column", serde_json::json!({
+        "board_rel_path": rel,
+        "name": "Backlog",
+    })).await;
+    assert_eq!(structured(&added_col)["status"], "written");
+    let renamed = call_tool(&b, "board_rename_column", serde_json::json!({
+        "board_rel_path": rel,
+        "old_name": "Backlog",
+        "new_name": "Icebox",
+    })).await;
+    assert_eq!(structured(&renamed)["status"], "written");
+
+    // board_get reflects all of it (direct writes hit disk).
+    let got = call_tool(&b, "board_get", serde_json::json!({ "rel_path": rel })).await;
+    let g = structured(&got);
+    let columns = g["columns"].as_array().expect("columns");
+    let names: Vec<&str> = columns.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Todo", "Doing", "Done", "Icebox"]);
+    // The card moved out of Todo into Doing.
+    let todo = columns.iter().find(|c| c["name"] == "Todo").unwrap();
+    assert!(todo["cards"].as_array().unwrap().is_empty(), "card left Todo");
+    let doing = columns.iter().find(|c| c["name"] == "Doing").unwrap();
+    let doing_cards = doing["cards"].as_array().unwrap();
+    assert_eq!(doing_cards.len(), 1);
+    assert_eq!(doing_cards[0]["text"], "ship boards");
+
+    shutdown(b).await;
+}
+
+/// `board_create` commits directly EVEN under `review_required` — the op-log
+/// staging path for a new file would seed the document by writing an empty
+/// `.md` to disk, leaving a phantom board-doc in the vault. Creates are
+/// structural; the safer fallback is direct-commit with the user deleting on
+/// reject. The subsequent board *edits* still stage as pending ops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_create_commits_directly_even_in_review_mode() {
+    let b = boot(McpConfig::default()).await; // review_required defaults true
+    let created = call_tool(&b, "board_create", serde_json::json!({ "name": "draft" })).await;
+    let cs = structured(&created);
+    assert_eq!(cs["status"], "written");
+    let rel = cs["rel_path"].as_str().unwrap();
+    // The new board-doc DID hit disk — this is the documented fallback.
+    assert!(b.td.path().join(rel).exists(), "create commits directly");
+
+    // A subsequent edit on that board still STAGES in review mode (does not
+    // hit disk) — only create is direct-only.
+    let added = call_tool(&b, "board_add_column", serde_json::json!({
+        "board_rel_path": rel,
+        "name": "Review",
+    })).await;
+    let as_ = structured(&added);
+    assert_eq!(as_["status"], "staged", "edits still stage in review mode: {added}");
+    assert!(as_["staging_id"].is_string());
     shutdown(b).await;
 }
 
@@ -176,13 +285,21 @@ async fn board_get_returns_columns_and_cards() {
     std::fs::create_dir_all(b.td.path().join("boards")).unwrap();
     let board_src = "---\nhiker:\n  kind: board\n  id: 01BOARD\n  columns:\n    - name: Todo\n      cards:\n        - { id: 01CARD, path: \"note.md\" }\n    - name: Done\n      cards: []\n---\n# Roadmap\n\nframing\n";
     std::fs::write(b.td.path().join("boards/roadmap.md"), board_src).unwrap();
+    // Hand-written file bypassed the watcher/indexer path that would normally
+    // seed the op-log; do the bootstrap walk so `board_get`'s
+    // `doc_id_for_path` lookup resolves. status: op-log-doc-id-bootstrap
+    hiker_core::ops::op_writes::bootstrap(&b.vault, &b.oplog).unwrap();
 
     let resp = call_tool(&b, "board_get", serde_json::json!({
         "rel_path": "boards/roadmap.md",
     })).await;
     let s = structured(&resp);
     assert_eq!(s["rel_path"], "boards/roadmap.md");
-    assert_eq!(s["board_id"], "01BOARD");
+    // board_id comes from op-log's path→doc_id mapping (`store-id-from-oplog`),
+    // not the frontmatter `hiker.id`. The seeded id is a fresh ULID; just
+    // assert presence.
+    let expected_id = b.oplog.doc_id_for_path("boards/roadmap.md").unwrap().unwrap();
+    assert_eq!(s["board_id"], expected_id);
     let columns = s["columns"].as_array().expect("columns array");
     assert_eq!(columns.len(), 2);
     assert_eq!(columns[0]["name"], "Todo");
@@ -662,5 +779,145 @@ async fn audit_logs_full_input_when_enabled() {
         }
     }
     assert!(leaked, "log_full_input=true should record the verbatim query");
+    shutdown(b).await;
+}
+
+// ---------- UI-context tool smoke tests ----------
+// status: mcp-tool-get-active-note
+// status: mcp-tool-get-open-notes
+// status: mcp-tool-get-selection
+
+fn set_ui_context(b: &Booted, snap: Snapshot) {
+    *b.ui_context.write().unwrap() = snap;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_context_tools_appear_in_tool_listing() {
+    let b = boot(McpConfig::default()).await;
+    let resp = rpc(&b, "tools/list", serde_json::json!({})).await;
+    let tools: Vec<String> = resp["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    for expected in ["get_active_note", "get_open_notes", "get_selection"] {
+        assert!(
+            tools.contains(&expected.to_string()),
+            "missing {expected} in {tools:?}"
+        );
+    }
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_active_note_returns_null_when_nothing_active() {
+    let b = boot(McpConfig::default()).await;
+    let resp = call_tool(&b, "get_active_note", serde_json::json!({})).await;
+    let s = structured(&resp);
+    assert!(s["path"].is_null(), "expected path:null, got {s}");
+    let opens = call_tool(&b, "get_open_notes", serde_json::json!({})).await;
+    let arr = structured(&opens).as_array().expect("array");
+    assert!(arr.is_empty(), "expected empty open_notes, got {arr:?}");
+    let sel = call_tool(&b, "get_selection", serde_json::json!({})).await;
+    assert!(structured(&sel)["path"].is_null());
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_active_note_buffer_with_no_selection() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("note.md"), "hello world").unwrap();
+    set_ui_context(
+        &b,
+        Snapshot {
+            open_tabs: vec![OpenBufferTab { path: "note.md".into(), active: true }],
+            active_buffer: Some(ActiveBuffer {
+                path: "note.md".into(),
+                cursor_byte: 5,
+                selection: None,
+            }),
+        },
+    );
+    let resp = call_tool(&b, "get_active_note", serde_json::json!({})).await;
+    let s = structured(&resp);
+    assert_eq!(s["path"], serde_json::json!("note.md"));
+    assert_eq!(s["cursor_byte"], serde_json::json!(5));
+    assert!(s["selection"].is_null(), "expected null selection, got {s}");
+    let opens = structured(&call_tool(&b, "get_open_notes", serde_json::json!({})).await)
+        .clone();
+    assert_eq!(
+        opens,
+        serde_json::json!([{"path": "note.md", "active": true}])
+    );
+    let sel = structured(&call_tool(&b, "get_selection", serde_json::json!({})).await)
+        .clone();
+    assert!(sel["path"].is_null(), "empty selection → null path, got {sel}");
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_selection_returns_text_and_range_for_non_empty_selection() {
+    let b = boot(McpConfig::default()).await;
+    std::fs::write(b.td.path().join("note.md"), "hello world").unwrap();
+    set_ui_context(
+        &b,
+        Snapshot {
+            open_tabs: vec![OpenBufferTab { path: "note.md".into(), active: true }],
+            active_buffer: Some(ActiveBuffer {
+                path: "note.md".into(),
+                cursor_byte: 5,
+                selection: Some((0, 5)),
+            }),
+        },
+    );
+    let active = structured(&call_tool(&b, "get_active_note", serde_json::json!({})).await)
+        .clone();
+    assert_eq!(active["path"], serde_json::json!("note.md"));
+    assert_eq!(active["selection"]["start_byte"], serde_json::json!(0));
+    assert_eq!(active["selection"]["end_byte"], serde_json::json!(5));
+    let sel = structured(&call_tool(&b, "get_selection", serde_json::json!({})).await)
+        .clone();
+    assert_eq!(sel["path"], serde_json::json!("note.md"));
+    assert_eq!(sel["start_byte"], serde_json::json!(0));
+    assert_eq!(sel["end_byte"], serde_json::json!(5));
+    assert_eq!(sel["text"], serde_json::json!("hello"));
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_active_note_returns_null_for_app_page_tab() {
+    let b = boot(McpConfig::default()).await;
+    set_ui_context(
+        &b,
+        Snapshot { open_tabs: vec![], active_buffer: None },
+    );
+    let resp = call_tool(&b, "get_active_note", serde_json::json!({})).await;
+    assert!(structured(&resp)["path"].is_null());
+    let sel = call_tool(&b, "get_selection", serde_json::json!({})).await;
+    assert!(structured(&sel)["path"].is_null());
+    shutdown(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_context_tools_respect_per_tool_disable() {
+    let mut cfg = McpConfig::default();
+    cfg.tools.get_active_note_enabled = false;
+    let b = boot(cfg).await;
+    let resp = call_tool(&b, "get_active_note", serde_json::json!({})).await;
+    let err = &resp["result"]["isError"];
+    let code = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let msg = resp
+        .get("error")
+        .and_then(|e| e["message"].as_str())
+        .map(str::to_string)
+        .unwrap_or(code);
+    assert!(
+        msg.contains("disabled") || err.as_bool().unwrap_or(false),
+        "expected disabled error, got {resp}"
+    );
     shutdown(b).await;
 }

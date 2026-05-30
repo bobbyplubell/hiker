@@ -307,8 +307,9 @@ egui-workbench/
 ├── README.md
 ├── src/
 │   ├── lib.rs                  — public re-exports, crate docs
-│   ├── activity_bar.rs         — ActivityBar widget, ActivityItem
-│   ├── side_bar.rs             — SideBar host + resize logic
+│   ├── activity_bar.rs         — ActivityBar widget, ActivityItem, drag-to-add
+│   ├── side_bar.rs             — secondary SideBar host + resize logic
+│   ├── side_panel_stack.rs     — primary side bar: accordion of collapsible sections
 │   ├── editor_area.rs          — EditorArea: editor groups, tab strip
 │   ├── panel_area.rs           — PanelArea: bottom panel host
 │   ├── status_bar.rs           — StatusBar widget

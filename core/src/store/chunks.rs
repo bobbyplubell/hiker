@@ -13,9 +13,19 @@ impl Store {
     ///
     /// status: cmd-chunks-for-path
     pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, Error> {
-        let id = match self.id_for_path(rel_path)? {
-            Some(id) => id,
-            None => return Ok(Vec::new()),
+        // Under `store-id-from-oplog`, `notes.id` is the op-log doc_id and
+        // also keyed by `notes.path UNIQUE`, so a path lookup goes directly
+        // through the `notes` table.
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM notes WHERE path = ?1",
+                params![rel_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(
             "SELECT chunk_index, byte_start, byte_end, heading_path
@@ -74,9 +84,17 @@ impl Store {
         &mut self,
         rel_path: &str,
     ) -> Result<Option<Vec<f32>>, Error> {
-        let note_id = match self.id_for_path(rel_path)? {
-            Some(id) => id,
-            None => return Ok(None),
+        // status: store-id-from-oplog
+        let note_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM notes WHERE path = ?1",
+                params![rel_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(note_id) = note_id else {
+            return Ok(None);
         };
         let weighted = self.collect_weighted_chunk_embeddings(&note_id)?;
         if weighted.is_empty() {
@@ -207,12 +225,11 @@ impl Store {
             ],
         )?;
 
-        // Path → id mapping (current path).
-        tx.execute(
-            "INSERT INTO path_ids (path, id) VALUES (?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET id = excluded.id",
-            params![upsert.path, upsert.id],
-        )?;
+        // status: store-id-from-oplog
+        // No separate `path_ids` write — `notes.path UNIQUE` keys the row,
+        // and the id supplied here is the op-log's `doc_id` for this path
+        // (read by the indexer via `oplog::doc_id_for_path` before this
+        // call). The on-disk path↔id mapping lives in `doc-index.db`.
 
         // Replace chunks. Drop existing chunks (chunk_vecs cleaned up
         // explicitly — vec0 doesn't honor the FK cascade).

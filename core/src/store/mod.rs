@@ -75,7 +75,14 @@ use vec::read_chunk_vecs_dim;
 /// board-doc's `hiker.columns` frontmatter on ingest (clear-by-board +
 /// re-insert), cleared on board-doc delete. See `docs/kanban.md`
 /// §"Indexer integration" — `board-cards-derived-table`.
-pub const SCHEMA_VERSION: i32 = 9;
+///
+/// v10 dropped the `path_ids` table. Under path-as-identity
+/// (`wikilink-path-form`), the path↔doc_id mapping lives in op-log's
+/// `doc-index.db` (`op-log-document-identity`) — the indexer reads each
+/// note's `doc_id` from there on upsert and uses it as `notes.id`, so the
+/// indexer no longer needs its own parallel mapping. See `docs/index.md`
+/// §"Store: sqlite-vec" — `store-id-from-oplog`.
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Default embedding dimension — matches the v1 default model
 /// (`bge-small-en-v1.5`). Used as the initial `chunk_vecs` column width on
@@ -167,11 +174,15 @@ impl Store {
                 embedding float[{dim}]
             );
 
-            CREATE TABLE IF NOT EXISTS path_ids (
-                path TEXT PRIMARY KEY,
-                id   TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS path_ids_id ON path_ids(id);
+            -- status: store-id-from-oplog
+            -- The legacy `path_ids` table is gone in v10. The authoritative
+            -- path → doc_id mapping lives in op-log's `doc-index.db`; the
+            -- indexer reads it via `oplog::doc_id_for_path` on upsert and
+            -- uses the value as `notes.id`. The `notes.path UNIQUE` index
+            -- already gives us path-keyed lookup; basename queries (for the
+            -- wikilink ambiguity resolver) read `notes.path` directly.
+            CREATE INDEX IF NOT EXISTS notes_path_basename
+              ON notes(path);
 
             -- status: search-fts5-schema
             -- External-content FTS5: tokens + offsets only, no duplicated text;

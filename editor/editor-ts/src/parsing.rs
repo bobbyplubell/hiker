@@ -86,8 +86,9 @@ fn run_highlights(
     let mut out: Vec<(Range<usize>, SmolStr)> = Vec::new();
     let mut cursor = QueryCursor::new();
     let bytes = doc.as_bytes();
-    let matches = cursor.matches(&query, tree.root_node(), bytes);
-    for m in matches {
+    let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+    use streaming_iterator::StreamingIterator;
+    while let Some(m) = matches.next() {
         for cap in m.captures {
             let idx = cap.index as usize;
             let name = names.get(idx).copied().unwrap_or("");

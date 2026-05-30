@@ -2,33 +2,44 @@
 //!
 //! These are the payloads carried over the muxed substreams of one
 //! authenticated connection (`sync-stream-muxing`): a control substream
-//! (hello, manifest, enrollment, handshake) plus one substream per document
-//! (lineage base + update blobs). The transport that frames and ships them is
-//! [`crate::transport`] (Wave 2); the server that store-and-forwards the
-//! encrypted blobs is [`crate::server`] (Wave 3).
+//! (hello, manifest, content-key transfer) plus one substream per document
+//! keyed by **vault path** (lineage base + update blobs). The transport that
+//! frames and ships them is [`crate::transport`]; the server that
+//! store-and-forwards the encrypted blobs is [`crate::server`].
 //!
 //! The session flow these messages drive: `Hello` handshake → exchange
-//! [`Manifest`]s → [`crate::enroll::classify`] each path match → bind /
-//! adopt / block → stream [`Message::LineageBase`] then [`Message::UpdateBlob`].
+//! [`Manifest`]s → [`crate::enroll::classify`] each path → adopt / stream
+//! delta / block. The transport speaks paths end-to-end; each device keeps
+//! its own internal `doc_id` ULID for op-log bookkeeping but never exchanges
+//! it. [sync-path-identity]
+//!
 //! See `docs/sync.md` "Transport".
 
 use serde::{Deserialize, Serialize};
 
-/// One manifest row: a device's view of a single document at first contact.
-/// `path` is the one-time matching key (`sync-path-matching-key`); the hashes
-/// feed [`crate::enroll::classify`]. `logical_id` is set once the document is
-/// already bound on the sending device.
+/// One manifest row: a device's view of a single document at a vault path.
+/// The hashes feed [`crate::enroll::classify`]. The document key is the path
+/// itself — there is no separate logical id. [sync-path-identity]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
-    /// Vault-relative path — the one-time bind matching key.
+    /// Vault-relative path — the cross-device identity of this document.
     pub path: String,
     /// blake3 of `materialize(accepted)` as of now.
     pub current_hash: String,
     /// Recent `content_hash` history from `op_metadata`, for fast-forward
     /// classification.
     pub recent_history_hashes: Vec<String>,
-    /// The shared logical id, if this document is already bound.
-    pub logical_id: Option<String>,
+    /// Vault paths this document has previously occupied on the sender (the
+    /// `from` of every `Rename` op in its accepted history). The receiver uses
+    /// this to follow a rename: if its local replica still lives at one of
+    /// these prior paths, the manifest at the new path identifies the same
+    /// document, so the receiver pulls the delta against the new path against
+    /// its existing doc's state vector and folds in the `Rename` op.
+    /// `#[serde(default)]` keeps the field additive (an older peer that omits
+    /// it still parses, falling back to never-matched). [sync-path-identity,
+    /// sync-rename-blob-rotation]
+    #[serde(default)]
+    pub prior_paths: Vec<String>,
 }
 
 /// A device's full document manifest, exchanged after the hello handshake.
@@ -48,18 +59,32 @@ pub enum Message {
     /// the peer detect whether both devices already share a key (skip transfer)
     /// or differ (the non-canonical side requests the canonical device's key
     /// in-band). [sync-vault-key-inband]
+    ///
+    /// `device_name` is the sender's SELF-set human name (`[sync].device_name`):
+    /// the receiver adopts it into its learned `fingerprint -> name` map so it
+    /// can render "synced from `laptop`" instead of a fingerprint. `Option` and
+    /// `#[serde(default)]` keep it additive — an older peer that omits the field
+    /// still parses. [sync-device-name]
     Hello {
         protocol_version: u32,
         device_fingerprint: String,
         content_key_fp: String,
+        #[serde(default)]
+        device_name: Option<String>,
     },
 
     /// Acknowledge a [`Message::Hello`] (the responder's hello reply on the
     /// request-response control exchange). Carries the responder's content-key
     /// fingerprint so the dialer learns whether their keys match. [sync-vault-key-inband]
+    ///
+    /// Like [`Message::Hello`], carries the responder's self-set `device_name`
+    /// so the dialer learns the responder's name on the same round trip.
+    /// Additive (`Option` + `#[serde(default)]`). [sync-device-name]
     HelloAck {
         device_fingerprint: String,
         content_key_fp: String,
+        #[serde(default)]
+        device_name: Option<String>,
     },
 
     /// Ask an enrolled peer for the vault content key over the
@@ -96,34 +121,23 @@ pub enum Message {
     /// The sender's full document manifest.
     Manifest(Manifest),
 
-    /// Ask the peer for the canonical Yrs base of a logical id (full
-    /// `export_state`), so the requester can [`adopt`][adopt] it as a fresh
-    /// shared lineage. The reply is a [`Message::LineageBase`].
-    ///
-    /// [adopt]: crate::transport::SyncNode
-    StateRequest { logical_id: String },
+    /// Ask the peer for the canonical Yrs base of the document at `path` (full
+    /// `export_state`), so the requester can adopt it as a fresh shared
+    /// lineage. The reply is a [`Message::LineageBase`]. [sync-path-identity]
+    StateRequest { path: String },
 
     /// Ask the peer for the incremental update past a state-vector watermark
-    /// once both sides already share a lineage. `state_vector` is the
-    /// requester's `state_vector_bytes`. The reply is a [`Message::UpdateBlob`]
-    /// (its `ciphertext` is `content_key.encrypt(export_since(...))`).
-    /// [sync-content-encryption-aes256]
-    DeltaRequest {
-        logical_id: String,
-        state_vector: Vec<u8>,
-    },
-
-    /// Request to bind a local path to a shared logical id (the binder
-    /// proposes the id it will use).
-    BindRequest { path: String, logical_id: String },
-
-    /// Acknowledge a bind, confirming the shared logical id.
-    BindAck { logical_id: String },
+    /// for the document at `path` once both sides already share a lineage.
+    /// `state_vector` is the requester's `state_vector_bytes`. The reply is a
+    /// [`Message::UpdateBlob`] (its `ciphertext` is
+    /// `content_key.encrypt(export_since(...))`).
+    /// [sync-content-encryption-aes256, sync-path-identity]
+    DeltaRequest { path: String, state_vector: Vec<u8> },
 
     /// The canonical replica's Yrs base (`encode_state_as_update_v2`) that an
-    /// adopting device takes as the Doc for this logical id. Opaque bytes —
-    /// the Yrs type never crosses the boundary. [sync-lineage-adoption]
-    LineageBase { logical_id: String, state: Vec<u8> },
+    /// adopting device takes as the Doc for `path`. Opaque bytes — the Yrs
+    /// type never crosses the boundary. [sync-lineage-adoption]
+    LineageBase { path: String, state: Vec<u8> },
 
     /// A sequenced, content-encrypted Yrs update blob, keyed by blind id.
     /// `ciphertext` is AES-256-GCM output from [`crate::crypto::ContentKey`].
@@ -153,31 +167,41 @@ pub enum Message {
     PushAck { blind_id: String, latest_seq: u64 },
 
     /// Push OUR canonical Yrs base to an enrolled peer so the peer ADOPTS it —
-    /// the one-click "keep mine" fork-resolution converge. The pusher's version
-    /// wins: the peer replaces its diverged doc with `state` (our full
-    /// `export_state`), establishing a SHARED lineage so subsequent deltas are
-    /// safe. `path` resolves the peer's local doc (it may not yet share a logical
-    /// id with us). `state` is the canonical v2 base; it rides the
-    /// Noise-encrypted channel to a verified-enrolled peer (enrollment is the
-    /// consent), so it is not re-wrapped in the content layer, NEVER logged, and
-    /// NEVER written into the synced vault. The reply is a
+    /// the one-click "keep mine" fork-resolution converge for the document at
+    /// `path`. The pusher's version wins: the peer replaces its diverged doc
+    /// with `state` (our full `export_state`), establishing a SHARED lineage so
+    /// subsequent deltas are safe. `state` is the canonical v2 base; it rides
+    /// the Noise-encrypted channel to a verified-enrolled peer (enrollment is
+    /// the consent), so it is not re-wrapped in the content layer, NEVER
+    /// logged, and NEVER written into the synced vault. The reply is a
     /// [`Message::PushAdoptAck`]. [sync-blocked-state, sync-lineage-adoption]
-    PushAdopt {
-        logical_id: String,
-        path: String,
-        state: Vec<u8>,
-    },
+    PushAdopt { path: String, state: Vec<u8> },
 
-    /// Acknowledge a [`Message::PushAdopt`]: the peer adopted our base, bound the
-    /// logical id, and cleared its own block / pending resolution for it.
+    /// Acknowledge a [`Message::PushAdopt`]: the peer adopted our base at
+    /// `path` and cleared its own block / pending resolution for it.
     /// [sync-blocked-state]
-    PushAdoptAck { logical_id: String },
+    PushAdoptAck { path: String },
 
     /// A responder's error reply to any request it couldn't serve (a handler
     /// error, or a request from a peer it hasn't enrolled). Sent INSTEAD of
     /// dropping the response channel, so the dialer surfaces the real reason
     /// rather than an opaque "connection closed before a response" failure.
     Error { reason: String },
+
+    /// Ask the store-and-forward server to GC the blob stream at `blind_id`:
+    /// drop every stored `(seq, ciphertext)` for that id AND reset all
+    /// per-device cursors against it. Sent by a client whose local replica just
+    /// applied a `Rename` op that rotated the doc's path → its old blind_id is
+    /// now an orphan stream on the hub. Authenticated by the enrollment gate
+    /// like every other request; idempotent on the server (an unknown
+    /// `blind_id` is a successful no-op). The reply is a
+    /// [`Message::DeleteBlobAck`]. [sync-rename-blob-rotation]
+    DeleteBlob { blind_id: String },
+
+    /// Acknowledge a [`Message::DeleteBlob`]: the server dropped the stream
+    /// (or had nothing at that id), echoing the `blind_id` for correlation.
+    /// [sync-rename-blob-rotation]
+    DeleteBlobAck { blind_id: String },
 }
 
 #[cfg(test)]
@@ -191,10 +215,12 @@ mod tests {
                 protocol_version: 1,
                 device_fingerprint: "DEV-ABC".into(),
                 content_key_fp: "ckfp-aaaa".into(),
+                device_name: Some("laptop".into()),
             },
             Message::HelloAck {
                 device_fingerprint: "DEV-XYZ".into(),
                 content_key_fp: "ckfp-bbbb".into(),
+                device_name: None,
             },
             Message::ContentKeyRequest,
             Message::ContentKeyResponse {
@@ -212,25 +238,18 @@ mod tests {
                     path: "notes/a.md".into(),
                     current_hash: "h0".into(),
                     recent_history_hashes: vec!["h-1".into()],
-                    logical_id: None,
+                    prior_paths: vec!["notes/a-old.md".into()],
                 }],
             }),
             Message::StateRequest {
-                logical_id: "G1".into(),
+                path: "notes/a.md".into(),
             },
             Message::DeltaRequest {
-                logical_id: "G1".into(),
+                path: "notes/a.md".into(),
                 state_vector: vec![4, 5, 6],
             },
-            Message::BindRequest {
-                path: "notes/a.md".into(),
-                logical_id: "G1".into(),
-            },
-            Message::BindAck {
-                logical_id: "G1".into(),
-            },
             Message::LineageBase {
-                logical_id: "G1".into(),
+                path: "notes/a.md".into(),
                 state: vec![1, 2, 3],
             },
             Message::UpdateBlob {
@@ -251,17 +270,40 @@ mod tests {
                 latest_seq: 5,
             },
             Message::PushAdopt {
-                logical_id: "G1".into(),
                 path: "notes/a.md".into(),
                 state: vec![1, 2, 3],
             },
             Message::PushAdoptAck {
-                logical_id: "G1".into(),
+                path: "notes/a.md".into(),
+            },
+            Message::DeleteBlob {
+                blind_id: "bf00".into(),
+            },
+            Message::DeleteBlobAck {
+                blind_id: "bf00".into(),
             },
         ];
         for m in msgs {
             let json = serde_json::to_string(&m).unwrap();
             assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), m);
         }
+    }
+
+    /// A `Hello` from an older peer that predates `device_name` (the field is
+    /// absent on the wire) still parses, with `device_name == None`. This is the
+    /// additive backward-compat guarantee. [sync-device-name]
+    #[test]
+    fn hello_without_device_name_field_parses() {
+        let legacy = r#"{"type":"hello","protocol_version":1,"device_fingerprint":"DEV-OLD","content_key_fp":"ckfp"}"#;
+        let parsed: Message = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            Message::Hello {
+                protocol_version: 1,
+                device_fingerprint: "DEV-OLD".into(),
+                content_key_fp: "ckfp".into(),
+                device_name: None,
+            }
+        );
     }
 }

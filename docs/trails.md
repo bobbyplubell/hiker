@@ -1,14 +1,14 @@
 # Trails
 
-Curated walks through a vault — a memex-style first-class concept where each waypoint is its own note carrying the user's annotation and a double-link back to the source the waypoint is about. Trails ride the existing markdown / indexer / watcher / changes / trash machinery so they're searchable, editable, syncable, and backup-able like any other note.
+Curated walks through a vault — a memex-style first-class concept where each waypoint is its own note carrying the user's annotation and a path-based link back to the source the waypoint is about. Trails ride the existing markdown / indexer / watcher / changes / trash machinery so they're searchable, editable, syncable, and backup-able like any other note.
 
 The headline decisions:
 
-- **A trail-doc is a regular markdown note in the vault.** Frontmatter holds the trail's metadata (id, activation timestamp, waypoint tree); body is freeform README-shape prose the user authors. The body is *not* auto-generated from waypoints — the sidebar renders the walk; the body is for the trail's framing. [trail-doc-shape]
-- **Each waypoint is its own markdown note** at `<vault>/.hiker/trails/<trail-id>/waypoints/<source-basename>--<short-id>.md`. Body is empty by design — a clean canvas the user fills with their commentary about the source. Frontmatter double-links to the source note and the trail. Order and tree position live in the trail-doc's frontmatter, not in filenames. [waypoint-note-shape, trail-storage-layout, trail-empty-waypoint-body]
-- **Every reference is a double-link** `{ id: <ulid>, path: <rel-path> }`. ULID is the canonical pointer that survives renames; rel-path is the externally-interoperable half so a trail-doc opened in any other markdown editor stays legible. [trail-double-link-references]
+- **A trail-doc is a regular markdown note in the vault.** Frontmatter holds the trail's metadata (activation timestamp, waypoint tree); body is freeform README-shape prose the user authors. The body is *not* auto-generated from waypoints — the sidebar renders the walk; the body is for the trail's framing. The trail's internal identifier is its op-log `doc_id` (per `op-log-document-identity`); it is not written into frontmatter. [trail-doc-shape]
+- **Each waypoint is its own markdown note** at `<vault>/.hiker/trails/<trail-id>/waypoints/<source-basename>--<rand6>.md`. Body is empty by design — a clean canvas the user fills with their commentary about the source. Frontmatter holds the source-note path and the trail-doc path. Order and tree position live in the trail-doc's frontmatter, not in filenames. The `<rand6>` is a 6-char random alphanumeric disambiguator so two waypoints in the same trail can point at the same source. [waypoint-note-shape, trail-storage-layout, trail-empty-waypoint-body]
+- **References are vault-relative paths.** The trail-doc lists each waypoint by its vault path; each waypoint-note lists its source and its trail by vault path. Renames rewrite paths through the shared rename-rewrite pass (`wikilink-rename-rewrite`). [trail-path-references]
 - **Trails branch.** A waypoint can have child waypoints forming a side trail; the trail-doc's waypoint list is a tree, not a flat list. Side trails render nested under their parent in the sidebar. The reader walks the main line, drops down a side trail to follow a digression, and walks back up — the Bush memex shape. [trail-side-trail-shape, trails-mode-side-trail-render]
-- **Trails are user-curated, not strictly user-authored.** The user owns every accepted trail. The clustering pipeline and MCP agents may *propose* draft trails which land in a review queue; the user accepts (with optional edits) or discards. Accepted drafts become normal trails. The proposal mechanic mirrors the shape `suggestions.md` uses for reorganization proposals, scoped to trails. [trail-draft-review-surface, trail-draft-from-agent, trail-draft-from-clustering]
+- **Trails are user-curated, not strictly user-authored.** The user owns every accepted trail. The clustering pipeline and MCP agents may *propose* draft trails which land in a review queue; the user accepts (with optional edits) or discards. Accepted drafts become normal trails. The proposal mechanic is the same propose-into-a-review-queue shape used for automation-authored changes elsewhere, scoped to trails. [trail-draft-review-surface, trail-draft-from-agent, trail-draft-from-clustering]
 - **Build-as-you-read verbs.** Two surfaces append the current note as a waypoint on the active trail without going through capture: a tree right-click "Add to active trail" verb on note rows, and an editor-pane affordance when a regular note is open and a trail is active. The reading-loop gesture has a native handle, not just the external-source ingest path. [trail-add-to-active-from-tree-verb, trail-add-to-active-from-editor-verb]
 - **MCP exposes trails for read and write.** Agents read trails to consume curated context and write trails to transcribe their own investigations as draft trails (gated by the standard `agent-write-review-mode` setting). [mcp-tool-trails-list, mcp-tool-trail-create, mcp-tool-trail-append-waypoint]
 - **The Trails sidebar mode shows the active trail vertically, top-to-bottom, read-only.** The dropdown at the top selects which trail is active; the trail-head icon next to it jumps to the trail-doc. The editor stays untouched — clicking a waypoint opens the source note in the editor pane on the right. [trails-mode-body, trails-mode-active-trail-dropdown]
@@ -39,7 +39,7 @@ A trail is a *trail-doc* plus a hidden subsystem dir of *waypoint-notes*:
                 └── scratchpad--9X4N6C.md
 ```
 
-The trail-doc lives at a user-chosen vault location (default `trails/`, configurable). Its hidden waypoint directory lives under `.hiker/trails/<trail-id>/waypoints/` and follows the same carve-out shape `chat-session-markdown-store` already uses for `.hiker/sessions/`. The waypoint-note basename is `<source-basename>--<short-id>.md` where `short-id` is a 6-char suffix of the waypoint's ULID; collisions across trails are impossible since each trail gets its own dir, and the short-id disambiguates two waypoints that point at the same source within one trail. [trail-storage-layout]
+The trail-doc lives at a user-chosen vault location (default `trails/`, configurable). The trail's *storage key* (the `<trail-id>` in the waypoint directory path) is **the trail-doc's `doc_id`** — the same unified ULID op-log mints for every document (per `op-log-document-identity`). It is read from `doc-index.db`, not stamped into frontmatter — no `hiker.id` field on the trail-doc. The storage key is stable across trail-doc renames so the waypoint folder doesn't have to move every time the user renames the trail. The hidden waypoint directory lives under `.hiker/trails/<trail-id>/waypoints/` and follows the same carve-out shape `chat-session-markdown-store` already uses for `.hiker/sessions/`. The waypoint-note basename is `<source-basename>--<rand6>.md` where `<rand6>` is a 6-char random alphanumeric disambiguator; collisions across trails are impossible since each trail gets its own dir. [trail-storage-layout]
 
 The waypoint dir is **flat regardless of tree depth** — side trails don't get nested directories. The trail-doc's `hiker.waypoints` frontmatter is the only source of truth for both *order* and *tree shape*. Filenames are stable identifiers, not position encoders: reordering, re-parenting, or moving waypoints between depths never renames a file. The tradeoff is that `ls`-ing the dir gives you no reading order — the sidebar (and the trail-doc itself) is the right surface for that.
 
@@ -52,20 +52,18 @@ Frontmatter:
 ---
 hiker:
   kind: trail
-  id: <ulid>
   last_activated_at: <iso8601>          # drives Trails-mode dropdown ordering
-  waypoints:                            # ordered tree of double-links
-    - id: <waypoint-note ulid>
-      path: ".hiker/trails/<trail-id>/waypoints/raptor-paper--7K2A9F.md"
+  waypoints:                            # ordered tree of waypoint-note paths
+    - path: ".hiker/trails/<trail-id>/waypoints/raptor-paper--7K2A9F.md"
       waypoints:                        # optional — children form a side trail
-        - id: <waypoint-note ulid>
-          path: ".hiker/trails/<trail-id>/waypoints/inline-citation--5R7Z2D.md"
-    - id: <waypoint-note ulid>
-      path: ".hiker/trails/<trail-id>/waypoints/embedding-survey--3Q8M1B.md"
+        - path: ".hiker/trails/<trail-id>/waypoints/inline-citation--5R7Z2D.md"
+    - path: ".hiker/trails/<trail-id>/waypoints/embedding-survey--3Q8M1B.md"
 ---
 ```
 
-`hiker.waypoints` is a tree: each entry is a double-link to a waypoint-note and may carry its own `waypoints:` array of child entries forming a side trail. Children are themselves trees — side trails nest arbitrarily deep. A waypoint with no `waypoints:` key (or an empty array) is a leaf; the common case for v1 is a flat tree where most or all waypoints sit at the root and side trails appear only where the user has explicitly digressed. [trail-side-trail-shape]
+(The trail's storage key — `<trail-id>` in the waypoint directory path — is the trail-doc's `doc_id`, read from `doc-index.db`. Not stamped into frontmatter.)
+
+`hiker.waypoints` is a tree: each entry is a vault-relative path to a waypoint-note and may carry its own `waypoints:` array of child entries forming a side trail. Children are themselves trees — side trails nest arbitrarily deep. A waypoint with no `waypoints:` key (or an empty array) is a leaf; the common case for v1 is a flat tree where most or all waypoints sit at the root and side trails appear only where the user has explicitly digressed. [trail-side-trail-shape]
 
 Body is freeform markdown — a hand-authored README for the trail. The user writes whatever framing they want here: why the trail exists, what it covers, where it ends, who they're sharing it with. The body is *not* auto-generated and never overwritten by hiker; the sidebar already renders the waypoint walk, the body is for the trail's prose framing, separate from the per-waypoint annotations (which live in each waypoint-note's body). [trail-doc-shape]
 
@@ -80,12 +78,9 @@ Frontmatter:
 ---
 hiker:
   kind: waypoint
-  id: <ulid>                            # waypoint-note's own stable id
-  references:                           # double-link to the source note
-    id: <source-note ulid>
+  references:                           # vault path to the source note
     path: "research/raptor-paper.md"
-  in_trail:                             # double-link to the trail-doc
-    id: <trail-doc ulid>
+  in_trail:                             # vault path to the trail-doc
     path: "trails/my-trail.md"
 ---
 ```
@@ -97,36 +92,20 @@ The two-hop structure (trail-doc → waypoint-note → source-note) means each w
 
 ## Reference shape
 
-Every reference from a trail-doc to a waypoint-note (and from a waypoint-note to its source note) is a **double-link**: both the **ULID** and the **rel-path** of the target. [trail-double-link-references]
+Every reference from a trail-doc to a waypoint-note (and from a waypoint-note to its source note or its trail-doc) is a **vault-relative path**. The path is the identity — there is no separate ID half. [trail-path-references]
 
 ```yaml
-{ id: "01HRX...", path: "research/raptor-paper.md" }
+path: "research/raptor-paper.md"
 ```
 
-ULID is the canonical pointer. The indexer's `path-ids` lookup (per `index.md`) guarantees stability across renames. Rel-path is the externally-interoperable half — when a user opens the trail-doc in any other markdown editor (Obsidian, vscode, plain `cat`), the path lets them navigate without consulting hiker's sqlite db. Locking trails to ULIDs alone would tie them to hiker; the rel-path keeps trails legible everywhere.
+**Resolution** when hiker reads a reference:
 
-**Resolution rule** when hiker reads a reference:
-
-- Both match → resolved.
-- ULID resolves but rel-path differs → ULID wins; trail-doc's path field is rewritten to the current path (self-healing). One `core::changes` row appended for the rewrite, `author='user'` since the move that caused the drift was user-initiated.
-- Rel-path matches an indexed note but the ULID matches a *different* note (rare — happens when a note was deleted and recreated, or a copy landed at a prior path) → **confirm modal** surfaces: "This reference's recorded note has changed identity at `<path>`. Keep the old reference (orphan) / Repoint to the current note at this path / Break the reference (delete the waypoint)?" The modal pauses resolution until the user decides. Logged either way for audit. [trail-path-conflict-modal]
-- Neither matches → orphaned. Surfaced visually in the sidebar (greyed card with "broken reference" pill); waypoint stays in the trail so the user decides whether to delete or fix. [trails-mode-orphan-card]
+- Path resolves to an indexed note → resolved.
+- Path doesn't resolve (file missing, name typo, target deleted) → orphaned. Surfaced visually in the sidebar (greyed card with "broken reference" pill); waypoint stays in the trail so the user decides whether to delete or fix. [trails-mode-orphan-card]
 
 [trail-reference-resolution]
 
-**Auto-update on note move.** When a note moves via `move-note-core-cmd` or `drag-and-drop-move`, trails referencing that note get their stored rel-path rewritten to match. The ULID is unchanged — the move is path-only. Mechanics: `core::ops::move_note` (and `move_folder`) call into a new `core::trails::on_note_moved(old_rel, new_rel)` helper that queries the derived `trail_waypoints` table for affected trail-docs and a parallel `waypoint_outgoing_refs` table for waypoint-notes, rewriting each match's `path` field via `vault.write_file_checked`. One `core::changes` row per touched file. Watcher-driven external moves (the `From`+`To` paired-rename branch in `watcher.md`) trigger the same path; unpaired Created+Deleted pairs are too speculative to act on. [trail-auto-update-on-note-move]
-
-
-## Note ID stamping policy
-
-Currently ULIDs live only in the indexer's `path_ids` table — they're not stamped onto md files. Trails (and any future cross-reference feature: wikilinks, MCP stable refs, source-derived dedup) need ULIDs to survive an indexer rebuild and to be readable in external tools. Two modes, vault-scope-configurable; the user picks one:
-
-- **`all`** — indexer writes `hiker.id: <ulid>` to every note's frontmatter on first ingest (lazy backfill via the standard reindex path for pre-existing notes). Notes without frontmatter get a freshly-minted block. Pros: durable across indexer wipes for the entire vault; external tools see a stable identity for every note. Cons: hiker mutates every user file at least once (one-time cost, but visible).
-- **`lazy`** (default) — indexer stamps `hiker.id: <ulid>` only when a note becomes the *target* of a reference (waypoint of a trail, or future wikilink target, or any other cross-reference feature). Notes that nothing references stay untouched. Once stamped, the stamp stays even if all references are later removed (cheap to keep; not worth a "stamp GC" pass). Pros: matches "filesystem is truth" — hiker only writes when the user has voluntarily made the note a referent.
-
-Both modes share the invariant that **any note referenced by a trail (or future wikilink) has its ULID stamped to frontmatter**; the choice is just *when other notes also get stamped*. Config key `[indexing] id_stamping = "all" | "lazy"`, vault-scope eligible per `settings-write-back`. Default `lazy`. [note-id-stamping]
-
-This decision is vault-wide — it shapes the future wikilink feature, MCP stable-ref behavior, and source-derived note dedup as much as it shapes trails. Trails just happens to be the first feature that earns its keep.
+**Auto-update on note move.** Path rewriting rides the shared `wikilink-rename-rewrite` pass: when a source note moves (via `move-note-core-cmd`, `drag-and-drop-move`, or a watcher-detected external rename), the indexer's referrer-rewrite pass updates every affected `hiker.references.path` in waypoint-notes and every affected `hiker.waypoints[].path` in trail-docs in the same transaction as the move itself. Wikilink bodies, kanban card paths, and trail/waypoint paths all flow through one rewrite path. [trail-auto-update-on-note-move]
 
 
 ## Active trail
@@ -178,7 +157,7 @@ A parent waypoint with children gets a second chevron (separate from the body-ex
 - Trails mode active, no active trail set: dropdown shows "None"; body shows a hint pointing at the dropdown ("Pick a trail to walk, or `+` to start a new one").
 - Trails mode active, no trails in the vault at all: dropdown empty; body shows a "Create a trail" affordance that calls the same path the `+` button does.
 - Active trail set with zero waypoints: body shows "Empty trail — capture into it or use `+` to add the first waypoint."
-- Active trail with one or more orphaned references (broken double-links, neither half resolves): orphan cards rendered greyed with a "broken reference" pill, sorted in their original positions; the rest of the trail renders normally.
+- Active trail with one or more orphaned references (paths that don't resolve): orphan cards rendered greyed with a "broken reference" pill, sorted in their original positions; the rest of the trail renders normally.
 
 ### Sidebar invariants
 
@@ -287,16 +266,14 @@ The earlier deferred design (`"Branch from this waypoint" sidebar verb`) require
 
 ## Indexer integration
 
-A derived `trail_waypoints` table inside `index.db` supports fast lookups: which trails contain a given note, which waypoint-notes belong to a given trail, what's the waypoint-note's `(trail_id, source_path)` pair, and where each waypoint sits in the trail's tree. Schema:
+A derived `trail_waypoints` table inside `index.db` supports fast lookups: which trails contain a given note, which waypoint-notes belong to a given trail, and where each waypoint sits in the trail's tree. Schema:
 
-- `trail_waypoints (waypoint_path TEXT PRIMARY KEY, waypoint_id TEXT, trail_id TEXT, source_id TEXT, source_path TEXT, parent_waypoint_id TEXT NULL, tree_path TEXT)`
-- `parent_waypoint_id` is `NULL` for root-level waypoints; otherwise the ULID of the parent waypoint.
+- `trail_waypoints (waypoint_path TEXT PRIMARY KEY, trail_doc_path TEXT, source_path TEXT, parent_waypoint_path TEXT NULL, tree_path TEXT)`
+- `parent_waypoint_path` is `NULL` for root-level waypoints; otherwise the vault path of the parent waypoint.
 - `tree_path` is a materialized path encoding depth-first position — `"1"`, `"1.2"`, `"1.2.1"`, etc. — so lexical ordering on `tree_path` gives reading order without a recursive query. Re-derived from the trail-doc's `hiker.waypoints` tree on every upsert; not load-bearing for correctness (the frontmatter is truth) but cheap for sidebar paint.
-- Indexes on `trail_id`, `source_id`, `source_path`, `parent_waypoint_id`.
+- Indexes on `trail_doc_path`, `source_path`, `parent_waypoint_path`.
 
-Built and maintained by `core::indexer` like every other derived index — re-derived on schema bump, fail-loud per `store-version-fail-loud`. Schema version increments to match. [trail-waypoints-derived-table]
-
-A parallel structure (column or sibling table) tracks trail-doc frontmatter waypoint refs for the auto-update-on-move path so a single query gives all the affected trail-docs without parsing every trail-doc on disk. The exact split (one table or two) is an implementation detail; the index just has to make `trails_containing(note_id)` and `waypoints_of(trail_id)` cheap.
+Built and maintained by `core::indexer` like every other derived index — re-derived on schema bump, fail-loud per `store-version-fail-loud`. Schema version increments to match. The same index feeds the shared rename-rewriter (`wikilink-rename-rewrite`) for the trail/waypoint side. [trail-waypoints-derived-table]
 
 
 ## Watcher integration
@@ -326,7 +303,7 @@ Trails are a first-class MCP surface — both read and write — so attached age
 
 ### Read tools
 
-- **`trails_list(filters?)`** — enumerate trails with optional filters (containing-note, recently-activated, name-substring). Returns trail-doc id + title + waypoint count + activation timestamp + `path`. [mcp-tool-trails-list]
+- **`trails_list(filters?)`** — enumerate trails with optional filters (containing-note, recently-activated, name-substring). Returns trail-doc path + title + waypoint count + activation timestamp. [mcp-tool-trails-list]
 - **`trail_get(id)`** — fetch a trail's full body + ordered waypoint list (each waypoint's source-note ref + annotation body). Detail levels (`digest` | `full`) mirror `mcp-tool-get-note`'s shape. [mcp-tool-trail-get]
 - **`trails_containing_note(rel_path)`** — reverse lookup; returns trails that include a given note as a waypoint. Useful for "what trails reference the note I'm reading?" [mcp-tool-trails-containing-note]
 
@@ -345,13 +322,13 @@ The clustering pipeline and MCP agents may *propose* trails the user hasn't auth
 
 ### Draft sources
 
-- **MCP agents** — any agent calling `trail_create(draft=true)` or appending waypoints to a draft trail produces a draft. The default for agent-initiated trail creation depends on the `agent-write-review-mode` flag: when review mode is on, `draft=true` is the implicit default (matching the existing staging-as-default-for-agent-writes shape); when review mode is off, agents can still opt into drafts explicitly. [trail-draft-from-agent]
-- **Clustering pipeline** — when `core::cluster` produces a tree containing a notable thread (e.g., a chain of related notes that look like an implicit reading order), it can emit a draft trail proposal alongside the existing reorganization proposal. The shape rides the same `vault/.hiker/proposals/<timestamp>.md` machinery `suggestions.md` already uses; trails-flavored proposals point at a draft trail-doc instead of a folder-move list. Off by default — opt-in via `[clustering] propose_trails = false`. [trail-draft-from-clustering]
+- **MCP agents** — any agent calling `trail_create(draft=true)` or appending waypoints to a draft trail produces a draft. The default for agent-initiated trail creation depends on the `agent-write-review-mode` flag: when review mode is on, `draft=true` is the implicit default (matching the existing staging-as-default-for-agent-writes shape); when review mode is off, agents can still opt into drafts explicitly. The MCP `trail_create` wrapper resolves the effective draft flag as `explicit_arg.unwrap_or(default_draft_for_review_mode(review_mode_on))` (the helper lives in `core::trails::ops`), so an explicit `draft=false` always overrides the review-mode default. [trail-draft-from-agent]
+- **Clustering pipeline** — when `core::cluster` produces a tree containing a notable thread (a chain of related notes that look like an implicit reading order), it can emit a draft trail proposal alongside the existing reorganization output. Off by default — opt-in via `[clustering] propose_trails = false`. The chain test is `core::cluster::detect_reading_order_chain`: a pure, conservative gate over each cluster member's `(note_id, order_key)` (the producer resolves `order_key` from ctime / a frontmatter sequence / a `part-N` naming pattern). It fires only when the cluster has 3..25 members with *distinct* ordering keys (a duplicate key = ambiguous ordering, so it declines rather than guess) and returns the members in reading order; the producer then runs `create_trail(draft=true)` + ordered `append_waypoint`s. Conservative-by-design: a missed chain costs the user a manual trail, a false chain costs review-queue noise. [trail-draft-from-clustering]
 - **Auto-generated from LLM tool-use trace** — folds into this same draft pipeline. When an agent answers a query, the set of `get_note` / `read_note` / search tool calls during that turn becomes a candidate draft trail. Specced under `trail-auto-from-llm-trace`; the draft-review surface here is its consumer.
 
 ### Storage
 
-Draft trail-docs live at `<vault>/.hiker/trails/drafts/<trail-id>.md` (parallel to the active-trail path under `.hiker/trails/<trail-id>/`). Their waypoint-notes live at `.hiker/trails/<trail-id>/waypoints/` exactly like a normal trail's — drafts and accepted trails are storage-shape-identical except for the trail-doc location and the `hiker.draft: true` flag. Drafts are excluded from the Trails sidebar dropdown, the filetree's trail rows, and `trails_list` MCP results unless the caller passes `include_drafts=true`. [trail-draft-review-surface]
+Draft trail-docs live at `<vault>/.hiker/trails/drafts/<trail-id>.md` (parallel to the active-trail path under `.hiker/trails/<trail-id>/`); the basename is the trail-doc's `doc_id` (the same storage key the waypoint folder uses), not a user-facing name, so drafts never collide and never need the `-N` suffix loop accepted trails use. Their waypoint-notes live at `.hiker/trails/<trail-id>/waypoints/` exactly like a normal trail's — drafts and accepted trails are storage-shape-identical except for the trail-doc location and the `hiker.draft: true` flag. The flag is a plain `hiker.draft` boolean that parses/writes through the same frontmatter round-trip as every other `hiker.*` field; absent or `false` both read as not-a-draft, and accepting strips the key entirely (no stale `draft: false`). Drafts are excluded from the Trails sidebar dropdown, the filetree's trail rows, and `trails_list` MCP results unless the caller passes `include_drafts=true` — implemented as the `include_drafts` parameter on `core::trails::list`, which surfaces each row's `draft` flag when drafts are included. [trail-draft-review-surface]
 
 ### Review surface
 
@@ -376,9 +353,9 @@ Each row is the source basename plus two muted action links. No full waypoint ca
 
 **Activity detail page.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill that lists all pending proposals, including draft trails and waypoint additions. Each row carries [Accept] [Reject]; [Accept all (N)] batch-approves.
 
-**Accept** — strips `hiker.draft: true`, moves the trail-doc from `.hiker/trails/drafts/` to the configured `[trails] new_trail_dir` (default `trails/`), keeps the waypoints in place, appends a `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "trail-draft"`. The trail joins the dropdown as a normal trail.
+**Accept** (`core::trails::ops::accept_draft`) — strips `hiker.draft: true`, then moves the trail-doc from `.hiker/trails/drafts/` to the configured `[trails] new_trail_dir` (default `trails/`) via `core::ops::file::move_note` so the trail's `doc_id` (storage key for the waypoint folder) is unchanged and the derived `trail_waypoints` rows re-derive against the new trail-doc path. Waypoints stay in place. The trail joins the dropdown as a normal trail. Refuses to act on a non-draft trail-doc (so a double-accept can't relocate a real trail). The `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "trail-draft"` is deferred until the in-app review surface lands.
 
-**Reject** — deletes the trail-doc and the entire `.hiker/trails/<trail-id>/` directory (waypoint-notes included). No trash, no `core::changes` row — drafts are pre-acceptance, so rejection is hard-delete.
+**Reject** (`core::trails::ops::reject_draft`) — hard-deletes the trail-doc and the entire `.hiker/trails/<trail-id>/` directory (waypoint-notes included), enqueueing index `Delete`s so the derived rows clear. No trash, no `core::changes` row — drafts are pre-acceptance, so rejection is hard-delete. Refuses to act on a non-draft trail-doc.
 
 Drafts also appear in the Trails sidebar dropdown when the user explicitly toggles "Show drafts" — useful for working on a draft over multiple sessions before deciding to accept. Toggle state is per-vault, off by default.
 
@@ -392,7 +369,7 @@ Drafts also appear in the Trails sidebar dropdown when the user explicitly toggl
 - **Stepper-only mode** (`← prev | trail name | next →` row above the editor).
 - **Trail-as-document live-preview that renders waypoint refs inline as mini-cards** in the trail-doc body. The body and the waypoint list are intentionally independent in v1.
 - **"On trails: …" row in the discovery panel** showing trails that include the active note. Useful future affordance; not v1.
-- **Cross-vault trail interop.** Trails are vault-scoped; ULIDs aren't unique across vaults and rel-paths aren't either. Bush's "reproduce a trail and hand to a friend" is a future concern once cross-vault identity is solved (or punted via export-as-bundle).
+- **Cross-vault trail interop.** Trails are vault-scoped; paths aren't unique across vaults. Bush's "reproduce a trail and hand to a friend" is a future concern once cross-vault identity is solved (or punted via export-as-bundle).
 
 
 ## Deferred

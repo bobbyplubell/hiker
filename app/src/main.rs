@@ -7,23 +7,29 @@ mod actions;
 mod buffer;
 mod bootstrap;
 mod chat;
+mod clusters;
+mod command_center;
 mod completion_sources;
 mod editor_pane;
+mod feature;
 mod icons;
 mod keybinds;
-mod layout;
-mod palette;
+// Old `palette.rs` was replaced by `panels::command_palette` per the
+// `command-palette` spec; the new module re-exports `command_palette`
+// on `AppState`, so the call site in `update()` is unchanged.
 mod panels;
 mod panels_registry;
 mod profiling;
+mod side_panel_persist;
 mod sidebar;
 mod state;
 mod sync_service;
 mod tab;
-mod tabs;
 mod theme;
 mod titlebar;
 mod toolbar;
+mod trails;
+mod vault_view;
 mod widgets;
 mod workbench_host;
 
@@ -75,7 +81,7 @@ fn main() -> eframe::Result<()> {
         .config
         .read()
         .map(|c| c.ui.custom_titlebar)
-        .unwrap_or(false)
+        .unwrap_or(true)
         || std::fs::read(state.vault_session.vault_root.join(".hiker/ui.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -110,6 +116,16 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             theme::Theme.install(&cc.egui_ctx);
             state.install_user_fonts(&cc.egui_ctx);
+            // Seed the per-frame `refresh_user_fonts` fingerprint so it
+            // doesn't redundantly re-install on the first paint. Live-flip
+            // detects changes by comparing this against the current config.
+            // status: editor-three-fonts
+            if let Ok(cfg) = state.vault_session.config.read() {
+                state.ui.last_fonts_fp = Some(format!(
+                    "{}\0{}\0{}",
+                    cfg.editor.font_system, cfg.editor.font_editor, cfg.editor.font_code
+                ));
+            }
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(HikerApp {
                 state,
@@ -132,40 +148,61 @@ impl AppState {
     /// Monospace families. Empty paths or unreadable files fall back to
     /// egui's bundled defaults. Best-effort; errors are logged, not
     /// surfaced.
-    fn install_user_fonts(&self, ctx: &egui::Context) {
+    ///
+    /// status: editor-three-fonts
+    pub(crate) fn install_user_fonts(&self, ctx: &egui::Context) {
         let state = self;
-    let cfg = match state.vault_session.config.read() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let e = &cfg.editor;
-    if e.font_system.is_empty() && e.font_editor.is_empty() && e.font_code.is_empty() {
-        return;
+        let cfg = match state.vault_session.config.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let e = &cfg.editor;
+        let mut defs = egui::FontDefinitions::default();
+        let mut load = |label: &str, path: &str, family: egui::FontFamily| {
+            if path.is_empty() {
+                return;
+            }
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let name = format!("user-{label}");
+                    defs.font_data.insert(
+                        name.clone(),
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    );
+                    defs.families.entry(family).or_default().insert(0, name);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, path, "font load failed");
+                }
+            }
+        };
+        // System + editor fonts both feed Proportional; the editor body is
+        // currently monospace-tied (see `format_for` in editor-egui) so the
+        // editor entry effectively shadows the system one when both are set.
+        load("system", &e.font_system, egui::FontFamily::Proportional);
+        load("editor", &e.font_editor, egui::FontFamily::Proportional);
+        load("code", &e.font_code, egui::FontFamily::Monospace);
+        ctx.set_fonts(defs);
     }
-    let mut defs = egui::FontDefinitions::default();
-    let mut load = |label: &str, path: &str, family: egui::FontFamily| {
-        if path.is_empty() {
+
+    /// Re-install user fonts if any of the three slots changed since the
+    /// last install. Called every frame; the common case (no changes)
+    /// costs only a string compare against `ui.last_fonts_fp`.
+    ///
+    /// status: editor-three-fonts
+    pub(crate) fn refresh_user_fonts(&mut self, ctx: &egui::Context) {
+        let fp = match self.vault_session.config.read() {
+            Ok(c) => format!(
+                "{}\0{}\0{}",
+                c.editor.font_system, c.editor.font_editor, c.editor.font_code
+            ),
+            Err(_) => return,
+        };
+        if self.ui.last_fonts_fp.as_deref() == Some(fp.as_str()) {
             return;
         }
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let name = format!("user-{label}");
-                defs.font_data
-                    .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-                defs.families.entry(family).or_default().insert(0, name);
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, path, "font load failed");
-            }
-        }
-    };
-    // System + editor fonts both feed Proportional; the editor body is
-    // currently monospace-tied (see `format_for` in editor-egui) so the
-    // editor entry effectively shadows the system one when both are set.
-    load("system", &e.font_system, egui::FontFamily::Proportional);
-    load("editor", &e.font_editor, egui::FontFamily::Proportional);
-    load("code", &e.font_code, egui::FontFamily::Monospace);
-    ctx.set_fonts(defs);
+        self.install_user_fonts(ctx);
+        self.ui.last_fonts_fp = Some(fp);
     }
 }
 
@@ -191,6 +228,11 @@ impl eframe::App for HikerApp {
         // is in flight (DB opens + initial full scan can be slow) and
         // we never block the UI thread on `open_vault`.
         self.state.progress_vault_switch(&self.runtime, ctx);
+
+        // Live-apply font slot changes from settings. No-op when nothing
+        // changed (the common case) via a cheap fingerprint compare.
+        // status: editor-three-fonts
+        self.state.refresh_user_fonts(ctx);
 
         // Window keybindings (close tab, cycle tabs, jump to tab, nav).
         // Runs before this frame's renderers, so the swipe-nav handler
@@ -219,6 +261,7 @@ impl eframe::App for HikerApp {
             self.state.refresh_pending_proposals();
             self.state.refresh_whole_file_proposals();
             self.state.refresh_skipped_paths();
+            self.state.refresh_ui_context_snapshot();
             self.state.poll_cluster_llm_job();
         }
 
@@ -233,19 +276,76 @@ impl eframe::App for HikerApp {
         // repaint cadence.)
         ctx.request_repaint_after(std::time::Duration::from_millis(750));
 
-        // Custom titlebar (opt-in). Must render before everything else so
-        // it claims the top strip.
+        // Reader / focus view (`editor-reader-view`): the active buffer
+        // wants distraction-free chrome. Hide the top toolbar, the
+        // workbench's side bars + activity bar + status bar, and the
+        // command center. Reader view is a per-buffer flag — switching
+        // tabs picks up the new tab's state on the next frame. Non-buffer
+        // tab kinds report `reader_view = false` here, so they ignore it.
+        let reader_view_active = crate::state::active_buffer_reader_view(&self.state);
+
+        // Frameless mode (default): the merged custom titlebar claims the
+        // top strip and hosts the centered command center; edge/corner
+        // grips provide window resize (no OS border). When off, the
+        // command center is inlined into the top toolbar instead (below).
+        // Suppressed in reader view. [frameless-merged-titlebar]
         if self.state.ui.custom_titlebar {
-            self.state.titlebar(ctx);
+            self.state.titlebar(ctx, !reader_view_active);
+            crate::titlebar::window_resize_handles(ctx);
         }
 
         // Toolbar: kept above the workbench for now. The plan is to
         // migrate its items into `HikerWbBehavior::status_bar_ui` /
         // activity-bar context menus, but that's a per-action port —
         // tracked separately.
-        {
+        if !reader_view_active {
             crate::profile_scope!("toolbar");
-            self.state.render_toolbars(ctx);
+            if self.state.ui.custom_titlebar {
+                // Frameless: the first top toolbar + command center are
+                // folded into the titlebar (rendered above). Only the
+                // secondary (bottom/left/right) toolbars render here.
+                self.state.render_secondary_toolbars(ctx);
+            } else {
+                // Native chrome: inline the command center into the first
+                // top toolbar; fall back to a dedicated bar when there's
+                // no top toolbar to share. [command-center-topbar]
+                let placed = self.state.render_toolbars(ctx, true);
+                if !placed {
+                    self.state.command_center_bar(ctx);
+                }
+            }
+        }
+
+        // Flip workbench chrome visibility for reader view. Only the
+        // per-frame *transition* matters — we drive the hide / show
+        // edges off the previous frame's value so toggling reader view
+        // off restores the chrome without trampling the user's
+        // independent collapse choices on the next frame.
+        if reader_view_active && !self.state.ui.reader_view_chrome_hidden {
+            self.state.ui.reader_view_chrome_hidden = true;
+            self.state.ui.reader_view_prev_primary_visible =
+                self.state.workbench.primary_side_bar.visible;
+            self.state.ui.reader_view_prev_secondary_visible =
+                self.state.workbench.secondary_side_bar.visible;
+            self.state.ui.reader_view_prev_status_visible =
+                self.state.workbench.status_bar.visible;
+            self.state.ui.reader_view_prev_activity_visible =
+                self.state.workbench.activity_bar.is_visible();
+            self.state.workbench.primary_side_bar.visible = false;
+            self.state.workbench.secondary_side_bar.visible = false;
+            self.state.workbench.status_bar.visible = false;
+            self.state.workbench.activity_bar.set_visible(false);
+        } else if !reader_view_active && self.state.ui.reader_view_chrome_hidden {
+            self.state.ui.reader_view_chrome_hidden = false;
+            self.state.workbench.primary_side_bar.visible =
+                self.state.ui.reader_view_prev_primary_visible;
+            self.state.workbench.secondary_side_bar.visible =
+                self.state.ui.reader_view_prev_secondary_visible;
+            self.state.workbench.status_bar.visible =
+                self.state.ui.reader_view_prev_status_visible;
+            self.state.workbench.activity_bar.set_visible(
+                self.state.ui.reader_view_prev_activity_visible,
+            );
         }
 
         // Central layout: egui_workbench owns the activity bar + side
@@ -285,26 +385,12 @@ impl eframe::App for HikerApp {
                 && let Some(handle) = new_active_handle
                 && let Some(tab) = self.state.workbench.editor_area.get(handle)
             {
+                // User clicked a tab in the strip — activate it and record
+                // nav history (shared with the keyboard switch paths). Copy
+                // the id out first so `tab`'s borrow of `self.state` ends
+                // before the `&mut self.state` call.
                 let tab_id = tab.id;
-                let prev_path = self
-                    .state
-                    .session
-                    .active_tab
-                    .and_then(|id| self.state.tab_by_id(id))
-                    .and_then(|t| t.buffer_path())
-                    .map(std::string::ToString::to_string);
-                let next_path = self
-                    .state
-                    .tab_by_id(tab_id)
-                    .and_then(|t| t.buffer_path())
-                    .map(std::string::ToString::to_string);
-                self.state.session.active_tab = Some(tab_id);
-                if !self.state.session.nav.locked
-                    && let Some(p) = next_path.as_deref()
-                    && prev_path.as_deref() != Some(p)
-                {
-                    crate::state::nav_push(&mut self.state, p);
-                }
+                crate::state::activate_tab(&mut self.state, tab_id);
             }
         }
 
@@ -346,11 +432,11 @@ fn help_overlay(&mut self, ctx: &egui::Context) {
                 .num_columns(2)
                 .spacing(egui::vec2(16.0, 4.0))
                 .show(ui, |ui| {
-                    for (chord, desc) in crate::keybinds::Keybinds.known_keybindings() {
+                    for k in crate::keybinds::Keybinds.known_keybindings() {
                         ui.label(
-                            egui::RichText::new(*chord).monospace().small(),
+                            egui::RichText::new(k.chord).monospace().small(),
                         );
-                        ui.label(egui::RichText::new(*desc).small());
+                        ui.label(egui::RichText::new(k.label).small());
                         ui.end_row();
                     }
                 });
@@ -404,7 +490,7 @@ fn drain_fs_events(&mut self) {
                 state.maybe_reload_clean_buffer(to);
             }
             FileEvent::Overflow => {
-                state.session.sidebar.dir_cache.clear();
+                state.session.file_tree.dir_cache.clear();
             }
         }
     }
@@ -412,7 +498,7 @@ fn drain_fs_events(&mut self) {
 
 fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    self.session.sidebar.dir_cache.remove(parent);
+    self.session.file_tree.dir_cache.remove(parent);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`
@@ -461,6 +547,65 @@ fn refresh_whole_file_proposals(&mut self) {
     let log = state.vault_session.services.oplog.clone();
     if let Ok(props) = hiker_core::ops::op_writes::list_whole_file_proposals(log.as_ref()) {
         state.ui_cache.whole_file_proposals = props;
+    }
+}
+
+/// Republish the per-frame snapshot of UI-context state for the MCP read
+/// tools (`get_active_note`, `get_open_notes`, `get_selection`). MCP
+/// handlers read this under a short RwLock instead of reaching into
+/// `Session`. Mirrors the other `refresh_*` snapshot fns above.
+///
+/// status: mcp-tool-get-active-note
+/// status: mcp-tool-get-open-notes
+/// status: mcp-tool-get-selection
+fn refresh_ui_context_snapshot(&mut self) {
+    use crate::tab::TabKind;
+    use hiker_mcp::ui_context::{ActiveBuffer, OpenBufferTab, Snapshot};
+    let state = self;
+    let active_id = state.session.active_tab;
+    let mut snap = Snapshot::default();
+    // Open-tabs list: only Editor tabs whose source has a vault-relative
+    // path (Vault / Snapshot / PendingProposal / Trash all carry a
+    // `path()`). Non-Editor kinds (Home/Settings/Queue/Board/Agent/etc.)
+    // are omitted by the producer — the spec says "non-buffer kinds
+    // omitted." Order follows `session.tabs`, which is the tab-strip's
+    // visible order (see `sync_workbench_tabs`).
+    for tab in &state.session.tabs {
+        if let TabKind::Editor { buffer, .. } = &tab.kind {
+            snap.open_tabs.push(OpenBufferTab {
+                path: buffer.path().to_string(),
+                active: Some(tab.id) == active_id,
+            });
+        }
+    }
+    // Active buffer: only when the focused tab is an Editor tab.
+    if let Some(id) = active_id
+        && let Some(tab) = state.session.tabs.iter().find(|t| t.id == id)
+        && let TabKind::Editor { buffer, .. } = &tab.kind
+    {
+        let path = buffer.path().to_string();
+        let mut ab = ActiveBuffer {
+            path: path.clone(),
+            cursor_byte: 0,
+            selection: None,
+        };
+        // Look up the buffer's editor state. For non-vault sources the
+        // buffer key isn't the bare path; we fall back to `None` for
+        // those — the snapshot reports `cursor_byte: 0`, `selection: None`
+        // rather than blocking the snapshot entirely.
+        if let Some(buf) = state.session.buffers.get(&path) {
+            let main = buf.editor.selection.main();
+            ab.cursor_byte = main.head.offset();
+            if !main.is_empty() {
+                ab.selection = Some((main.start(), main.end()));
+            }
+        }
+        snap.active_buffer = Some(ab);
+    }
+    // Best-effort write — a poisoned RwLock can't sensibly recover here,
+    // and the prior snapshot stays in place.
+    if let Ok(mut guard) = state.vault_session.services.mcp_ui_context.write() {
+        *guard = snap;
     }
 }
 
@@ -843,19 +988,10 @@ fn autosave_tick(&mut self) {
         tracing::debug!(error = %err, "trails persist failed");
     }
 
-    if state.session.dock_dirty {
-        let bundle = layout::DockBundle {
-            tree: state.session.dock.clone(),
-            center_tile: state.session.center_tile,
-            left_tile: state.session.left_tile,
-            right_tile: state.session.right_tile,
-        };
-        if let Err(err) = bundle.save_for_vault(&state.vault_session.vault_root) {
-            tracing::debug!(error = %err, "layout persist failed");
-        } else {
-            state.session.dock_dirty = false;
-        }
-    }
+    // Primary side-panel accordion: writes only when the arrangement
+    // changed since the last tick (no dirty flag — it mutates inside
+    // egui_workbench). [feature-multi-region-sidebar]
+    state.persist_side_panel();
 }
 
 fn persist_tab_state(&self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {

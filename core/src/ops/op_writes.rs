@@ -67,37 +67,87 @@ fn kind_for(rel: &str) -> &'static str {
 ///
 /// status: op-log-doc-id-bootstrap
 pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
-    let paths = vault.walk_indexable_files("")?;
     let mut seeded = 0usize;
-    for rel in paths {
-        if log.doc_id_for_path(&rel).map_err(map_err)?.is_some() {
-            continue;
-        }
-        // Already marked unreadable on a prior run — skip silently so we
-        // don't re-read the file or re-emit the WARN on every bootstrap.
-        if log.is_bootstrap_skipped(&rel).map_err(map_err)? {
-            continue;
-        }
-        // Read the file's current bytes as the seed text. A read failure
-        // (vanished mid-walk, non-UTF-8) skips the note rather than aborting
-        // the whole bootstrap — the watcher / external-edit-sync path can
-        // adopt it later. Persist a skip marker so the next bootstrap run
-        // doesn't re-read the file and re-emit this warning.
-        let text = match vault.read_file(&rel) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(path = %rel, error = %e, "op-log bootstrap: skipping unreadable note");
-                if let Err(mark_err) = log.mark_bootstrap_skipped(&rel, &e.to_string()) {
-                    tracing::debug!(path = %rel, error = %mark_err, "op-log bootstrap: could not persist skip marker");
-                }
-                continue;
-            }
-        };
-        log.create_document(&rel, kind_for(&rel), &text, &Author::User)
-            .map_err(map_err)?;
-        seeded += 1;
+    // Main pass: the user-visible vault. `walk_indexable_files` prunes at
+    // `.hiker/` (the watcher-ignore rule applies in filter_entry), so the
+    // hidden carve-outs are picked up in the second pass below.
+    for rel in vault.walk_indexable_files("")? {
+        seeded += seed_one(vault, log, &rel)? as usize;
     }
+    // Second pass: `.hiker/trails/` carve-out — trail-docs at
+    // `.hiker/trails/drafts/` and waypoint-notes at
+    // `.hiker/trails/<id>/waypoints/`. Pre-existing waypoint files arriving
+    // via sync (or a fresh open against an existing vault) need op-log
+    // `doc_id`s exactly like vault-root notes so trail integrity holds
+    // without waiting for an individual ingest event. status: op-log-doc-id-bootstrap
+    for rel in walk_hidden_md_subtree(vault, ".hiker/trails")? {
+        seeded += seed_one(vault, log, &rel)? as usize;
+    }
+    // TODO: `.hiker/trees/` cluster-tree docs (per `cluster-editor.md` and
+    // `op-log.md`'s sync section) deserve the same second-pass coverage
+    // here. Currently per-tree `.md` files are managed by `core::trees`
+    // and lazily seeded on first save via `op_writes::user_save` →
+    // `doc_id_or_seed`; a vault arriving with pre-existing tree files
+    // (sync, manual import) would not have op-log mappings until something
+    // touches them. Add a `walk_hidden_md_subtree(vault, ".hiker/trees")`
+    // pass once the tree-doc location stabilizes (or a watcher carve-out
+    // is added for `.hiker/trees/` matching the trails carve-out).
     Ok(seeded)
+}
+
+/// Seed one path into the op-log if it isn't already mapped. Returns `true`
+/// when a new doc was created, `false` when the path was skipped (already
+/// mapped, or marked unreadable on a prior run, or unreadable now). Read
+/// failures log and persist a skip marker but never abort the caller —
+/// matching the original bootstrap loop's posture.
+fn seed_one(vault: &Vault, log: &OpLog, rel: &str) -> Result<bool, HikerError> {
+    if log.doc_id_for_path(rel).map_err(map_err)?.is_some() {
+        return Ok(false);
+    }
+    if log.is_bootstrap_skipped(rel).map_err(map_err)? {
+        return Ok(false);
+    }
+    let text = match vault.read_file(rel) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %rel, error = %e, "op-log bootstrap: skipping unreadable note");
+            if let Err(mark_err) = log.mark_bootstrap_skipped(rel, &e.to_string()) {
+                tracing::debug!(path = %rel, error = %mark_err, "op-log bootstrap: could not persist skip marker");
+            }
+            return Ok(false);
+        }
+    };
+    log.create_document(rel, kind_for(rel), &text, &Author::User)
+        .map_err(map_err)?;
+    Ok(true)
+}
+
+/// Walk a hidden vault subtree (e.g. `.hiker/trails`) returning every `.md`
+/// file as a vault-relative path. Used by [`bootstrap`] to reach files the
+/// main [`Vault::walk_indexable_files`] pass prunes at `.hiker/`. Symlinks
+/// are not followed, mirroring the main walker's policy.
+fn walk_hidden_md_subtree(vault: &Vault, rel_subtree: &str) -> Result<Vec<String>, HikerError> {
+    let abs = vault.root().join(rel_subtree);
+    if !abs.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(&abs).follow_links(false) {
+        let entry = entry.map_err(|e| HikerError::Io(e.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel_to_vault) = path.strip_prefix(vault.root()) else {
+            continue;
+        };
+        let rel_str = rel_to_vault.to_string_lossy().replace('\\', "/");
+        if !rel_str.ends_with(".md") {
+            continue;
+        }
+        out.push(rel_str);
+    }
+    Ok(out)
 }
 
 /// Resolve a vault-relative path to its doc_id, seeding a fresh document from
@@ -105,7 +155,7 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
 /// exist on disk) if no mapping exists. Used by the write paths so a note
 /// that was created after the bootstrap walk — or never seen by it — still
 /// gets a doc before its first op is recorded.
-fn doc_id_or_seed(
+pub(crate) fn doc_id_or_seed(
     log: &OpLog,
     vault: &Vault,
     rel: &str,
@@ -117,6 +167,22 @@ fn doc_id_or_seed(
     let seed = vault.read_file(rel).unwrap_or_else(|_| initial_text.to_string());
     log.create_document(rel, kind_for(rel), &seed, &Author::User)
         .map_err(map_err)
+}
+
+/// Ensure an op-log document exists for `rel`, seeding one from the file's
+/// current bytes when none is registered yet — a note created after the
+/// bootstrap walk (the New Note button, the tree's new-file verb, the
+/// wikilink "create missing note" jump). Returns the doc_id. Idempotent: a
+/// no-op returning the existing id when the path already has a document.
+///
+/// Callers seed at *open* time so the live editor binding engages from the
+/// first keystroke (it bails on a doc-less buffer), and so the layered save
+/// (`commit_working`) has a doc to commit onto. Seeding at save time alone is
+/// too late — the user's typing would never have reached the `working` layer.
+///
+/// status: op-log-ops-producer-helpers
+pub fn ensure_doc(log: &OpLog, vault: &Vault, rel: &str) -> Result<String, HikerError> {
+    doc_id_or_seed(log, vault, rel, "")
 }
 
 /// Route a user save through the op log: resolve `rel` to its doc_id (seeding
@@ -609,32 +675,6 @@ pub fn external_edit(log: &OpLog, vault: &Vault, rel: &str) -> Result<bool, Hike
         }
     };
     log.apply_external_edit(&doc_id, &disk_text).map_err(map_err)
-}
-
-/// Tombstone a document on delete: resolve `rel` to its doc_id and record the
-/// logical delete in the op log. The filesystem move-to-trash stays the
-/// caller's concern (the indexer task owns it); this records that the
-/// document was deleted so the activity feed and history surfaces see it.
-/// No-op (returns `Ok`) when the path has no doc — a never-seeded note.
-///
-/// status: op-log-ops-producer-helpers
-pub fn tombstone(log: &OpLog, rel: &str, author: &Author) -> Result<(), HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
-        return Ok(());
-    };
-    log.tombstone_document(&doc_id, author).map_err(map_err)
-}
-
-/// Rename a document: resolve `from` to its doc_id and record the logical
-/// rename (repointing `doc-index.db` and `meta.path`). The filesystem rename
-/// stays the caller's concern. No-op when `from` has no doc.
-///
-/// status: op-log-ops-producer-helpers
-pub fn rename(log: &OpLog, from: &str, to: &str, author: &Author) -> Result<(), HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(from).map_err(map_err)? else {
-        return Ok(());
-    };
-    log.rename_document(&doc_id, to, author).map_err(map_err)
 }
 
 /// Auto-reject any drifted pending ops on the document at `rel` when the

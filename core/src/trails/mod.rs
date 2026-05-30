@@ -23,6 +23,7 @@ use thiserror::Error;
 
 use crate::errors::HikerError;
 use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
+use crate::oplog::OpLog;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -33,27 +34,21 @@ mod tests;
 use ops::{resolve_reference, ResolutionOutcome};
 
 
-/// A double-link reference: ULID is the canonical pointer (survives
-/// renames via `path-ids`); rel-path is the externally-interoperable
-/// half so a trail-doc opened in any other markdown editor stays legible.
-///
-/// status: trail-double-link-references
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DoubleLinkRef {
-    pub id: String,
-    pub path: String,
-}
-
 /// One entry in the trail-doc's recursive `hiker.waypoints` tree. Each
-/// entry is a double-link to a waypoint-note and may carry its own
-/// `waypoints:` array of children forming a side trail. Children nest
-/// arbitrarily deep; an entry with no `waypoints:` key (or an empty
-/// array) is a leaf.
+/// entry is a vault-relative path to a waypoint-note and may carry its
+/// own `waypoints:` array of children forming a side trail. Children
+/// nest arbitrarily deep; an entry with no `waypoints:` key (or an
+/// empty array) is a leaf.
+///
+/// Under path-as-identity (`wikilink-path-form`), references are
+/// path-only — no ULID half. The waypoint's internal storage id is
+/// op-log's `doc_id` for the waypoint-note's path, never written into
+/// frontmatter.
 ///
 /// status: trail-side-trail-shape
+/// status: trail-path-references
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaypointEntry {
-    pub id: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waypoints: Vec<WaypointEntry>,
@@ -65,11 +60,14 @@ pub struct WaypointEntry {
 /// not part of this struct — round-trip is via `parse_trail_doc` /
 /// `write_trail_doc_frontmatter` which preserve unknown siblings.
 ///
+/// The trail's internal identifier is its op-log `doc_id`, read from
+/// `doc-index.db` rather than stamped into frontmatter
+/// (`op-log-document-identity`). No `hiker.id` field here.
+///
 /// status: trail-doc-shape
 /// status: trail-side-trail-shape
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrailDocFrontmatter {
-    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activated_at: Option<String>,
     #[serde(default)]
@@ -80,19 +78,34 @@ pub struct TrailDocFrontmatter {
     /// tail" — the original flat-trail behavior. See
     /// `docs/trails.md` §"Append cursor — branching the trail".
     ///
+    /// The cursor names a waypoint by its vault-relative `path` (the
+    /// waypoint-note's path under `.hiker/trails/<trail-id>/waypoints/`).
+    ///
     /// status: trail-append-cursor
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_under: Option<String>,
+    /// Draft flag (per `docs/trails.md` §"Draft trails"). When `true`,
+    /// the trail-doc is a proposal (agent- or clustering-emitted) the
+    /// user reviews before it becomes a real trail; it lives under
+    /// `.hiker/trails/drafts/` and is excluded from listings unless the
+    /// caller opts in. Absent / `false` in YAML both parse as `false`.
+    ///
+    /// status: trail-draft-review-surface
+    #[serde(default)]
+    pub draft: bool,
 }
 
-/// Parsed `hiker.*` frontmatter for a waypoint-note.
+/// Parsed `hiker.*` frontmatter for a waypoint-note. References are
+/// vault-relative paths — no ULID half — per `trail-path-references`.
 ///
 /// status: waypoint-note-shape
+/// status: trail-path-references
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaypointFrontmatter {
-    pub id: String,
-    pub references: DoubleLinkRef,
-    pub in_trail: DoubleLinkRef,
+    /// Source note this waypoint annotates.
+    pub references: String,
+    /// Trail-doc this waypoint belongs to.
+    pub in_trail: String,
 }
 
 #[derive(Debug, Error)]
@@ -141,12 +154,6 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, Error> {
         });
     }
 
-    let id = hiker_map
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or(Error::MissingField("hiker.id"))?
-        .to_string();
-
     let last_activated_at = hiker_map
         .get("last_activated_at")
         .and_then(|v| v.as_str())
@@ -167,11 +174,19 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, Error> {
         .and_then(|v| v.as_str())
         .map(std::string::ToString::to_string);
 
+    // status: trail-draft-review-surface
+    // Missing key or non-bool both map to false; only an explicit
+    // `draft: true` flags the trail-doc as a draft proposal.
+    let draft = hiker_map
+        .get("draft")
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(false);
+
     Ok(TrailDocFrontmatter {
-        id,
         last_activated_at,
         waypoints,
         append_under,
+        draft,
     })
 }
 
@@ -212,44 +227,40 @@ pub fn parse_waypoint(source: &str) -> Result<WaypointFrontmatter, Error> {
         });
     }
 
-    let id = hiker_map
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or(Error::MissingField("hiker.id"))?
-        .to_string();
-
     let references = hiker_map
         .get("references")
-        .and_then(parse_double_link)
+        .and_then(parse_path_ref)
         .ok_or(Error::MissingField("hiker.references"))?;
     let in_trail = hiker_map
         .get("in_trail")
-        .and_then(parse_double_link)
+        .and_then(parse_path_ref)
         .ok_or(Error::MissingField("hiker.in_trail"))?;
 
     Ok(WaypointFrontmatter {
-        id,
         references,
         in_trail,
     })
 }
 
-fn parse_double_link(v: &YamlValue) -> Option<DoubleLinkRef> {
+/// Pull `path: "<rel>"` from a `references` / `in_trail` YAML mapping.
+/// status: trail-path-references
+fn parse_path_ref(v: &YamlValue) -> Option<String> {
     let YamlValue::Mapping(m) = v else { return None };
-    let id = m.get("id")?.as_str()?.to_string();
     let path = m.get("path")?.as_str()?.to_string();
-    Some(DoubleLinkRef { id, path })
+    Some(path)
 }
 
 /// Recursive YAML-to-`WaypointEntry` parser. Children at any depth are
 /// parsed via the same function. Pre-tree-format YAML (entries with no
 /// `waypoints:` key) parses cleanly with an empty children vec, so old
-/// flat trail-docs round-trip as a tree of all-root entries.
+/// flat trail-docs round-trip as a tree of all-root entries. References
+/// are path-only per `trail-path-references` — any legacy `id:` half is
+/// silently dropped on parse.
 ///
 /// status: trail-side-trail-shape
+/// status: trail-path-references
 fn parse_waypoint_entry(v: &YamlValue) -> Option<WaypointEntry> {
     let YamlValue::Mapping(m) = v else { return None };
-    let id = m.get("id")?.as_str()?.to_string();
     let path = m.get("path")?.as_str()?.to_string();
     let waypoints = match m.get("waypoints") {
         Some(YamlValue::Sequence(seq)) => {
@@ -257,7 +268,7 @@ fn parse_waypoint_entry(v: &YamlValue) -> Option<WaypointEntry> {
         }
         _ => Vec::new(),
     };
-    Some(WaypointEntry { id, path, waypoints })
+    Some(WaypointEntry { path, waypoints })
 }
 
 /// Serialize a trail-doc frontmatter back into the source. Preserves
@@ -280,7 +291,10 @@ pub fn write_trail_doc_frontmatter(
     }
     let mut hiker_patch = serde_json::Map::new();
     hiker_patch.insert("kind".into(), serde_json::Value::String("trail".into()));
-    hiker_patch.insert("id".into(), serde_json::Value::String(fm.id.clone()));
+    // status: trail-doc-shape
+    // No `hiker.id` — the trail's storage key is op-log's `doc_id` for
+    // the trail-doc's path (read via `oplog::doc_id_for_path`), kept in
+    // `doc-index.db` rather than stamped into the file.
     if let Some(ts) = &fm.last_activated_at {
         hiker_patch.insert(
             "last_activated_at".into(),
@@ -295,6 +309,13 @@ pub fn write_trail_doc_frontmatter(
             "append_under".into(),
             serde_json::Value::String(cursor.clone()),
         );
+    }
+    // status: trail-draft-review-surface
+    // Only emit `draft: true` when the trail is a draft. When false the
+    // key is stripped below (mirroring the `append_under` posture) so an
+    // accepted trail-doc carries no stale `draft` marker.
+    if fm.draft {
+        hiker_patch.insert("draft".into(), serde_json::Value::Bool(true));
     }
     hiker_patch.insert(
         "waypoints".into(),
@@ -317,6 +338,10 @@ pub fn write_trail_doc_frontmatter(
         && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
     {
         hiker.remove("waypoints");
+        // status: trail-doc-shape
+        // Strip any legacy `hiker.id` so rewriting an old trail-doc whose
+        // frontmatter stamped a ULID drops the field cleanly.
+        hiker.remove("id");
         // status: trail-append-cursor
         // When fm.append_under is None, strip any pre-existing
         // `append_under` key so the rewritten frontmatter reflects
@@ -325,6 +350,13 @@ pub fn write_trail_doc_frontmatter(
         // anything pre-existing via the deep-merge.
         if fm.append_under.is_none() {
             hiker.remove("append_under");
+        }
+        // status: trail-draft-review-surface
+        // When fm.draft is false, strip any pre-existing `draft` key so an
+        // accept (false-after-true) clears the flag rather than leaving a
+        // stale `draft: false`. When true the patch's key lands via merge.
+        if !fm.draft {
+            hiker.remove("draft");
         }
     }
     merge_json_into_yaml(&mut existing, patch);
@@ -337,11 +369,10 @@ pub fn write_trail_doc_frontmatter(
 /// status: trail-side-trail-shape
 fn waypoint_entry_to_json(e: &WaypointEntry) -> serde_json::Value {
     if e.waypoints.is_empty() {
-        serde_json::json!({ "id": e.id, "path": e.path })
+        serde_json::json!({ "path": e.path })
     } else {
         let children: Vec<_> = e.waypoints.iter().map(waypoint_entry_to_json).collect();
         serde_json::json!({
-            "id": e.id,
             "path": e.path,
             "waypoints": children,
         })
@@ -365,16 +396,27 @@ pub fn write_waypoint_frontmatter(
     }
     let mut hiker_patch = serde_json::Map::new();
     hiker_patch.insert("kind".into(), serde_json::Value::String("waypoint".into()));
-    hiker_patch.insert("id".into(), serde_json::Value::String(fm.id.clone()));
-    hiker_patch.insert("references".into(), double_link_to_json(&fm.references));
-    hiker_patch.insert("in_trail".into(), double_link_to_json(&fm.in_trail));
+    // status: waypoint-note-shape
+    // No `hiker.id` — waypoints are addressed by their vault path.
+    hiker_patch.insert("references".into(), path_ref_to_json(&fm.references));
+    hiker_patch.insert("in_trail".into(), path_ref_to_json(&fm.in_trail));
+    // Strip any pre-existing legacy `id` so a rewrite of an old waypoint
+    // drops the stale field.
+    if let YamlValue::Mapping(top) = &mut existing
+        && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
+    {
+        hiker.remove("id");
+    }
     let patch = serde_json::json!({ "hiker": serde_json::Value::Object(hiker_patch) });
     merge_json_into_yaml(&mut existing, patch);
     Ok(assemble(&existing, split_view.body)?)
 }
 
-fn double_link_to_json(d: &DoubleLinkRef) -> serde_json::Value {
-    serde_json::json!({ "id": d.id, "path": d.path })
+/// Serialize a path reference for waypoint frontmatter. Always emits the
+/// single `{ path: "<rel>" }` shape — no `id:` half, per
+/// `trail-path-references`.
+fn path_ref_to_json(rel: &str) -> serde_json::Value {
+    serde_json::json!({ "path": rel })
 }
 
 /// Vault-relative path of the hidden waypoints dir for `trail_id`.
@@ -388,32 +430,36 @@ pub fn waypoints_dir_for(trail_id: &str) -> String {
 
 /// Filename for a waypoint-note. Per spec
 /// (`docs/trails.md` §"Storage layout"), basename is
-/// `<source-basename>--<short-id>.md` where `short-id` is the
-/// upper-cased last 6 chars of the waypoint's ULID. Filename is a
-/// stable identifier — never renamed on reorder/re-parent — so order +
-/// tree shape live in the trail-doc's frontmatter alone.
+/// `<source-basename>--<rand6>.md` where `<rand6>` is a 6-char random
+/// alphanumeric disambiguator. Filename is a stable identifier — never
+/// renamed on reorder/re-parent — so order + tree shape live in the
+/// trail-doc's frontmatter alone. Under path-as-identity
+/// (`trail-path-references`) the waypoint carries no ULID, so the slot
+/// previously held by the ULID-suffix is filled by a fresh random 6-char
+/// token per call.
 ///
-/// `source_basename` should be the source-note's basename *without*
-/// its `.md` extension; callers that need to embed an arbitrary string
+/// `source_basename` should be the source-note's basename *without* its
+/// `.md` extension; callers that need to embed an arbitrary string
 /// (e.g. for a non-md source-derived note) pass the basename verbatim.
 ///
 /// status: trail-storage-layout
-pub fn waypoint_filename(source_basename: &str, waypoint_id: &str) -> String {
-    let short_id = short_id_of(waypoint_id);
-    format!("{source_basename}--{short_id}.md")
+pub fn waypoint_filename(source_basename: &str) -> String {
+    format!("{source_basename}--{}.md", random_alphanumeric_6())
 }
 
-/// Last 6 chars of a ULID, upper-cased. ULIDs are 26 chars; the last 6
-/// chars are random enough for the disambiguation purpose. Falls back
-/// to the upper-cased full string for ULIDs shorter than 6 chars
-/// (defensive — should never happen in production).
-fn short_id_of(ulid: &str) -> String {
-    let n = ulid.len();
-    if n < 6 {
-        ulid.to_uppercase()
-    } else {
-        ulid[n - 6..].to_uppercase()
-    }
+/// 6-char random alphanumeric token used as the waypoint-filename
+/// disambiguator. Cryptographic randomness isn't required — collision
+/// is the only failure mode and the caller's suffix-loop handles the
+/// vanishingly-rare clash. Derived from the random tail of a fresh ULID
+/// (Crockford base32, so uppercase letters + digits only — already
+/// filesystem-safe alphanumeric across every host fs hiker supports).
+fn random_alphanumeric_6() -> String {
+    let s = ulid::Ulid::new().to_string();
+    // ULIDs are 26 chars; the last 10 are the random component. Take the
+    // tail 6 of those 10 so two ULIDs produced microseconds apart still
+    // disagree at this slot.
+    let n = s.len();
+    s[n - 6..].to_string()
 }
 
 /// Walk the recursive waypoint tree depth-first in reading order.
@@ -421,14 +467,25 @@ fn short_id_of(ulid: &str) -> String {
 /// `parent_id` is `None` for root-level entries; `tree_path` is the
 /// 1-based dotted index path (`"1"`, `"1.2"`, `"1.2.1"`).
 ///
+/// Walk the recursive waypoint tree depth-first. `f` receives
+/// `(parent_path, entry, tree_path)` for every node; `parent_path` is
+/// `None` for root-level entries and the parent's vault-relative
+/// waypoint-note path otherwise; `tree_path` is the 1-based dotted index
+/// path (`"1"`, `"1.2"`, `"1.2.1"`).
+///
+/// Under path-as-identity (`trail-path-references`) the waypoint's
+/// vault path is its identity; the previous `parent_id` ULID parameter
+/// is renamed to `parent_path` accordingly.
+///
 /// status: trail-side-trail-shape
+/// status: trail-path-references
 pub fn walk_waypoints_depth_first<F>(entries: &[WaypointEntry], f: &mut F)
 where
     F: FnMut(Option<&str>, &WaypointEntry, &str),
 {
     fn walk<F: FnMut(Option<&str>, &WaypointEntry, &str)>(
         entries: &[WaypointEntry],
-        parent_id: Option<&str>,
+        parent_path: Option<&str>,
         prefix: &str,
         f: &mut F,
     ) {
@@ -439,31 +496,29 @@ where
             } else {
                 format!("{prefix}.{one_based}")
             };
-            f(parent_id, entry, &tree_path);
+            f(parent_path, entry, &tree_path);
             if !entry.waypoints.is_empty() {
-                walk(&entry.waypoints, Some(&entry.id), &tree_path, f);
+                walk(&entry.waypoints, Some(&entry.path), &tree_path, f);
             }
         }
     }
     walk(entries, None, "", f);
 }
 
-/// Find a waypoint entry by id anywhere in the recursive tree
-/// (mutable). Returns the `&mut` entry the caller can edit (typically
-/// to push a child onto its `waypoints` array).
+/// Find a waypoint entry by its vault path anywhere in the recursive
+/// tree (mutable). Returns the `&mut` entry the caller can edit
+/// (typically to push a child onto its `waypoints` array).
 ///
 /// status: trail-side-trail-shape
 pub fn find_waypoint_mut<'a>(
     entries: &'a mut [WaypointEntry],
-    waypoint_id: &str,
+    waypoint_path: &str,
 ) -> Option<&'a mut WaypointEntry> {
     for entry in entries.iter_mut() {
-        if entry.id == waypoint_id {
-            // Reborrow through the indexed slot; the borrow checker is
-            // happy with this shape.
+        if entry.path == waypoint_path {
             return Some(entry);
         }
-        if let Some(found) = find_waypoint_mut(&mut entry.waypoints, waypoint_id) {
+        if let Some(found) = find_waypoint_mut(&mut entry.waypoints, waypoint_path) {
             return Some(found);
         }
     }
@@ -475,27 +530,27 @@ pub fn find_waypoint_mut<'a>(
 /// status: trail-side-trail-shape
 pub fn find_waypoint<'a>(
     entries: &'a [WaypointEntry],
-    waypoint_id: &str,
+    waypoint_path: &str,
 ) -> Option<&'a WaypointEntry> {
     for entry in entries.iter() {
-        if entry.id == waypoint_id {
+        if entry.path == waypoint_path {
             return Some(entry);
         }
-        if let Some(found) = find_waypoint(&entry.waypoints, waypoint_id) {
+        if let Some(found) = find_waypoint(&entry.waypoints, waypoint_path) {
             return Some(found);
         }
     }
     None
 }
 
-/// Collect every descendant id of `entry` (including `entry`'s own id),
-/// depth-first. Used by `remove_waypoint`'s cascade-delete pass.
+/// Collect every descendant path of `entry` (including `entry`'s own
+/// path), depth-first. Used by `remove_waypoint`'s cascade-delete pass.
 ///
 /// status: trail-side-trail-shape
-pub fn collect_descendant_ids(entry: &WaypointEntry) -> Vec<String> {
+pub fn collect_descendant_paths(entry: &WaypointEntry) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(e: &WaypointEntry, out: &mut Vec<String>) {
-        out.push(e.id.clone());
+        out.push(e.path.clone());
         for child in &e.waypoints {
             walk(child, out);
         }
@@ -504,20 +559,18 @@ pub fn collect_descendant_ids(entry: &WaypointEntry) -> Vec<String> {
     out
 }
 
-/// Remove the entry whose id is `waypoint_id` from the recursive tree
-/// rooted at `entries`. Returns the removed entry on success (the
-/// caller typically already has a clone of its descendants from
-/// `collect_descendant_ids`). Walks every level until the match is
-/// found.
+/// Remove the entry whose path is `waypoint_path` from the recursive
+/// tree rooted at `entries`. Returns the removed entry on success.
+/// Walks every level until the match is found.
 fn remove_waypoint_from_tree(
     entries: &mut Vec<WaypointEntry>,
-    waypoint_id: &str,
+    waypoint_path: &str,
 ) -> Option<WaypointEntry> {
-    if let Some(pos) = entries.iter().position(|e| e.id == waypoint_id) {
+    if let Some(pos) = entries.iter().position(|e| e.path == waypoint_path) {
         return Some(entries.remove(pos));
     }
     for entry in entries.iter_mut() {
-        if let Some(removed) = remove_waypoint_from_tree(&mut entry.waypoints, waypoint_id) {
+        if let Some(removed) = remove_waypoint_from_tree(&mut entry.waypoints, waypoint_path) {
             return Some(removed);
         }
     }
@@ -543,6 +596,13 @@ pub struct TrailListItem {
     pub title: String,
     pub waypoint_count: u32,
     pub last_activated_at: Option<String>,
+    /// True when this trail-doc carries `hiker.draft: true` (an
+    /// unaccepted proposal). Only surfaced when the caller passed
+    /// `include_drafts = true`; the default-filtered listing never
+    /// returns draft rows.
+    ///
+    /// status: trail-draft-review-surface
+    pub draft: bool,
 }
 
 /// One waypoint of `get_trail`, post-resolution. The body is the
@@ -556,10 +616,11 @@ pub struct TrailListItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedWaypoint {
     pub waypoint_rel: String,
-    pub waypoint_id: String,
     pub annotation_body: String,
-    pub source_ref: DoubleLinkRef,
-    pub in_trail: DoubleLinkRef,
+    /// Vault-relative path of the source note this waypoint annotates.
+    pub source_path: String,
+    /// Vault-relative path of the trail-doc this waypoint belongs to.
+    pub in_trail_path: String,
     pub resolution: ResolutionOutcome,
     pub children: Vec<ResolvedWaypoint>,
     pub tree_path: String,
@@ -589,10 +650,25 @@ pub struct TrailDetail {
 /// frontmatter doesn't carry `hiker.kind: trail` produce a parse error
 /// and are silently skipped — same shape an external editor would see.
 ///
+/// Draft trail-docs (`hiker.draft: true`, parked under
+/// `.hiker/trails/drafts/`) are filtered OUT unless `include_drafts` is
+/// true — they don't pollute the user's dropdown / MCP `trails_list` /
+/// CLI listing until accepted. Passing `include_drafts = true` surfaces
+/// them (each row's `draft` flag distinguishes which are proposals); this
+/// backs the Trails sidebar "Show drafts" toggle and the review surface.
+/// [trail-draft-review-surface]
+///
 /// Pure data-shaping: the same listing drives the UI dropdown,
 /// `mcp-tool-trails-list`, and `cli-trail-list`. Lives in core so the
 /// three surfaces don't fork.
-pub fn list(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, HikerError> {
+///
+/// status: trail-draft-review-surface
+pub fn list(
+    vault: &Vault,
+    store: &Store,
+    log: &OpLog,
+    include_drafts: bool,
+) -> Result<Vec<TrailListItem>, HikerError> {
     let paths = store
         .all_note_paths()
         .map_err(|e| HikerError::Io(e.to_string()))?;
@@ -609,19 +685,29 @@ pub fn list(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, HikerErr
             Ok(fm) => fm,
             Err(_) => continue,
         };
+        // status: trail-draft-review-surface
+        if fm.draft && !include_drafts {
+            continue;
+        }
         let mut count: u32 = 0;
         walk_waypoints_depth_first(&fm.waypoints, &mut |_, _, _| {
             count += 1;
         });
+        // status: store-id-from-oplog
+        let trail_id = match log.doc_id_for_path(&rel) {
+            Ok(Some(id)) => id,
+            _ => continue, // not yet seeded — skip rather than fabricate
+        };
         out.push(TrailListItem {
             rel_path: rel.clone(),
-            trail_id: fm.id,
+            trail_id,
             title: {
                 let base = rel.rsplit('/').next().unwrap_or(&rel);
                 base.strip_suffix(".md").unwrap_or(base).to_string()
             },
             waypoint_count: count,
             last_activated_at: fm.last_activated_at,
+            draft: fm.draft,
         });
     }
     Ok(out)
@@ -634,6 +720,7 @@ pub fn list(vault: &Vault, store: &Store) -> Result<Vec<TrailListItem>, HikerErr
 pub fn get_trail(
     vault: &Vault,
     store: &Store,
+    log: &OpLog,
     trail_doc_rel: &str,
 ) -> Result<TrailDetail, HikerError> {
     let src = vault.read_file(trail_doc_rel)?;
@@ -642,18 +729,21 @@ pub fn get_trail(
     // Body = post-frontmatter slice. `frontmatter::split` returns it.
     let body = split(&src).body.to_string();
 
-    let waypoints = resolve_waypoint_tree(
-        vault,
-        store,
-        trail_doc_rel,
-        &fm.id,
-        &fm.waypoints,
-        "",
-    );
+    let waypoints = resolve_waypoint_tree(vault, store, trail_doc_rel, &fm.waypoints, "");
+
+    // status: store-id-from-oplog
+    let trail_id = log
+        .doc_id_for_path(trail_doc_rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?
+        .ok_or_else(|| {
+            HikerError::NotFound(format!(
+                "op-log doc_id missing for trail-doc: {trail_doc_rel}"
+            ))
+        })?;
 
     Ok(TrailDetail {
         rel_path: trail_doc_rel.to_string(),
-        trail_id: fm.id,
+        trail_id,
         last_activated_at: fm.last_activated_at,
         body,
         waypoints,
@@ -687,6 +777,7 @@ pub struct ContainingNoteHit {
 pub fn containing_note_with_paths(
     vault: &Vault,
     store: &Store,
+    log: &OpLog,
     source_rel: &str,
 ) -> Result<Vec<ContainingNoteHit>, HikerError> {
     let hits = store
@@ -699,8 +790,10 @@ pub fn containing_note_with_paths(
     // listing once. List-trails is the same data-shaping used by the
     // sidebar dropdown so the two stay consistent (e.g. trail-doc
     // renamed but indexer not yet caught up — both surfaces see the
-    // same view).
-    let listing = list(vault, store)?;
+    // same view). Drafts are included here so the per-trail idempotency
+    // check ("is this note already a waypoint of THIS trail?") still
+    // matches a draft trail the agent is appending to.
+    let listing = list(vault, store, log, true)?;
     let mut by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for t in &listing {
         by_id.insert(t.trail_id.as_str(), t.rel_path.as_str());
@@ -734,7 +827,6 @@ fn resolve_waypoint_tree(
     vault: &Vault,
     store: &Store,
     trail_doc_rel: &str,
-    trail_id: &str,
     entries: &[WaypointEntry],
     prefix: &str,
 ) -> Vec<ResolvedWaypoint> {
@@ -746,32 +838,27 @@ fn resolve_waypoint_tree(
         } else {
             format!("{prefix}.{one_based}")
         };
-        let (annotation_body, source_ref, in_trail, resolution) =
+        let (annotation_body, source_path, in_trail_path, resolution) =
             match vault.read_file(&wp.path) {
                 Ok(wp_src) => match parse_waypoint(&wp_src) {
                     Ok(wfm) => {
                         let body = split(&wp_src).body.to_string();
-                        let resolution = resolve_reference(store, vault, &wfm.references)
-                            .unwrap_or(ResolutionOutcome::Orphan);
+                        let resolution =
+                            resolve_reference(store, vault, &wfm.references)
+                                .unwrap_or(ResolutionOutcome::Orphan);
                         (body, wfm.references, wfm.in_trail, resolution)
                     }
                     Err(_) => (
                         String::new(),
-                        DoubleLinkRef { id: String::new(), path: String::new() },
-                        DoubleLinkRef {
-                            id: trail_id.to_string(),
-                            path: trail_doc_rel.to_string(),
-                        },
+                        String::new(),
+                        trail_doc_rel.to_string(),
                         ResolutionOutcome::Orphan,
                     ),
                 },
                 Err(_) => (
                     String::new(),
-                    DoubleLinkRef { id: String::new(), path: String::new() },
-                    DoubleLinkRef {
-                        id: trail_id.to_string(),
-                        path: trail_doc_rel.to_string(),
-                    },
+                    String::new(),
+                    trail_doc_rel.to_string(),
                     ResolutionOutcome::Orphan,
                 ),
             };
@@ -779,16 +866,14 @@ fn resolve_waypoint_tree(
             vault,
             store,
             trail_doc_rel,
-            trail_id,
             &wp.waypoints,
             &tree_path,
         );
         out.push(ResolvedWaypoint {
             waypoint_rel: wp.path.clone(),
-            waypoint_id: wp.id.clone(),
             annotation_body,
-            source_ref,
-            in_trail,
+            source_path,
+            in_trail_path,
             resolution,
             children,
             tree_path,

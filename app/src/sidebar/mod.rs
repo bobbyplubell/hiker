@@ -5,14 +5,11 @@
 //!
 //! `SidebarMode` survives as a compatibility shim for the persisted
 //! `Config::ui.default_sidebar_mode` setting in Settings — it no longer
-//! drives runtime layout. The trash bin lives inside the Files panel
-//! body now (it used to be pinned at the bottom across every mode).
+//! drives runtime layout. Trash is its own dockable panel
+//! (`sidebar::trash`), not pinned inside the Files body.
 
-pub(crate) mod clusters;
 pub(crate) mod files;
-mod trails;
-
-use eframe::egui;
+pub(crate) mod trash;
 
 use crate::editor_pane;
 use crate::state::{AppState, ToastLevel};
@@ -25,39 +22,6 @@ pub enum SidebarMode {
     Files,
     Clusters,
     Trails,
-}
-
-/// Render context shared by the three sidebar panels. The panel bodies
-/// are `&mut self` methods so each is exempt from `single_call_fn` (every
-/// panel is mounted from exactly one registry record) without a
-/// per-panel `#[allow]` or an arbitrary split.
-pub struct PanelRender<'a> {
-    pub ui: &'a mut egui::Ui,
-    pub state: &'a mut AppState,
-}
-
-impl PanelRender<'_> {
-    /// Clusters panel: cluster-trees sidebar body.
-    pub fn clusters(&mut self) {
-        let state = &mut *self.state;
-        egui::ScrollArea::vertical()
-            .id_salt("panel-clusters-body")
-            .auto_shrink([false, false])
-            .show(self.ui, |ui| {
-                state.clusters_panel(ui);
-            });
-    }
-
-    /// Trails panel: trail picker + waypoints.
-    pub fn trails(&mut self) {
-        let state = &mut *self.state;
-        egui::ScrollArea::vertical()
-            .id_salt("panel-trails-body")
-            .auto_shrink([false, false])
-            .show(self.ui, |ui| {
-                trails::TrailsView { ui, state }.render();
-            });
-    }
 }
 
 impl AppState {
@@ -74,7 +38,7 @@ impl AppState {
     let state = self;
     let target_dir = state
         .session
-        .sidebar
+        .file_tree
         .selected_folder
         .as_deref()
         .unwrap_or("");
@@ -106,9 +70,23 @@ impl AppState {
     } else {
         format!("{}/{}", target_dir, candidate)
     };
-    match state.vault_session.vault.create_note(&rel) {
+    // Route through the indexer-driven `core::ops::file::create_at` (watcher
+    // suppression + `IndexJob::Upsert`) rather than the bare
+    // `vault::create_note`, so the new note is indexed without a duplicate
+    // watcher-driven ingest — mirrors the `+` new-item button / new-board.
+    let watcher = state.vault_session.services.watcher.clone();
+    let jobs = state.vault_session.services.indexer.job_sender();
+    let vault = state.vault_session.vault.clone();
+    let rel_owned = rel.clone();
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::ops::file::create_at(&watcher, &jobs, &vault, &rel_owned, "").await
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
+    };
+    match result {
         Ok(actual) => {
-            state.session.sidebar.dir_cache.remove(target_dir);
+            state.session.file_tree.dir_cache.remove(target_dir);
             editor_pane::open_file(state, &actual, /* sticky */ true);
         }
         Err(err) => {
@@ -128,6 +106,7 @@ impl AppState {
         let watcher = state.vault_session.services.watcher.clone();
         let jobs = state.vault_session.services.indexer.job_sender();
         let vault = state.vault_session.vault.clone();
+        let oplog = state.vault_session.services.oplog.clone();
         let cfg = state
             .vault_session
             .config
@@ -138,11 +117,15 @@ impl AppState {
             state.push_toast("New board failed: no runtime", ToastLevel::Error);
             return;
         };
-        let result = handle
-            .block_on(async { hiker_core::boards::ops::create_board(&watcher, &jobs, &vault, &cfg, "new-board").await });
+        let result = handle.block_on(async {
+            hiker_core::boards::ops::create_board(
+                &watcher, &jobs, &oplog, &vault, &cfg, "new-board",
+            )
+            .await
+        });
         match result {
             Ok(outcome) => {
-                state.session.sidebar.dir_cache.clear();
+                state.session.file_tree.dir_cache.clear();
                 // Open in the board view with inline-rename active so the
                 // user names it before submitting (mirrors new-trail /
                 // new-file). status: board-create

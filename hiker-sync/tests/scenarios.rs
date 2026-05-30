@@ -796,10 +796,11 @@ async fn true_fork_is_blocked() {
     );
     assert!(report.converged.is_empty(), "no silent convergence: {report:?}");
     assert_eq!(
-        b.status_of(&hiker_sync::identity::LocalDocId(doc_b.clone())),
+        b.status_of_path(path),
         Some(SyncStatus::Blocked),
         "B's doc is Blocked"
     );
+    let _ = &doc_b;
     // Each side keeps its own divergent content; no interleave happened.
     assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text);
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, b_text);
@@ -843,24 +844,24 @@ async fn fork_keep_theirs_converges() {
         r1.blocked.iter().any(|(p, reason)| p == path && reason == "fork"),
         "round 1 forks: {r1:?}"
     );
-    let local_b = LocalDocId(doc_b.clone());
+    let _ = LocalDocId(doc_b.clone()); // (sanity ref; status keyed by path now)
     assert_eq!(
-        b.status_of(&local_b),
+        b.status_of_path(path),
         Some(SyncStatus::Blocked),
         "B is blocked after round 1"
     );
     let blocked = b.blocked_docs();
     assert_eq!(blocked.len(), 1, "one persistent blocked entry: {blocked:?}");
-    let logical = blocked[0].logical_id.clone();
-    assert_eq!(blocked[0].path, path, "blocked record carries the path");
+    let fork_path = blocked[0].path.clone();
+    assert_eq!(fork_path, path, "blocked record carries the path");
     assert_eq!(
         blocked[0].peer_fingerprint,
         a.fingerprint(),
         "blocked record names the peer we forked against"
     );
 
-    // The user chooses keep-theirs on B for that logical id.
-    b.set_fork_resolution(logical.clone(), Resolution::KeepTheirs);
+    // The user chooses keep-theirs on B for that path.
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepTheirs);
 
     // Round 2: the fork branch consumes the decision and adopts A's lineage.
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
@@ -870,7 +871,7 @@ async fn fork_keep_theirs_converges() {
 
     assert!(r2.blocked.is_empty(), "round 2 no longer blocks: {r2:?}");
     assert!(
-        r2.converged.iter().any(|l| l == &logical),
+        r2.converged.iter().any(|p| p == &fork_path),
         "round 2 converged the resolved doc: {r2:?}"
     );
 
@@ -927,13 +928,13 @@ async fn fork_keep_mine_resolves_both_sides() {
     let _r1 = b.sync_once(&addr).await.unwrap();
     let mut a = server.await.unwrap();
 
-    let local_b = LocalDocId(doc_b.clone());
+    let _ = LocalDocId(doc_b.clone());
     let blocked = b.blocked_docs();
     assert_eq!(blocked.len(), 1, "one fork recorded: {blocked:?}");
-    let logical = blocked[0].logical_id.clone();
+    let fork_path = blocked[0].path.clone();
 
     // The user chooses keep-mine on B (B is the side that dials = the resolver).
-    b.set_fork_resolution(logical.clone(), Resolution::KeepMine);
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepMine);
 
     // Round 2: B dials and pushes its base; A (the responder) adopts it.
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
@@ -943,7 +944,7 @@ async fn fork_keep_mine_resolves_both_sides() {
 
     assert!(r2.blocked.is_empty(), "round 2 no longer blocks: {r2:?}");
     assert!(
-        r2.converged.iter().any(|l| l == &logical),
+        r2.converged.iter().any(|p| p == &fork_path),
         "round 2 converged the resolved doc: {r2:?}"
     );
 
@@ -956,7 +957,7 @@ async fn fork_keep_mine_resolves_both_sides() {
 
     // The resolver's content is unchanged, both bound, block cleared.
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, b_text, "B unchanged");
-    assert_eq!(b.status_of(&local_b), Some(SyncStatus::Bound), "B bound after keep-mine");
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Bound), "B bound after keep-mine");
     assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
 
     // MULTI-ROUND DISCIPLINE: several more rounds must NOT corrupt (the deferred
@@ -1040,12 +1041,12 @@ async fn fork_both_keep_mine_converges_deterministically() {
     a.sync_once(&addr_b0).await.unwrap();
     let mut b = server_b0.await.unwrap();
 
-    let logical_b = b.blocked_docs()[0].logical_id.clone();
-    let logical_a = a.blocked_docs()[0].logical_id.clone();
+    let path_b = b.blocked_docs()[0].path.clone();
+    let path_a = a.blocked_docs()[0].path.clone();
 
     // BOTH set keep-mine.
-    a.set_fork_resolution(logical_a, Resolution::KeepMine);
-    b.set_fork_resolution(logical_b, Resolution::KeepMine);
+    a.set_fork_resolution(path_a, Resolution::KeepMine);
+    b.set_fork_resolution(path_b, Resolution::KeepMine);
 
     // Drive both directions for a few rounds. The first push wins and clears the
     // other's pending keep-mine, so they converge without flapping.
@@ -1106,10 +1107,10 @@ async fn fork_keep_both_preserves_local_copy() {
     let server = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr).await.unwrap();
     let mut a = server.await.unwrap();
-    let logical = b.blocked_docs()[0].logical_id.clone();
+    let fork_path = b.blocked_docs()[0].path.clone();
 
     // Resolve keep-both, then round 2.
-    b.set_fork_resolution(logical.clone(), Resolution::KeepBoth);
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepBoth);
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server2 = spawn_responder(a, Duration::from_secs(3));
     let r2 = b.sync_once(&addr2).await.unwrap();
@@ -1187,7 +1188,7 @@ async fn fork_resolution_no_corruption_on_extra_rounds() {
         let server = spawn_responder(a, Duration::from_secs(3));
         b.sync_once(&addr).await.unwrap();
         let mut a = server.await.unwrap();
-        let logical = b.blocked_docs()[0].logical_id.clone();
+        let fork_path = b.blocked_docs()[0].path.clone();
 
         // The expected single converged text per resolution:
         // - keep-mine  → B's content wins on both sides.
@@ -1198,7 +1199,7 @@ async fn fork_resolution_no_corruption_on_extra_rounds() {
         };
 
         // Resolution round.
-        b.set_fork_resolution(logical.clone(), resolution);
+        b.set_fork_resolution(fork_path.clone(), resolution);
         let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
         let server2 = spawn_responder(a, Duration::from_secs(3));
         let r2 = b.sync_once(&addr2).await.unwrap();
@@ -1260,11 +1261,13 @@ async fn rename_does_not_fork_identity() {
 
     let doc_b = oplog_b.doc_id_for_path(old_path).unwrap().unwrap();
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, seed);
-    let logical_for_b = b
-        .bindings()
-        .logical_for(&hiker_sync::identity::LocalDocId(doc_b.clone()))
-        .cloned()
-        .expect("B bound the doc");
+    // Path IS the identity (sync-path-identity). Confirm B's local doc lives at
+    // the old path before the rename rides in.
+    assert_eq!(
+        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
+        Some(old_path),
+        "B's local doc starts at the old path"
+    );
 
     // A renames foo -> bar (a meta.path op on the shared lineage). B, still at
     // the old path, makes a body edit.
@@ -1290,14 +1293,9 @@ async fn rename_does_not_fork_identity() {
         Some(new_path),
         "B's existing doc moved to the new path — identity is the binding"
     );
-    // The binding is unchanged: still the one logical id.
-    assert_eq!(
-        b.bindings()
-            .logical_for(&hiker_sync::identity::LocalDocId(doc_b.clone()))
-            .cloned(),
-        Some(logical_for_b),
-        "B kept the same logical identity across the rename"
-    );
+    // Identity is the path; the doc_id stays the same across the rename (no
+    // phantom second doc was minted).
+    let _ = &doc_b;
     // B's own edit is still present (the rename didn't clobber the body).
     assert!(
         oplog_b
@@ -1312,14 +1310,116 @@ async fn rename_does_not_fork_identity() {
     assert_eq!(all_docs.len(), 1, "exactly one logical doc on B: {all_docs:?}");
 }
 
+// --- 5b. Concurrent rename collision: LWW-on-path, loser → conflict-copy ----
+
+/// `sync-concurrent-rename-not-merged`: two devices independently rename
+/// DIFFERENT documents to the SAME target path while disconnected. The
+/// later-arriving rename's local replica collides with the existing
+/// `target.md` (now owned by the winning device's lineage) → the loser lands
+/// at `target.conflict-<rand6>.md`, the winner is at `target.md`, both devices
+/// converge with no data loss.
+///
+/// Test shape: A holds `foo.md`, B holds `bar.md` (different docs, different
+/// content, never synced together). A renames `foo.md → target.md`. B renames
+/// `bar.md → target.md`. Then sync. The receiver (B as dialer) sees A's
+/// manifest entry for `target.md` with `prior_paths = [foo.md]` and its own
+/// local replica at `target.md` (formerly bar). The two lineages are disjoint
+/// → classify Fork → the rename-collision detection in
+/// `act_on_classification` writes B's local content as a conflict-copy and
+/// adopts A's lineage at the original path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_rename_to_same_target_loser_becomes_conflict_copy() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let foo_path = "notes/foo.md";
+    let bar_path = "notes/bar.md";
+    let target_path = "notes/target.md";
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+
+    // Independently seeded: A has foo.md with its own content; B has bar.md
+    // with different content. No prior sync, so the lineages are disjoint.
+    let doc_a = oplog_a
+        .create_document(foo_path, "note", a_content, &Author::User)
+        .unwrap();
+    let doc_b = oplog_b
+        .create_document(bar_path, "note", b_content, &Author::User)
+        .unwrap();
+
+    // Concurrent rename to the same target path (each device offline from the
+    // other).
+    oplog_a
+        .rename_document(&doc_a, target_path, &Author::User)
+        .unwrap();
+    oplog_b
+        .rename_document(&doc_b, target_path, &Author::User)
+        .unwrap();
+
+    // B dials A, so B is the receiver of A's manifest entry for target.md →
+    // B's local replica at target.md (formerly bar) collides → B becomes the
+    // loser of the LWW-on-path race.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let report = b.sync_once(&addr).await.unwrap();
+    let _a = server.await.unwrap();
+
+    assert!(
+        report.blocked.is_empty(),
+        "rename collision must NOT block — the loser becomes a conflict-copy: {report:?}"
+    );
+
+    // Target path now holds A's content (B adopted A's lineage there).
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_content,
+        "B's doc at target.md adopted A's content"
+    );
+    assert_eq!(
+        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
+        Some(target_path),
+        "B's original doc is at target.md (lineage adopted in place)"
+    );
+
+    // B's original bar content lives on as a conflict-copy sibling at
+    // `<stem>.conflict-<rand6>.<ext>`, indexed like any note (created via the
+    // op-log create path).
+    let all_paths: Vec<String> = oplog_b
+        .list_doc_ids()
+        .unwrap()
+        .into_iter()
+        .filter_map(|id| oplog_b.path_for_doc(&id).ok().flatten())
+        .collect();
+    let copy = all_paths
+        .iter()
+        .find(|p| p.contains(".conflict-") && p.ends_with(".md") && p.starts_with("notes/target."))
+        .unwrap_or_else(|| panic!("expected a target.conflict-<rand6>.md sibling: {all_paths:?}"));
+    let copy_id = oplog_b.doc_id_for_path(copy).unwrap().unwrap();
+    assert_eq!(
+        oplog_b.materialize_accepted(&copy_id).unwrap().text,
+        b_content,
+        "the conflict-copy preserves B's original bar content"
+    );
+
+    // No data lost: A still has its own content under target.md, B has A's at
+    // target.md, and B has its original content at the conflict-copy sibling.
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        a_content,
+        "A's content at target.md unchanged on A"
+    );
+}
+
 // --- 6. Server-mediated store-and-forward, zero-knowledge -----------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_store_and_forward_zero_knowledge() {
-    use hiker_sync::identity::{LocalDocId, LogicalId};
+    // Path is the cross-device identity (sync-path-identity); no LogicalId
+    // negotiation rides through the hub.
 
     let key = ContentKey::generate();
-    let logical = LogicalId(ulid::Ulid::new().to_string());
     let path = "notes/hub.md";
 
     let kp_server = DeviceKeypair::generate();
@@ -1341,16 +1441,16 @@ async fn server_store_and_forward_zero_knowledge() {
     .unwrap();
     let server_addr = server.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
 
-    // A holds a doc with content; B shares the lineage (a prior P2P bind/adopt
-    // stand-in, exactly as the server path assumes — the hub can't negotiate
-    // ids on ciphertext). Both are bound to the one logical id.
+    // A holds a doc with content; B shares the lineage (a prior P2P
+    // bind/adopt stand-in, exactly as the server path assumes — the hub can't
+    // classify on ciphertext). Both reach the doc by its path; the blind_id
+    // (HMAC of the content key + path) is the same on both ends, so the hub's
+    // append-only log under that blind_id is the shared transfer channel.
     let doc_a = oplog_a.create_document(path, "note", "alpha\n", &Author::User).unwrap();
     oplog_a.apply_user_text(&doc_a, "alpha\nbeta\n").unwrap();
-    a.bind_for_test(LocalDocId(doc_a.clone()), logical.clone());
 
     let doc_b = oplog_b.create_document(path, "note", "", &Author::User).unwrap();
     oplog_b.adopt_lineage(&doc_b, &oplog_a.export_state(&doc_a).unwrap()).unwrap();
-    b.bind_for_test(LocalDocId(doc_b.clone()), logical.clone());
 
     // A makes an offline edit B has never seen.
     oplog_a.apply_user_text(&doc_a, "alpha\nbeta\nGAMMA marker\n").unwrap();
@@ -1360,16 +1460,16 @@ async fn server_store_and_forward_zero_knowledge() {
 
     // A pushes while B is "offline" (not connected). Then B pulls and converges.
     let ra = a.sync_via_server(&server_addr).await.unwrap();
-    assert!(ra.bound.contains(&logical), "A pushed: {ra:?}");
+    assert!(ra.bound.iter().any(|p| p == path), "A pushed: {ra:?}");
     let rb = b.sync_via_server(&server_addr).await.unwrap();
-    assert!(rb.converged.contains(&logical), "B converged via the hub: {rb:?}");
+    assert!(rb.converged.iter().any(|p| p == path), "B converged via the hub: {rb:?}");
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, want);
 
     serve.abort();
 
     // Zero-knowledge: re-open the on-disk store; stored bytes are ciphertext.
     let store = FileBlobStore::open(&server_data).unwrap();
-    let blind = blind_id(&key, &logical.0);
+    let blind = blind_id(&key, path);
     let stored = store.pull(&blind, 0);
     assert!(!stored.is_empty(), "the hub stored A's pushed blob(s)");
     let plaintext_marker = b"GAMMA marker";
@@ -2052,7 +2152,7 @@ async fn shared_lineage_same_region_edits_converge() {
 /// snapshot. [sync-blocked-state]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_while_forked_then_keep_theirs() {
-    use hiker_sync::identity::{LocalDocId, Resolution};
+    use hiker_sync::identity::Resolution;
 
     let seed = "title\nbody line\n";
     let a_text = "title\nbody edited by A\n";
@@ -2074,7 +2174,7 @@ async fn edit_while_forked_then_keep_theirs() {
     let server = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr).await.unwrap();
     let mut a = server.await.unwrap();
-    let logical = b.blocked_docs()[0].logical_id.clone();
+    let fork_path = b.blocked_docs()[0].path.clone();
 
     // B edits AGAIN while blocked (stale-snapshot trap: a resolution must use
     // this current content, not the content at block time).
@@ -2082,7 +2182,7 @@ async fn edit_while_forked_then_keep_theirs() {
 
     // keep-theirs: B discards its branch (incl. the while-blocked edit) and
     // adopts A's content.
-    b.set_fork_resolution(logical.clone(), Resolution::KeepTheirs);
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepTheirs);
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server2 = spawn_responder(a, Duration::from_secs(3));
     let r2 = b.sync_once(&addr2).await.unwrap();
@@ -2094,7 +2194,8 @@ async fn edit_while_forked_then_keep_theirs() {
         a_text,
         "keep-theirs adopts A's content, discarding B's while-blocked edit"
     );
-    assert_eq!(b.status_of(&LocalDocId(doc_b.clone())), Some(SyncStatus::Bound));
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Bound));
+    let _ = &doc_b;
 
     // Extra rounds: byte-stable, A's marker once, B's discarded edit absent.
     let (_a, _b) = drive_bidirectional(a, b, 3).await;
@@ -2131,13 +2232,13 @@ async fn edit_while_forked_then_keep_mine_uses_current_content() {
     let server = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr).await.unwrap();
     let mut a = server.await.unwrap();
-    let logical = b.blocked_docs()[0].logical_id.clone();
+    let fork_path = b.blocked_docs()[0].path.clone();
 
     // B edits AGAIN while blocked — this CURRENT content is what keep-mine pushes.
     let b_current = "title\nbody edited by B\nB-CURRENT after block\n";
     oplog_b.apply_user_text(&doc_b, b_current).unwrap();
 
-    b.set_fork_resolution(logical.clone(), Resolution::KeepMine);
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepMine);
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server2 = spawn_responder(a, Duration::from_secs(3));
     let r2 = b.sync_once(&addr2).await.unwrap();
@@ -2187,8 +2288,8 @@ async fn refork_after_keep_theirs_is_crdt_merge() {
     let server = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr).await.unwrap();
     let mut a = server.await.unwrap();
-    let logical = b.blocked_docs()[0].logical_id.clone();
-    b.set_fork_resolution(logical.clone(), Resolution::KeepTheirs);
+    let fork_path = b.blocked_docs()[0].path.clone();
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepTheirs);
     let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server2 = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr2).await.unwrap();

@@ -89,7 +89,6 @@ pub struct VaultStats {
 pub struct NoteProperties {
     pub path: String,
     pub note_id: Option<String>,
-    pub path_ids_id: Option<String>,
     pub mtime: Option<i64>,
     pub size: Option<i64>,
     pub content_hash: Option<String>,

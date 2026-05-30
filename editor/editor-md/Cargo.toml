@@ -10,6 +10,22 @@ editor-core.workspace = true
 editor-view.workspace = true
 pulldown-cmark.workspace = true
 smol_str.workspace = true
+# Syntax highlighting inside fenced code blocks (`editor-code-syntax-highlight`).
+# Pure-Rust tree-sitter-highlight runs per-language `HighlightConfiguration`s
+# against the block body and emits per-token color spans. Adding a language is
+# one workspace dep + one registration in `syntax.rs`.
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-yaml.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-sequel.workspace = true
 
 [lints]
 workspace = true

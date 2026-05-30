@@ -12,4 +12,5 @@ pub mod equations;
 pub mod diagrams;
 pub mod embeds;
 pub mod links;
+pub mod syntax;
 

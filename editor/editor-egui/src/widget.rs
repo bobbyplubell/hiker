@@ -225,6 +225,16 @@ impl<'a> Widget<'a> {
         // waiting on the idle 500 ms repaint (which would read as a flicker).
         let needs_relayout = self.measure(update, decorations_refreshed);
 
+        // An edit this frame asked the caret be scrolled back into view. Apply
+        // it now that the height map reflects the post-edit doc — but only when
+        // measure didn't defer (`needs_relayout`); on a deferred frame the
+        // geometry is still stale, so keep the flag and let the forced repaint
+        // below settle it next frame.
+        if self.view.scroll_caret_into_view && !needs_relayout {
+            command::scroll_caret_into_view(self.state, self.view);
+            self.view.scroll_caret_into_view = false;
+        }
+
         // Phase 3: paint — always runs, but reads cached geometry built in
         // measure.
         self.view.click_zones.clear();
@@ -1007,93 +1017,78 @@ fn prewrap_visible(&mut self) {
         return;
     }
     let total = state.doc.len_lines();
-    // Walk every line. `get_or_compute` short-circuits in O(1) when the
-    // line's cached entry still matches the current width and text hash
-    // (the common case after the first frame), so the per-frame cost is
-    // a single hash + width check per line — cheap even for long docs.
+    // Decide the line range to rescan. On a pure scroll (full-doc geometry
+    // inputs unchanged), only lines whose viewport-scoped decoration coverage
+    // could have shifted need work — the union of last frame's and this
+    // frame's visible band. Lines outside that union were covered by the same
+    // layers in both frames, so their cached wraps remain valid. On any
+    // geometry change (doc edit, full-doc layer churn, width/char/enabled
+    // change, line-count change) we fall back to walking the whole document.
     //
-    // We previously only re-walked the visible band on warm frames as an
-    // optimization, but that left off-screen lines uncomputed after
-    // per-line invalidations (edits). `apply_line_height_decorations`
-    // skips lines where `wrap_map.peek` is None, so those lines kept
-    // their base (unwrapped) height in `height_map` — producing
-    // LOD-style scaling in the minimap as scrolling lazily filled in
-    // off-screen wraps. Always walking keeps `total_height`,
-    // `text_height`, and `y_at_text` stable regardless of scroll
-    // position.
+    // The "always walk all lines" approach we kept here for a while masked an
+    // off-screen-stale bug after edits by paying O(N) per scroll frame; the
+    // partition between geometry-affecting and viewport-scoped layers
+    // (`DecorationLayers::geometry_epoch` vs `signature`) gives us the same
+    // correctness without the per-line cost.
     //
-    // Per-line `font_scale` (heading promotion etc.) is folded into the
-    // wrap calc so a heading whose decorated text is e.g. 1.6× the base
-    // monospace cell wraps at the right column, instead of overshooting
-    // and getting clipped by the minimap or the pane edge.
-    //
-    // Compute scales upfront via an immutable borrow of `view.decorations`,
-    // then iterate with a mutable borrow of `view.wrap_map` — the two
-    // fields are disjoint but the borrow checker can't see that across
-    // the per-line closure without a separate scoped collection.
-    // Compute per-line scale + visual spans inline, via an immutable borrow of
-    // `view.decorations`, then wrap with a mutable borrow of `view.wrap_map`.
-    //
-    // - scale: the max `font_scale` of any Mark covering the line (heading
-    //   promotion etc.), so a larger cell fits fewer chars per row.
-    // - spans: every `Replace` decoration on the line, in line-local bytes,
-    //   counted at its rendered width (hidden -> 0 cols, display -> char count).
-    //   These encode the live-preview reveal state — a long hidden marker (a
-    //   color span's `<span …>` tag, a wikilink target) no longer eats wrap
-    //   budget it never paints, and moving the cursor onto the line (which
-    //   reveals the markers, dropping the spans) re-wraps it.
-    //
-    // Probes one byte past EOL so decorations anchored at the line break still
-    // register (range queries are half-open).
-    let total_lines = state.doc.len_lines();
-    let per_line: Vec<(f32, Vec<VisualSpan>)> = (0..total)
-        .map(|line| {
-            if line >= total_lines {
-                return (1.0_f32, Vec::new());
+    // Per-line `font_scale` (heading promotion etc.) and visual spans are
+    // folded into the wrap calc so a heading whose decorated text is e.g.
+    // 1.6× the base monospace cell wraps at the right column, and a hidden
+    // marker (`<span …>` tag, wikilink target) doesn't eat wrap budget it
+    // never paints. Probes one byte past EOL so decorations anchored at the
+    // line break still register (range queries are half-open).
+    let geo_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        state.doc.content_id().hash(&mut h);
+        view.decorations.geometry_epoch.hash(&mut h);
+        view.wrap_map.width().to_bits().hash(&mut h);
+        view.wrap_map.char_width().to_bits().hash(&mut h);
+        view.wrap_map.enabled().hash(&mut h);
+        h.finish()
+    };
+    let vp = view.visible_lines();
+    let walk = view.wrap_map.walk_range(geo_key, total, (vp.start, vp.end));
+    let mut spans: Vec<VisualSpan> = Vec::new();
+    for line in walk {
+        let start = state.doc.line_to_byte(line);
+        let line_text = state.doc.line_str(line);
+        let line_len = line_text.len();
+        let probe_end = (start + line_len).max(start + 1);
+        let snap = |b: usize| -> usize {
+            let mut b = b.min(line_len);
+            while b > 0 && !line_text.is_char_boundary(b) {
+                b -= 1;
             }
-            let start = state.doc.line_to_byte(line);
-            let line_text = state.doc.line_str(line);
-            let line_len = line_text.len();
-            let probe_end = (start + line_len).max(start + 1);
-            let snap = |b: usize| -> usize {
-                let mut b = b.min(line_len);
-                while b > 0 && !line_text.is_char_boundary(b) {
-                    b -= 1;
-                }
-                b
-            };
-            let mut max_scale: f32 = 1.0;
-            let mut spans: Vec<VisualSpan> = Vec::new();
-            for layer in &view.decorations.layers {
-                for (range, deco) in layer.iter_overlapping(start..probe_end) {
-                    match deco {
-                        Decoration::Mark(ms) => {
-                            if let Some(s) = ms.font_scale
-                                && s > max_scale
-                            {
-                                max_scale = s;
-                            }
+            b
+        };
+        let mut max_scale: f32 = 1.0;
+        spans.clear();
+        for layer in &view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(start..probe_end) {
+                match deco {
+                    Decoration::Mark(ms) => {
+                        if let Some(s) = ms.font_scale
+                            && s > max_scale
+                        {
+                            max_scale = s;
                         }
-                        Decoration::Replace { display } => {
-                            let s = snap(range.start.saturating_sub(start));
-                            let e = snap(range.end.saturating_sub(start));
-                            if e > s {
-                                let cols =
-                                    display.as_ref().map_or(0, |d| d.chars().count()) as u32;
-                                spans.push(VisualSpan { start: s as u32, end: e as u32, cols });
-                            }
-                        }
-                        _ => {}
                     }
+                    Decoration::Replace { display } => {
+                        let s = snap(range.start.saturating_sub(start));
+                        let e = snap(range.end.saturating_sub(start));
+                        if e > s {
+                            let cols =
+                                display.as_ref().map_or(0, |d| d.chars().count()) as u32;
+                            spans.push(VisualSpan { start: s as u32, end: e as u32, cols });
+                        }
+                    }
+                    _ => {}
                 }
             }
-            spans.sort_by_key(|s| s.start);
-            (max_scale, spans)
-        })
-        .collect();
-    for (line, (scale, spans)) in per_line.iter().enumerate() {
-        let text = state.doc.line_str(line);
-        view.wrap_map.get_or_compute(line, |_| text.clone(), *scale, spans);
+        }
+        spans.sort_by_key(|s| s.start);
+        view.wrap_map.get_or_compute(line, &line_text, max_scale, &spans);
     }
 }
 }

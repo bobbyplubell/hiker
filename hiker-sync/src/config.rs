@@ -5,6 +5,8 @@
 //! key that decrypts it. See `docs/sync.md` "`[sync]` config section".
 //! [sync-config-section]
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Sync topology mode.
@@ -34,6 +36,19 @@ pub struct Settings {
     pub discovery: bool,
     /// Enrolled device fingerprints.
     pub devices: Vec<String>,
+    /// THIS device's SELF-set human name, carried on the `Hello`/`HelloAck`
+    /// handshake so peers can render "synced from `laptop`" instead of a
+    /// fingerprint. Empty / `None` means unnamed. A device only ever names
+    /// itself. [sync-device-name]
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Learned `fingerprint -> name` map for enrolled peers: the name each peer
+    /// self-reported in its handshake. Adopted on every handshake (last name a
+    /// device reports for ITSELF wins); a device never writes another device's
+    /// name here on that device's behalf. The UI renders this for a remote
+    /// device (a local `aliases.json` override wins over it). [sync-device-name]
+    #[serde(default)]
+    pub device_names: HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -44,6 +59,8 @@ impl Default for Settings {
             server_url: String::new(),
             discovery: true,
             devices: Vec::new(),
+            device_name: None,
+            device_names: HashMap::new(),
         }
     }
 }
@@ -76,8 +93,25 @@ mod tests {
             server_url: "wss://hub.example".into(),
             discovery: false,
             devices: vec!["DEV-ABC".into()],
+            device_name: Some("laptop".into()),
+            device_names: HashMap::from([("DEV-ABC".into(), "phone".into())]),
         };
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), c);
+    }
+
+    /// Defaults leave the device-naming fields empty, and a config JSON that
+    /// predates them still parses (additive). [sync-device-name]
+    #[test]
+    fn device_name_defaults_and_back_compat() {
+        let d = Settings::default();
+        assert!(d.device_name.is_none());
+        assert!(d.device_names.is_empty());
+
+        // A pre-device-name config omits both fields entirely.
+        let legacy = r#"{"enabled":false,"mode":"peer","server_url":"","discovery":true,"devices":[]}"#;
+        let parsed: Settings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.device_name.is_none());
+        assert!(parsed.device_names.is_empty());
     }
 }

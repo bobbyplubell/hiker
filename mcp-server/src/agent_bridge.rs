@@ -90,8 +90,8 @@ pub fn agent_tool_defs_filtered(
     tools_cfg: Option<&hiker_core::config::sections::McpToolsConfig>,
 ) -> Vec<ToolDef> {
     use crate::handler::{
-        ApplyTag, EditNote, GetNote, RelatedNotes, SearchNotes,
-        SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat,
+        ApplyTag, EditNote, GetActiveNote, GetNote, GetOpenNotes, GetSelection, RelatedNotes,
+        SearchNotes, SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat,
         TaskList, TaskSubmit, WriteNote,
     };
     use schemars::schema_for;
@@ -130,6 +130,27 @@ pub fn agent_tool_defs_filtered(
                 "Top-K notes whose chunks are most semantically similar to a given note."
                     .into(),
             parameters: schema::<RelatedNotes>(),
+        },
+        ToolDef {
+            name: "get_active_note".into(),
+            description:
+                "Return the currently-focused editor tab's path + cursor byte offset + (if non-empty) selection range. { path: null } when the active tab is an app page. Read-only; does NOT populate the read-before-write set."
+                    .into(),
+            parameters: schema::<GetActiveNote>(),
+        },
+        ToolDef {
+            name: "get_open_notes".into(),
+            description:
+                "Return the ordered list of open buffer tabs as [{path, active}]. Non-buffer tabs are omitted. Read-only; does NOT populate the read-before-write set."
+                    .into(),
+            parameters: schema::<GetOpenNotes>(),
+        },
+        ToolDef {
+            name: "get_selection".into(),
+            description:
+                "Return the active buffer's selection as { path, start_byte, end_byte, text } when non-empty; otherwise { path: null }. Same content source as get_note(detail='full'). Read-only; does NOT populate the read-before-write set."
+                    .into(),
+            parameters: schema::<GetSelection>(),
         },
         ToolDef {
             name: "write_note".into(),
@@ -218,6 +239,9 @@ mod tests {
                 "search_notes",
                 "get_note",
                 "related_notes",
+                "get_active_note",
+                "get_open_notes",
+                "get_selection",
                 "write_note",
                 "edit_note",
                 "set_frontmatter",

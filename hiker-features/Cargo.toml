@@ -1,0 +1,18 @@
+[package]
+name = "hiker-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Shareable feature implementations (FileTree, FindReplace, HexView, etc.) usable by any egui_workbench consumer app via the per-feature Ctx requirement-trait pattern."
+
+[dependencies]
+# The generic feature-registry foundation. Each feature here declares its
+# own Ctx requirement trait and impls `Feature<C>` for any C satisfying it.
+egui_workbench.workspace = true
+egui.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

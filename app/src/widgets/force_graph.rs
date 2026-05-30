@@ -88,13 +88,6 @@ impl View {
         move |w: egui::Vec2| center + (w + pan) * zoom
     }
 
-    /// Convenience: reset pan to origin and zoom to 1.0.
-    #[allow(dead_code)] // TODO: bind to a "Reset view" toolbar button.
-    pub const fn reset(&mut self) {
-        self.pan = egui::Vec2::ZERO;
-        self.zoom = 1.0;
-    }
-
     /// Set pan/zoom so the bounding box of `positions` fits inside
     /// `canvas` with a margin. Used by both graph panels for "fit to
     /// content" on rebuild and on the Reset view button — necessary

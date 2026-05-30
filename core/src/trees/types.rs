@@ -28,6 +28,8 @@ pub enum Error {
     OpLog(String),
     #[error("store: {0}")]
     Store(String),
+    #[error("cluster: {0}")]
+    Cluster(#[from] crate::cluster::BuildError),
     #[error("tree not found: {0}")]
     TreeNotFound(String),
     #[error("node not found: tree={tree_id} node={node_id}")]
@@ -38,7 +40,13 @@ pub enum Error {
 
 impl From<Error> for crate::errors::HikerError {
     fn from(e: Error) -> Self {
-        crate::errors::HikerError::Io(e.to_string())
+        use crate::errors::HikerError;
+        match e {
+            Error::TreeNotFound(_) | Error::NodeNotFound { .. } => {
+                HikerError::NotFound(e.to_string())
+            }
+            _ => HikerError::Io(e.to_string()),
+        }
     }
 }
 
@@ -305,4 +313,35 @@ pub struct Db {
     /// In-memory session undo log, keyed by tree id. Replaces the retired
     /// `cluster_tree_history` table (`cluster-editor-edit-history`).
     pub(super) history: Mutex<HashMap<TreeId, Vec<HistoryEntry>>>,
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+    use crate::errors::HikerError;
+
+    #[test]
+    fn structured_tree_errors_keep_their_shape_through_hikererror() {
+        // A real missing-tree/node maps to NotFound instead of being
+        // flattened to Io (the bug this guards).
+        assert!(matches!(
+            HikerError::from(Error::TreeNotFound("t1".into())),
+            HikerError::NotFound(_)
+        ));
+        assert!(matches!(
+            HikerError::from(Error::NodeNotFound {
+                tree_id: "t1".into(),
+                node_id: "n1".into(),
+            }),
+            HikerError::NotFound(_)
+        ));
+        // A clustering compute failure is io-shaped to the caller, not
+        // not-found — so it can never masquerade as "tree not found".
+        assert!(matches!(
+            HikerError::from(Error::Cluster(crate::cluster::BuildError::Compute(
+                "boom".into()
+            ))),
+            HikerError::Io(_)
+        ));
+    }
 }

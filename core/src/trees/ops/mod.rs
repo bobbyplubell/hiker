@@ -280,13 +280,19 @@ fn run_rollup_partition(
             let mut leiden = params.leiden.clone();
             let upper = n_inputs.saturating_sub(1).max(1) as u32;
             leiden.k_nearest = leiden.k_nearest.min(upper);
-            partition_leiden(summary_embeddings, &leiden)
-                .map_err(|e| Error::TreeNotFound(format!("rollup leiden: {e}")))
+            partition_leiden(summary_embeddings, &leiden).map_err(|e| {
+                Error::Cluster(crate::cluster::BuildError::Compute(format!(
+                    "rollup leiden: {e}"
+                )))
+            })
         }
         _ => {
             let min_size = (params.min_cluster_size as usize).max(2);
-            partition(summary_embeddings, min_size, None)
-                .map_err(|e| Error::TreeNotFound(format!("rollup hdbscan: {e}")))
+            partition(summary_embeddings, min_size, None).map_err(|e| {
+                Error::Cluster(crate::cluster::BuildError::Compute(format!(
+                    "rollup hdbscan: {e}"
+                )))
+            })
         }
     }
 }

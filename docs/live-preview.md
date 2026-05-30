@@ -1,6 +1,6 @@
 # Live preview
 
-Markdown live-preview rendering inside the editor — fade the syntax markers when the cursor is elsewhere, reveal them when the cursor is on the same line. Obsidian-style, deliberately narrow scope. Widget-based rendering (images, math, embeds, callouts) is a separate, later concern; see "Deferred" below.
+Markdown live-preview rendering inside the editor — fade the syntax markers when the cursor is elsewhere, reveal them when the cursor is on the same line. Inline live-preview, deliberately narrow scope. Widget-based rendering (images, math, embeds, callouts) is a separate, later concern; see "Deferred" below.
 
 The headline decisions:
 
@@ -58,12 +58,14 @@ These markers fade when their line lacks the cursor and the line lacks selection
 ## Block elements
 
 - **Headings.** `#`, `##`, ... markers fade on lines without the cursor. Heading text always renders at the appropriate size and weight; the fade is just the marker itself plus the trailing space. ATX (`# heading`) is the only form supported in v1; setext-style underlined headings (`===` / `---`) keep their underline visible (they're a marker spread across two lines and per-line reveal logic gets weird). [live-preview-heading-style-fade-marker]
-- **Code fences (` ``` `).** Per-block reveal, not per-line: when the cursor is anywhere *inside the fenced block* (between the opening and closing ` ``` ` lines, inclusive), the fences reveal. Outside, they fade and the block renders with a monospace background. Per-line would have shown a fence-line on top of an "indented" block which looks broken; per-block matches what Obsidian does and reads cleanly. Code-block content stays the literal source — language-specific syntax highlighting inside fenced blocks is a separate feature, not part of live preview. [live-preview-code-fence-block-reveal]
+- **Code fences (` ``` `).** Per-block reveal, not per-line: when the cursor is anywhere *inside the fenced block* (between the opening and closing ` ``` ` lines, inclusive), the fences reveal. Outside, they fade and the block renders with a monospace background. Per-line would have shown a fence-line on top of an "indented" block which looks broken; per-block reads cleanly. Code-block content stays the literal source — language-specific syntax highlighting inside fenced blocks is a separate feature, not part of live preview. [live-preview-code-fence-block-reveal]
 - **Blockquotes (`>`).** The `>` marker is *always* visible. It's a useful structural cue and fading it (turning quoted text into bare-but-italic prose) is more disorienting than helpful. The text after the marker can pick up subtle styling (muted color, italic) but the marker itself stays. [live-preview-block-markers-keep]
 - **Lists.** Bullets (`-`/`*`/`+`) and numbered prefixes (`1.`, `2.`) are *always* visible. Same reasoning as blockquotes — they're structural, not decorative. v1 does not prettify bullets to `•` glyphs; the literal marker is what shows. [live-preview-block-markers-keep]
 - **Horizontal rules (`---`).** v1 leaves them as literal text on a styled line (subtle muted color). Tier 2 will replace them with an actual rule decoration.
 - **Tables.** v1 leaves them as literal source. Tables read tolerably as monospaced pipe-and-dash text, and a real table widget is Tier 2 work.
-- **Frontmatter.** The `---` block at the top of a `.md` file is parsed by the editor's markdown parser and rendered as a styled-but-plain block (muted color, monospace). No marker fading; no key/value parsing in this layer. [live-preview-frontmatter-passthrough]
+- **Frontmatter.** The `---` block at the top of a `.md` file is parsed by the editor's markdown parser and rendered as a styled-but-plain block at **body size** (not heading size) using the configured code font (per `editor-three-fonts` in `editor.md`), with muted color. No marker fading; no key/value parsing in this layer. The body-size + code-font rule is what keeps a YAML frontmatter block from rendering as a tall stack of heading-sized lines when the parser's default heading-level inference would otherwise apply. [live-preview-frontmatter-passthrough] [editor-frontmatter-rendering-fix]
+
+- **Fenced code blocks — syntax highlighting.** Code inside fenced blocks is syntax-highlighted by the language named on the opening fence (` ```rust `, ` ```py `, …). Highlighting renders as a styling layer over the literal source — the block's reveal behavior, monospace background, and the live-preview fence-marker rule above are unchanged; only the per-token color is added. Engine: `tree-sitter-highlight` (pure-Rust). Languages shipped: rust, python, typescript, javascript, bash, json, toml, yaml, markdown, sql. Adding a language is one workspace dep + one registration in `editor-md::syntax`. Unrecognized info-string languages render the block as plain monospace (no error, no fallback guess). When `[code-source-ingest]` lands (per `ideas.md`), the same highlighter applies to code files opened as editor buffers, gated on the file's extension. [editor-code-syntax-highlight]
 
 
 ## Implementation
@@ -87,7 +89,6 @@ The providers live in the `editor-md` crate (e.g. `editor/editor-md/src/styling.
 - **Tier 3 — media widgets.** Inline images, KaTeX math, embeds/transclusions, drag-to-resize. Left for later in the editor's decoration pipeline (see `editor.md`); gets its own spec when built.
 - **Setext-style heading marker fade.** Skipped in v1 because per-line reveal misbehaves on multi-line markers; revisit if real content uses them.
 - **Bullet-glyph prettification** (`-` → `•`). Out of v1 to keep "what you typed" visually present. Easy to add later as a styling-only change.
-- **Code-block syntax highlighting** (language-specific colors inside fenced blocks). Separate language-injection feature, not part of live preview.
 - **Per-vault / per-user persistence of the toggle.** Lands with `settings.md`'s editor section.
 
 

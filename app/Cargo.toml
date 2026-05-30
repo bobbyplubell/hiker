@@ -33,7 +33,6 @@ puffin_http = { version = "0.16", optional = true }
 # UI
 egui.workspace = true
 egui_extras.workspace = true
-egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { workspace = true, features = ["serde"] }
 graph-widgets.workspace = true
 eframe.workspace = true
@@ -77,6 +76,7 @@ ulid.workspace = true
 smol_str.workspace = true
 time.workspace = true
 similar.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true

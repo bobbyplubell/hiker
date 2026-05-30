@@ -52,6 +52,16 @@ v3 ships a deliberately small surface — three reads, three writes — covering
 - **`get_note(rel_path: string, detail?: 'digest'|'snippet'|'full')`** — fetch a single note. `digest` returns id + title + (when summary enrichment lands) cached summary. `snippet` returns top-1 chunk + heading_path. `full` returns the entire body. Default for explicit `get_note` calls is `full`; multi-hit search responses default to `digest`. [mcp-tool-get-note, mcp-progressive-disclosure]
 - **`related_notes(rel_path: string, top_k?: number)`** — wraps the existing `related-notes-query`. Returns the same `RelatedHit` shape the UI's related panel already consumes. [mcp-tool-related-notes]
 
+### UI context tools
+
+Three read tools that surface "what is the user looking at right now" to an attached agent. Cheap to call, no new permission beyond the existing vault-read posture (every value they return is derivable from state the agent could observe with an extra `get_note` round-trip; these tools cut the round-trip). All three honor per-tool toggles under `[mcp.tools]` (defaults true). All three return inert payloads when no buffer is focused so the agent gets a clean "nothing's active" answer rather than an error.
+
+- **`get_active_note()`** — returns the focused editor tab's vault-relative path plus the cursor's byte offset and (if non-empty) the current selection's `{ start_byte, end_byte }`. Buffer-only — when the active tab is an app page (settings / home / queue / etc., per `tab-kinds`), returns `{ path: null }`. The path is the value `chat-active-note-context-injection` already injects on every turn; exposing it as a tool lets a session-less rmcp client see the same context. [mcp-tool-get-active-note]
+- **`get_open_notes()`** — returns the ordered list of currently-open `buffer` tabs, each as `{ path, active: bool }`. Non-buffer tab kinds are omitted (an `agent` / `graph` / `home` tab doesn't have a note path). Order matches the tab strip's visible order. Useful for "summarize the set of notes I've been moving between." [mcp-tool-get-open-notes]
+- **`get_selection()`** — returns the active buffer's current selection as `{ path, start_byte, end_byte, text }` when non-empty, else `{ path: null }`. Same data the chat input's `@selection` token captures (per `chat-input-at-selection`); exposing it as an MCP tool means a non-chat agent (Claude Code, Codex over MCP) can read the user's highlight without the user having to copy-paste. [mcp-tool-get-selection]
+
+All three are read-only and bypass the read-before-write set — calling them does **not** count as "the agent read this path" for `mcp-read-before-write` purposes; only `get_note` populates the read set. Otherwise an agent could `get_open_notes()` and then claim it had read the file.
+
 ### Pending-op introspection tools
 
 When `review_required` is on (per `agent-write-review-mode`), agent writes don't land on disk — they enter the document's pending queue per `op-log-pending-queue` / `op-log-status-states`. An agent that called `write_note("inbox/foo.md", ...)` and then `get_note("inbox/foo.md")` sees `1002 note_not_found` (against the accepted materialization) even though the write "succeeded" with `status: "pending"`. These tools let the agent confirm and inspect its own pending work. Both wrap `core::oplog::query` filtered to pending ops by surface + session.
@@ -83,10 +93,10 @@ All writes route through `core::ops`. Every agent write produces ops tagged `aut
 
 **Authorship stamping is creation-only** — only a `write_note` that *creates* a file stamps `hiker.author: agent-authored`; replacements and every `edit_note` / `set_frontmatter` / `apply_tag` skip it. Per-modification provenance lives on each op's `author` field. Full statement under Authorship + audit trail (`mcp-author-stamp-on-create-only`).
 
-**Pending-mode caveat — load-bearing for agent behavior.** When `[mcp.tools].review_required` is on (see `agent-write-review-mode`), every write tool below produces ops with `status = pending` *instead of* writing to disk. The tool returns `{ status: "pending", op_ids: ["<id>", ...] }` and the file is **not** visible on disk or via `get_note` until the user accepts — `get_note` returns `1002 note_not_found` for a path that exists only as pending ops (per `mcp-staging-read-disk-only`). Tool descriptions surface this behavior in plain language so the agent doesn't mistake a pending write for a failed write; the agent can introspect via `mcp-tool-list-pending-proposals` / `mcp-tool-get-pending-proposal`. `edit_note` produces *one `Replace` op per edit* sharing a `batch_id` per `op-log-op-shape`; `write_note` / `set_frontmatter` / `apply_tag` produce one op per call. [mcp-write-tools-staging-aware]
+**Pending-mode caveat — load-bearing for agent behavior.** When `[mcp.tools].review_required` is on (see `agent-write-review-mode`), every write tool below produces ops with `status = pending` *instead of* writing to disk. The tool returns `{ status: "staged", staging_id: "<id>" }` (`write_note` / `set_frontmatter` / `apply_tag`) or `{ status: "staged", staging_ids: ["<id>", ...] }` (`edit_note`, one per edit); in direct mode the response is `{ status: "written" }`. The file is **not** visible on disk or via `get_note` until the user accepts — `get_note` returns `1002 note_not_found` for a path that exists only as pending ops (per `mcp-staging-read-disk-only`). Tool descriptions surface this behavior in plain language so the agent doesn't mistake a pending write for a failed write; the agent can introspect via `mcp-tool-list-pending-proposals` / `mcp-tool-get-pending-proposal`. `edit_note` produces *one `Replace` op per edit* sharing a `batch_id` per `op-log-op-shape`; `write_note` / `set_frontmatter` / `apply_tag` produce one op per call. [mcp-write-tools-staging-aware]
 
 - **`write_note(rel_path: string, content: string, expected_hash?: string)`** — create or replace a note's body. If `expected_hash` is provided, the write is drift-aware (checks against `materialize(accepted)`); without it, an unconditional write. Refuses paths under `.hiker/`. Stamps `hiker.author: agent-authored` on the resulting frontmatter *only when the target path did not previously exist* (per `mcp-author-stamp-on-create-only`). When the target path already exists, the call requires the agent to have read the note in the current session via `get_note` first (`1008 read_required`); see `mcp-read-before-write`. Creates are exempt. Returns the new content hash. [mcp-tool-write-note]
-- **`edit_note(rel_path: string, edits: [{ old_str: string, new_str: string, replace_all?: bool }])`** — apply one or more span-anchored patches to an existing note. Each `old_str` must match exactly once in the file unless `replace_all: true`. Refuses non-existent paths (use `write_note` to create). Validation happens at receive time as one transaction; on any failure the whole call rejects and nothing is queued. Returns `{ status: "pending" | "accepted", op_ids?: [...], content_hash?: string }`. [mcp-tool-edit-note]
+- **`edit_note(rel_path: string, edits: [{ old_str: string, new_str: string, replace_all?: bool }])`** — apply one or more span-anchored patches to an existing note. Each `old_str` must match exactly once in the file unless `replace_all: true`. Refuses non-existent paths (use `write_note` to create). Validation happens at receive time as one transaction; on any failure the whole call rejects and nothing is queued. Returns `{ status: "staged", staging_ids: [...] }` in review mode or `{ status: "written", content_hash }` in direct mode. [mcp-tool-edit-note]
 
   Validation rules (all must hold before the call is accepted):
 
@@ -114,11 +124,24 @@ Trails (per `trails.md`) get a six-tool surface — three read, three write — 
 
 ### Board tools
 
-Boards (per `kanban.md`) get a three-tool surface — two read, one write — so attached agents can read boards as context and curate them. The write tool routes through the same op-log user-save path the board UI uses and produces a pending op when `agent-write-review-mode` is on (the staged board-doc edit appears in the patch-review surface; disk is unchanged until accept). Each tool is independently toggleable under `[mcp.tools]` (`boards_list_enabled` / `board_get_enabled` / `board_add_card_enabled`).
+Boards (per `kanban.md`) get a read + curate MCP surface so attached agents can read boards as context and reorganize them. Every **write** tool routes through the same op-log user-save path the board UI uses and produces a pending op when `agent-write-review-mode` is on (the staged board-doc edit appears in the patch-review surface; disk is unchanged until accept), commits via `op_writes::user_save` in direct mode, returns `{status: "staged", staging_id}` in review mode or `{status: "written"}` direct, and is independently toggleable under `[mcp.tools]`. Card-targeting writes identify the card by its board-local `card_id` (from `board_get`); column writes by column name. All board mutations touch only the board-doc frontmatter — referenced notes are never modified.
+
+Read:
 
 - **`boards_list()`** — enumerate every board-doc in the vault; returns `rel_path` + `board_id` + `title` + `column_count` + `card_count` per board (the `core::boards::list` shape). [mcp-tool-boards-list]
-- **`board_get(rel_path)`** — full board-doc body + resolved columns, each column carrying its ordered cards (title + reference-resolution outcome), via `core::boards::get_board`. [mcp-tool-board-get]
-- **`board_add_card(board_rel_path, column, source_rel_path)`** — append a note as a card to a board column; idempotent per board (a note already on the board returns `status: "noop"`). In review mode the board-doc frontmatter edit STAGES as one pending op (`status: "staged"` + `staging_id`); in direct mode it commits via `op_writes::user_save` (`status: "written"`). [mcp-tool-board-add-card]
+- **`board_get(rel_path)`** — full board-doc body + resolved columns, each column carrying its ordered cards (each card's `card_id`, title, and reference-resolution outcome), via `core::boards::get_board`. The `card_id`s it returns are the handles the write tools below take. [mcp-tool-board-get]
+
+Write:
+
+- **`board_create(name)`** — create a new board-doc (default `Todo`/`Doing`/`Done` columns) at the configured `[boards] new_board_dir`; returns the new `rel_path` + `board_id`. Wraps `core::boards::ops::create_board`. [mcp-tool-board-create]
+- **`board_add_card(board_rel_path, column, source_rel_path)`** — append a note as a card to a column; idempotent per board (a note already on the board returns `status: "noop"`). Wraps `core::boards::ops::add_card`. [mcp-tool-board-add-card]
+- **`board_add_text_card(board_rel_path, column, text)`** — append a freeform (non-note) text card to a column; returns the new `card_id`. Wraps `core::boards::ops::add_text_card`. [mcp-tool-board-add-text-card]
+- **`board_move_card(board_rel_path, card_id, to_column, to_index?)`** — move/reorder a card to `to_column` at `to_index` (tail when omitted). Wraps `core::boards::ops::move_card`. [mcp-tool-board-move-card]
+- **`board_set_card_text(board_rel_path, card_id, text)`** — rewrite a freeform card's text (errors on a note card). Wraps `core::boards::ops::set_card_text`. [mcp-tool-board-set-card-text]
+- **`board_remove_card(board_rel_path, card_id)`** — drop a card from the board (the referenced note is untouched). Wraps `core::boards::ops::remove_card`. [mcp-tool-board-remove-card]
+- **`board_add_column(board_rel_path, name)`** / **`board_rename_column(board_rel_path, old_name, new_name)`** / **`board_reorder_column(board_rel_path, name, to_index)`** / **`board_delete_column(board_rel_path, name)`** — column management; delete drops that column's card references (notes untouched). Wrap the matching `core::boards::ops::*_column` verbs. [mcp-tool-board-add-column, mcp-tool-board-rename-column, mcp-tool-board-reorder-column, mcp-tool-board-delete-column]
+
+`repoint_card` (path-conflict resolution) is intentionally **not** exposed — re-pointing a card whose note identity changed is a human-judgment call surfaced as the board's Keep/Repoint/Break modal, not an agent action.
 
 ### Task queue tools
 
@@ -257,7 +280,7 @@ Written on bind, removed on graceful shutdown. Stale files are detected by attem
 
 At rmcp `initialize` time, hiker advertises the tool list dynamically based on what features are present:
 
-- Always advertised in v3: `search_notes`, `get_note`, `related_notes`, `list_pending_proposals`, `get_pending_proposal`, `write_note`, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag`.
+- Always advertised in v3: `search_notes`, `get_note`, `related_notes`, `get_active_note`, `get_open_notes`, `get_selection`, `list_pending_proposals`, `get_pending_proposal`, `write_note`, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag`.
 - Conditionally advertised: nothing in v3, but the mechanism is built for future tools that depend on backing features (trails, landmarks, collections, vision extractors). Each future tool defines a `is_available()` predicate; the server filters its tool list at initialize time. [mcp-dynamic-capabilities]
 - Plugin-provided tools (per `plugins.md`'s `plugin-mcp-tools`) ride this same mechanism: a loaded, enabled plugin's declared tools join the surface at `initialize` and drop off when it's disabled or removed.
 
@@ -314,6 +337,9 @@ allow_redacted_lookup = false
 search_notes_enabled = true
 get_note_enabled = true
 related_notes_enabled = true
+get_active_note_enabled = true
+get_open_notes_enabled = true
+get_selection_enabled = true
 list_pending_proposals_enabled = true
 get_pending_proposal_enabled = true
 write_note_enabled = true

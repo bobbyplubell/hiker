@@ -198,10 +198,22 @@ impl History {
         if self.head == 0 {
             return false;
         }
+        let last = &self.revisions[self.head as usize];
+        // Coalescing composes `last.forward` with `tx.changes`, which is only
+        // defined when the new change's pre-state length matches the last
+        // revision's post-state length. If the doc advanced out-of-band since
+        // the last record (e.g. the op-log binding pulled a new `working` state
+        // into the editor between two keystrokes), those lengths diverge and
+        // the compose would trip `Set::compose`'s invariant assert. In that
+        // case never coalesce — start a fresh revision so undo stays correct.
+        // This guard is unconditional: it also overrides `join_with_previous`,
+        // since that flag cannot make a length-mismatched compose valid.
+        if last.forward.len_after() != tx.changes.len_before() {
+            return false;
+        }
         if tx.annotations.join_with_previous {
             return true;
         }
-        let last = &self.revisions[self.head as usize];
         matches!(
             (last.edit_type, tx.annotations.edit_type),
             (Some(EditType::Input), Some(EditType::Input))
@@ -468,5 +480,59 @@ mod tests {
         let fwd = h.later(Duration::from_millis(2000)).unwrap();
         apply(&mut rope, &fwd);
         assert_eq!(rope.to_string(), "AB");
+    }
+
+    #[test]
+    fn record_does_not_coalesce_across_out_of_band_doc_advance() {
+        // Regression for `bug-concurrent-edit-compose-length-mismatch-panic`.
+        //
+        // The layered op-log binding pulls a new `working` state into the
+        // editor's doc *out-of-band* (an accepted agent op) between two user
+        // keystrokes — it mutates `editor.doc` directly, NOT via `Editor::apply`,
+        // so `history` is not told. The next keystroke is recorded against the
+        // advanced doc, whose length no longer matches what the last coalescing
+        // candidate revision expects. Coalescing would then compose two Sets
+        // whose lengths disagree (`last.forward.len_after != tx.changes.len_before`),
+        // tripping `Set::compose`'s `compose length mismatch` assert.
+        //
+        // The fix: refuse to coalesce when the base diverged — start a fresh
+        // revision instead. Undo stays correct; the assert (a true invariant)
+        // is never violated from the coalesce path.
+        let mut rope = Rope::from_str("");
+        let mut h = History::new();
+        let sel0 = Selection::default();
+
+        let t0 = Instant::now();
+
+        // Keystroke 1: insert "a" at 0. doc -> "a".
+        let tx1 = insert_tx(rope.len_bytes(), 0, "a", EditType::Input);
+        let before = rope.clone();
+        apply(&mut rope, &tx1);
+        h.set_now(t0);
+        h.record(&before, &tx1, sel0.clone(), sel0.clone());
+        assert_eq!(rope.to_string(), "a");
+
+        // OUT-OF-BAND advance: the binding pulls a longer `working` into the doc
+        // directly (an accepted agent op). History is NOT informed; its last
+        // revision still thinks the post-state length is 1.
+        rope = Rope::from_str("aWORKING");
+
+        // Keystroke 2: insert "b" at the end of the advanced doc. Recorded
+        // within the coalesce window with the same Input edit type, so the old
+        // code would try to coalesce and compose mismatched-length Sets.
+        let tx2 = insert_tx(rope.len_bytes(), rope.len_bytes(), "b", EditType::Input);
+        let before = rope.clone();
+        apply(&mut rope, &tx2);
+        h.set_now(t0 + Duration::from_millis(10));
+        // Before the fix this panics: "compose length mismatch: 1 vs 8".
+        h.record(&before, &tx2, sel0.clone(), sel0.clone());
+        assert_eq!(rope.to_string(), "aWORKINGb");
+
+        // A fresh revision must have been created (no coalesce). Undoing it
+        // reverts only keystroke 2, against the advanced doc — proving the
+        // inverse was captured against the correct base.
+        let u = h.undo().unwrap();
+        apply(&mut rope, &u);
+        assert_eq!(rope.to_string(), "aWORKING", "undo reverts only the post-advance keystroke");
     }
 }

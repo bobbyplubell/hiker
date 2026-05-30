@@ -20,6 +20,42 @@ use editor_md::indenter::MarkdownIndent;
 use editor_view::viewport::ViewState;
 use editor_view::viewport::ClickAction;
 
+/// Compile a double/triple-click selection regex from config. Always returns a
+/// valid regex: empty string → `default` (the shared lazy default; lets users
+/// clear the field to reset). Invalid pattern → log once and use `default`, so
+/// a config typo can never break click selection. status: click-select-pattern
+fn compile_click_pattern(
+    pattern: &str,
+    which: &str,
+    default: fn() -> Arc<regex::Regex>,
+) -> Arc<regex::Regex> {
+    if pattern.is_empty() {
+        return default();
+    }
+    match regex::Regex::new(pattern) {
+        Ok(re) => Arc::new(re),
+        Err(err) => {
+            tracing::warn!(
+                target: "ui::editor",
+                pattern, which, error = %err,
+                "invalid editor click-select pattern; using default",
+            );
+            default()
+        }
+    }
+}
+
+/// Pattern strings cached on the buffer alongside the compiled regexes, so the
+/// per-frame `sync_click_patterns` call can skip recompiling when the user
+/// hasn't actually edited the setting. Default-initialized to whatever was
+/// passed at construction; `sync_click_patterns` keeps them in lockstep with
+/// `view.double_click_re` / `view.triple_click_re`.
+#[derive(Default, Clone)]
+pub struct ClickPatternCache {
+    pub double_src: String,
+    pub triple_src: String,
+}
+
 pub struct Buffer {
     /// What this buffer is sourcing — vault file, snapshot blob, pending
     /// proposal content, or trash entry. Drives the toolbar's per-source
@@ -130,6 +166,22 @@ pub struct Buffer {
     /// accept/reject flips the contributing pending op ids through
     /// `core::ops::op_writes::flip_op_status`. Per `patch-review-buffer-state`
     /// in `patch-review.md`.
+    /// Source strings for the compiled `view.double_click_re` / `triple_click_re`,
+    /// kept in sync with config by the per-frame `sync_click_patterns` call.
+    /// Tracking the strings (not just the compiled regexes) lets the sync skip
+    /// recompiling when the setting hasn't changed. status: click-select-pattern
+    pub click_patterns: ClickPatternCache,
+    /// Per-buffer find-bar UI state (`editor-find-in-note`). The match
+    /// engine itself lives in `editor_view::find::SearchState` on the
+    /// view; this struct is the host-side UI bits — bar open/closed,
+    /// query draft, debounce timestamps, error / wrapped hints, and the
+    /// saved selection restored when Esc closes the bar.
+    pub find_ui: FindUi,
+    /// Per-buffer reader / focus view toggle (`editor-reader-view`).
+    /// When true, the buffer panel hides its toolbar + status bar, and
+    /// the host hides the window-level chrome (top toolbar, side bars,
+    /// activity bar, status bar) around the active editor.
+    pub reader_view: bool,
     pub agent_proposal: Option<String>,
     /// Which agent session's pending ops are in scope for the inline review.
     /// `None` selects the whole pending queue (all sessions). The file pill
@@ -137,6 +189,37 @@ pub struct Buffer {
     /// accept-reject pass it to the op-log seams so the hunks and flips are
     /// scoped to one session at a time. Per `patch-review-multi-session`.
     pub active_session: Option<String>,
+}
+
+/// Per-buffer find-bar UI state (`editor-find-in-note`). The match index
+/// itself lives in `view.search` (`editor_view::find::SearchState`); this
+/// struct is the host-side bits that don't belong in the editor crate.
+#[derive(Default)]
+pub struct FindUi {
+    /// Whether the find bar is visible on the buffer panel.
+    pub open: bool,
+    /// Most-recent regex parse error, when the regex toggle is on and
+    /// the pattern doesn't compile. Cleared on every successful run.
+    pub regex_error: Option<String>,
+    /// When the user edited the query last; the buffer panel debounces
+    /// match-index rebuilds ~150ms off this.
+    pub query_dirty_at: Option<std::time::Instant>,
+    /// When a wrap happened last; the panel shows a one-shot
+    /// `Wrapped to top` / `Wrapped to bottom` hint until ~1.2s elapses.
+    pub wrapped_hint_at: Option<std::time::Instant>,
+    /// Direction of the most recent wrap (`true` = wrapped past end →
+    /// jumped to top, `false` = past start → jumped to bottom). Drives
+    /// the hint text.
+    pub wrapped_forward: bool,
+    /// Selection snapshot captured when the bar was opened; restored on
+    /// Esc so closing the bar puts the cursor back where the user was
+    /// (per `editor-find-in-note`'s "Esc closes and returns selection to
+    /// the active match" — we keep the explicit pre-bar selection so the
+    /// user can undo a wandering "next match" walk in one keystroke).
+    pub saved_selection: Option<editor_core::selection::Selection>,
+    /// Set true on open so the buffer panel can request keyboard focus
+    /// on the find input on the next paint.
+    pub focus_next_frame: bool,
 }
 
 /// Slot for one cached decoration provider output.
@@ -261,6 +344,23 @@ impl Buffer {
         };
         view.wrap_map.set_enabled(wrap);
         view.hide_gutter = !show_ln;
+        // Configurable double/triple-click selection: compile the user's
+        // `editor.{double,triple}_click_pattern` regexes. Empty = built-in
+        // word/line selection; an invalid pattern logs once and falls back to
+        // built-in so a typo never breaks selection. status: click-select-pattern
+        let double_src = cfg.map(|c| c.editor.double_click_pattern.clone()).unwrap_or_default();
+        let triple_src = cfg.map(|c| c.editor.triple_click_pattern.clone()).unwrap_or_default();
+        view.double_click_re = compile_click_pattern(
+            &double_src,
+            "double_click_pattern",
+            editor_view::viewport::default_double_click_regex,
+        );
+        view.triple_click_re = compile_click_pattern(
+            &triple_src,
+            "triple_click_pattern",
+            editor_view::viewport::default_triple_click_regex,
+        );
+        let click_patterns = ClickPatternCache { double_src, triple_src };
         // Wikilink autocomplete: register a Source so typing `[[`
         // opens a vault-path picker. Only attached when a vault handle is
         // available (always true in normal app flow; preview buffers may
@@ -301,8 +401,41 @@ impl Buffer {
                 .unwrap_or(false),
             show_minimap: cfg.map(|c| c.editor.show_minimap).unwrap_or(true),
             hide_scrollbar: cfg.map(|c| c.editor.hide_scrollbar).unwrap_or(false),
+            click_patterns,
+            find_ui: FindUi::default(),
+            reader_view: false,
             agent_proposal: None,
             active_session: None,
+        }
+    }
+
+    /// Re-derive `view.double_click_re` / `view.triple_click_re` from the live
+    /// config when the user has edited the patterns since this buffer was
+    /// constructed. Cheap when nothing changed (two string compares); only
+    /// recompiles the regex on an actual edit. Wired into the buffer panel's
+    /// per-frame render path so config changes take effect without needing to
+    /// close and reopen the file. status: click-select-pattern
+    /// Apply pre-detected changes to the click-select patterns. Each arg is
+    /// `Some(new_src)` when the live config differs from the cached source and
+    /// `None` otherwise — the caller does the equality check under the config
+    /// read lock so the no-change frame never allocates. status:
+    /// click-select-pattern
+    pub fn sync_click_patterns(&mut self, double_src: Option<String>, triple_src: Option<String>) {
+        if let Some(src) = double_src {
+            self.view.double_click_re = compile_click_pattern(
+                &src,
+                "double_click_pattern",
+                editor_view::viewport::default_double_click_regex,
+            );
+            self.click_patterns.double_src = src;
+        }
+        if let Some(src) = triple_src {
+            self.view.triple_click_re = compile_click_pattern(
+                &src,
+                "triple_click_pattern",
+                editor_view::viewport::default_triple_click_regex,
+            );
+            self.click_patterns.triple_src = src;
         }
     }
 

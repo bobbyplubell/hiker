@@ -32,8 +32,9 @@ mod patch;
 pub mod sections;
 
 use sections::{
-    AcpConfig, BoardsConfig, EditorConfig, IndexingConfig, LlmConfig, McpConfig, OpLogConfig,
-    SearchConfig, SuggestionsConfig, SyncSection, TasksConfig, TrailsConfig, VaultConfig,
+    AcpConfig, BoardsConfig, ClusteringConfig, EditorConfig, InboxConfig, IndexingConfig,
+    LlmConfig, McpConfig, OpLogConfig, SearchConfig, SuggestionsConfig, SyncSection, TasksConfig,
+    TrailsConfig, VaultConfig, WikilinksConfig,
 };
 
 use io::{atomic_write, deep_merge, display_path, write_defaults};
@@ -92,6 +93,9 @@ pub struct Config {
     pub trails: TrailsConfig,
     #[serde(default)]
     pub boards: BoardsConfig,
+    /// status: wikilink-ambiguous-resolution
+    #[serde(default)]
+    pub wikilinks: WikilinksConfig,
     #[serde(default)]
     pub acp: AcpConfig,
     /// status: op-log-config-section
@@ -102,6 +106,12 @@ pub struct Config {
     pub sync: SyncSection,
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
+    /// status: trail-draft-from-clustering
+    #[serde(default)]
+    pub clustering: ClusteringConfig,
+    /// status: inbox-rules
+    #[serde(default)]
+    pub inbox: InboxConfig,
     #[serde(default)]
     pub ui: Ui,
 }
@@ -109,13 +119,23 @@ pub struct Config {
 /// UI-layer preferences. Currently just the custom-titlebar toggle;
 /// future entries will join (theme, sidebar widths, etc.). Living on
 /// `Config` means changes persist via the standard `Config::set` path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ui {
-    /// When true, the app draws its own titlebar (drag region + window
-    /// controls) and asks eframe to hide native chrome.
-    #[serde(default)]
+    /// When true (the default), the app draws its own titlebar (window
+    /// controls + merged top bar) and asks eframe to hide native chrome.
+    #[serde(default = "default_true")]
     pub custom_titlebar: bool,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self { custom_titlebar: true }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_schema_version() -> u32 {
@@ -135,10 +155,13 @@ impl Default for Config {
             tasks: TasksConfig::default(),
             trails: TrailsConfig::default(),
             boards: BoardsConfig::default(),
+            wikilinks: WikilinksConfig::default(),
             acp: AcpConfig::default(),
             op_log: OpLogConfig::default(),
             sync: SyncSection::default(),
             suggestions: SuggestionsConfig::default(),
+            clustering: ClusteringConfig::default(),
+            inbox: InboxConfig::default(),
             ui: Ui::default(),
         }
     }
@@ -232,137 +255,18 @@ impl Config {
     /// mismatch, or schema-version mismatch aborts with a clear error.
     pub fn load(vault_root: &Path) -> Result<Self, HikerError> {
         let paths = Paths::resolve(vault_root);
-
-        // User file: best-effort. If we couldn't resolve the platform config
-        // dir, treat it as empty rather than failing — vault TOML can still
-        // carry everything the user needs.
-        let user_doc = match paths.user.as_ref() {
-            Some(p) => Some({
-                if p.exists() {
-                    let raw = fs::read_to_string(p).map_err(|e| {
-                        tracing::error!(file = %p.display(), error = %e, "settings read failed");
-                        HikerError::Config(format!("read {}: {e}", p.display()))
-                    })?;
-                    toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
-                        tracing::error!(
-                            file = %p.display(),
-                            error = %e,
-                            "settings parse failed",
-                        );
-                        HikerError::Config(format!("parse {}: {e}", p.display()))
-                    })?
-                } else {
-                    write_defaults(p, &Self::default())?;
-                    toml::Value::try_from(Self::default()).expect("Config serializes cleanly")
-                }
-            }),
-            None => None,
-        };
-
-        let vault_doc = {
-            let path = &paths.vault;
-            if path.exists() {
-                let raw = fs::read_to_string(path).map_err(|e| {
-                    tracing::error!(file = %path.display(), error = %e, "settings read failed");
-                    HikerError::Config(format!("read {}: {e}", path.display()))
-                })?;
-                toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
-                    tracing::error!(
-                        file = %path.display(),
-                        error = %e,
-                        "settings parse failed",
-                    );
-                    HikerError::Config(format!("parse {}: {e}", path.display()))
-                })?
-            } else {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        HikerError::Config(format!("mkdir {}: {e}", parent.display()))
-                    })?;
-                }
-                let header = format!(
-                    "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
-                     # This file was auto-generated. Add per-vault overrides here;\n\
-                     # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
-                );
-                let body = format!("schema_version = {SCHEMA_VERSION}\n");
-                let bytes = format!("{header}{body}");
-                atomic_write(path, bytes.as_bytes())?;
-                let mut map = toml::map::Map::new();
-                map.insert("schema_version".into(), toml::Value::Integer(SCHEMA_VERSION as i64));
-                toml::Value::Table(map)
-            }
-        };
+        let user_doc = load_user_doc(paths.user.as_deref())?;
+        let vault_doc = load_vault_doc(&paths.vault)?;
 
         // Deep-merge user under vault (vault wins per-key). Tables recurse;
         // arrays and scalars replace.
-        let mut merged: toml::Value = match user_doc {
-            Some(u) => u,
-            None => toml::Value::Table(toml::map::Map::new()),
-        };
+        let mut merged: toml::Value =
+            user_doc.unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
         deep_merge(&mut merged, vault_doc);
 
-        // Schema-version check fires before deserialization so users get a
-        // helpful "schema N, expected M" instead of an unknown-field error
-        // from a future binary's keys.
-        if let Some(toml::Value::Integer(v)) = merged.get("schema_version")
-            && *v as u32 != SCHEMA_VERSION
-        {
-            let user_disp = display_path(paths.user.as_deref());
-            let vault_disp = paths.vault.display().to_string();
-            tracing::error!(
-                user_file = %user_disp,
-                vault_file = %vault_disp,
-                found = *v,
-                expected = SCHEMA_VERSION,
-                "settings schema_version mismatch",
-            );
-            return Err(HikerError::Config(format!(
-                "settings schema_version {v}, this binary expects {SCHEMA_VERSION} (user={user_disp}, vault={vault_disp})"
-            )));
-        }
-
-        // Both files have already parsed cleanly via `read_or_create`; if
-        // try_into fails here it's an unknown key or type mismatch from the
-        // *merged* view, so we can't single out which file contributed it
-        // without a per-file trial-deserialize. Surface both paths so the
-        // user can grep.
-        let cfg: Config = merged.try_into().map_err(|e: toml::de::Error| {
-            let user_disp = display_path(paths.user.as_deref());
-            let vault_disp = paths.vault.display().to_string();
-            tracing::error!(
-                user_file = %user_disp,
-                vault_file = %vault_disp,
-                error = %e,
-                "settings strict-load rejected merged config",
-            );
-            HikerError::Config(format!(
-                "invalid settings (user={user_disp}, vault={vault_disp}): {e}"
-            ))
-        })?;
-
-        // Cross-field validation: model must be one of the supported
-        // fastembed ids (per `embedder-model-selectable`). batch_size must
-        // be non-zero.
-        if !crate::embed::is_known_model(&cfg.indexing.model) {
-            tracing::error!(
-                key = "indexing.model",
-                value = %cfg.indexing.model,
-                "unsupported settings value",
-            );
-            return Err(HikerError::Config(format!(
-                "indexing.model = \"{}\" — supported: {}",
-                cfg.indexing.model,
-                crate::embed::supported_model_ids().join(", "),
-            )));
-        }
-        if cfg.indexing.batch_size == 0 {
-            tracing::error!(key = "indexing.batch_size", "value must be > 0");
-            return Err(HikerError::Config(
-                "indexing.batch_size must be > 0".to_string(),
-            ));
-        }
-
+        check_schema_version(&merged, &paths)?;
+        let cfg = deserialize_strict(merged, &paths)?;
+        validate_cross_field(&cfg)?;
         Ok(cfg)
     }
 
@@ -453,6 +357,146 @@ impl Config {
         // the merged state across both files.
         Self::load(vault_root)
     }
+}
+
+// ---------- `Config::load` helpers ----------
+//
+// Split out of `load` so the loader stays under the cognitive-complexity
+// budget. The split is along natural seams: parse the user file, parse
+// the vault file, verify the schema version against the binary, deserialize
+// with full per-file error context, and run cross-field invariants.
+
+/// Read + parse the per-user TOML, auto-creating it with defaults if
+/// missing. `None` when the platform config dir couldn't be resolved at
+/// all (treated as "no user file"); the loader still works off the vault
+/// file alone in that case.
+fn load_user_doc(user_path: Option<&Path>) -> Result<Option<toml::Value>, HikerError> {
+    let Some(p) = user_path else { return Ok(None) };
+    if p.exists() {
+        let raw = fs::read_to_string(p).map_err(|e| {
+            tracing::error!(file = %p.display(), error = %e, "settings read failed");
+            HikerError::Config(format!("read {}: {e}", p.display()))
+        })?;
+        let parsed = toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
+            tracing::error!(file = %p.display(), error = %e, "settings parse failed");
+            HikerError::Config(format!("parse {}: {e}", p.display()))
+        })?;
+        Ok(Some(parsed))
+    } else {
+        write_defaults(p, &Config::default())?;
+        Ok(Some(
+            toml::Value::try_from(Config::default()).expect("Config serializes cleanly"),
+        ))
+    }
+}
+
+/// Read + parse the per-vault TOML, auto-creating a minimal stub
+/// (header + `schema_version`) if missing.
+fn load_vault_doc(path: &Path) -> Result<toml::Value, HikerError> {
+    if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|e| {
+            tracing::error!(file = %path.display(), error = %e, "settings read failed");
+            HikerError::Config(format!("read {}: {e}", path.display()))
+        })?;
+        toml::from_str::<toml::Value>(&raw).map_err(|e: toml::de::Error| {
+            tracing::error!(file = %path.display(), error = %e, "settings parse failed");
+            HikerError::Config(format!("parse {}: {e}", path.display()))
+        })
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| HikerError::Config(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let header = format!(
+            "# Hiker vault settings (schema_version = {SCHEMA_VERSION}). See docs/settings.md.\n\
+             # This file was auto-generated. Add per-vault overrides here;\n\
+             # user-scope settings (LLM provider, API keys, etc.) live in your user config.toml.\n\n"
+        );
+        let body = format!("schema_version = {SCHEMA_VERSION}\n");
+        let bytes = format!("{header}{body}");
+        atomic_write(path, bytes.as_bytes())?;
+        let mut map = toml::map::Map::new();
+        map.insert(
+            "schema_version".into(),
+            toml::Value::Integer(SCHEMA_VERSION.into()),
+        );
+        Ok(toml::Value::Table(map))
+    }
+}
+
+/// Fail fast on a `schema_version` mismatch so users get a "schema N,
+/// expected M" instead of an unknown-field error from a future binary.
+fn check_schema_version(merged: &toml::Value, paths: &Paths) -> Result<(), HikerError> {
+    let Some(toml::Value::Integer(v)) = merged.get("schema_version") else {
+        return Ok(());
+    };
+    if *v as u32 == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let user_disp = display_path(paths.user.as_deref());
+    let vault_disp = paths.vault.display().to_string();
+    tracing::error!(
+        user_file = %user_disp,
+        vault_file = %vault_disp,
+        found = *v,
+        expected = SCHEMA_VERSION,
+        "settings schema_version mismatch",
+    );
+    Err(HikerError::Config(format!(
+        "settings schema_version {v}, this binary expects {SCHEMA_VERSION} (user={user_disp}, vault={vault_disp})"
+    )))
+}
+
+/// Deserialize the merged TOML into `Config` with `deny_unknown_fields`
+/// active. On failure, surface both source paths so the user can grep —
+/// we can't single out which file contributed the offending key from the
+/// merged view.
+fn deserialize_strict(merged: toml::Value, paths: &Paths) -> Result<Config, HikerError> {
+    merged.try_into().map_err(|e: toml::de::Error| {
+        let user_disp = display_path(paths.user.as_deref());
+        let vault_disp = paths.vault.display().to_string();
+        tracing::error!(
+            user_file = %user_disp,
+            vault_file = %vault_disp,
+            error = %e,
+            "settings strict-load rejected merged config",
+        );
+        HikerError::Config(format!(
+            "invalid settings (user={user_disp}, vault={vault_disp}): {e}"
+        ))
+    })
+}
+
+/// Cross-field invariants checked after deserialization succeeds:
+/// embedder model is a supported id, batch size is non-zero, inbox rules
+/// compile cleanly.
+fn validate_cross_field(cfg: &Config) -> Result<(), HikerError> {
+    if !crate::embed::is_known_model(&cfg.indexing.model) {
+        tracing::error!(
+            key = "indexing.model",
+            value = %cfg.indexing.model,
+            "unsupported settings value",
+        );
+        return Err(HikerError::Config(format!(
+            "indexing.model = \"{}\" — supported: {}",
+            cfg.indexing.model,
+            crate::embed::supported_model_ids().join(", "),
+        )));
+    }
+    if cfg.indexing.batch_size == 0 {
+        tracing::error!(key = "indexing.batch_size", "value must be > 0");
+        return Err(HikerError::Config(
+            "indexing.batch_size must be > 0".to_string(),
+        ));
+    }
+    // status: inbox-rules
+    // Compile happens here (vs. at first use) so a malformed rule aborts at
+    // vault open with a clear "rule N: <reason>" message.
+    if let Err(e) = crate::inbox::Rules::validate(&cfg.inbox.rules) {
+        tracing::error!(error = %e, "invalid [inbox] rules");
+        return Err(HikerError::Config(format!("[inbox] {e}")));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

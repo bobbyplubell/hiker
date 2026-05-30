@@ -17,7 +17,7 @@ layout, types, data structures, build order. SPEC.md says *what*; this says *how
 | Bidi | Deferred entirely. APIs are LTR-only; revisit if ever needed. | User does not need it. |
 | Accessibility | Deferred. | v2. |
 | Diff view | In v1. Side-by-side + unified+intraline. | User priority feature. |
-| Live preview | Full markdown live preview (Obsidian-mode) in v1, including tables. | User priority feature. |
+| Live preview | Full markdown live preview (inline mode) in v1, including tables. | User priority feature. |
 | Workspace | Multi-crate: core / view / egui / md / ts. | Renderer-agnostic state layer; testable headlessly. |
 
 ---

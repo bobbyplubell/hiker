@@ -55,10 +55,12 @@
 pub mod activity_bar;
 pub mod behavior;
 pub mod editor_area;
+pub mod feature;
 pub mod panel_area;
 #[cfg(feature = "serde")]
 pub mod persistence;
 pub mod side_bar;
+pub mod side_panel_stack;
 pub mod tab;
 pub mod theme;
 pub mod workspace;

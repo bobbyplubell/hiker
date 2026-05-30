@@ -53,6 +53,12 @@ pub trait BlobStore {
     fn set_cursor(&self, _device: &str, _blind_id: &str, _seq: u64) -> Result<(), Error> {
         Ok(())
     }
+
+    /// Drop every stored blob at `blind_id` AND reset all per-device cursors
+    /// against it — the server-side GC the receiver triggers after applying a
+    /// `Rename` op that rotated the doc's path. Idempotent: an unknown
+    /// `blind_id` is a successful no-op. [sync-rename-blob-rotation]
+    fn delete(&mut self, blind_id: &str);
 }
 
 /// In-memory [`BlobStore`]: a `HashMap<blind_id, Vec<(seq, ciphertext)>>` kept
@@ -90,6 +96,10 @@ impl BlobStore for MemBlobStore {
 
     fn latest_seq(&self, blind_id: &str) -> Option<u64> {
         self.logs.get(blind_id).and_then(|log| log.last().map(|(s, _)| *s))
+    }
+
+    fn delete(&mut self, blind_id: &str) {
+        self.logs.remove(blind_id);
     }
 }
 
@@ -321,6 +331,54 @@ impl BlobStore for FileBlobStore {
     fn set_cursor(&self, device: &str, blind_id: &str, seq: u64) -> Result<(), Error> {
         self.set_device_cursor(device, blind_id, seq)
     }
+
+    fn delete(&mut self, blind_id: &str) {
+        // Drop the cached log mirror.
+        self.logs.remove(blind_id);
+        // Remove the on-disk log; missing-file is fine (idempotent no-op).
+        let log_path = self.log_path(blind_id);
+        match fs::remove_file(&log_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, blind_id, "delete blob log: {e}"),
+        }
+        // Strip this blind_id from every device cursor file. Walking the
+        // cursors dir is acceptable — the cursors are small per-device files.
+        let cursors_dir = self.data_dir.join("cursors");
+        let Ok(entries) = fs::read_dir(&cursors_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("cursor") {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(&path) else { continue };
+            let mut map: HashMap<String, u64> = HashMap::new();
+            for line in contents.lines() {
+                if let Some((bid, s)) = line.split_once(' ')
+                    && let Ok(v) = s.trim().parse()
+                    && bid != blind_id
+                {
+                    map.insert(bid.to_string(), v);
+                }
+            }
+            let mut body = String::new();
+            for (bid, s) in &map {
+                body.push_str(&format!("{bid} {s}\n"));
+            }
+            let tmp = path.with_extension("cursor.tmp");
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                && f.write_all(body.as_bytes()).and_then(|_| f.sync_all()).is_ok()
+            {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
+    }
 }
 
 // --- the hub ---------------------------------------------------------------
@@ -504,9 +562,12 @@ impl<S: BlobStore> Hub<S> {
             // reports an empty content-key fingerprint and never participates in
             // the in-band key transfer (clients drive that peer-to-peer via
             // `sync_once`, not against the hub). [sync-vault-key-inband, sync-zero-knowledge-server]
+            // The hub is a relay, not a named user device, so it reports no
+            // self-set device name. [sync-device-name, sync-zero-knowledge-server]
             Message::Hello { .. } => Message::HelloAck {
                 device_fingerprint: self.keypair.fingerprint().0,
                 content_key_fp: String::new(),
+                device_name: None,
             },
             Message::UpdateBlob {
                 blind_id,
@@ -533,6 +594,14 @@ impl<S: BlobStore> Hub<S> {
                     let _ = self.record_cursor(peer, &blind_id, *high);
                 }
                 Message::BlobBatch { blind_id, blobs }
+            }
+            // Server-side GC of the blob stream at `blind_id` after a rename
+            // rotated the doc's path on the sender. Idempotent — an unknown
+            // blind_id is a successful no-op. Connection is already enrollment
+            // gated. [sync-rename-blob-rotation]
+            Message::DeleteBlob { blind_id } => {
+                self.store.delete(&blind_id);
+                Message::DeleteBlobAck { blind_id }
             }
             other => {
                 tracing::debug!(?other, "hub ignoring non-relay request");

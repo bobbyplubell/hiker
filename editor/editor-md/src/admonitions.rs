@@ -1,4 +1,4 @@
-//! Obsidian-style callouts. A callout is a blockquote whose first content line
+//! Callouts. A callout is a blockquote whose first content line
 //! starts with `[!type]` (case-insensitive). Supported types: note, warning,
 //! tip, info, important. Each gets a distinct background tint and left bar
 //! color. These decorations stack on top of the regular blockquote styling.

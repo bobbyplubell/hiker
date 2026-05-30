@@ -9,7 +9,21 @@ use eframe::egui;
 
 use crate::editor_pane;
 use crate::state::AppState;
-use crate::tabs::close_tab_with_dirty_guard;
+use crate::editor_pane::close_tab_with_dirty_guard;
+
+/// Window-level keybinding entry. Carries an action id (`area.verb`), the
+/// chord string surfaced by the help overlay, and a human label.
+///
+/// Action ids drive the command palette ([`crate::panels::command_palette`])
+/// and let an override file (deferred) rebind by id rather than chord. The
+/// `area` part of the id (everything before the first `.`) is what the
+/// palette renders as a small badge.
+#[derive(Clone, Copy, Debug)]
+pub struct KnownKeybind {
+    pub id: &'static str,
+    pub chord: &'static str,
+    pub label: &'static str,
+}
 
 /// Zero-sized handle for the window-level keybinding catalog. Kept as an
 /// inherent method (not a free fn) so the single production caller doesn't
@@ -17,26 +31,28 @@ use crate::tabs::close_tab_with_dirty_guard;
 pub struct Keybinds;
 
 impl Keybinds {
-/// Static list of window-level keybindings surfaced in the help panel.
-/// Buffer-local chords (Mod-S etc.) and editor-internal chords (motion,
-/// selection) are documented in their respective modules; this list is
-/// what gets enumerated in the F1 / `?` help overlay.
-pub const fn known_keybindings(self) -> &'static [(&'static str, &'static str)] {
+/// Static list of window-level keybindings surfaced in the help panel
+/// and the command palette. Buffer-local chords (motion, selection)
+/// are documented in their respective modules.
+pub const fn known_keybindings(self) -> &'static [KnownKeybind] {
     &[
-        ("Mod-S", "Save the active buffer"),
-        ("Mod-W", "Close the active tab"),
-        ("Mod-,", "Open Settings"),
-        ("Ctrl-K", "Open the command palette"),
-        ("Ctrl-Space", "Focus the search box"),
-        ("Ctrl-Tab", "Cycle to the next tab"),
-        ("Shift-Ctrl-Tab", "Cycle to the previous tab"),
-        ("Mod-1..9", "Jump to the Nth tab (Mod-9 = last)"),
-        ("Alt-Left", "Navigate back through history"),
-        ("Alt-Right", "Navigate forward through history"),
-        ("Mod-[", "Navigate back through history (macOS)"),
-        ("Mod-]", "Navigate forward through history (macOS)"),
-        ("Two-finger horizontal swipe", "Back / forward (browser-style)"),
-        ("F1 or ?", "Open the help overlay"),
+        KnownKeybind { id: "editor.save",        chord: "Mod-S",          label: "Save the active buffer" },
+        KnownKeybind { id: "editor.find",        chord: "Mod-F",          label: "Find in note" },
+        KnownKeybind { id: "editor.reader-view", chord: "Mod-Shift-R",    label: "Toggle reader / focus view" },
+        KnownKeybind { id: "tab.close",          chord: "Mod-W",          label: "Close the active tab" },
+        KnownKeybind { id: "vault.openSettings", chord: "Mod-,",          label: "Open Settings" },
+        KnownKeybind { id: "vault.commandPalette", chord: "Mod-Shift-P", label: "Open the command palette" },
+        KnownKeybind { id: "vault.commandPaletteCtrlK", chord: "Ctrl-K",  label: "Open the command palette (Ctrl-K)" },
+        KnownKeybind { id: "vault.focusSearch",  chord: "Ctrl-Space",     label: "Focus the search box" },
+        KnownKeybind { id: "tab.cycleNext",      chord: "Ctrl-Tab",       label: "Cycle to the next tab" },
+        KnownKeybind { id: "tab.cyclePrev",      chord: "Shift-Ctrl-Tab", label: "Cycle to the previous tab" },
+        KnownKeybind { id: "tab.jumpN",          chord: "Mod-1..9",       label: "Jump to the Nth tab (Mod-9 = last)" },
+        KnownKeybind { id: "navigation.back",    chord: "Alt-Left",       label: "Navigate back through history" },
+        KnownKeybind { id: "navigation.forward", chord: "Alt-Right",      label: "Navigate forward through history" },
+        KnownKeybind { id: "navigation.backMac", chord: "Mod-[",          label: "Navigate back through history (macOS)" },
+        KnownKeybind { id: "navigation.forwardMac", chord: "Mod-]",       label: "Navigate forward through history (macOS)" },
+        KnownKeybind { id: "navigation.swipe",   chord: "Two-finger horizontal swipe", label: "Back / forward (browser-style)" },
+        KnownKeybind { id: "view.toggleHelp",    chord: "F1 or ?",        label: "Open the help overlay" },
     ]
 }
 }
@@ -49,14 +65,14 @@ mod keybinds_tests {
     fn known_keybindings_has_required_entries() {
         let list = Keybinds.known_keybindings();
         assert!(list.len() >= 10, "expected at least 10 documented chords, got {}", list.len());
-        // Every entry must have a non-empty chord and description.
-        for (chord, desc) in list {
-            assert!(!chord.is_empty(), "empty chord");
-            assert!(!desc.is_empty(), "empty description for {chord}");
+        for k in list {
+            assert!(!k.chord.is_empty(), "empty chord");
+            assert!(!k.label.is_empty(), "empty description for {}", k.chord);
+            assert!(!k.id.is_empty(), "empty id for {}", k.chord);
+            assert!(k.id.contains('.'), "action id {} should be area.verb", k.id);
         }
-        // Headline chords the help overlay promises to surface.
-        let chords: Vec<&str> = list.iter().map(|(c, _)| *c).collect();
-        for required in &["Mod-S", "Mod-W", "Ctrl-Tab", "F1 or ?"] {
+        let chords: Vec<&str> = list.iter().map(|k| k.chord).collect();
+        for required in &["Mod-S", "Mod-W", "Ctrl-Tab", "F1 or ?", "Mod-F", "Mod-Shift-R", "Mod-Shift-P"] {
             assert!(
                 chords.contains(required),
                 "known_keybindings missing {required}; got {chords:?}",
@@ -67,9 +83,11 @@ mod keybinds_tests {
     #[test]
     fn known_keybindings_has_no_duplicates() {
         let list = Keybinds.known_keybindings();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (chord, _) in list {
-            assert!(seen.insert(chord), "duplicate chord in known_keybindings: {chord}");
+        let mut seen_chords: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for k in list {
+            assert!(seen_chords.insert(k.chord), "duplicate chord in known_keybindings: {}", k.chord);
+            assert!(seen_ids.insert(k.id), "duplicate id in known_keybindings: {}", k.id);
         }
     }
 }
@@ -134,10 +152,29 @@ pub fn handle_keybinds(&mut self, ctx: &egui::Context) {
         crate::toolbar::open_singleton_tab(state, crate::tab::TabKind::Settings);
     }
 
-    // Ctrl-K: open the command palette. The palette is searchable over
-    // every registered Action, so it doubles as a discovery surface for
-    // commands that don't have their own keybind.
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
+    // Mod-F: open the per-buffer find bar (`editor.find`). Routed to
+    // the active buffer so we don't open find on a non-buffer tab.
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::F)) {
+        if let Some(path) = active_buffer_path(state) {
+            crate::panels::buffer::find::open(state, &path);
+        }
+    }
+
+    // Mod-Shift-R: toggle reader / focus view on the active buffer.
+    if ctx.input_mut(|i| i.consume_key(shift_cmd, egui::Key::R)) {
+        if let Some(path) = active_buffer_path(state) {
+            if let Some(b) = state.session.buffers.get_mut(&path) {
+                b.reader_view = !b.reader_view;
+            }
+        }
+    }
+
+    // Ctrl-K / Mod-Shift-P: open the command palette. The palette is
+    // searchable over every registered keybind, so it doubles as a
+    // discovery surface for commands that don't have their own keybind.
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K))
+        || ctx.input_mut(|i| i.consume_key(shift_cmd, egui::Key::P))
+    {
         state.ui.palette_open = true;
         state.ui.palette_query.clear();
         state.ui.palette_selected = 0;
@@ -176,9 +213,110 @@ pub fn handle_keybinds(&mut self, ctx: &egui::Context) {
     // Two-finger horizontal swipe → back/forward, browser-style. Lives in
     // `widgets::swipe_nav` next to its on-screen indicator.
     state.handle_swipe_nav(ctx);
-
-    let _ = shift_cmd;
 }
+}
+
+/// Dispatch a window-level action by its `known_keybindings` id. The
+/// command palette uses this so palette invocations run through the
+/// same code path the chord handler runs (per `command-palette`'s
+/// "fires the action through the same dispatch path the keybind handler
+/// uses"). Returns `false` for unknown ids (no-op) so the caller doesn't
+/// need to maintain a parallel allowlist.
+pub fn dispatch_action(state: &mut AppState, id: &str) -> bool {
+    match id {
+        "editor.save" => {
+            // Save the active buffer through the editor pane (same path
+            // the Mod-S handler buried inside `panels::buffer` uses).
+            let Some(path) = active_buffer_path(state) else { return true };
+            if let Err(err) = editor_pane::save_buffer(state, &path) {
+                state.push_toast(format!("Save failed: {err}"), crate::state::ToastLevel::Error);
+            }
+        }
+        "editor.find" => {
+            if let Some(path) = active_buffer_path(state) {
+                crate::panels::buffer::find::open(state, &path);
+            }
+        }
+        "editor.reader-view" => {
+            if let Some(path) = active_buffer_path(state)
+                && let Some(b) = state.session.buffers.get_mut(&path)
+            {
+                b.reader_view = !b.reader_view;
+            }
+        }
+        "tab.close" => {
+            if let Some(id) = state.session.active_tab {
+                close_tab_with_dirty_guard(state, id);
+            }
+        }
+        "tab.cycleNext" => cycle_active(state, 1),
+        "tab.cyclePrev" => cycle_active(state, -1),
+        "vault.openSettings" => {
+            crate::toolbar::open_singleton_tab(state, crate::tab::TabKind::Settings);
+        }
+        "vault.commandPalette" | "vault.commandPaletteCtrlK" => {
+            state.ui.palette_open = true;
+            state.ui.palette_query.clear();
+            state.ui.palette_selected = 0;
+        }
+        "vault.focusSearch" => {
+            state.panels.search.focus_query_next_frame = true;
+        }
+        "navigation.back" | "navigation.backMac" => editor_pane::nav_go(state, -1),
+        "navigation.forward" | "navigation.forwardMac" => editor_pane::nav_go(state, 1),
+        "view.toggleHelp" => state.ui.show_help = !state.ui.show_help,
+        _ => return false,
+    }
+    true
+}
+
+/// True when the action id is currently dispatchable. Drives the
+/// greyed-out rows in the command palette (per `command-palette`).
+pub fn is_action_dispatchable(state: &AppState, id: &str) -> bool {
+    match id {
+        "editor.save" | "editor.find" | "editor.reader-view" => {
+            active_buffer_path(state).is_some()
+        }
+        "tab.close" | "tab.cycleNext" | "tab.cyclePrev" | "tab.jumpN" => {
+            state.session.active_tab.is_some()
+        }
+        _ => true,
+    }
+}
+
+/// True when the action touches LLM-backed features. Per
+/// `command-palette`, those rows hide entirely when `[llm] enabled =
+/// false` so the palette doesn't surface dead verbs. None of the v1
+/// window-level keybinds currently route into LLM features, but the
+/// gate stays in place so future additions just flip this match arm.
+pub const fn is_action_ai_touching(_id: &str) -> bool {
+    false
+}
+
+/// Infer a small "area" badge from the action id's prefix. The palette
+/// uses this label to group / colour rows; matches the convention in
+/// `command-palette`'s "source area as a small badge" rule.
+pub fn action_area_badge(id: &str) -> &'static str {
+    match id.split_once('.').map(|(area, _)| area) {
+        Some("editor") => "editor",
+        Some("tab") => "tab",
+        Some("navigation") => "navigation",
+        Some("vault") => "vault",
+        Some("view") => "view",
+        _ => "other",
+    }
+}
+
+/// Resolve the buffer-map key for the active editor tab, if any. Used by
+/// chords that act on the active buffer (find, reader view).
+fn active_buffer_path(state: &AppState) -> Option<String> {
+    let id = state.session.active_tab?;
+    let tab = state.tab_by_id(id)?;
+    if let crate::tab::TabKind::Editor { buffer, .. } = &tab.kind {
+        Some(crate::buffer::buffer_key_for_source(buffer))
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -230,7 +368,7 @@ fn cycle_active(state: &mut AppState, delta: i32) {
         .unwrap_or(0) as i32;
     let n = state.session.tabs.len() as i32;
     let next = ((current + delta) % n + n) % n;
-    state.session.active_tab = Some(state.session.tabs[next as usize].id);
+    crate::state::activate_tab(state, state.session.tabs[next as usize].id);
 }
 
 impl AppState {
@@ -246,6 +384,6 @@ fn jump_to_tab(&mut self, idx: usize, last_if_n: bool) {
     } else {
         return;
     };
-    state.session.active_tab = Some(state.session.tabs[target].id);
+    crate::state::activate_tab(state, state.session.tabs[target].id);
 }
 }

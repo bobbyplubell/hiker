@@ -31,6 +31,9 @@ impl EligibleKey {
             (ValueType::SidebarMode, J::String(s)) => {
                 matches!(s.as_str(), "files" | "clusters" | "trails")
             }
+            (ValueType::MinimapStyle, J::String(s)) => {
+                matches!(s.as_str(), "glyphs" | "bars")
+            }
             (ValueType::UnitFraction, J::Number(n)) => n
                 .as_f64()
                 .map(|f| (0.0..=1.0).contains(&f))
@@ -60,9 +63,6 @@ impl EligibleKey {
                 .unwrap_or(false),
             (ValueType::RecencyBias, J::String(s)) => {
                 matches!(s.as_str(), "off" | "mild" | "strong")
-            }
-            (ValueType::IdStamping, J::String(s)) => {
-                matches!(s.as_str(), "all" | "lazy")
             }
             (ValueType::EmbedderModel, J::String(s)) => crate::embed::is_known_model(s),
             (ValueType::HexColor, J::String(s)) => {
@@ -198,6 +198,8 @@ pub(super) enum ValueType {
     TreeSortBy,
     /// `files | clusters | trails`.
     SidebarMode,
+    /// `glyphs | bars` for `[editor.minimap] style`.
+    MinimapStyle,
     /// Floating-point fraction in `[0.0, 1.0]`.
     UnitFraction,
     /// Positive integer (fits in u32). Used for the LLM/agent knobs
@@ -217,8 +219,6 @@ pub(super) enum ValueType {
     SemanticTopK,
     /// `off | mild | strong` for `[search.semantic] recency_bias`.
     RecencyBias,
-    /// `all | lazy` for `[indexing] id_stamping`.
-    IdStamping,
     /// One of the supported fastembed model ids — `bge-small-en-v1.5` /
     /// `bge-m3` / `embedding-gemma-300m`. Used by `[indexing] model`.
     /// status: embedder-model-selectable
@@ -258,7 +258,7 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.show_minimap",           ty: ValueType::Bool },
     EligibleKey { path: "editor.hide_scrollbar",         ty: ValueType::Bool },
     EligibleKey { path: "editor.scroll_speed",           ty: ValueType::ScrollSpeed },
-    EligibleKey { path: "editor.minimap.style",                ty: ValueType::String },
+    EligibleKey { path: "editor.minimap.style",                ty: ValueType::MinimapStyle },
     EligibleKey { path: "editor.minimap.width",                ty: ValueType::MinimapWidth },
     EligibleKey { path: "editor.minimap.bar_padding_left",     ty: ValueType::MinimapPad },
     EligibleKey { path: "editor.minimap.bar_padding_right",    ty: ValueType::MinimapPad },
@@ -281,6 +281,9 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.font_system",            ty: ValueType::String },
     EligibleKey { path: "editor.font_editor",            ty: ValueType::String },
     EligibleKey { path: "editor.font_code",              ty: ValueType::String },
+    EligibleKey { path: "editor.double_click_pattern",   ty: ValueType::String },
+    EligibleKey { path: "editor.triple_click_pattern",   ty: ValueType::String },
+    EligibleKey { path: "ui.custom_titlebar",            ty: ValueType::Bool },
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
@@ -297,8 +300,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "trails.new_trail_dir",          ty: ValueType::String },
     // status: board-default-location
     EligibleKey { path: "boards.new_board_dir",          ty: ValueType::String },
-    // status: note-id-stamping
-    EligibleKey { path: "indexing.id_stamping",          ty: ValueType::IdStamping },
+    // status: trail-draft-from-clustering
+    EligibleKey { path: "clustering.propose_trails",     ty: ValueType::Bool },
     // status: embedder-model-selectable
     // status: settings-embedder-model-change-warning
     // Gated in the UI by a confirm modal (`settings-embedder-model-change-warning`)
@@ -363,9 +366,18 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
     // status: board-mcp-tools
-    EligibleKey { path: "mcp.tools.boards_list_enabled",    ty: ValueType::Bool },
-    EligibleKey { path: "mcp.tools.board_get_enabled",      ty: ValueType::Bool },
-    EligibleKey { path: "mcp.tools.board_add_card_enabled", ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.boards_list_enabled",        ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_get_enabled",          ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_card_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_create_enabled",       ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_text_card_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_move_card_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_set_card_text_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_remove_card_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_column_enabled",   ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_rename_column_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_reorder_column_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_delete_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -394,6 +406,12 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "sync.server_url",                  ty: ValueType::String },
     EligibleKey { path: "sync.discovery",                   ty: ValueType::Bool },
     EligibleKey { path: "sync.devices",                     ty: ValueType::StringArray },
+    // status: sync-device-name
+    // THIS device's self-set human name (vault scope, carried on the sync
+    // handshake). The learned `device_names` peer map is populated at runtime
+    // from handshakes (seeded from config), not user-set, so it is not an
+    // eligible write key.
+    EligibleKey { path: "sync.device_name",                 ty: ValueType::String },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },
@@ -406,6 +424,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
 pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "vault.recent",  ty: ValueType::StringArray },
     EligibleKey { path: "vault.default", ty: ValueType::String },
+    // [ui] chrome toggle — global app preference, eligible at user scope.
+    EligibleKey { path: "ui.custom_titlebar",               ty: ValueType::Bool },
     // status: embedder-model-selectable
     // Also eligible at user scope as a global default; per-vault override
     // wins per the standard merge rule.
@@ -449,9 +469,18 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.apply_tag_enabled",      ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.remove_tag_enabled",     ty: ValueType::Bool },
     // status: board-mcp-tools
-    EligibleKey { path: "mcp.tools.boards_list_enabled",    ty: ValueType::Bool },
-    EligibleKey { path: "mcp.tools.board_get_enabled",      ty: ValueType::Bool },
-    EligibleKey { path: "mcp.tools.board_add_card_enabled", ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.boards_list_enabled",        ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_get_enabled",          ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_card_enabled",     ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_create_enabled",       ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_text_card_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_move_card_enabled",    ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_set_card_text_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_remove_card_enabled",  ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_add_column_enabled",   ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_rename_column_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_reorder_column_enabled",ty: ValueType::Bool },
+    EligibleKey { path: "mcp.tools.board_delete_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -478,3 +507,42 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
 ];
 
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `editor.minimap.style` is validated against the `MinimapStyle`
+    /// allow-set (`glyphs` / `bars`), not as a free `String` — so a bogus
+    /// value is rejected at `set` time instead of being persisted and then
+    /// aborting the next strict-load. (bug-config-documented-sections-abort-strict-load)
+    #[test]
+    fn minimap_style_only_accepts_known_variants() {
+        let key = ELIGIBLE_VAULT
+            .iter()
+            .find(|k| k.path == "editor.minimap.style")
+            .expect("editor.minimap.style is eligible");
+        assert!(matches!(key.ty(), ValueType::MinimapStyle));
+        assert!(key.validate(&json!("glyphs")));
+        assert!(key.validate(&json!("bars")));
+        assert!(!key.validate(&json!("banana")));
+        assert!(!key.validate(&json!("Glyphs")));
+        assert!(!key.validate(&json!(true)));
+    }
+
+    /// `ui.custom_titlebar` is an eligible bool key at both scopes so the
+    /// documented `[ui]` toggle is user-settable (and round-trips through
+    /// strict-load). (bug-config-documented-sections-abort-strict-load)
+    #[test]
+    fn ui_custom_titlebar_is_eligible_bool_both_scopes() {
+        for table in [ELIGIBLE_VAULT, ELIGIBLE_USER] {
+            let key = table
+                .iter()
+                .find(|k| k.path == "ui.custom_titlebar")
+                .expect("ui.custom_titlebar is eligible");
+            assert!(matches!(key.ty(), ValueType::Bool));
+            assert!(key.validate(&json!(false)));
+            assert!(!key.validate(&json!("nope")));
+        }
+    }
+}

@@ -243,14 +243,16 @@ impl View<'_> {
     let app = self.app;
     let trees = app.vault_session.services.trees.as_ref();
     let store_mutex = app.vault_session.services.read_store.as_ref();
-    // Resolve path → note_id via the read store. Without an id we can't
+    // Resolve path → note_id via the op-log. Without an id we can't
     // join into the leaf rows.
-    let note_id_opt: Option<String> = {
-        let Ok(store) = store_mutex.lock() else {
-            return Vec::new();
-        };
-        store.id_for_path(path).unwrap_or(None)
-    };
+    // status: store-id-from-oplog
+    let _ = store_mutex; // store not needed once id comes from op-log
+    let note_id_opt: Option<String> = app
+        .vault_session
+        .services
+        .oplog
+        .doc_id_for_path(path)
+        .unwrap_or(None);
     let Some(note_id) = note_id_opt else {
         return Vec::new();
     };

@@ -7,11 +7,11 @@
 pub mod agent;
 pub mod buffer;
 pub mod changes;
+pub mod command_palette;
 pub mod cluster_graph;
-pub mod cluster_review;
 pub mod backlinks;
 pub mod board;
-pub mod discovery_pane;
+pub mod boards_index;
 pub mod graph;
 pub mod home;
 pub mod indexer_detail;

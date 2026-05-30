@@ -255,6 +255,52 @@ fn bootstrap_skips_non_utf8_and_persists_skip_marker() {
 }
 
 #[test]
+fn bootstrap_seeds_hidden_trail_waypoints() {
+    // A vault arriving with pre-existing waypoint-notes under
+    // `.hiker/trails/<id>/waypoints/` (e.g. via sync, or a fresh open
+    // against an existing trails store) must give each waypoint an op-log
+    // `doc_id` on bootstrap — otherwise trail integrity breaks until
+    // something individually ingests each file. The main
+    // `walk_indexable_files` pass prunes at `.hiker/`, so this exercises
+    // the second-pass walk over the `.hiker/trails/` carve-out.
+    // status: op-log-doc-id-bootstrap
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+
+    // A regular vault note for sanity.
+    std::fs::write(td.path().join("trails-readme.md"), "# Trails\n").unwrap();
+
+    // Two waypoint-notes pre-existing under .hiker/trails/<id>/waypoints/.
+    let wp_dir = td.path().join(".hiker/trails/01HFAKETRAILID000000000000/waypoints");
+    std::fs::create_dir_all(&wp_dir).unwrap();
+    std::fs::write(wp_dir.join("alpha--7K2A9F.md"), "alpha annotation\n").unwrap();
+    std::fs::write(wp_dir.join("beta--3Q8M1B.md"), "beta annotation\n").unwrap();
+
+    // A draft trail-doc at .hiker/trails/drafts/<id>.md.
+    let drafts = td.path().join(".hiker/trails/drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    std::fs::write(drafts.join("01HFAKEDRAFTID000000000000.md"), "---\nhiker:\n  kind: trail\n  draft: true\n---\n").unwrap();
+
+    let log = OpLog::open(td.path()).unwrap();
+    let seeded = bridge::bootstrap(&vault, &log).unwrap();
+    // 1 readme + 2 waypoints + 1 draft trail-doc = 4 seeded docs.
+    assert_eq!(seeded, 4);
+
+    // Every waypoint-note has a doc_id mapping.
+    let wp_a = ".hiker/trails/01HFAKETRAILID000000000000/waypoints/alpha--7K2A9F.md";
+    let wp_b = ".hiker/trails/01HFAKETRAILID000000000000/waypoints/beta--3Q8M1B.md";
+    let draft = ".hiker/trails/drafts/01HFAKEDRAFTID000000000000.md";
+    assert!(log.doc_id_for_path(wp_a).unwrap().is_some(), "alpha waypoint must be mapped");
+    assert!(log.doc_id_for_path(wp_b).unwrap().is_some(), "beta waypoint must be mapped");
+    assert!(log.doc_id_for_path(draft).unwrap().is_some(), "draft trail-doc must be mapped");
+
+    // Idempotent: a second bootstrap is a no-op walk.
+    assert_eq!(bridge::bootstrap(&vault, &log).unwrap(), 0);
+}
+
+#[test]
 fn user_save_writes_through_oplog_to_disk() {
     use crate::ops::op_writes as bridge;
 
@@ -279,6 +325,31 @@ fn user_save_writes_through_oplog_to_disk() {
     bridge::user_save(&log, &vault, "fresh.md", "new note\n").unwrap();
     let fresh = log.doc_id_for_path("fresh.md").unwrap().unwrap();
     assert_eq!(log.materialize_accepted(&fresh).unwrap().text, "new note\n");
+}
+
+#[test]
+fn ensure_doc_seeds_new_note_then_is_idempotent() {
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+
+    // Mimic the New Note button: create an empty file after bootstrap, with no
+    // op-log document registered for it yet.
+    vault.create_note("new-note-1.md").unwrap();
+    assert!(log.doc_id_for_path("new-note-1.md").unwrap().is_none());
+
+    // Opening the buffer ensures a doc; the path now resolves so the layered
+    // save (`commit_working`) has something to commit onto.
+    let id = bridge::ensure_doc(&log, &vault, "new-note-1.md").unwrap();
+    assert_eq!(log.doc_id_for_path("new-note-1.md").unwrap().as_deref(), Some(id.as_str()));
+    assert_eq!(log.materialize_accepted(&id).unwrap().text, "");
+
+    // Idempotent: a second call returns the same id, not a fresh document.
+    let again = bridge::ensure_doc(&log, &vault, "new-note-1.md").unwrap();
+    assert_eq!(again, id);
 }
 
 #[test]

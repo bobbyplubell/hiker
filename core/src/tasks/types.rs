@@ -281,7 +281,7 @@ pub struct TaskRecord {
     pub finished_at_ms: Option<u64>,
 }
 
-/// status: task-queue-row-details
+/// status: task-queue-home-detail-view
 /// On-demand inspection payload for a single task. Bigger than
 /// `TaskRecord` (carries the full prompt + retained result/error
 /// bodies); fetched lazily when the user clicks a queue-detail row so

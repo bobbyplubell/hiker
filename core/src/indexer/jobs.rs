@@ -14,12 +14,13 @@ use crate::chunker::markdown::Markdown;
 use crate::chunker::txt::Txt;
 use crate::embed::{Embedder, Error as EmbedError, FastembedEmbedder};
 use crate::hash_string;
+use crate::oplog::OpLog;
 use crate::store::dto::{new_id, MetaEntry, NoteUpsert};
 use crate::store::Store;
 use crate::watcher::is_ignored;
 
 use super::{
-    frontmatter_hiker_id, now_secs, path_extension, submit_embedder_load_task, update_status,
+    now_secs, path_extension, submit_embedder_load_task, update_status,
     update_total_notes, IndexJob, IndexJobTx, IndexStatus, Error, ProgressEvent,
     MAX_FILE_BYTES,
 };
@@ -40,6 +41,8 @@ pub(super) struct JobCtx<'a> {
     pub self_tx: &'a IndexJobTx,
     pub watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     pub oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    /// status: inbox-rules
+    pub inbox_cell: &'a Arc<OnceCell<Arc<crate::inbox::Rules>>>,
 }
 
 /// Subset of `JobCtx` used by handlers that don't need the trails /
@@ -49,6 +52,12 @@ pub(super) struct UpsertCtx<'a> {
     pub embedder: &'a Arc<dyn Embedder>,
     pub progress: &'a broadcast::Sender<ProgressEvent>,
     pub status: &'a watch::Sender<IndexStatus>,
+    /// Cell holding the vault's `OpLog` once `attach_oplog` runs. Per
+    /// `op-log-bootstraps-first`, this is populated before the indexer
+    /// processes any jobs in the steady state, so handlers read it via
+    /// `oplog_cell.get()` to translate vault paths to `doc_id` for
+    /// `notes.id`. status: store-id-from-oplog
+    pub oplog_cell: &'a Arc<OnceCell<Arc<OpLog>>>,
 }
 
 impl<'a> JobCtx<'a> {
@@ -61,6 +70,7 @@ impl<'a> JobCtx<'a> {
             embedder: self.embedder,
             progress: self.progress,
             status: self.status,
+            oplog_cell: self.oplog_cell,
         }
     }
 
@@ -73,7 +83,16 @@ impl<'a> JobCtx<'a> {
         // remove on every terminal outcome below.
         pending.lock().unwrap().insert(rel_path.clone());
         let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
-        let outcome = process_upsert(self.vault_root, store, self.embedder.clone(), &rel_path, force).await;
+        let oplog = self.oplog_cell.get().cloned();
+        let outcome = process_upsert(
+            self.vault_root,
+            store,
+            self.embedder.clone(),
+            oplog.as_deref(),
+            &rel_path,
+            force,
+        )
+        .await;
         pending.lock().unwrap().remove(&rel_path);
         match outcome {
             Ok(UpsertOutcome::Indexed) => {
@@ -115,31 +134,26 @@ impl<'a> JobCtx<'a> {
         let status = self.status;
         let self_tx = self.self_tx;
         let watcher_cell = self.watcher_cell;
-        // Inline `process_rename` (used only here): rename the stored path
-        // when an id is present, else return `Ok(false)` so the caller can
-        // treat the destination as a new upsert.
-        let process_result: Result<bool, Error> = (|| {
-            let id = match store.id_for_path(&from)? {
-                Some(id) => id,
-                None => return Ok(false),
-            };
-            store.rename_note(&id, &to)?;
-            Ok(true)
-        })();
+        // status: store-id-from-oplog
+        // Rename targets the `notes.path UNIQUE` row directly. False means
+        // the source path was never indexed; treat the destination as a
+        // fresh upsert. The op-log's `doc-index.db` rename happens through
+        // `record_oplog_rename` on the Move/MoveFolder paths; watcher-
+        // driven external renames here don't touch the op-log directly —
+        // a subsequent ingest re-reads `doc_id` from the (already updated
+        // or freshly minted) `doc-index.db` row.
+        let process_result: Result<bool, Error> =
+            store.rename_note_by_path(&from, &to).map_err(Error::from);
         match process_result {
             Ok(true) => {
                 let _ = progress.send(ProgressEvent::Renamed {
                     from: from.clone(),
                     to: to.clone(),
                 });
-                // status: trail-auto-update-on-note-move
-                // Watcher-driven external rename: run the trails update.
-                run_trails_on_note_moved(
-                    watcher_cell, self_tx, vault, store, &from, &to,
-                )
-                .await;
-                // status: board-card-references
-                run_boards_on_note_moved(
+                // status: wikilink-rename-rewrite
+                // Watcher-driven external rename: run the shared
+                // referrer-rewrite pass (trails + boards + wikilinks).
+                crate::links_rename::on_note_moved(
                     watcher_cell, self.oplog_cell, self_tx, vault, store, &from, &to,
                 )
                 .await;
@@ -401,6 +415,11 @@ pub(super) async fn handle_simple_job(
     let watcher_cell = ctx.watcher_cell;
     let _ = embedder; // some arms don't need it directly; per-handler ctxs pull it back in
     match job {
+        // status: inbox-rules
+        IndexJob::Created { rel_path } => {
+            let final_path = run_inbox_rules(ctx, store, &rel_path).await;
+            ctx.handle_upsert(store, final_path, false).await;
+        }
         IndexJob::Upsert { rel_path, force } => {
             ctx.handle_upsert(store, rel_path, force).await;
         }
@@ -426,18 +445,14 @@ pub(super) async fn handle_simple_job(
             // need to here. Run vault::move_note on the indexer's owned
             // store so all writes flow through one connection.
             let result = crate::vault::move_note(vault, store, None, &from, &to);
-            // status: trail-auto-update-on-note-move
-            // After the path remap succeeds, sweep trails referencing the
-            // moved note. Errors are swallowed (logged inside the helper)
-            // so a partial trails update never fails the move's reply.
+            // status: wikilink-rename-rewrite
+            // After the path remap succeeds, run the shared rename-rewrite
+            // pass over every referrer (trails, boards, wikilinks). Errors
+            // inside each domain helper are logged, never propagated, so a
+            // partial referrer update can't fail the move's reply.
             if result.is_ok() {
-                run_trails_on_note_moved(
-                    watcher_cell, self_tx, vault, store, &from, &to,
-                )
-                .await;
                 record_oplog_rename(ctx.oplog_cell, &from, &to);
-                // status: board-card-references
-                run_boards_on_note_moved(
+                crate::links_rename::on_note_moved(
                     watcher_cell, ctx.oplog_cell, self_tx, vault, store, &from, &to,
                 )
                 .await;
@@ -460,16 +475,11 @@ pub(super) async fn handle_simple_job(
                 .collect();
 
             let result = crate::vault::move_folder(vault, store, None, &from, &to);
-            // status: trail-auto-update-on-note-move
+            // status: wikilink-rename-rewrite
             if result.is_ok() {
                 for (old, new) in &pairs {
-                    run_trails_on_note_moved(
-                        watcher_cell, self_tx, vault, store, old, new,
-                    )
-                    .await;
                     record_oplog_rename(ctx.oplog_cell, old, new);
-                    // status: board-card-references
-                    run_boards_on_note_moved(
+                    crate::links_rename::on_note_moved(
                         watcher_cell, ctx.oplog_cell, self_tx, vault, store, old, new,
                     )
                     .await;
@@ -486,6 +496,20 @@ pub(super) async fn handle_simple_job(
             let result = crate::vault::delete_note(vault, store, None, &trash, &rel);
             match &result {
                 Ok(entry) => {
+                    // status: board-cards-derived-table
+                    // `vault::delete_note` drops the `notes`/`chunks` rows but
+                    // `board_cards` has no FK cascade, so a trashed board-doc's
+                    // derived rows must be cleared explicitly (mirrors the
+                    // `process_delete` cleanup the `IndexJob::Delete` path uses)
+                    // so the trashed board drops off the Boards index.
+                    // status: board-delete
+                    clear_board_cards_for_delete(store, &rel, entry);
+                    // `trail_waypoints` likewise has no FK cascade off
+                    // `notes`, so a trashed trail-doc / waypoint-note must
+                    // drop its derived rows explicitly — mirrors the
+                    // `process_delete` cleanup the `IndexJob::Delete` / watcher
+                    // path runs.
+                    clear_trail_waypoints_for_delete(store, &rel, entry);
                     record_oplog_tombstone(ctx.oplog_cell, entry);
                     let _ = progress.send(ProgressEvent::Deleted {
                         path: entry.original_path.clone(),
@@ -528,73 +552,51 @@ pub(super) async fn handle_simple_job(
     }
 }
 
-/// Run the trails auto-update sweep after a successful path remap. Reads
-/// `watcher_cell` so callers don't need to know whether the host has wired
-/// it — CLI / tests run without it attached and the sweep degrades to a
-/// write-without-suppress shape. Errors are swallowed (logged inside
-/// `core::trails::on_note_moved`).
+/// Evaluate the inbox rules against a freshly-created file. Returns the
+/// path the file ends up at (same as input when no rule matched), so the
+/// caller can upsert at the post-move location. Errors are logged and
+/// degrade to "no rule applied" so a config mistake never blocks ingest.
 ///
-/// status: trail-auto-update-on-note-move
-async fn run_trails_on_note_moved(
-    watcher_cell: &Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    self_tx: &IndexJobTx,
-    vault: &crate::vault::Vault,
+/// status: inbox-rules
+async fn run_inbox_rules(
+    ctx: &JobCtx<'_>,
     store: &mut Store,
-    from: &str,
-    to: &str,
-) {
-    let watcher_arc = watcher_cell.get().cloned();
-    let watcher_ref = watcher_arc.as_deref();
-    if let Err(e) = crate::trails::ops::on_note_moved(
-        watcher_ref,
-        Some(self_tx),
-        vault,
-        store,
-        from,
-        to,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, %from, %to,
-            "indexer: trails on_note_moved sweep failed");
+    rel_path: &str,
+) -> String {
+    let Some(rules) = ctx.inbox_cell.get() else {
+        return rel_path.to_string();
+    };
+    if rules.is_empty() {
+        return rel_path.to_string();
     }
-}
-
-/// Run the boards auto-update sweep after a successful path remap —
-/// the board mirror of `run_trails_on_note_moved`. Reads the op-log handle
-/// (when wired) so the card-path rewrite rides the user-save path; CLI /
-/// tests run without it and the sweep degrades to a suppressed write.
-///
-/// status: board-card-references
-async fn run_boards_on_note_moved(
-    watcher_cell: &Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    oplog_cell: &Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
-    self_tx: &IndexJobTx,
-    vault: &crate::vault::Vault,
-    store: &mut Store,
-    from: &str,
-    to: &str,
-) {
-    let watcher_arc = watcher_cell.get().cloned();
-    let watcher_ref = watcher_arc.as_deref();
-    let log_arc = oplog_cell.get().cloned();
-    let log_ref = log_arc.as_deref();
-    // Routed through the `boards` module root (not `boards::ops`) so the
-    // card-path remap is a first-class board concern; the heavy lifting
-    // stays in `boards::ops`.
-    if let Err(e) = crate::boards::on_note_moved(
-        watcher_ref,
-        Some(self_tx),
-        log_ref,
-        vault,
-        store,
-        from,
-        to,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, %from, %to,
-            "indexer: boards on_note_moved sweep failed");
+    let watcher = ctx.watcher_cell.get().map(std::sync::Arc::as_ref);
+    match rules.apply_to_created(ctx.vault, store, watcher, rel_path) {
+        Ok(Some(applied)) => {
+            let _ = ctx.progress.send(ProgressEvent::InboxApplied {
+                rule_index: applied.rule_index as u32,
+                original_path: rel_path.to_string(),
+                final_path: applied.final_rel_path.clone(),
+                moved_to: applied.moved_to.clone(),
+                tagged: applied.tagged.clone(),
+            });
+            if let Some(new_path) = applied.moved_to.as_deref() {
+                // The original path may have been indexed transiently —
+                // make sure no stale row lingers for it before we upsert at
+                // the new path.
+                let _ = process_delete(store, rel_path);
+                tracing::info!(
+                    from = %rel_path,
+                    to = %new_path,
+                    "inbox: rule moved file",
+                );
+            }
+            applied.final_rel_path
+        }
+        Ok(None) => rel_path.to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %rel_path, "inbox: rule application failed");
+            rel_path.to_string()
+        }
     }
 }
 
@@ -610,7 +612,7 @@ fn record_oplog_rename(
 ) {
     let Some(log) = oplog_cell.get() else { return };
     if let Err(e) =
-        crate::ops::op_writes::rename(log, from, to, &crate::oplog::shapes::Author::User)
+        crate::oplog::writes::rename(log, from, to, &crate::oplog::shapes::Author::User)
     {
         tracing::warn!(error = %e, %from, %to, "indexer: op-log rename failed");
     }
@@ -630,7 +632,7 @@ fn record_oplog_tombstone(
     };
     for path in &paths {
         if let Err(e) =
-            crate::ops::op_writes::tombstone(log, path, &crate::oplog::shapes::Author::User)
+            crate::oplog::writes::tombstone(log, path, &crate::oplog::shapes::Author::User)
         {
             tracing::warn!(error = %e, %path, "indexer: op-log tombstone failed");
         }
@@ -647,7 +649,17 @@ async fn handle_inline_upsert(
     let progress = ctx.progress;
     let status = ctx.status;
     let _ = progress.send(ProgressEvent::Started { path: rel_path.to_string() });
-    match process_upsert(ctx.vault_root, store, ctx.embedder.clone(), rel_path, false).await? {
+    let oplog = ctx.oplog_cell.get().cloned();
+    match process_upsert(
+        ctx.vault_root,
+        store,
+        ctx.embedder.clone(),
+        oplog.as_deref(),
+        rel_path,
+        false,
+    )
+    .await?
+    {
         UpsertOutcome::Indexed => {
             let _ = progress.send(ProgressEvent::Finished { path: rel_path.to_string() });
         }
@@ -674,6 +686,34 @@ enum UpsertOutcome {
     Skipped(String),
 }
 
+/// Read the document's `doc_id` from the op-log's `doc-index.db` for
+/// `rel_path`. Op-log bootstraps before the indexer (per
+/// `op-log-bootstraps-first`), so every path the indexer sees has a row
+/// here in the steady state. Two fallbacks for paths that haven't been
+/// seeded yet:
+///
+///   1. The indexer's own `notes.id` row, when the path was upserted in a
+///      previous run — keeps the id stable across re-indexes when an
+///      op-log isn't attached (CLI / test paths).
+///   2. A fresh ULID, only when no other source has one — first ingest of
+///      a brand-new file.
+///
+/// status: store-id-from-oplog
+fn resolve_doc_id(oplog: Option<&OpLog>, store: &Store, rel_path: &str) -> String {
+    if let Some(log) = oplog {
+        match log.doc_id_for_path(rel_path) {
+            Ok(Some(id)) => return id,
+            Ok(None) => {} // fall through
+            Err(e) => tracing::warn!(error = %e, path = %rel_path,
+                "indexer: doc_id_for_path lookup failed; trying store"),
+        }
+    }
+    if let Ok(Some(row)) = store.get_note_by_path(rel_path) {
+        return row.id;
+    }
+    new_id()
+}
+
 /// Flatten a note's frontmatter into `note_meta` write entries. Empty when
 /// the file has no (well-formed) frontmatter. status: store-note-metadata-index
 fn note_metadata_entries(contents: &str) -> Vec<MetaEntry> {
@@ -694,6 +734,7 @@ async fn process_upsert(
     vault_root: &Path,
     store: &mut Store,
     embedder: Arc<dyn Embedder>,
+    oplog: Option<&OpLog>,
     rel_path: &str,
     force: bool,
 ) -> Result<UpsertOutcome, Error> {
@@ -733,7 +774,8 @@ async fn process_upsert(
         // (per index.md `cmd-file-index-state`). Reason string is the
         // exact human-readable text the tooltip / status bar will display.
         let reason = "file too large";
-        store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
+        let id = resolve_doc_id(oplog, store, rel_path);
+        store.upsert_skipped(&id, rel_path, reason, mtime, size as i64)?;
         return Ok(UpsertOutcome::Skipped(reason.into()));
     }
     let bytes = tokio::fs::read(&abs).await?;
@@ -741,7 +783,8 @@ async fn process_upsert(
         Ok(s) => s,
         Err(_) => {
             let reason = "not UTF-8";
-            store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
+            let id = resolve_doc_id(oplog, store, rel_path);
+            store.upsert_skipped(&id, rel_path, reason, mtime, size as i64)?;
             return Ok(UpsertOutcome::Skipped(reason.into()));
         }
     };
@@ -762,13 +805,8 @@ async fn process_upsert(
     if chunks.is_empty() {
         // Empty note: still record the row so deletes/renames work, but no
         // embeddings to insert.
-        // Adopt frontmatter `hiker.id` when present and `path_ids` empty,
-        // same as the chunked branch — see
-        // `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`.
-        let id = match store.id_for_path(rel_path)? {
-            Some(id) => id,
-            None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
-        };
+        // status: store-id-from-oplog
+        let id = resolve_doc_id(oplog, store, rel_path);
         let indexed_at = now_secs();
         store.upsert_note(&NoteUpsert {
             id: &id,
@@ -789,22 +827,14 @@ async fn process_upsert(
         // Also re-derive on the empty-body branch — waypoint-notes
         // intentionally have empty bodies (`trail-empty-waypoint-body`),
         // so the FM-only path is the common case for them.
-        update_trail_waypoints_if_relevant(store, rel_path, &contents);
+        update_trail_waypoints_if_relevant(store, oplog, rel_path, &contents);
         // status: board-cards-derived-table
-        update_board_cards_if_relevant(store, rel_path, &contents);
+        update_board_cards_if_relevant(store, oplog, rel_path, &contents);
         return Ok(UpsertOutcome::Indexed);
     }
 
-    // bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids:
-    // adopt the source's `hiker.id` from frontmatter when the indexer
-    // has no `path_ids` row yet. Otherwise the case where a user-action
-    // pre-stamped the file (e.g. capture flow that bypasses the indexer
-    // for a moment) would mint a *different* ULID into `path_ids`,
-    // diverging from the value already written into the file.
-    let id = match store.id_for_path(rel_path)? {
-        Some(id) => id,
-        None => frontmatter_hiker_id(&contents).unwrap_or_else(new_id),
-    };
+    // status: store-id-from-oplog
+    let id = resolve_doc_id(oplog, store, rel_path);
     let indexed_at = now_secs();
 
     // status: trail-waypoints-derived-table
@@ -814,11 +844,11 @@ async fn process_upsert(
     // `MAX_FILE_BYTES` (5 MiB). Holding it alongside the chunks +
     // embeddings dominates per-file memory; dropping it here halves
     // the peak.
-    update_trail_waypoints_if_relevant(store, rel_path, &contents);
+    update_trail_waypoints_if_relevant(store, oplog, rel_path, &contents);
     // status: board-cards-derived-table
     // Re-derive `board_cards` rows for board-docs before the body drops —
     // same ordering rationale as the trail re-derive above.
-    update_board_cards_if_relevant(store, rel_path, &contents);
+    update_board_cards_if_relevant(store, oplog, rel_path, &contents);
     // status: store-note-metadata-index
     // Flatten frontmatter now, before the body is dropped — the upsert
     // below runs after `drop(contents)` to bound peak memory, but the
@@ -890,6 +920,7 @@ async fn process_upsert(
 ///     trail-doc), so the canonical fill follows immediately.
 fn update_trail_waypoints_if_relevant(
     store: &mut Store,
+    oplog: Option<&OpLog>,
     rel_path: &str,
     contents: &str,
 ) {
@@ -897,7 +928,7 @@ fn update_trail_waypoints_if_relevant(
     if !rel_path.ends_with(".md") {
         return;
     }
-    let ingest = WaypointIngest { store, rel_path, contents };
+    let ingest = WaypointIngest { store, oplog, rel_path, contents };
     if rel_path.starts_with(".hiker/trails/") && rel_path.contains("/waypoints/") {
         ingest.upsert_waypoint_row();
     } else {
@@ -910,6 +941,7 @@ fn update_trail_waypoints_if_relevant(
 /// stays under the cognitive-complexity cap.
 struct WaypointIngest<'a> {
     store: &'a mut Store,
+    oplog: Option<&'a OpLog>,
     rel_path: &'a str,
     contents: &'a str,
 }
@@ -929,25 +961,33 @@ impl<'a> WaypointIngest<'a> {
                 return;
             }
         };
-        // Source id comes from the index lookup at ingest time; may be
-        // None if the source hasn't been indexed yet.
-        let source_id = match self.store.id_for_path(&fm.references.path) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %self.rel_path,
-                    "indexer: source id_for_path lookup failed",
-                );
-                None
-            }
-        };
+        // status: store-id-from-oplog
+        // Source id is the op-log's `doc_id` for the source's path; may
+        // be None if the source hasn't been bootstrapped yet. Trail id
+        // is the op-log's `doc_id` for `fm.in_trail` (the waypoint-
+        // note's parent trail-doc path).
+        let source_path = fm.references.clone();
+        let source_id = self
+            .oplog
+            .and_then(|log| log.doc_id_for_path(&source_path).unwrap_or(None));
+        let trail_id = self
+            .oplog
+            .and_then(|log| log.doc_id_for_path(&fm.in_trail).unwrap_or(None))
+            .unwrap_or_default();
+        // Waypoint id (the legacy `WaypointRow.waypoint_id` column) is
+        // the op-log's `doc_id` for the waypoint-note's own path under
+        // path-as-identity — sourced from the same lookup the trail-doc
+        // ingest uses to seed its row.
+        let waypoint_id = self
+            .oplog
+            .and_then(|log| log.doc_id_for_path(self.rel_path).unwrap_or(None))
+            .unwrap_or_default();
         let row = WaypointRow {
             waypoint_path: self.rel_path.to_string(),
-            waypoint_id: fm.id,
-            trail_id: fm.in_trail.id,
+            waypoint_id,
+            trail_id,
             source_id,
-            source_path: fm.references.path,
+            source_path,
             // Tree-position columns are owned by the trail-doc ingest
             // path; written as the empty / NULL default here. The trail-
             // doc ingest that follows `append_waypoint` enqueues both, so
@@ -974,7 +1014,15 @@ impl<'a> WaypointIngest<'a> {
         use crate::store::dto::WaypointRow;
         use crate::trails::{parse_trail_doc_for, walk_waypoints_depth_first};
         let Ok(fm) = parse_trail_doc_for(self.rel_path, self.contents) else { return };
-        let trail_id = fm.id.clone();
+        // status: store-id-from-oplog
+        // The trail's id is the op-log's `doc_id` for the trail-doc's
+        // path; absent (oplog not seeded yet) is a soft no-op so the
+        // next ingest re-derives once the cell is populated.
+        let Some(log) = self.oplog else { return };
+        let trail_id = match log.doc_id_for_path(self.rel_path) {
+            Ok(Some(id)) => id,
+            _ => return,
+        };
         // Capture existing rows BEFORE the clear so we can preserve each
         // row's `source_id` / `source_path` (those columns are owned by
         // the per-waypoint ingest path and aren't recoverable from the
@@ -994,18 +1042,30 @@ impl<'a> WaypointIngest<'a> {
             );
         }
         let store = self.store;
-        walk_waypoints_depth_first(&fm.waypoints, &mut |parent_id, entry, tree_path| {
+        walk_waypoints_depth_first(&fm.waypoints, &mut |parent_path, entry, tree_path| {
             let (source_id, source_path) = existing_by_path
                 .get(&entry.path)
                 .cloned()
                 .unwrap_or((None, String::new()));
+            // status: store-id-from-oplog
+            // Waypoint id / parent waypoint id are the op-log doc_ids
+            // for each waypoint-note path. Both default to empty when
+            // the lookup misses — the rows still wire correctly via
+            // `waypoint_path` / `source_path`.
+            let waypoint_id = log
+                .doc_id_for_path(&entry.path)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let parent_waypoint_id = parent_path
+                .and_then(|p| log.doc_id_for_path(p).ok().flatten());
             let row = WaypointRow {
                 waypoint_path: entry.path.clone(),
-                waypoint_id: entry.id.clone(),
+                waypoint_id,
                 trail_id: trail_id.clone(),
                 source_id,
                 source_path,
-                parent_waypoint_id: parent_id.map(str::to_string),
+                parent_waypoint_id,
                 tree_path: tree_path.to_string(),
             };
             if let Err(e) = store.upsert_trail_waypoint(&row) {
@@ -1028,28 +1088,107 @@ impl<'a> WaypointIngest<'a> {
 /// no-op.
 ///
 /// status: board-cards-derived-table
-fn update_board_cards_if_relevant(store: &mut Store, rel_path: &str, contents: &str) {
+fn update_board_cards_if_relevant(
+    store: &mut Store,
+    oplog: Option<&OpLog>,
+    rel_path: &str,
+    contents: &str,
+) {
     use crate::boards::parse_board_for;
     use crate::store::dto::BoardCardRow;
     if !rel_path.ends_with(".md") {
         return;
     }
     let Ok(board) = parse_board_for(rel_path, contents) else { return };
+    // status: store-id-from-oplog
+    // The board's storage key is the op-log's `doc_id` for the
+    // board-doc's path; absent (oplog not seeded yet) is a soft no-op so
+    // the next ingest re-derives once the cell is populated.
+    let Some(log) = oplog else { return };
+    let board_id = match log.doc_id_for_path(rel_path) {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
     let mut rows: Vec<BoardCardRow> = Vec::new();
     for col in &board.columns {
         for (ordinal, card) in col.cards.iter().enumerate() {
+            // Freeform text cards reference no note, so they get no derived
+            // row — the reverse "boards containing note" lookup and
+            // auto-update-on-move don't apply to them. The card's column
+            // position is still its ordinal. status: board-freeform-card
+            let crate::boards::BoardCard::Note { path } = card else {
+                continue;
+            };
+            // status: store-id-from-oplog
+            // The card's note id is the op-log's doc_id for its path;
+            // None means the source hasn't been seeded yet, which the
+            // derived row carries as an empty string (the existing
+            // BoardCardRow shape — the column still rebuilds when the
+            // source is ingested later).
+            let card_note_id = log
+                .doc_id_for_path(path)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             rows.push(BoardCardRow {
-                board_id: board.id.clone(),
+                board_id: board_id.clone(),
                 board_path: rel_path.to_string(),
-                card_note_id: card.id.clone(),
-                card_note_path: card.path.clone(),
+                card_note_id,
+                card_note_path: path.clone(),
                 column_name: col.name.clone(),
                 ordinal: ordinal as i64,
             });
         }
     }
-    if let Err(e) = store.replace_board_cards(&board.id, &rows) {
+    if let Err(e) = store.replace_board_cards(&board_id, &rows) {
         tracing::warn!(error = %e, path = %rel_path, "indexer: replace_board_cards failed");
+    }
+}
+
+/// Clear the derived `board_cards` rows for a board-doc moved to trash via
+/// `IndexJob::DeleteNote`. `board_cards` has no FK cascade off `notes`, so the
+/// rows have to be dropped by board-doc path. Covers both a single board-doc
+/// (`rel`) and every `.md` member of a deleted folder (`entry.members`).
+/// Soft-error: a clear failure is logged, never propagated (matches the rest
+/// of the derived-table maintenance). status: board-delete
+fn clear_board_cards_for_delete(store: &mut Store, rel: &str, entry: &crate::trash::Entry) {
+    let mut paths: Vec<&str> = vec![rel];
+    if let Some(members) = &entry.members {
+        paths.extend(members.iter().map(String::as_str));
+    }
+    for p in paths {
+        if let Err(e) = store.delete_board_cards_by_board_path(p) {
+            tracing::warn!(
+                error = %e,
+                path = %p,
+                "indexer: delete_board_cards_by_board_path (delete-note) failed",
+            );
+        }
+    }
+}
+
+/// Clear the derived `trail_waypoints` rows for a waypoint-note or source-note
+/// moved to trash via `IndexJob::DeleteNote`. `trail_waypoints` has no FK
+/// cascade off `notes`, so the rows have to be dropped by path. Covers both a
+/// single note (`rel`) and every `.md` member of a deleted folder
+/// (`entry.members`). `delete_trail_waypoint_by_path` matches on both
+/// `waypoint_path` and `source_path`, so this drops a deleted waypoint-note's
+/// own row and any waypoint pointing at a deleted source — mirroring the
+/// `process_delete` (watcher / `IndexJob::Delete`) cleanup. Soft-error: a clear
+/// failure is logged, never propagated. status: trail-waypoints-derived-table
+fn clear_trail_waypoints_for_delete(store: &mut Store, rel: &str, entry: &crate::trash::Entry) {
+    let mut paths: Vec<&str> = vec![rel];
+    if let Some(members) = &entry.members {
+        paths.extend(members.iter().map(String::as_str));
+    }
+    for p in paths {
+        if let Err(e) = store.delete_trail_waypoint_by_path(p) {
+            tracing::warn!(
+                error = %e,
+                path = %p,
+                "indexer: delete_trail_waypoint_by_path (delete-note) failed",
+            );
+        }
     }
 }
 
@@ -1078,11 +1217,7 @@ fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, Error> {
             "indexer: delete_board_cards_by_board_path failed",
         );
     }
-    let id = match store.id_for_path(rel_path)? {
-        Some(id) => id,
-        None => return Ok(false),
-    };
-    store.delete_note(&id)?;
-    Ok(true)
+    // status: store-id-from-oplog / ingest-delete-cascade
+    Ok(store.delete_note_by_path(rel_path)?)
 }
 

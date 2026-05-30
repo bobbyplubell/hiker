@@ -507,40 +507,15 @@ impl View<'_> {
     fn results_section(&mut self) {
     let ui = &mut *self.ui;
     let app = &mut *self.app;
-    // Results section — collapsible header per
-    // `search-section-collapse-persisted`. The header click toggles the
-    // expanded state and persists it to vault settings so the layout
-    // sticks across vault re-opens.
-    let results_expanded = app.panels.search.results_expanded;
+    // The workbench accordion is the panel's single header; results
+    // render directly under the search input — no inner collapsible.
+    // [feature-panel-single-accordion]
     if app.panels.search.query.is_empty() {
         ui.label(
             egui::RichText::new("(type to search vault — semantic + lexical if indexed)")
                 .color(theme::muted())
                 .small(),
         );
-        return;
-    }
-    // Filename-grep fallback badge: when the read store is unavailable
-    // (indexer offline / vault not yet indexed), `run_query` falls back
-    // to a basename grep. Surface that so the user understands why
-    // semantic / lexical hits are missing (`search-filename-fallback-badge`).
-    // Read store is always available now post-refactor; the "index
-    // offline" badge that used to live here is dead.
-    if crate::panels::discovery_pane::collapsible_header(
-        ui,
-        "search-results",
-        "Results",
-        results_expanded,
-        app.panels.search.results.len(),
-    ) {
-        app.panels.search.results_expanded = !results_expanded;
-        persist_search_setting(
-            app,
-            "search.sections.results_expanded",
-            &serde_json::json!(app.panels.search.results_expanded),
-        );
-    }
-    if !app.panels.search.results_expanded {
         return;
     }
     let results = app.panels.search.results.clone();
@@ -650,13 +625,13 @@ impl View<'_> {
                 acc.push('/');
             }
             acc.push_str(part);
-            app.session.sidebar.expanded.insert(acc.clone());
+            app.session.file_tree.expanded.insert(acc.clone());
         }
         crate::actions::ensure_panel_visible(
             app,
             crate::panels_registry::PANEL_FILES,
         );
-        app.session.sidebar.scroll_target = Some(rel);
+        app.session.file_tree.scroll_target = Some(rel);
     }
     if results.is_empty() {
         ui.label(
@@ -991,12 +966,6 @@ pub(crate) fn result_card(
     }
     ui.add_space(4.0);
     action
-}
-
-#[allow(dead_code)]
-// TODO: use in copy/export paths to strip highlight markers.
-fn strip_mark_tokens(s: &str) -> String {
-    s.replace("<mark>", "").replace("</mark>", "")
 }
 
 enum MarkPart<'a> {

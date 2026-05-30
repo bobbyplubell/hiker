@@ -12,7 +12,22 @@ use eframe::egui;
 use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole};
 use crate::state::AppState;
+use crate::tab::{BufferSource, TabKind};
 use crate::theme;
+
+/// The active-context label prepended to a chat message so the agent knows
+/// what the user is looking at: an editable vault note, or a board. Returns
+/// `None` for read-only previews (snapshot / staging / trash) and non-content
+/// tabs. status: chat-active-note-context-injection
+fn active_context_label(kind: &TabKind) -> Option<String> {
+    match kind {
+        TabKind::Editor { buffer: BufferSource::Vault { path }, .. } => {
+            Some(format!("[active note: {path}]"))
+        }
+        TabKind::Board { path } => Some(format!("[active board: {path}]")),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
@@ -1117,71 +1132,6 @@ impl AtMentionScan for str {
 /// matches `query` case-insensitively, returning up to `cap` results.
 /// Cheap O(n) scan — good enough for the default vault size; future
 /// work routes this through the indexer's lexical engine.
-/// Path list cache for `@`-mention autocomplete (`chat-at-autocomplete`).
-/// Walking the vault per frame on every keystroke is the legacy perf
-/// regression the original port audit called out; we instead pull the
-/// snapshot from the indexer's read store when available (cheap SQL
-/// query), and fall back to `Vault::walk_indexable_files` only when the
-/// store is offline. The result is cached in egui memory for ~2 seconds
-/// so successive keystrokes share one fetch.
-// TODO: wire into the @-mention completion path; kept around because the
-// store-backed cache will replace the current vault-walk fallback.
-#[allow(dead_code)]
-#[derive(Clone)]
-struct MentionPaths {
-    paths: Vec<String>,
-    built_at: std::time::Instant,
-}
-
-#[allow(dead_code)]
-const MENTION_CACHE_TTL_MS: u128 = 2000;
-
-#[allow(dead_code)]
-fn mention_suggestions_ctx(
-    ctx: &egui::Context,
-    app: &AppState,
-    query: &str,
-    cap: usize,
-) -> Vec<String> {
-    let mem_id = egui::Id::new("chat-mention-paths");
-    let cache: Option<MentionPaths> = ctx.data(|d| d.get_temp(mem_id));
-    let fresh = cache
-        .as_ref()
-        .map(|c| c.built_at.elapsed().as_millis() < MENTION_CACHE_TTL_MS)
-        .unwrap_or(false);
-    let paths = if fresh {
-        cache.unwrap().paths
-    } else {
-        let mut out: Vec<String> = Vec::new();
-        if let Ok(store) = app.vault_session.services.read_store.lock()
-            && let Ok(rows) = store.all_note_paths()
-        {
-            out = rows;
-        }
-        if out.is_empty()
-            && let Ok(rows) = app.vault_session.vault.walk_indexable_files("")
-        {
-            out = rows;
-        }
-        ctx.data_mut(|d| {
-            d.insert_temp(
-                mem_id,
-                MentionPaths {
-                    paths: out.clone(),
-                    built_at: std::time::Instant::now(),
-                },
-            );
-        });
-        out
-    };
-    let q = query.to_lowercase();
-    paths
-        .into_iter()
-        .filter(|p| q.is_empty() || p.to_lowercase().contains(&q))
-        .take(cap)
-        .collect()
-}
-
 fn mention_suggestions(app: &AppState, query: &str, cap: usize) -> Vec<String> {
     let q = query.to_lowercase();
     let mut out: Vec<String> = Vec::new();
@@ -1444,21 +1394,20 @@ fn composer(
     if send_now {
         let mut text = std::mem::take(app.session.chat.drafts.entry(active_id).or_default());
         if !text.trim().is_empty() {
-            // Active-note context injection (`chat-active-note-context-injection`):
-            // when a buffer tab is focused and the user hasn't already
-            // dropped an `@` reference into the draft, prepend a context
-            // block naming the active note. Keeps the assistant aware of
-            // what the user is looking at without a manual mention.
+            // Active-context injection (`chat-active-note-context-injection`):
+            // when an editable note OR a board tab is focused and the user
+            // hasn't already dropped an `@` reference into the draft, prepend a
+            // context block naming what they're looking at. Read-only previews
+            // (snapshot / staging / trash) and non-content app-page tabs are
+            // skipped — `buffer_path()` is not used here because it also covers
+            // those previews and never covered the non-buffer board tab.
             if !text.contains('@')
-                && let Some(rel) = app
+                && let Some(ctx) = app
                     .session.active_tab
                     .and_then(|id| app.tab_by_id(id))
-                    .and_then(|t| t.buffer_path().map(str::to_string))
+                    .and_then(|t| active_context_label(&t.kind))
             {
-                text = format!(
-                    "[active note: {}]\n\n{}",
-                    rel, text
-                );
+                text = format!("{}\n\n{}", ctx, text);
             }
             let vault_root = app.vault_session.vault_root.clone();
             let config = app.vault_session.config.clone();

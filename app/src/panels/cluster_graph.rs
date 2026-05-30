@@ -103,7 +103,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
 /// Render the cluster graph from a pre-resolved `EditableNode` slice
 /// instead of loading from the tree's `.md`. Shared between the persisted
 /// cluster-tree tab (`show`) and the un-persisted `BuiltClusterTree`
-/// preview in `panels::cluster_review` (see
+/// preview in `clusters::panel` (see
 /// `built_tree_to_editable_nodes` for the synthesis path).
 ///
 /// `state_key` is used to namespace the per-tree layout cache on
@@ -625,13 +625,14 @@ impl PaintCtx<'_> {
             // first; fall back to treating `note_ref` as a path so
             // the review preview also gets a working preview card.
             let leaf_path = if let Some(note_id) = &n.note_ref {
+                // status: store-id-from-oplog
                 let resolved = app
                     .vault_session
                     .services
-                    .read_store
-                    .lock()
+                    .oplog
+                    .path_for_doc(note_id)
                     .ok()
-                    .and_then(|s| s.path_for_id(note_id).ok().flatten());
+                    .flatten();
                 let path = resolved.unwrap_or_else(|| note_id.clone());
                 if clickable_leaves && resp.clicked() {
                     clicked_path = Some(path.clone());

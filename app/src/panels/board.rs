@@ -25,13 +25,17 @@ const fn error_color() -> egui::Color32 {
     egui::Color32::from_rgb(200, 60, 60)
 }
 
+/// Fixed column-lane width. Cards fill it; also caps the drag preview, which
+/// is rendered in a free tooltip layer where `available_width` is the screen.
+const COLUMN_WIDTH: f32 = 230.0;
+
 /// Which render the board pane shows. The toggle is a render choice over the
 /// one underlying op-log document, not two tabs — switching to `Markdown`
 /// hosts the live editor widget over the board-doc inline (mirroring the
 /// cluster editor's view menu), so frontmatter / body edits and column moves
 /// ride the same document. status: board-view-toggle
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
-pub enum BoardView {
+pub enum ViewMode {
     #[default]
     Board,
     Markdown,
@@ -43,7 +47,7 @@ pub struct Pane {
     /// Active in-pane render (Board columns vs. the inline markdown editor).
     ///
     /// status: board-view-toggle
-    pub view: BoardView,
+    pub view: ViewMode,
     /// Inline-rename draft for a column header: `(old_name, draft_text)`.
     pub renaming_column: Option<(String, String)>,
     /// Pending column-delete confirm: the column name awaiting confirmation
@@ -59,6 +63,18 @@ pub struct Pane {
     /// grabs focus once (and selects its text) without stealing focus every
     /// frame.
     pub title_rename_focus: bool,
+    /// Inline-edit draft for a freeform card: `(card_id, draft_text)`. Set
+    /// when the user clicks a text card to edit it, or right after a
+    /// `+ Add card` mints a fresh empty card. Commits on Enter / focus-loss,
+    /// cancels on Esc.
+    ///
+    /// status: board-freeform-card
+    pub editing_card: Option<(String, String)>,
+    /// Set the frame after `editing_card` is seeded so the card field grabs
+    /// focus once without stealing it every frame.
+    ///
+    /// status: board-freeform-card
+    pub card_edit_focus: bool,
 }
 
 /// Find-or-focus a board tab for `path`, opening one if none exists.
@@ -112,7 +128,7 @@ pub fn open_for_rename(app: &mut AppState, path: &str) {
 /// borrow on the resolved board is released first.
 enum BoardAction {
     OpenNote(String),
-    MoveCard { from: String, card_id: String, to: String, to_index: usize },
+    MoveCard { from: String, card_handle: String, to: String, to_index: usize },
     RemoveCard(String),
     /// A note (by rel-path) dropped onto a column from the file tree → add it
     /// as a card. status: board-dnd
@@ -122,17 +138,14 @@ enum BoardAction {
     ReorderColumn { name: String, to: usize },
     DeleteColumn(String),
     RenameBoard { new_title: String },
-    /// Surface the shared Keep mine / Repoint / Break modal for a card whose
-    /// reference is a `PathConflict`. status: board-card-references
-    OpenPathConflict {
-        card_id: String,
-        path: String,
-        recorded_id: String,
-        current_path_id: String,
-    },
     /// Set the WIP limit on a column (`None` clears it).
     /// status: board-wip-limits
     SetWipLimit { name: String, limit: Option<usize> },
+    /// Create a freeform card in `column` (empty text) and enter inline edit
+    /// on it. status: board-freeform-card
+    AddTextCard { column: String },
+    /// Commit the edited text of a freeform card. status: board-freeform-card
+    SetCardText { card_id: String, text: String },
 }
 
 pub fn show(
@@ -151,7 +164,12 @@ pub fn show(
                 return;
             }
         };
-        hiker_core::boards::get_board(&app.vault_session.vault, &store, path)
+        hiker_core::boards::get_board(
+            &app.vault_session.vault,
+            &store,
+            &app.vault_session.services.oplog,
+            path,
+        )
     };
     let detail = match detail {
         Ok(d) => d,
@@ -172,8 +190,8 @@ pub fn show(
         .map(|p| p.view)
         .unwrap_or_default();
     match view {
-        BoardView::Board => render_columns(ui, app, tab_id, &detail, &mut action),
-        BoardView::Markdown => {
+        ViewMode::Board => render_columns(ui, app, tab_id, &detail, &mut action),
+        ViewMode::Markdown => {
             // Host the live editor widget over the board-doc inline, in this
             // same tab — a render choice over the one op-log document, not a
             // separate buffer tab. status: board-view-toggle
@@ -223,14 +241,14 @@ fn render_header(
             .get(&tab_id)
             .map(|p| p.view)
             .unwrap_or_default();
-        if ui.selectable_label(current == BoardView::Board, "Board").clicked() {
-            app.panels.boards.entry(tab_id).or_default().view = BoardView::Board;
+        if ui.selectable_label(current == ViewMode::Board, "Board").clicked() {
+            app.panels.boards.entry(tab_id).or_default().view = ViewMode::Board;
         }
-        if ui.selectable_label(current == BoardView::Markdown, "Markdown").clicked() {
-            app.panels.boards.entry(tab_id).or_default().view = BoardView::Markdown;
+        if ui.selectable_label(current == ViewMode::Markdown, "Markdown").clicked() {
+            app.panels.boards.entry(tab_id).or_default().view = ViewMode::Markdown;
         }
         // Column management only applies in the Board render.
-        if current == BoardView::Board {
+        if current == ViewMode::Board {
             ui.separator();
             if ui.button("+ Column").clicked() {
                 *action = Some(BoardAction::AddColumn);
@@ -326,13 +344,19 @@ fn render_columns(
     action: &mut Option<BoardAction>,
 ) {
     let column_names: Vec<String> = detail.columns.iter().map(|c| c.name.clone()).collect();
-    egui::ScrollArea::horizontal().show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            for (idx, col) in detail.columns.iter().enumerate() {
-                render_column(ui, app, tab_id, col, idx, &column_names, action);
-            }
+    // `auto_shrink([false, true])`: fill the available width (so columns that
+    // fit never trip a scrollbar) but shrink to the columns' height (so the
+    // horizontal scrollbar, when columns overflow, hugs the lanes instead of
+    // floating at the bottom of the empty tab — the "wonky" placement).
+    egui::ScrollArea::horizontal()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for (idx, col) in detail.columns.iter().enumerate() {
+                    render_column(ui, app, tab_id, col, idx, &column_names, action);
+                }
+            });
         });
-    });
 }
 
 /// A card drag payload: the card's id + its source column, so a column drop
@@ -341,7 +365,9 @@ fn render_columns(
 /// add-from-file. status: board-dnd
 #[derive(Clone)]
 struct CardDrag {
-    card_id: String,
+    /// Polymorphic handle: a note card's vault path or a freeform
+    /// card's `card_id`. status: board-card-references
+    card_handle: String,
     from_column: String,
 }
 
@@ -354,41 +380,58 @@ fn render_column(
     column_names: &[String],
     action: &mut Option<BoardAction>,
 ) {
+    // The column is a subtle lane (light gray, rounded); the *cards* inside are
+    // the elevated white boxes. We paint our OWN `Frame` rather than going
+    // through `dnd_drop_zone` — `dnd_drop_zone` ignores the frame colour (it
+    // overrides fill/stroke with the widget-state visuals), which is why the
+    // styling only appeared mid-drag. Drops are read off the lane response's
+    // payload below. status: board-dnd
     let col_frame = egui::Frame::default()
         .fill(theme::active_bg())
+        .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(8));
-    // The whole column is a drop zone: a `CardDrag` payload moves a card here
-    // (appended to the tail), a `String` rel-path payload (from the file tree)
-    // adds that note as a card. status: board-dnd
-    let (_, card_drop) = ui.dnd_drop_zone::<CardDrag, _>(col_frame, |ui| {
-        ui.set_width(230.0);
-        render_column_header(ui, app, tab_id, col, col_index, column_names, action);
-        ui.add_space(4.0);
-        for (card_index, card) in col.cards.iter().enumerate() {
-            render_card(ui, &col.name, card, card_index, column_names, action);
-        }
-        // Filler so an empty / short column still presents a droppable body.
-        if col.cards.is_empty() {
-            ui.add_space(24.0);
-        }
-    });
-    // Card move dropped onto the column body → append to the tail. (A
-    // card-level drop computes a precise index; see `render_card`.)
-    if let Some(drag) = card_drop {
+    let response = col_frame
+        .show(ui, |ui| {
+            // A `Frame`'s inner ui inherits the parent layout (here
+            // `horizontal_top`); force a vertical lane so header + cards stack.
+            ui.vertical(|ui| {
+                ui.set_width(COLUMN_WIDTH);
+                render_column_header(ui, app, tab_id, col, col_index, column_names, action);
+                ui.add_space(6.0);
+                for (card_index, card) in col.cards.iter().enumerate() {
+                    render_card(ui, app, tab_id, &col.name, card, card_index, action);
+                }
+                if col.cards.is_empty() {
+                    ui.add_space(24.0);
+                }
+                // Per-column freeform-card affordance. status: board-freeform-card
+                ui.add_space(2.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("+ Add card").small().color(theme::muted()),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    *action = Some(BoardAction::AddTextCard { column: col.name.clone() });
+                }
+            });
+        })
+        .response;
+    // A card released over the lane — but NOT over a specific card, which takes
+    // the payload first during the frame above — appends to the tail.
+    if let Some(drag) = response.dnd_release_payload::<CardDrag>() {
         *action = Some(BoardAction::MoveCard {
             from: drag.from_column.clone(),
-            card_id: drag.card_id.clone(),
+            card_handle: drag.card_handle.clone(),
             to: col.name.clone(),
             to_index: usize::MAX,
         });
     }
-    // A file-tree rel-path dropped onto the column → add-card.
-    let col_resp = ui.interact(
-        ui.min_rect(),
-        ui.id().with(("board-col-file-drop", col_index)),
-        egui::Sense::hover(),
-    );
-    if let Some(src) = col_resp.dnd_release_payload::<String>() {
+    // A file-tree rel-path dropped onto the lane → add that note as a card.
+    if let Some(src) = response.dnd_release_payload::<String>() {
         *action = Some(BoardAction::AddCardFromFile {
             column: col.name.clone(),
             source_rel: (*src).clone(),
@@ -397,7 +440,7 @@ fn render_column(
 }
 
 /// Column header: name + count, with an inline-rename text field when this
-/// column is being renamed, plus a `⋯` menu for rename / reorder / delete.
+/// column is being renamed, plus a `…` menu for rename / reorder / delete.
 fn render_column_header(
     ui: &mut egui::Ui,
     app: &mut AppState,
@@ -462,7 +505,7 @@ fn render_column_header(
                 )
                 .on_hover_text("This column exceeds its WIP limit");
             }
-            ui.menu_button("⋯", |ui| {
+            ui.menu_button("…", |ui| {
                 render_wip_limit_menu(ui, col, action);
                 if ui.button("Rename column").clicked() {
                     app.panels
@@ -561,105 +604,231 @@ fn render_wip_limit_menu(
 
 fn render_card(
     ui: &mut egui::Ui,
+    app: &mut AppState,
+    tab_id: TabId,
     column_name: &str,
     card: &ResolvedCard,
     card_index: usize,
-    column_names: &[String],
     action: &mut Option<BoardAction>,
 ) {
+    // If this freeform card is being edited, render the inline editor
+    // (interactive) and skip the drag overlay so typing/selection work.
+    // Inline-edit only applies to freeform cards (they have an
+    // editable `text` body); note cards open via OpenNote.
+    let editing = app
+        .panels
+        .boards
+        .get(&tab_id)
+        .and_then(|p| p.editing_card.as_ref())
+        .filter(|(id, _)| Some(id.as_str()) == card.card_id.as_deref())
+        .map(|(_, draft)| draft.clone());
+    if let Some(draft) = editing {
+        render_card_editor(ui, app, tab_id, card, draft, action);
+        ui.add_space(6.0);
+        return;
+    }
+
+    // The WHOLE card is the drag source — drag from anywhere — and also senses
+    // clicks. Its face is non-interactive labels + a painted `×`, so there are
+    // no inner widgets fighting the drag for presses (the cause of the earlier
+    // "can't click" trouble). A click is disambiguated by hit-testing its
+    // position: on the `×` → remove; elsewhere → open the note / edit the text.
+    // status: board-dnd
     let card_frame = egui::Frame::default()
-        .fill(theme::hover_bg())
-        .inner_margin(egui::Margin::symmetric(6, 4));
-    let drag_id = ui.make_persistent_id(("board-card", column_name, &card.card_ref.id, card_index));
-    // The card is a drag source carrying its id + source column; the card is
-    // also a drop zone so a card dropped here inserts *before* it (precise
-    // index). status: board-dnd
-    let (_, dropped_before) = ui.dnd_drop_zone::<CardDrag, _>(card_frame, |ui| {
-        ui.dnd_drag_source(
-            drag_id,
-            CardDrag {
-                card_id: card.card_ref.id.clone(),
-                from_column: column_name.to_string(),
-            },
-            |ui| render_card_body(ui, column_name, card, column_names, action),
-        );
-    });
-    if let Some(drag) = dropped_before {
-        // Insert the dragged card at this card's position in this column.
+        .fill(egui::Color32::WHITE)
+        .stroke(egui::Stroke::new(1.0, theme::divider()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8));
+    let handle = card.handle().to_string();
+    let drag_id =
+        ui.make_persistent_id(("board-card", column_name, handle.as_str(), card_index));
+    let egui::InnerResponse { inner: x_rect, response } = ui.dnd_drag_source(
+        drag_id,
+        CardDrag {
+            card_handle: handle.clone(),
+            from_column: column_name.to_string(),
+        },
+        |ui| card_frame.show(ui, |ui| render_card_face(ui, card)).inner,
+    );
+    let resp = response.interact(egui::Sense::click());
+    // The face labels are non-interactive (so they don't fight the drag), so we
+    // paint the hover feedback ourselves: a faint accent wash over the card body
+    // when it's hovered (signals "click to open"), or a red wash behind the `×`
+    // when the pointer is over it (signals "click to remove"). Both are
+    // low-alpha overlays so the content stays legible.
+    let over_x = ui
+        .ctx()
+        .pointer_hover_pos()
+        .is_some_and(|p| x_rect.expand(4.0).contains(p));
+    if resp.hovered() {
+        let painter = ui.painter();
+        if over_x {
+            let c = error_color();
+            painter.rect_filled(
+                x_rect.expand(3.0),
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 30),
+            );
+        } else {
+            let a = theme::accent();
+            painter.rect_filled(
+                resp.rect,
+                egui::CornerRadius::same(6),
+                egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 16),
+            );
+        }
+    }
+    if resp.clicked() {
+        if over_x {
+            *action = Some(BoardAction::RemoveCard(handle.clone()));
+        } else {
+            card_open_action(app, tab_id, card, action);
+        }
+    }
+    // A card released over this card inserts *before* it (precise index).
+    if let Some(drag) = resp.dnd_release_payload::<CardDrag>() {
         *action = Some(BoardAction::MoveCard {
             from: drag.from_column.clone(),
-            card_id: drag.card_id.clone(),
+            card_handle: drag.card_handle.clone(),
             to: column_name.to_string(),
             to_index: card_index,
         });
     }
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 }
 
-/// The inner contents of a card (title row + per-card verbs), rendered inside
-/// the drag source. Split out so the drag-source closure stays small.
-fn render_card_body(
-    ui: &mut egui::Ui,
-    column_name: &str,
+/// The card's non-interactive face: the title/text on the left, a painted `×`
+/// docked right. Returns the `×` glyph's rect so `render_card` can hit-test a
+/// click against it — there are no inner widgets, so the whole card owns clicks
+/// + drag and nothing competes for presses. status: board-dnd
+fn render_card_face(ui: &mut egui::Ui, card: &ResolvedCard) -> egui::Rect {
+    // Fill the column width so cards read as full-width rows and the `×` docks
+    // to the right edge.
+    ui.set_width(ui.available_width().min(COLUMN_WIDTH));
+    let mut x_rect = egui::Rect::NOTHING;
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            x_rect = ui
+                .label(egui::RichText::new("×").color(theme::muted()))
+                .on_hover_text("Remove from board")
+                .rect;
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                render_card_face_body(ui, card);
+            });
+        });
+    });
+    x_rect
+}
+
+/// The title/text portion of a card face — all non-interactive labels;
+/// `render_card`'s card-level click does the opening/editing. A resolved note
+/// renders accent-coloured (reads as openable); an orphan/conflict renders
+/// muted with a hint; a freeform card shows its text. status: board-freeform-card
+fn render_card_face_body(ui: &mut egui::Ui, card: &ResolvedCard) {
+    match &card.resolution {
+        None => {
+            let text = card.text.as_deref().unwrap_or(&card.title);
+            let label = if text.trim().is_empty() { "(empty)" } else { text };
+            ui.label(label);
+        }
+        Some(ResolutionOutcome::Orphan) => {
+            ui.label(egui::RichText::new(&card.title).color(theme::muted()));
+            ui.label(egui::RichText::new("broken reference").small().color(error_color()));
+        }
+        Some(ResolutionOutcome::Resolved { .. }) => {
+            ui.label(egui::RichText::new(&card.title).color(theme::accent()));
+        }
+    }
+}
+
+/// Handle a card-body click (not on the `×`): open the referenced note,
+/// surface the path-conflict modal, or enter inline edit for a freeform card.
+fn card_open_action(
+    app: &mut AppState,
+    tab_id: TabId,
     card: &ResolvedCard,
-    column_names: &[String],
     action: &mut Option<BoardAction>,
 ) {
-    // Distinguish a `PathConflict` (actionable — the path now resolves to a
-    // different note, repointable) from an `Orphan` (neither half resolves —
-    // greyed, non-actionable). status: board-card-references
-    let path_conflict = matches!(card.resolution, ResolutionOutcome::PathConflict { .. });
-    let orphan = matches!(card.resolution, ResolutionOutcome::Orphan);
-    ui.horizontal(|ui| {
-        if orphan {
-            ui.label(egui::RichText::new(&card.title).color(theme::muted()));
-            ui.label(
-                egui::RichText::new("broken reference")
-                    .small()
-                    .color(error_color()),
-            );
-        } else if path_conflict {
-            ui.label(egui::RichText::new(&card.title).color(theme::muted()));
-            if ui
-                .small_button(egui::RichText::new("conflict — resolve…").small().color(error_color()))
-                .clicked()
-                && let ResolutionOutcome::PathConflict { recorded_id, current_path_id, path } =
-                    &card.resolution
-            {
-                *action = Some(BoardAction::OpenPathConflict {
-                    card_id: card.card_ref.id.clone(),
-                    path: path.clone(),
-                    recorded_id: recorded_id.clone(),
-                    current_path_id: current_path_id.clone(),
-                });
-            }
-        } else if ui.link(&card.title).clicked() {
-            let target = match &card.resolution {
-                ResolutionOutcome::Resolved { rel_path, .. } => rel_path.clone(),
-                ResolutionOutcome::SelfHeal { canonical_path, .. } => canonical_path.clone(),
-                _ => card.card_ref.path.clone(),
-            };
-            *action = Some(BoardAction::OpenNote(target));
+    match &card.resolution {
+        // Freeform card → enter inline edit. status: board-freeform-card
+        None => {
+            let Some(card_id) = card.card_id.clone() else { return };
+            let text = card.text.clone().unwrap_or_default();
+            let pane = app.panels.boards.entry(tab_id).or_default();
+            pane.editing_card = Some((card_id, text));
+            pane.card_edit_focus = true;
         }
-    });
-    ui.horizontal(|ui| {
-        // Per-card "Move to >" menu is kept as a fallback to drag-and-drop.
-        ui.menu_button("Move to >", |ui| {
-            for target in column_names {
-                if target != column_name && ui.button(target).clicked() {
-                    *action = Some(BoardAction::MoveCard {
-                        from: column_name.to_string(),
-                        card_id: card.card_ref.id.clone(),
-                        to: target.clone(),
-                        to_index: usize::MAX,
-                    });
-                    ui.close();
-                }
-            }
-        });
-        if ui.small_button("Remove").clicked() {
-            *action = Some(BoardAction::RemoveCard(card.card_ref.id.clone()));
+        Some(ResolutionOutcome::Resolved { rel_path }) => {
+            *action = Some(BoardAction::OpenNote(rel_path.clone()));
         }
+        Some(ResolutionOutcome::Orphan) => {}
+    }
+}
+
+/// Inline editor for a freeform card being edited (entered via a card-body
+/// click on a text card). Commits on Enter / focus-loss → `SetCardText`,
+/// cancels on Esc. Rendered in the same white card frame as the static face.
+///
+/// status: board-freeform-card
+fn render_card_editor(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    tab_id: TabId,
+    card: &ResolvedCard,
+    draft: String,
+    action: &mut Option<BoardAction>,
+) {
+    let card_frame = egui::Frame::default()
+        .fill(egui::Color32::WHITE)
+        .stroke(egui::Stroke::new(1.0, theme::divider()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8));
+    card_frame.show(ui, |ui| {
+    ui.set_width(ui.available_width().min(COLUMN_WIDTH));
+    let mut buf = draft;
+    let resp = ui.add(
+        egui::TextEdit::multiline(&mut buf)
+            .desired_width(ui.available_width())
+            .desired_rows(2)
+            .hint_text("card text"),
+    );
+    let take_focus = app
+        .panels
+        .boards
+        .get(&tab_id)
+        .map(|p| p.card_edit_focus)
+        .unwrap_or(false);
+    if take_focus {
+        resp.request_focus();
+        if let Some(pane) = app.panels.boards.get_mut(&tab_id) {
+            pane.card_edit_focus = false;
+        }
+    }
+    if let Some(pane) = app.panels.boards.get_mut(&tab_id) {
+        if let Some((_, d)) = pane.editing_card.as_mut() {
+            *d = buf.clone();
+        }
+    }
+    // Enter commits (without inserting a newline); Esc cancels; focus-loss
+    // commits the current draft.
+    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let commit = (resp.lost_focus() && !cancel) || (resp.has_focus() && enter);
+    if commit {
+        if let Some(card_id) = card.card_id.clone() {
+            *action = Some(BoardAction::SetCardText {
+                card_id,
+                text: buf.trim().to_string(),
+            });
+        }
+        if let Some(pane) = app.panels.boards.get_mut(&tab_id) {
+            pane.editing_card = None;
+        }
+    } else if cancel
+        && let Some(pane) = app.panels.boards.get_mut(&tab_id)
+    {
+        pane.editing_card = None;
+    }
     });
 }
 
@@ -685,23 +854,19 @@ fn apply_action(app: &mut AppState, tab_id: TabId, board_rel: &str, action: Boar
             rename_board(app, tab_id, &rel, &new_title);
             return;
         }
-        BoardAction::OpenPathConflict { card_id, path, recorded_id, current_path_id } => {
-            app.session.modal = Some(crate::state::Modal::PathConflict {
-                path,
-                recorded_id,
-                current_path_id,
-                target: crate::state::PathConflictTarget::BoardCard {
-                    board_rel: rel,
-                    card_id,
-                },
-            });
-            return;
-        }
         BoardAction::AddCardFromFile { column, source_rel } => {
             add_card(app, &rel, &column, &source_rel);
             return;
         }
-        BoardAction::MoveCard { from, card_id, to, to_index } => (
+        BoardAction::AddTextCard { column } => {
+            add_text_card(app, tab_id, &rel, &column);
+            return;
+        }
+        BoardAction::SetCardText { card_id, text } => (
+            "Edit card",
+            run(async move { bops::set_card_text(&log, &jobs, &vault, &rel, &card_id, &text).await }),
+        ),
+        BoardAction::MoveCard { from, card_handle, to, to_index } => (
             "Move card",
             run(async move {
                 bops::move_card(
@@ -711,7 +876,7 @@ fn apply_action(app: &mut AppState, tab_id: TabId, board_rel: &str, action: Boar
                     bops::MoveCardRequest {
                         board_doc_rel: &rel,
                         from_column: &from,
-                        card_id: &card_id,
+                        card_handle: &card_handle,
                         to_column: &to,
                         to_index,
                     },
@@ -719,9 +884,11 @@ fn apply_action(app: &mut AppState, tab_id: TabId, board_rel: &str, action: Boar
                 .await
             }),
         ),
-        BoardAction::RemoveCard(card_id) => (
+        BoardAction::RemoveCard(card_handle) => (
             "Remove card",
-            run(async move { bops::remove_card(&log, &jobs, &vault, &rel, &card_id).await }),
+            run(async move {
+                bops::remove_card(&log, &jobs, &vault, &rel, &card_handle).await
+            }),
         ),
         BoardAction::AddColumn => {
             let name = unique_column_name(app, &rel);
@@ -754,11 +921,14 @@ fn apply_action(app: &mut AppState, tab_id: TabId, board_rel: &str, action: Boar
     }
 }
 
-/// Rename the board-doc by moving it to `<parent>/<new_title>.md` via
-/// `core::vault::move_note` (the same path the file-tree inline-rename uses),
-/// then repoint the open board tab + any buffer/editor tabs at the new path.
-/// The board carries its identity in frontmatter, so a rename is a path-only
-/// move; the auto-update-on-move hook fixes any cards referencing it.
+/// Rename the board-doc by moving it to `<parent>/<new_title>.md` via the
+/// indexer-driven `core::ops::file::move_note` (the same full op the file-tree
+/// inline-rename uses), then repoint the open board tab + any buffer/editor
+/// tabs at the new path. The board carries its identity in frontmatter, so a
+/// rename is a path-only move; the op's `IndexJob::Move` remaps the store
+/// (including the `board_cards.board_path` rows for this board-doc) and
+/// `links_rename::on_note_moved` rewrites any cards referencing it, so cards
+/// stay attached and the board doesn't drop off the Boards index.
 ///
 /// status: board-create
 fn rename_board(app: &mut AppState, tab_id: TabId, from: &str, new_title: &str) {
@@ -771,26 +941,21 @@ fn rename_board(app: &mut AppState, tab_id: TabId, from: &str, new_title: &str) 
     if to == from {
         return;
     }
-    let store_mutex = app.vault_session.services.read_store.clone();
     let watcher = app.vault_session.services.watcher.clone();
-    {
-        let mut store = match store_mutex.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if let Err(err) = hiker_core::vault::move_note(
-            &app.vault_session.vault,
-            &mut store,
-            Some(watcher.as_ref()),
-            from,
-            &to,
-        ) {
-            drop(store);
-            app.push_toast(format!("Rename board failed: {err}"), ToastLevel::Error);
-            return;
-        }
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let from_owned = from.to_string();
+    let to_owned = to.clone();
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::ops::file::move_note(&watcher, &jobs, &from_owned, &to_owned).await
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
+    };
+    if let Err(err) = result {
+        app.push_toast(format!("Rename board failed: {err}"), ToastLevel::Error);
+        return;
     }
-    app.session.sidebar.dir_cache.remove(parent);
+    app.session.file_tree.dir_cache.remove(parent);
     // Repoint this board tab + any editor/buffer tabs at the old path.
     if let Some(tab) = app.tab_by_id_mut(tab_id) {
         if let crate::tab::TabKind::Board { path } = &mut tab.kind {
@@ -829,57 +994,17 @@ where
     }
 }
 
-/// "Repoint" branch of the shared path-conflict modal for a board card:
-/// rewrite the card to adopt the identity of the note now at `new_path`, via
-/// the core `repoint_card` op (frontmatter user-save). Runs synchronously on
-/// the frame's tokio runtime.
-///
-/// status: board-card-references
-pub fn repoint_card(app: &mut AppState, board_rel: &str, card_id: &str, new_path: &str) {
-    let log = app.vault_session.services.oplog.clone();
-    let jobs = app.vault_session.services.indexer.job_sender();
-    let vault = app.vault_session.vault.clone();
-    let store_arc = app.vault_session.services.read_store.clone();
-    let (board_rel, card_id, new_path) =
-        (board_rel.to_string(), card_id.to_string(), new_path.to_string());
-    let result = run(async move {
-        let guard = store_arc
-            .lock()
-            .map_err(|_| hiker_core::errors::HikerError::Io("store lock poisoned".into()))?;
-        hiker_core::boards::ops::repoint_card(
-            &log, &jobs, &vault, &guard, &board_rel, &card_id, &new_path,
-        )
-        .await
-    });
-    if let Err(e) = result {
-        app.push_toast(format!("Repoint failed: {e}"), ToastLevel::Error);
-    }
-}
-
-/// "Break" branch of the shared path-conflict modal for a board card: drop
-/// the card from the board-doc (the referenced note is untouched). Reuses
-/// the core `remove_card` op.
-///
-/// status: board-card-references
-pub fn break_card(app: &mut AppState, board_rel: &str, card_id: &str) {
-    let log = app.vault_session.services.oplog.clone();
-    let jobs = app.vault_session.services.indexer.job_sender();
-    let vault = app.vault_session.vault.clone();
-    let (board_rel, card_id) = (board_rel.to_string(), card_id.to_string());
-    let result =
-        run(async move { hiker_core::boards::ops::remove_card(&log, &jobs, &vault, &board_rel, &card_id).await });
-    if let Err(e) = result {
-        app.push_toast(format!("Break reference failed: {e}"), ToastLevel::Error);
-    }
-}
+// `repoint_card` / `break_card` retired with `trail-path-conflict-modal`.
+// Under path-as-identity (`board-card-references`) the Keep mine /
+// Repoint / Break modal has no analogue; an unresolved card is an
+// orphan the user removes via the per-card `×` (RemoveCard).
 
 /// One board for the "Add to board…" picker: path, title, column names.
 pub type PickerEntry = (String, String, Vec<String>);
 
 /// Gather every board-doc + its columns, the set of board paths `note_rel`
 /// is already a card on, and whether `note_rel` is itself a board-doc.
-/// Read-only; runs on menu open. Shared by the file-tree verb and the
-/// editor pill.
+/// Read-only; runs on menu open. Used by the file-tree "Add to board…" verb.
 ///
 /// status: board-add-card
 pub fn picker_context(
@@ -895,8 +1020,9 @@ pub fn picker_context(
         .ok()
         .map(|s| hiker_core::boards::parse_board_for(note_rel, &s).is_ok())
         .unwrap_or(false);
+    let log = &app.vault_session.services.oplog;
     let mut boards: Vec<PickerEntry> = Vec::new();
-    for item in hiker_core::boards::list(vault, &store).unwrap_or_default() {
+    for item in hiker_core::boards::list(vault, &store, log).unwrap_or_default() {
         let columns = vault
             .read_file(&item.rel_path)
             .ok()
@@ -906,7 +1032,7 @@ pub fn picker_context(
         boards.push((item.rel_path, item.title, columns));
     }
     let membership: std::collections::HashSet<String> =
-        hiker_core::boards::containing_note_with_paths(vault, &store, note_rel)
+        hiker_core::boards::containing_note_with_paths(vault, &store, log, note_rel)
             .unwrap_or_default()
             .into_iter()
             .map(|h| h.board_doc_rel)
@@ -914,33 +1040,8 @@ pub fn picker_context(
     (boards, membership, is_board)
 }
 
-/// "Add to board…" pill in the editor toolbar (`board-add-card`). Hidden
-/// unless `path` is a regular `.md`/`.txt` note and at least one board
-/// exists; hidden when `path` is itself a board-doc. The menu picks a board
-/// + column; a board the note is already on shows "Already on this board".
-///
-/// status: board-add-card
-pub fn add_to_board_pill(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
-    let lower = path.to_lowercase();
-    if !lower.ends_with(".md") && !lower.ends_with(".txt") {
-        return;
-    }
-    let (boards, membership, is_board) = picker_context(app, path);
-    if is_board || boards.is_empty() {
-        return;
-    }
-    ui.separator();
-    let mut pick: Option<(String, String)> = None;
-    ui.menu_button("+ Board", |ui| {
-        column_picker(ui, &boards, &membership, &mut pick);
-    });
-    if let Some((board_rel, column)) = pick {
-        add_card(app, &board_rel, &column, path);
-    }
-}
-
 /// Render the board → column nested picker, recording the user's pick.
-/// Shared by the editor pill and the file-tree verb.
+/// Used by the file-tree "Add to board…" verb.
 ///
 /// status: board-add-card
 pub fn column_picker(
@@ -972,7 +1073,7 @@ pub fn column_picker(
 /// Append `note_rel` as a card to `board_rel`'s `column` via the core
 /// `add_card` op (op-log user-save + lazy id-stamp). Runs synchronously on
 /// the frame's tokio runtime; the board view re-reads on its next paint.
-/// Shared by the editor pill and the file-tree "Add to board…" verb.
+/// Used by the file-tree "Add to board…" verb.
 ///
 /// status: board-add-card
 pub fn add_card(app: &mut AppState, board_rel: &str, column: &str, note_rel: &str) {
@@ -980,7 +1081,6 @@ pub fn add_card(app: &mut AppState, board_rel: &str, column: &str, note_rel: &st
     let jobs = app.vault_session.services.indexer.job_sender();
     let vault = app.vault_session.vault.clone();
     let watcher = app.vault_session.services.watcher.clone();
-    let store_arc = app.vault_session.services.read_store.clone();
     let board_rel = board_rel.to_string();
     let column = column.to_string();
     let note_rel = note_rel.to_string();
@@ -988,14 +1088,13 @@ pub fn add_card(app: &mut AppState, board_rel: &str, column: &str, note_rel: &st
         return;
     };
     let result = handle.block_on(async {
-        let mut guard = store_arc
-            .lock()
-            .map_err(|_| hiker_core::errors::HikerError::Io("store lock poisoned".into()))?;
+        // status: board-card-references
+        // No `&mut Store` needed — under path-as-identity the card holds
+        // only the source's vault path; no ULID stamp.
         hiker_core::boards::ops::add_card(hiker_core::boards::ops::AddCardArgs {
             watcher: &watcher,
             jobs: &jobs,
             vault: &vault,
-            store: &mut guard,
             log: &log,
             board_doc_rel: &board_rel,
             column_name: &column,
@@ -1006,6 +1105,33 @@ pub fn add_card(app: &mut AppState, board_rel: &str, column: &str, note_rel: &st
     match result {
         Ok(()) => app.push_toast("Added to board".to_string(), ToastLevel::Info),
         Err(e) => app.push_toast(format!("Add to board failed: {e}"), ToastLevel::Error),
+    }
+}
+
+/// Create a freeform card (empty text) in `column` via the core
+/// `add_text_card` op, then seed inline edit on the new card so the user
+/// types its text immediately. Runs synchronously on the frame's tokio
+/// runtime; the board re-reads on its next paint.
+///
+/// status: board-freeform-card
+fn add_text_card(app: &mut AppState, tab_id: TabId, board_rel: &str, column: &str) {
+    let log = app.vault_session.services.oplog.clone();
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let vault = app.vault_session.vault.clone();
+    let (board_rel, column) = (board_rel.to_string(), column.to_string());
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let result = handle.block_on(async {
+        hiker_core::boards::ops::add_text_card(&log, &jobs, &vault, &board_rel, &column, "").await
+    });
+    match result {
+        Ok(card_id) => {
+            let pane = app.panels.boards.entry(tab_id).or_default();
+            pane.editing_card = Some((card_id, String::new()));
+            pane.card_edit_focus = true;
+        }
+        Err(e) => app.push_toast(format!("Add card failed: {e}"), ToastLevel::Error),
     }
 }
 

@@ -2,24 +2,59 @@ use rusqlite::{params, OptionalExtension};
 
 use super::error::Error;
 use super::dto::{
-    new_id, title_from_path, NoteProperties, NoteRow, RecentNote, VaultStats,
+    title_from_path, NoteProperties, NoteRow, RecentNote, VaultStats,
 };
 use super::Store;
 
 impl Store {
-    /// Look up the stable id for a path, or None if the note has never been
-    /// indexed. Reads from `path_ids`; valid even after a rename has updated
-    /// `notes.path` (the old path still resolves to the same id).
-    pub fn id_for_path(&self, rel_path: &str) -> Result<Option<String>, Error> {
-        let id = self
+    /// True iff a note row exists for `rel_path`. Cheap path-only check —
+    /// callers that just need "is this indexed" use this instead of
+    /// `get_note_by_path` so we don't pay the row-decode cost.
+    ///
+    /// status: store-id-from-oplog
+    pub fn note_exists(&self, rel_path: &str) -> Result<bool, Error> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notes WHERE path = ?1",
+            params![rel_path],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every indexed note whose basename (the filename, with `.md` /
+    /// `.markdown` stripped) equals `name`. Backs the wikilink ambiguity
+    /// resolver in `core::wikilink::resolve_path`: bare-name links collect
+    /// every candidate and feed them to the resolver's policy.
+    ///
+    /// Returns vault-relative paths; ordering is unspecified (the resolver
+    /// applies its own sort). Empty `Vec` when nothing matches.
+    ///
+    /// status: store-id-from-oplog
+    /// status: wikilink-ambiguous-resolution
+    pub fn find_notes_by_basename(&self, name: &str) -> Result<Vec<String>, Error> {
+        // Cheap shape: pull every indexed `.md` path, filter on the basename
+        // in Rust. The vault is small enough at v1 scale (≤500k notes) that
+        // a basename-only index isn't justified, and the resolver needs
+        // exact-case equality on the basename stem regardless of host fs
+        // casing.
+        let mut stmt = self
             .conn
-            .query_row(
-                "SELECT id FROM path_ids WHERE path = ?1",
-                params![rel_path],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(id)
+            .prepare("SELECT path FROM notes WHERE skipped = 0")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for rel in rows {
+            let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+            let stem = base
+                .strip_suffix(".md")
+                .or_else(|| base.strip_suffix(".markdown"))
+                .unwrap_or(base);
+            if stem == name {
+                out.push(rel);
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch the note row for a given path, or None if not indexed.
@@ -200,7 +235,6 @@ impl Store {
                 Ok(NoteProperties {
                     path: rel_path.to_string(),
                     note_id,
-                    path_ids_id: None,
                     mtime,
                     size,
                     content_hash,
@@ -217,20 +251,12 @@ impl Store {
         );
         match row {
             Ok(props) => {
-                // Pull the path_ids id in a separate query — cheap, and
-                // keeps the main query simple.
-                let path_ids_id: Option<String> = self.conn.query_row(
-                    "SELECT id FROM path_ids WHERE path = ?1",
-                    params![rel_path],
-                    |row| row.get(0),
-                ).optional()?;
                 let chunk_count: i64 = self.conn.query_row(
                     "SELECT COUNT(*) FROM chunks WHERE note_id = ?1",
                     params![props.note_id],
                     |row| row.get(0),
                 )?;
                 let mut p = props;
-                p.path_ids_id = path_ids_id;
                 p.chunk_count = Some(chunk_count);
                 Ok(Some(p))
             }
@@ -273,28 +299,19 @@ impl Store {
     /// that was Indexed and is now Skipped doesn't keep stale hits.
     /// `content_hash` and `embedder_version` are stored empty — the row
     /// exists for state, not for retrieval.
+    ///
+    /// `id` is the document's ULID, supplied by the caller — under
+    /// path-as-identity, that's the op-log's `doc_id` for this path
+    /// (`store-id-from-oplog`). The indexer no longer mints its own.
     pub fn upsert_skipped(
         &mut self,
+        id: &str,
         rel_path: &str,
         reason: &str,
         mtime: i64,
         size: i64,
     ) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
-
-        // Reuse an existing id for this path if we have one, else mint a new
-        // one — same rule as the indexed path so renames keep working.
-        let id: String = match tx
-            .query_row(
-                "SELECT id FROM path_ids WHERE path = ?1",
-                params![rel_path],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            Some(id) => id,
-            None => new_id(),
-        };
         let indexed_at = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -311,12 +328,6 @@ impl Store {
                skipped = 1,
                skip_reason = excluded.skip_reason",
             params![id, rel_path, mtime, size, indexed_at, reason],
-        )?;
-
-        tx.execute(
-            "INSERT INTO path_ids (path, id) VALUES (?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET id = excluded.id",
-            params![rel_path, id],
         )?;
 
         // Clear any chunks/vecs left over from a previous successful ingest.
@@ -338,8 +349,7 @@ impl Store {
     }
 
     /// Delete a note by id. Cascades through `chunks`; `chunk_vecs` cleaned
-    /// up explicitly. `path_ids` for this id are removed too — a deleted
-    /// note no longer has a stable path mapping.
+    /// up explicitly.
     pub fn delete_note(&mut self, note_id: &str) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
         let chunk_ids: Vec<String> = {
@@ -351,10 +361,33 @@ impl Store {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
         }
         tx.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
-        tx.execute("DELETE FROM path_ids WHERE id = ?1", params![note_id])?;
         tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![note_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Delete a note by its vault-relative path. Convenience for callers
+    /// (the vault `delete_note` path) that no longer carry the indexer's
+    /// `id_for_path` indirection. Silent no-op when the path isn't indexed.
+    /// Returns true when a row was actually removed.
+    ///
+    /// status: ingest-delete-cascade
+    pub fn delete_note_by_path(&mut self, rel_path: &str) -> Result<bool, Error> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM notes WHERE path = ?1",
+                params![rel_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => {
+                self.delete_note(&id)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Delete many notes by vault-relative path in a single transaction.
@@ -370,7 +403,7 @@ impl Store {
         for rel in rel_paths {
             let id_opt: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM path_ids WHERE path = ?1",
+                    "SELECT id FROM notes WHERE path = ?1",
                     params![rel],
                     |row| row.get(0),
                 )
@@ -385,7 +418,6 @@ impl Store {
                 tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
             }
             tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
-            tx.execute("DELETE FROM path_ids WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![id])?;
             removed += 1;
         }
@@ -406,65 +438,43 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut updated = 0;
         for (old, new) in renames {
-            let id_opt: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM path_ids WHERE path = ?1",
-                    params![old],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(id) = id_opt else { continue };
-            tx.execute(
-                "UPDATE notes SET path = ?1 WHERE id = ?2",
-                params![new, id],
+            let n = tx.execute(
+                "UPDATE notes SET path = ?1 WHERE path = ?2",
+                params![new, old],
             )?;
-            tx.execute("DELETE FROM path_ids WHERE id = ?1", params![id])?;
-            tx.execute(
-                "INSERT INTO path_ids (path, id) VALUES (?1, ?2)",
-                params![new, id],
-            )?;
-            updated += 1;
+            if n > 0 {
+                updated += 1;
+            }
         }
         tx.commit()?;
         Ok(updated)
     }
 
-    /// Rename: update `notes.path` and add a new `path_ids` row for the new
-    /// path. Old path_ids row is removed so search by old path returns None.
+    /// Rename: update `notes.path` for the row with the given id.
     /// Content unchanged — chunks stay valid.
     pub fn rename_note(&mut self, note_id: &str, new_path: &str) -> Result<(), Error> {
-        let tx = self.conn.transaction()?;
-        let updated = tx.execute(
+        let updated = self.conn.execute(
             "UPDATE notes SET path = ?1 WHERE id = ?2",
             params![new_path, note_id],
         )?;
         if updated == 0 {
             return Err(Error::NotFound(note_id.to_string()));
         }
-        tx.execute("DELETE FROM path_ids WHERE id = ?1", params![note_id])?;
-        tx.execute(
-            "INSERT INTO path_ids (path, id) VALUES (?1, ?2)",
-            params![new_path, note_id],
-        )?;
-        tx.commit()?;
         Ok(())
     }
 
-    /// Resolve a note id back to its current vault-relative path via the
-    /// `path_ids` table. Returns the most recently inserted path for the
-    /// id (renames write a fresh row + delete the old one, so there's
-    /// at most one live row per id under normal operation).
-    ///
-    /// status: trail-reference-resolution
-    pub fn path_for_id(&self, note_id: &str) -> Result<Option<String>, Error> {
-        let path = self
-            .conn
-            .query_row(
-                "SELECT path FROM path_ids WHERE id = ?1 LIMIT 1",
-                params![note_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(path)
+    /// Rename a note by its old path. Convenience for callers (the indexer
+    /// rename handler, the vault `move_note` path) that no longer carry the
+    /// `id_for_path` indirection. Returns true when a row moved.
+    pub fn rename_note_by_path(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<bool, Error> {
+        let updated = self.conn.execute(
+            "UPDATE notes SET path = ?1 WHERE path = ?2",
+            params![new_path, old_path],
+        )?;
+        Ok(updated > 0)
     }
 }

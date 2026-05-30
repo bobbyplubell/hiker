@@ -1,16 +1,21 @@
-//! Wikilink decorations: `[[Target]]` / `[[Target|Alias]]`.
+//! Wikilink decorations: `[[Target]]`.
 //!
 //! When the cursor is off the link's line the whole `[[…]]` span collapses to
 //! a styled link pill; with the cursor on the line the raw markdown stays
 //! visible for editing (the standard live-preview reveal).
 //!
-//! A host may pass a `resolve` closure mapping a link target (a ULID or a
-//! name) to the note's *current* title. When present, links render as
-//! clickable [`WikilinkWidget`] pills carrying the live title — a click emits
-//! a `WidgetClick` tagged with [`WIKILINK_WIDGET_TAG`] so the host can resolve
-//! the target and open it. A target the resolver can't place renders in a
-//! distinct unresolved style. Without a resolver (read-only previews, the
-//! standalone example) links fall back to a plain non-clickable `Replace`.
+//! Under the path-form (`wikilink-path-form`) the body is the target verbatim
+//! — a bare basename (`Name`) or a vault-relative path without the `.md`
+//! extension (`folder/sub/Name`). There is no `|display` alias half.
+//!
+//! A host may pass a `resolve` closure mapping a link target to the note's
+//! *current* title (its basename, or frontmatter `title` once that's wired).
+//! When present, links render as clickable [`WikilinkWidget`] pills carrying
+//! the live title — a click emits a `WidgetClick` tagged with
+//! [`WIKILINK_WIDGET_TAG`] so the host can resolve the target and open it.
+//! A target the resolver can't place renders in a distinct unresolved style.
+//! Without a resolver (read-only previews, the standalone example) links
+//! fall back to a plain non-clickable `Replace`.
 
 use editor_core::decoration::Color;
 use editor_core::decoration::Decoration;
@@ -36,8 +41,8 @@ pub const COLOR_WIKILINK_UNRESOLVED: Color = Color::rgb(224, 108, 117);
 /// apart from other inline-widget click consumers (patch-review, diff hunks).
 pub const WIKILINK_WIDGET_TAG: u64 = 1 << 62;
 
-/// Resolver closure: target (ULID or name) → the note's current display title,
-/// or `None` when the target can't be resolved.
+/// Resolver closure: target (a vault path or bare basename) → the note's
+/// current display title, or `None` when the target can't be resolved.
 pub type TitleResolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 /// Clickable inline pill for a resolved/unresolved wikilink. Renders as
@@ -121,16 +126,14 @@ pub fn wikilink_decorations(
                 continue;
             }
 
-            // Split on '|' for alias.
-            let (target, alias_range_in_inner) = if let Some(pipe) = inner.find('|') {
-                let alias = (pipe + 1)..inner.len();
-                (&inner[..pipe], alias)
-            } else {
-                (inner, 0..inner.len())
-            };
-            let target = target.trim();
-            let alias_text = inner[alias_range_in_inner.clone()].trim();
-            let display_text: &str = if alias_text.is_empty() { target } else { alias_text };
+            // Path-form (`wikilink-path-form`): the entire body is the target;
+            // no `|alias` half. The display falls back to the target verbatim
+            // when no resolver provides a title.
+            let target = inner.trim();
+            let display_text: &str = target;
+            // Range of the styled text inside the brackets — used for the
+            // alias Mark below; under path-form it's the whole body.
+            let alias_range_in_inner: std::ops::Range<usize> = 0..inner.len();
 
             let span_line_start = line_of(i);
             let span_line_end = line_of(full_end.saturating_sub(1).max(i));

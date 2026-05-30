@@ -69,9 +69,13 @@ pub enum ClickAction {
 pub enum DragState {
     #[default]
     Idle,
-    /// Mouse pressed outside a selection; subsequent drag extends a
-    /// selection from `anchor` to the current pointer position.
-    MaybeSelecting { anchor: usize },
+    /// Mouse pressed outside a selection; subsequent drag extends a selection.
+    /// `lo`/`hi` are the byte bounds of the selection the press produced — a
+    /// single point for a plain click, or the whole word/line for a
+    /// double/triple click. A drag unions this range with the pointer position,
+    /// so the initial word/line is preserved (and extended) rather than
+    /// collapsing the moment the pointer jitters within it.
+    MaybeSelecting { lo: usize, hi: usize },
     /// Mouse pressed inside a non-empty selection; a real text drag begins
     /// once the pointer moves more than `threshold` pixels from `start`.
     MaybeDraggingSelection { start: (f32, f32), threshold: f32 },
@@ -137,6 +141,19 @@ pub struct DecorationLayers {
     /// the widget detect a no-op for the heightmap driver specifically
     /// (height-affecting layers unchanged even if paint-only ones did).
     pub height_signature: u64,
+    /// Fingerprint over layers that are NOT viewport-scoped — i.e. layers whose
+    /// decoration coverage of any given line is independent of the visible
+    /// range. Updated by [`Self::push`] / [`Self::push_with_heights`] (which
+    /// the host uses for full-document layers) and deliberately *not* updated
+    /// by [`Self::push_viewport_scoped`].
+    ///
+    /// The wrap cache uses this to decide whether off-viewport lines could
+    /// have changed since the last frame: when this fingerprint is stable
+    /// and the document and wrap metrics are stable, the only lines whose
+    /// spans could differ are those whose viewport-scoped coverage shifted —
+    /// i.e. the union of last frame's and this frame's visible band. That
+    /// turns prewrap from O(N) per scroll frame into O(viewport_size).
+    pub geometry_epoch: u64,
 }
 
 impl DecorationLayers {
@@ -145,6 +162,7 @@ impl DecorationLayers {
         self.height_indices.clear();
         self.signature = 0;
         self.height_signature = 0;
+        self.geometry_epoch = 0;
     }
     /// Push a decoration layer, routing it to the heightmap driver iff the set
     /// reports [`DecorationSet::affects_height`]. The flag is computed once at
@@ -152,11 +170,19 @@ impl DecorationLayers {
     /// height-affecting decoration is always visible to the heightmap driver
     /// regardless of how the caller obtained the set — and a paint-only set
     /// never costs the driver a scan.
+    ///
+    /// Use this for full-document layers (coverage doesn't depend on the
+    /// visible range). For layers the host scopes to the viewport — i.e.
+    /// rebuilt fresh on every scroll with `vp_fp` in their cache key — use
+    /// [`Self::push_viewport_scoped`] instead, so prewrap can skip the
+    /// off-viewport rescan on pure scroll.
     pub fn push(&mut self, set: DecorationSet) {
         if set.affects_height() {
             self.push_with_heights(set);
         } else {
-            self.signature = mix_u64(self.signature, set.content_id() as u64);
+            let id = set.content_id() as u64;
+            self.signature = mix_u64(self.signature, id);
+            self.geometry_epoch = mix_u64(self.geometry_epoch, id);
             self.layers.push(set);
         }
     }
@@ -169,6 +195,27 @@ impl DecorationLayers {
         let id = set.content_id() as u64;
         self.signature = mix_u64(self.signature, id);
         self.height_signature = mix_u64(self.height_signature, id);
+        self.geometry_epoch = mix_u64(self.geometry_epoch, id);
+        self.layers.push(set);
+    }
+    /// Push a paint-only layer whose coverage is scoped to the viewport — i.e.
+    /// the host rebuilds it fresh every frame with the visible range mixed
+    /// into the cache key (wikilink, transclusion, callout, footnote, math,
+    /// mermaid, occurrence, bracket match, trailing-ws, etc.). The set still
+    /// contributes to [`Self::signature`] (so the minimap and the per-line
+    /// galley cache see it churn), but *not* to [`Self::geometry_epoch`] —
+    /// telling the wrap cache "any line outside the viewport union still has
+    /// the same spans as last frame, so don't rescan it." Panics in debug if
+    /// the set carries height-affecting decorations, since those need
+    /// height-signature accounting.
+    pub fn push_viewport_scoped(&mut self, set: DecorationSet) {
+        debug_assert!(
+            !set.affects_height(),
+            "viewport-scoped layers can't carry height-affecting decorations — \
+             that would force a full prewrap on every scroll"
+        );
+        let id = set.content_id() as u64;
+        self.signature = mix_u64(self.signature, id);
         self.layers.push(set);
     }
     /// Iterate only the layers flagged as containing height-affecting
@@ -203,6 +250,12 @@ pub struct ViewState {
     pub drag: DragState,
     /// Last interaction; for cursor blinking.
     pub last_interaction: Instant,
+    /// Set by `command::handle` when an edit moved the caret; consumed by the
+    /// egui widget after its measure pass (once the height map reflects the
+    /// post-edit doc) to scroll the caret back into view. A deferred flag,
+    /// not an immediate scroll, because the height map isn't current at the
+    /// moment the command runs — a just-inserted newline isn't measured yet.
+    pub scroll_caret_into_view: bool,
     /// When true, command dispatch ignores text-modifying input. Used by the
     /// diff view (which displays a synthesized rope that cannot be edited
     /// in-place).
@@ -251,6 +304,17 @@ pub struct ViewState {
     /// Active snippet expansion state (Tab/Shift-Tab cycle through stops).
     /// Defaults to inactive. See SPEC §9.22.
     pub snippet: SnippetState,
+    /// Compiled regex deciding what a double-click selects: the match on the
+    /// clicked line containing the cursor becomes the selection. Set from
+    /// `editor.double_click_pattern`; the default value is
+    /// [`default_double_click_regex`] (i.e. `\w+`, which reproduces the
+    /// historic Unicode-word behavior). `Arc` so cloning the view is cheap.
+    pub double_click_re: Arc<regex::Regex>,
+    /// As [`Self::double_click_re`], for triple-click. Default is
+    /// [`default_triple_click_regex`] (`.*\n?`, matched against the line
+    /// **including** its trailing newline — same selection as the previous
+    /// whole-line built-in).
+    pub triple_click_re: Arc<regex::Regex>,
     /// Last-frame fingerprints used by the widget's measure phase to detect
     /// which (if any) geometry inputs changed. When all four match the
     /// current frame's values, the measure pass is skipped entirely.
@@ -319,6 +383,7 @@ impl Default for ViewState {
             decorations: DecorationLayers::default(),
             drag: DragState::Idle,
             last_interaction: Instant::now(),
+            scroll_caret_into_view: false,
             read_only: false,
             hide_gutter: false,
             click_zones: Vec::new(),
@@ -334,6 +399,8 @@ impl Default for ViewState {
             search: SearchState::default(),
             panels: PanelStack::default(),
             snippet: SnippetState::default(),
+            double_click_re: default_double_click_regex(),
+            triple_click_re: default_triple_click_regex(),
             measure_cache: MeasureCache::default(),
         }
     }
@@ -344,6 +411,46 @@ impl Default for ViewState {
 /// the text by this much with the gutter off; the click→byte inverse must
 /// subtract the same amount, hence it lives here as the shared source of truth.
 pub const HIDDEN_GUTTER_PAD: f32 = 4.0;
+
+/// Default `editor.double_click_pattern`. `\w+` (Unicode word characters) —
+/// reproduces the historic Unicode-word double-click selection. `foo-bar`
+/// splits at `-`; set `editor.double_click_pattern = "[\\w-]+"` to include
+/// hyphens. Mirrored in `core::config::EditorConfig`'s serde default — keep
+/// in sync.
+pub const DEFAULT_DOUBLE_CLICK_PATTERN: &str = r"\w+";
+
+/// Default `editor.triple_click_pattern`. `.*\n?` matched against the clicked
+/// line **with** its trailing newline — reproduces the previous whole-line
+/// behavior including the newline. Mirrored in `core::config::EditorConfig`'s
+/// serde default — keep in sync.
+pub const DEFAULT_TRIPLE_CLICK_PATTERN: &str = r".*\n?";
+
+static DEFAULT_DOUBLE_CLICK_RE: std::sync::LazyLock<Arc<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            regex::Regex::new(DEFAULT_DOUBLE_CLICK_PATTERN)
+                .expect("DEFAULT_DOUBLE_CLICK_PATTERN must be a valid regex"),
+        )
+    });
+
+static DEFAULT_TRIPLE_CLICK_RE: std::sync::LazyLock<Arc<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            regex::Regex::new(DEFAULT_TRIPLE_CLICK_PATTERN)
+                .expect("DEFAULT_TRIPLE_CLICK_PATTERN must be a valid regex"),
+        )
+    });
+
+/// Shared, lazily-compiled default `double_click_re`. Cheap to clone (it's an
+/// `Arc`) — callers reach for this when the user pattern is empty or invalid.
+pub fn default_double_click_regex() -> Arc<regex::Regex> {
+    DEFAULT_DOUBLE_CLICK_RE.clone()
+}
+
+/// Shared, lazily-compiled default `triple_click_re`.
+pub fn default_triple_click_regex() -> Arc<regex::Regex> {
+    DEFAULT_TRIPLE_CLICK_RE.clone()
+}
 
 impl ViewState {
     pub fn touch(&mut self) {

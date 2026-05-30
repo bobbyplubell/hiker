@@ -18,6 +18,10 @@ The headline decisions:
 Vault is the fourth entry in the sidebar's uniform mode-switcher row (`sidebar-mode-switcher`), pressed-state like the others; clicking switches the sidebar body in place, leaving the editor pane and discovery panel untouched. Mode persists per-vault under the existing `vault.sidebar_mode` key. The pinned Trash bin and the `+` / `⋯` row stay, their behavior mode-aware as elsewhere: `+` defaults to a new note (cross-type picker on right-click), `⋯` hosts Vault-mode actions (the lens/grouping choice below). [vault-view-mode]
 
 
+## v1 status
+
+The mode, the read-only lens contract, the registry/activity-bar wiring, and the lens-picker are built (`app/src/vault_view/`, registered as the `vault` `Feature` + `HikerMode::Vault` + `PANEL_VAULT`). v1 ships the two groupings derivable from data that exists today — **by top-level folder** (flattened within each, distinct from Files' fully-nested tree) and **flat (all notes)** — both read from the index's `all_note_paths`. The three richer groupings below (crawl-job nesting, sidecar surfacing, source-type/provenance) depend on `extract.md` (unbuilt, v4+) and a provenance index column; their dispatch slots are reserved in `vault_view::Lens` and light up when that data lands. Files mode is already pure on-disk (it never grew the virtual-group rendering), so no behavior moved out of it.
+
 ## What the lens shows
 
 Vault mode renders a tree whose nodes are notes and whose nesting comes from metadata, not directories. The default lens composes three groupings:

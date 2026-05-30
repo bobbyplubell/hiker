@@ -1,7 +1,7 @@
 # egui_editor — Product Spec
 
 A reusable code + markdown editing **widget** for Rust UI. Primary host: egui. Modeled on
-CodeMirror 6 in capability and extensibility. Built for a note-taking app with a native
+modern decoration-based editors in capability and extensibility. Built for a note-taking app with a native
 Rust UI.
 
 This document is the **user-facing requirements** — what the editor does, not how it is
@@ -99,7 +99,7 @@ application would be built on.
 ### 3.6 Folding / replace
 - Hide a range of text behind a placeholder widget (the standard code-folding behavior).
 - Cursor motion treats a folded region as a single step.
-- **Expansion controls** (the "dropdown thingies" in VSCode/Obsidian): clickable
+- **Expansion controls** (the "dropdown thingies" common in code/note editors): clickable
   chevron / triangle markers in the gutter (or inline) that toggle a fold
   open/closed. Two specific shapes the widget must support:
   - **Per-language fold regions**: code blocks/braces/markdown sections that the
@@ -107,7 +107,7 @@ application would be built on.
   - **Diff context expansion**: at the boundary between a shown hunk and
     elided unchanged context, an inline "▼ N unchanged lines" affordance that
     reveals the hidden context when clicked (and a corresponding "▲" to recollapse).
-    VSCode shows these between hunks; Obsidian uses similar dropdowns for
+    VSCode shows these between hunks; note editors use similar dropdowns for
     collapsible sections.
 
 Both shapes are the same underlying primitive: a fold model that owns a set of
@@ -166,7 +166,7 @@ Live-preview behaviors:
 - **Horizontal rules** render as a thin horizontal line.
 - **Images** render as inline or block image widgets (with the source text hidden until cursor is near).
 
-### 4.0 Obsidian-style extensions (v1)
+### 4.0 Wiki-style extensions (v1)
 - **Wikilinks**: `[[Page]]` and `[[Page|alt]]` render as chips (Inline widget) with the
   page title styled, target hidden. Click → host emits a `WikilinkClicked(target)` event.
 - **Transclusion**: `![[Page]]` and `![[Page#section]]` render as block-embed widgets;
@@ -185,11 +185,11 @@ Live-preview behaviors:
 - Cursor entering the table region transitions back to source view for editing, or stays
   in a structured cell-edit mode (TBD which feels better — see open questions in
   IMPLEMENTATION.md).
-- Obsidian-style extensions: cell alignment markers, simple column-resize cues.
+- Wiki-style table extensions: cell alignment markers, simple column-resize cues.
 
 ### 4.2 Live-preview UX rules
 - "Reveal source on cursor line" is the universal rule: whichever line the cursor is on
-  shows raw markdown; everywhere else shows the rendered form. This is the Obsidian-style
+  shows raw markdown; everywhere else shows the rendered form. This is the inline live-preview
   Live Preview mode, and it should be the default. A pure-source-view mode and a
   pure-render-view mode are both available toggles.
 
@@ -498,7 +498,7 @@ be added later without rewriting the editor. See `IMPLEMENTATION.md` §11.
 ## 13. Architectural extension surface (host-facing)
 
 These aren't end-user features but they're the host-facing API surface that
-makes near-CM6 parity feel CM6-like to extension authors.
+makes the extension surface feel familiar to extension authors.
 
 ### 13.1 Facet<Input, Output>
 Typed multi-provider channels. An extension declares a facet (typed by its

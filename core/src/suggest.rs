@@ -102,6 +102,11 @@ pub fn apply_tree(
     log: &OpLog,
     history: Option<&RejectionHistory>,
 ) -> Result<ApplyOutcome, HikerError> {
+    // status: store-id-from-oplog — leaf `note_ref` → path resolution
+    // now goes through `log.path_for_doc`, but `store` is kept on the
+    // signature so callers don't break (the structural-index path-walk
+    // surface stays open here for future filters).
+    let _ = store;
     let nodes = trees
         .list_nodes(tree_id)
         .map_err(|e: TreesError| HikerError::Io(e.to_string()))?;
@@ -127,8 +132,8 @@ pub fn apply_tree(
                 continue;
             }
         };
-        let rel = match store
-            .path_for_id(&note_id)
+        let rel = match log
+            .path_for_doc(&note_id)
             .map_err(|e| HikerError::Io(e.to_string()))?
         {
             Some(p) => p,
@@ -468,6 +473,10 @@ pub fn stage_moves(
     vault: &Vault,
     log: &OpLog,
 ) -> Result<StageOutcome, HikerError> {
+    // status: store-id-from-oplog — `store` kept on the signature for
+    // future use; leaf `note_ref` → path resolution now routes through
+    // the op-log.
+    let _ = store;
     let mut moves = Vec::new();
     for node_id in args.node_ids {
         let Some(node) = trees
@@ -480,8 +489,8 @@ pub fn stage_moves(
             continue;
         }
         let Some(note_id) = node.note_ref.clone() else { continue };
-        let Some(rel) = store
-            .path_for_id(&note_id)
+        let Some(rel) = log
+            .path_for_doc(&note_id)
             .map_err(|e| HikerError::Io(e.to_string()))?
         else {
             continue;
@@ -517,6 +526,8 @@ pub fn stage_tags(
     store: &Store,
     log: &OpLog,
 ) -> Result<Vec<String>, HikerError> {
+    // status: store-id-from-oplog — see `apply_tree`.
+    let _ = store;
     let mut ids = Vec::new();
     for node_id in args.node_ids {
         let Some(node) = trees
@@ -529,8 +540,8 @@ pub fn stage_tags(
             continue;
         }
         let Some(note_id) = node.note_ref.clone() else { continue };
-        let Some(rel) = store
-            .path_for_id(&note_id)
+        let Some(rel) = log
+            .path_for_doc(&note_id)
             .map_err(|e| HikerError::Io(e.to_string()))?
         else {
             continue;
@@ -1125,10 +1136,24 @@ mod tests {
         let mut store = Store::open(td.path()).unwrap();
         let log = open_log(&td);
 
-        // Index the two notes so `path_for_id` returns the expected rels.
+        // status: store-id-from-oplog
+        // Seed each note in the op-log so `path_for_doc` (called from
+        // `apply_tree`) resolves the leaf's `note_ref` back to a vault
+        // path. The doc_id is what apply_tree dereferences.
+        let note_a_id = crate::ops::op_writes::bootstrap(&vault, &log).unwrap_or(0);
+        let _ = note_a_id;
+        let note_a = log.doc_id_for_path("a.md").unwrap().expect("seeded");
+        let note_b = log
+            .doc_id_for_path("inbox/b.md")
+            .unwrap()
+            .expect("seeded");
+
+        // Index the two notes so the structural query (used elsewhere)
+        // also has rows. Use the op-log's doc_ids as `notes.id` per
+        // path-as-identity.
         store
             .upsert_note(&NoteUpsert {
-                id: "note-a",
+                id: &note_a,
                 path: "a.md",
                 content_hash: "h-a",
                 mtime: 1,
@@ -1140,7 +1165,7 @@ mod tests {
             .unwrap();
         store
             .upsert_note(&NoteUpsert {
-                id: "note-b",
+                id: &note_b,
                 path: "inbox/b.md",
                 content_hash: "h-b",
                 mtime: 1,
@@ -1171,7 +1196,7 @@ mod tests {
                             require_review: false,
                         }),
                     ),
-                    leaf("leaf-a", "tag-cluster", "note-a"),
+                    leaf("leaf-a", "tag-cluster", &note_a),
                     cluster(
                         "move-cluster",
                         Some("root"),
@@ -1180,7 +1205,7 @@ mod tests {
                             require_review: true,
                         }),
                     ),
-                    leaf("leaf-b", "move-cluster", "note-b"),
+                    leaf("leaf-b", "move-cluster", &note_b),
                 ],
             )
             .unwrap();

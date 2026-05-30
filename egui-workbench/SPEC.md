@@ -4,7 +4,7 @@
 
 A reusable layout crate that gives any egui application the configurable
 multi-pane workbench surface used by most modern IDE / editor / design
-tools (JetBrains, Figma, Ableton, Theia, Trilium, Obsidian). The user
+tools (JetBrains, Figma, Ableton, Theia, Trilium). The user
 gets a familiar, dockable, persistable workspace; the host application
 provides the content.
 
@@ -45,11 +45,11 @@ arrangement is persistable per workspace.
 
 1.2. Each item in the strip represents an **activity** (an addressable view container the user can summon to the side bar).
 
-1.3. Clicking an item **toggles** its side bar visibility — first click shows, second hides.
+1.3. Clicking an item **switches** the primary side bar to that activity: it focuses the activity if it is already an open section (keeping the current arrangement), otherwise it **opens that activity in full** — replacing the entire stack with just that one section. Clicking the already-focused activity **hides** the side bar. This is VSCode's view-container switch behavior — a click never adds to or splits the existing arrangement; extra sections are built only via drag or the `+` menu (§2.6).
 
 1.4. The currently-active activity is rendered with an **accent indicator** (e.g., a colored bar on the leading edge of the item).
 
-1.5. Items are **draggable** to reorder within the strip.
+1.5. Items are **draggable**. Releasing a drag **inside the strip** reorders the item within the strip; releasing it **outside the strip** (over the rest of the window) **adds that activity as a new section** in the primary side bar — VSCode's "drag a view into the sidebar". A cursor-following ghost previews the dragged item, and the side bar highlights as a drop target while a drag hovers it.
 
 1.6. Items can be **right-clicked** to access per-item commands: Hide, Move to Other Side Bar, etc.
 
@@ -63,17 +63,29 @@ arrangement is persistable per workspace.
 
 ### 2. Primary side bar
 
-2.1. The primary side bar **renders the content of the currently-active activity** as a stacked view (single-column).
+2.1. The primary side bar is a **vertical accordion** of one or more activity **sections** (single-column). With one section open it looks identical to a plain single-activity side bar; additional sections stack below it.
 
-2.2. The bar has its own **header** with a title (the active activity's name) and a small actions menu (hamburger or ellipsis).
+2.2. Each section has a **header**: a collapse twistie, the activity's title, and the host's per-activity action buttons. All headers render identically (no per-section focus highlight) so an added section reads as a peer, not a selected sub-item.
 
-2.3. The bar is **horizontally resizable** with a draggable splitter on its inner edge.
+2.3. **Panel menu.** Right-clicking a section header opens its menu: the host's per-activity actions, an "Add panel" submenu (activities not yet open), and "Close panel". (There is no discrete `+` or `…` button — the right-click menu is the single entry point.)
 
-2.4. The bar can be **collapsed** entirely with a keyboard shortcut (`Ctrl+B` / `Cmd+B` by default) — the content is preserved, only visibility changes.
+2.4. **One accordion per panel.** A section body renders the feature's content directly; features do not draw their own nested collapsible headers (the workbench header is the only accordion level).
 
-2.5. The bar's width is **persisted** across sessions.
+2.5. **Collapse / expand.** Clicking a section header (or its twistie) toggles that section's body; collapsed sections show only their header.
 
-2.6. The bar's position can be **swapped** to the right edge — content unchanged, just rendered on the other side.
+2.6. **Reorder.** A section header is a drag handle — dragging it reorders the section within the bar, with an insertion-line preview.
+
+2.7. **Resize between sections.** The boundary between two expanded sections is a draggable handle that reallocates height between them; neither body shrinks below a minimum (collapse the section to go smaller).
+
+2.8. **Adding a section** happens via the header right-click "Add panel" submenu or by dragging an activity icon out of the strip into the window (§1.5). The new section is inserted below the focused one and focused.
+
+2.9. The bar is **horizontally resizable** with a draggable splitter on its inner edge.
+
+2.10. The bar can be **collapsed** entirely with a keyboard shortcut (`Ctrl+B` / `Cmd+B` by default) — the section set is preserved, only visibility changes.
+
+2.11. The bar's width is **persisted** across sessions. The host may also persist the section arrangement (open sections, collapse flags, height weights, focus, visibility) via the `SidePanelStack` accessors + `restore` — hiker does so per-vault in `.hiker/side-panel.json`.
+
+2.12. The bar's position can be **swapped** to the right edge — content unchanged, just rendered on the other side.
 
 ### 3. Secondary side bar
 

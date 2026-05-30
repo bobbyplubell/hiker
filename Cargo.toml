@@ -17,10 +17,13 @@ members = [
     "editor/examples/diff",
     "egui-workbench",
     "egui-workbench/examples/workbench-demo",
+    "hiker-features",
+    "hiker-lite",
     "site",
     "tools/graph-snapshot",
     "tools/minimap-render",
     "tools/profile-indexer",
+    "tools/profile-scroll",
     "widgets/graph-widgets",
 ]
 # Example plugins compile to wasm32 (cdylib importing `hiker.host_call`), so
@@ -100,7 +103,18 @@ editor-egui = { path = "editor/editor-egui" }
 editor-md = { path = "editor/editor-md" }
 editor-diff = { path = "editor/editor-diff" }
 editor-ts = { path = "editor/editor-ts" }
-tree-sitter = "0.22"
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
+tree-sitter-sequel = "0.3"
 
 # --- egui ecosystem ---
 egui = "0.32"
@@ -109,6 +123,7 @@ eframe = { version = "0.32", default-features = false, features = ["default_font
 egui_dock = "0.17"
 egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { path = "egui-workbench" }
+hiker-features = { path = "hiker-features" }
 graph-widgets = { path = "widgets/graph-widgets" }
 petgraph = { version = "0.6", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

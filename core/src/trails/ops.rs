@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::sections::TrailsConfig;
 use crate::errors::HikerError;
 use crate::indexer::{IndexJob, IndexJobTx};
-use crate::store::dto::new_id;
+use crate::oplog::OpLog;
 use crate::store::Store;
 use crate::trash::{Trash, Entry};
 use crate::vault::Vault;
@@ -18,10 +18,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::{
-    collect_descendant_ids, find_waypoint, find_waypoint_mut,
-    parse_trail_doc_for, parse_waypoint, remove_waypoint_from_tree, short_id_of,
-    waypoint_filename, waypoints_dir_for, write_trail_doc_frontmatter,
-    write_waypoint_frontmatter, DoubleLinkRef, WaypointEntry, WaypointFrontmatter,
+    collect_descendant_paths, find_waypoint, find_waypoint_mut,
+    parse_trail_doc_for, parse_waypoint, random_alphanumeric_6,
+    remove_waypoint_from_tree, waypoint_filename, waypoints_dir_for,
+    write_trail_doc_frontmatter, write_waypoint_frontmatter, WaypointEntry,
+    WaypointFrontmatter,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,18 +31,21 @@ use super::{
 
 /// Outcome of a successful `create_trail` call. `trail_doc_rel` is the
 /// vault-relative path of the just-written trail-doc; `trail_id` is the
-/// minted ULID.
+/// op-log `doc_id` for that path (read after the write, since op-log
+/// minted it during ingest of the new file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTrailOutcome {
     pub trail_doc_rel: String,
     pub trail_id: String,
 }
 
-/// Outcome of a successful `append_waypoint` call.
+/// Outcome of a successful `append_waypoint` call. The waypoint is
+/// addressed by its vault-relative path; the optional op-log `doc_id`
+/// for the waypoint-note is surfaced for callers that still need the
+/// internal id (e.g. trail-graph viewers).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendWaypointOutcome {
     pub waypoint_rel: String,
-    pub waypoint_id: String,
     pub trail_id: String,
 }
 
@@ -65,64 +69,111 @@ pub struct RemoveWaypointOutcome {
 /// `-N.md` (1..1000) only when there is a collision, mirroring
 /// `core::ops::create_with_suffix`.
 ///
+/// When `draft` is true the trail-doc lands at
+/// `.hiker/trails/drafts/<trail-id>.md` with `hiker.draft: true` stamped
+/// in its frontmatter (per `docs/trails.md` §"Draft trails"); the draft
+/// path is keyed by the minted ULID so it never collides with another
+/// draft and never pollutes the user's `new_trail_dir`. The waypoint dir
+/// is identical for drafts and accepted trails. When `draft` is false the
+/// behavior is unchanged. [trail-draft-from-agent, trail-draft-review-surface]
+///
 /// status: trails-default-location
 /// status: trail-doc-shape
+/// status: trail-draft-from-agent
 pub async fn create_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
+    log: &OpLog,
     vault: &Vault,
     config: &TrailsConfig,
     name: &str,
+    draft: bool,
 ) -> Result<CreateTrailOutcome, HikerError> {
     let folder = config.new_trail_dir.trim_end_matches('/');
-    // Auto-create the folder (if non-empty) so the very first trail in a
-    // vault doesn't fail with NotFound on the parent.
-    if !folder.is_empty() {
-        let abs = vault.abs_path(folder)?;
+    // Auto-create the placement folder so the very first trail in a vault
+    // doesn't fail with NotFound on the parent. Drafts always live under
+    // the hidden `.hiker/trails/drafts/` carve-out; accepted trails use
+    // the configured `new_trail_dir`.
+    let placement_dir = if draft {
+        ".hiker/trails/drafts".to_string()
+    } else {
+        folder.to_string()
+    };
+    if !placement_dir.is_empty() {
+        let abs = vault.abs_path(&placement_dir)?;
         if !abs.exists() {
             std::fs::create_dir_all(&abs)
-                .map_err(|e| HikerError::Io(format!("create new_trail_dir: {e}")))?;
+                .map_err(|e| HikerError::Io(format!("create trail placement dir: {e}")))?;
         }
     }
 
-    let trail_id = new_id();
-    // Minimal valid trail-doc frontmatter — no last_activated_at yet.
-    let body = format!("---\nhiker:\n  kind: trail\n  id: {trail_id}\n  waypoints: []\n---\n");
-
-    // Write the trail-doc with auto-suffix on collision.
-    let mut chosen: Option<String> = None;
-    let base_candidate = if folder.is_empty() {
-        format!("{name}.md")
+    // Minimal valid trail-doc frontmatter — no `hiker.id` per
+    // `trail-doc-shape` (the trail's storage key is the op-log's
+    // doc_id, read from `doc-index.db` after the write). Draft trails
+    // additionally carry `hiker.draft: true` so the listing filter and
+    // review surface can distinguish them from accepted trails.
+    let body = if draft {
+        "---\nhiker:\n  kind: trail\n  draft: true\n  waypoints: []\n---\n".to_string()
     } else {
-        format!("{folder}/{name}.md")
+        "---\nhiker:\n  kind: trail\n  waypoints: []\n---\n".to_string()
     };
-    {
-        let abs = vault.abs_path(&base_candidate)?;
-        if !abs.exists() {
-            watcher.suppress(base_candidate.clone());
-            vault.write_file(&base_candidate, &body)?;
-            chosen = Some(base_candidate);
-        }
-    }
-    if chosen.is_none() {
-        for n in 1..1000 {
-            let candidate = if folder.is_empty() {
-                format!("{name}-{n}.md")
-            } else {
-                format!("{folder}/{name}-{n}.md")
-            };
-            let abs = vault.abs_path(&candidate)?;
+
+    // Resolve the trail-doc path. Drafts use a fresh random 6-char token
+    // for the basename so the basename never collides with another draft
+    // and the user-facing slot isn't burned on a ULID; accepted trails use
+    // the name verbatim with auto-suffix on collision.
+    let trail_doc_rel = if draft {
+        let candidate = format!("{placement_dir}/{}.md", random_alphanumeric_6());
+        watcher.suppress(candidate.clone());
+        vault.write_file(&candidate, &body)?;
+        candidate
+    } else {
+        let mut chosen: Option<String> = None;
+        let base_candidate = if folder.is_empty() {
+            format!("{name}.md")
+        } else {
+            format!("{folder}/{name}.md")
+        };
+        {
+            let abs = vault.abs_path(&base_candidate)?;
             if !abs.exists() {
-                watcher.suppress(candidate.clone());
-                vault.write_file(&candidate, &body)?;
-                chosen = Some(candidate);
-                break;
+                watcher.suppress(base_candidate.clone());
+                vault.write_file(&base_candidate, &body)?;
+                chosen = Some(base_candidate);
             }
         }
-    }
-    let trail_doc_rel = chosen.ok_or_else(|| {
-        HikerError::AlreadyExists(format!("ran out of {name}-N candidates"))
-    })?;
+        if chosen.is_none() {
+            for n in 1..1000 {
+                let candidate = if folder.is_empty() {
+                    format!("{name}-{n}.md")
+                } else {
+                    format!("{folder}/{name}-{n}.md")
+                };
+                let abs = vault.abs_path(&candidate)?;
+                if !abs.exists() {
+                    watcher.suppress(candidate.clone());
+                    vault.write_file(&candidate, &body)?;
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+        }
+        chosen.ok_or_else(|| {
+            HikerError::AlreadyExists(format!("ran out of {name}-N candidates"))
+        })?
+    };
+
+    // Read the op-log's doc_id for the trail-doc path; this is the
+    // trail's storage key for the waypoint folder under `.hiker/trails/`.
+    // op-log mints it on first ingest (`op-log-doc-id-bootstrap`); the
+    // file we just wrote exists on disk, but the bootstrap pass may not
+    // have run yet on this path — call into `commit_working` /
+    // `external_edit`-equivalent semantics via the standard read after
+    // the file is on disk. The `OpLog::doc_id_for_path` only returns
+    // Some once seeded; if it isn't, seed by reading the just-written
+    // file as a fresh document via the bootstrap routine.
+    let trail_id =
+        crate::ops::op_writes::doc_id_or_seed(log, vault, &trail_doc_rel, &body)?;
 
     // Seed the hidden waypoints dir so subsequent waypoint writes don't
     // need to mkdir on each hop.
@@ -149,6 +200,211 @@ pub async fn create_trail(
     })
 }
 
+
+/// Default-draft policy for an agent-initiated `trail_create`. Per
+/// `docs/trails.md` §"Draft sources": when `agent-write-review-mode` is
+/// on, agent-created trails default to drafts (matching the existing
+/// staging-as-default-for-agent-writes shape); when off, agents create
+/// real trails unless they explicitly opt into a draft.
+///
+/// The MCP `trail_create` wrapper resolves the effective `draft` arg as
+/// `explicit.unwrap_or(default_draft_for_review_mode(review_mode))` so an
+/// explicit `draft=false` can still override the review-mode default.
+///
+/// status: trail-draft-from-agent
+#[must_use]
+pub const fn default_draft_for_review_mode(review_mode_on: bool) -> bool {
+    review_mode_on
+}
+
+/// Outcome of accepting a draft trail. `trail_doc_rel` is the trail-doc's
+/// new (promoted) path; `trail_id` the unchanged ULID.
+///
+/// status: trail-draft-review-surface
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptDraftOutcome {
+    pub trail_doc_rel: String,
+    pub trail_id: String,
+}
+
+/// Accept a draft trail (per `docs/trails.md` §"Review surface").
+/// Strips `hiker.draft: true` from the trail-doc frontmatter and moves
+/// the doc out of `.hiker/trails/drafts/` to the configured
+/// `new_trail_dir`, keeping the waypoints in place. The ULID is unchanged
+/// (the move is path-only, via `core::ops::file::move_note`, so the
+/// derived `trail_waypoints` rows re-derive against the new path
+/// cleanly). The trail joins the dropdown as a normal trail.
+///
+/// `draft_doc_rel` MUST resolve to a trail-doc currently flagged
+/// `hiker.draft: true`; accepting a non-draft is a `NotFound`-shaped
+/// no-op error so a double-accept can't silently relocate a real trail.
+///
+/// status: trail-draft-review-surface
+pub async fn accept_draft(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    log: &OpLog,
+    vault: &Vault,
+    config: &TrailsConfig,
+    draft_doc_rel: &str,
+) -> Result<AcceptDraftOutcome, HikerError> {
+    let src = vault.read_file(draft_doc_rel)?;
+    let mut fm = parse_trail_doc_for(draft_doc_rel, &src)
+        .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
+    if !fm.draft {
+        return Err(HikerError::NotFound(format!(
+            "trail-doc is not a draft: {draft_doc_rel}"
+        )));
+    }
+    // status: store-id-from-oplog
+    let trail_id = log
+        .doc_id_for_path(draft_doc_rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?
+        .ok_or_else(|| {
+            HikerError::NotFound(format!(
+                "op-log doc_id missing for draft trail: {draft_doc_rel}"
+            ))
+        })?;
+
+    // 1. Clear the draft flag in place, then persist + re-index so the
+    //    on-disk doc no longer carries `hiker.draft`.
+    fm.draft = false;
+    let cleared = write_trail_doc_frontmatter(&src, &fm)
+        .map_err(|e| HikerError::Io(format!("rewrite trail-doc: {e}")))?;
+    watcher.suppress(draft_doc_rel.to_string());
+    vault.write_file(draft_doc_rel, &cleared)?;
+    watcher.suppress(draft_doc_rel.to_string());
+
+    // 2. Choose the promoted path under `new_trail_dir` (auto-suffixed on
+    //    collision, mirroring `create_trail`). The promoted basename is
+    //    the trail's doc_id, so it never collides; the user can rename
+    //    later.
+    let folder = config.new_trail_dir.trim_end_matches('/');
+    if !folder.is_empty() {
+        let abs = vault.abs_path(folder)?;
+        if !abs.exists() {
+            std::fs::create_dir_all(&abs)
+                .map_err(|e| HikerError::Io(format!("create new_trail_dir: {e}")))?;
+        }
+    }
+    let dest = promote_destination(vault, folder, &trail_id)?;
+
+    // 3. Relocate via the indexer's path-remap so the doc_id survives.
+    crate::ops::file::move_note(watcher, jobs, draft_doc_rel, &dest).await?;
+
+    Ok(AcceptDraftOutcome {
+        trail_doc_rel: dest,
+        trail_id,
+    })
+}
+
+/// Resolve a collision-free promoted path `<folder>/<trail_id>.md`
+/// (auto-suffixed `-N` on collision; `folder` empty → vault root).
+fn promote_destination(
+    vault: &Vault,
+    folder: &str,
+    trail_id: &str,
+) -> Result<String, HikerError> {
+    let base = if folder.is_empty() {
+        format!("{trail_id}.md")
+    } else {
+        format!("{folder}/{trail_id}.md")
+    };
+    if !vault.abs_path(&base)?.exists() {
+        return Ok(base);
+    }
+    for n in 1..1000 {
+        let candidate = if folder.is_empty() {
+            format!("{trail_id}-{n}.md")
+        } else {
+            format!("{folder}/{trail_id}-{n}.md")
+        };
+        if !vault.abs_path(&candidate)?.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(HikerError::AlreadyExists(format!(
+        "ran out of {trail_id}-N promote candidates"
+    )))
+}
+
+/// Reject a draft trail (per `docs/trails.md` §"Review surface"). Drafts
+/// are pre-acceptance, so rejection is a hard-delete: the trail-doc and
+/// the entire `.hiker/trails/<trail-id>/` directory (waypoint-notes
+/// included) are removed from disk directly — no trash, no `core::changes`
+/// row. Refuses to act on a non-draft trail-doc so a real trail can't be
+/// hard-deleted through this path.
+///
+/// status: trail-draft-review-surface
+pub async fn reject_draft(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    log: &OpLog,
+    vault: &Vault,
+    store: &Store,
+    draft_doc_rel: &str,
+) -> Result<(), HikerError> {
+    let src = vault.read_file(draft_doc_rel)?;
+    let fm = parse_trail_doc_for(draft_doc_rel, &src)
+        .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
+    if !fm.draft {
+        return Err(HikerError::NotFound(format!(
+            "trail-doc is not a draft: {draft_doc_rel}"
+        )));
+    }
+    // status: store-id-from-oplog
+    let trail_id = log
+        .doc_id_for_path(draft_doc_rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?
+        .ok_or_else(|| {
+            HikerError::NotFound(format!(
+                "op-log doc_id missing for draft trail: {draft_doc_rel}"
+            ))
+        })?;
+    drop(src);
+    drop(fm);
+
+    // Gather the waypoint-note paths the indexer knows about up front so
+    // we can enqueue their index deletes (the !Sync store read happens
+    // before any .await fan-out).
+    let waypoint_paths: Vec<String> = store
+        .waypoints_of(&trail_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.waypoint_path)
+        .collect();
+
+    // Hard-delete the trail-doc on disk. Watcher suppressed so notify
+    // can't surface a stale Deleted; index Delete enqueued so derived
+    // rows clear without waiting for a rescan.
+    watcher.suppress(draft_doc_rel.to_string());
+    let abs = vault.abs_path(draft_doc_rel)?;
+    if abs.exists() {
+        std::fs::remove_file(&abs)
+            .map_err(|e| HikerError::Io(format!("remove draft trail-doc: {e}")))?;
+    }
+    let _ = jobs
+        .send(IndexJob::Delete {
+            rel_path: draft_doc_rel.to_string(),
+        })
+        .await;
+
+    // Hard-delete the trail's hidden subsystem dir (waypoint-notes), then
+    // clear each waypoint-note's index rows.
+    let trail_root = format!(".hiker/trails/{trail_id}");
+    let root_abs = vault.abs_path(&trail_root)?;
+    if root_abs.exists() {
+        std::fs::remove_dir_all(&root_abs)
+            .map_err(|e| HikerError::Io(format!("remove draft trail dir: {e}")))?;
+    }
+    for wp in waypoint_paths {
+        watcher.suppress(wp.clone());
+        let _ = jobs.send(IndexJob::Delete { rel_path: wp }).await;
+    }
+
+    Ok(())
+}
+
 /// Append a waypoint to an existing trail.
 ///
 /// 1. Lazy-stamps `hiker.id` on the source note (per `note-id-stamping`).
@@ -170,11 +426,15 @@ pub async fn create_trail(
 pub struct AppendWaypointArgs<'a> {
     pub watcher: &'a Watcher,
     pub jobs: &'a IndexJobTx,
+    pub log: &'a OpLog,
     pub vault: &'a Vault,
-    pub store: &'a mut Store,
     pub trail_doc_rel: &'a str,
     pub source_rel: &'a str,
-    pub parent_waypoint_id: Option<&'a str>,
+    /// Vault-relative waypoint-note path of the parent waypoint when this
+    /// append should land as a child (a side-trail entry); `None` means
+    /// "use the trail-doc's append cursor, or root-tail when the cursor
+    /// is unset". status: trail-append-cursor
+    pub parent_waypoint_path: Option<&'a str>,
     pub annotation: Option<&'a str>,
 }
 
@@ -184,32 +444,36 @@ pub async fn append_waypoint(
     let AppendWaypointArgs {
         watcher,
         jobs,
+        log,
         vault,
-        store,
         trail_doc_rel,
         source_rel,
-        parent_waypoint_id,
+        parent_waypoint_path,
         annotation,
     } = args;
-    // 1. Lazy-stamp the source. `store` is threaded through so the helper
-    // can adopt the indexer's existing `path_ids` ULID rather than minting
-    // a fresh one (which would later resolve as a PathConflict orphan in
-    // Trails-mode rendering — see
-    // `bug-id-stamping-mints-fresh-ulid-instead-of-adopting-path-ids`).
-    let source_id =
-        crate::ops::buffer::ensure_note_id_stamped(watcher, jobs, vault, store, source_rel)
-            .await?;
 
-    // 2. Read the trail-doc.
+    // status: store-id-from-oplog
+    // No source-side id stamping — `note-id-stamping` retired with
+    // path-as-identity. The source is referenced by its vault path; the
+    // op-log keeps the path↔doc_id mapping internally.
+
+    // 1. Read the trail-doc + look up its doc_id (storage key for the
+    //    waypoints folder).
     let trail_src = vault.read_file(trail_doc_rel)?;
     let mut fm = parse_trail_doc_for(trail_doc_rel, &trail_src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
-    let trail_id = fm.id.clone();
+    let trail_id = log
+        .doc_id_for_path(trail_doc_rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?
+        .ok_or_else(|| {
+            HikerError::NotFound(format!(
+                "op-log doc_id missing for trail-doc: {trail_doc_rel}"
+            ))
+        })?;
 
-    // 3. Mint waypoint id; compose the waypoint-note path + body.
-    // Filename embeds a 6-char short-id derived from the waypoint ULID
-    // so files never need renaming on reorder/re-parent.
-    let waypoint_id = new_id();
+    // 2. Compose the waypoint-note path + body. Filename embeds a 6-char
+    //    random alphanumeric token so two waypoints with the same source
+    //    basename don't collide. status: trail-storage-layout
     let basename = source_rel
         .rsplit('/')
         .next()
@@ -226,21 +490,21 @@ pub async fn append_waypoint(
             .map_err(|e| HikerError::Io(format!("create waypoint dir: {e}")))?;
     }
 
-    // Resolve filename + collision-suffix. The short-id makes collisions
-    // vanishingly rare per-trail, but if the same source basename hits
-    // an existing file we append `_N` (1..1000) to disambiguate.
+    // Resolve filename + collision-suffix. The random 6-char token makes
+    // collisions vanishingly rare per-trail, but if a clash hits we
+    // append `_N` (1..1000) before re-minting a fresh token.
     let waypoint_rel = {
-        let primary = waypoint_filename(basename, &waypoint_id);
-        let primary_rel = format!("{waypoints_dir}/{primary}");
+        let primary_rel = format!("{waypoints_dir}/{}", waypoint_filename(basename));
         let primary_abs = vault.abs_path(&primary_rel)?;
         if !primary_abs.exists() {
             primary_rel
         } else {
-            let short_id = short_id_of(&waypoint_id);
             let mut chosen: Option<String> = None;
             for n in 2..1000 {
-                let candidate =
-                    format!("{waypoints_dir}/{basename}_{n}--{short_id}.md");
+                let candidate = format!(
+                    "{waypoints_dir}/{basename}_{n}--{}.md",
+                    random_alphanumeric_6()
+                );
                 let abs = vault.abs_path(&candidate)?;
                 if !abs.exists() {
                     chosen = Some(candidate);
@@ -249,38 +513,26 @@ pub async fn append_waypoint(
             }
             chosen.ok_or_else(|| {
                 HikerError::AlreadyExists(format!(
-                    "ran out of {basename}_N--<short-id>.md candidates"
+                    "ran out of {basename}_N--<rand6>.md candidates"
                 ))
             })?
         }
     };
-    let source_ref = DoubleLinkRef {
-        id: source_id,
-        path: source_rel.to_string(),
-    };
-    let in_trail = DoubleLinkRef {
-        id: trail_id.clone(),
-        path: trail_doc_rel.to_string(),
-    };
     let mut waypoint_body = {
-        let fm = WaypointFrontmatter {
-            id: waypoint_id.clone(),
-            references: source_ref.clone(),
-            in_trail: in_trail.clone(),
+        let wfm = WaypointFrontmatter {
+            references: source_rel.to_string(),
+            in_trail: trail_doc_rel.to_string(),
         };
         // Body-source is just the empty string — no body, no extra newlines
         // beyond the closing `---\n` that `assemble` produces. Per spec,
         // `trail-empty-waypoint-body` requires zero bytes after the FM.
-        write_waypoint_frontmatter("", &fm)
+        write_waypoint_frontmatter("", &wfm)
             .map_err(|e| HikerError::Io(format!("write waypoint fm: {e}")))?
     };
     // Honor optional annotation; None or empty → spec-mandated empty body.
     if let Some(ann) = annotation
         && !ann.is_empty()
     {
-        // Append annotation after the closing FM block. `assemble`
-        // already produced a string ending right after `---\n`, so
-        // the annotation slots in cleanly.
         waypoint_body.push_str(ann);
     }
 
@@ -295,36 +547,26 @@ pub async fn append_waypoint(
         })
         .await;
 
-    // 4. Append entry to trail-doc.
+    // 3. Append entry to trail-doc.
     //
     // status: trail-append-cursor
     // Precedence (per `docs/trails.md` §"Append cursor"):
-    //   explicit `parent_waypoint_id: Some(id)` > cursor > root-tail.
-    //
-    // - Explicit-parent (MCP, future explicit-parent callers): use it
-    //   verbatim — explicit beats cursor so the typed surface stays
-    //   honest.
-    // - parent_waypoint_id None + cursor names a live waypoint: use
-    //   cursor as the parent.
-    // - parent_waypoint_id None + cursor names a stale id (or is None):
-    //   root-tail append; warn-log the stale case so a hand-edit
-    //   pointing at a deleted id surfaces in the trace.
+    //   explicit `parent_waypoint_path: Some(p)` > cursor > root-tail.
     let new_entry = WaypointEntry {
-        id: waypoint_id.clone(),
         path: waypoint_rel.clone(),
         waypoints: Vec::new(),
     };
-    let effective_parent: Option<String> = match parent_waypoint_id {
-        Some(id) => Some(id.to_string()),
+    let effective_parent: Option<String> = match parent_waypoint_path {
+        Some(p) => Some(p.to_string()),
         None => match fm.append_under.as_deref() {
-            Some(cursor_id) => {
-                if find_waypoint(&fm.waypoints, cursor_id).is_some() {
-                    Some(cursor_id.to_string())
+            Some(cursor_path) => {
+                if find_waypoint(&fm.waypoints, cursor_path).is_some() {
+                    Some(cursor_path.to_string())
                 } else {
                     tracing::warn!(
-                        cursor = %cursor_id,
+                        cursor = %cursor_path,
                         trail = %trail_doc_rel,
-                        "trail-append-cursor: stale append_under id `{cursor_id}`, falling back to root"
+                        "trail-append-cursor: stale append_under path `{cursor_path}`, falling back to root"
                     );
                     None
                 }
@@ -334,20 +576,13 @@ pub async fn append_waypoint(
     };
     match effective_parent.as_deref() {
         None => fm.waypoints.push(new_entry),
-        Some(pid) => {
-            let parent = find_waypoint_mut(&mut fm.waypoints, pid).ok_or_else(|| {
-                HikerError::NotFound(format!("parent waypoint id: {pid}"))
+        Some(pp) => {
+            let parent = find_waypoint_mut(&mut fm.waypoints, pp).ok_or_else(|| {
+                HikerError::NotFound(format!("parent waypoint path: {pp}"))
             })?;
             parent.waypoints.push(new_entry);
         }
     }
-    // status: trail-append-cursor
-    // The cursor is exclusively user-controlled per spec — appends do
-    // NOT move it. Successive appends under the same cursor become
-    // siblings (X.1, X.2, X.3); to dig deeper the user explicitly
-    // moves the cursor via "Append from here" or by editing
-    // `hiker.append_under` directly. Auto-advance was rejected because
-    // it produces unintended deepening of the tree.
     let new_trail_src = write_trail_doc_frontmatter(&trail_src, &fm)
         .map_err(|e| HikerError::Io(format!("rewrite trail-doc: {e}")))?;
 
@@ -364,7 +599,6 @@ pub async fn append_waypoint(
 
     Ok(AppendWaypointOutcome {
         waypoint_rel,
-        waypoint_id,
         trail_id,
     })
 }
@@ -380,7 +614,7 @@ pub async fn remove_waypoint(
     vault: &Vault,
     _trash: &Trash,
     trail_doc_rel: &str,
-    waypoint_id: &str,
+    waypoint_path: &str,
 ) -> Result<RemoveWaypointOutcome, HikerError> {
     // Read trail-doc, find the target anywhere in the tree, and collect
     // every descendant path before mutating so the cascade pass has the
@@ -389,32 +623,20 @@ pub async fn remove_waypoint(
     let mut fm = parse_trail_doc_for(trail_doc_rel, &trail_src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
 
-    let target = find_waypoint(&fm.waypoints, waypoint_id)
-        .ok_or_else(|| HikerError::NotFound(format!("waypoint id: {waypoint_id}")))?;
-    // Collect paths of the target + every descendant. We walk the
-    // subtree directly (not via `Store::waypoints_of`) so the answer is
-    // correct even if the derived index is stale — frontmatter is the
-    // source of truth.
-    let mut removed_paths: Vec<String> = Vec::new();
-    fn collect_paths(e: &WaypointEntry, out: &mut Vec<String>) {
-        out.push(e.path.clone());
-        for c in &e.waypoints {
-            collect_paths(c, out);
-        }
-    }
-    collect_paths(target, &mut removed_paths);
+    let target = find_waypoint(&fm.waypoints, waypoint_path)
+        .ok_or_else(|| HikerError::NotFound(format!("waypoint path: {waypoint_path}")))?;
+    // Collect paths of the target + every descendant.
+    let removed_paths: Vec<String> = collect_descendant_paths(target);
 
     // status: trail-append-cursor
     // Cascade-delete safety: if the cursor lives inside the subtree
-    // being removed (target itself, or any descendant), reset it to
-    // None in the same rewrite. Compute the id-set from the live target
-    // before mutating.
-    let removed_ids: std::collections::HashSet<String> =
-        collect_descendant_ids(target).into_iter().collect();
+    // being removed, reset it to None in the same rewrite.
+    let removed_set: std::collections::HashSet<&str> =
+        removed_paths.iter().map(String::as_str).collect();
     let cursor_swept = fm
         .append_under
         .as_deref()
-        .map(|c| removed_ids.contains(c))
+        .map(|c| removed_set.contains(c))
         .unwrap_or(false);
     if cursor_swept {
         fm.append_under = None;
@@ -422,8 +644,8 @@ pub async fn remove_waypoint(
 
     // Drop the subtree from frontmatter.
     let _removed_entry =
-        remove_waypoint_from_tree(&mut fm.waypoints, waypoint_id).ok_or_else(|| {
-            HikerError::NotFound(format!("waypoint id: {waypoint_id}"))
+        remove_waypoint_from_tree(&mut fm.waypoints, waypoint_path).ok_or_else(|| {
+            HikerError::NotFound(format!("waypoint path: {waypoint_path}"))
         })?;
 
     // Cascade-delete every waypoint-note (target + descendants) via
@@ -465,14 +687,14 @@ pub async fn remove_waypoint(
 pub fn descendant_count(
     vault: &Vault,
     trail_doc_rel: &str,
-    waypoint_id: &str,
+    waypoint_path: &str,
 ) -> Result<u32, HikerError> {
     let src = vault.read_file(trail_doc_rel)?;
     let fm = parse_trail_doc_for(trail_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
-    let target = find_waypoint(&fm.waypoints, waypoint_id)
-        .ok_or_else(|| HikerError::NotFound(format!("waypoint id: {waypoint_id}")))?;
-    Ok(collect_descendant_ids(target).len() as u32)
+    let target = find_waypoint(&fm.waypoints, waypoint_path)
+        .ok_or_else(|| HikerError::NotFound(format!("waypoint path: {waypoint_path}")))?;
+    Ok(collect_descendant_paths(target).len() as u32)
 }
 
 /// Delete a trail. Cascade-deletes the trail-doc *and* its
@@ -490,25 +712,18 @@ pub fn descendant_count(
 pub async fn delete_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
+    log: &OpLog,
     vault: &Vault,
     _trash: &Trash,
     trail_doc_rel: &str,
 ) -> Result<Entry, HikerError> {
-    // Pull the trail id off the trail-doc so we know which waypoint dir
-    // to cascade. If the trail-doc can't be parsed (mid-edit, garbage),
-    // fall back to deleting just the trail-doc — surface that clearly.
-    let trail_id = match vault.read_file(trail_doc_rel) {
-        Ok(src) => match parse_trail_doc_for(trail_doc_rel, &src) {
-            Ok(fm) => Some(fm.id),
-            Err(e) => {
-                tracing::warn!(error = %e, path = %trail_doc_rel,
-                    "delete_trail: trail-doc unparseable; cascading skipped");
-                None
-            }
-        },
+    // Pull the trail id off the op-log so we know which waypoint dir to
+    // cascade. status: store-id-from-oplog
+    let trail_id = match log.doc_id_for_path(trail_doc_rel) {
+        Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, path = %trail_doc_rel,
-                "delete_trail: read failed; trying delete anyway");
+                "delete_trail: doc_id_for_path failed; cascading skipped");
             None
         }
     };
@@ -546,38 +761,28 @@ pub async fn delete_trail(
 // Reference resolution
 // ---------------------------------------------------------------------------
 
-/// Outcome of resolving a `DoubleLinkRef` against the index.
+/// Outcome of resolving a path reference against the live index.
+///
+/// Under path-as-identity (`trail-path-references`) the reference IS a
+/// vault path, so resolution collapses to a two-branch yes/no: either
+/// the path lives in the index (`Resolved`) or it doesn't (`Orphan`).
+/// The legacy `SelfHeal` and `PathConflict` branches retire — there's
+/// no id half left to disagree with the path.
 ///
 /// status: trail-reference-resolution
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolutionOutcome {
-    /// Both halves agree, or only the ULID is present and it resolves —
-    /// either way no rewrite is needed.
-    Resolved { rel_path: String, id: String },
-    /// ULID resolves but to a different path than the recorded one.
-    /// Caller rewrites the rel-path to `canonical_path`.
-    SelfHeal {
-        canonical_path: String,
-        id: String,
-        prior_path: String,
-    },
-    /// Path matches an indexed note but to a different ULID. The caller
-    /// surfaces the path-conflict modal (Keep / Repoint / Break).
-    ///
-    /// status: trail-path-conflict-modal
-    PathConflict {
-        recorded_id: String,
-        current_path_id: String,
-        path: String,
-    },
-    /// Neither half resolves. Render as a greyed orphan card; user
+    /// The path resolves to an indexed note.
+    Resolved { rel_path: String },
+    /// The path doesn't resolve. Render as a greyed orphan card; user
     /// decides delete-or-fix.
     Orphan,
 }
 
-/// Resolve a stored double-link reference against the live index. See
-/// `docs/trails.md` §"Resolution rule".
+/// Resolve a path reference against the live index. A note marked as
+/// `skipped` in the index still counts as resolved — the user-visible
+/// file exists at that path; the indexer just didn't ingest its body.
 ///
 /// `vault` is accepted (not used in this implementation) so future
 /// extensions (e.g. fs-existence fallback when the index hasn't ingested
@@ -587,47 +792,17 @@ pub enum ResolutionOutcome {
 pub fn resolve_reference(
     store: &Store,
     _vault: &Vault,
-    link: &DoubleLinkRef,
+    rel_path: &str,
 ) -> Result<ResolutionOutcome, HikerError> {
-    let id_for_path = store
-        .id_for_path(&link.path)
+    let exists = store
+        .note_exists(rel_path)
         .map_err(|e| HikerError::Io(e.to_string()))?;
-    let path_for_id = store
-        .path_for_id(&link.id)
-        .map_err(|e| HikerError::Io(e.to_string()))?;
-
-    match (path_for_id, id_for_path) {
-        // ULID resolves; both agree.
-        (Some(p), Some(pid)) if p == link.path && pid == link.id => {
-            Ok(ResolutionOutcome::Resolved {
-                rel_path: link.path.clone(),
-                id: link.id.clone(),
-            })
-        }
-        // ULID resolves to a different path. Whether or not the recorded
-        // path itself currently resolves to a different note, the ULID
-        // wins: rewrite the path.
-        (Some(canonical), _) => Ok(ResolutionOutcome::SelfHeal {
-            canonical_path: canonical,
-            id: link.id.clone(),
-            prior_path: link.path.clone(),
-        }),
-        // ULID doesn't resolve, but the path does — and to a different
-        // ULID. Path-conflict modal territory.
-        (None, Some(pid)) if pid != link.id => Ok(ResolutionOutcome::PathConflict {
-            recorded_id: link.id.clone(),
-            current_path_id: pid,
-            path: link.path.clone(),
-        }),
-        // Neither half resolves.
-        (None, None) => Ok(ResolutionOutcome::Orphan),
-        // Defensive: ULID missing but the path matches a note whose id
-        // happens to equal `link.id` — should be caught by the first arm,
-        // but if reached, treat as Resolved.
-        (None, Some(pid)) => Ok(ResolutionOutcome::Resolved {
-            rel_path: link.path.clone(),
-            id: pid,
-        }),
+    if exists {
+        Ok(ResolutionOutcome::Resolved {
+            rel_path: rel_path.to_string(),
+        })
+    } else {
+        Ok(ResolutionOutcome::Orphan)
     }
 }
 
@@ -668,6 +843,7 @@ pub fn resolve_reference(
 pub async fn on_note_moved(
     watcher: Option<&Watcher>,
     jobs: Option<&IndexJobTx>,
+    log: Option<&OpLog>,
     vault: &Vault,
     store: &mut Store,
     old_rel: &str,
@@ -687,13 +863,16 @@ pub async fn on_note_moved(
             Vec::new()
         }
     };
-    let trail_id_candidate = match store.id_for_path(new_rel) {
-        Ok(Some(id)) => Some(id),
-        _ => match store.id_for_path(old_rel) {
-            Ok(Some(id)) => Some(id),
-            _ => None,
-        },
-    };
+    // status: store-id-from-oplog
+    // The trail id of a moved trail-doc is the op-log's doc_id for the
+    // doc's path — the same id for old or new path after the rename
+    // committed in `doc-index.db`.
+    let trail_id_candidate: Option<String> = log.and_then(|l| {
+        l.doc_id_for_path(new_rel)
+            .ok()
+            .flatten()
+            .or_else(|| l.doc_id_for_path(old_rel).ok().flatten())
+    });
     let waypoints_of_trail = match &trail_id_candidate {
         Some(trail_id) => store.waypoints_of(trail_id).unwrap_or_default(),
         None => Vec::new(),
@@ -784,7 +963,7 @@ impl<'a> RewriteCtx<'a> {
         // trail-doc.
         let Ok(src) = self.vault.read_file(new_rel) else { return 0 };
         let Ok(fm) = parse_waypoint(&src) else { return 0 };
-        let trail_doc_rel = fm.in_trail.path.clone();
+        let trail_doc_rel = fm.in_trail.clone();
         // Drop `src` / `fm` borrows before the .await so no Store-derived
         // value lives across the suspension point.
         drop(src);
@@ -819,10 +998,10 @@ impl<'a> RewriteCtx<'a> {
         let src = self.vault.read_file(waypoint_rel)?;
         let mut fm = parse_waypoint(&src)
             .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
-        if fm.references.path == new_source_rel {
+        if fm.references == new_source_rel {
             return Ok(()); // already canonical (idempotent re-runs)
         }
-        fm.references.path = new_source_rel.to_string();
+        fm.references = new_source_rel.to_string();
         let new_src = write_waypoint_frontmatter(&src, &fm)
             .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
         write_with_suppress_and_reindex(
@@ -831,8 +1010,8 @@ impl<'a> RewriteCtx<'a> {
         .await
     }
 
-    /// Read + parse a waypoint-note, rewrite `hiker.in_trail.path`
-    /// (id unchanged), persist.
+    /// Read + parse a waypoint-note, rewrite `hiker.in_trail.path`,
+    /// persist.
     async fn rewrite_waypoint_in_trail_path(
         &self,
         waypoint_rel: &str,
@@ -841,10 +1020,10 @@ impl<'a> RewriteCtx<'a> {
         let src = self.vault.read_file(waypoint_rel)?;
         let mut fm = parse_waypoint(&src)
             .map_err(|e| HikerError::Io(format!("parse waypoint: {e}")))?;
-        if fm.in_trail.path == new_trail_doc_rel {
+        if fm.in_trail == new_trail_doc_rel {
             return Ok(());
         }
-        fm.in_trail.path = new_trail_doc_rel.to_string();
+        fm.in_trail = new_trail_doc_rel.to_string();
         let new_src = write_waypoint_frontmatter(&src, &fm)
             .map_err(|e| HikerError::Io(format!("write waypoint: {e}")))?;
         write_with_suppress_and_reindex(
@@ -893,6 +1072,23 @@ impl<'a> RewriteCtx<'a> {
         )
         .await
     }
+}
+
+/// Shared rename-rewrite re-export of the suppress-write-reindex sequence
+/// below. Called from `core::links_rename` so the wikilink-body rewriter
+/// rides the exact same watcher / indexer plumbing the trail and board
+/// rewriters use, instead of reimplementing it. Pure re-export; the wrapper
+/// is the seam that keeps the helper itself private to this module.
+///
+/// status: wikilink-rename-rewrite
+pub(crate) async fn write_with_suppress_and_reindex_for_links(
+    watcher: Option<&Watcher>,
+    jobs: Option<&IndexJobTx>,
+    vault: &Vault,
+    rel: &str,
+    new_src: &str,
+) -> Result<(), HikerError> {
+    write_with_suppress_and_reindex(watcher, jobs, vault, rel, new_src).await
 }
 
 /// Common: pre-suppress watcher → write file → re-suppress watcher →
@@ -971,20 +1167,18 @@ pub async fn set_append_cursor(
     jobs: &IndexJobTx,
     vault: &Vault,
     trail_doc_rel: &str,
-    waypoint_id: Option<&str>,
+    waypoint_path: Option<&str>,
 ) -> Result<(), HikerError> {
     let src = vault.read_file(trail_doc_rel)?;
     let mut fm = parse_trail_doc_for(trail_doc_rel, &src)
         .map_err(|e| HikerError::Io(format!("parse trail-doc: {e}")))?;
 
-    if let Some(id) = waypoint_id
-        && find_waypoint(&fm.waypoints, id).is_none()
+    if let Some(p) = waypoint_path
+        && find_waypoint(&fm.waypoints, p).is_none()
     {
-        return Err(HikerError::NotFound(format!(
-            "waypoint id: {id}"
-        )));
+        return Err(HikerError::NotFound(format!("waypoint path: {p}")));
     }
-    fm.append_under = waypoint_id.map(std::string::ToString::to_string);
+    fm.append_under = waypoint_path.map(std::string::ToString::to_string);
 
     let new_src = write_trail_doc_frontmatter(&src, &fm)
         .map_err(|e| HikerError::Io(format!("rewrite trail-doc: {e}")))?;

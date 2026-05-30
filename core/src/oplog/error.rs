@@ -36,6 +36,18 @@ pub enum Error {
     /// No pending op with the given id exists in the queue.
     #[error("unknown pending op: {0}")]
     UnknownPendingOp(String),
+    /// `accept_pending` refused because the op's Yrs update was produced
+    /// against `accepted + the session's prior pending ops` (the fallback
+    /// path in `stage_pending`), and at least one of those predecessor ops
+    /// is still pending — accepting this op alone would land a drifted
+    /// update against positions the predecessor establishes. The user must
+    /// accept (or reject) the listed predecessor(s) first. Local-only:
+    /// pending ops never sync.
+    #[error("op {op_id} depends on unaccepted predecessor(s): {predecessors:?}")]
+    DependsOn {
+        op_id: String,
+        predecessors: Vec<String>,
+    },
     #[error("schema version mismatch: db is v{found}, binary expects v{expected}")]
     VersionMismatch { found: i32, expected: i32 },
     #[error("connection mutex poisoned")]

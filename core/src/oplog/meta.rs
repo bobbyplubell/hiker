@@ -26,6 +26,16 @@ use super::shapes::{Author, OpKind};
 /// (`sync-content-hash-column`).
 pub const SCHEMA_VERSION: i32 = 2;
 
+/// Schema version for the separate `doc-index.db` file (`open_index`). Tracked
+/// independently of `SCHEMA_VERSION` because the two SQLite files evolve on
+/// their own cadence. v1 is the current schema: `doc_index` plus the
+/// `bootstrap_skipped` table (`bug-oplog-bootstrap-nonutf8-warn-spam`). Same
+/// fail-loud posture as `open_meta` / `core::store` — a mismatch is an error,
+/// not a migration. Existing on-disk files predate version tracking
+/// (`user_version == 0`) and are stamped to v1 on next open since their schema
+/// already matches.
+pub const INDEX_SCHEMA_VERSION: i32 = 1;
+
 /// Status of an accepted/rejected op in the side table. `pending` is *not*
 /// a side-table state — pending ops live only in `<doc-id>.pending` and have
 /// no Yrs client_id range until they land in `accepted`.
@@ -172,6 +182,14 @@ pub(super) fn open_index(oplog_dir: &Path) -> Result<Connection, Error> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+
+    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != 0 && user_version != INDEX_SCHEMA_VERSION {
+        return Err(Error::VersionMismatch {
+            found: user_version,
+            expected: INDEX_SCHEMA_VERSION,
+        });
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS doc_index (
@@ -186,6 +204,13 @@ pub(super) fn open_index(oplog_dir: &Path) -> Result<Connection, Error> {
         );
         "#,
     )?;
+    if user_version == 0 {
+        conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+        tracing::info!(
+            schema_version = INDEX_SCHEMA_VERSION,
+            "oplog: created doc-index db schema",
+        );
+    }
     Ok(conn)
 }
 
@@ -331,6 +356,34 @@ pub(super) fn doc_content_hashes(
     let rows = stmt
         .query_map(params![doc_id], |row| row.get::<_, String>(0))?
         .collect::<Result<std::collections::HashSet<String>, _>>()?;
+    Ok(rows)
+}
+
+/// The most-recent `limit` distinct non-null `content_hash` values for a doc's
+/// *accepted* ops, ordered by `timestamp_ms DESC, rowid DESC` — the bounded
+/// recent-history window the sync manifest carries. Returning an ordered `Vec`
+/// (not a `HashSet`) keeps the truncation deterministic: peers will classify
+/// the same window the same way every time (`bug-sync-history-hashset-truncation-nondet`).
+///
+/// status: op-log-side-table
+pub(super) fn doc_recent_content_hashes(
+    conn: &Connection,
+    doc_id: &str,
+    limit: usize,
+) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT content_hash, MAX(timestamp_ms) AS ts, MAX(rowid) AS rid \
+         FROM op_metadata \
+         WHERE doc_id = ?1 AND status = 'accepted' AND content_hash IS NOT NULL \
+         GROUP BY content_hash \
+         ORDER BY ts DESC, rid DESC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![doc_id, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
     Ok(rows)
 }
 

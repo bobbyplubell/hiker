@@ -130,6 +130,92 @@ pub fn plan_sample_merge(
     SampleMergePlan::SampleAndMerge { batches }
 }
 
+// ── Reading-order-chain detection (draft-trail proposals) ─────────────
+//
+// status: trail-draft-from-clustering
+//
+// The clustering pipeline can emit a DRAFT trail proposal when a cluster
+// contains an implicit *reading-order chain* — a set of notes that not
+// only sit close in embedding space (the cluster) but also carry a
+// monotonic ordering signal (creation time, an explicit sequence number
+// in frontmatter, a `part-1 / part-2` naming pattern resolved by the
+// caller into an ordering key). The detector here is deliberately
+// conservative: it only fires when the ordering is dense and unambiguous,
+// because a false positive turns the user's review queue into noise.
+//
+// The detector is pure data-shaping (no IO, no store access) so the
+// producer and tests both reason about it; the producer resolves each
+// cluster member into a `ChainCandidate { note_id, order_key }` and hands
+// the slice in. Gating on `[clustering] propose_trails` and the actual
+// `core::trails::create_trail(draft=true)` emission happen in the
+// producer — this module only decides *whether* a chain exists and in
+// *what order*.
+
+/// One cluster member as a chain-detection candidate. `order_key` is the
+/// monotonic ordering signal the producer extracted (unix-seconds ctime,
+/// a frontmatter `seq`, etc.); members with no resolvable key are dropped
+/// by the producer before calling the detector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainCandidate {
+    pub note_id: String,
+    pub order_key: i64,
+}
+
+/// A detected reading-order chain: the cluster's member note ids in
+/// reading order. Produced only when the detector's conservative gates
+/// pass; the producer turns this into a `create_trail(draft=true)` +
+/// `append_waypoint` sequence in reading order.
+///
+/// status: trail-draft-from-clustering
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadingOrderChain {
+    /// Note ids in ascending `order_key` order.
+    pub ordered_note_ids: Vec<String>,
+}
+
+/// Minimum chain length: fewer than this and a "chain" is just a pair —
+/// not worth a trail proposal. Three notes is the smallest sequence that
+/// reads as an intentional walk rather than a coincidence.
+pub const MIN_CHAIN_LEN: usize = 3;
+
+/// Maximum chain length: a cluster larger than this is more likely a
+/// topic bucket than a hand-authored sequence, so the detector declines
+/// rather than proposing an unwieldy trail.
+pub const MAX_CHAIN_LEN: usize = 25;
+
+/// Detect an implicit reading-order chain in a cluster's members.
+///
+/// Conservative gates (all must hold, else `None`):
+/// - At least `MIN_CHAIN_LEN` and at most `MAX_CHAIN_LEN` candidates.
+/// - Every `order_key` is distinct — a duplicate key means the ordering
+///   is ambiguous (two notes claim the same slot), so we decline rather
+///   than guess.
+///
+/// On success the members are returned sorted ascending by `order_key`.
+/// Distinctness + the length window are intentionally strict: the cost of
+/// a missed chain is "the user makes the trail by hand," whereas the cost
+/// of a false chain is review-queue noise the user learns to ignore.
+///
+/// status: trail-draft-from-clustering
+#[must_use]
+pub fn detect_reading_order_chain(candidates: &[ChainCandidate]) -> Option<ReadingOrderChain> {
+    let n = candidates.len();
+    if !(MIN_CHAIN_LEN..=MAX_CHAIN_LEN).contains(&n) {
+        return None;
+    }
+    let mut keys: Vec<i64> = candidates.iter().map(|c| c.order_key).collect();
+    keys.sort_unstable();
+    if keys.windows(2).any(|w| w[0] == w[1]) {
+        // A repeated key = ambiguous ordering; decline.
+        return None;
+    }
+    let mut sorted: Vec<&ChainCandidate> = candidates.iter().collect();
+    sorted.sort_by_key(|c| c.order_key);
+    Some(ReadingOrderChain {
+        ordered_note_ids: sorted.into_iter().map(|c| c.note_id.clone()).collect(),
+    })
+}
+
 // ── Cluster tree shape (consumed by placement) ────────────────────────
 
 /// Stable per-node id. Per `clustering.md`'s `cluster-tree-output`,
@@ -574,6 +660,11 @@ pub enum BuildError {
     VaultTooSmall { found: usize },
     #[error("cluster: {0}")]
     Cluster(#[from] Error),
+    /// A clustering compute step (Leiden / HDBSCAN partition) failed. Distinct
+    /// from `VaultTooSmall` (a well-formed "too few clusters" outcome) — this
+    /// is an algorithm-internal failure carrying the underlying message.
+    #[error("compute: {0}")]
+    Compute(String),
     #[error("summarizer: {0}")]
     Summarizer(String),
     /// The producer signalled cancellation via the shared atomic the

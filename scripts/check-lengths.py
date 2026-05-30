@@ -25,6 +25,7 @@ RUST_ROOTS = [
     "mcp-server/src",
     "cli/src",
     "app/src",
+    "hiker-sync/src",
     "editor/editor-core/src",
     "editor/editor-view/src",
     "editor/editor-egui/src",

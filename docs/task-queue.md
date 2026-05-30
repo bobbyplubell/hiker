@@ -114,7 +114,7 @@ Producers default to `Normal` and bump up only with a reason. The note-mutation 
 
 ## Cluster-tree task types
 
-Two task types are produced by the cluster-editor / triage pipeline (per `clustering.md`, `suggestions.md`, `cluster-editor.md`). Both are `TaskShape::Direct` — they don't need tool calls during execution.
+Two task types are produced by the cluster-editor / triage pipeline (per `clustering.md`, `cluster-editor.md`). Both are `TaskShape::Direct` — they don't need tool calls during execution.
 
 ### `RaptorSummarize` [task-queue-raptor-summarize]
 

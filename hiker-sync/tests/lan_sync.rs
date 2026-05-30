@@ -127,6 +127,81 @@ async fn two_nodes_converge_a_document_over_libp2p() {
     server.abort();
 }
 
+/// Device-name transfer (`sync-device-name`): each node carries a self-set
+/// `[sync].device_name`; after one `sync_once` BOTH sides have learned the
+/// other's name from the `Hello`/`HelloAck` handshake, keyed by the peer's
+/// enrolled fingerprint. The dialer learns the responder's name (via `HelloAck`)
+/// and the responder learns the dialer's (via `Hello`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_name_transfers_on_handshake_both_directions() {
+    let content_key = ContentKey::generate();
+
+    let (_dir_a, oplog_a) = open_vault();
+    let (_dir_b, oplog_b) = open_vault();
+
+    let kp_a = DeviceKeypair::generate();
+    let kp_b = DeviceKeypair::generate();
+    let fp_a = kp_a.fingerprint();
+    let fp_b = kp_b.fingerprint();
+
+    // A names itself "desktop", B names itself "laptop".
+    let cfg_a = Settings {
+        device_name: Some("desktop".into()),
+        ..Settings::default()
+    };
+    let cfg_b = Settings {
+        device_name: Some("laptop".into()),
+        ..Settings::default()
+    };
+
+    let mut node_a = SyncNode::new(
+        Arc::clone(&oplog_a),
+        SharedContentKey::new(ContentKey::from_bytes(*content_key.as_bytes())),
+        kp_a,
+        cfg_a,
+        EnrolledPeers::new(),
+    );
+    node_a.enroll_peer(fp_b.clone()).unwrap();
+
+    let mut node_b = SyncNode::new(
+        Arc::clone(&oplog_b),
+        SharedContentKey::new(ContentKey::from_bytes(*content_key.as_bytes())),
+        kp_b,
+        cfg_b,
+        EnrolledPeers::new(),
+    );
+    node_b.enroll_peer(fp_a.clone()).unwrap();
+
+    let bound = node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    // A short responder window: the single round below completes well within it,
+    // and the test reads A's learned map only after the window returns A back.
+    let server = tokio::spawn(async move {
+        node_a.run(Duration::from_secs(2)).await.unwrap();
+        // Hand A back so we can read its learned map post-round.
+        node_a
+    });
+
+    // B dials A: the Hello carries B's "laptop"; the HelloAck carries A's "desktop".
+    let _ = node_b.sync_once(&bound).await.unwrap();
+
+    // B learned A's self-reported name from the HelloAck.
+    let b_learned = node_b.learned_device_names();
+    assert_eq!(
+        b_learned.get(&fp_a.0).map(String::as_str),
+        Some("desktop"),
+        "B learned A's name from the HelloAck: {b_learned:?}"
+    );
+
+    // A learned B's self-reported name from the Hello (read after the run window).
+    let node_a = server.await.unwrap();
+    let a_learned = node_a.learned_device_names();
+    assert_eq!(
+        a_learned.get(&fp_b.0).map(String::as_str),
+        Some("laptop"),
+        "A learned B's name from the Hello: {a_learned:?}"
+    );
+}
+
 /// The read-only "view diff" probe (`sync-fork-diff`): a dialer fetches the
 /// responder's current accepted text for one path via `fetch_doc_text` and gets
 /// exactly the responder's `materialize_accepted` text back, WITHOUT binding,

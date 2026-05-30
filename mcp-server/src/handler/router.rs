@@ -10,9 +10,11 @@ use rmcp::{tool, tool_router};
 
 use super::App;
 use crate::handler::params::{
-    audit_err, audit_status, ApplyTag, BoardAddCard, BoardGet, BoardsList, EditNote, GetNote,
-    RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail, TaskHeartbeat, TaskList,
-    TaskSubmit, WriteNote,
+    audit_err, audit_status, ApplyTag, BoardAddCard, BoardAddColumn, BoardAddTextCard, BoardCreate,
+    BoardDeleteColumn, BoardGet, BoardMoveCard, BoardRemoveCard, BoardRenameColumn,
+    BoardReorderColumn, BoardSetCardText, BoardsList, EditNote, GetActiveNote, GetNote,
+    GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail,
+    TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
 };
 
 // ---------- tool router ----------
@@ -81,6 +83,66 @@ impl App {
         let outcome = self.find_related(&p).await;
         self.state.audit.record(
             "related_notes",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// status: mcp-tool-get-active-note
+    #[tool(
+        name = "get_active_note",
+        description = "Return the currently-focused editor tab's path, cursor byte offset, and (if non-empty) selection range. Returns { path: null } when the active tab is an app page (Home / Settings / Queue / etc.). Read-only; does NOT count as having read the note for mcp-read-before-write — only get_note does."
+    )]
+    pub async fn get_active_note(
+        &self,
+        params: Parameters<GetActiveNote>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.read_active_note(&p).await;
+        self.state.audit.record(
+            "get_active_note",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// status: mcp-tool-get-open-notes
+    #[tool(
+        name = "get_open_notes",
+        description = "Return the ordered list of currently-open buffer tabs as [{path, active}]. Non-buffer tabs (Home / Settings / Queue / Board / Agent) are omitted. Read-only; does NOT count as having read any note for mcp-read-before-write."
+    )]
+    pub async fn get_open_notes(
+        &self,
+        params: Parameters<GetOpenNotes>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.read_open_notes(&p).await;
+        self.state.audit.record(
+            "get_open_notes",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// status: mcp-tool-get-selection
+    #[tool(
+        name = "get_selection",
+        description = "Return the active buffer's current selection as { path, start_byte, end_byte, text } when non-empty; otherwise { path: null }. Text comes from the same source as get_note(detail='full'). Read-only; does NOT count as having read the note."
+    )]
+    pub async fn get_selection(
+        &self,
+        params: Parameters<GetSelection>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.read_selection(&p).await;
+        self.state.audit.record(
+            "get_selection",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
             audit_status(&outcome),
             audit_err(&outcome),
@@ -277,6 +339,223 @@ impl App {
         let outcome = self.add_board_card(&p).await;
         self.state.audit.record(
             "board_add_card",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Create a new board-doc (default Todo/Doing/Done columns) at the
+    /// configured `[boards] new_board_dir`. Review-gated like every write tool.
+    ///
+    /// status: mcp-tool-board-create
+    #[tool(
+        name = "board_create",
+        description = "Create a new board-doc with default Todo/Doing/Done columns under the configured new_board_dir. \
+                       Returns rel_path + board_id. NOTE: in review-required mode the new board-doc is STAGED as a \
+                       pending proposal (status=\"staged\" + staging_id); it does not reach disk until the user accepts."
+    )]
+    pub async fn board_create(
+        &self,
+        params: Parameters<BoardCreate>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.create_board(&p).await;
+        self.state.audit.record(
+            "board_create",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Append a freeform text card to a board column.
+    ///
+    /// status: mcp-tool-board-add-text-card
+    #[tool(
+        name = "board_add_text_card",
+        description = "Append a freeform (non-note) text card to a board column. Returns the new card_id. \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id) \
+                       and unchanged on disk until the user accepts."
+    )]
+    pub async fn board_add_text_card(
+        &self,
+        params: Parameters<BoardAddTextCard>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.add_board_text_card(&p).await;
+        self.state.audit.record(
+            "board_add_text_card",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Move/reorder a card to another column (or within a column).
+    ///
+    /// status: mcp-tool-board-move-card
+    #[tool(
+        name = "board_move_card",
+        description = "Move/reorder a card (by card_id from board_get) to to_column at to_index (tail when omitted). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_move_card(
+        &self,
+        params: Parameters<BoardMoveCard>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.move_board_card(&p).await;
+        self.state.audit.record(
+            "board_move_card",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Rewrite a freeform card's text (errors on a note card).
+    ///
+    /// status: mcp-tool-board-set-card-text
+    #[tool(
+        name = "board_set_card_text",
+        description = "Rewrite a freeform card's text in place (errors on a note card). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_set_card_text(
+        &self,
+        params: Parameters<BoardSetCardText>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.set_board_card_text(&p).await;
+        self.state.audit.record(
+            "board_set_card_text",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Drop a card from the board (referenced note untouched).
+    ///
+    /// status: mcp-tool-board-remove-card
+    #[tool(
+        name = "board_remove_card",
+        description = "Remove a card from the board by card_id (the referenced note is untouched). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_remove_card(
+        &self,
+        params: Parameters<BoardRemoveCard>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.remove_board_card(&p).await;
+        self.state.audit.record(
+            "board_remove_card",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Add a new empty column to a board (idempotent on name collision).
+    ///
+    /// status: mcp-tool-board-add-column
+    #[tool(
+        name = "board_add_column",
+        description = "Add a new empty column to a board (appended at the tail; no-op if the name exists). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_add_column(
+        &self,
+        params: Parameters<BoardAddColumn>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.add_board_column(&p).await;
+        self.state.audit.record(
+            "board_add_column",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Rename a column in place (cards keep order/membership).
+    ///
+    /// status: mcp-tool-board-rename-column
+    #[tool(
+        name = "board_rename_column",
+        description = "Rename a board column in place (cards keep their order and membership). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_rename_column(
+        &self,
+        params: Parameters<BoardRenameColumn>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.rename_board_column(&p).await;
+        self.state.audit.record(
+            "board_rename_column",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Move a column to a new index in the column order.
+    ///
+    /// status: mcp-tool-board-reorder-column
+    #[tool(
+        name = "board_reorder_column",
+        description = "Move a board column to a new index in the column order (clamps to the tail). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_reorder_column(
+        &self,
+        params: Parameters<BoardReorderColumn>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.reorder_board_column(&p).await;
+        self.state.audit.record(
+            "board_reorder_column",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Delete a column (drops its card refs; notes untouched).
+    ///
+    /// status: mcp-tool-board-delete-column
+    #[tool(
+        name = "board_delete_column",
+        description = "Delete a board column (drops that column's card references; referenced notes are untouched). \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       disk is unchanged until the user accepts."
+    )]
+    pub async fn board_delete_column(
+        &self,
+        params: Parameters<BoardDeleteColumn>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.delete_board_column(&p).await;
+        self.state.audit.record(
+            "board_delete_column",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
             audit_status(&outcome),
             audit_err(&outcome),

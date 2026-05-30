@@ -10,7 +10,7 @@
 //! see `state::VaultSession` and `main::update`'s vault-switch branch.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,6 +60,26 @@ impl ProgressLine {
                 Some(p) => format!("error {p}: {message}"),
                 None => format!("error: {message}"),
             },
+            // status: inbox-rules
+            P::InboxApplied {
+                rule_index,
+                original_path,
+                final_path,
+                moved_to,
+                tagged,
+            } => {
+                let mut bits = Vec::new();
+                if let Some(dest) = moved_to {
+                    bits.push(format!("moved to {dest}"));
+                }
+                if let Some(tag) = tagged {
+                    bits.push(format!("tagged #{tag}"));
+                }
+                format!(
+                    "inbox rule {rule_index} on {original_path}: {} (now at {final_path})",
+                    bits.join(", "),
+                )
+            }
         }
     }
 }
@@ -653,6 +673,20 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // Let the indexer's move / delete jobs record renames + tombstones in the
     // op log so `doc-index.db` follows file moves and deletes reach history.
     indexer.attach_oplog(oplog.clone());
+    // status: inbox-rules
+    // Compile the [inbox] rule list once at vault open and hand it to the
+    // indexer; the Created-event hook applies rules before the upsert.
+    // Strict-load already validated the rules in Config::load above, so
+    // compile here is expected to succeed; log + skip on the off chance it
+    // doesn't (e.g. drift between validate / compile).
+    let inbox_rules_src = config
+        .read()
+        .map(|c| c.inbox.rules.clone())
+        .unwrap_or_default();
+    match hiker_core::inbox::Rules::compile(&inbox_rules_src) {
+        Ok(rules) => indexer.attach_inbox_rules(Arc::new(rules)),
+        Err(e) => tracing::error!(error = %e, "inbox: rule compile failed; rules disabled"),
+    }
 
     // Wire watcher → indexer router so file events drive re-indexing.
     let _router = route_watcher_events(watcher.subscribe(), indexer.job_sender());
@@ -719,6 +753,10 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // into. The same Arc is shared; the handler's `state.tools.read()`
     // returns whatever value `set_setting` last wrote.
     let mcp_tools_cfg = Arc::new(std::sync::RwLock::new(mcp_cfg.tools.clone()));
+    // status: mcp-tool-get-active-note, mcp-tool-get-open-notes,
+    // mcp-tool-get-selection — shared UI-context snapshot the MCP read
+    // tools consume. Refreshed each frame by `refresh_ui_context_snapshot`.
+    let mcp_ui_context = hiker_mcp::ui_context::shared_empty();
     let mcp = McpStarter.start(mcp_cfg.enabled, hiker_mcp::McpDeps {
         vault: (*vault).clone(),
         vault_root: root.clone(),
@@ -731,8 +769,10 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         audit: audit.clone(),
         tasks: tasks.clone(),
         tasks_config: tasks_cfg,
+        boards_config: config.read().map(|c| c.boards.clone()).unwrap_or_default(),
         llm_enabled: config.read().map(|c| c.llm.enabled).unwrap_or(false),
         oplog: Some(oplog.clone()),
+        ui_context: mcp_ui_context.clone(),
     }).await;
 
     // Crash recovery, persisted tab snapshot, and trails for the new Session.
@@ -780,6 +820,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         tasks,
         mcp,
         mcp_tools_cfg,
+        mcp_ui_context,
         sync,
     };
     let vault_session = VaultSession {
@@ -792,69 +833,58 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         plugins,
     };
 
-    let modal = if !recovery_entries.is_empty() {
-        Some(crate::state::Modal::Recovery {
-            entries: recovery_entries,
-        })
-    } else {
-        None
-    };
-    let bundle = crate::layout::load_for_vault(&root);
+    // Recovered autosave buffers restore silently (no modal) once `AppState`
+    // exists — see the `auto_restore_recovered` call below, before the
+    // tab-state restore. `autosave-recovery-auto-restore`.
     let session = Session {
         trails,
-        modal,
-        dock: bundle.tree,
-        center_tile: bundle.center_tile,
-        left_tile: bundle.left_tile,
-        right_tile: bundle.right_tile,
+        modal: None,
         ..Session::default()
     };
 
-    // Inlined panel-state seeding: search/related/backlinks pull persisted
-    // toggles + collapse flags from the vault config when readable;
-    // everything else defaults. Inlined (not a `PanelStates` constructor)
-    // because a `self`-less associated fn would trip `single_call_fn`.
-    let panels: PanelStates = {
-        let cfg_guard = config.read().ok();
-        let (search, related, backlinks) = match cfg_guard.as_deref() {
-            Some(c) => (
-                crate::panels::search::State::default().with_config(c),
-                crate::panels::related::State::default().with_config(c),
-                crate::panels::backlinks::State::default().with_config(c),
-            ),
-            None => (
-                crate::panels::search::State::default(),
-                crate::panels::related::State::default(),
-                crate::panels::backlinks::State::default(),
-            ),
-        };
-        PanelStates { search, related, backlinks, ..PanelStates::default() }
-    };
+    let panels = seed_panel_states(&config);
 
     let mut state = AppState {
         vault_session,
         session,
         ui_cache: UiCache::default(),
         panels,
+        clusters_state: crate::clusters::state::State::default(),
+        trails_state: crate::trails::state::State::default(),
+        // Per-vault feature registry: built-ins (Clusters in v1) plus
+        // (Phase 3) plugin-derived features. `feature-registry`.
+        features: crate::feature::Registry::build(crate::feature::builtin_features()),
         ui: UiState::default(),
         toasts: Vec::new(),
         vault_switch: VaultSwitchState::Idle,
         workbench: {
             // Inlined `new_workbench`: fresh workbench with the default
-            // activity (`Files`) selected, the Chat (secondary) side bar
-            // visible, and the global bottom status strip on.
+            // activity (`Files`) open in the splittable primary side
+            // region, the Chat (secondary) side bar visible, and the
+            // global bottom status strip on.
             let mut wb = egui_workbench::workspace::Workbench::default();
-            wb.activity_bar
-                .set_active(Some(crate::workbench_host::HikerMode::Files));
+            wb.open_primary_panel(crate::workbench_host::HikerMode::Files);
             wb.secondary_side_bar.visible = true;
             wb.status_bar.visible = true;
             wb
         },
     };
 
+    // Silently auto-restore recovered autosave buffers as dirty sticky tabs
+    // (no modal), then restore the persisted tab state. Recovered buffers open
+    // first so `tab_state.active_path` still wins when resolvable, per
+    // `autosave-tab-state-silent-restore`.
+    if !recovery_entries.is_empty() {
+        crate::widgets::modal::auto_restore_recovered(&mut state, recovery_entries);
+    }
     if let Some(ts) = tab_state {
         state.restore_tab_state(ts);
     }
+
+    // Restore the persisted primary side-panel accordion (open sections,
+    // collapse, weights, focus, visibility). No-op on a fresh vault —
+    // the default single `Files` section set above stands.
+    crate::side_panel_persist::restore(&mut state, &root);
 
     // Ensure the dock's center never starts blank. If nothing was
     // restored from autosave (fresh vault, or first launch on this
@@ -872,24 +902,45 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         state.session.active_tab = Some(id);
     }
 
-    // Load data-driven toolbar layout (falls back to default if the file
-    // is missing or malformed). Done after the rest of the state is
-    // assembled so the loader gets a stable `vault_root` to read from.
-    // Inlined rather than a `self`-less `Toolbars` loader fn, which would
-    // trip `single_call_fn`.
-    state.ui.toolbars = {
-        let path = state.vault_session.vault_root.join(".hiker/toolbars.json");
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<crate::state::Toolbars>(&bytes)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(error = %err, "toolbars: parse failed; using default");
-                    crate::state::Toolbars::default()
-                }),
-            Err(_) => crate::state::Toolbars::default(),
-        }
-    };
+    state.ui.toolbars = load_toolbar_layout(&state.vault_session.vault_root);
 
     Ok(state)
+}
+
+/// Seed `PanelStates` from the loaded vault config. Search / related /
+/// backlinks pull persisted toggles + collapse flags; everything else
+/// defaults. Lifted out of `open_vault` to keep that function under the
+/// length budget.
+fn seed_panel_states(config: &Arc<std::sync::RwLock<Config>>) -> PanelStates {
+    let cfg_guard = config.read().ok();
+    let (search, related, backlinks) = match cfg_guard.as_deref() {
+        Some(c) => (
+            crate::panels::search::State::default().with_config(c),
+            crate::panels::related::State::default().with_config(c),
+            crate::panels::backlinks::State::default().with_config(c),
+        ),
+        None => (
+            crate::panels::search::State::default(),
+            crate::panels::related::State::default(),
+            crate::panels::backlinks::State::default(),
+        ),
+    };
+    PanelStates { search, related, backlinks, ..PanelStates::default() }
+}
+
+/// Load the data-driven toolbar layout from `.hiker/toolbars.json`,
+/// falling back to the default when the file is missing or malformed.
+fn load_toolbar_layout(vault_root: &Path) -> crate::state::Toolbars {
+    let path = vault_root.join(".hiker/toolbars.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<crate::state::Toolbars>(&bytes).unwrap_or_else(
+            |err| {
+                tracing::warn!(error = %err, "toolbars: parse failed; using default");
+                crate::state::Toolbars::default()
+            },
+        ),
+        Err(_) => crate::state::Toolbars::default(),
+    }
 }
 
 // Panel-state seeding, toolbar loading, and the `load_trails` reader are
@@ -934,6 +985,8 @@ impl AppState {
                 Some(TabKind::Board { path: p["board:".len()..].to_string() })
             }
             ":patch_review" => Some(TabKind::PatchReview),
+            // status: board-index-page
+            ":boards_index" => Some(TabKind::BoardsIndex),
             ":plugins" => Some(TabKind::Plugins),
             ":indexer" => Some(TabKind::IndexerDetail),
             ":sync" => Some(TabKind::Sync),

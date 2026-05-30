@@ -24,18 +24,66 @@ use crate::theme;
 impl AppState {
 /// Render every configured toolbar. Call once per frame, BEFORE side
 /// panels — top/bottom panels claim their strip first.
-pub fn render_toolbars(&mut self, ctx: &egui::Context) {
+///
+/// When `overlay_command_center` is set, the VSCode-style command center
+/// is painted centered over the *first* top toolbar so it shares that
+/// strip instead of adding a row. Returns whether it was placed — the
+/// caller renders a dedicated bar as a fallback when there's no top
+/// toolbar to host it. [command-center-topbar]
+pub fn render_toolbars(&mut self, ctx: &egui::Context, overlay_command_center: bool) -> bool {
+    self.render_toolbar_panels(ctx, overlay_command_center, true)
+}
+
+/// Render only the non-top toolbars (bottom/left/right) as panels — used
+/// when the top bar is folded into the custom titlebar.
+pub fn render_secondary_toolbars(&mut self, ctx: &egui::Context) {
+    self.render_toolbar_panels(ctx, false, false);
+}
+
+/// Render the first **Top** toolbar's items into an existing `ui` (used
+/// to fold the toolbar into the custom titlebar's single strip). Returns
+/// `true` if a top toolbar existed. [command-center-topbar]
+pub fn render_top_bar_inline(&mut self, ui: &mut egui::Ui) -> Option<(f32, f32)> {
+    let app = self;
+    let idx = app.ui.toolbars.bars.iter().position(|b| b.side == ToolbarSide::Top)?;
+    // The caller's `ui` is already a left-to-right, vertically-centered
+    // layout spanning the titlebar (minus the window controls). The
+    // spacer is respected, so the tail (e.g. sidebar toggles) right-aligns
+    // next to the controls — its original placement. Returns the
+    // head-right / tail-left x for the titlebar's drag-zone gaps.
+    Some(render_bar_items(ui, app, idx, /* vertical */ false))
+}
+
+/// Shared toolbar renderer. `include_top` is false when the top bar has
+/// been folded into the custom titlebar — only bottom/left/right bars
+/// render as panels then.
+fn render_toolbar_panels(
+    &mut self,
+    ctx: &egui::Context,
+    overlay_command_center: bool,
+    include_top: bool,
+) -> bool {
     let app = self;
     // Clone the bars list (cheap — just a Vec of small structs) so we can
     // mutate `app` while iterating.
     let bars = app.ui.toolbars.bars.clone();
+    let mut cc_placed = false;
     for (idx, bar) in bars.iter().enumerate() {
         let panel_id = format!("toolbar-{}-{idx}", bar.id);
         match bar.side {
+            ToolbarSide::Top if !include_top => {}
             ToolbarSide::Top => {
+                let place_cc = overlay_command_center && !cc_placed;
                 egui::TopBottomPanel::top(panel_id)
                     .frame(panel_frame(ctx))
-                    .show(ctx, |ui| render_bar_horizontal(ui, app, idx));
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        render_bar_horizontal(ui, app, idx);
+                        if place_cc {
+                            app.command_center(ui, full);
+                        }
+                    });
+                cc_placed |= place_cc;
             }
             ToolbarSide::Bottom => {
                 egui::TopBottomPanel::bottom(panel_id)
@@ -58,6 +106,7 @@ pub fn render_toolbars(&mut self, ctx: &egui::Context) {
             }
         }
     }
+    cc_placed
 }
 }
 
@@ -83,12 +132,17 @@ fn render_bar_vertical(ui: &mut egui::Ui, app: &mut AppState, bar_idx: usize) {
 /// Walk the bar's action ids and dispatch each to the right renderer.
 /// `spacer` flips the layout into right-to-left (horizontal) or
 /// bottom-to-top (vertical) so subsequent items pin to the far edge.
+///
+/// Returns `(head_right, tail_left)` — the x where the leading (head)
+/// items end and the x where the trailing (tail) items begin. The
+/// titlebar uses these to place its drag zones in the empty gap between
+/// them (around the command center). Meaningful only for horizontal bars.
 fn render_bar_items(
     ui: &mut egui::Ui,
     app: &mut AppState,
     bar_idx: usize,
     vertical: bool,
-) {
+) -> (f32, f32) {
     let action_ids = app.ui.toolbars.bars[bar_idx].actions.clone();
     let customize = app.ui.customize_toolbars;
     let mut pending: Vec<BarOp> = Vec::new();
@@ -113,6 +167,8 @@ fn render_bar_items(
     for (slot, id) in &head {
         render_single(ui, app, bar_idx, *slot, id, customize, &mut pending);
     }
+    let head_right = ui.min_rect().right();
+    let mut tail_left = ui.max_rect().right();
     if !tail.is_empty() {
         let layout = if vertical {
             egui::Layout::bottom_up(egui::Align::Center)
@@ -126,17 +182,19 @@ fn render_bar_items(
         } else {
             tail.iter().rev().collect()
         };
-        ui.with_layout(layout, |ui| {
+        let inner = ui.with_layout(layout, |ui| {
             for (slot, id) in ordered {
                 render_single(ui, app, bar_idx, *slot, id, customize, &mut pending);
             }
         });
+        tail_left = inner.response.rect.left();
     }
     if customize {
         app.customize_add_button(ui, bar_idx, &mut pending);
     }
 
     app.apply_pending(bar_idx, pending);
+    (head_right, tail_left)
 }
 
 /// Pending mutation against a toolbar — collected while iterating, then
@@ -461,6 +519,11 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             open_singleton_tab(state, TabKind::Graph);
             ui.close();
         }
+        // status: board-index-page
+        if tab_menu_row(ui, &TabKind::BoardsIndex, 0) {
+            open_singleton_tab(state, TabKind::BoardsIndex);
+            ui.close();
+        }
         if tab_menu_row(ui, &TabKind::PatchReview, pending_count) {
             open_singleton_tab(state, TabKind::PatchReview);
             ui.close();
@@ -491,8 +554,35 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             crate::actions::dispatch(state, "palette.open");
             ui.close();
         }
+        // Feature-registry entries. Per `feature-consumer-hamburger`,
+        // the hamburger walks the registry and renders any feature
+        // that returns a `HamburgerEntry`. The hardcoded rows above
+        // stay until each owning feature migrates them in.
+        render_feature_hamburger_entries(ui, state);
     });
 }
+}
+
+/// Walk the per-vault feature registry and render any entries opting
+/// into the hamburger menu. Built fresh per open so dynamic entries
+/// (e.g. plugin features in Phase 3) appear as soon as they register.
+/// [feature-consumer-hamburger]
+fn render_feature_hamburger_entries(ui: &mut egui::Ui, state: &mut AppState) {
+    let features = state.features.clone();
+    let entries: Vec<(String, &'static str)> = features
+        .iter()
+        .filter_map(|f| f.hamburger().map(|h| (f.id().to_string(), h.label())))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    ui.separator();
+    for (feature_id, label) in entries {
+        if ui.button(label).clicked() {
+            crate::feature::dispatch_hamburger(state, &feature_id);
+            ui.close();
+        }
+    }
 }
 
 fn tab_menu_row(ui: &mut egui::Ui, kind: &TabKind, count: usize) -> bool {

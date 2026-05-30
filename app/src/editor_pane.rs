@@ -25,6 +25,19 @@ pub(crate) fn ensure_vault_buffer_loaded(state: &mut AppState, rel: &str) -> boo
     }
     match state.vault_session.vault.read_file_with_hash(rel) {
         Ok((contents, hash)) => {
+            // Ensure the op log has a document for this path before the editor
+            // binding runs. A note created after the bootstrap walk (New Note
+            // button, tree new-file, wikilink-create) has no doc yet; without
+            // one the forward binding never mirrors typing into `working` and
+            // the save fails with "no op-log document". Existing files were
+            // seeded at vault open, so this is a no-op for them.
+            if let Err(e) = hiker_core::ops::op_writes::ensure_doc(
+                &state.vault_session.services.oplog,
+                &state.vault_session.vault,
+                rel,
+            ) {
+                tracing::warn!(path = %rel, error = %e, "op-log: failed to ensure document on open");
+            }
             let cfg_guard = state.vault_session.config.read().ok();
             let buf = Buffer::with_config_and_vault(
                 rel.to_string(),
@@ -227,6 +240,33 @@ pub fn open_snapshot_in_tab(state: &mut AppState, path: &str, op_id: &str) {
     set_active_tab_kind(state, TabKind::snapshot_preview(path.to_string(), op_id.to_string()));
 }
 
+/// Open a trashed item as a read-only preview in the editor's preview
+/// slot (reused like a non-sticky file open). `feature-trash-panel`.
+pub fn open_trash_in_tab(state: &mut AppState, trash_path: &str, original_path: &str) {
+    use crate::tab::BufferSource;
+    let source = BufferSource::Trash {
+        trash_path: trash_path.to_string(),
+        original_path: original_path.to_string(),
+    };
+    if ensure_readonly_buffer_loaded(state, &source).is_none() {
+        state.push_toast("Can't preview trashed item", crate::state::ToastLevel::Error);
+        return;
+    }
+    let kind = TabKind::trash_preview(trash_path.to_string(), original_path.to_string());
+    if let Some(prev_id) = state.session.preview_tab {
+        if let Some(tab) = state.tab_by_id_mut(prev_id) {
+            tab.kind = kind;
+            tab.sticky = false;
+        }
+        state.session.active_tab = Some(prev_id);
+        return;
+    }
+    let tab_id = state.next_tab_id();
+    state.session.tabs.push(Tab { id: tab_id, kind, sticky: false });
+    state.session.active_tab = Some(tab_id);
+    state.session.preview_tab = Some(tab_id);
+}
+
 /// Swap the active tab back to the live vault buffer for `path`, in place, and
 /// record it on the nav stack (the version-dropdown "Live" pick).
 pub fn open_live_in_tab(state: &mut AppState, path: &str) {
@@ -327,33 +367,9 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     // Fold the `working` layer into `accepted` (atomic `.md` rewrite). The
     // forward binding already mirrored the user's typing into `working`, so
     // the committed content is exactly the editable buffer text.
-    let mut text = buffer.current_text();
-
-    // Normalize hand-typed / external wikilinks to the durable id form before
-    // committing: resolve each name target, stamp it, rewrite to
-    // `[[<ulid>|<display>]]`. The cheap parse pre-check keeps the common
-    // save (no name-form links) off the store lock + async bridge entirely.
-    // status: wikilink-name-normalize
-    let needs_normalize = hiker_core::wikilink::parse_links(&text)
-        .iter()
-        .any(|l| !l.is_id_form() && !l.target.is_empty());
-    if needs_normalize {
-        if let Some(normalized) = normalize_wikilinks_blocking(state, rel, &text) {
-            if normalized != text {
-                // Update the working layer + the visible editor doc so the
-                // commit folds the id-form text and the cursor stays valid.
-                let _ = state
-                    .vault_session
-                    .services
-                    .oplog
-                    .apply_user_text(&doc_id, &normalized);
-                if let Some(b) = state.session.buffers.get_mut(rel) {
-                    b.set_doc_clamping_selection(&normalized);
-                }
-                text = normalized;
-            }
-        }
-    }
+    let text = buffer.current_text();
+    // Path-form wikilinks (per `wikilink-path-form`) are stored as-typed —
+    // no save-time normalize step. What the user typed reaches disk verbatim.
     let log = &state.vault_session.services.oplog;
     match log.commit_working(&doc_id) {
         Ok(_) => {
@@ -387,38 +403,6 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
             Ok(())
         }
         Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Run the async wikilink id-form normalizer (`core::ops::buffer::
-/// normalize_wikilinks`) to completion on the frame's tokio runtime. A fresh
-/// reader `Store` is opened for the call rather than locking the shared
-/// `read_store` across the `.await` (the trail-stamping seam does the same — a
-/// `MutexGuard` held across an await point is the anti-pattern the indexer's
-/// fresh-connection model exists to avoid). Returns the rewritten text, or
-/// `None` (after a warn log) when there's no runtime or the pass errors — in
-/// which case the save proceeds with the user's text unchanged.
-fn normalize_wikilinks_blocking(state: &AppState, rel: &str, text: &str) -> Option<String> {
-    let watcher = state.vault_session.services.watcher.clone();
-    let jobs = state.vault_session.services.indexer.job_sender();
-    let vault = state.vault_session.vault.clone();
-    let handle = tokio::runtime::Handle::try_current().ok()?;
-    let mut store = match hiker_core::store::Store::open(vault.root()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %rel, "wikilink normalize: open store failed");
-            return None;
-        }
-    };
-    let result = handle.block_on(hiker_core::ops::buffer::normalize_wikilinks(
-        &watcher, &jobs, &vault, &mut store, rel, text,
-    ));
-    match result {
-        Ok(out) => Some(out),
-        Err(e) => {
-            tracing::warn!(error = %e, path = %rel, "wikilink normalize-on-save failed");
-            None
-        }
     }
 }
 
@@ -529,6 +513,26 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
     // Drop the cluster-review pane state — owns a draft tree until the
     // user persists, keyed by the closed tab's id.
     if matches!(&removed.kind, TabKind::ClusterReview { .. }) {
-        state.panels.clusters.review_panes.remove(&id);
+        state.clusters_state.review_panes.remove(&id);
+    }
+}
+
+/// Close a tab; if the underlying buffer is dirty, surface the dirty-close
+/// modal instead of closing immediately.
+pub fn close_tab_with_dirty_guard(app: &mut AppState, tab_id: TabId) {
+    let dirty_path = app
+        .tab_by_id(tab_id)
+        .and_then(|t| t.buffer_path().map(str::to_string))
+        .filter(|p| {
+            app.session
+                .buffers
+                .get(p)
+                .map(crate::buffer::Buffer::is_dirty)
+                .unwrap_or(false)
+        });
+    if let Some(path) = dirty_path {
+        app.session.modal = Some(crate::state::Modal::DirtyClose { path, tab_id });
+    } else {
+        close_tab(app, tab_id);
     }
 }

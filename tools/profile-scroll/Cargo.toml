@@ -1,0 +1,22 @@
+[package]
+name = "profile-scroll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "profile-scroll"
+path = "src/main.rs"
+
+[dependencies]
+editor-core = { path = "../../editor/editor-core" }
+editor-view = { path = "../../editor/editor-view" }
+editor-egui = { path = "../../editor/editor-egui" }
+editor-md = { path = "../../editor/editor-md" }
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dhat.workspace = true

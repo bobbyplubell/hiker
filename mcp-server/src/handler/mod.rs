@@ -65,6 +65,18 @@ pub struct HikerState {
     /// work), so the `task_*` tools are guarded with `1004 disabled`
     /// per `task-queue-respects-llm-disable`. Read once at server start.
     pub llm_enabled: bool,
+    /// `[boards]` config — supplies `new_board_dir` for `board_create`'s
+    /// default placement.
+    ///
+    /// status: board-mcp-tools
+    pub boards_config: hiker_core::config::sections::BoardsConfig,
+    /// status: mcp-tool-get-active-note, mcp-tool-get-open-notes,
+    /// mcp-tool-get-selection
+    ///
+    /// Live snapshot of what the user is currently looking at, populated
+    /// by the host's per-frame `refresh_ui_context_snapshot`. Read-only
+    /// from the MCP handler's side; the host is the sole writer.
+    pub ui_context: crate::ui_context::Shared,
 }
 
 #[derive(Clone)]

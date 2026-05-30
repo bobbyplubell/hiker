@@ -51,7 +51,7 @@ Hard-coded ignores (never reach consumers): [watcher-ignore-hardcoded]
 
 - Anything under `.hiker/` (our own state — index.db, refs/, proposals/, reconcile-history.yaml)
 - Anything under `.git/` if present
-- Dotfiles at vault root by default (`.DS_Store`, `.obsidian/` if a vault is migrating from Obsidian, etc.)
+- Dotfiles at vault root by default (`.DS_Store`, config dirs left by other markdown apps, etc.)
 - Files matching `*.tmp`, `*.swp`, `*~`, `4913` (vim's permission-probe file), `.#*` (emacs lock files)
 
 Configurable ignores (later):
@@ -126,4 +126,3 @@ The watcher handle lives in the per-vault state held by the host. Vault-swap dro
 - Polling fallback for network filesystems
 - User-configurable ignore file
 - Cross-vault event routing (multi-vault support is a v3+ concern)
-- Tree-view auto-refresh on watcher events (the editor consumer is the only frontend subscriber in v1; the file tree gets a manual refresh button until v2)

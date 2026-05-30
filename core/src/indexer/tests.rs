@@ -266,29 +266,40 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     )
     .unwrap();
 
-    // Trail-doc.
+    // Trail-doc. status: trail-path-references (no `hiker.id`, no id half
+    // on the waypoint entry — the trail's storage key is its op-log
+    // doc_id, looked up below).
     std::fs::create_dir_all(dir.path().join("trails")).unwrap();
     let trail_doc = format!(
-        "---\nhiker:\n  kind: trail\n  id: {trail_id}\n  waypoints:\n    - id: {waypoint_id}\n      path: .hiker/trails/{trail_id}/waypoints/0001--raptor.md\n---\nbody\n"
+        "---\nhiker:\n  kind: trail\n  waypoints:\n    - path: .hiker/trails/{trail_id}/waypoints/0001--raptor.md\n---\nbody\n"
     );
     std::fs::write(dir.path().join("trails/my-trail.md"), trail_doc).unwrap();
 
-    // Waypoint-note.
+    // Waypoint-note. status: waypoint-note-shape — references and
+    // in_trail are path-only.
     let waypoint_dir = dir
         .path()
         .join(format!(".hiker/trails/{trail_id}/waypoints"));
     std::fs::create_dir_all(&waypoint_dir).unwrap();
-    let wp = format!(
-        "---\nhiker:\n  kind: waypoint\n  id: {waypoint_id}\n  references:\n    id: WILLBELOOKEDUP\n    path: research/raptor.md\n  in_trail:\n    id: {trail_id}\n    path: trails/my-trail.md\n---\n"
-    );
+    let wp = "---\nhiker:\n  kind: waypoint\n  references:\n    path: research/raptor.md\n  in_trail:\n    path: trails/my-trail.md\n---\n".to_string();
     std::fs::write(waypoint_dir.join("0001--raptor.md"), wp).unwrap();
 
     let store = Store::open(dir.path()).unwrap();
-    let handle = start(
-        crate::vault::Vault::open(dir.path()).unwrap(),
-        store,
-        mock_loader(),
+    let vault = crate::vault::Vault::open(dir.path()).unwrap();
+    // status: store-id-from-oplog / op-log-bootstraps-first
+    // The trail / waypoint derived-table re-derive reads the op-log's
+    // doc_id mapping; bootstrap + attach before any ingest. Bootstrap's
+    // walker skips `.hiker/` so the waypoint-note under the carved-out
+    // `.hiker/trails/` dir won't auto-seed — seed it explicitly via
+    // `doc_id_or_seed`, the same shape `create_trail` uses.
+    let oplog = std::sync::Arc::new(crate::oplog::OpLog::open(dir.path()).unwrap());
+    crate::ops::op_writes::bootstrap(&vault, &oplog).unwrap();
+    let waypoint_rel = format!(
+        ".hiker/trails/{trail_id}/waypoints/0001--raptor.md"
     );
+    crate::ops::op_writes::doc_id_or_seed(&oplog, &vault, &waypoint_rel, "").unwrap();
+    let handle = start(vault, store, mock_loader());
+    handle.attach_oplog(oplog.clone());
     let mut prog = handle.subscribe_progress();
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
 
@@ -322,11 +333,23 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     })
     .await;
 
-    // Verify derived rows.
+    // Verify derived rows. status: store-id-from-oplog —
+    // `trail_id` / `waypoint_id` are now the op-log doc_ids for the
+    // trail-doc / waypoint-note paths, not the legacy `hiker.id` stamps.
+    let trail_doc_id = oplog
+        .doc_id_for_path("trails/my-trail.md")
+        .unwrap()
+        .expect("trail-doc seeded");
+    let waypoint_doc_id = oplog
+        .doc_id_for_path(&format!(
+            ".hiker/trails/{trail_id}/waypoints/0001--raptor.md"
+        ))
+        .unwrap()
+        .expect("waypoint seeded");
     let store2 = Store::open(dir.path()).unwrap();
-    let waypoints = store2.waypoints_of(trail_id).unwrap();
+    let waypoints = store2.waypoints_of(&trail_doc_id).unwrap();
     assert_eq!(waypoints.len(), 1);
-    assert_eq!(waypoints[0].waypoint_id, waypoint_id);
+    assert_eq!(waypoints[0].waypoint_id, waypoint_doc_id);
     assert_eq!(waypoints[0].tree_path, "1");
     assert_eq!(waypoints[0].source_path, "research/raptor.md");
     assert!(waypoints[0].parent_waypoint_id.is_none());
@@ -335,7 +358,8 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
 
     let containing = store2.trails_containing_note("research/raptor.md").unwrap();
     assert_eq!(containing.len(), 1);
-    assert_eq!(containing[0].trail_id, trail_id);
+    assert_eq!(containing[0].trail_id, trail_doc_id);
+    let _ = waypoint_id;
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@ Schema (initial):
 ```sql
 -- one row per indexed file
 CREATE TABLE notes (
-  id            TEXT PRIMARY KEY,           -- ulid; stable across renames via path table
+  id            TEXT PRIMARY KEY,           -- ulid; THE SAME id as op-log's doc_id for this path
   path          TEXT NOT NULL UNIQUE,       -- vault-relative
   content_hash  TEXT NOT NULL,              -- blake3 of file body; skip re-embed if unchanged
   mtime         INTEGER NOT NULL,           -- unix seconds; cheap pre-check before hashing
@@ -45,19 +45,13 @@ CREATE VIRTUAL TABLE chunk_vecs USING vec0(
   chunk_id      TEXT PRIMARY KEY,
   embedding     FLOAT[N]
 );
-
--- ulid stability across renames: path → id
-CREATE TABLE path_ids (
-  path          TEXT PRIMARY KEY,
-  id            TEXT NOT NULL
-);
 ```
 
 Notes:
 
 - `chunks.text` is duplicated from the source file for snippet rendering and to decouple the index from filesystem reads on every query. Cheap; vault sizes don't justify cleverness here.
-- `path_ids` is the rename-stability table. On a rename event we look up the old path's id, update `notes.path`, leave the id alone. Trails and links never break.
-- Schema version pragma (`PRAGMA user_version = 1`) so future migrations have a hook.
+- **`notes.id` is op-log's `doc_id` for this path** — one ULID per document, minted by op-log on first ingest. The indexer reads it from op-log's `doc-index.db` (`oplog::doc_id_for_path`) when upserting a note; it never mints its own. This is why there is no separate `path_ids` table: the authoritative path↔id mapping lives in op-log. Renames update the mapping there; the id never changes. [store-id-from-oplog]
+- Schema version pragma (`PRAGMA user_version = N`) so future migrations have a hook.
 
 **Static linking.** Both SQLite itself and the sqlite-vec extension are statically linked into the Hiker binary — `rusqlite` with the `bundled` feature compiles the SQLite C source in, and the `sqlite-vec` crate compiles the vec extension's C source in via its `cc` build-script. No system libsqlite3 dependency, no runtime extension load, no separate `vec0.so` to ship. One binary, no surprises across OS/distro versions. [store-sqlite-vec-static]
 
@@ -83,7 +77,7 @@ v1 is permissive about what's already in the user's vault. No "init" step rewrit
 
 **Non-markdown files are silently ignored.** PDFs, images, audio, office docs, code files — all sit in the vault untouched. The indexer doesn't error, doesn't warn, doesn't produce sidecars. They simply aren't searchable until the extractor pipeline lands per design.md:419 (v4+). Users importing an existing mixed-content folder get a working v1 over their markdown subset on day one; non-md content waits its turn.
 
-**Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. The path→id table in the store is the authoritative id source in v1; the `hiker.id` field in frontmatter only starts being written when an explicit user action requires a stable id in the file itself (creating a wikilink target, pinning a trail waypoint, etc.) — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, Obsidian, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
+**Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. The path→id table in the store is the authoritative id source in v1; the `hiker.id` field in frontmatter only starts being written when an explicit user action requires a stable id in the file itself (creating a wikilink target, pinning a trail waypoint, etc.) — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, other markdown apps, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
 
 
 ## Chunking (v1)
@@ -193,7 +187,6 @@ read file → compute blake3 hash → if hash matches notes.content_hash AND
                                                  upsert notes row
                                                  delete old chunks + vecs for note_id
                                                  insert new chunks + vecs
-                                                 update path_ids
                                                COMMIT
          → emit indexer-progress events
 ```
@@ -270,7 +263,7 @@ DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` per design.md:3
 
 ## Per-file index state
 
-The `notes` row already answers "is this file indexed" — presence + non-zero chunks = yes. v1 expands the surface so the UI can also explain *why not* when the answer is no, and render a distinct tree-row marker for each case (see `tree-row-unsupported-marker` / `tree-row-skipped-marker` / `tree-row-queued-marker` in `editor.md`). Three non-indexed states:
+The `notes` row already answers "is this file indexed" — presence + non-zero chunks = yes. v1 expands the surface so the UI can also explain *why not* when the answer is no, and render a distinct tree-row marker for each case (see `tree-row-unsupported-marker` / `tree-row-skipped-marker` / `tree-row-queued-marker` in `files.md`). Three non-indexed states:
 
 - **Unsupported** — the extension has no chunker (`is_indexable_path` returns false). Derivable client-side from the path; no store row required. The indexer never sees the file.
 - **Skipped** — a chunker exists but ingest refused: file exceeded the 5MB sanity cap, failed UTF-8 decode, or (future) hit a corrupted-source signal. The indexer records the attempt as a `notes` row with a `skipped` flag set and a short `skip_reason` string. Storing the row (rather than dropping silently) is what lets the UI distinguish "skipped on purpose" from "never seen."
@@ -288,7 +281,7 @@ Indexer logic: when ingest decides to skip a file, write the `notes` row with `s
 
 ## Reindex verbs
 
-`cmd-index` covers the mechanics; v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `editor.md`'s `sidebar-toolbar-actions-menu`):
+`cmd-index` covers the mechanics; v1 wires two UI verbs to it through the sidebar's `⋯` actions menu in Files mode (see `files.md`'s `sidebar-toolbar-actions-menu`):
 
 - **Reindex all** — `index(IndexScope::All)` with the `force` flag set: bypasses the content-hash + embedder-version short-circuit so every note re-embeds even when nothing changed. The button is the user's explicit "redo all the work" verb; without `force` the click would be a no-op on a clean vault. The first-launch / vault-open startup scan and watcher-driven Upserts still default to `force=false` so the cheap-when-nothing-changed path keeps applying to ambient ingest. [reindex-all-action]
 - **Reindex this file** — `index(IndexScope::Path(currentPath))` with `force=true` for the same reason. Greyed when no file is active. [reindex-current-file-action]

@@ -46,17 +46,11 @@ pub fn modal(&mut self, ctx: &egui::Context) {
         Modal::DirtyClose { path, tab_id } => {
             app.dirty_close_dialog(ctx, path, tab_id);
         }
-        Modal::Recovery { entries } => {
-            app.recovery_dialog(ctx, entries);
-        }
         Modal::ConfirmDelete { path } => {
             app.confirm_delete_dialog(ctx, path);
         }
         Modal::DiskDrift { path, in_buffer_text } => {
             app.disk_drift_dialog(ctx, path, in_buffer_text);
-        }
-        Modal::PathConflict { path, recorded_id, current_path_id, target } => {
-            app.path_conflict_dialog(ctx, path, recorded_id, current_path_id, target);
         }
     }
 }
@@ -220,32 +214,38 @@ fn confirm_delete_dialog(&mut self, ctx: &egui::Context, path: String) {
 
 fn apply_confirm_delete(&mut self, rel: &str) {
     let app = self;
-    let store_mutex = app.vault_session.services.read_store.clone();
+    // Soft-delete through the indexer-routed `core::ops::delete` — the same
+    // path file-tree deletes take. It moves the note (or board-doc) to
+    // `.hiker/trash/`, drops its index entries, and clears any derived
+    // `board_cards` rows on the delete-ingest (so a trashed board drops off
+    // the Boards index). Referenced notes are untouched. status: board-delete
     let watcher = app.vault_session.services.watcher.clone();
-    let trash = hiker_core::trash::Trash::open(&app.vault_session.vault_root);
-    let mut store = match store_mutex.lock() {
-        Ok(s) => s,
-        Err(_) => return,
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let vault = app.vault_session.vault.clone();
+    let rel_owned = rel.to_string();
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::ops::file::delete(&watcher, &jobs, &vault, &rel_owned).await
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
     };
-    if let Err(err) = hiker_core::vault::delete_note(
-        &app.vault_session.vault,
-        &mut store,
-        Some(watcher.as_ref()),
-        &trash,
-        rel,
-    ) {
-        drop(store);
+    if let Err(err) = result {
         app.push_toast(format!("Delete failed: {}", err), ToastLevel::Error);
         return;
     }
-    drop(store);
 
-    // Close any open tabs for the deleted path + drop its buffer.
+    // Close any open tabs for the deleted path + drop its buffer. A board-doc
+    // can be open in a `Board`-kind tab (which `buffer_path()` doesn't cover),
+    // so close those too — mirroring how file delete closes an open buffer.
+    // status: board-delete
     let to_close: Vec<crate::tab::TabId> = app
         .session
         .tabs
         .iter()
-        .filter(|t| t.buffer_path() == Some(rel))
+        .filter(|t| {
+            t.buffer_path() == Some(rel)
+                || matches!(&t.kind, crate::tab::TabKind::Board { path } if path == rel)
+        })
         .map(|t| t.id)
         .collect();
     for id in to_close {
@@ -253,7 +253,7 @@ fn apply_confirm_delete(&mut self, rel: &str) {
     }
     app.session.buffers.remove(rel);
     let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    app.session.sidebar.dir_cache.remove(parent);
+    app.session.file_tree.dir_cache.remove(parent);
     app.push_toast(format!("Moved {} to trash", rel), ToastLevel::Info);
 }
 }
@@ -395,101 +395,20 @@ enum DirtyChoice {
     Cancel,
 }
 
-impl AppState {
-fn recovery_dialog(
-    &mut self,
-    ctx: &egui::Context,
-    mut entries: Vec<hiker_core::autosave::RecoveredEntry>,
+/// Silently auto-restore recovered autosave buffers on vault open — no modal,
+/// no per-row prompt (per `autosave-recovery-auto-restore`). Each entry opens
+/// as a sticky tab carrying the autosaved content, dirty against disk
+/// (`current_hash != loaded_hash`), so the user sees the unsaved work and
+/// decides to save or revert via the normal affordances. Called before the
+/// silent tab-state restore so `tab_state.active_path` still wins when
+/// resolvable (per `autosave-tab-state-silent-restore`).
+pub(crate) fn auto_restore_recovered(
+    app: &mut AppState,
+    entries: Vec<hiker_core::autosave::RecoveredEntry>,
 ) {
-    let app = self;
-    let mut bulk_decision: Option<BulkChoice> = None;
-    let mut per_row: Vec<RowChoice> = Vec::new();
-
-    egui::Window::new("Restore unsaved changes?")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            ui.label(
-                "Hiker has autosaved copies of these buffers from a previous session. \
-                 Restore brings the autosaved text back into the buffer; Discard drops it.",
-            );
-            ui.add_space(8.0);
-            for (i, entry) in entries.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&entry.path).monospace());
-                    if ui.button("Restore").clicked() {
-                        per_row.push(RowChoice { idx: i, restore: true });
-                    }
-                    if ui.button("Discard").clicked() {
-                        per_row.push(RowChoice { idx: i, restore: false });
-                    }
-                });
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Restore all").clicked() {
-                    bulk_decision = Some(BulkChoice::RestoreAll);
-                }
-                if ui.button("Discard all").clicked() {
-                    bulk_decision = Some(BulkChoice::DiscardAll);
-                }
-                if ui.button("Decide later").clicked() {
-                    bulk_decision = Some(BulkChoice::Defer);
-                }
-            });
-        });
-
-    if let Some(bulk) = bulk_decision {
-        match bulk {
-            BulkChoice::RestoreAll => {
-                for entry in entries.drain(..) {
-                    apply_restore(app, &entry);
-                }
-            }
-            BulkChoice::DiscardAll => {
-                for entry in entries.drain(..) {
-                    apply_discard(app, &entry.path);
-                }
-            }
-            BulkChoice::Defer => {
-                // Leave the sidecars on disk; close the modal so the
-                // user can keep working.
-            }
-        }
-        return;
+    for entry in entries {
+        apply_restore(app, &entry);
     }
-
-    // Apply per-row decisions (in reverse index order so indexes stay
-    // valid while we drain).
-    per_row.sort_by_key(|c| std::cmp::Reverse(c.idx));
-    for choice in per_row {
-        if choice.idx >= entries.len() {
-            continue;
-        }
-        let entry = entries.remove(choice.idx);
-        if choice.restore {
-            apply_restore(app, &entry);
-        } else {
-            apply_discard(app, &entry.path);
-        }
-    }
-
-    if !entries.is_empty() {
-        app.session.modal = Some(Modal::Recovery { entries });
-    }
-}
-}
-
-enum BulkChoice {
-    RestoreAll,
-    DiscardAll,
-    Defer,
-}
-
-struct RowChoice {
-    idx: usize,
-    restore: bool,
 }
 
 fn apply_restore(app: &mut AppState, entry: &hiker_core::autosave::RecoveredEntry) {
@@ -523,133 +442,8 @@ fn apply_restore(app: &mut AppState, entry: &hiker_core::autosave::RecoveredEntr
     }
 }
 
-fn apply_discard(app: &mut AppState, path: &str) {
-    let autosave = app.vault_session.services.autosave.clone();
-    if let Err(err) = autosave.discard(path) {
-        app.push_toast(
-            format!("Discard failed for {}: {}", path, err),
-            crate::state::ToastLevel::Error,
-        );
-    }
-}
-
-// ===========================================================================
-// Path-conflict modal (Keep mine / Repoint / Break)
-// ===========================================================================
-
-#[derive(Clone, Copy)]
-enum ConflictChoice {
-    KeepMine,
-    Repoint,
-    Break,
-    Cancel,
-}
-
-impl AppState {
-/// Resolve a stored double-link `PathConflict`: the recorded path now points
-/// at a note with a different ULID than the one recorded. Three branches,
-/// reused across every reference surface (`target`):
-///   - **Keep mine** — leave the stored reference as-is (it stays a broken/
-///     orphan-style card until the note it recorded reappears).
-///   - **Repoint** — rewrite the stored path to the note now at `path`,
-///     adopting its current identity (one `user_save` op).
-///   - **Break** — remove the reference (card / waypoint) entirely.
-///
-/// status: trail-path-conflict-modal
-/// status: board-card-references
-fn path_conflict_dialog(
-    &mut self,
-    ctx: &egui::Context,
-    path: String,
-    recorded_id: String,
-    current_path_id: String,
-    target: crate::state::PathConflictTarget,
-) {
-    let app = self;
-    let mut decision: Option<ConflictChoice> = None;
-    let mut open = true;
-    egui::Window::new("Reference conflict")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(format!(
-                "The note at {path} is no longer the one this reference recorded."
-            ));
-            ui.label(
-                egui::RichText::new(format!(
-                    "recorded id {recorded_id} - current note id {current_path_id}"
-                ))
-                .small()
-                .monospace()
-                .color(egui::Color32::from_rgb(0xb9, 0x6a, 0x6a)),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Keep mine").on_hover_text(
-                    "Leave the reference unchanged (stays broken until the recorded note returns)",
-                ).clicked() {
-                    decision = Some(ConflictChoice::KeepMine);
-                }
-                if ui.button("Repoint").on_hover_text(
-                    "Rewrite the reference to the note now at this path",
-                ).clicked() {
-                    decision = Some(ConflictChoice::Repoint);
-                }
-                let break_btn = egui::Button::new(
-                    egui::RichText::new("Break").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(egui::Color32::from_rgb(0xc0, 0x39, 0x2b));
-                if ui.add(break_btn).on_hover_text("Remove the reference").clicked() {
-                    decision = Some(ConflictChoice::Break);
-                }
-                if ui.button("Cancel").clicked() {
-                    decision = Some(ConflictChoice::Cancel);
-                }
-            });
-        });
-
-    match decision {
-        Some(ConflictChoice::KeepMine) | Some(ConflictChoice::Cancel) => {}
-        Some(ConflictChoice::Repoint) => app.apply_conflict_repoint(&path, &target),
-        Some(ConflictChoice::Break) => app.apply_conflict_break(&target),
-        None if !open => {}
-        None => {
-            app.session.modal = Some(Modal::PathConflict {
-                path,
-                recorded_id,
-                current_path_id,
-                target,
-            });
-        }
-    }
-}
-
-/// "Repoint": rewrite the reference's stored path to the note now at `path`.
-/// For a board card this is a board-doc frontmatter `user_save` via the
-/// board ops (the card's id stays; only the path half is adopted from the
-/// current note — actually a fresh `{id,path}` for the note now there).
-fn apply_conflict_repoint(
-    &mut self,
-    path: &str,
-    target: &crate::state::PathConflictTarget,
-) {
-    use crate::state::PathConflictTarget;
-    match target {
-        PathConflictTarget::BoardCard { board_rel, card_id } => {
-            crate::panels::board::repoint_card(self, board_rel, card_id, path);
-        }
-    }
-}
-
-/// "Break": remove the conflicting reference entirely.
-fn apply_conflict_break(&mut self, target: &crate::state::PathConflictTarget) {
-    use crate::state::PathConflictTarget;
-    match target {
-        PathConflictTarget::BoardCard { board_rel, card_id } => {
-            crate::panels::board::break_card(self, board_rel, card_id);
-        }
-    }
-}
-}
+// The Keep mine / Repoint / Break path-conflict modal retired with
+// `trail-path-conflict-modal`. Under path-as-identity
+// (`wikilink-path-form`) there's no id half left to disagree with a
+// recorded path — an unresolved reference is just an orphan card the
+// user removes via the per-card / per-waypoint verb.

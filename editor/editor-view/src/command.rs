@@ -67,6 +67,15 @@ impl Action {
     const fn state_only(state: EditorState) -> Self {
         Self::Replace { state, tx: None }
     }
+
+    /// True for actions that changed the document text — the cases where the
+    /// caret should be scrolled back into view. Selection-only replaces
+    /// (`tx: None`, incl. undo/redo and pure motion) and clipboard copies
+    /// don't qualify; this scopes caret-follow to edits, per
+    /// `bug-editor-no-scroll-cursor-into-view-on-edit`.
+    const fn mutates_doc(&self) -> bool {
+        matches!(self, Self::Replace { tx: Some(_), .. } | Self::Cut { .. })
+    }
 }
 
 /// Command-handler context: bundles the immutable editor state and mutable
@@ -80,6 +89,16 @@ struct Cmd<'a> {
 }
 
 pub fn handle(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> Action {
+    let action = dispatch_event(state, view, event);
+    // An edit moved the caret — request a scroll-into-view, applied by the
+    // widget after its next measure pass. status: scroll-caret-into-view-on-edit
+    if action.mutates_doc() {
+        view.scroll_caret_into_view = true;
+    }
+    action
+}
+
+fn dispatch_event(state: &EditorState, view: &mut ViewState, event: &InputEvent) -> Action {
     if view.read_only {
         return match event {
             InputEvent::Mouse(ev) => handle_mouse(state, view, ev),
@@ -475,7 +494,16 @@ fn maybe_open_completion(state: &EditorState, view: &mut ViewState, s: &str) {
         .completion_sources
         .iter()
         .any(|src| src.triggers().contains(&ch));
-    if !triggered {
+    // Re-open even on a non-trigger keystroke when the caret sits inside
+    // a source's context (editing an existing `[[wikilink]]`). The cheap
+    // `reopens_in_context` predicate gates the heavier `matches` walk so
+    // ordinary typing doesn't pay for it. [bug-wikilink-edit-reopens-popup]
+    let in_context = !triggered
+        && view
+            .completion_sources
+            .iter()
+            .any(|src| src.reopens_in_context(state, pos));
+    if !triggered && !in_context {
         return;
     }
     let items = gather_matches(state, view, pos);
@@ -924,25 +952,28 @@ fn mouse_down(
         return Action::state_only(apply_selection(state, Selection::single(pos)));
     }
 
-    view.drag = DragState::MaybeSelecting { anchor: pos };
     let sel = match click_count {
         2 => {
-            use unicode_segmentation::UnicodeSegmentation;
+            // Single code path: run `view.double_click_re` against the
+            // clicked line's content. The default (`\w+`) reproduces the
+            // historic Unicode-word behavior; users override via
+            // `editor.double_click_pattern`. No match → plain caret.
             let line = state.doc.byte_to_line(pos);
             let line_start = state.doc.line_to_byte(line);
             let text = state.doc.line_str(line);
             let local = pos - line_start;
-            let mut sel = Selection::single(pos);
-            for (i, w) in text.unicode_word_indices() {
-                let end = i + w.len();
-                if local >= i && local <= end {
-                    sel = Selection::from_range(SelRange::new(line_start + i, line_start + end));
-                    break;
+            match pattern_span_at(&text, local, &view.double_click_re) {
+                Some((s, e)) => {
+                    Selection::from_range(SelRange::new(line_start + s, line_start + e))
                 }
+                None => Selection::single(pos),
             }
-            sel
         }
         3 => {
+            // Single code path: run `view.triple_click_re` against the
+            // clicked line **including** its trailing newline (the slice
+            // `line_start..line_end_with_newline`), so the default `.*\n?`
+            // reproduces the previous whole-line-incl-newline behavior.
             let line = state.doc.byte_to_line(pos);
             let line_start = state.doc.line_to_byte(line);
             let line_end = if line + 1 < state.doc.len_lines() {
@@ -950,7 +981,14 @@ fn mouse_down(
             } else {
                 state.doc.len_bytes()
             };
-            Selection::from_range(SelRange::new(line_start, line_end))
+            let text = state.doc.slice(line_start..line_end).to_string();
+            let local = pos - line_start;
+            match pattern_span_at(&text, local, &view.triple_click_re) {
+                Some((s, e)) => {
+                    Selection::from_range(SelRange::new(line_start + s, line_start + e))
+                }
+                None => Selection::single(pos),
+            }
         }
         _ if mods.alt || (mods.primary() && !mods.shift) => {
             multicursor::add_cursor(state, pos)
@@ -961,6 +999,12 @@ fn mouse_down(
         }
         _ => Selection::single(pos),
     };
+    // Arm a drag from the selection we just made: a plain click anchors a
+    // point (lo == hi), a double/triple click anchors the whole word/line so a
+    // subsequent drag (or a no-motion stray Drag — see `mouse_drag`) extends
+    // rather than collapses it.
+    let main = sel.main();
+    view.drag = DragState::MaybeSelecting { lo: main.start(), hi: main.end() };
     Action::state_only(apply_selection(state, sel))
 }
 
@@ -968,11 +1012,22 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
     let state = self.state;
     let view = &mut *self.view;
     match view.drag {
-        DragState::MaybeSelecting { anchor } => {
+        DragState::MaybeSelecting { lo, hi } => {
             view.touch();
             let head = view_to_buffer(state, view, x, y);
-            let sel = Selection::from_range(SelRange::new(anchor, head));
-            Action::state_only(apply_selection(state, sel))
+            // Union the anchored range with the pointer: while the pointer
+            // stays within [lo, hi] the selection is exactly that range (so a
+            // double-click word survives jitter and the no-motion stray Drag
+            // the translate layer emits each held frame). Dragging past either
+            // edge extends from the far edge, with the head on the moving side.
+            let start = lo.min(head);
+            let end = hi.max(head);
+            let range = if head < lo {
+                SelRange::new(end, start)
+            } else {
+                SelRange::new(start, end)
+            };
+            Action::state_only(apply_selection(state, Selection::from_range(range)))
         }
         DragState::MaybeDraggingSelection { start, threshold } => {
             let dx = x - start.0;
@@ -1201,14 +1256,58 @@ fn pos_in_any_nonempty_range(state: &EditorState, pos: usize) -> bool {
     state.selection.ranges().iter().any(|r| !r.is_empty() && pos >= r.start() && pos < r.end())
 }
 
+/// Byte span (relative to `text`) of the first regex match that contains the
+/// click column `local`. `None` when no match covers it, so the caller falls
+/// back to its built-in behavior. End-inclusive (`local <= end`) so a click at
+/// a match's trailing edge still selects it, mirroring the Unicode-word path.
+/// Used by double/triple-click when `editor.{double,triple}_click_pattern` is
+/// set. status: click-select-pattern
+fn pattern_span_at(text: &str, local: usize, re: &regex::Regex) -> Option<(usize, usize)> {
+    re.find_iter(text).map(|m| (m.start(), m.end())).find(|&(s, e)| local >= s && local <= e)
+}
+
 fn scroll_by(view: &mut ViewState, delta_y: f32) {
     view.scroll_y = (view.scroll_y - delta_y).max(0.0);
+    clamp_scroll(view);
+}
+
+/// Clamp `scroll_y` to `[0, total - height + scroll_past_end*height]`. Shared
+/// by wheel scroll and caret-follow so both honor the same bounds, including
+/// the `scroll_past_end` overshoot allowance.
+fn clamp_scroll(view: &mut ViewState) {
+    view.scroll_y = view.scroll_y.max(0.0);
     let max = (view.height_map.total_height() - view.height
         + view.scroll_past_end * view.height)
         .max(0.0);
     if view.scroll_y > max {
         view.scroll_y = max;
     }
+}
+
+/// Scroll the minimum amount so the caret's line is within the visible band
+/// `[scroll_y, scroll_y + height]`. No-op when the caret is already visible.
+/// Called (deferred) after edits so typing follows the caret; consumed by the
+/// egui widget once the height map reflects the post-edit doc. Granularity is
+/// the buffer line — with wrap on, a caret deep inside a long wrapped line
+/// scrolls that line's top into view rather than the exact visual row.
+pub fn scroll_caret_into_view(state: &EditorState, view: &mut ViewState) {
+    let lines = state.doc.len_lines();
+    if lines == 0 || view.height <= 0.0 {
+        return;
+    }
+    let caret = state.selection.main().head.offset().min(state.doc.len_bytes());
+    let line = state.doc.byte_to_line(caret).min(lines - 1);
+    let top = view.height_map.y_at_text(line);
+    let bottom = top + view.height_map.text_height(line).max(view.line_height);
+
+    if top < view.scroll_y {
+        view.scroll_y = top;
+    } else if bottom > view.scroll_y + view.height {
+        view.scroll_y = bottom - view.height;
+    } else {
+        return;
+    }
+    clamp_scroll(view);
 }
 
 /// Map widget-local (x, y) to a byte offset in the doc. `x` is widget-local

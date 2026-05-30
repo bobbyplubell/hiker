@@ -520,3 +520,325 @@ fn two_agent_ops_accept_one_reject_other_with_user_edit() {
     assert!(log.commit_working(&doc_id).unwrap());
     assert_accepted_and_disk(&log, dir.path(), &doc_id, working);
 }
+
+#[test]
+fn bug_sync_commit_working_races_remote_apply() {
+    // status: bug-sync-commit-working-races-remote-apply
+    //
+    // commit_working reads `materialize(working).text` under one locked() block
+    // and then calls commit_text_edit (which acquires its own lock and diffs
+    // the captured text against the *current* accepted). If a remote/external
+    // edit lands between the two lock acquisitions, the diff vs. the just-
+    // updated accepted reverts the peer's bytes — silent data loss.
+    //
+    // We use the #[cfg(test)] `commit_working_test_hook` to deterministically
+    // schedule an `apply_external_edit` into the lock-gap, then assert the
+    // committed accepted contains BOTH edits (a real three-way merge). The
+    // test FAILS today because the peer's line-3 edit is reverted.
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    let log = Arc::new(OpLog::open(dir.path()).unwrap());
+    let original = "line one\nline two\nline three\n";
+    let doc_id = log
+        .create_document("a.md", "note", original, &Author::User)
+        .unwrap();
+
+    // User edits line 2: insert " MODIFIED-BY-USER" after "line two".
+    let insert_at = "line one\nline two".len();
+    log.apply_working_edit(&doc_id, insert_at, 0, " MODIFIED-BY-USER")
+        .unwrap();
+    let user_working = "line one\nline two MODIFIED-BY-USER\nline three\n";
+    assert_eq!(log.materialize_working(&doc_id).unwrap().text, user_working);
+
+    // Peer edit: same `original` accepted, but extends line 3 (disjoint from
+    // the user's line-2 change).
+    let peer_disk = "line one\nline two\nline three EXTENDED-BY-PEER\n";
+
+    // Hook fires *after* commit_working reads the working text and releases
+    // the first lock, but *before* commit_text_edit takes its own lock — the
+    // exact window the bug needs. Inside the hook we launch a thread that
+    // applies the external edit (taking the lock while commit_working is
+    // paused), and wait for it to complete before returning. Once we return,
+    // commit_text_edit acquires the lock and diffs the (now stale) user
+    // working text against the (now peer-extended) accepted.
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let log_for_hook = Arc::clone(&log);
+    let start_hook = Arc::clone(&start);
+    let done_hook = Arc::clone(&done);
+    let peer_disk_owned = peer_disk.to_string();
+    let doc_id_for_hook = doc_id.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let log_for_thread = Arc::clone(&log_for_hook);
+        let start_thread = Arc::clone(&start_hook);
+        let done_thread = Arc::clone(&done_hook);
+        let peer_owned = peer_disk_owned.clone();
+        let doc_id_thread = doc_id_for_hook.clone();
+        let handle = thread::spawn(move || {
+            // Sync with the hook: only fire the external edit once the hook
+            // has released the commit_working lock.
+            start_thread.wait();
+            log_for_thread
+                .apply_external_edit(&doc_id_thread, &peer_owned)
+                .unwrap();
+            done_thread.wait();
+        });
+        // Signal the worker to apply the external edit, then wait until it's
+        // done so commit_text_edit observes the peer-advanced accepted.
+        start_hook.wait();
+        done_hook.wait();
+        handle.join().unwrap();
+    });
+    *log.commit_working_test_hook.lock().unwrap() = Some(hook);
+
+    log.commit_working(&doc_id).unwrap();
+
+    // Both edits should have landed (real three-way merge). Today, the peer's
+    // line-3 extension is reverted by the user save.
+    let expected = "line one\nline two MODIFIED-BY-USER\nline three EXTENDED-BY-PEER\n";
+    let final_text = log.materialize_accepted(&doc_id).unwrap().text;
+    assert_eq!(
+        final_text, expected,
+        "commit_working raced apply_external_edit — peer's edit was reverted",
+    );
+}
+
+#[test]
+fn commit_working_preserves_peer_edit_during_race() {
+    // Regression: commit_working must pass (base, ours=working, theirs=peer)
+    // to three_way_merge. With overlapping spans the peer wins per the merge
+    // policy, so the peer's bytes survive in accepted instead of being
+    // silently overwritten by the user's stale working text.
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    let log = Arc::new(OpLog::open(dir.path()).unwrap());
+    let original = "line one\nline two\nline three\n";
+    let doc_id = log
+        .create_document("a.md", "note", original, &Author::User)
+        .unwrap();
+
+    // User REPLACES "line two" with "LINE-TWO-USER" (a replacement span).
+    let start = "line one\n".len();
+    let removed = "line two".len();
+    log.apply_working_edit(&doc_id, start, removed, "LINE-TWO-USER")
+        .unwrap();
+    let user_working = "line one\nLINE-TWO-USER\nline three\n";
+    assert_eq!(log.materialize_working(&doc_id).unwrap().text, user_working);
+
+    // Peer ALSO replaces "line two" with "LINE-TWO-PEER" — true span overlap.
+    let peer_disk = "line one\nLINE-TWO-PEER\nline three\n";
+
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let log_for_hook = Arc::clone(&log);
+    let start_hook = Arc::clone(&start);
+    let done_hook = Arc::clone(&done);
+    let peer_disk_owned = peer_disk.to_string();
+    let doc_id_for_hook = doc_id.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let log_for_thread = Arc::clone(&log_for_hook);
+        let start_thread = Arc::clone(&start_hook);
+        let done_thread = Arc::clone(&done_hook);
+        let peer_owned = peer_disk_owned.clone();
+        let doc_id_thread = doc_id_for_hook.clone();
+        let handle = thread::spawn(move || {
+            start_thread.wait();
+            log_for_thread
+                .apply_external_edit(&doc_id_thread, &peer_owned)
+                .unwrap();
+            done_thread.wait();
+        });
+        start_hook.wait();
+        done_hook.wait();
+        handle.join().unwrap();
+    });
+    *log.commit_working_test_hook.lock().unwrap() = Some(hook);
+
+    log.commit_working(&doc_id).unwrap();
+
+    let final_accepted = log.materialize_accepted(&doc_id).unwrap().text;
+    assert_eq!(
+        final_accepted, peer_disk,
+        "peer's edit must be preserved when commit_working races an overlapping peer edit",
+    );
+    assert!(
+        !final_accepted.contains("LINE-TWO-USER"),
+        "user's overlapping span should drop per peer-wins policy: accepted={final_accepted:?}",
+    );
+}
+
+#[test]
+fn bug_sync_per_hunk_accept_cross_op_deps() {
+    // Bug: stage_pending falls back to producing op #2 against
+    // `accepted + prior session pending` when op #2's anchor isn't in
+    // `accepted`. The Yrs update is encoded with before_sv =
+    // accepted.state_vector, so accepting op #2 alone (skipping op #1) either
+    // silently lands a drifted edit or fails — per-hunk independence breaks.
+    //
+    // Scenario:
+    //   accepted = "alpha\nbeta\n"
+    //   op #1: insert INSERT line between alpha and beta (anchored in accepted)
+    //   op #2: replace "INSERT" -> "REPLACED" (anchor exists ONLY in pending
+    //          view → forces fallback path in stage_pending lines 436-439)
+    //   Accept ONLY op #2 (skip op #1).
+    //
+    // Acceptable safe outcomes:
+    //   - accept returns Err (per-hunk Accept disabled) AND accepted unchanged
+    //   - accept returns Ok and accepted is unchanged ("alpha\nbeta\n")
+    //
+    // Bug manifestation: accept returns Ok with corrupted text (e.g.
+    // "alphaREPLACED\nbeta\n"), or returns a generic Drift error that today
+    // would surface to the user as a confusing "anchor drift" rather than
+    // "depends on op #1".
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("a.md", "note", "alpha\nbeta\n", &Author::User)
+        .unwrap();
+    // Stage op #1 first so it's in state.pending under the session, then
+    // stage op #2 separately under the same session — that's what forces
+    // op #2 down the fallback path (its "INSERT" anchor is absent from
+    // `accepted` but present in `accepted + prior session pending`).
+    let out1 = log
+        .stage_pending(
+            &doc_id,
+            &[EditSpec {
+                old_str: Some("alpha\nbeta\n".into()),
+                new_str: "alpha\nINSERT\nbeta\n".into(),
+            }],
+            &user_ctx(),
+        )
+        .unwrap();
+    assert_eq!(out1.op_ids.len(), 1);
+    let out2 = log
+        .stage_pending(
+            &doc_id,
+            &[EditSpec {
+                old_str: Some("INSERT".into()),
+                new_str: "REPLACED".into(),
+            }],
+            &user_ctx(),
+        )
+        .unwrap();
+    assert_eq!(out2.op_ids.len(), 1, "op #2 should stage via fallback path");
+    let op2_id = out2.op_ids[0].clone();
+
+    // Accept ONLY op #2; skip op #1.
+    let result = log.accept_pending(&doc_id, &op2_id);
+    let materialized = log.materialize_accepted(&doc_id).unwrap().text;
+    eprintln!(
+        "accept_pending(op2) result = {:?}, materialized accepted = {:?}",
+        result, materialized
+    );
+
+    // Safe outcomes:
+    //   - Err returned AND accepted unchanged, OR
+    //   - Ok returned AND accepted unchanged.
+    // Bug outcomes: Ok with mangled text, or Err with corrupted accepted, or
+    // an Err whose only signal is generic "drift" (which the spec wants to
+    // become a clean DependsOn). Today no DependsOn variant exists, so we
+    // assert: if Ok was returned, accepted must equal the original.
+    match result {
+        Ok(()) => {
+            assert_eq!(
+                materialized, "alpha\nbeta\n",
+                "BUG: accept_pending of dependent op #2 without op #1 silently \
+                 corrupted accepted — got {materialized:?}"
+            );
+        }
+        Err(e) => {
+            // Accepted must still be unchanged after a failed accept.
+            assert_eq!(
+                materialized, "alpha\nbeta\n",
+                "accept_pending errored but accepted was mutated anyway: \
+                 err={e:?}, accepted={materialized:?}"
+            );
+            // And the error should be a per-hunk dependency error, not a
+            // generic anchor/drift one — names the blocker so the caller
+            // (UI or agent) can accept/reject it first.
+            match &e {
+                super::super::error::Error::DependsOn { op_id, predecessors } => {
+                    assert_eq!(op_id, &op2_id);
+                    assert_eq!(predecessors.len(), 1);
+                    assert_eq!(predecessors[0], out1.op_ids[0]);
+                }
+                _ => panic!(
+                    "BUG: accept_pending of dependent op #2 returned a generic \
+                     error instead of a clean depends-on signal: {e:?}"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn bug_sync_working_mirror_cross_lineage_apply() {
+    // status: bug-sync-working-mirror-cross-lineage-apply
+    //
+    // The working Doc is cloned from accepted via `clone_doc`, which mints a
+    // fresh client_id. When a peer-authored update advances accepted and the
+    // working-mirror path (`apply_remote_update` in sync.rs:150-153) applies
+    // the encoded delta onto working, working sees foreign client_ids and the
+    // merge can drop, dup, or interleave bytes — exactly the cross-lineage
+    // failure mode the spec warns about.
+    //
+    // Real cross-lineage scenario: two devices share a lineage via
+    // adopt_lineage. Device B holds an uncommitted working edit on line 2.
+    // Device A authors a disjoint edit on line 3 and ships the delta to B.
+    // After B applies the remote update, materialize_working should show
+    // BOTH edits (three-way merge). Today the cross-lineage apply doesn't
+    // preserve both correctly.
+    let seed = "alpha\nbeta\ngamma\n";
+    let dir_a = tempdir().unwrap();
+    let log_a = OpLog::open(dir_a.path()).unwrap();
+    let doc_a = log_a
+        .create_document("shared.md", "note", seed, &Author::User)
+        .unwrap();
+    let dir_b = tempdir().unwrap();
+    let log_b = OpLog::open(dir_b.path()).unwrap();
+    let doc_b = log_b
+        .create_document("shared.md", "note", seed, &Author::User)
+        .unwrap();
+    // B adopts A's canonical lineage so future deltas merge.
+    let canonical = log_a.export_state(&doc_a).unwrap();
+    log_b.adopt_lineage(&doc_b, &canonical).unwrap();
+    assert_eq!(log_b.materialize_accepted(&doc_b).unwrap().text, seed);
+
+    // B: user edits line 2 in working — uncommitted, working-only.
+    let line2_end = "alpha\nbeta".len();
+    log_b
+        .apply_working_edit(&doc_b, line2_end, 0, " MODIFIED-BY-USER")
+        .unwrap();
+    assert_eq!(
+        log_b.materialize_working(&doc_b).unwrap().text,
+        "alpha\nbeta MODIFIED-BY-USER\ngamma\n"
+    );
+
+    // A: disjoint edit on line 3, then ship the delta to B.
+    assert!(log_a
+        .apply_user_text(&doc_a, "alpha\nbeta\ngamma EXTENDED-BY-PEER\n")
+        .unwrap());
+    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
+    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
+    assert!(log_b
+        .apply_remote_update(&doc_b, &delta, "deviceA")
+        .unwrap());
+
+    // Accepted on B carries A's peer edit; working should carry BOTH.
+    assert_eq!(
+        log_b.materialize_accepted(&doc_b).unwrap().text,
+        "alpha\nbeta\ngamma EXTENDED-BY-PEER\n"
+    );
+    let materialized = log_b.materialize_working(&doc_b).unwrap().text;
+    dbg!(&materialized);
+
+    let expected = "alpha\nbeta MODIFIED-BY-USER\ngamma EXTENDED-BY-PEER\n";
+    assert_eq!(
+        materialized, expected,
+        "cross-lineage working-mirror apply did not produce a clean three-way merge"
+    );
+}

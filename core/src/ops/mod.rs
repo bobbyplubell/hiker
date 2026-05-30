@@ -33,16 +33,11 @@
 //!   `set_frontmatter`, `apply_tag`, `remove_tag`) +
 //!   `WriteCtx`. Queue as pending op-log ops authored `agent:<client_id>`
 //!   when review mode is on.
-//! - [`buffer`] — editor-buffer lifecycle (`open_for_edit`,
-//!   `commit`, `resolve_drift`, `ensure_note_id_stamped`) + the
-//!   `Token` family of types. Owns the drift-check policy and the
-//!   id-stamping path that user-driven waypoint creation rides.
 //!
 //! Every entry from the prior `core::ops` flat module re-exports here so
 //! `hiker_core::ops::FOO` continues to resolve unchanged.
 
 pub mod agent;
-pub mod buffer;
 pub mod file;
 pub mod op_writes;
 

@@ -47,7 +47,7 @@ use hiker_core::trees::types::Db;
 use hiker_core::watcher::{FileEvent, Watcher};
 
 use crate::buffer::Buffer;
-use crate::tab::{DockTab, Tab, TabId, TabKind};
+use crate::tab::{Tab, TabId, TabKind};
 
 // ===========================================================================
 // AppState — top-level
@@ -58,6 +58,20 @@ pub struct AppState {
     pub session: Session,
     pub ui_cache: UiCache,
     pub panels: PanelStates,
+    /// Per-feature UI state for the migrated `clusters` feature.
+    /// Top-level (sibling to `panels`) per `feature-state-ownership`:
+    /// each migrated feature owns its state on `AppState` directly so
+    /// `PanelStates` shrinks rather than growing into a god struct.
+    pub clusters_state: crate::clusters::state::State,
+    /// Per-feature UI state for the migrated `trails` feature
+    /// (`feature-trails-migration`).
+    pub trails_state: crate::trails::state::State,
+    /// Per-session feature descriptor registry. Built in
+    /// `bootstrap::open_vault` from `feature::builtin_features()` plus
+    /// (in Phase 3) plugin-derived features. Sidebar/activity/hamburger
+    /// consumers iterate this rather than hardcoding feature lists.
+    /// `feature-registry`.
+    pub features: std::sync::Arc<crate::feature::Registry>,
     pub ui: UiState,
     pub toasts: Vec<Toast>,
     pub vault_switch: VaultSwitchState,
@@ -151,6 +165,13 @@ pub struct Services {
     /// per-tool gates) take effect without an MCP restart. Always
     /// present even when MCP is disabled — keeps the wiring uniform.
     pub mcp_tools_cfg: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
+    /// status: mcp-tool-get-active-note, mcp-tool-get-open-notes,
+    /// mcp-tool-get-selection
+    ///
+    /// Live snapshot of "what the user is looking at" the MCP UI-context
+    /// read tools surface. The host writes it each frame via
+    /// `refresh_ui_context_snapshot`; the MCP handler only reads.
+    pub mcp_ui_context: hiker_mcp::ui_context::Shared,
     /// The live `hiker-sync` engine, present only when `[sync].enabled`. When
     /// sync is off this is `None` and nothing is constructed (no keys, no
     /// swarm, no listener). The Sync page renders a disabled state in that
@@ -208,35 +229,19 @@ impl Drop for VaultSession {
 pub struct Session {
     pub buffers: HashMap<String, Buffer>,
     pub tabs: Vec<Tab>,
-    /// `egui_tiles::Tree` arrangement mirror. `session.tabs` is the
-    /// source of truth for "which tab ids exist"; `dock` mirrors them
-    /// into the tree so egui_tiles can render the strip and let the
-    /// user drag-to-split. `tabs::reconcile_dock` keeps them in sync at
-    /// the top of every render.
-    pub dock: egui_tiles::Tree<DockTab>,
-    /// Tabs container that hosts buffer tabs (DockTab::Tab). The
-    /// reconciler appends new tabs here; the post-frame enforcement
-    /// moves stray buffer tabs back into it.
-    pub center_tile: egui_tiles::TileId,
-    /// Tabs container that holds left-side panels by default.
-    pub left_tile: egui_tiles::TileId,
-    /// Tabs container that holds right-side panels by default.
-    pub right_tile: egui_tiles::TileId,
-    /// Set whenever the dock arrangement mutates. The autosave tick
-    /// serialises `dock` to `<vault>/.hiker/layout.json` whenever this
-    /// flag is set, then clears it.
-    pub dock_dirty: bool,
-    /// Last-known `TileId` for each registered panel id. Updated each
-    /// frame so panel-toggle can re-insert a hidden panel near where
-    /// the user last had it.
-    pub panel_locations: std::collections::HashMap<String, egui_tiles::TileId>,
+    /// Last-persisted primary side-panel accordion snapshot. The
+    /// autosave tick compares the live arrangement against this and
+    /// rewrites `<vault>/.hiker/side-panel.json` only on change (the
+    /// accordion mutates inside egui_workbench, so there's no dirty flag
+    /// to hang off). [feature-multi-region-sidebar]
+    pub side_panel_saved: Option<crate::side_panel_persist::SidePanelState>,
     pub active_tab: Option<TabId>,
     /// VSCode-style preview slot — at most one tab is "preview" (italic
     /// label, replaced by the next click).
     pub preview_tab: Option<TabId>,
     pub next_tab_id: u64,
     pub modal: Option<Modal>,
-    pub sidebar: SidebarState,
+    pub file_tree: FileTreeState,
     pub nav: NavState,
     pub trails: Vec<Trail>,
     /// Id of the trail that receives manual append-waypoint actions.
@@ -257,21 +262,15 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Self {
-        let bundle = crate::layout::default_dock();
         Self {
             buffers: HashMap::new(),
             tabs: Vec::new(),
-            dock: bundle.tree,
-            center_tile: bundle.center_tile,
-            left_tile: bundle.left_tile,
-            right_tile: bundle.right_tile,
-            dock_dirty: false,
-            panel_locations: std::collections::HashMap::new(),
+            side_panel_saved: None,
             active_tab: None,
             preview_tab: None,
             next_tab_id: 1,
             modal: None,
-            sidebar: SidebarState::default(),
+            file_tree: FileTreeState::default(),
             nav: NavState::default(),
             trails: Vec::new(),
             active_trail: None,
@@ -295,16 +294,6 @@ pub enum NavTarget {
     File(String),
     /// A historical snapshot of `path` at a specific accepted op.
     Snapshot { path: String, op_id: String },
-}
-
-impl NavTarget {
-    /// The vault-relative path this target concerns (for tab matching / the
-    /// status bar), regardless of variant.
-    pub fn path(&self) -> &str {
-        match self {
-            NavTarget::File(p) | NavTarget::Snapshot { path: p, .. } => p,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -359,10 +348,6 @@ pub struct PanelStates {
     pub search: crate::panels::search::State,
     pub related: crate::panels::related::State,
     pub backlinks: crate::panels::backlinks::State,
-    #[allow(dead_code)]
-    pub chat_dock: crate::panels::discovery_pane::ChatDockState,
-    pub clusters: ClusterUiState,
-    pub trails_ui: TrailsUiState,
     /// Per-board-tab UI state (View-as toggle, inline-rename drafts,
     /// pending column-delete confirm). Keyed by tab id.
     pub boards: HashMap<TabId, crate::panels::board::Pane>,
@@ -371,6 +356,14 @@ pub struct PanelStates {
     pub home: crate::panels::home::State,
     /// Sync page local UI state — the per-fork "view diff" cache. [sync-fork-diff]
     pub sync: crate::panels::sync::State,
+    /// Wikilink hover-preview lifecycle (timer + cached body + scroll).
+    /// One instance is enough — at most one preview card is up at a time
+    /// across all buffer panes. [wikilink-hover-preview]
+    pub wikilink_hover: crate::panels::buffer::wikilink_nav::HoverState,
+    /// Vault-view (logical-lens sidebar mode) state — chosen lens +
+    /// collapsed groups. Read-only lens; nothing persisted on notes.
+    /// status: vault-view-mode
+    pub vault_view: crate::vault_view::State,
 }
 
 // ===========================================================================
@@ -506,6 +499,31 @@ pub fn nav_push(state: &mut AppState, path: &str) {
     state.session.nav.push(NavTarget::File(path.to_string()));
 }
 
+/// Activate the tab with `id`, recording a nav-history entry when it carries a
+/// buffer path that differs from the currently-active tab's (and we're not
+/// mid back/forward, which sets `nav.locked`). Every tab-activation path — the
+/// tab-strip click (reconciled in `main`), Ctrl-Tab cycling, and Ctrl-digit
+/// jump — routes through here so switching tabs counts for navigation history
+/// uniformly: Back from a switched-to tab returns to the one you left.
+pub fn activate_tab(state: &mut AppState, id: TabId) {
+    let prev_path = state
+        .session
+        .active_tab
+        .and_then(|p| state.tab_by_id(p))
+        .and_then(super::tab::Tab::buffer_path)
+        .map(str::to_string);
+    state.session.active_tab = Some(id);
+    if state.session.nav.locked {
+        return;
+    }
+    let next_path = state.tab_by_id(id).and_then(super::tab::Tab::buffer_path).map(str::to_string);
+    if let Some(p) = next_path
+        && prev_path.as_deref() != Some(p.as_str())
+    {
+        nav_push(state, &p);
+    }
+}
+
 pub fn nav_can_back(state: &AppState) -> bool {
     state.session.nav.can_back()
 }
@@ -555,15 +573,6 @@ pub fn trail_append_waypoint(state: &mut AppState, path: &str) {
         let drop = trail.waypoints.len() - TRAILS_MAX;
         trail.waypoints.drain(0..drop);
     }
-}
-
-#[derive(Debug, Default)]
-pub struct TrailsUiState {
-    pub expanded_path: Option<String>,
-    pub expand_all: bool,
-    pub side_trail_collapsed: HashSet<String>,
-    pub annotation_edit: Option<(String, String)>,
-    pub all_trails_picker_open: bool,
 }
 
 pub fn find_waypoint_mut<'a>(
@@ -734,69 +743,8 @@ pub fn move_waypoint(&mut self, src: &str, op: MoveOp) -> bool {
 }
 
 #[cfg(test)]
-mod move_tests {
-    use super::*;
-    fn wp(path: &str, children: Vec<Waypoint>) -> Waypoint {
-        Waypoint { path: path.into(), at_ms: 0, children, annotation: String::new() }
-    }
-    fn tr(waypoints: Vec<Waypoint>) -> Trail {
-        Trail {
-            id: "t".into(),
-            name: "t".into(),
-            waypoints,
-            created_at_ms: 0,
-            last_activated_at_ms: 0,
-            append_under: None,
-        }
-    }
-    #[test]
-    fn move_to_tail_reorders_root() {
-        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
-        assert!(t.move_waypoint("a", MoveOp::Tail));
-        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
-    }
-    #[test]
-    fn move_before_inserts_at_root() {
-        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
-        assert!(t.move_waypoint("c", MoveOp::Before("a".into())));
-        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["c", "a", "b"]);
-    }
-    #[test]
-    fn move_as_child_nests() {
-        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![])]);
-        assert!(t.move_waypoint("b", MoveOp::Child("a".into())));
-        assert_eq!(t.waypoints.len(), 1);
-        assert_eq!(t.waypoints[0].path, "a");
-        assert_eq!(t.waypoints[0].children[0].path, "b");
-    }
-    #[test]
-    fn move_after_inserts_following_target_at_root() {
-        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
-        assert!(t.move_waypoint("a", MoveOp::After("b".into())));
-        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "a", "c"]);
-    }
-    #[test]
-    fn move_after_last_appends_to_tail() {
-        let mut t = tr(vec![wp("a", vec![]), wp("b", vec![]), wp("c", vec![])]);
-        assert!(t.move_waypoint("a", MoveOp::After("c".into())));
-        assert_eq!(t.waypoints.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
-    }
-    #[test]
-    fn move_after_nested_target_stays_in_parent_list() {
-        let mut t = tr(vec![wp("a", vec![wp("a1", vec![]), wp("a2", vec![])]), wp("b", vec![])]);
-        assert!(t.move_waypoint("b", MoveOp::After("a1".into())));
-        let children = t.waypoints[0].children.iter().map(|w| w.path.as_str()).collect::<Vec<_>>();
-        assert_eq!(children, vec!["a1", "b", "a2"]);
-    }
-    #[test]
-    fn cycle_drop_into_own_subtree_rejected() {
-        let mut t = tr(vec![wp("a", vec![wp("a1", vec![])])]);
-        assert!(!t.move_waypoint("a", MoveOp::Child("a1".into())));
-        // Untouched.
-        assert_eq!(t.waypoints[0].path, "a");
-        assert_eq!(t.waypoints[0].children[0].path, "a1");
-    }
-}
+#[path = "state_move_tests.rs"]
+mod move_tests;
 
 // ===========================================================================
 // UiState — window-level UI
@@ -827,6 +775,48 @@ pub struct UiState {
     pub chat_input_id: Option<eframe::egui::Id>,
     /// egui id of the discovery search box's text field; see `chat_input_id`.
     pub search_input_id: Option<eframe::egui::Id>,
+    /// Fingerprint of the (system, editor, code) font triple last installed
+    /// onto the egui context. `None` means "nothing installed yet". Used by
+    /// the per-frame `install_user_fonts` re-application so flipping a font
+    /// in settings takes effect immediately without a restart. Stored as the
+    /// concatenation `"system\0editor\0code"` for a cheap equality compare.
+    pub last_fonts_fp: Option<String>,
+    /// Latched "we hid the workbench chrome for reader view" state. The
+    /// main update loop reads this to decide whether to drive the hide
+    /// or restore edge, so the user's independent collapse / expand
+    /// choices outside reader view aren't trampled every frame.
+    pub reader_view_chrome_hidden: bool,
+    pub reader_view_prev_primary_visible: bool,
+    pub reader_view_prev_secondary_visible: bool,
+    pub reader_view_prev_status_visible: bool,
+    pub reader_view_prev_activity_visible: bool,
+    /// Per-session MRU of command-palette action ids — most-recently
+    /// invoked first. Floats recent picks above their fuzzy-match rank
+    /// per `command-palette`'s recency rule. In-memory only.
+    pub palette_mru: Vec<String>,
+}
+
+/// True when the active tab is an editor with `reader_view = true`. Used
+/// by the main update loop to flip the host-level chrome. Non-buffer
+/// tab kinds always report `false` so reader view is meaningless there
+/// (per `editor-reader-view`'s scope rule).
+pub fn active_buffer_reader_view(state: &AppState) -> bool {
+    let Some(id) = state.session.active_tab else {
+        return false;
+    };
+    let Some(tab) = state.tab_by_id(id) else {
+        return false;
+    };
+    let crate::tab::TabKind::Editor { buffer, .. } = &tab.kind else {
+        return false;
+    };
+    let key = crate::buffer::buffer_key_for_source(buffer);
+    state
+        .session
+        .buffers
+        .get(&key)
+        .map(|b| b.reader_view)
+        .unwrap_or(false)
 }
 
 // ===========================================================================
@@ -885,11 +875,11 @@ impl Default for Toolbars {
 }
 
 // ===========================================================================
-// SidebarState
+// FileTreeState
 // ===========================================================================
 
 #[derive(Default)]
-pub struct SidebarState {
+pub struct FileTreeState {
     pub expanded: HashSet<String>,
     pub dir_cache: HashMap<String, Vec<hiker_core::vault::DirEntryDto>>,
     pub selected_folder: Option<String>,
@@ -897,74 +887,6 @@ pub struct SidebarState {
     pub renaming: Option<String>,
     pub renaming_text: String,
     pub scroll_target: Option<String>,
-}
-
-// ===========================================================================
-// ClusterUiState
-// ===========================================================================
-
-/// Outcome posted by a background LLM-naming task. `(succeeded, failed)`.
-pub type LlmJobOutcome = (usize, usize);
-
-#[derive(Default)]
-pub struct ClusterUiState {
-    pub trees: Vec<hiker_core::trees::types::TreeRow>,
-    pub selected_tree: Option<String>,
-    pub nodes: Vec<hiker_core::trees::types::EditableNode>,
-    pub expanded: HashSet<String>,
-    pub renaming: Option<(String, String)>,
-    pub editing_summary: Option<(String, String)>,
-    pub editing_tag_policy: Option<(String, String, bool)>,
-    pub editing_move_policy: Option<(String, String, bool)>,
-    pub selected_nodes: HashSet<String>,
-    pub editing_stage_move_target: Option<String>,
-    pub editing_stage_tag_slug: Option<String>,
-    pub redo_stacks: HashMap<String, Vec<hiker_core::trees::types::HistoryEntry>>,
-    pub showing_advanced_params: bool,
-    pub advanced_params: AdvancedClusterParams,
-    pub dirty: bool,
-    pub loaded: bool,
-    pub review_panes: HashMap<TabId, crate::panels::cluster_review::ReviewPane>,
-    /// True while a background LLM naming run (regenerate / summarize
-    /// subset) is in flight. Gates the "Regenerate names" /
-    /// "Summarize subset" buttons so the user can't double-fire.
-    pub llm_job_in_flight: bool,
-    /// Result channel for the in-flight naming task. The UI loop polls
-    /// each frame; on completion we surface a toast and clear the gate.
-    pub llm_job_rx: Option<oneshot::Receiver<LlmJobOutcome>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AdvancedClusterParams {
-    pub min_cluster_size: usize,
-    pub min_samples: usize,
-    pub k_nearest: usize,
-    pub edge_weight_floor: f32,
-    pub iterations: u32,
-    pub resolution: f32,
-    pub use_leiden: bool,
-    pub outlier_threshold: f32,
-    pub include_outliers: bool,
-    pub summary_confidence_threshold: f32,
-    pub disable_recursion: bool,
-}
-
-impl Default for AdvancedClusterParams {
-    fn default() -> Self {
-        Self {
-            min_cluster_size: 5,
-            min_samples: 2,
-            k_nearest: 15,
-            edge_weight_floor: 0.0,
-            iterations: 100,
-            resolution: 1.0,
-            use_leiden: false,
-            outlier_threshold: 0.5,
-            include_outliers: true,
-            summary_confidence_threshold: 0.5,
-            disable_recursion: false,
-        }
-    }
 }
 
 // ===========================================================================
@@ -1017,9 +939,6 @@ pub enum Modal {
         path: String,
         tab_id: TabId,
     },
-    Recovery {
-        entries: Vec<hiker_core::autosave::RecoveredEntry>,
-    },
     ConfirmDelete {
         path: String,
     },
@@ -1027,34 +946,12 @@ pub enum Modal {
         path: String,
         in_buffer_text: String,
     },
-    /// A stored double-link reference whose recorded path now points at a
-    /// note with a different ULID than the one recorded (the core's
-    /// `ResolutionOutcome::PathConflict`). Offers Keep mine / Repoint /
-    /// Break. Reusable across reference surfaces (boards, trails) via the
-    /// `target` discriminator. status: trail-path-conflict-modal
-    PathConflict {
-        /// The recorded path that now resolves to a different identity.
-        path: String,
-        /// The ULID the reference recorded.
-        recorded_id: String,
-        /// The ULID the note currently at `path` carries.
-        current_path_id: String,
-        /// Which reference surface + entry the resolution applies to.
-        target: PathConflictTarget,
-    },
-}
-
-/// Identifies the concrete reference whose `PathConflict` the modal resolves.
-/// One variant per reference surface so the single modal serves boards and
-/// (when its app-side waypoint model carries a ULID) trails alike.
-///
-/// status: trail-path-conflict-modal
-#[derive(Clone)]
-pub enum PathConflictTarget {
-    /// A board card: identified by its board-doc path + card id. "Repoint"
-    /// rewrites the card's stored path to the note now at `path`; "Break"
-    /// removes the card. status: board-card-references
-    BoardCard { board_rel: String, card_id: String },
+    // `Modal::PathConflict` retired with `trail-path-conflict-modal`
+    // under path-as-identity (`wikilink-path-form`): there's no ULID
+    // half left to disagree with a recorded path, so the Keep mine /
+    // Repoint / Break modal has no analogue. An unresolved reference is
+    // simply an orphan; the user removes it via the per-card / per-
+    // waypoint verbs.
 }
 
 /// Concrete confirm intents driving `Modal::Confirm`. New flows add a

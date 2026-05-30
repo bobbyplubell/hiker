@@ -19,7 +19,8 @@ use hiker_core::oplog::shapes::Author;
 use hiker_core::oplog::OpLog;
 use hiker_sync::config::Settings;
 use hiker_sync::crypto::{blind_id, ContentKey, DeviceKeypair, SharedContentKey};
-use hiker_sync::identity::{LocalDocId, LogicalId};
+// Path is the cross-device identity (sync-path-identity); no LogicalId is
+// negotiated — both clients reach the same doc via its vault-relative path.
 use hiker_sync::server::{BlobStore, FileBlobStore, Hub};
 use hiker_sync::transport::{EnrolledPeers, SyncNode};
 
@@ -33,7 +34,6 @@ fn open_vault() -> (tempfile::TempDir, Arc<OpLog>) {
 async fn server_relays_ciphertext_and_b_converges() {
     // One shared vault content key for both clients (the server never sees it).
     let content_key = ContentKey::generate();
-    let logical = LogicalId(ulid::Ulid::new().to_string());
     let doc_path = "notes/shared.md";
 
     // Device keypairs + fingerprints.
@@ -72,7 +72,6 @@ async fn server_relays_ciphertext_and_b_converges() {
         EnrolledPeers::new(),
     );
     node_a.enroll_peer(fp_server.clone()).unwrap();
-    node_a.bind_for_test(LocalDocId(doc_a.clone()), logical.clone());
 
     // --- Client B: a separate vault that already shares A's lineage. ---
     // The shared lineage stands in for a prior P2P bind/adopt; the server path
@@ -98,7 +97,6 @@ async fn server_relays_ciphertext_and_b_converges() {
         EnrolledPeers::new(),
     );
     node_b.enroll_peer(fp_server.clone()).unwrap();
-    node_b.bind_for_test(LocalDocId(doc_b.clone()), logical.clone());
 
     // A makes a new offline edit B has never seen.
     oplog_a
@@ -114,14 +112,14 @@ async fn server_relays_ciphertext_and_b_converges() {
     // A pushes its state to the hub (and pulls its own back, a no-op merge).
     let report_a = node_a.sync_via_server(&server_addr).await.unwrap();
     assert!(
-        report_a.bound.contains(&logical),
+        report_a.bound.iter().any(|p| p == doc_path),
         "A pushed the bound doc: {report_a:?}"
     );
 
     // B pulls everything past its cursor, decrypts, and converges.
     let report_b = node_b.sync_via_server(&server_addr).await.unwrap();
     assert!(
-        report_b.converged.contains(&logical),
+        report_b.converged.iter().any(|p| p == doc_path),
         "B converged via the relay: {report_b:?}"
     );
 
@@ -133,7 +131,7 @@ async fn server_relays_ciphertext_and_b_converges() {
     // --- Zero-knowledge: the stored bytes are ciphertext, not plaintext. ---
     // Re-open the hub's on-disk store and read what it actually persisted.
     let store = FileBlobStore::open(&server_data).unwrap();
-    let blind = blind_id(&content_key, &logical.0);
+    let blind = blind_id(&content_key, doc_path);
     let stored = store.pull(&blind, 0);
     assert!(!stored.is_empty(), "the hub stored A's pushed blob(s)");
 
@@ -172,7 +170,6 @@ async fn server_relays_ciphertext_and_b_converges() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_idempotent_repull_does_not_double() {
     let content_key = ContentKey::generate();
-    let logical = LogicalId(ulid::Ulid::new().to_string());
     let doc_path = "notes/relay-idem.md";
 
     let kp_server = DeviceKeypair::generate();
@@ -199,7 +196,6 @@ async fn server_idempotent_repull_does_not_double() {
         EnrolledPeers::new(),
     );
     node_a.enroll_peer(fp_server.clone()).unwrap();
-    node_a.bind_for_test(LocalDocId(doc_a.clone()), logical.clone());
 
     // Client B: shares A's lineage (prior P2P bind/adopt stand-in).
     let (_dir_b, oplog_b) = open_vault();
@@ -213,7 +209,6 @@ async fn server_idempotent_repull_does_not_double() {
         EnrolledPeers::new(),
     );
     node_b.enroll_peer(fp_server.clone()).unwrap();
-    node_b.bind_for_test(LocalDocId(doc_b.clone()), logical.clone());
 
     // A makes an offline edit, pushes it.
     oplog_a.apply_user_text(&doc_a, "seed line\nDUPE-MARKER body\nthird relayed\n").unwrap();
@@ -223,7 +218,7 @@ async fn server_idempotent_repull_does_not_double() {
 
     node_a.sync_via_server(&server_addr).await.unwrap();
     let rb = node_b.sync_via_server(&server_addr).await.unwrap();
-    assert!(rb.converged.contains(&logical), "B converged via the relay: {rb:?}");
+    assert!(rb.converged.iter().any(|p| p == doc_path), "B converged via the relay: {rb:?}");
     let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
     assert_eq!(got_b, expected, "B materialized A's relayed content exactly");
     assert_eq!(got_b.matches("DUPE-MARKER").count(), 1, "marker once after first pull: {got_b:?}");
@@ -257,7 +252,6 @@ async fn server_idempotent_repull_does_not_double() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_unbound_doc_is_not_interleaved() {
     let content_key = ContentKey::generate();
-    let logical_shared = LogicalId(ulid::Ulid::new().to_string());
 
     let kp_server = DeviceKeypair::generate();
     let kp_a = DeviceKeypair::generate();
@@ -282,7 +276,7 @@ async fn server_unbound_doc_is_not_interleaved() {
         EnrolledPeers::new(),
     );
     node_a.enroll_peer(fp_server.clone()).unwrap();
-    node_a.bind_for_test(LocalDocId(doc_a.clone()), logical_shared.clone());
+    let _ = doc_a;
 
     // B has a DIFFERENT doc that is NOT bound to `logical_shared` (no shared
     // lineage with A's doc). Its own content must be preserved.
@@ -297,20 +291,117 @@ async fn server_unbound_doc_is_not_interleaved() {
         EnrolledPeers::new(),
     );
     node_b.enroll_peer(fp_server.clone()).unwrap();
-    // B does NOT bind its doc to logical_shared. (It's unbound for sync.)
+    // B holds its OWN doc at a different path; A's doc lives at a different
+    // path, so the two derive disjoint blind_ids and never share a blob stream.
+    // (Per sync-path-identity, the path IS the cross-device key.)
 
     let serve = tokio::spawn(async move { server.run(Duration::from_secs(15)).await.unwrap() });
 
     node_a.sync_via_server(&server_addr).await.unwrap();
-    // B syncs: it has no bound docs, so it pulls nothing for the foreign blob.
+    // B syncs its OWN doc only; it pulls nothing under A's blind_id because
+    // their paths differ.
     let rb = node_b.sync_via_server(&server_addr).await.unwrap();
-    assert!(rb.converged.is_empty(), "B converged nothing (no bound doc): {rb:?}");
-    assert!(rb.bound.is_empty(), "B pushed nothing (no bound doc): {rb:?}");
+    assert!(
+        !rb.converged.iter().any(|p| p == "notes/a-shared.md"),
+        "B never converged A's foreign path: {rb:?}"
+    );
+    assert!(
+        !rb.bound.iter().any(|p| p == "notes/a-shared.md"),
+        "B never pushed A's foreign path: {rb:?}"
+    );
 
     serve.abort();
 
     // B's own doc is untouched — A's secret never interleaved into it.
     let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
-    assert_eq!(got_b, own, "B's unbound doc keeps its own content exactly: {got_b:?}");
-    assert!(!got_b.contains("SHARED secret"), "A's content did not leak into B's unbound doc");
+    assert_eq!(got_b, own, "B's own doc keeps its own content exactly: {got_b:?}");
+    assert!(!got_b.contains("SHARED secret"), "A's content did not leak into B's own doc");
 }
+
+// --- Server-side blob GC after rename ------------------------------------------
+
+/// `sync-rename-blob-rotation`: when a rename op flows through the relay, the
+/// receiving device sends a `DeleteBlob` for the old blind_id so the hub GCs
+/// the orphan stream and resets its per-device cursors against it. A subsequent
+/// re-push of an unrelated blob under the OLD blind_id is still possible (the
+/// store is content-agnostic), but the receiver's pull cursor against that id
+/// is now at 0, so a redundant blob arrives as fresh — proving the cursor was
+/// indeed cleared.
+///
+/// Test shape: simulate the receiver's GC kick by calling
+/// `BlobStore::delete(old_blind)` directly on the hub's on-disk store
+/// (deterministic; no need to drive the live rename merge through libp2p just
+/// to assert the side effect). This is the exact API path the production
+/// `Message::DeleteBlob` handler uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_blob_drops_stream_and_cursor() {
+    let content_key = ContentKey::generate();
+    let server_dir = tempfile::tempdir().unwrap();
+
+    // Seed two blobs under the OLD blind_id (the rename source) and one under
+    // the NEW blind_id (the rename target), plus a per-device cursor against
+    // the OLD blind_id.
+    let old_path = "notes/old-name.md";
+    let new_path = "notes/new-name.md";
+    let blind_old = blind_id(&content_key, old_path);
+    let blind_new = blind_id(&content_key, new_path);
+    {
+        let mut store = FileBlobStore::open(server_dir.path()).unwrap();
+        store.push(&blind_old, 1, content_key.encrypt(b"old-1"));
+        store.push(&blind_old, 2, content_key.encrypt(b"old-2"));
+        store.push(&blind_new, 1, content_key.encrypt(b"new-1"));
+        store.set_device_cursor("DEV-A", &blind_old, 2).unwrap();
+        store.set_device_cursor("DEV-A", &blind_new, 1).unwrap();
+        store.set_device_cursor("DEV-B", &blind_old, 1).unwrap();
+    }
+
+    // GC: the receiver's `Message::DeleteBlob` handler routes to this method.
+    {
+        let mut store = FileBlobStore::open(server_dir.path()).unwrap();
+        store.delete(&blind_old);
+    }
+
+    // Reload and verify the OLD stream is gone, the NEW stream is intact, AND
+    // every device's cursor against the OLD blind_id is cleared. Cursors
+    // against unrelated blind_ids stay put.
+    let store = FileBlobStore::open(server_dir.path()).unwrap();
+    assert!(
+        store.pull(&blind_old, 0).is_empty(),
+        "old blind_id stream GC'd"
+    );
+    assert_eq!(store.latest_seq(&blind_old), None, "old blind_id has no head");
+    let new_blobs = store.pull(&blind_new, 0);
+    assert_eq!(new_blobs.len(), 1, "new blind_id stream untouched");
+    assert_eq!(new_blobs[0].0, 1);
+
+    assert_eq!(
+        store.device_cursor("DEV-A", &blind_old),
+        None,
+        "DEV-A's cursor against OLD blind_id cleared"
+    );
+    assert_eq!(
+        store.device_cursor("DEV-B", &blind_old),
+        None,
+        "DEV-B's cursor against OLD blind_id cleared"
+    );
+    assert_eq!(
+        store.device_cursor("DEV-A", &blind_new),
+        Some(1),
+        "DEV-A's cursor against NEW blind_id preserved"
+    );
+
+    // Idempotent: a repeat GC is a successful no-op.
+    {
+        let mut store = FileBlobStore::open(server_dir.path()).unwrap();
+        store.delete(&blind_old);
+        store.delete("never-existed-blind-id");
+    }
+    let _ = (old_path, new_path);
+}
+
+// The wire-level handler for `Message::DeleteBlob` is exercised indirectly:
+// the receiver-side rename-rotation kick lives in `apply_delta_from_peer`
+// (`hiker-sync/src/transport/lineage.rs`) and routes through the `Hub`'s
+// request handler to `BlobStore::delete`, which the test above asserts
+// against. Protocol serde round-trip for `DeleteBlob`/`DeleteBlobAck` is
+// covered in `protocol::tests::message_round_trips`.

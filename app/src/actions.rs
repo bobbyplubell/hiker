@@ -29,7 +29,6 @@ pub enum ActionCategory {
     Chat,
     Palette,
     Panel,
-    Layout,
 }
 
 impl ActionCategory {
@@ -42,7 +41,6 @@ impl ActionCategory {
             ActionCategory::Chat => "Chat",
             ActionCategory::Palette => "Palette",
             ActionCategory::Panel => "Panel",
-            ActionCategory::Layout => "Layout",
         }
     }
 }
@@ -367,7 +365,7 @@ static A_FILE_CLOSE_TAB: Action = Action {
     enabled: Some(|s| s.session.active_tab.is_some()),
     run: |s| {
         if let Some(id) = s.session.active_tab {
-            crate::tabs::close_tab_with_dirty_guard(s, id);
+            crate::editor_pane::close_tab_with_dirty_guard(s, id);
         }
     },
     category: ActionCategory::File,
@@ -389,72 +387,44 @@ static A_PALETTE_OPEN: Action = Action {
 
 // ---- Panel toggles ------------------------------------------------------
 
+/// Toggle a registered side-bar panel via the workbench. For a panel
+/// that maps to an activity-bar mode (Files/Clusters/Trails/Search/
+/// Related/Backlinks/Vault/Trash) this collapses the primary side bar
+/// when that mode is already showing, and otherwise selects the mode +
+/// shows the bar. `PANEL_CHAT` lives in the secondary side bar, so its
+/// toggle flips that bar's visibility.
 fn toggle_panel(state: &mut AppState, panel_id: &'static str) {
-    if let Some(tile_id) = crate::layout::find_panel_tile(&state.session.dock, panel_id) {
-        state.session.dock.remove_recursively(tile_id);
-        state.session.dock_dirty = true;
+    if panel_id == crate::panels_registry::PANEL_CHAT {
+        state.workbench.secondary_side_bar.toggle();
         return;
     }
-    ensure_panel_visible(state, panel_id);
+    let Some(mode) = crate::workbench_host::HikerMode::from_panel_id(panel_id) else {
+        return;
+    };
+    let already_showing = state.workbench.primary_side_bar.visible
+        && state.workbench.activity_bar.active() == Some(&mode);
+    if already_showing {
+        state.workbench.primary_side_bar.visible = false;
+    } else {
+        state.workbench.activity_bar.set_active(Some(mode));
+        state.workbench.primary_side_bar.visible = true;
+    }
 }
 
-/// Insert `panel_id` into the dock if it's not already present, then
-/// activate its tab. Re-inserts at the panel's last-known TileId if we
-/// remember a still-valid one; otherwise falls back to the panel's
-/// default side.
+/// Reveal a registered side-bar panel via the workbench: select its
+/// activity-bar mode and show the primary side bar (or show the
+/// secondary side bar for `PANEL_CHAT`). Used by callers that want a
+/// specific panel visible after an action (e.g. reveal-in-files,
+/// activate-trail, new-chat).
 pub fn ensure_panel_visible(state: &mut AppState, panel_id: &'static str) {
-    use crate::tab::DockTab;
-    use egui_tiles::{Container, Tile};
-    if let Some(tile_id) = crate::layout::find_panel_tile(&state.session.dock, panel_id) {
-        // Already in the dock; activate it by making its ancestor tabs
-        // container show this pane.
-        state
-            .session
-            .dock
-            .make_active(|id, _tile| id == tile_id);
+    if panel_id == crate::panels_registry::PANEL_CHAT {
+        state.workbench.secondary_side_bar.visible = true;
         return;
     }
-
-    // Look up the panel's default side so we know where it wants to go
-    // if we don't remember anything.
-    let reg = crate::panels_registry::PanelRegistry::all();
-    let default_side = reg.by_id(panel_id).map(|p| p.default_side);
-
-    // Prefer the last-known container if it still exists and is Tabs.
-    let target = state
-        .session
-        .panel_locations
-        .get(panel_id)
-        .copied()
-        .filter(|tid| {
-            matches!(
-                state.session.dock.tiles.get(*tid),
-                Some(Tile::Container(Container::Tabs(_)))
-            )
-        })
-        .unwrap_or(match default_side {
-            Some(crate::panels_registry::PanelSide::Left) => state.session.left_tile,
-            Some(crate::panels_registry::PanelSide::Right) => state.session.right_tile,
-            _ => state.session.center_tile,
-        });
-
-    let pane_id = state
-        .session
-        .dock
-        .tiles
-        .insert_pane(DockTab::panel(panel_id));
-    if let Some(Tile::Container(Container::Tabs(tabs))) =
-        state.session.dock.tiles.get_mut(target)
-    {
-        tabs.add_child(pane_id);
-        tabs.set_active(pane_id);
-    } else {
-        // Target container is gone; drop the pane (don't leak it) and
-        // fall through silently. The next reconcile cycle won't see it.
-        state.session.dock.tiles.remove(pane_id);
-        return;
+    if let Some(mode) = crate::workbench_host::HikerMode::from_panel_id(panel_id) {
+        state.workbench.activity_bar.set_active(Some(mode));
+        state.workbench.primary_side_bar.visible = true;
     }
-    state.session.dock_dirty = true;
 }
 
 static A_PANEL_TOGGLE_FILES: Action = Action {
@@ -521,142 +491,6 @@ static A_PANEL_TOGGLE_CHAT: Action = Action {
     category: ActionCategory::Panel,
 };
 
-// ---- Layout actions -----------------------------------------------------
-
-fn current_bundle(state: &AppState) -> crate::layout::DockBundle {
-    crate::layout::DockBundle {
-        tree: state.session.dock.clone(),
-        center_tile: state.session.center_tile,
-        left_tile: state.session.left_tile,
-        right_tile: state.session.right_tile,
-    }
-}
-
-fn apply_bundle(state: &mut AppState, bundle: crate::layout::DockBundle) {
-    state.session.dock = bundle.tree;
-    state.session.center_tile = bundle.center_tile;
-    state.session.left_tile = bundle.left_tile;
-    state.session.right_tile = bundle.right_tile;
-    state.session.dock_dirty = true;
-}
-
-static A_LAYOUT_SAVE_AS: Action = Action {
-    id: "layout.save_as",
-    icon: icons::Icon::Check,
-    label: "Save layout as...",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Save layout profile")
-            .set_directory(crate::layout::user_profiles_dir())
-            .set_file_name("my-layout.json")
-            .add_filter("Layout JSON", &["json"])
-            .save_file()
-        else {
-            return;
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("layout")
-            .to_string();
-        let bundle = current_bundle(state);
-        match bundle.save_profile(&stem) {
-            Ok(p) => state.push_toast(
-                format!("Layout saved as {}", p.display()),
-                ToastLevel::Info,
-            ),
-            Err(err) => state.push_toast(
-                format!("Save layout failed: {err}"),
-                ToastLevel::Error,
-            ),
-        }
-    },
-    category: ActionCategory::Layout,
-};
-static A_LAYOUT_APPLY: Action = Action {
-    id: "layout.apply",
-    icon: icons::Icon::Folder,
-    label: "Apply layout...",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Apply layout profile")
-            .set_directory(crate::layout::user_profiles_dir())
-            .add_filter("Layout JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("layout")
-            .to_string();
-        let path = crate::layout::user_profiles_dir().join(format!("{stem}.json"));
-        match crate::layout::read_layout_at(&path).map(crate::layout::finalize_loaded) {
-            Some(bundle) => {
-                apply_bundle(state, bundle);
-                state.push_toast(
-                    format!("Layout '{stem}' applied"),
-                    ToastLevel::Info,
-                );
-            }
-            None => state.push_toast(
-                format!("Layout '{stem}' not found"),
-                ToastLevel::Error,
-            ),
-        }
-    },
-    category: ActionCategory::Layout,
-};
-static A_LAYOUT_SET_AS_DEFAULT: Action = Action {
-    id: "layout.set_as_default",
-    icon: icons::Icon::Check,
-    label: "Set current layout as default",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let bundle = current_bundle(state);
-        match bundle.save_user_default() {
-            Ok(()) => state.push_toast("Current layout saved as default", ToastLevel::Info),
-            Err(err) => state.push_toast(
-                format!("Set default failed: {err}"),
-                ToastLevel::Error,
-            ),
-        }
-    },
-    category: ActionCategory::Layout,
-};
-static A_LAYOUT_RESET_TO_DEFAULT: Action = Action {
-    id: "layout.reset_to_default",
-    icon: icons::Icon::Restore,
-    label: "Reset layout to default",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let bundle = crate::layout::load_for_vault(&state.vault_session.vault_root);
-        apply_bundle(state, bundle);
-        state.push_toast("Layout reset to default", ToastLevel::Info);
-    },
-    category: ActionCategory::Layout,
-};
-static A_LAYOUT_RESET_FACTORY: Action = Action {
-    id: "layout.reset_factory",
-    icon: icons::Icon::Restore,
-    label: "Reset layout to factory",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let bundle = crate::layout::default_dock();
-        apply_bundle(state, bundle);
-        state.push_toast("Layout reset to factory default", ToastLevel::Info);
-    },
-    category: ActionCategory::Layout,
-};
-
 static ALL: &[&Action] = &[
     &A_NAV_BACK,
     &A_NAV_FORWARD,
@@ -677,11 +511,6 @@ static ALL: &[&Action] = &[
     &A_PANEL_TOGGLE_RELATED,
     &A_PANEL_TOGGLE_BACKLINKS,
     &A_PANEL_TOGGLE_CHAT,
-    &A_LAYOUT_SAVE_AS,
-    &A_LAYOUT_APPLY,
-    &A_LAYOUT_SET_AS_DEFAULT,
-    &A_LAYOUT_RESET_TO_DEFAULT,
-    &A_LAYOUT_RESET_FACTORY,
     &A_VIEW_TOGGLE_HELP,
     &A_VIEW_TOGGLE_PROFILER,
     &A_VIEW_TOGGLE_LEFT_SIDEBAR,

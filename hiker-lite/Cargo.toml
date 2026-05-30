@@ -1,0 +1,48 @@
+[package]
+name = "hiker-lite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "A lightweight Notepad++-style text editor built on the standalone editor stack."
+
+[[bin]]
+name = "hiker-lite"
+path = "src/main.rs"
+
+[dependencies]
+# Editor stack only.
+editor-core.workspace = true
+editor-view.workspace = true
+editor-egui.workspace = true
+# `editor-md` for markdown decorations — fenced-code syntax highlighting
+# (every shipped tree-sitter grammar), heading/emphasis/list styling, the
+# live-preview fade behaviour. Active for `.md` / `.markdown` buffers.
+editor-md.workspace = true
+
+# UI shell.
+egui.workspace = true
+eframe.workspace = true
+egui_workbench.workspace = true
+egui_extras.workspace = true
+
+# Async / Vfs.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+async-trait.workspace = true
+
+# Native-only deps. Gated by cfg in code; Cargo still resolves them on
+# non-wasm targets which is fine — Phase 2 will add `target.'cfg(...)'.dependencies`
+# entries for the wasm side.
+rfd.workspace = true
+walkdir.workspace = true
+
+# Misc.
+anyhow.workspace = true
+tracing.workspace = true
+
+# Fuzzy filename search. Direct dep — no workspace-wide consumer yet.
+nucleo-matcher = "0.3"
+
+[lints]
+workspace = true

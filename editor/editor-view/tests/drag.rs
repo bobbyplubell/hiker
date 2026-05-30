@@ -130,7 +130,7 @@ fn mouse_down_outside_selection_still_moves_caret() {
     let down = MouseEvent::Down { button: MouseButton::Left, x: x_for_col(&view, 2), y: 4.0, click_count: 1 };
     let act = handle_mouse_with_mods(&state, &mut view, &down, Modifiers::default());
     apply(act, &mut state);
-    assert!(matches!(view.drag, DragState::MaybeSelecting { anchor: 2 }));
+    assert!(matches!(view.drag, DragState::MaybeSelecting { lo: 2, hi: 2 }));
     let sel = state.selection.main();
     assert_eq!((sel.start(), sel.end()), (2, 2));
 }

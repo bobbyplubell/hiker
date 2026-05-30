@@ -177,6 +177,17 @@ pub struct PendingOp {
     pub created_at_ms: i64,
     /// Free-form producer metadata.
     pub metadata: serde_json::Value,
+    /// Op ids in the same session whose Yrs updates were folded into the
+    /// `base_doc` this op's update was produced against. Populated only when
+    /// `stage_pending` falls back to the session's pending view (the anchor
+    /// wasn't in bare `accepted`). Accepting this op while a predecessor is
+    /// still pending would land a drifted update that references positions
+    /// only present after the predecessor — `accept_pending` refuses with
+    /// [`Error::DependsOn`] in that case. Local-only: pending ops never sync.
+    ///
+    /// status: op-log-pending-queue
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// Returns `true` when the byte range `[start, end)` falls entirely inside

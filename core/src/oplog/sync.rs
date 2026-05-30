@@ -92,13 +92,38 @@ impl OpLog {
         let now = now_ms();
         self.locked(|inner| {
             let op_id = ulid::Ulid::new().to_string();
+            // Pre-flight collision check: apply the update to a CLONE of
+            // `accepted` so we can see the post-merge path WITHOUT mutating
+            // real state. If the rename would land on a path already owned by
+            // another doc, refuse — mirrors `accept_pending`'s pre-check
+            // (mod.rs ~line 650). Without this, `repoint_doc` would silently
+            // steal the path mapping from the existing doc and `write_md_file`
+            // would overwrite its `.md` on disk
+            // (bug-sync-remote-rename-overwrites-collision).
+            {
+                let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
+                let prev_path = doc::meta_string(&state.accepted, "path");
+                let preview = doc::clone_doc(&state.accepted);
+                doc::apply_update(&preview, doc_id, update)?;
+                let preview_path = doc::meta_string(&preview, "path");
+                if let Some(new_path) = preview_path
+                    && prev_path.as_deref() != Some(new_path.as_str())
+                    && meta::doc_id_for_path(&inner.index, &new_path)?
+                        .is_some_and(|other| other != doc_id)
+                {
+                    return Err(Error::Anchor(format!(
+                        "remote rename target already occupied: {new_path}"
+                    )));
+                }
+            }
             let (advanced, client_id, lo, hi, hash, rel_path, prev_path, materialized) = {
                 let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-                let cid = state.accepted.client_id();
-                // Capture the clock watermark and full SV before applying, so we
-                // can both record the op's clock range and (below) encode exactly
-                // the ops the update introduced for the `working` mirror.
-                let lo = doc::state_clock(&state.accepted, cid);
+                // Capture the full SV before applying so we can both record the
+                // peer's gained clock range (per-client SV diff — the local
+                // cid's clock never advances on a peer-authored update, so the
+                // recorded range must be the *peer's* cid + its actual advance)
+                // and (below) encode exactly the ops the update introduced for
+                // the `working` mirror.
                 let before_sv = doc::state_vector(&state.accepted);
                 // The path BEFORE the merge: a remote delta can carry a peer-side
                 // rename (a `meta.path` op on the shared lineage), so we compare
@@ -114,7 +139,10 @@ impl OpLog {
                 if after_sv == before_sv {
                     (false, 0, 0, 0, String::new(), None, None, doc::materialize(&state.accepted))
                 } else {
-                    let hi = doc::state_clock(&state.accepted, cid);
+                    // The dominant cid that advanced — fixes
+                    // `bug-sync-clock-range-records-local-cid`.
+                    let (client_id, lo, hi) = doc::dominant_advance(&before_sv, &after_sv)
+                        .expect("SV changed but no client advanced");
                     // Mirror the gained ops onto the user's uncommitted overlay
                     // (if any) so the editable buffer stays `accepted + working`.
                     // Best-effort: a drift simply doesn't contribute (the disk
@@ -134,7 +162,7 @@ impl OpLog {
                     )?;
                     (
                         true,
-                        cid.get() as i64,
+                        client_id,
                         lo,
                         hi,
                         content_hash(&materialized.text),
@@ -226,7 +254,12 @@ impl OpLog {
         // commit.
         let merged = self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let local_text = doc::materialize(&state.accepted).text;
+            // Mirror `materialize_working`: the user's effective local text is
+            // the working overlay if present, else accepted. Reading only
+            // accepted here would silently discard uncommitted typing — the
+            // working edits must flow into the three-way merge as `ours`.
+            let local_doc = state.working.as_ref().unwrap_or(&state.accepted);
+            let local_text = doc::materialize(local_doc).text;
             // The common ancestor: our lineage's first retained history frame is
             // a self-contained keyframe of the seed both devices started from.
             // Falling back to the local text means "no recoverable seed" → treat
@@ -291,8 +324,15 @@ impl OpLog {
             let adopted = doc::load_doc(doc_id, canonical_state)?;
             let materialized = doc::materialize(&adopted);
             let rel_path = doc::meta_string(&adopted, "path");
-            let cid = adopted.client_id();
-            let hi = doc::state_clock(&adopted, cid);
+            // The adopted lineage replaces local accepted wholesale, so the
+            // gained range is *everything* in canonical: per-client SV diff
+            // against an empty SV picks the dominant authoring cid (the peer
+            // who built this lineage), avoiding the
+            // `bug-sync-clock-range-records-local-cid` mistake of recording the
+            // local cid against a zero-width range.
+            let after_sv = doc::state_vector(&adopted);
+            let (cid, lo, hi) = doc::dominant_advance(&yrs::StateVector::default(), &after_sv)
+                .unwrap_or_else(|| (adopted.client_id().get() as i64, 0, 0));
             // Rewrite the `.yrs` base to the adopted lineage (atomic), clearing
             // the `.yrslog` so the abandoned lineage's deltas never replay.
             super::store::save_yrs(&self.oplog_dir, doc_id, &doc::encode_full(&adopted))?;
@@ -325,8 +365,8 @@ impl OpLog {
                 &MetadataInsert {
                     doc_id,
                     op_id: &op_id,
-                    yrs_client_id: cid.get() as i64,
-                    yrs_clock_lo: 0,
+                    yrs_client_id: cid,
+                    yrs_clock_lo: lo,
                     yrs_clock_hi: hi,
                     author: &Author::Sync(device_id.to_string()),
                     op_kind: &OpKind::Replace { anchor: None },

@@ -421,17 +421,11 @@ pub fn move_note(
     // alone is the whole operation. Any store error after a successful
     // rename gets a best-effort fs rollback so we don't leave the index and
     // disk disagreeing.
-    let id_lookup = store.id_for_path(from);
-    let id_opt = match id_lookup {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = fs::rename(&to_abs, &from_abs);
-            return Err(HikerError::Io(e.to_string()));
-        }
-    };
-    if let Some(id) = id_opt
-        && let Err(e) = store.rename_note(&id, to)
-    {
+    // status: store-id-from-oplog
+    // No `id_for_path` indirection — the indexer rename targets the row
+    // directly by its old path. Non-indexed `from` is a silent no-op
+    // (`rename_note_by_path` returns false).
+    if let Err(e) = store.rename_note_by_path(from, to) {
         let _ = fs::rename(&to_abs, &from_abs);
         return Err(HikerError::Io(e.to_string()));
     }
@@ -615,16 +609,8 @@ pub fn delete_note(
         }
         // Index cleanup. Non-indexed files (e.g. `.md` files we haven't
         // ingested yet, or non-md files) just have nothing to remove.
-        let id_opt = match store.id_for_path(rel) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = rollback_file(vault, trash, &entry);
-                return Err(HikerError::Io(e.to_string()));
-            }
-        };
-        if let Some(id) = id_opt
-            && let Err(e) = store.delete_note(&id)
-        {
+        // status: store-id-from-oplog
+        if let Err(e) = store.delete_note_by_path(rel) {
             let _ = rollback_file(vault, trash, &entry);
             return Err(HikerError::Io(e.to_string()));
         }
@@ -938,7 +924,7 @@ use crate::store::Store;
         assert!(!dir.path().join("a.md").exists());
         assert!(dir.path().join(".hiker/trash").join(&entry.trashed_name).exists());
         assert!(store.get_note_by_path("a.md").unwrap().is_none());
-        assert!(store.id_for_path("a.md").unwrap().is_none());
+        assert!(!store.note_exists("a.md").unwrap());
 
         let listed = trash.list().unwrap();
         assert_eq!(listed.len(), 1);

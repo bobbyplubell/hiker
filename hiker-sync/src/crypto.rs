@@ -11,8 +11,12 @@
 //!   authenticate the Noise channel. Its [`DeviceFingerprint`] is swapped out
 //!   of band to enroll. [sync-key-swap-enrollment]
 //!
-//! The server keys blobs by a **blind id** — `HMAC(content_key, logical_id)` —
-//! so it sees random-looking ids, never human paths. [sync-blind-id]
+//! The server keys blobs by a **blind id** — `HMAC(content_key, path)` —
+//! so it sees random-looking ids, never human paths. A rename rotates the
+//! blind id: the document's blob stream at the old blind id stops growing
+//! and a fresh stream opens at the new blind id (the receiving device GCs
+//! the old stream after applying the `Rename { from }` op).
+//! [sync-blind-id, sync-rename-blob-rotation]
 //!
 //! `aes-gcm` and `libp2p`'s identity types are confined to this module; the
 //! public surface returns plain `Vec<u8>` / `String` / fixed-array newtypes.
@@ -211,13 +215,23 @@ impl SharedContentKey {
     }
 }
 
-/// The server's per-document key: `hex(HMAC-SHA256(content_key, logical_id))`.
-/// Deterministic and key-dependent, so the server can group a document's blobs
-/// without ever learning the human path. [sync-blind-id]
-pub fn blind_id(key: &ContentKey, logical_id: &str) -> String {
+/// The server's per-document key: `hex(HMAC-SHA256(content_key, path))`.
+/// Deterministic and key-dependent, so the server can group a document's
+/// blobs without ever learning the human path. A rename rotates the blind
+/// id (the new path hashes to a fresh id) so the document's blob stream
+/// at the old blind id stops; the receiving device GCs the old stream
+/// after applying the `Rename { from }` op. [sync-blind-id]
+///
+/// The parameter is named `path` for the post-`sync-path-identity` world
+/// where vault-relative paths are the cross-device document identity; the
+/// function itself is a pure HMAC over any UTF-8 string, so callers that
+/// haven't migrated off the prior logical-id key still get the same
+/// determinism. A separate slug retires the negotiated-logical-id
+/// machinery in `identity.rs` / `transport.rs`.
+pub fn blind_id(key: &ContentKey, path: &str) -> String {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.0)
         .expect("HMAC-SHA256 accepts any key length");
-    mac.update(logical_id.as_bytes());
+    mac.update(path.as_bytes());
     let tag = mac.finalize().into_bytes();
     hex_encode(&tag)
 }
@@ -460,15 +474,21 @@ mod tests {
 
     #[test]
     fn blind_id_is_deterministic_and_key_dependent() {
-        let a = blind_id(&key_a(), "logical-123");
-        let a2 = blind_id(&key_a(), "logical-123");
-        assert_eq!(a, a2, "same key + id must be stable");
+        let a = blind_id(&key_a(), "notes/foo.md");
+        let a2 = blind_id(&key_a(), "notes/foo.md");
+        assert_eq!(a, a2, "same key + path must be stable");
 
-        let b = blind_id(&key_b(), "logical-123");
+        let b = blind_id(&key_b(), "notes/foo.md");
         assert_ne!(a, b, "different key must give different blind id");
 
-        let c = blind_id(&key_a(), "logical-456");
-        assert_ne!(a, c, "different logical id must give different blind id");
+        let c = blind_id(&key_a(), "notes/bar.md");
+        assert_ne!(a, c, "different path must give different blind id");
+
+        // A rename to a new path rotates the blind id — the cross-device
+        // identity now keys off path, so renaming a document opens a
+        // fresh blob stream on the server. [sync-rename-blob-rotation]
+        let renamed = blind_id(&key_a(), "archive/foo.md");
+        assert_ne!(a, renamed, "rename rotates blind_id off the old path");
 
         // hex of a 32-byte SHA-256 HMAC.
         assert_eq!(a.len(), 64);

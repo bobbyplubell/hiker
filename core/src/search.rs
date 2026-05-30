@@ -725,7 +725,9 @@ mod tests {
     #[test]
     fn fts5_excludes_skipped_notes() {
         let (_dir, mut store) = fresh_store();
-        store.upsert_skipped("big.md", "file too large", 1, 1).unwrap();
+        store
+            .upsert_skipped(&new_id(), "big.md", "file too large", 1, 1)
+            .unwrap();
 
         // Indexed counterpart so the test confirms the skipped one is the
         // only thing being filtered, not "everything is empty."

@@ -83,6 +83,71 @@ fn default_triage_scope() -> String {
     "inbox/".to_string()
 }
 
+/// `[inbox]` section. Declarative routing rules evaluated on filesystem
+/// `Created` events for indexable files (`.md` / `.txt`). Each rule matches
+/// by basename regex and/or body regex (first ~4 KB) and emits one or both
+/// of: a `move_to` folder, or an `add_tag` frontmatter append. First match
+/// wins; non-matching files stay put. See `docs/inbox-rules.md`.
+///
+/// Strict-load (`Rules::compile`) validates that each rule has at least one
+/// match and one action, that regexes compile, and that `move_to` is vault-
+/// relative with no `..` traversal. Default is an empty rule list.
+///
+/// status: inbox-rules
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxConfig {
+    #[serde(default)]
+    pub rules: Vec<InboxRule>,
+}
+
+/// Single inbox routing rule. Both `match` and `action` are required; the
+/// loader validates that `match` has at least one field set and `action`
+/// has at least one field set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxRule {
+    #[serde(rename = "match", default)]
+    pub match_: InboxMatch,
+    #[serde(default)]
+    pub action: InboxAction,
+}
+
+/// Match predicate for a rule. Fields are AND-combined when both are
+/// present. Both are regex strings; the loader compiles them via the
+/// `regex` crate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxMatch {
+    /// Regex matched against the file's basename (the final path segment,
+    /// extension included).
+    #[serde(default)]
+    pub basename: Option<String>,
+    /// Regex matched against the first ~4 KB of the file body (UTF-8
+    /// decoded; non-UTF-8 files are skipped).
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// Action to apply when a rule matches. At least one field must be set.
+/// Both can be set; `move_to` runs first, then `add_tag` against the
+/// post-move path so the tag-append edits the file at its new location.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxAction {
+    /// Vault-relative destination directory. The file's basename is
+    /// preserved; the rule moves `<rel>` → `<move_to>/<basename>`.
+    /// Capture-group rewriting is out of scope. Loader rejects values
+    /// containing `..` traversal or starting with `/`.
+    #[serde(default)]
+    pub move_to: Option<String>,
+    /// Tag to append to the file's frontmatter `tags` list. Idempotent —
+    /// re-applying an already-present tag is a no-op (still writes if the
+    /// frontmatter would otherwise change).
+    #[serde(default)]
+    pub add_tag: Option<String>,
+}
+
 /// `[op-log]` section. Tunables for the `core::oplog` substrate (the CRDT
 /// op log that owns every write). See `docs/op-log.md` §`[op-log]` config section.
 ///
@@ -166,6 +231,16 @@ pub struct SyncSection {
     /// Enrolled device fingerprints (Syncthing-Device-ID style strings).
     #[serde(default)]
     pub devices: Vec<String>,
+    /// THIS device's self-set human name, carried on the sync handshake so
+    /// peers can show "synced from `laptop`" instead of a fingerprint. A device
+    /// only ever names itself. Empty = unnamed. See `sync-device-name`.
+    #[serde(default)]
+    pub device_name: String,
+    /// Learned `fingerprint -> name` map: the name each enrolled peer
+    /// self-reported in its handshake (last name a device reports for ITSELF
+    /// wins). Persisted so a peer's name survives a restart. See `sync-device-name`.
+    #[serde(default)]
+    pub device_names: std::collections::HashMap<String, String>,
 }
 
 impl Default for SyncSection {
@@ -176,6 +251,8 @@ impl Default for SyncSection {
             server_url: String::new(),
             discovery: true,
             devices: Vec::new(),
+            device_name: String::new(),
+            device_names: std::collections::HashMap::new(),
         }
     }
 }
@@ -215,6 +292,66 @@ impl Default for TrailsConfig {
 
 fn default_new_trail_dir() -> String {
     "trails/".to_string()
+}
+
+/// `[wikilinks]` section. Vault-wide wikilink policy. See
+/// `docs/wikilinks.md`.
+///
+/// status: wikilink-ambiguous-resolution
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WikilinksConfig {
+    /// What to do when a bare-name link has more than one matching
+    /// note. `Unresolved` (default) renders the link as broken and
+    /// surfaces a disambiguation picker. `LexFirst` resolves to the
+    /// lexicographically-first matching path. `NearestFolder` picks
+    /// the match with the longest shared folder prefix with the
+    /// referrer. Vault-scope eligible.
+    #[serde(default)]
+    pub ambiguous_resolution: AmbiguousResolution,
+}
+
+/// Wire form of [`crate::wikilink::AmbiguityPolicy`]. Lives in `config`
+/// so the TOML round-trip stays decoupled from the resolver crate; a
+/// `From` impl below converts to the resolver enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AmbiguousResolution {
+    #[default]
+    Unresolved,
+    LexFirst,
+    NearestFolder,
+}
+
+impl From<AmbiguousResolution> for crate::wikilink::AmbiguityPolicy {
+    fn from(value: AmbiguousResolution) -> Self {
+        match value {
+            AmbiguousResolution::Unresolved => Self::Unresolved,
+            AmbiguousResolution::LexFirst => Self::LexFirst,
+            AmbiguousResolution::NearestFolder => Self::NearestFolder,
+        }
+    }
+}
+
+/// `[clustering]` section. Vault-wide clustering-pipeline policy that
+/// isn't a per-build parameter (build params live on the saved-tree
+/// `method` JSON). Currently just the draft-trail proposal opt-in. See
+/// `docs/clustering.md` and `docs/trails.md` §"Draft sources".
+///
+/// status: trail-draft-from-clustering
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusteringConfig {
+    /// When `true`, the clustering pipeline emits a DRAFT trail proposal
+    /// alongside its existing reorganization output whenever a cluster
+    /// contains an implicit reading-order chain (per
+    /// `core::cluster::detect_reading_order_chain`). Off by default — the
+    /// reorganization flow is the primary clustering product; trail
+    /// proposals are an opt-in extra. [trail-draft-from-clustering]
+    ///
+    /// status: trail-draft-from-clustering
+    #[serde(default = "no")]
+    pub propose_trails: bool,
 }
 
 /// `[boards]` section. Mirrors `[trails]`: default placement for newly
@@ -620,17 +757,32 @@ pub struct McpToolsConfig {
     #[serde(default = "yes")] pub search_notes_enabled: bool,
     #[serde(default = "yes")] pub get_note_enabled: bool,
     #[serde(default = "yes")] pub related_notes_enabled: bool,
+    /// status: mcp-tool-get-active-note
+    #[serde(default = "yes")] pub get_active_note_enabled: bool,
+    /// status: mcp-tool-get-open-notes
+    #[serde(default = "yes")] pub get_open_notes_enabled: bool,
+    /// status: mcp-tool-get-selection
+    #[serde(default = "yes")] pub get_selection_enabled: bool,
     // Writes (also gated by `writes_enabled` master flag):
     #[serde(default = "yes")] pub write_note_enabled: bool,
     #[serde(default = "yes")] pub edit_note_enabled: bool,
     #[serde(default = "yes")] pub set_frontmatter_enabled: bool,
     #[serde(default = "yes")] pub apply_tag_enabled: bool,
     #[serde(default = "yes")] pub remove_tag_enabled: bool,
-    // Board tools (status: board-mcp-tools). Reads + one write
-    // (`board_add_card`, also gated by `writes_enabled`):
+    // Board tools (status: board-mcp-tools). Reads + writes (every write is
+    // also gated by `writes_enabled`):
     #[serde(default = "yes")] pub boards_list_enabled: bool,
     #[serde(default = "yes")] pub board_get_enabled: bool,
     #[serde(default = "yes")] pub board_add_card_enabled: bool,
+    #[serde(default = "yes")] pub board_create_enabled: bool,
+    #[serde(default = "yes")] pub board_add_text_card_enabled: bool,
+    #[serde(default = "yes")] pub board_move_card_enabled: bool,
+    #[serde(default = "yes")] pub board_set_card_text_enabled: bool,
+    #[serde(default = "yes")] pub board_remove_card_enabled: bool,
+    #[serde(default = "yes")] pub board_add_column_enabled: bool,
+    #[serde(default = "yes")] pub board_rename_column_enabled: bool,
+    #[serde(default = "yes")] pub board_reorder_column_enabled: bool,
+    #[serde(default = "yes")] pub board_delete_column_enabled: bool,
     // Task-queue tools (also gated by `[tasks] expose_to_chat_agent`
     // for the in-process chat agent path):
     #[serde(default = "yes")] pub task_checkout_enabled: bool,
@@ -652,6 +804,15 @@ impl McpToolsConfig {
                 | "apply_tag"
                 | "remove_tag"
                 | "board_add_card"
+                | "board_create"
+                | "board_add_text_card"
+                | "board_move_card"
+                | "board_set_card_text"
+                | "board_remove_card"
+                | "board_add_column"
+                | "board_rename_column"
+                | "board_reorder_column"
+                | "board_delete_column"
         );
         if is_write && !self.writes_enabled {
             return false;
@@ -660,6 +821,9 @@ impl McpToolsConfig {
             "search_notes" => self.search_notes_enabled,
             "get_note" => self.get_note_enabled,
             "related_notes" => self.related_notes_enabled,
+            "get_active_note" => self.get_active_note_enabled,
+            "get_open_notes" => self.get_open_notes_enabled,
+            "get_selection" => self.get_selection_enabled,
             "write_note" => self.write_note_enabled,
             "edit_note" => self.edit_note_enabled,
             "set_frontmatter" => self.set_frontmatter_enabled,
@@ -668,6 +832,15 @@ impl McpToolsConfig {
             "boards_list" => self.boards_list_enabled,
             "board_get" => self.board_get_enabled,
             "board_add_card" => self.board_add_card_enabled,
+            "board_create" => self.board_create_enabled,
+            "board_add_text_card" => self.board_add_text_card_enabled,
+            "board_move_card" => self.board_move_card_enabled,
+            "board_set_card_text" => self.board_set_card_text_enabled,
+            "board_remove_card" => self.board_remove_card_enabled,
+            "board_add_column" => self.board_add_column_enabled,
+            "board_rename_column" => self.board_rename_column_enabled,
+            "board_reorder_column" => self.board_reorder_column_enabled,
+            "board_delete_column" => self.board_delete_column_enabled,
             "task_checkout" => self.task_checkout_enabled,
             "task_submit" => self.task_submit_enabled,
             "task_fail" => self.task_fail_enabled,
@@ -687,6 +860,9 @@ impl Default for McpToolsConfig {
             search_notes_enabled: true,
             get_note_enabled: true,
             related_notes_enabled: true,
+            get_active_note_enabled: true,
+            get_open_notes_enabled: true,
+            get_selection_enabled: true,
             write_note_enabled: true,
             edit_note_enabled: true,
             set_frontmatter_enabled: true,
@@ -695,6 +871,15 @@ impl Default for McpToolsConfig {
             boards_list_enabled: true,
             board_get_enabled: true,
             board_add_card_enabled: true,
+            board_create_enabled: true,
+            board_add_text_card_enabled: true,
+            board_move_card_enabled: true,
+            board_set_card_text_enabled: true,
+            board_remove_card_enabled: true,
+            board_add_column_enabled: true,
+            board_rename_column_enabled: true,
+            board_reorder_column_enabled: true,
+            board_delete_column_enabled: true,
             task_checkout_enabled: true,
             task_submit_enabled: true,
             task_fail_enabled: true,
@@ -900,6 +1085,32 @@ pub struct EditorConfig {
     /// use the egui default monospace.
     #[serde(default)]
     pub font_code: String,
+    /// Regex deciding what a double-click selects: the match on the clicked
+    /// line that contains the cursor becomes the selection. Default `\w+`
+    /// reproduces the historic Unicode-word behavior (so `foo-bar` splits at
+    /// `-`). Override e.g. `"[\\w-]+"` to select hyphenated words whole, or
+    /// `"\\S+"` to select runs of non-whitespace. Empty value resets to the
+    /// default; an invalid regex logs once and falls back to the default.
+    /// Must match `editor_view::viewport::DEFAULT_DOUBLE_CLICK_PATTERN`.
+    #[serde(default = "default_double_click_pattern")]
+    pub double_click_pattern: String,
+    /// Regex deciding what a triple-click selects (matched against the line
+    /// **with** its trailing newline). Default `.*\n?` reproduces the
+    /// historic whole-line-incl-newline behavior. Override e.g. `".*"` to
+    /// drop the trailing newline. Must match
+    /// `editor_view::viewport::DEFAULT_TRIPLE_CLICK_PATTERN`.
+    #[serde(default = "default_triple_click_pattern")]
+    pub triple_click_pattern: String,
+}
+
+fn default_double_click_pattern() -> String {
+    // Keep in sync with `editor_view::viewport::DEFAULT_DOUBLE_CLICK_PATTERN`.
+    r"\w+".to_string()
+}
+
+fn default_triple_click_pattern() -> String {
+    // Keep in sync with `editor_view::viewport::DEFAULT_TRIPLE_CLICK_PATTERN`.
+    r".*\n?".to_string()
 }
 
 impl Default for EditorConfig {
@@ -922,6 +1133,8 @@ impl Default for EditorConfig {
             font_system: String::new(),
             font_editor: String::new(),
             font_code: String::new(),
+            double_click_pattern: default_double_click_pattern(),
+            triple_click_pattern: default_triple_click_pattern(),
         }
     }
 }
@@ -1055,15 +1268,6 @@ pub struct IndexingConfig {
     pub batch_size: u16,
     #[serde(default)]
     pub ignored_paths: Vec<String>,
-    /// Controls when notes get their `hiker.id` stamped into frontmatter.
-    /// `lazy` (default) stamps only when a note becomes a reference target
-    /// (e.g. trail waypoint, future wikilink). `all` stamps every note on
-    /// first ingest. Both modes share the invariant that any *referenced*
-    /// note is stamped.
-    ///
-    /// status: note-id-stamping
-    #[serde(default)]
-    pub id_stamping: IdStampingMode,
 }
 
 impl Default for IndexingConfig {
@@ -1072,22 +1276,8 @@ impl Default for IndexingConfig {
             model: default_model(),
             batch_size: default_batch_size(),
             ignored_paths: Vec::new(),
-            id_stamping: IdStampingMode::default(),
         }
     }
-}
-
-/// Note-id stamping policy. See `docs/trails.md` §"Note ID stamping policy".
-///
-/// status: note-id-stamping
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdStampingMode {
-    /// Stamp every note on first ingest (lazy backfill via reindex).
-    All,
-    /// Stamp only when a note becomes a reference target. Default.
-    #[default]
-    Lazy,
 }
 
 fn default_model() -> String {

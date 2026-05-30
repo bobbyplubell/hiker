@@ -183,6 +183,44 @@ fn sync_detail_grid(ui: &mut egui::Ui, snap: &crate::sync_service::SyncSnapshot)
         });
 }
 
+/// The editable "Device name" row: this device names ITSELF, and that name is
+/// carried on the sync handshake so peers show it instead of a fingerprint. The
+/// draft lives in egui memory; Set persists it to `[sync].device_name`.
+/// [sync-device-name]
+fn device_name_section(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    service: &Arc<crate::sync_service::SyncService>,
+    snap: &crate::sync_service::SyncSnapshot,
+) {
+    ui.label(egui::RichText::new("This device's name").color(theme::muted()));
+    let name_id = egui::Id::new("sync-device-name-draft");
+    // Seed the draft from the current configured name on first render.
+    let mut draft: String = ui
+        .ctx()
+        .data(|d| d.get_temp::<String>(name_id))
+        .unwrap_or_else(|| snap.device_name.clone());
+    let mut do_set = false;
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut draft)
+                .hint_text("e.g. laptop, work desktop")
+                .desired_width(240.0),
+        );
+        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button("Set name").clicked() || submit {
+            do_set = true;
+        }
+    });
+    if do_set {
+        match service.set_device_name(&app.vault_session.vault_root, draft.trim()) {
+            Ok(()) => app.push_toast("Device name set", ToastLevel::Info),
+            Err(e) => app.push_toast(format!("Set name failed: {e}"), ToastLevel::Error),
+        }
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(name_id, draft));
+}
+
 /// The scrollable body of the Sync page: everything below the fixed header
 /// (config warning, last error, conflicts, the detail grid, content key,
 /// enrolled devices, enroll/connect fields, action buttons, discovered peers,
@@ -232,6 +270,13 @@ fn sync_body(
     ui.add_space(6.0);
 
     sync_detail_grid(ui, snap);
+
+    ui.add_space(6.0);
+
+    // This device's self-set name, carried on the handshake so peers show it
+    // instead of a fingerprint. Editable here; persists to [sync].device_name.
+    // [sync-device-name]
+    device_name_section(ui, app, service, snap);
 
     ui.add_space(10.0);
     ui.separator();
@@ -478,9 +523,10 @@ fn discovered_peers_section(
         );
     } else {
         for (fp, addr) in &snap.discovered {
-            // Prefer the local alias, else a truncated fingerprint; full fp on hover.
+            // Local alias override, else the learned synced name, else a
+            // truncated fingerprint; full fp on hover. [sync-device-name]
             let name = service
-                .device_alias(fp)
+                .display_name(fp)
                 .unwrap_or_else(|| truncate_mono(fp, 18));
             ui.label(egui::RichText::new(format!("{name} \u{2014} {addr}")).monospace().small())
                 .on_hover_text(fp);
@@ -577,10 +623,11 @@ fn conflicts_section(
     ui.add_space(4.0);
 
     for doc in blocked {
-        // Peer name: the local alias if set, else a truncated fingerprint.
+        // Peer name: local alias override, else the learned synced name, else a
+        // truncated fingerprint. [sync-device-name]
         let fp = &doc.peer_fingerprint.0;
         let peer = service
-            .device_alias(fp)
+            .display_name(fp)
             .unwrap_or_else(|| truncate_mono(fp, 18));
         ui.group(|ui| {
             ui.label(egui::RichText::new(&doc.path).strong());
@@ -593,18 +640,18 @@ fn conflicts_section(
 
             ui.horizontal(|ui| {
                 if ui.button("Keep mine").clicked() {
-                    service.resolve_fork(&doc.logical_id.0, Resolution::KeepMine, rt);
+                    service.resolve_fork(&doc.path, Resolution::KeepMine, rt);
                     app.push_toast(
                         "Keeping your version — pushing it so the other device adopts it too",
                         ToastLevel::Info,
                     );
                 }
                 if ui.button("Keep theirs").clicked() {
-                    service.resolve_fork(&doc.logical_id.0, Resolution::KeepTheirs, rt);
+                    service.resolve_fork(&doc.path, Resolution::KeepTheirs, rt);
                     app.push_toast("Adopting the peer's version", ToastLevel::Info);
                 }
                 if ui.button("Keep both").clicked() {
-                    service.resolve_fork(&doc.logical_id.0, Resolution::KeepBoth, rt);
+                    service.resolve_fork(&doc.path, Resolution::KeepBoth, rt);
                     app.push_toast(
                         "Saving your version as a conflict copy, then adopting theirs",
                         ToastLevel::Info,
@@ -820,17 +867,21 @@ fn enrolled_devices_section(
     }
     for fp in &enrolled {
         let alias = service.device_alias(fp);
+        let learned = service.learned_name(fp);
         ui.horizontal(|ui| {
-            // Display: alias if named, else a truncated fingerprint. Full fp on
-            // hover either way.
-            let display = match &alias {
-                Some(name) => name.clone(),
-                None => truncate_mono(fp, 18),
+            // Display precedence: local alias override, else the peer's learned
+            // self-reported synced name, else a truncated fingerprint. Full fp on
+            // hover either way. [sync-device-name]
+            let display = match (&alias, &learned) {
+                (Some(name), _) => name.clone(),
+                (None, Some(name)) => name.clone(),
+                (None, None) => truncate_mono(fp, 18),
             };
             ui.label(egui::RichText::new(display).monospace().small())
                 .on_hover_text(fp);
 
-            // Inline rename field, seeded with the current alias.
+            // Inline rename field for the LOCAL alias override (wins over the
+            // synced name). Seeded with the current alias. [sync-device-name]
             let name_id = egui::Id::new(("sync-alias", fp.clone()));
             let mut name: String = ui
                 .ctx()

@@ -37,7 +37,7 @@ pub(super) struct Slot {
     /// `worker_preference` + the per-preference grace window. MCP
     /// `task_checkout` ignores this.
     pub(super) eligible_to_direct_at: SystemTime,
-    /// status: task-queue-row-details
+    /// status: task-queue-home-detail-view
     /// Retained terminal result so the queue-detail UI can show the
     /// final response when the user clicks a row. The producer's handle
     /// also carries this, but the handle is consumed exactly once —
@@ -45,7 +45,7 @@ pub(super) struct Slot {
     /// of producer ownership. Bounded by `terminal_retention_secs` (the
     /// row + its result get GC'd together).
     pub(super) last_result: Option<serde_json::Value>,
-    /// status: task-queue-row-details
+    /// status: task-queue-home-detail-view
     /// Retained terminal error string (Failed) so the queue-detail UI
     /// can show the underlying provider / worker error verbatim.
     pub(super) last_error: Option<String>,
@@ -491,7 +491,7 @@ impl Queue {
             .collect()
     }
 
-    /// status: task-queue-row-details
+    /// status: task-queue-home-detail-view
     /// Full inspection payload for one task — the lazy "click a row to
     /// see prompt / result / error" path. `None` if the id is unknown
     /// (already GC'd past `terminal_retention_secs`, or never existed).

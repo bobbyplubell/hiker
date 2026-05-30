@@ -164,10 +164,9 @@ impl Db {
             if !is_top_level {
                 return Ok(());
             }
-            return Err(Error::TreeNotFound(format!(
-                "split_cluster: not enough members ({}) to split (need >= 4)",
-                embeddings.len()
-            )));
+            return Err(Error::Cluster(crate::cluster::BuildError::VaultTooSmall {
+                found: embeddings.len(),
+            }));
         }
 
         // 2. Partition. Use top_level_resolution on the top-level Leiden
@@ -182,13 +181,17 @@ impl Db {
                 let upper = embeddings.len().saturating_sub(1).max(1) as u32;
                 leiden_lvl.k_nearest = leiden_lvl.k_nearest.min(upper);
                 partition_leiden(&embeddings, &leiden_lvl).map_err(|e| {
-                    Error::TreeNotFound(format!("split_cluster leiden: {e}"))
+                    Error::Cluster(crate::cluster::BuildError::Compute(format!(
+                        "split_cluster leiden: {e}"
+                    )))
                 })?
             }
             _ => {
                 let min_size = (embeddings.len() / 4).max(2);
                 partition(&embeddings, min_size, None).map_err(|e| {
-                    Error::TreeNotFound(format!("split_cluster hdbscan: {e}"))
+                    Error::Cluster(crate::cluster::BuildError::Compute(format!(
+                        "split_cluster hdbscan: {e}"
+                    )))
                 })?
             }
         };
@@ -208,9 +211,9 @@ impl Db {
             if !is_top_level {
                 return Ok(());
             }
-            return Err(Error::TreeNotFound(
-                "split_cluster: produced fewer than 2 clusters".into(),
-            ));
+            return Err(Error::Cluster(crate::cluster::BuildError::VaultTooSmall {
+                found: groups.len(),
+            }));
         }
 
         // 3. Insert new cluster rows + reparent leaves. Only the real-node

@@ -133,6 +133,12 @@ impl<Mode: Clone + Eq + Hash + 'static> ActivityBar<Mode> {
     }
 }
 
+/// Shared flag id: set true while an activity item is mid-drag so other
+/// regions (the primary side bar) can light up as drop targets.
+pub(crate) fn drag_active_id() -> egui::Id {
+    egui::Id::new("egui_workbench::activity_drag_active")
+}
+
 /// Outcome of a single activity-bar frame. Communicated back to the
 /// caller (the `Workbench`) so it can act on user interactions —
 /// toggling the side bar visibility, updating focus, etc.
@@ -140,11 +146,16 @@ pub(crate) struct ActivityBarResponse<Mode> {
     /// User clicked the activity item with this mode. The workbench
     /// toggles side bar visibility OR swaps the active activity.
     pub clicked: Option<Mode>,
+    /// User dragged this mode's item out of the strip and released it
+    /// over the rest of the window. The workbench adds it as a new
+    /// primary side-panel section (VSCode "drag a view into the
+    /// sidebar"). Mutually exclusive with `clicked`.
+    pub dropped_out: Option<Mode>,
 }
 
 impl<Mode> Default for ActivityBarResponse<Mode> {
     fn default() -> Self {
-        Self { clicked: None }
+        Self { clicked: None, dropped_out: None }
     }
 }
 
@@ -423,18 +434,29 @@ where
         ui: &egui::Ui,
         drag_src: Option<usize>,
         target_idx: Option<usize>,
+        over_strip: bool,
     ) {
         let pointer_released = ui.input(|i| i.pointer.any_released());
         if pointer_released {
-            if let (Some(s), Some(t)) = (drag_src, target_idx)
-                && s != t
-                && s < self.bar.items.len()
-                && t < self.bar.items.len()
-            {
-                let item = self.bar.items.remove(s);
-                self.bar.items.insert(t, item);
-                self.bar.order = self.bar.items.iter().map(|it| it.mode.clone()).collect();
-                tracing::debug!(from = s, to = t, "workbench: activity item reordered");
+            if let Some(s) = drag_src.filter(|&s| s < self.bar.items.len()) {
+                if over_strip {
+                    // Released back inside the strip → reorder.
+                    if let Some(t) = target_idx
+                        && s != t
+                        && t < self.bar.items.len()
+                    {
+                        let item = self.bar.items.remove(s);
+                        self.bar.items.insert(t, item);
+                        self.bar.order =
+                            self.bar.items.iter().map(|it| it.mode.clone()).collect();
+                        tracing::debug!(from = s, to = t, "workbench: activity item reordered");
+                    }
+                } else {
+                    // Released over the rest of the window → the host adds
+                    // it as a side-panel section.
+                    self.response.dropped_out = Some(self.bar.items[s].mode.clone());
+                    tracing::debug!("workbench: activity item dropped into panel area");
+                }
             }
             ui.memory_mut(|m| {
                 m.data.remove::<usize>(self.drag_src_id);
@@ -447,6 +469,9 @@ where
 
     fn run(mut self, ui: &mut egui::Ui) -> ActivityBarResponse<Mode> {
         self.refresh_items();
+        // Full strip rect: a drag released outside it is a "drop into the
+        // panel" rather than a reorder.
+        let strip_rect = ui.max_rect();
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.add_space(self.item_padding);
@@ -460,9 +485,16 @@ where
                 let drag_grip: f32 = ui
                     .memory(|m| m.data.get_temp::<f32>(self.drag_grip_id))
                     .unwrap_or(self.item_h / 2.0);
+                // Publish whether a drag is in flight so the primary side
+                // bar can highlight itself as a drop target this frame.
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(drag_active_id(), drag_src.is_some()));
                 let first_top = slots[0].0.top();
+                let over_strip = pointer_pos.is_some_and(|p| strip_rect.contains(p));
+                // Only show a reorder target while the pointer is inside
+                // the strip; outside, the ghost reads as "drop into panel".
                 let target_idx: Option<usize> = match (drag_src, pointer_pos) {
-                    (Some(_), Some(p)) => {
+                    (Some(_), Some(p)) if over_strip => {
                         let raw = ((p.y - first_top) / self.item_h).floor();
                         Some((raw.max(0.0) as usize).min(count - 1))
                     }
@@ -472,7 +504,7 @@ where
                     self.render_item(ui, idx, slot, drag_src, target_idx);
                 }
                 self.paint_ghost(ui, &slots, drag_src, target_idx, drag_grip, pointer_pos);
-                self.finish_drag(ui, drag_src, target_idx);
+                self.finish_drag(ui, drag_src, target_idx, over_strip);
             }
             // Claim the remaining strip area for the visibility menu so a
             // right-click on empty space — including when every item is

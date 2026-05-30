@@ -52,7 +52,9 @@ fn build_harness(
     size: egui::Vec2,
 ) -> egui_kittest::Harness<'static, Workbench<TestTab, TestMode>> {
     let mut wb = Workbench::<TestTab, TestMode>::new();
-    wb.activity_bar.set_active(Some(TestMode));
+    // Open the panel into the splittable primary region (the activity-bar
+    // highlight follows the focused pane). [feature-multi-region-sidebar]
+    wb.open_primary_panel(TestMode);
     wb.secondary_side_bar.visible = true;
     egui_kittest::Harness::builder()
         .with_size(size)

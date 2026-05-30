@@ -111,7 +111,7 @@ fn build_view(ctx: &egui::Context, editor: &EditorState, font_size: f32, editor_
             let scale = line_font_scale(&view, editor, line);
             // No live-preview spans in the offline minimap render — markers
             // render as raw text, so wrapping sees the full bytes.
-            view.wrap_map.get_or_compute(line, |_| text.clone(), scale, &[]);
+            view.wrap_map.get_or_compute(line, &text, scale, &[]);
         }
     }
 

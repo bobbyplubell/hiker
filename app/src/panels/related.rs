@@ -70,25 +70,10 @@ pub(crate) struct View<'a> {
 
 impl View<'_> {
     pub(crate) fn show(&mut self) {
-        self.ui.add_space(12.0);
-        let related_expanded = self.app.panels.related.related_expanded;
-        if crate::panels::discovery_pane::collapsible_header(
-            self.ui,
-            "related-notes",
-            "Related notes",
-            related_expanded,
-            0,
-        ) {
-            self.app.panels.related.related_expanded = !related_expanded;
-            crate::panels::search::persist_search_setting(
-                self.app,
-                "search.sections.related_expanded",
-                &serde_json::json!(self.app.panels.related.related_expanded),
-            );
-        }
-        if self.app.panels.related.related_expanded {
-            self.related_for_active();
-        }
+        // The workbench accordion provides the section header + collapse;
+        // the panel body is just the content. [feature-panel-single-accordion]
+        self.ui.add_space(8.0);
+        self.related_for_active();
     }
 
     fn related_for_active(&mut self) {
@@ -168,8 +153,9 @@ impl View<'_> {
         Ok(s) => s,
         Err(_) => return,
     };
-    let note_id = match store.id_for_path(path) {
-        Ok(Some(id)) => id,
+    // status: store-id-from-oplog
+    let note_id = match store.get_note_by_path(path) {
+        Ok(Some(row)) => row.id,
         Ok(None) => {
             drop(store);
             app.panels.related.cached_hits.clear();

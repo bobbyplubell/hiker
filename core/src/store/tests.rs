@@ -80,7 +80,13 @@ fn upsert_then_read() {
     assert_eq!(chunks[0].chunk_index, 0);
     assert_eq!(chunks[1].text, "second chunk");
 
-    assert_eq!(store.id_for_path("alpha.md").unwrap().as_deref(), Some(id.as_str()));
+    assert_eq!(
+        store
+            .get_note_by_path("alpha.md")
+            .unwrap()
+            .map(|r| r.id),
+        Some(id.clone())
+    );
 }
 
 #[test]
@@ -234,7 +240,7 @@ fn delete_note_cascades() {
     store.delete_note(&id).unwrap();
     assert!(store.get_note_by_path("x.md").unwrap().is_none());
     assert!(store.get_note_chunks(&id).unwrap().is_empty());
-    assert!(store.id_for_path("x.md").unwrap().is_none());
+    assert!(!store.note_exists("x.md").unwrap());
 
     let conn = store.open_reader().unwrap();
     let n: i64 = conn
@@ -267,8 +273,11 @@ fn rename_preserves_id_and_chunks() {
     assert_eq!(note.id, id);
 
     // Old path no longer maps to the id.
-    assert!(store.id_for_path("old.md").unwrap().is_none());
-    assert_eq!(store.id_for_path("new.md").unwrap().as_deref(), Some(id.as_str()));
+    assert!(!store.note_exists("old.md").unwrap());
+    assert_eq!(
+        store.get_note_by_path("new.md").unwrap().map(|r| r.id),
+        Some(id.clone()),
+    );
 
     // Chunks survived.
     assert_eq!(store.get_note_chunks(&id).unwrap().len(), 1);
@@ -600,36 +609,17 @@ fn rename_trail_waypoint_paths_rewrites_prefix() {
     );
 }
 
-// status: trail-reference-resolution
-#[test]
-fn path_for_id_round_trip_through_upsert_and_rename() {
-    let (_dir, mut store) = fresh_store();
-    let id = new_id();
-    store
-        .upsert_note(&NoteUpsert {
-            id: &id,
-            path: "alpha.md",
-            content_hash: "h",
-            mtime: 1,
-            size: 1,
-            indexed_at: 1,
-            embedder_version: "t",
-            chunks: vec![],
-        })
-        .unwrap();
-    assert_eq!(store.path_for_id(&id).unwrap().as_deref(), Some("alpha.md"));
-    store.rename_note(&id, "beta.md").unwrap();
-    assert_eq!(store.path_for_id(&id).unwrap().as_deref(), Some("beta.md"));
-    assert!(store.path_for_id("nonexistent").unwrap().is_none());
-}
+// status: trail-reference-resolution / store-id-from-oplog
+// Path-by-id round-trip retired with the `path_ids` table. The op-log
+// now owns the path↔doc_id mapping (`doc-index.db`), so this test moved
+// to `core::oplog::tests` (`doc_index_maps_path_to_id`).
 
 #[test]
 fn at_autocomplete_skips_skipped_rows() {
     let (_dir, mut store) = fresh_store();
     let id = new_id();
-    let _ = id;
     store
-        .upsert_skipped("huge.md", "file too large", 1, 1)
+        .upsert_skipped(&id, "huge.md", "file too large", 1, 1)
         .unwrap();
     let hits = store.at_autocomplete("", 10).unwrap();
     assert!(hits.iter().all(|h| h.basename != "huge"));

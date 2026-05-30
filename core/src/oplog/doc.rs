@@ -130,6 +130,44 @@ pub(super) fn state_vector(doc: &Doc) -> StateVector {
     txn.state_vector()
 }
 
+/// The dominant `(client_id, clock_lo, clock_hi)` range gained between
+/// `before_sv` and `after_sv` — used by the sync receive path
+/// ([`super::OpLog::apply_remote_update`], `accept_pending`,
+/// `adopt_lineage_theirs`) to record a side-table row that actually describes
+/// the ops the update introduced.
+///
+/// The bug this fixes: those paths used to capture `cid =
+/// accepted.client_id()` and bracket the apply with `state_clock(accepted,
+/// cid)` pre/post — but the incoming Yrs update authors ops under the *peer's*
+/// (or pending-session's) client id, so the local cid's clock never advances
+/// and the recorded range is a zero-width `(local_cid, c, c)` describing
+/// nothing real. Diffing state vectors per-client gives the actually-gained
+/// ranges.
+///
+/// In the common case exactly one client id advances per `apply_update`. When
+/// the update batches ops from several remote clients, we pick the cid with the
+/// widest advance and record that one range — the side-table schema is one
+/// `(client_id, lo, hi)` triple per op, so a lossy single-row pick is the
+/// minimum-impact correct fix. Returns `None` when no client id advanced (the
+/// update was a no-op against `before_sv`).
+pub(super) fn dominant_advance(
+    before_sv: &StateVector,
+    after_sv: &StateVector,
+) -> Option<(i64, i64, i64)> {
+    let mut best: Option<(ClientID, u32, u32)> = None;
+    for (cid, after_clock) in after_sv.iter() {
+        let before_clock = before_sv.get(cid);
+        if *after_clock > before_clock {
+            let delta = *after_clock - before_clock;
+            let widest = best.map_or(0, |(_, lo, hi)| hi - lo);
+            if delta > widest {
+                best = Some((*cid, before_clock, *after_clock));
+            }
+        }
+    }
+    best.map(|(cid, lo, hi)| (cid.get() as i64, lo as i64, hi as i64))
+}
+
 /// The update carrying every op `doc` gained since `before` was captured.
 /// Replaying it onto another Doc that shares `doc`'s prior history merges
 /// those ops in by anchor — used to mirror an `accepted` edit onto the

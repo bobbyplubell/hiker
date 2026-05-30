@@ -62,13 +62,14 @@ fn process_events(app: &mut AppState, plugin_id: &str, events: Vec<PluginUiEvent
                 }
             }
             PluginUiEvent::OpenNote { note_id } => {
+                // status: store-id-from-oplog
                 let path = app
                     .vault_session
                     .services
-                    .read_store
-                    .lock()
+                    .oplog
+                    .path_for_doc(&note_id)
                     .ok()
-                    .and_then(|s| s.path_for_id(&note_id).ok().flatten());
+                    .flatten();
                 if let Some(path) = path {
                     crate::editor_pane::open_file(app, &path, true);
                 }

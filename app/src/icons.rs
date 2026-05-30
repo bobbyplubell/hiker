@@ -89,6 +89,7 @@ icons! {
     ClusterTree => "cluster_tree.svg",
     SidebarLeft => "sidebar_left.svg",
     SidebarRight => "sidebar_right.svg",
+    Vault => "vault.svg",
 }
 
 pub struct Icons;

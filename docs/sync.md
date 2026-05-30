@@ -4,7 +4,7 @@ Multi-device sync of a vault's op log (`op-log.md`) across a user's own devices.
 
 The headline decisions:
 
-- **Transport-negotiated document identity.** Each device keeps minting its own local ULID `doc_id`; the transport binds local ids to a shared logical lineage, so devices never agree on an id string up front and identity survives renames. [sync-negotiated-doc-ids]
+- **Path is the cross-device document identity.** Two devices recognize the same document by its vault-relative path. Each device keeps its own internal `doc_id` ULID for op-log bookkeeping (per `op-log-document-identity`); the transport never sees those local ids. Concurrent rename on two devices is explicitly **not** a supported merge case — it's an unusual single-user scenario. [sync-path-identity, sync-concurrent-rename-not-merged]
 - **Two modes, one protocol.** Direct peer-to-peer on a LAN, or through a decoupled server that runs standalone or in-process alongside the app — the same wire protocol either way, only the topology differs. [sync-p2p-lan, sync-decoupled-server]
 - **Two encryption layers; the server is zero-knowledge.** A Noise channel authenticates endpoints and secures the hop; a client-side AES-256-GCM layer encrypts content, so a relay server only ever stores ciphertext and never holds the vault key. [sync-noise-channel, sync-content-encryption-aes256, sync-zero-knowledge-server]
 - **libp2p for transport, with the P2P footguns compiled out.** `default-features = false` plus a minimal feature set; `cargo-deny` bans the DHT / hole-punching / relay crates so they never enter the binary. [sync-libp2p-transport, sync-banned-p2p-features]
@@ -14,20 +14,33 @@ The headline decisions:
 
 ## Identity
 
-A device never agrees on a shared `doc_id` string. Each keeps its local ULID `doc_id` (the `.yrs` / `.pending` / `.ops` filename, the `op_metadata.doc_id` key); the transport maintains a binding from each device's local id to a shared **logical id** and establishes one shared Yrs lineage behind it. [sync-negotiated-doc-ids]
+Documents are identified across devices by their **vault-relative path**. Each device keeps its own internal `doc_id` ULID for its op-log files (`.yrs` / `.pending` / `.ops` filename, `op_metadata.doc_id` key) — these are per-device implementation handles, never exchanged between peers. The transport speaks paths and Yrs updates. [sync-path-identity]
 
-Path is the **one-time matching key**, not the identity. At first contact two unbound documents bind when their vault-relative paths match; after binding, identity is the logical id and a rename (a `meta.path` change) never re-opens the question. This is what lets reorganization (`op-log-reorg-batch`) move notes freely without severing sync identity. [sync-path-matching-key]
+A rename produces a new identity. The sending device emits its `Rename { from }` op (per `op-log.md`'s op shapes); the receiving device matches the `from` path against its own document, updates its local `path → doc_id` mapping (`doc-index.db`), and the document continues syncing under its new path. Internally, both devices' `doc_id`s are unchanged; only the path-to-doc_id mapping moves.
 
-Two independently-seeded Yrs Docs do not merge — identical bytes interleave, because the lineages share no history. So a newly-bound device **adopts the canonical lineage** rather than applying the peer's update onto its own Doc: [sync-lineage-adoption]
+**Concurrent rename on two devices is not merged.** If both devices rename the same document while disconnected, the last-arriving rename wins on path. If the loser's new path now collides with a different document, the collision surfaces as a conflict (same `drift-conflict-modal` resolver as content conflicts). This is treated as a rare single-user mishap, not a first-class collaborative operation. [sync-concurrent-rename-not-merged]
 
-1. Take the canonical replica's base (`encode_state_as_update_v2` of its Doc) as the Doc for this logical id.
+Two independently-seeded Yrs Docs at the same path do not auto-merge — identical bytes interleave, because the lineages share no history. So at **first contact** for a given path, the receiving device adopts the canonical lineage rather than applying the peer's updates onto its own Doc: [sync-lineage-adoption]
+
+1. Take the canonical replica's base (`encode_state_as_update_v2` of its Doc) as the Doc for this path.
 2. Re-apply the local-only divergence as one edit on the shared lineage via the existing external-edit reconciliation (`op-log-external-edit-sync`): diff canonical text → local text, apply as `user` ops.
 
-The adopting device's pre-binding op history (local-only, never synced) collapses into that one reconciliation op.
+The adopting device's pre-binding op history (local-only, never synced) collapses into that one reconciliation op. After first-contact adoption, both devices share a single Yrs lineage for the path and subsequent updates merge normally.
 
-### Enrollment-time classification
+### Device naming
 
-A fork must not be auto-merged: a positional CRDT merge of two genuinely divergent texts interleaves into nonsense (the reason `op-log-merge-conflict` exists). At binding there is no shared lineage to trust, so divergence is classified from the **content-hash history** before any adoption. [sync-enrollment-hash-classification]
+Device identity is the immutable fingerprint; the human-readable **device name** is a separate, self-set label that propagates so the other devices can show "synced from `laptop`" instead of a fingerprint. [sync-device-name]
+
+- **Self-set, vault-scope.** A device names *itself*: `[sync].device_name` holds THIS device's chosen name (per-vault, part of the synced config metadata — not the user-scope key sidecar). A device never sets another device's name.
+- **Carried on the handshake.** The `Hello`/`HelloAck` messages carry the sending device's `device_name` (optional, so a peer that omits it still parses). A peer learns this device's self-reported name on first contact / enrollment.
+- **Learned names map.** Each device keeps `[sync].device_names`, a `fingerprint → name` map, and on every handshake adopts the peer's self-reported name into it (last-write-from-that-device wins for ITS OWN name). This is what the UI renders for a remote device.
+- **Local override.** The existing user-scope `aliases.json` stays as an optional **local display override**: when set, the local alias wins over the learned synced name in the UI. It is never synced — it only relabels what THIS user sees. With no local alias, the learned synced name is shown; with neither, the truncated fingerprint.
+
+The name is a convenience label only — it never gates authentication or affects the fingerprint-based enrollment/auth path.
+
+### First-contact classification
+
+A fork must not be auto-merged: a positional CRDT merge of two genuinely divergent texts interleaves into nonsense (the reason `op-log-merge-conflict` exists). At first contact for a path there is no shared lineage to trust, so divergence is classified from the **content-hash history** before any adoption. [sync-enrollment-hash-classification]
 
 | Condition | Meaning | Action |
 | --- | --- | --- |
@@ -48,7 +61,7 @@ Resolution verbs reuse the `drift-conflict-modal` shape:
 
 - **Keep mine** — my side is canonical and the resolution converges BOTH devices in one click: the resolver pushes its canonical Yrs base (`PushAdopt`) and the peer adopts it, discarding its own divergence (that is what "keep mine" means). Because the peer adopts the resolver's exact base, both sides land on one shared lineage, so subsequent deltas are safe. If both devices set keep-mine, whoever pushes first wins and clears the other's pending decision, so it converges to one version with no flapping.
 - **Keep theirs** — symmetric: the resolver adopts the peer's lineage, discarding its own divergence.
-- **Keep both** — one side canonical; the other lands as a sibling conflict-copy note (its own fresh logical id, indexable like any note), then the original path adopts the peer's content.
+- **Keep both** — one side canonical; the other lands as a sibling conflict-copy note at a fresh path (e.g. `<basename>.conflict-<short>.md`, indexable like any note), then the original path adopts the peer's content.
 
 Before resolving, the user can **View diff**: a forked document holds the local content but not the peer's (forks are detected from content hashes, so the peer's body was never fetched), so the peer's current text is fetched on demand over the authenticated channel and shown as a read-only unified diff against the local version. The fetch never mutates the local doc or changes sync state; the peer must be online (discovered on the LAN) to diff. [sync-fork-diff]
 
@@ -87,7 +100,7 @@ One authenticated connection carries many **muxed substreams** (yamux): a contro
 
 The server never holds the vault content key, so it cannot read content. Because it can't decrypt, it can't compute Yrs state-vector deltas either — so it degrades to the only thing it can do on ciphertext: an **append-only encrypted-blob log per document, with a per-device cursor** (store-and-forward). Clients push sequenced encrypted update blobs; a device pulls everything past its cursor, decrypts, and lets Yrs merge them. All CRDT logic stays on the client. [sync-zero-knowledge-server]
 
-The server keys blobs by a **blind id** — `HMAC(vault_key, logical_id)` — not the human path, so it sees random-looking ids and ciphertext, never names or content. It still learns blob count, size, and timing; hiding that (padding / cover traffic) is deferred. [sync-blind-id]
+The server keys blobs by a **blind id** — `HMAC(vault_key, path)` — not the human path, so it sees random-looking ids and ciphertext, never names or content. A rename rotates the blind id: the document's blob stream at the old blind id stops growing, and a fresh stream opens at the new blind id; the receiving device GCs the old stream after applying the rename. The server still learns blob count, size, and timing; hiding that (padding / cover traffic) is deferred. [sync-blind-id, sync-rename-blob-rotation]
 
 
 ## Encryption
@@ -125,6 +138,8 @@ mode = "peer"                # "peer" | "server" | "both"
 server_url = ""              # when using a relay / hub
 discovery = true             # allow the manual mDNS discovery window
 devices = []                 # enrolled device fingerprints
+device_name = ""             # THIS device's self-set human name (carried on the handshake) [sync-device-name]
+device_names = {}            # learned fingerprint -> name map for enrolled peers [sync-device-name]
 ```
 
 Embedding sync rides alongside but separate — the content-addressed blob store of `op-log-embeddings-lww-cache`, not the CRDT transport.
@@ -134,7 +149,7 @@ Embedding sync rides alongside but separate — the content-addressed blob store
 
 The sync surfaces in the egui app; all of it degrades cleanly when `[sync]` is off.
 
-- **Sync page** — a singleton tab (actions menu → "Sync") showing engine state (enabled, mode, server URL), this device's fingerprint (copyable), the enrolled-device list (rename + remove), the content-key copy/import, the discovered-peer buckets with one-click Enroll (`sync-discovered-peers`, `sync-enroll-from-discovered`), config-sanity warnings, the conflicts section, and last-sync result. Actions: an **Enable sync / Disable sync** button (flips `[sync].enabled` via the config-commit path, same as the Settings toggle), enroll-by-fingerprint, "Sync now", "Discover (30s)", and a manual **"Connect to peer address"** field (dial an explicit multiaddr — an mDNS fallback; the peer must still be enrolled). Below, a recently-synced-items list (op log `author LIKE 'sync:%'`) renders each as its real op alongside a live progress log. When sync is disabled the page shows an "Enable sync" button instead of a dead end. [sync-ui-page]
+- **Sync page** — a singleton tab (actions menu → "Sync") showing engine state (enabled, mode, server URL), this device's fingerprint (copyable) and an editable **device name** for THIS device (`sync-device-name`), the enrolled-device list (showing each peer's learned synced name with an optional local-alias override + remove), the content-key copy/import, the discovered-peer buckets with one-click Enroll (`sync-discovered-peers`, `sync-enroll-from-discovered`), config-sanity warnings, the conflicts section, and last-sync result. Actions: an **Enable sync / Disable sync** button (flips `[sync].enabled` via the config-commit path, same as the Settings toggle), enroll-by-fingerprint, "Sync now", "Discover (30s)", and a manual **"Connect to peer address"** field (dial an explicit multiaddr — an mDNS fallback; the peer must still be enrolled). Below, a recently-synced-items list (op log `author LIKE 'sync:%'`) renders each as its real op alongside a live progress log. When sync is disabled the page shows an "Enable sync" button instead of a dead end. [sync-ui-page]
 - **Settings `[sync]` section** — `enabled` / `mode` / `server_url` / `discovery` via the standard settings rows; `devices` is read-only there (enrollment is the Sync page's job). Vault scope; secrets never appear (user-scope per `sync-secrets-user-scope`). [sync-settings-section]
 - **Activity provenance** — synced changes appear in the activity feed as their underlying op (Modified / Created / Renamed), not as a distinct "sync" category, tagged with their source device (`sync:<device>`) and isolable via a "Synced" filter pill. [sync-activity-provenance]
 - **Enable/disable are both live** — sync is off by default; with `[sync].enabled = false` nothing is constructed (no keys, no swarm, no listener, no mDNS advertising). A per-frame reconcile builds + spawns the engine the moment the toggle goes on, and tears it down (closing the listener and mDNS) the moment it goes off — no vault reopen in either direction. [sync-disable-kill-switch]

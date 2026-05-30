@@ -50,6 +50,17 @@ pub trait CompletionSource: Send + Sync {
     /// caret at byte offset `pos`. Sources should filter against the
     /// current query themselves; the caller does not pre-filter.
     fn matches(&self, state: &EditorState, pos: usize) -> Vec<CompletionItem>;
+
+    /// Cheap predicate: would this source produce completions at `pos`
+    /// even though no trigger char was just typed? Lets the driver
+    /// re-open the popup when the caret is edited back into an existing
+    /// context — e.g. typing inside an already-closed `[[wikilink]]`.
+    /// Must be cheap (a local scan); it runs on every non-trigger
+    /// keystroke. Default `false` so most sources only open on their
+    /// trigger char. [bug-wikilink-edit-reopens-popup]
+    fn reopens_in_context(&self, _state: &EditorState, _pos: usize) -> bool {
+        false
+    }
 }
 
 /// Per-frame state of the autocomplete popup. Inactive by default.

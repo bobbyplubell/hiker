@@ -70,32 +70,69 @@ impl<'a> CompletionPainter<'a> {
         let selected_bg = visuals.selection.bg_fill;
         let text_color = visuals.text_color();
         let detail_color = visuals.weak_text_color();
+        let label_font = egui::FontId::proportional(13.0);
+        let detail_font = egui::FontId::proportional(11.0);
         for (i, item) in self.view.completion.items.iter().enumerate() {
             let is_selected = i == self.view.completion.selected;
             let row = ui.allocate_response(
                 egui::vec2(ui.available_width(), ROW_HEIGHT),
                 egui::Sense::hover(),
             );
-            let painter = ui.painter();
+            // Clip everything painted for this row to the row rect so a
+            // long label / detail can never bleed past the card edges
+            // (`wikilink-hover-preview` / wikilink autocomplete had detail
+            // paths overflowing the 280px popup). Each row gets its own
+            // clip-scoped painter.
+            let painter = ui.painter().with_clip_rect(row.rect);
             if is_selected {
                 painter.rect_filled(row.rect, 2.0, selected_bg);
             }
+            let label_color = if is_selected { Color32::WHITE } else { text_color };
             let icon = self.kind_icon(item.kind);
             let label_text = format!("{icon}  {}", item.label);
-            let label_color = if is_selected { Color32::WHITE } else { text_color };
-            painter.text(
+
+            // Reserve the right portion for the detail (≈45% of the row),
+            // and truncate each side to its budget so label + detail never
+            // overlap. The detail is a path — keep its tail (the
+            // distinguishing folder/name) and front-ellipsize.
+            let inner_w = (row.rect.width() - 12.0).max(0.0);
+            let detail_budget = if item.detail.is_some() {
+                inner_w * 0.45
+            } else {
+                0.0
+            };
+            let label_budget = (inner_w - detail_budget - 8.0).max(0.0);
+
+            let label_galley = ui.fonts(|f| {
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    label_text,
+                    label_font.clone(),
+                    label_color,
+                );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(label_budget);
+                f.layout_job(job)
+            });
+            painter.galley(
                 row.rect.left_top() + egui::vec2(6.0, 2.0),
-                egui::Align2::LEFT_TOP,
-                label_text,
-                egui::FontId::proportional(13.0),
+                label_galley,
                 label_color,
             );
+
             if let Some(detail) = &item.detail {
-                painter.text(
-                    row.rect.right_top() + egui::vec2(-6.0, 2.0),
-                    egui::Align2::RIGHT_TOP,
-                    detail.as_str(),
-                    egui::FontId::proportional(11.0),
+                let shown = elide_front(detail.as_str(), &detail_font, detail_budget, ui);
+                let detail_galley = ui.fonts(|f| {
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        shown,
+                        detail_font.clone(),
+                        detail_color,
+                    );
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(detail_budget);
+                    f.layout_job(job)
+                });
+                let x = row.rect.right() - 6.0 - detail_galley.rect.width();
+                painter.galley(
+                    egui::pos2(x, row.rect.top() + 3.0),
+                    detail_galley,
                     detail_color,
                 );
             }
@@ -129,4 +166,41 @@ impl<'a> CompletionPainter<'a> {
         let y = self.widget_rect.min.y + view.line_top_y(line);
         Pos2::new(x, y)
     }
+}
+
+/// Front-elide `text` (a path-like detail string) so its tail — the
+/// distinguishing folder + name — survives when it doesn't fit in
+/// `max_width`. Returns the original when it already fits; otherwise
+/// trims leading path segments / chars and prepends `…`-as-ASCII
+/// (`...`). Width is measured with `font` via egui's font layout so it
+/// matches what gets painted.
+fn elide_front(text: &str, font: &egui::FontId, max_width: f32, ui: &egui::Ui) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    let measure = |s: &str| -> f32 {
+        ui.fonts(|f| {
+            f.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE)
+                .rect
+                .width()
+        })
+    };
+    if measure(text) <= max_width {
+        return text.to_string();
+    }
+    // Trim from the front by chars until "..." + tail fits.
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let candidate: String = std::iter::once('.')
+            .chain(std::iter::once('.'))
+            .chain(std::iter::once('.'))
+            .chain(chars[start..].iter().copied())
+            .collect();
+        if measure(&candidate) <= max_width {
+            return candidate;
+        }
+        start += 1;
+    }
+    "...".to_string()
 }
