@@ -929,7 +929,9 @@ fn update_trail_waypoints_if_relevant(
         return;
     }
     let ingest = WaypointIngest { store, oplog, rel_path, contents };
-    if rel_path.starts_with(".hiker/trails/") && rel_path.contains("/waypoints/") {
+    if rel_path.starts_with(&crate::trails::dir_prefix())
+        && rel_path.contains(&format!("/{}/", crate::trails::WAYPOINTS_DIRNAME))
+    {
         ingest.upsert_waypoint_row();
     } else {
         ingest.rebuild_trail_doc_rows();
@@ -962,14 +964,10 @@ impl<'a> WaypointIngest<'a> {
             }
         };
         // status: store-id-from-oplog
-        // Source id is the op-log's `doc_id` for the source's path; may
-        // be None if the source hasn't been bootstrapped yet. Trail id
-        // is the op-log's `doc_id` for `fm.in_trail` (the waypoint-
-        // note's parent trail-doc path).
+        // Trail id is the op-log's `doc_id` for `fm.in_trail` (the
+        // waypoint-note's parent trail-doc path). The source note is
+        // referenced by path only (path-as-identity).
         let source_path = fm.references.clone();
-        let source_id = self
-            .oplog
-            .and_then(|log| log.doc_id_for_path(&source_path).unwrap_or(None));
         let trail_id = self
             .oplog
             .and_then(|log| log.doc_id_for_path(&fm.in_trail).unwrap_or(None))
@@ -986,7 +984,6 @@ impl<'a> WaypointIngest<'a> {
             waypoint_path: self.rel_path.to_string(),
             waypoint_id,
             trail_id,
-            source_id,
             source_path,
             // Tree-position columns are owned by the trail-doc ingest
             // path; written as the empty / NULL default here. The trail-
@@ -1024,15 +1021,14 @@ impl<'a> WaypointIngest<'a> {
             _ => return,
         };
         // Capture existing rows BEFORE the clear so we can preserve each
-        // row's `source_id` / `source_path` (those columns are owned by
-        // the per-waypoint ingest path and aren't recoverable from the
-        // trail-doc alone).
-        let existing_by_path: std::collections::HashMap<String, (Option<String>, String)> = self
+        // row's `source_path` (that column is owned by the per-waypoint
+        // ingest path and isn't recoverable from the trail-doc alone).
+        let existing_by_path: std::collections::HashMap<String, String> = self
             .store
             .waypoints_of(&trail_id)
             .unwrap_or_default()
             .into_iter()
-            .map(|r| (r.waypoint_path, (r.source_id, r.source_path)))
+            .map(|r| (r.waypoint_path, r.source_path))
             .collect();
         if let Err(e) = self.store.delete_trail_waypoints_by_trail(&trail_id) {
             tracing::warn!(
@@ -1043,10 +1039,10 @@ impl<'a> WaypointIngest<'a> {
         }
         let store = self.store;
         walk_waypoints_depth_first(&fm.waypoints, &mut |parent_path, entry, tree_path| {
-            let (source_id, source_path) = existing_by_path
+            let source_path = existing_by_path
                 .get(&entry.path)
                 .cloned()
-                .unwrap_or((None, String::new()));
+                .unwrap_or_default();
             // status: store-id-from-oplog
             // Waypoint id / parent waypoint id are the op-log doc_ids
             // for each waypoint-note path. Both default to empty when
@@ -1063,7 +1059,6 @@ impl<'a> WaypointIngest<'a> {
                 waypoint_path: entry.path.clone(),
                 waypoint_id,
                 trail_id: trail_id.clone(),
-                source_id,
                 source_path,
                 parent_waypoint_id,
                 tree_path: tree_path.to_string(),
@@ -1119,21 +1114,10 @@ fn update_board_cards_if_relevant(
             let crate::boards::BoardCard::Note { path } = card else {
                 continue;
             };
-            // status: store-id-from-oplog
-            // The card's note id is the op-log's doc_id for its path;
-            // None means the source hasn't been seeded yet, which the
-            // derived row carries as an empty string (the existing
-            // BoardCardRow shape — the column still rebuilds when the
-            // source is ingested later).
-            let card_note_id = log
-                .doc_id_for_path(path)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            // Path-as-identity: the card references its note by rel-path.
             rows.push(BoardCardRow {
                 board_id: board_id.clone(),
                 board_path: rel_path.to_string(),
-                card_note_id,
                 card_note_path: path.clone(),
                 column_name: col.name.clone(),
                 ordinal: ordinal as i64,

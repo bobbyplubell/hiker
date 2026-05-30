@@ -137,7 +137,7 @@ pub fn ensure_readonly_buffer_loaded(
         return Some(key);
     }
     let contents = match source {
-        BufferSource::Snapshot { op_id, path } => {
+        BufferSource::HistoryVersion { op_id, path } => {
             // The version's content materialized from the op log at `op_id`.
             let log = state.vault_session.services.oplog.as_ref();
             hiker_core::ops::op_writes::content_at_op(log, path, op_id)
@@ -220,24 +220,24 @@ fn navigate_to(state: &mut AppState, target: &NavTarget) {
             }
             open_file(state, path, /* sticky */ false);
         }
-        NavTarget::Snapshot { path, op_id } => {
-            set_active_tab_kind(state, TabKind::snapshot_preview(path.clone(), op_id.clone()));
+        NavTarget::HistoryVersion { path, op_id } => {
+            set_active_tab_kind(state, TabKind::version_preview(path.clone(), op_id.clone()));
         }
     }
 }
 
-/// Open a historical snapshot in the *active* tab, in place, and record it on
+/// Open a historical version in the *active* tab, in place, and record it on
 /// the nav stack so Back returns to the live file. The active tab's content
-/// swaps to the read-only snapshot view; the live buffer keeps its own
+/// swaps to the read-only history-version view; the live buffer keeps its own
 /// buffer-map key, so reverting (Back / "Live") is lossless.
-pub fn open_snapshot_in_tab(state: &mut AppState, path: &str, op_id: &str) {
+pub fn open_version_in_tab(state: &mut AppState, path: &str, op_id: &str) {
     if !state.session.nav.locked {
-        state.session.nav.push(NavTarget::Snapshot {
+        state.session.nav.push(NavTarget::HistoryVersion {
             path: path.to_string(),
             op_id: op_id.to_string(),
         });
     }
-    set_active_tab_kind(state, TabKind::snapshot_preview(path.to_string(), op_id.to_string()));
+    set_active_tab_kind(state, TabKind::version_preview(path.to_string(), op_id.to_string()));
 }
 
 /// Open a trashed item as a read-only preview in the editor's preview

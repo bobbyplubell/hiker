@@ -1,6 +1,6 @@
 //! Popup menus rendered in the editor toolbar / status bar: the
 //! view-options menu, the mutations menu, and the version dropdown (which
-//! lists pending staging proposals and changelog snapshots for the active
+//! lists pending proposals and version history for the active
 //! path and opens the corresponding preview tab). All three share the same
 //! `Menus { ui, app, path }` context and are pulled out of `buffer/mod.rs`
 //! to keep the parent file under the workspace's per-file length cap.
@@ -348,8 +348,8 @@ impl Menus<'_> {
     );
     }
 
-    /// Version dropdown for the buffer status bar. Lists pending staging
-    /// proposals and changelog snapshots for the active path, and opens the
+    /// Version dropdown for the buffer status bar. Lists pending
+    /// proposals and version history for the active path, and opens the
     /// corresponding preview tab when the user picks one.
     pub(super) fn version_dropdown(&mut self, label: &str) {
     use crate::tab::TabKind;
@@ -368,7 +368,7 @@ impl Menus<'_> {
         .on_hover_text("Versions");
     enum Pick {
         Live,
-        Snapshot { op_id: String },
+        Version { op_id: String },
         Proposal { id: String },
     }
     let mut pick: Option<Pick> = None;
@@ -427,7 +427,7 @@ impl Menus<'_> {
         if !history.is_empty() {
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new("Snapshots")
+                egui::RichText::new("Versions")
                     .small()
                     .color(crate::theme::muted()),
             );
@@ -444,7 +444,7 @@ impl Menus<'_> {
                     )
                     .clicked()
                 {
-                    pick = Some(Pick::Snapshot { op_id: row.op_id.clone() });
+                    pick = Some(Pick::Version { op_id: row.op_id.clone() });
                     ui.close();
                 }
             }
@@ -460,13 +460,13 @@ impl Menus<'_> {
     });
     // Load the picked version IN THIS TAB rather than spawning a new one, and
     // record it on the nav stack so Back/Forward walk the active tab's view
-    // history (live ↔ snapshot). The live buffer keeps its own buffer-map key,
+    // history (live ↔ version). The live buffer keeps its own buffer-map key,
     // so reverting is lossless; read-only preview sources load on the next
     // render via the tab dispatch (`ensure_readonly_buffer_loaded`).
     match pick {
         Some(Pick::Live) => crate::editor_pane::open_live_in_tab(app, path),
-        Some(Pick::Snapshot { op_id }) => {
-            crate::editor_pane::open_snapshot_in_tab(app, path, &op_id);
+        Some(Pick::Version { op_id }) => {
+            crate::editor_pane::open_version_in_tab(app, path, &op_id);
         }
         Some(Pick::Proposal { id }) => {
             // Proposals aren't a nav target (yet); swap the active tab in place.
@@ -481,7 +481,7 @@ impl Menus<'_> {
     }
 }
 
-/// Zero-sized timestamp formatter for version-dropdown snapshot rows. A
+/// Zero-sized timestamp formatter for version-dropdown rows. A
 /// struct (rather than a free fn) so the single prod call site stays an
 /// inherent method.
 struct VersionTimeFmt;

@@ -1002,7 +1002,7 @@ fn render_readonly_source_toolbar(&mut self, source: Option<&crate::tab::BufferS
         .and_then(|t| t.kind.diff_source())
         .is_some();
     match source {
-        Some(BufferSource::Snapshot { path, op_id }) => {
+        Some(BufferSource::HistoryVersion { path, op_id }) => {
             let path = path.clone();
             let cid = op_id.clone();
             if ui
@@ -1175,13 +1175,13 @@ impl<'a> BufCtx<'a> {
     }
     // Pill only surfaces when there's an explicitly-active trail.
     let Some(trail_id) = app
-        .session.active_trail
+        .trails_state.active_trail
         .clone()
-        .filter(|id| app.session.trails.iter().any(|t| &t.id == id))
+        .filter(|id| app.trails_state.trails.iter().any(|t| &t.id == id))
     else {
         return;
     };
-    let trail = match app.session.trails.iter().find(|t| t.id == trail_id) {
+    let trail = match app.trails_state.trails.iter().find(|t| t.id == trail_id) {
         Some(t) => t,
         None => return,
     };
@@ -1202,7 +1202,7 @@ impl<'a> BufCtx<'a> {
     let resp = resp.on_hover_text(tooltip);
     if resp.clicked() {
         crate::state::trail_append_waypoint(app, path);
-        let _ = crate::bootstrap::save_trails(&app.vault_session.vault_root, &app.session.trails);
+        let _ = crate::bootstrap::save_trails(&app.vault_session.vault_root, &app.trails_state.trails);
         app.push_toast(
             format!("Added to '{}'", trail_name),
             ToastLevel::Info,

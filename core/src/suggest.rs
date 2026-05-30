@@ -67,8 +67,8 @@ pub struct ApplyOutcome {
     pub frozen: u32,
     /// Leaves with no resolved policy anywhere up the tree.
     pub unpolicied: u32,
-    /// Leaves whose `note_ref` couldn't be resolved to a path (e.g. the
-    /// underlying note was deleted between build and Apply).
+    /// Leaves with no source-note path recorded (e.g. the underlying note
+    /// was deleted between build and Apply).
     pub missing: u32,
 }
 
@@ -102,10 +102,9 @@ pub fn apply_tree(
     log: &OpLog,
     history: Option<&RejectionHistory>,
 ) -> Result<ApplyOutcome, HikerError> {
-    // status: store-id-from-oplog — leaf `note_ref` → path resolution
-    // now goes through `log.path_for_doc`, but `store` is kept on the
-    // signature so callers don't break (the structural-index path-walk
-    // surface stays open here for future filters).
+    // Path-as-identity: each leaf carries its source note's rel-path
+    // (`note_path`) directly, so no doc-id resolution is needed. `store` and
+    // `log` are kept on the signature (callers + op staging below).
     let _ = store;
     let nodes = trees
         .list_nodes(tree_id)
@@ -125,18 +124,10 @@ pub fn apply_tree(
             out.unpolicied += 1;
             continue;
         };
-        let note_id = match &node.note_ref {
-            Some(s) => s.clone(),
-            None => {
-                out.missing += 1;
-                continue;
-            }
-        };
-        let rel = match log
-            .path_for_doc(&note_id)
-            .map_err(|e| HikerError::Io(e.to_string()))?
-        {
-            Some(p) => p,
+        // Path-as-identity: the leaf carries the source note's rel-path
+        // directly (no op-log doc-id round-trip).
+        let rel = match &node.note_path {
+            Some(p) => p.clone(),
             None => {
                 out.missing += 1;
                 continue;
@@ -473,9 +464,8 @@ pub fn stage_moves(
     vault: &Vault,
     log: &OpLog,
 ) -> Result<StageOutcome, HikerError> {
-    // status: store-id-from-oplog — `store` kept on the signature for
-    // future use; leaf `note_ref` → path resolution now routes through
-    // the op-log.
+    // Path-as-identity: leaves carry their source note's rel-path
+    // (`note_path`) directly. `store` is kept on the signature for callers.
     let _ = store;
     let mut moves = Vec::new();
     for node_id in args.node_ids {
@@ -488,13 +478,7 @@ pub fn stage_moves(
         if !matches!(node.kind, NodeKind::Leaf) {
             continue;
         }
-        let Some(note_id) = node.note_ref.clone() else { continue };
-        let Some(rel) = log
-            .path_for_doc(&note_id)
-            .map_err(|e| HikerError::Io(e.to_string()))?
-        else {
-            continue;
-        };
+        let Some(rel) = node.note_path.clone() else { continue };
         let basename = rel.rsplit('/').next().unwrap_or(&rel);
         let folder_trim = args.target_folder.trim_end_matches('/');
         let target = if folder_trim.is_empty() {
@@ -526,7 +510,7 @@ pub fn stage_tags(
     store: &Store,
     log: &OpLog,
 ) -> Result<Vec<String>, HikerError> {
-    // status: store-id-from-oplog — see `apply_tree`.
+    // Path-as-identity: see `apply_tree`. `store` is kept on the signature.
     let _ = store;
     let mut ids = Vec::new();
     for node_id in args.node_ids {
@@ -539,13 +523,7 @@ pub fn stage_tags(
         if !matches!(node.kind, NodeKind::Leaf) {
             continue;
         }
-        let Some(note_id) = node.note_ref.clone() else { continue };
-        let Some(rel) = log
-            .path_for_doc(&note_id)
-            .map_err(|e| HikerError::Io(e.to_string()))?
-        else {
-            continue;
-        };
+        let Some(rel) = node.note_path.clone() else { continue };
         let disk_text = vault
             .read_file(&rel)
             .map_err(|e| HikerError::Io(e.to_string()))?;
@@ -1136,12 +1114,11 @@ mod tests {
         let mut store = Store::open(td.path()).unwrap();
         let log = open_log(&td);
 
-        // status: store-id-from-oplog
-        // Seed each note in the op-log so `path_for_doc` (called from
-        // `apply_tree`) resolves the leaf's `note_ref` back to a vault
-        // path. The doc_id is what apply_tree dereferences.
-        let note_a_id = crate::ops::op_writes::bootstrap(&vault, &log).unwrap_or(0);
-        let _ = note_a_id;
+        // Path-as-identity: leaves carry the source note's rel-path directly,
+        // which `apply_tree` reads as the vault path. Bootstrap seeds the
+        // op-log so the staging path the suggestions write through resolves;
+        // the resolved doc_ids double as the `notes.id` for the store upserts.
+        let _ = crate::ops::op_writes::bootstrap(&vault, &log).unwrap_or(0);
         let note_a = log.doc_id_for_path("a.md").unwrap().expect("seeded");
         let note_b = log
             .doc_id_for_path("inbox/b.md")
@@ -1196,7 +1173,7 @@ mod tests {
                             require_review: false,
                         }),
                     ),
-                    leaf("leaf-a", "tag-cluster", &note_a),
+                    leaf("leaf-a", "tag-cluster", "a.md"),
                     cluster(
                         "move-cluster",
                         Some("root"),
@@ -1205,7 +1182,7 @@ mod tests {
                             require_review: true,
                         }),
                     ),
-                    leaf("leaf-b", "move-cluster", &note_b),
+                    leaf("leaf-b", "move-cluster", "inbox/b.md"),
                 ],
             )
             .unwrap();

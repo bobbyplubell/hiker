@@ -272,7 +272,7 @@ async fn board_create_commits_directly_even_in_review_mode() {
     })).await;
     let as_ = structured(&added);
     assert_eq!(as_["status"], "staged", "edits still stage in review mode: {added}");
-    assert!(as_["staging_id"].is_string());
+    assert!(as_["proposal_id"].is_string());
     shutdown(b).await;
 }
 
@@ -650,7 +650,7 @@ async fn edit_note_stages_per_edit_when_review_required() {
     let s = structured(&resp);
     assert_eq!(s["status"], "staged", "resp: {resp}");
     assert_eq!(s["edit_count"], 2);
-    let ids = s["staging_ids"].as_array().expect("staging_ids array");
+    let ids = s["proposal_ids"].as_array().expect("proposal_ids array");
     assert_eq!(ids.len(), 2);
     assert!(s["batch_id"].is_string());
     // Disk unchanged until accept.

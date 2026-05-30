@@ -57,7 +57,7 @@ pub struct ClickPatternCache {
 }
 
 pub struct Buffer {
-    /// What this buffer is sourcing — vault file, snapshot blob, pending
+    /// What this buffer is sourcing — vault file, history version, pending
     /// proposal content, or trash entry. Drives the toolbar's per-source
     /// verb bar (Save vs. Restore vs. Accept/Reject vs. nothing) and the
     /// read-only flag in `view`. For Vault sources, the path here matches
@@ -67,7 +67,7 @@ pub struct Buffer {
     /// Vault-relative path. Doubles as the key in `AppState::buffers`
     /// for vault sources; for non-vault sources, the path identifies the
     /// underlying note (e.g. the original path of a trashed file, the
-    /// target path of a pending proposal, the path the snapshot is *of*).
+    /// target path of a pending proposal, the path the history version is *of*).
     pub path: String,
     /// Hash of the contents most recently read from / written to disk.
     pub loaded_hash: String,
@@ -284,8 +284,8 @@ pub fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String {
     use crate::tab::BufferSource;
     match source {
         BufferSource::Vault { path } => path.clone(),
-        BufferSource::Snapshot { op_id, path } => {
-            format!("\0snapshot:{}:{}", op_id, path)
+        BufferSource::HistoryVersion { op_id, path } => {
+            format!("\0history:{}:{}", op_id, path)
         }
         BufferSource::PendingProposal { proposal_id, .. } => {
             format!("\0pending:{}", proposal_id)

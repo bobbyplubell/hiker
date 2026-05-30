@@ -109,8 +109,23 @@ pub enum ChatEvent {
     },
 }
 
-/// App-level chat registry. Lives on `AppState`. `tx` is cheap-cloned
-/// into spawned reply tasks; `rx` is drained each frame by
+/// Per-feature chat state. Held on `AppState` as the top-level
+/// `chat_state` field; the chat sidebar surface downcasts the
+/// `feature::Ctx::state` opaque slot to `&mut State`. Owns the
+/// in-memory session registry plus the one-shot "have we walked the
+/// sessions dir yet" gate. Relocated off `Session::chat` /
+/// `Session::chat_discovered` during the chat feature migration.
+#[derive(Default)]
+pub struct State {
+    /// The in-memory chat registry (sessions, drafts, reply channel).
+    pub registry: ChatRegistry,
+    /// True once `session::discover` has been called for this vault —
+    /// keeps the lazy disk walk from running every frame.
+    pub discovered: bool,
+}
+
+/// App-level chat registry. Lives inside the feature's `State`. `tx` is
+/// cheap-cloned into spawned reply tasks; `rx` is drained each frame by
 /// `pump_events`.
 pub struct ChatRegistry {
     pub sessions: HashMap<String, ChatSession>,
@@ -200,7 +215,7 @@ mod sniff_tests {
         let reg = ChatRegistry::default();
         assert_eq!(
             reg.sniff_target_path_from_result(
-                r#"{"status":"staged","staging_id":"01H","target_path":"a/b.md"}"#
+                r#"{"status":"staged","proposal_id":"01H","target_path":"a/b.md"}"#
             ),
             Some("a/b.md".to_string()),
         );
@@ -220,7 +235,7 @@ mod sniff_tests {
         // review.
         assert!(reg.result_produced_write(r#"{"status":"written"}"#));
         // Legacy review mode still reports `staged`.
-        assert!(reg.result_produced_write(r#"{"status":"staged","staging_id":"01HXAB"}"#));
+        assert!(reg.result_produced_write(r#"{"status":"staged","proposal_id":"01HXAB"}"#));
     }
 
     #[test]

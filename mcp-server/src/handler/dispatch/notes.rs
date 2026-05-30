@@ -244,7 +244,7 @@ impl App {
     /// Stage a whole-body rewrite (`write_note` / `set_frontmatter` /
     /// `apply_tag` / `remove_tag` review shapes) as one anchorless op-log
     /// pending op authored `agent:<client_id>`, returning the minted op id
-    /// for the tool's `staging_id` field. The op-log diffs the new text
+    /// for the tool's `proposal_id` field. The op-log diffs the new text
     /// against current accepted, so an unchanged whole-body produces no op
     /// (returns `None`).
     pub(super) fn stage_whole_body(
@@ -290,13 +290,13 @@ impl App {
                     None,
                 )
             })?;
-            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &p.content)?;
+            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &p.content)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id,
+                    proposal_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -321,7 +321,7 @@ impl App {
                     rel_path: p.rel_path.clone(),
                     content_hash: new_hash,
                     status: None,
-                    staging_id: None,
+                    proposal_id: None,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -487,7 +487,7 @@ impl App {
                     status: "staged",
                     edit_count: p.edits.len() as u32,
                     content_hash: None,
-                    staging_ids: outcome.op_ids,
+                    proposal_ids: outcome.op_ids,
                     batch_id: Some(outcome.batch_id),
                 })
                 .unwrap_or(serde_json::Value::Null),
@@ -530,7 +530,7 @@ impl App {
                 status: "written",
                 edit_count: p.edits.len() as u32,
                 content_hash: Some(new_hash),
-                staging_ids: Vec::new(),
+                proposal_ids: Vec::new(),
                 batch_id: None,
             })
             .unwrap_or(serde_json::Value::Null),
@@ -572,13 +572,13 @@ impl App {
                 serde_json::Value::Object(p.fields.clone()),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
+            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id,
+                    proposal_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -602,7 +602,7 @@ impl App {
                     rel_path: p.rel_path.clone(),
                     content_hash: new_hash,
                     status: None,
-                    staging_id: None,
+                    proposal_id: None,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -666,13 +666,13 @@ impl App {
                 serde_json::json!({"tags": tags}),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let staging_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
+            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
                     content_hash: String::new(),
                     status: Some("staged".into()),
-                    staging_id,
+                    proposal_id,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))
@@ -695,7 +695,7 @@ impl App {
                     rel_path: p.rel_path.clone(),
                     content_hash: new_hash,
                     status: None,
-                    staging_id: None,
+                    proposal_id: None,
                 })
                 .unwrap_or(serde_json::Value::Null),
             ))

@@ -32,8 +32,8 @@ use crate::state::{NavState, Services, Toast};
 /// here. Surface accessors default to `None` so a new feature only
 /// implements the surfaces it wants.
 pub trait Feature: Send + Sync {
-    /// Stable kebab-case id, e.g. `"clusters"`. Used as the dispatch key
-    /// from `SidebarMode::Feature` and persisted in settings.
+    /// Stable kebab-case id, e.g. `"clusters"`. Used as the feature
+    /// dispatch key and persisted in settings.
     fn id(&self) -> &'static str;
     /// Human-facing label, e.g. `"Cluster trees"`.
     fn label(&self) -> &'static str;
@@ -47,6 +47,14 @@ pub trait Feature: Send + Sync {
 
     fn sidebar(&self) -> Option<&dyn SidebarSurface> {
         None
+    }
+    /// Whether this feature belongs on the PRIMARY (left) activity bar.
+    /// Default: any feature with a `sidebar()` surface is a primary
+    /// activity mode. Secondary-dock-only features (chat, which renders
+    /// in the right side bar, not as an activity mode) override this to
+    /// `false`. [feature-consumer-activity-bar]
+    fn primary_activity(&self) -> bool {
+        self.sidebar().is_some()
     }
     fn panel(&self) -> Option<&dyn PanelSurface> {
         None
@@ -162,11 +170,41 @@ pub struct Ctx<'a> {
     pub nav: &'a mut NavState,
     pub toasts: &'a mut Vec<Toast>,
     pub config: &'a Arc<RwLock<Config>>,
+    /// Read handle to the open vault (list/read files). Shared because
+    /// several features scan or read vault contents during render
+    /// (backlinks, related, search). A disjoint borrow of
+    /// `vault_session.vault`, alongside the `&mut services` borrow.
+    pub vault: &'a Arc<hiker_core::vault::Vault>,
     /// Per-feature opaque state slice. Each feature downcasts to its
     /// own state struct (e.g.
     /// `ctx.state.downcast_mut::<State>().unwrap()`). The
     /// registry shell never sees the concrete type.
     pub state: &'a mut dyn Any,
+    /// Vault-relative path of the active note, if a buffer is focused.
+    /// A cheap read filled at ctx-build time so a surface reads "the
+    /// current note" here instead of reaching into `session`. Shared
+    /// because ≥2 features (backlinks, related, search, ...) need it.
+    pub active_path: Option<String>,
+    /// Deferred-effect sink. A surface pushes closures here (via
+    /// [`Ctx::defer`]) for cross-cutting effects that need broad
+    /// `&mut AppState` (open a note, reveal a path) and so can't run
+    /// inside the narrow ctx borrow. The consumer drains them right
+    /// after the surface returns. Mirrors helix's compositor callback
+    /// queue; closures reuse the existing `&mut AppState` helpers.
+    pub effects: &'a mut Vec<Effect>,
+}
+
+/// A deferred effect queued by a feature surface and applied by the
+/// consumer after the surface returns, with full `&mut AppState`.
+pub type Effect = Box<dyn FnOnce(&mut crate::state::AppState)>;
+
+impl Ctx<'_> {
+    /// Queue a cross-cutting effect to run after the surface returns,
+    /// with full `&mut AppState`. Use for "open this note", "reveal in
+    /// tree", etc. — anything the narrow ctx can't do inline.
+    pub fn defer(&mut self, f: impl FnOnce(&mut crate::state::AppState) + 'static) {
+        self.effects.push(Box::new(f));
+    }
 }
 
 // ---- Registry --------------------------------------------------------
@@ -222,11 +260,6 @@ impl Registry {
 
 // ---- Builtins --------------------------------------------------------
 
-/// Construct the built-in feature list. v1 ships the migrated
-/// `Clusters` feature only; remaining surfaces (Files, Trails, Search,
-/// Related, Backlinks) still render through legacy hardcoded paths and
-/// will move here as they migrate (Phase 2+). Plugins are appended
-/// after built-ins by callers once Phase 3's adapter lands.
 /// Build a `Ctx` borrow scoped to `feature_id` and run `f` against
 /// it. Returns `None` when the feature id doesn't resolve to a state
 /// slice on `AppState` (Phase 2 wires only the migrated features).
@@ -238,12 +271,27 @@ impl Registry {
 pub fn with_ctx<R>(
     app: &mut crate::state::AppState,
     feature_id: &str,
+    effects: &mut Vec<Effect>,
     f: impl FnOnce(&mut Ctx<'_>) -> R,
 ) -> Option<R> {
+    // Compute the active note path first (immutable read, released
+    // before the disjoint &mut field borrows below).
+    let active_path = app
+        .session
+        .active_tab
+        .and_then(|id| app.tab_by_id(id))
+        .and_then(crate::tab::Tab::buffer_path)
+        .map(str::to_string);
     let state: &mut dyn Any = match feature_id {
+        "files" => &mut app.file_tree_state,
         "clusters" => &mut app.clusters_state,
         "trails" => &mut app.trails_state,
-        "vault" => &mut app.panels.vault_view,
+        "vault" => &mut app.vault_state,
+        "backlinks" => &mut app.backlinks_state,
+        "related" => &mut app.related_state,
+        "search" => &mut app.search_state,
+        "trash" => &mut app.trash_state,
+        "chat" => &mut app.chat_state,
         _ => return None,
     };
     let mut ctx = Ctx {
@@ -251,7 +299,10 @@ pub fn with_ctx<R>(
         nav: &mut app.session.nav,
         toasts: &mut app.toasts,
         config: &app.vault_session.config,
+        vault: &app.vault_session.vault,
         state,
+        active_path,
+        effects,
     };
     Some(f(&mut ctx))
 }
@@ -267,14 +318,27 @@ pub fn dispatch_hamburger(app: &mut crate::state::AppState, feature_id: &str) {
     let Some(entry) = feature.hamburger() else {
         return;
     };
-    with_ctx(app, feature_id, |ctx| entry.invoke(ctx));
+    let mut effects: Vec<Effect> = Vec::new();
+    with_ctx(app, feature_id, &mut effects, |ctx| entry.invoke(ctx));
+    for eff in effects {
+        eff(app);
+    }
 }
 
+/// Construct the built-in feature list in sidebar/activity-bar order.
+/// `Files` is first (the primary mode). Plugins are appended after
+/// built-ins by callers once Phase 3's adapter lands.
 pub fn builtin_features() -> Vec<Arc<dyn Feature>> {
     vec![
+        Arc::new(crate::files::Files) as Arc<dyn Feature>,
         Arc::new(crate::clusters::Clusters) as Arc<dyn Feature>,
         Arc::new(crate::trails::Trails) as Arc<dyn Feature>,
         Arc::new(crate::vault_view::Vault) as Arc<dyn Feature>,
+        Arc::new(crate::backlinks::Backlinks) as Arc<dyn Feature>,
+        Arc::new(crate::related::Related) as Arc<dyn Feature>,
+        Arc::new(crate::search::Search) as Arc<dyn Feature>,
+        Arc::new(crate::trash::Trash) as Arc<dyn Feature>,
+        Arc::new(crate::chat::Chat) as Arc<dyn Feature>,
     ]
 }
 
@@ -387,12 +451,24 @@ mod registry_tests {
         // `MaybeUninit` does not run `Drop`.
         let services_ref: &mut crate::state::Services =
             unsafe { &mut *services_uninit.as_mut_ptr() };
+        // Same punt for `vault`: the echo features under test never read
+        // it, so an uninit `Arc<Vault>` reference is never dereferenced.
+        // `MaybeUninit` does not run `Drop`, so the uninit Arc is never
+        // dropped either.
+        let vault_uninit: MaybeUninit<std::sync::Arc<hiker_core::vault::Vault>> =
+            MaybeUninit::uninit();
+        let vault_ref: &std::sync::Arc<hiker_core::vault::Vault> =
+            unsafe { &*vault_uninit.as_ptr() };
+        let mut effects: Vec<Effect> = Vec::new();
         let mut ctx = Ctx {
             services: services_ref,
             nav: &mut nav,
             toasts: &mut toasts,
             config: &cfg,
+            vault: vault_ref,
             state,
+            active_path: None,
+            effects: &mut effects,
         };
         f(&mut ctx)
     }
@@ -401,7 +477,13 @@ mod registry_tests {
     fn builtins_in_expected_order() {
         let reg = Registry::build(builtin_features());
         let ids: Vec<&str> = reg.iter().map(|f| f.id()).collect();
-        assert_eq!(ids, vec!["clusters", "trails", "vault"]);
+        assert_eq!(
+            ids,
+            vec![
+                "files", "clusters", "trails", "vault", "backlinks", "related", "search", "trash",
+                "chat"
+            ]
+        );
     }
 
     #[test]

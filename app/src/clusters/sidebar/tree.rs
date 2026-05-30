@@ -23,8 +23,10 @@ use std::sync::Arc;
 use eframe::egui;
 use hiker_core::trees::types::{Db, EditableNode, Error, NodeInsert, NodeKind, NodePolicy};
 
-use super::{mark_dirty, regenerate_names, summarize_subset, ClusterCtx};
-use crate::state::{AppState, ToastLevel};
+use super::{push_toast, regenerate_names, summarize_subset, ClusterCtx};
+use crate::clusters::state::State;
+use crate::feature::Ctx;
+use crate::state::{Toast, ToastLevel};
 use crate::theme;
 
 /// Drag-and-drop payload — the node id being dragged.
@@ -33,7 +35,7 @@ pub(super) struct DragNode {
     pub node_id: String,
 }
 
-impl ClusterCtx<'_> {
+impl ClusterCtx<'_, '_> {
 pub(super) fn show_tree(
     &mut self,
     ui: &mut egui::Ui,
@@ -43,7 +45,7 @@ pub(super) fn show_tree(
     // hydrated once per dirty cycle so we don't pay for this every row.
     let mut by_parent: std::collections::HashMap<Option<String>, Vec<EditableNode>> =
         std::collections::HashMap::new();
-    for n in self.state.clusters_state.nodes.iter().cloned() {
+    for n in self.st().nodes.iter().cloned() {
         by_parent.entry(n.parent.clone()).or_default().push(n);
     }
     for kids in by_parent.values_mut() {
@@ -78,7 +80,7 @@ fn render_node(
         .get(&Some(node.id.clone()))
         .map(|c| !c.is_empty())
         .unwrap_or(false);
-    let expanded = self.state.clusters_state.expanded.contains(&node.id);
+    let expanded = self.st().expanded.contains(&node.id);
 
     self.paint_row(ui, tree_id, node, depth, has_children, expanded);
 
@@ -107,7 +109,7 @@ fn paint_row(
     );
 
     // Hover highlight + selection highlight.
-    let is_selected = self.state.clusters_state.selected_nodes.contains(&node.id);
+    let is_selected = self.st().selected_nodes.contains(&node.id);
     if is_selected {
         ui.painter().rect_filled(rect, 2.0, theme::active_bg());
     } else if ui.rect_contains_pointer(rect) {
@@ -163,10 +165,10 @@ fn paint_row(
     if row_response.clicked() {
         let multi = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
         if multi {
-            if self.state.clusters_state.selected_nodes.contains(&node.id) {
-                self.state.clusters_state.selected_nodes.remove(&node.id);
+            if self.st().selected_nodes.contains(&node.id) {
+                self.st().selected_nodes.remove(&node.id);
             } else {
-                self.state.clusters_state.selected_nodes.insert(node.id.clone());
+                self.st().selected_nodes.insert(node.id.clone());
             }
         } else if node.kind == NodeKind::Leaf {
             self.open_leaf(node);
@@ -189,8 +191,9 @@ fn row_contents(
     has_children: bool,
     expanded: bool,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let trees = self.trees.clone();
+    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
+    let toasts = &mut *self.ctx.toasts;
     // Chevron / spacer. Folders that can expand get a clickable SVG
     // chevron; leaf nodes get a same-width spacer so siblings align.
     let chev_size = egui::vec2(14.0, 14.0);
@@ -203,7 +206,7 @@ fn row_contents(
         let chev_btn = egui::ImageButton::new(icon).frame(false);
         let chev_resp = ui.add_sized(chev_size, chev_btn);
         if chev_resp.clicked() {
-            let expanded_set = &mut state.clusters_state.expanded;
+            let expanded_set = &mut state.expanded;
             if expanded_set.contains(&node.id) {
                 expanded_set.remove(&node.id);
             } else {
@@ -224,13 +227,11 @@ fn row_contents(
 
     // Name (inline-editable for clusters, read-only for leaves).
     let is_renaming = state
-        .clusters_state
         .renaming
         .as_ref()
         .is_some_and(|(id, _)| id == &node.id);
     if is_renaming {
         let mut draft = state
-            .clusters_state
             .renaming
             .as_ref()
             .map(|(_, t)| t.clone())
@@ -242,23 +243,24 @@ fn row_contents(
         );
         resp.request_focus();
         // Persist back.
-        state.clusters_state.renaming = Some((node.id.clone(), draft.clone()));
+        state.renaming = Some((node.id.clone(), draft.clone()));
         let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let cancel = resp.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Enter));
         if commit {
             let trimmed = draft.trim();
-            state.clusters_state.renaming = None;
+            state.renaming = None;
             if !trimmed.is_empty() {
                 match trees.rename(tree_id, &node.id, trimmed) {
-                    Ok(()) => super::mark_dirty(state),
-                    Err(err) => state.push_toast(
+                    Ok(()) => state.mark_dirty(),
+                    Err(err) => push_toast(
+                        toasts,
                         format!("Rename failed: {}", err),
-                        crate::state::ToastLevel::Error,
+                        ToastLevel::Error,
                     ),
                 }
             }
         } else if cancel {
-            state.clusters_state.renaming = None;
+            state.renaming = None;
         }
     } else {
         let mut text = egui::RichText::new(&node.name).size(13.0);
@@ -270,7 +272,7 @@ fn row_contents(
             .sense(egui::Sense::click());
         let resp = ui.add(label);
         if resp.double_clicked() && node.kind != NodeKind::Leaf {
-            state.clusters_state.renaming = Some((node.id.clone(), node.name.clone()));
+            state.renaming = Some((node.id.clone(), node.name.clone()));
         }
     }
 }
@@ -286,20 +288,14 @@ fn handle_drop(
     // dragged node.
     if let Some(np) = new_parent {
         if self.is_descendant_of(np, dragged_id) || np == dragged_id {
-            self.state.push_toast(
-                "Cannot move a node into its own subtree",
-                crate::state::ToastLevel::Warn,
-            );
+            self.toast("Cannot move a node into its own subtree", ToastLevel::Warn);
             return;
         }
     }
-    let trees = self.trees;
+    let trees = self.trees.clone();
     match trees.move_node(tree_id, dragged_id, new_parent) {
-        Ok(()) => super::mark_dirty(self.state),
-        Err(err) => self.state.push_toast(
-            format!("Move failed: {}", err),
-            crate::state::ToastLevel::Error,
-        ),
+        Ok(()) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Move failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -310,7 +306,7 @@ fn is_descendant_of(
     descendant_root: &str,
     candidate: &str,
 ) -> bool {
-    let nodes = &self.state.clusters_state.nodes;
+    let nodes = &self.st_ref().nodes;
     // Walk up from `descendant_root` to root. If we ever see `candidate`,
     // we'd be dropping `candidate` inside its own subtree.
     let mut cur = Some(descendant_root.to_string());
@@ -324,26 +320,17 @@ fn is_descendant_of(
 }
 
 fn open_leaf(&mut self, node: &EditableNode) {
-    let state = &mut *self.state;
-    let Some(note_id) = node.note_ref.as_deref() else {
+    // Path-as-identity: the leaf carries the source note's vault-relative
+    // path directly, so open it with no doc-id resolution. Defer the actual
+    // open — `open_file` needs full `&mut AppState`, which the narrow ctx
+    // can't grant inline.
+    let Some(rel) = node.note_path.as_deref() else {
         return;
     };
-    // Resolve note_id → vault-relative path via the op log (per the
-    // `store-id-from-oplog` rework; the read store no longer carries this
-    // mapping). Clone the Arc so we can release the borrow on `state`
-    // before calling `push_toast` / `open_file` (both need `&mut state`).
-    let oplog = state.vault_session.services.oplog.clone();
-    let lookup: Result<Option<String>, String> = oplog
-        .path_for_doc(note_id)
-        .map_err(|e| e.to_string());
-    match lookup {
-        Ok(Some(rel)) => crate::editor_pane::open_file(state, &rel, /* sticky */ false),
-        Ok(None) => state.push_toast(
-            format!("Note {} no longer in index", note_id),
-            crate::state::ToastLevel::Warn,
-        ),
-        Err(err) => state.push_toast(format!("Lookup failed: {}", err), crate::state::ToastLevel::Error),
-    }
+    let rel = rel.to_string();
+    self.ctx.defer(move |app| {
+        crate::editor_pane::open_file(app, &rel, /* sticky */ false);
+    });
 }
 
 // ── Per-row right-click context menu ──────────────────────────────────
@@ -362,11 +349,11 @@ pub(super) fn node_context_menu(
     let is_leaf = node.kind == NodeKind::Leaf;
 
     if !is_leaf && ui.button("Rename").clicked() {
-        self.state.clusters_state.renaming = Some((node.id.clone(), node.name.clone()));
+        self.st().renaming = Some((node.id.clone(), node.name.clone()));
         ui.close();
     }
     if !is_leaf && ui.button("Edit summary…").clicked() {
-        self.state.clusters_state.editing_summary = Some((node.id.clone(), node.summary.clone()));
+        self.st().editing_summary = Some((node.id.clone(), node.summary.clone()));
         ui.close();
     }
     if is_cluster {
@@ -388,7 +375,7 @@ pub(super) fn node_context_menu(
             .clicked()
         {
             let ids = vec![node.id.clone()];
-            super::summarize_subset(self.state, self.trees, tree_id, &ids);
+            summarize_subset(self, tree_id, &ids);
             ui.close();
         }
         if ui.button("Merge children up").on_hover_text(
@@ -406,7 +393,7 @@ pub(super) fn node_context_menu(
         let parent_is_outlier_bucket = node
             .parent
             .as_ref()
-            .and_then(|pid| self.state.clusters_state.nodes.iter().find(|n| &n.id == pid))
+            .and_then(|pid| self.st_ref().nodes.iter().find(|n| &n.id == pid))
             .is_some_and(|p| p.kind == NodeKind::OutlierBucket);
         if parent_is_outlier_bucket && ui.button("Promote out of outliers…").clicked() {
             // v0: route through the Move to… picker.
@@ -427,7 +414,7 @@ pub(super) fn node_context_menu(
         });
     }
     if ui.button("Collapse all").clicked() {
-        self.state.clusters_state.expanded.clear();
+        self.st().expanded.clear();
         ui.close();
     }
 }
@@ -438,8 +425,9 @@ fn policy_submenu(
     tree_id: &str,
     node: &EditableNode,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let trees = self.trees.clone();
+    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
+    let toasts = &mut *self.ctx.toasts;
     let current = node.policy.clone();
     let is_freeze = matches!(current, Some(NodePolicy::Freeze));
     let is_tag = matches!(current, Some(NodePolicy::Tag { .. }));
@@ -449,7 +437,7 @@ fn policy_submenu(
         .on_hover_text("Clear any policy from this cluster")
         .clicked()
     {
-        apply_policy(state, trees, tree_id, &node.id, None);
+        apply_policy(state, toasts, &trees, tree_id, &node.id, None);
         ui.close();
     }
     if ui
@@ -457,7 +445,7 @@ fn policy_submenu(
         .on_hover_text("Reclustering won't touch this subtree")
         .clicked()
     {
-        apply_policy(state, trees, tree_id, &node.id, Some(&NodePolicy::Freeze));
+        apply_policy(state, toasts, &trees, tree_id, &node.id, Some(&NodePolicy::Freeze));
         ui.close();
     }
     let (existing_tag_slug, existing_tag_req) = match &node.policy {
@@ -468,7 +456,7 @@ fn policy_submenu(
         .selectable_label(is_tag, "Set Tag policy…")
         .clicked()
     {
-        state.clusters_state.editing_tag_policy =
+        state.editing_tag_policy =
             Some((node.id.clone(), existing_tag_slug, existing_tag_req));
         ui.close();
     }
@@ -480,7 +468,7 @@ fn policy_submenu(
         .selectable_label(is_move, "Set Move policy…")
         .clicked()
     {
-        state.clusters_state.editing_move_policy =
+        state.editing_move_policy =
             Some((node.id.clone(), existing_move_folder, existing_move_req));
         ui.close();
     }
@@ -491,11 +479,10 @@ fn merge_children_up(
     tree_id: &str,
     node: &EditableNode,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let trees = self.trees.clone();
     match trees.merge_children_up(tree_id, &node.id) {
-        Ok(()) => super::mark_dirty(state),
-        Err(err) => state.push_toast(format!("Merge failed: {}", err), ToastLevel::Error),
+        Ok(()) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Merge failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -505,11 +492,11 @@ fn show_merge_siblings(
     tree_id: &str,
     node: &EditableNode,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let trees = self.trees.clone();
+    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
+    let toasts = &mut *self.ctx.toasts;
     let parent = node.parent.clone();
     let siblings: Vec<EditableNode> = state
-        .clusters_state
         .nodes
         .iter()
         .filter(|n| {
@@ -528,8 +515,9 @@ fn show_merge_siblings(
         if ui.button(label).clicked() {
             let ids = vec![node.id.clone(), sib.id.clone()];
             match trees.merge_siblings(tree_id, &ids) {
-                Ok(_) => super::mark_dirty(state),
-                Err(err) => state.push_toast(
+                Ok(_) => state.mark_dirty(),
+                Err(err) => push_toast(
+                    toasts,
                     format!("Merge siblings failed: {}", err),
                     ToastLevel::Error,
                 ),
@@ -544,21 +532,20 @@ fn drop_cluster(
     tree_id: &str,
     node: &EditableNode,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
-    let Some(bucket) = state
-        .clusters_state
+    let trees = self.trees.clone();
+    let Some(bucket) = self
+        .st_ref()
         .nodes
         .iter()
         .find(|n| n.kind == NodeKind::OutlierBucket)
         .cloned()
     else {
-        state.push_toast("This tree has no outlier bucket", ToastLevel::Warn);
+        self.toast("This tree has no outlier bucket", ToastLevel::Warn);
         return;
     };
     match trees.drop_cluster(tree_id, &node.id, &bucket.id) {
-        Ok(()) => super::mark_dirty(state),
-        Err(err) => state.push_toast(format!("Drop failed: {}", err), ToastLevel::Error),
+        Ok(()) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Drop failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -567,21 +554,20 @@ fn promote_to_outlier_bucket(
     tree_id: &str,
     node: &EditableNode,
 ) {
-    let state = &mut *self.state;
-    let trees = self.trees;
-    let Some(bucket) = state
-        .clusters_state
+    let trees = self.trees.clone();
+    let Some(bucket) = self
+        .st_ref()
         .nodes
         .iter()
         .find(|n| n.kind == NodeKind::OutlierBucket)
         .cloned()
     else {
-        state.push_toast("This tree has no outlier bucket", ToastLevel::Warn);
+        self.toast("This tree has no outlier bucket", ToastLevel::Warn);
         return;
     };
     match trees.promote_outlier(tree_id, &node.id, Some(&bucket.id)) {
-        Ok(()) => super::mark_dirty(state),
-        Err(err) => state.push_toast(format!("Move failed: {}", err), ToastLevel::Error),
+        Ok(()) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Move failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -592,10 +578,10 @@ fn show_move_targets(
     node: &EditableNode,
 ) {
     let descendants = self.collect_descendants(&node.id);
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let trees = self.trees.clone();
+    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
+    let toasts = &mut *self.ctx.toasts;
     let candidates: Vec<EditableNode> = state
-        .clusters_state
         .nodes
         .iter()
         .filter(|n| {
@@ -619,8 +605,9 @@ fn show_move_targets(
                 trees.move_node(tree_id, &node.id, Some(&c.id))
             };
             match result {
-                Ok(()) => super::mark_dirty(state),
-                Err(err) => state.push_toast(
+                Ok(()) => state.mark_dirty(),
+                Err(err) => push_toast(
+                    toasts,
                     format!("Move failed: {}", err),
                     ToastLevel::Error,
                 ),
@@ -636,7 +623,7 @@ fn collect_descendants(
     &self,
     root: &str,
 ) -> std::collections::HashSet<String> {
-    let nodes = &self.state.clusters_state.nodes;
+    let nodes = &self.st_ref().nodes;
     let mut out = std::collections::HashSet::new();
     let mut stack = vec![root.to_string()];
     while let Some(id) = stack.pop() {
@@ -651,15 +638,16 @@ fn collect_descendants(
 }
 
 fn apply_policy(
-    state: &mut AppState,
+    state: &mut State,
+    toasts: &mut Vec<Toast>,
     trees: &Arc<Db>,
     tree_id: &str,
     node_id: &str,
     policy: Option<&NodePolicy>,
 ) {
     match trees.set_policy(tree_id, node_id, policy) {
-        Ok(()) => super::mark_dirty(state),
-        Err(err) => state.push_toast(format!("Set policy failed: {}", err), ToastLevel::Error),
+        Ok(()) => state.mark_dirty(),
+        Err(err) => push_toast(toasts, format!("Set policy failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -680,7 +668,7 @@ fn apply_policy(
 /// `summary` is empty, and which has not been user-edited. The tree is
 /// considered to be in placeholder-name state if it has at least one
 /// cluster and *every* cluster matches the placeholder shape.
-impl ClusterCtx<'_> {
+impl ClusterCtx<'_, '_> {
 fn tree_has_placeholder_names(&self) -> bool {
     // Placeholder ≡ cluster node whose name matches `^Cluster \d+$`,
     // whose summary is empty, and which has not been user-edited.
@@ -692,7 +680,7 @@ fn tree_has_placeholder_names(&self) -> bool {
         }
     };
     let mut saw_cluster = false;
-    for n in &self.state.clusters_state.nodes {
+    for n in &self.st_ref().nodes {
         if !matches!(n.kind, NodeKind::Cluster) {
             continue;
         }
@@ -708,17 +696,22 @@ fn tree_has_placeholder_names(&self) -> bool {
 }
 
 pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
-    let Some(tree_id) = self.state.clusters_state.selected_tree.clone() else {
+    let Some(tree_id) = self.st().selected_tree.clone() else {
         return;
     };
     let placeholder_state = self.tree_has_placeholder_names();
-    // Undo/redo are applied after the layout closure so their redo-stack
-    // bookkeeping can be `&mut self` methods rather than reaching into the
-    // closure's reborrowed `state`/`trees`.
+    // Undo/redo + the LLM jobs + the graph tab are applied after the
+    // layout closure so their bookkeeping can be `&mut self` methods
+    // (or `ctx.defer`) rather than reaching into the closure's
+    // reborrowed `state`/`trees`/`toasts`.
     let mut undo_clicked = false;
     let mut redo_clicked = false;
-    let state = &mut *self.state;
-    let trees = self.trees;
+    let mut summarize_ids: Option<Vec<String>> = None;
+    let mut regenerate_clicked = false;
+    let mut graph_clicked = false;
+    let trees = self.trees.clone();
+    let Ctx { state, toasts, .. } = &mut *self.ctx;
+    let state = state.downcast_mut::<State>().expect("clusters state");
     ui.horizontal_wrapped(|ui| {
         if ui
             .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Undo), "Undo").small())
@@ -728,7 +721,6 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
             undo_clicked = true;
         }
         let redo_has = state
-            .clusters_state
             .redo_stacks
             .get(&tree_id)
             .map(|s| !s.is_empty())
@@ -745,33 +737,31 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         }
         ui.separator();
         // Selection-aware actions.
-        let selected_count = state.clusters_state.selected_nodes.len();
+        let selected_count = state.selected_nodes.len();
         if selected_count > 0 {
             ui.label(
                 egui::RichText::new(format!("{selected_count} selected"))
                     .small()
                     .color(theme::muted()),
             );
-            let llm_busy = state.clusters_state.llm_job_in_flight;
+            let llm_busy = state.llm_job_in_flight;
             if ui
                 .add_enabled(!llm_busy, egui::Button::new("Summarize subset").small())
                 .on_hover_text(if llm_busy { "LLM naming in flight" } else { "Summarize the selected clusters via the LLM" })
                 .clicked()
             {
-                let ids: Vec<String> =
-                    state.clusters_state.selected_nodes.iter().cloned().collect();
-                summarize_subset(state, trees, &tree_id, &ids);
+                summarize_ids = Some(state.selected_nodes.iter().cloned().collect());
             }
             let resp_stage_move = ui.small_button("Stage moves…");
             if resp_stage_move.clicked() {
-                state.clusters_state.editing_stage_move_target = Some(String::new());
+                state.editing_stage_move_target = Some(String::new());
             }
             let resp_stage_tag = ui.small_button("Stage tags…");
             if resp_stage_tag.clicked() {
-                state.clusters_state.editing_stage_tag_slug = Some(String::new());
+                state.editing_stage_tag_slug = Some(String::new());
             }
             if ui.small_button("Clear selection").clicked() {
-                state.clusters_state.selected_nodes.clear();
+                state.selected_nodes.clear();
             }
             ui.separator();
         }
@@ -793,7 +783,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
                 "LLM-rename every cluster not user-edited",
             )
         };
-        let llm_busy = state.clusters_state.llm_job_in_flight;
+        let llm_busy = state.llm_job_in_flight;
         let busy_hover = "LLM naming in flight";
         let effective_hover = if llm_busy { busy_hover } else { hover };
         let clicked = if placeholder_state {
@@ -814,29 +804,21 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
                 .clicked()
         };
         if clicked {
-            regenerate_names(state, trees, &tree_id);
+            regenerate_clicked = true;
         }
         if ui
             .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Settings), "Params").small())
             .on_hover_text("Advanced clustering parameters")
             .clicked()
         {
-            state.clusters_state.showing_advanced_params = !state.clusters_state.showing_advanced_params;
+            state.showing_advanced_params = !state.showing_advanced_params;
         }
         if ui
             .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Graph), "Graph view").small())
             .on_hover_text("Open a radial graph of this cluster tree")
             .clicked()
         {
-            use crate::tab::TabKind;
-            // Singleton-per-tree: focus an existing graph tab if one's
-            // open. Otherwise spawn a fresh ClusterGraph tab.
-            let tid = tree_id.clone();
-            let tid_for_build = tid.clone();
-            state.find_or_open_tab(
-                |k| matches!(k, TabKind::ClusterGraph { tree_id: x } if x == &tid),
-                || TabKind::ClusterGraph { tree_id: tid_for_build },
-            );
+            graph_clicked = true;
         }
         if ui
             .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Trash), "Discard tree").small())
@@ -845,17 +827,18 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         {
             match trees.delete_tree(&tree_id) {
                 Ok(()) => {
-                    state.push_toast("Tree discarded", crate::state::ToastLevel::Info);
-                    state.clusters_state.selected_tree = None;
-                    state.clusters_state.nodes.clear();
-                    state.clusters_state.selected_nodes.clear();
-                    state.clusters_state.redo_stacks.remove(&tree_id);
-                    state.clusters_state.loaded = false;
-                    state.clusters_state.dirty = true;
+                    push_toast(toasts, "Tree discarded", ToastLevel::Info);
+                    state.selected_tree = None;
+                    state.nodes.clear();
+                    state.selected_nodes.clear();
+                    state.redo_stacks.remove(&tree_id);
+                    state.loaded = false;
+                    state.dirty = true;
                 }
-                Err(err) => state.push_toast(
+                Err(err) => push_toast(
+                    toasts,
                     format!("Discard failed: {err}"),
-                    crate::state::ToastLevel::Error,
+                    ToastLevel::Error,
                 ),
             }
         }
@@ -866,7 +849,27 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     if redo_clicked {
         self.perform_redo(&tree_id);
     }
-    if self.state.clusters_state.showing_advanced_params {
+    if let Some(ids) = summarize_ids {
+        summarize_subset(self, &tree_id, &ids);
+    }
+    if regenerate_clicked {
+        regenerate_names(self, &tree_id);
+    }
+    if graph_clicked {
+        // Singleton-per-tree: focus an existing graph tab if one's open;
+        // otherwise spawn a fresh ClusterGraph tab. Needs full
+        // `&mut AppState`, so defer past the narrow ctx borrow.
+        let tid = tree_id.clone();
+        self.ctx.defer(move |app| {
+            use crate::tab::TabKind;
+            let tid_for_build = tid.clone();
+            app.find_or_open_tab(
+                |k| matches!(k, TabKind::ClusterGraph { tree_id: x } if x == &tid),
+                || TabKind::ClusterGraph { tree_id: tid_for_build },
+            );
+        });
+    }
+    if self.st().showing_advanced_params {
         self.advanced_params_popover(ui);
     }
 }
@@ -889,35 +892,31 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
 /// interactively.
 const REDO_STACK_CAP: usize = 32;
 
-impl ClusterCtx<'_> {
+impl ClusterCtx<'_, '_> {
 /// Toolbar "Undo" click: pop+invert the last history row, toast the
 /// outcome, and push the popped entry onto the bounded per-tree redo
 /// stack. A `&mut self` method (the toolbar's only caller) so the
 /// redo-stack bookkeeping stays out of the button-layout closure.
 fn perform_undo(&mut self, tree_id: &str) {
-    let trees = self.trees;
-    let state = &mut *self.state;
-    match (TreeUndo { trees, tree_id }).undo() {
+    let trees = self.trees.clone();
+    match (TreeUndo { trees: &trees, tree_id }).undo() {
         Ok((op, entry)) => {
-            state.push_toast(format!("Undid '{op}'"), ToastLevel::Info);
-            let stack = state
-                .clusters_state
-                .redo_stacks
-                .entry(tree_id.to_string())
-                .or_default();
+            self.toast(format!("Undid '{op}'"), ToastLevel::Info);
+            let st = self.st();
+            let stack = st.redo_stacks.entry(tree_id.to_string()).or_default();
             if stack.len() >= REDO_STACK_CAP {
                 // Drop the oldest (front) so the most recent undos stay
                 // redoable.
                 stack.remove(0);
             }
             stack.push(entry);
-            mark_dirty(state);
+            st.mark_dirty();
         }
         Err(UndoError::NothingToUndo) => {
-            state.push_toast("Nothing to undo", ToastLevel::Info);
+            self.toast("Nothing to undo", ToastLevel::Info);
         }
         Err(err) => {
-            state.push_toast(format!("Undo failed: {err}"), ToastLevel::Error);
+            self.toast(format!("Undo failed: {err}"), ToastLevel::Error);
         }
     }
 }
@@ -926,22 +925,21 @@ fn perform_undo(&mut self, tree_id: &str) {
 /// stack and re-apply it, toasting the outcome. No-op when the stack is
 /// empty (the button is disabled in that case anyway).
 fn perform_redo(&mut self, tree_id: &str) {
-    let trees = self.trees;
-    let state = &mut *self.state;
-    let Some(entry) = state
-        .clusters_state
+    let trees = self.trees.clone();
+    let Some(entry) = self
+        .st()
         .redo_stacks
         .get_mut(tree_id)
         .and_then(Vec::pop)
     else {
         return;
     };
-    match (TreeUndo { trees, tree_id }).redo(&entry) {
+    match (TreeUndo { trees: &trees, tree_id }).redo(&entry) {
         Ok(op) => {
-            state.push_toast(format!("Redid '{op}'"), ToastLevel::Info);
-            mark_dirty(state);
+            self.toast(format!("Redid '{op}'"), ToastLevel::Info);
+            self.st().mark_dirty();
         }
-        Err(err) => state.push_toast(format!("Redo failed: {err}"), ToastLevel::Error),
+        Err(err) => self.toast(format!("Redo failed: {err}"), ToastLevel::Error),
     }
 }
 }

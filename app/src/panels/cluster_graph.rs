@@ -277,7 +277,6 @@ pub fn show_with_nodes(
         zoom,
         resp: &resp,
         to_screen: &to_screen,
-        app,
         clickable_leaves,
     }
     .paint_nodes();
@@ -505,14 +504,13 @@ struct PaintCtx<'a> {
     zoom: f32,
     resp: &'a egui::Response,
     to_screen: &'a dyn Fn(egui::Vec2) -> egui::Pos2,
-    app: &'a AppState,
     clickable_leaves: bool,
 }
 
 impl PaintCtx<'_> {
     /// Paint all cluster/leaf nodes with color-by-policy, size-by-members, and
     /// staleness encodings. Surfaces hover tooltips and detects clicks on leaf
-    /// nodes carrying a `note_ref`, returning the resolved vault path so the
+    /// nodes carrying a `note_path`, returning the vault path so the
     /// caller can open it.
     fn paint_nodes(&self) -> PaintHits {
         use hiker_core::trees::types::{NodeKind, NodePolicy};
@@ -525,7 +523,6 @@ impl PaintCtx<'_> {
         let zoom = self.zoom;
         let resp = self.resp;
         let to_screen = self.to_screen;
-        let app = self.app;
         let clickable_leaves = self.clickable_leaves;
 
         let members = self.compute_member_counts();
@@ -617,27 +614,16 @@ impl PaintCtx<'_> {
             // instead. Either way we record the screen position so
             // the preview can anchor near the hovered node.
             //
-            // `note_ref` semantics differ between the persisted
-            // cluster-tree tab (a real `NoteId` looked up through the
-            // store) and the cluster-review embed (a vault-relative
-            // path stuffed into the same field, since the build runs
-            // off `NoteInput { id: rel_path, … }`). Try the store
-            // first; fall back to treating `note_ref` as a path so
-            // the review preview also gets a working preview card.
-            let leaf_path = if let Some(note_id) = &n.note_ref {
-                // status: store-id-from-oplog
-                let resolved = app
-                    .vault_session
-                    .services
-                    .oplog
-                    .path_for_doc(note_id)
-                    .ok()
-                    .flatten();
-                let path = resolved.unwrap_or_else(|| note_id.clone());
+            // Path-as-identity: `note_path` is the leaf's vault-relative
+            // path in both the persisted cluster-tree tab and the
+            // cluster-review embed (the build runs off
+            // `NoteInput { id: rel_path, … }`), so it's used directly with
+            // no doc-id resolution.
+            let leaf_path = if let Some(path) = &n.note_path {
                 if clickable_leaves && resp.clicked() {
                     clicked_path = Some(path.clone());
                 }
-                Some(path)
+                Some(path.clone())
             } else {
                 None
             };
@@ -743,10 +729,9 @@ struct PaintHits {
 struct HoveredNode {
     name: String,
     summary: String,
-    /// Resolved vault path when this is a leaf with a `note_ref`. None
-    /// for clusters (and for leaves whose note_ref can't be resolved
-    /// through the store) — the card falls back to the in-memory
-    /// `summary` for those.
+    /// Vault path when this is a leaf with a `note_path`. None for
+    /// clusters and for leaves with no recorded path — the card falls back
+    /// to the in-memory `summary` for those.
     leaf_path: Option<String>,
     screen_pos: egui::Pos2,
 }

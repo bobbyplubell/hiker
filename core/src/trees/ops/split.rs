@@ -124,7 +124,7 @@ impl Db {
                     if let Some(kids) = children_by_parent.get(&id) {
                         for k in kids {
                             if matches!(k.kind, NodeKind::Leaf) {
-                                let Some(note_ref) = k.note_ref.clone() else { continue };
+                                let Some(note_ref) = k.note_path.clone() else { continue };
                                 let Some(emb) = embeddings_for_leaf(&note_ref) else {
                                     continue;
                                 };

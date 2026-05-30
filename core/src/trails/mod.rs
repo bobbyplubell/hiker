@@ -419,13 +419,66 @@ fn path_ref_to_json(rel: &str) -> serde_json::Value {
     serde_json::json!({ "path": rel })
 }
 
+/// Leaf directory name of the hidden trails tree under `.hiker/`. Mirrors
+/// `trash::TRASH_DIRNAME` / `autosave::AUTOSAVE_DIRNAME` — the single source
+/// of truth for the on-disk path shape so the watcher carve-out and every
+/// trail writer/reader stay in sync.
+///
+/// status: trail-storage-layout
+pub const TRAILS_DIRNAME: &str = "trails";
+
+/// Leaf directory name holding a trail's waypoint-notes:
+/// `.hiker/trails/<trail-id>/waypoints/`.
+///
+/// status: trail-storage-layout
+pub const WAYPOINTS_DIRNAME: &str = "waypoints";
+
+/// Leaf directory name holding draft trail-docs: `.hiker/trails/drafts/`.
+///
+/// status: trail-storage-layout
+pub const DRAFTS_DIRNAME: &str = "drafts";
+
+/// Vault-relative path of the hidden trails dir (`.hiker/trails`). Always
+/// forward-slashed. The single source for the trails path shape — route
+/// every `.hiker/trails` literal through this (or the helpers below).
+///
+/// status: trail-storage-layout
+pub fn dir() -> String {
+    format!(".hiker/{TRAILS_DIRNAME}")
+}
+
+/// Vault-relative prefix used to match anything under the trails tree:
+/// `.hiker/trails/`. Use with `str::starts_with` (watcher carve-out,
+/// indexer/job routing, app trail-doc detection).
+///
+/// status: trail-storage-layout
+pub fn dir_prefix() -> String {
+    format!("{}/", dir())
+}
+
+/// Vault-relative path of the drafts dir (`.hiker/trails/drafts`).
+///
+/// status: trail-storage-layout
+pub fn drafts_dir() -> String {
+    format!("{}/{DRAFTS_DIRNAME}", dir())
+}
+
+/// Vault-relative path of the hidden trail root for `trail_id`
+/// (`.hiker/trails/<trail-id>`). Parent of the waypoints dir; also the
+/// delete-cascade scope.
+///
+/// status: trail-storage-layout
+pub fn trail_root_for(trail_id: &str) -> String {
+    format!("{}/{trail_id}", dir())
+}
+
 /// Vault-relative path of the hidden waypoints dir for `trail_id`.
 /// Always uses forward slashes, matching the rest of the vault path
 /// surface.
 ///
 /// status: trail-storage-layout
 pub fn waypoints_dir_for(trail_id: &str) -> String {
-    format!(".hiker/trails/{trail_id}/waypoints")
+    format!("{}/{WAYPOINTS_DIRNAME}", trail_root_for(trail_id))
 }
 
 /// Filename for a waypoint-note. Per spec

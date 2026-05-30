@@ -105,8 +105,14 @@ pub struct EditableNode {
     pub id: NodeId,
     pub parent: Option<NodeId>,
     pub kind: NodeKind,
-    /// Present only on leaves.
-    pub note_ref: Option<NoteId>,
+    /// Vault-relative path of the leaf's source note. Present only on leaves.
+    /// Path-as-identity: this is the single carrier the renderer and the
+    /// apply/stage paths key on — no op-log doc-id is held in memory (the
+    /// on-disk frontmatter still records both id + path as a double-link, but
+    /// the id is not surfaced here). `#[serde(alias = "note_ref")]` keeps any
+    /// older serialized tab-state loadable.
+    #[serde(alias = "note_ref")]
+    pub note_path: Option<String>,
     /// User-editable label. Cluster basename for leaves; LLM-proposed for
     /// clusters until the user edits it.
     pub name: String,

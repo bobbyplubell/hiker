@@ -107,7 +107,7 @@ impl ServerHandler for App {
                  Write: write_note, edit_note, set_frontmatter, apply_tag, remove_tag. \
                  Review mode: when the server is configured with review_required = true, write tools STAGE a \
                  proposal instead of writing to disk — the response carries `status: \"staged\"` and a \
-                 `staging_id`. A follow-up get_note reflects your own staged edits (you read your pending \
+                 `proposal_id`. A follow-up get_note reflects your own staged edits (you read your pending \
                  replica), but the change does not reach disk for the user until they accept the proposal in \
                  the hiker UI. A brand-new note that does not yet exist on disk still returns 1002 not_found \
                  from get_note until accepted; that is expected, the write is pending human review, not lost.",

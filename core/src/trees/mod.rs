@@ -132,7 +132,7 @@ mod tests {
         let kids = trees.children_of(&tree_id, Some("root")).unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].id, "leaf1");
-        assert_eq!(kids[0].note_ref.as_deref(), Some("note-a"));
+        assert_eq!(kids[0].note_path.as_deref(), Some("note-a"));
     }
 
     // Regression: deleting a tree then creating one at the same path must work.

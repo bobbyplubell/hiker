@@ -521,7 +521,6 @@ fn trail_waypoints_insert_query_delete() {
         waypoint_path: ".hiker/trails/01HTRAIL/waypoints/a--AAAAAA.md".into(),
         waypoint_id: "01HWP1".into(),
         trail_id: trail_id.into(),
-        source_id: Some("01HSRCA".into()),
         source_path: "research/a.md".into(),
         parent_waypoint_id: None,
         tree_path: "1".into(),
@@ -530,7 +529,6 @@ fn trail_waypoints_insert_query_delete() {
         waypoint_path: ".hiker/trails/01HTRAIL/waypoints/b--BBBBBB.md".into(),
         waypoint_id: "01HWP2".into(),
         trail_id: trail_id.into(),
-        source_id: None,
         source_path: "research/b.md".into(),
         parent_waypoint_id: Some("01HWP1".into()),
         tree_path: "1.1".into(),
@@ -544,24 +542,24 @@ fn trail_waypoints_insert_query_delete() {
     assert_eq!(by_trail[1].waypoint_id, "01HWP2");
     assert_eq!(by_trail[1].parent_waypoint_id.as_deref(), Some("01HWP1"));
 
-    // Lookup by source id matches wp1.
-    let hits_id = store.trails_containing_note("01HSRCA").unwrap();
-    assert_eq!(hits_id.len(), 1);
-    assert_eq!(hits_id[0].waypoint_id, "01HWP1");
+    // Lookup by source path matches wp1.
+    let hits_a = store.trails_containing_note("research/a.md").unwrap();
+    assert_eq!(hits_a.len(), 1);
+    assert_eq!(hits_a[0].waypoint_id, "01HWP1");
 
-    // Lookup by source path matches wp2 (no source_id stamped yet).
+    // Lookup by the other source path matches wp2.
     let hits_path = store.trails_containing_note("research/b.md").unwrap();
     assert_eq!(hits_path.len(), 1);
     assert_eq!(hits_path[0].waypoint_id, "01HWP2");
 
-    // Re-upsert with mutated source_id is an update, not a new row.
+    // Re-upsert with a mutated source path is an update, not a new row.
     let wp1_v2 = WaypointRow {
-        source_id: Some("01HSRCA-V2".into()),
+        source_path: "research/a-renamed.md".into(),
         ..wp1.clone()
     };
     store.upsert_trail_waypoint(&wp1_v2).unwrap();
     assert_eq!(store.waypoints_of(trail_id).unwrap().len(), 2);
-    let hits_v2 = store.trails_containing_note("01HSRCA-V2").unwrap();
+    let hits_v2 = store.trails_containing_note("research/a-renamed.md").unwrap();
     assert_eq!(hits_v2.len(), 1);
 
     // Single-path delete.
@@ -585,7 +583,6 @@ fn rename_trail_waypoint_paths_rewrites_prefix() {
         waypoint_path: ".hiker/trails/01OLD/waypoints/a--AAAAAA.md".into(),
         waypoint_id: "01HWP".into(),
         trail_id: "01OLD".into(),
-        source_id: None,
         source_path: "src.md".into(),
         parent_waypoint_id: None,
         tree_path: "1".into(),

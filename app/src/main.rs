@@ -4,6 +4,7 @@
 //! default vault, opens it, and launches the eframe loop.
 
 mod actions;
+mod backlinks;
 mod buffer;
 mod bootstrap;
 mod chat;
@@ -12,14 +13,16 @@ mod command_center;
 mod completion_sources;
 mod editor_pane;
 mod feature;
+mod files;
 mod icons;
 mod keybinds;
 // Old `palette.rs` was replaced by `panels::command_palette` per the
 // `command-palette` spec; the new module re-exports `command_palette`
 // on `AppState`, so the call site in `update()` is unchanged.
 mod panels;
-mod panels_registry;
 mod profiling;
+mod related;
+mod search;
 mod side_panel_persist;
 mod sidebar;
 mod state;
@@ -29,6 +32,7 @@ mod theme;
 mod titlebar;
 mod toolbar;
 mod trails;
+mod trash;
 mod vault_view;
 mod widgets;
 mod workbench_host;
@@ -490,7 +494,7 @@ fn drain_fs_events(&mut self) {
                 state.maybe_reload_clean_buffer(to);
             }
             FileEvent::Overflow => {
-                state.session.file_tree.dir_cache.clear();
+                state.file_tree_state.dir_cache.clear();
             }
         }
     }
@@ -498,7 +502,7 @@ fn drain_fs_events(&mut self) {
 
 fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    self.session.file_tree.dir_cache.remove(parent);
+    self.file_tree_state.dir_cache.remove(parent);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`
@@ -983,7 +987,7 @@ fn autosave_tick(&mut self) {
 
     if let Err(err) = bootstrap::save_trails(
         &state.vault_session.vault_root,
-        &state.session.trails,
+        &state.trails_state.trails,
     ) {
         tracing::debug!(error = %err, "trails persist failed");
     }

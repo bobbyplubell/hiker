@@ -26,12 +26,11 @@ impl Store {
         for row in rows {
             tx.execute(
                 "INSERT INTO board_cards
-                   (board_id, board_path, card_note_id, card_note_path, column_name, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                   (board_id, board_path, card_note_path, column_name, ordinal)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     row.board_id,
                     row.board_path,
-                    row.card_note_id,
                     row.card_note_path,
                     row.column_name,
                     row.ordinal,
@@ -65,24 +64,24 @@ impl Store {
         Ok(n)
     }
 
-    /// Boards that contain a given note as a card. `note_id_or_path` is
-    /// matched against both `card_note_id` and `card_note_path` so the
-    /// caller doesn't have to pre-resolve. One hit per (board, column).
+    /// Boards that contain a given note as a card, matched on the note's
+    /// vault-relative path (path-as-identity — the derived table is keyed on
+    /// path only). One hit per (board, column).
     ///
     /// status: board-cards-derived-table
     /// status: board-many-to-many
     pub fn boards_containing_note(
         &self,
-        note_id_or_path: &str,
+        note_path: &str,
     ) -> Result<Vec<BoardContainingHit>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT board_id, board_path, column_name
              FROM board_cards
-             WHERE card_note_id = ?1 OR card_note_path = ?1
+             WHERE card_note_path = ?1
              ORDER BY board_id, column_name",
         )?;
         let rows = stmt
-            .query_map(params![note_id_or_path], |row| {
+            .query_map(params![note_path], |row| {
                 Ok(BoardContainingHit {
                     board_id: row.get(0)?,
                     board_path: row.get(1)?,
@@ -98,7 +97,7 @@ impl Store {
     /// status: board-cards-derived-table
     pub fn cards_of(&self, board_id: &str) -> Result<Vec<BoardCardRow>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT board_id, board_path, card_note_id, card_note_path, column_name, ordinal
+            "SELECT board_id, board_path, card_note_path, column_name, ordinal
              FROM board_cards
              WHERE board_id = ?1
              ORDER BY column_name, ordinal",
@@ -108,10 +107,9 @@ impl Store {
                 Ok(BoardCardRow {
                     board_id: row.get(0)?,
                     board_path: row.get(1)?,
-                    card_note_id: row.get(2)?,
-                    card_note_path: row.get(3)?,
-                    column_name: row.get(4)?,
-                    ordinal: row.get(5)?,
+                    card_note_path: row.get(2)?,
+                    column_name: row.get(3)?,
+                    ordinal: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

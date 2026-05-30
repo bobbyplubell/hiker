@@ -56,6 +56,12 @@ use crate::tab::{Tab, TabId, TabKind};
 pub struct AppState {
     pub vault_session: VaultSession,
     pub session: Session,
+    /// File-tree UI state (expanded dirs, dir listing cache, selection,
+    /// inline-rename draft, reveal scroll target). Relocated off
+    /// `Session::file_tree` so the `files` feature surface can reach it
+    /// through the registry `Ctx::state` slot, matching the other
+    /// migrated features. [feature-filetree-migration]
+    pub file_tree_state: FileTreeState,
     pub ui_cache: UiCache,
     pub panels: PanelStates,
     /// Per-feature UI state for the migrated `clusters` feature.
@@ -66,6 +72,28 @@ pub struct AppState {
     /// Per-feature UI state for the migrated `trails` feature
     /// (`feature-trails-migration`).
     pub trails_state: crate::trails::state::State,
+    /// Per-feature UI state for the migrated `backlinks` feature
+    /// (`feature-backlinks-migration`).
+    pub backlinks_state: crate::backlinks::State,
+    /// Per-feature UI state for the migrated `related` feature
+    /// (`feature-related-migration`).
+    pub related_state: crate::related::State,
+    /// Per-feature UI state for the migrated `search` feature
+    /// (`feature-search-migration`).
+    pub search_state: crate::search::state::State,
+    /// Per-feature UI state for the migrated `vault` lens feature
+    /// (chosen lens + collapsed groups; read-only, nothing persisted on
+    /// notes). status: vault-view-mode
+    pub vault_state: crate::vault_view::State,
+    /// Per-feature UI state for the migrated `trash` feature. The panel
+    /// is effectively stateless (listing read fresh from disk), but the
+    /// registry hands every feature a state slice, so this is a
+    /// zero-field marker. status: feature-trash-panel
+    pub trash_state: crate::trash::State,
+    /// Per-feature state for the migrated docked `chat` sidebar: the
+    /// in-memory session registry + the lazy-discover gate. Relocated
+    /// off `Session::chat` / `Session::chat_discovered`.
+    pub chat_state: crate::chat::state::State,
     /// Per-session feature descriptor registry. Built in
     /// `bootstrap::open_vault` from `feature::builtin_features()` plus
     /// (in Phase 3) plugin-derived features. Sidebar/activity/hamburger
@@ -81,7 +109,7 @@ pub struct AppState {
     /// which the workbench's pane renderers read mutably each frame.
     pub workbench: egui_workbench::workspace::Workbench<
         crate::workbench_host::HikerWbTab,
-        crate::workbench_host::HikerMode,
+        String,
     >,
 }
 
@@ -241,18 +269,7 @@ pub struct Session {
     pub preview_tab: Option<TabId>,
     pub next_tab_id: u64,
     pub modal: Option<Modal>,
-    pub file_tree: FileTreeState,
     pub nav: NavState,
-    pub trails: Vec<Trail>,
-    /// Id of the trail that receives manual append-waypoint actions.
-    /// `None` = no active trail; the Add-to-trail verbs hide/disable.
-    pub active_trail: Option<String>,
-    /// Inline-rename draft for the trails sidebar.
-    pub trail_rename: Option<(String, String)>,
-    pub chat: crate::chat::state::ChatRegistry,
-    /// True once `chat::session::discover` has been called for this
-    /// vault — keeps the lazy disk walk from running every frame.
-    pub chat_discovered: bool,
     /// Last time autosave ticked.
     pub last_autosave_tick: Instant,
     /// Paths with a `NoteMutation` task we just submitted. Gates the
@@ -270,13 +287,7 @@ impl Default for Session {
             preview_tab: None,
             next_tab_id: 1,
             modal: None,
-            file_tree: FileTreeState::default(),
             nav: NavState::default(),
-            trails: Vec::new(),
-            active_trail: None,
-            trail_rename: None,
-            chat: crate::chat::state::ChatRegistry::new(),
-            chat_discovered: false,
             last_autosave_tick: Instant::now(),
             pending_mutations: HashSet::new(),
         }
@@ -285,15 +296,15 @@ impl Default for Session {
 
 /// One entry in the back/forward navigation stack — what a Back/Forward press
 /// restores into the active editor view. Path-only nav couldn't represent a
-/// historical snapshot (a `(path, op_id)` pair), so navigating to a snapshot
+/// historical version (a `(path, op_id)` pair), so navigating to a version
 /// dropped out of the stack and Back couldn't return; modelling the target
 /// explicitly fixes that and keeps the stack logic unit-testable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavTarget {
     /// The live vault buffer for a path.
     File(String),
-    /// A historical snapshot of `path` at a specific accepted op.
-    Snapshot { path: String, op_id: String },
+    /// A historical version of `path` at a specific accepted op.
+    HistoryVersion { path: String, op_id: String },
 }
 
 #[derive(Default)]
@@ -345,9 +356,6 @@ pub struct UiCache {
 
 #[derive(Default)]
 pub struct PanelStates {
-    pub search: crate::panels::search::State,
-    pub related: crate::panels::related::State,
-    pub backlinks: crate::panels::backlinks::State,
     /// Per-board-tab UI state (View-as toggle, inline-rename drafts,
     /// pending column-delete confirm). Keyed by tab id.
     pub boards: HashMap<TabId, crate::panels::board::Pane>,
@@ -360,10 +368,6 @@ pub struct PanelStates {
     /// One instance is enough — at most one preview card is up at a time
     /// across all buffer panes. [wikilink-hover-preview]
     pub wikilink_hover: crate::panels::buffer::wikilink_nav::HoverState,
-    /// Vault-view (logical-lens sidebar mode) state — chosen lens +
-    /// collapsed groups. Read-only lens; nothing persisted on notes.
-    /// status: vault-view-mode
-    pub vault_view: crate::vault_view::State,
 }
 
 // ===========================================================================
@@ -424,19 +428,6 @@ pub fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-pub fn create_trail(state: &mut AppState, name: &str) -> String {
-    let id = format!("trail-{}", now_ms_i64());
-    state.session.trails.push(Trail {
-        id: id.clone(),
-        name: name.to_string(),
-        waypoints: Vec::new(),
-        created_at_ms: now_ms_i64(),
-        last_activated_at_ms: now_ms_i64(),
-        append_under: None,
-    });
-    id
 }
 
 impl NavState {
@@ -536,10 +527,10 @@ pub fn nav_can_forward(state: &AppState) -> bool {
 /// No-op when no trail is active. When `append_under` is set, the new
 /// waypoint nests under that cursor; otherwise it lands at the root tail.
 pub fn trail_append_waypoint(state: &mut AppState, path: &str) {
-    let Some(trail_id) = state.session.active_trail.clone() else {
+    let Some(trail_id) = state.trails_state.active_trail.clone() else {
         return;
     };
-    let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == trail_id) else {
+    let Some(trail) = state.trails_state.trails.iter_mut().find(|t| t.id == trail_id) else {
         return;
     };
     let wp = Waypoint {
@@ -887,6 +878,35 @@ pub struct FileTreeState {
     pub renaming: Option<String>,
     pub renaming_text: String,
     pub scroll_target: Option<String>,
+    /// Per-frame row-decoration snapshot the files feature renders from.
+    /// Refreshed once per frame by the files sidebar surface via a
+    /// deferred pre-pass (which has full `&mut AppState`), so the render
+    /// path reads only this opaque snapshot rather than reaching past the
+    /// narrow `feature::Ctx` into `session.buffers` / the skipped-paths
+    /// channel / another feature's trail state. [feature-filetree-migration]
+    pub deco: FileTreeDeco,
+}
+
+/// Row-decoration snapshot for the files filetree. The sets are populated
+/// from `AppState` data the narrow `feature::Ctx` doesn't carry, snapshotted
+/// once per frame so the render path stays `Ctx`-only. Holds opaque path
+/// strings — no feature-specific types leak in.
+#[derive(Default)]
+pub struct FileTreeDeco {
+    /// Vault-relative paths whose loaded buffer is dirty (drives the
+    /// trailing ` *` dirty-dot). Snapshot of `session.buffers`.
+    pub dirty: HashSet<String>,
+    /// Vault-relative paths the indexer marked skipped (drives the
+    /// `  [skip]` marker). Snapshot of `ui_cache.skipped_paths`.
+    pub skipped: HashSet<String>,
+    /// Name of the active trail (the "Add to trail 'X'" context-menu
+    /// target), plus the set of paths already waypoints on it (any depth).
+    /// `None` when no trail is active. Snapshot of `trails_state`.
+    pub active_trail: Option<(String, HashSet<String>)>,
+    /// Names of every registered trail, lowercased — drives the
+    /// "Set as active trail" verb's basename match. Snapshot of
+    /// `trails_state`.
+    pub trail_names: HashSet<String>,
 }
 
 // ===========================================================================
@@ -1126,7 +1146,7 @@ impl AppState {
                 }
             }
             let removed = if let Some(trail) = state
-                .session
+                .trails_state
                 .trails
                 .iter_mut()
                 .find(|t| t.id == trail_id)
@@ -1142,7 +1162,7 @@ impl AppState {
             };
             let _ = crate::bootstrap::save_trails(
                 &state.vault_session.vault_root,
-                &state.session.trails,
+                &state.trails_state.trails,
             );
             let msg = if removed > 1 {
                 let sides = removed - 1;
@@ -1242,7 +1262,7 @@ mod nav_tests {
         NavTarget::File(p.to_string())
     }
     fn snap(p: &str, op: &str) -> NavTarget {
-        NavTarget::Snapshot { path: p.to_string(), op_id: op.to_string() }
+        NavTarget::HistoryVersion { path: p.to_string(), op_id: op.to_string() }
     }
 
     #[test]

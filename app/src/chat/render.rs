@@ -1,11 +1,10 @@
-//! Chat panel renderer. One entry point (`show`) used by both the
-//! full-tab `panels::agent` view and the docked region at the bottom
-//! of the discovery panel. A `Layout` enum picks the framing — the
-//! tab variant gets a session picker header strip + larger transcript
-//! area; the docked variant collapses the picker to a single
-//! current-session label + new-button.
-
-use std::sync::Arc;
+//! Chat panel renderer for the full-tab Agent view (`show` / `show_tab`,
+//! `TabKind::Agent`). A `Layout` enum picks the framing — the tab variant
+//! gets a session picker header strip + larger transcript area. The
+//! docked secondary-side-bar surface lives in `chat::sidebar` and renders
+//! through the narrow `feature::Ctx`, reusing the AppState-free helpers
+//! here (`render_turn`, `ToolCard::render_card`, `mention_suggestions`,
+//! …) plus the `Chat` receiver for its deferred broad effects.
 
 use eframe::egui;
 
@@ -19,7 +18,7 @@ use crate::theme;
 /// what the user is looking at: an editable vault note, or a board. Returns
 /// `None` for read-only previews (snapshot / staging / trash) and non-content
 /// tabs. status: chat-active-note-context-injection
-fn active_context_label(kind: &TabKind) -> Option<String> {
+pub(crate) fn active_context_label(kind: &TabKind) -> Option<String> {
     match kind {
         TabKind::Editor { buffer: BufferSource::Vault { path }, .. } => {
             Some(format!("[active note: {path}]"))
@@ -53,31 +52,46 @@ pub fn show(
     app: &mut AppState,
     session_id: Option<&str>,
     layout: Layout,
-    rt: &Arc<tokio::runtime::Runtime>,
 ) {
-    Chat { app, rt }.show(ui, session_id, layout);
+    Chat { app }.show(ui, session_id, layout);
 }
 
-/// Per-frame chat render context. Bundles the mutable `AppState` borrow
-/// with the tokio runtime handle so the render/action helpers can be
-/// `&mut self` methods on a single receiver.
-struct Chat<'a> {
-    app: &'a mut AppState,
-    rt: &'a Arc<tokio::runtime::Runtime>,
+/// Full-tab Agent view entry point (the `TabKind::Agent` body). Runs the
+/// first-render disk walk (kept out of `bootstrap::open_vault` so the
+/// vault-open path stays minimal and async-free — the cost is paid the
+/// first time the user opens a chat surface), then renders the FullTab
+/// layout. The docked sidebar surface lives in `chat::sidebar`.
+pub fn show_tab(ui: &mut egui::Ui, app: &mut AppState, session_id: &str) {
+    if !app.chat_state.discovered {
+        let vault_root = app.vault_session.vault_root.clone();
+        session::discover(&mut app.chat_state.registry, &vault_root);
+        app.chat_state.discovered = true;
+    }
+    let id = if session_id.is_empty() { None } else { Some(session_id) };
+    show(ui, app, id, Layout::FullTab);
+}
+
+/// Per-frame chat render context for the full-tab Agent view. Bundles
+/// the mutable `AppState` borrow so the render/action helpers can be
+/// `&mut self` methods on a single receiver. Async reply tasks spawn on
+/// the ambient tokio handle (the egui frame runs inside
+/// `runtime.enter()`), so no explicit runtime handle is threaded here.
+pub(crate) struct Chat<'a> {
+    pub(crate) app: &'a mut AppState,
 }
 
 impl Chat<'_> {
     fn show(&mut self, ui: &mut egui::Ui, session_id: Option<&str>, layout: Layout) {
     // 1) Fold in any pending reply-task events from this frame.
-    self.app.session.chat.pump_events();
+    self.app.chat_state.registry.pump_events();
 
     // 2) Override active pointer if the tab specified one. Lazy-load
     //    historic sessions on first view in case discovery didn't run
     //    yet (e.g. tab restored from a saved layout).
     if let Some(id) = session_id
-        && self.app.session.chat.sessions.contains_key(id)
+        && self.app.chat_state.registry.sessions.contains_key(id)
     {
-        self.app.session.chat.active = Some(id.to_string());
+        self.app.chat_state.registry.active = Some(id.to_string());
     }
 
     match layout {
@@ -148,8 +162,8 @@ impl Chat<'_> {
     // A left-to-right horizontal with a fixed-width ComboBox + trailing
     // buttons would inflate the side bar's min content width and shove
     // the buttons off-screen when the user resizes narrower.
-    let active_id = app.session.chat.active.clone();
-    let active_label = active_label_for(&app.session.chat, active_id.as_deref());
+    let active_id = app.chat_state.registry.active.clone();
+    let active_label = active_label_for(&app.chat_state.registry, active_id.as_deref());
     let mut switch_to: Option<String> = None;
     let mut delete: Option<String> = None;
     let mut create_new = false;
@@ -181,7 +195,7 @@ impl Chat<'_> {
                 .width(picker_width)
                 .show_ui(ui, |ui| {
                     let mut rows: Vec<(String, String, i64)> = app
-                        .session.chat
+                        .chat_state.registry
                         .sessions
                         .values()
                         .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
@@ -207,7 +221,7 @@ impl Chat<'_> {
     // Apply picker actions (outside the layout closure so the borrows
     // on `app` don't conflict with the combo's render).
     if let Some(id) = switch_to {
-        session::set_active(&mut app.session.chat, &id);
+        session::set_active(&mut app.chat_state.registry, &id);
     }
     if create_new {
         let vault_root = app.vault_session.vault_root.clone();
@@ -217,7 +231,7 @@ impl Chat<'_> {
             .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
             .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
         if let Err(err) = session::create_new(
-            &mut app.session.chat,
+            &mut app.chat_state.registry,
             &vault_root,
             &model,
             &provider,
@@ -227,7 +241,7 @@ impl Chat<'_> {
     }
     if let Some(id) = delete {
         let vault_root = app.vault_session.vault_root.clone();
-        if let Err(err) = session::delete(&mut app.session.chat, &vault_root, &id) {
+        if let Err(err) = session::delete(&mut app.chat_state.registry, &vault_root, &id) {
             tracing::warn!(error = %err, "chat: delete failed");
         }
     }
@@ -240,8 +254,8 @@ impl AppState {
     /// side bar's chrome title row alongside the +/trash buttons that
     /// `secondary_side_bar_action_buttons` already places there.
     pub fn chat_session_picker(&mut self, ui: &mut egui::Ui) {
-        let active_id = self.session.chat.active.clone();
-        let active_label = active_label_for(&self.session.chat, active_id.as_deref());
+        let active_id = self.chat_state.registry.active.clone();
+        let active_label = active_label_for(&self.chat_state.registry, active_id.as_deref());
         let mut switch_to: Option<String> = None;
 
         let picker_width = ui.available_width().min(280.0).max(0.0);
@@ -250,7 +264,7 @@ impl AppState {
             .width(picker_width)
             .show_ui(ui, |ui| {
                 let mut rows: Vec<(String, String, i64)> = self
-                    .session.chat
+                    .chat_state.registry
                     .sessions
                     .values()
                     .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
@@ -272,7 +286,7 @@ impl AppState {
             });
 
         if let Some(id) = switch_to {
-            session::set_active(&mut self.session.chat, &id);
+            session::set_active(&mut self.chat_state.registry, &id);
         }
     }
 }
@@ -286,7 +300,7 @@ fn active_label_for(reg: &ChatRegistry, id: Option<&str>) -> String {
 
 impl Chat<'_> {
     fn transcript(&mut self, ui: &mut egui::Ui) {
-    let Some(s) = self.app.session.chat.active_session() else {
+    let Some(s) = self.app.chat_state.registry.active_session() else {
         ui.label(
             egui::RichText::new("(no session — press + or start typing)")
                 .color(theme::muted())
@@ -319,7 +333,7 @@ impl Chat<'_> {
     // previews. Borrowed mutably here for the whole transcript render;
     // `turns` was cloned above so there's no aliasing with the session
     // list this lives alongside on the registry.
-    let previews = &mut self.app.session.chat.md_previews;
+    let previews = &mut self.app.chat_state.registry.md_previews;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         // Only pin to the bottom while a reply is streaming in. Pinning
@@ -389,7 +403,7 @@ impl Chat<'_> {
     /// Resolve a wikilink target like `Some Note` or `notes/foo` into a
     /// vault-relative path. Falls back to the literal `target.md` when no
     /// indexed match exists.
-    fn resolve_wikilink_target(&self, target: &str) -> String {
+    pub(crate) fn resolve_wikilink_target(&self, target: &str) -> String {
     let app = &*self.app;
     let direct = if target.ends_with(".md") {
         target.to_string()
@@ -413,7 +427,7 @@ impl Chat<'_> {
     direct
 }
 
-    fn apply_tool_card_action(&mut self, action: ToolCardAction) {
+    pub(crate) fn apply_tool_card_action(&mut self, action: ToolCardAction) {
     let app = &mut *self.app;
     use crate::state::ToastLevel;
     match action {
@@ -688,7 +702,7 @@ fn render_op_review(
 }
 
 impl crate::chat::state::ToolCard {
-    fn render_card(
+    pub(crate) fn render_card(
     &self,
     ui: &mut egui::Ui,
     session_id: &str,
@@ -863,7 +877,7 @@ impl crate::chat::state::ToolCard {
 /// Render a single transcript turn. Returns `Some(target)` when the user
 /// clicked a `[[wikilink]]` inside the bubble — the caller hands that off
 /// to the file-open routing (`chat-panel-note-link-render`).
-fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
+pub(crate) fn render_turn(ui: &mut egui::Ui, role: ChatRole, text: &str) -> Option<String> {
     let mut clicked_link: Option<String> = None;
     let (label, color) = match role {
         ChatRole::User => ("You", theme::accent()),
@@ -1069,7 +1083,7 @@ impl Chat<'_> {
 /// Pull the active buffer's current selection out as a String. Returns
 /// `None` when no buffer is focused, when the focused tab isn't a buffer,
 /// or when the selection is empty (caret with no range).
-fn active_buffer_selection(&self) -> Option<String> {
+pub(crate) fn active_buffer_selection(&self) -> Option<String> {
     let app = &*self.app;
     let path = app
         .session.active_tab
@@ -1091,7 +1105,7 @@ fn active_buffer_selection(&self) -> Option<String> {
 /// Cheap `@<query>` mention scan over the trailing token of a draft.
 /// A trait on `str` so the sole render call site and the unit tests share
 /// one implementation without a free helper.
-trait AtMentionScan {
+pub(crate) trait AtMentionScan {
     /// If the cursor-trailing token looks like a partial `@<query>`
     /// mention (no whitespace between `@` and the end), return the byte
     /// offset of the `@` plus the captured query. Otherwise `None`.
@@ -1132,11 +1146,16 @@ impl AtMentionScan for str {
 /// matches `query` case-insensitively, returning up to `cap` results.
 /// Cheap O(n) scan — good enough for the default vault size; future
 /// work routes this through the indexer's lexical engine.
-fn mention_suggestions(app: &AppState, query: &str, cap: usize) -> Vec<String> {
+pub(crate) fn mention_suggestions(
+    services: &crate::state::Services,
+    vault: &hiker_core::vault::Vault,
+    query: &str,
+    cap: usize,
+) -> Vec<String> {
     let q = query.to_lowercase();
     let mut out: Vec<String> = Vec::new();
     // Prefer the indexer's path list when it's online — no disk walk.
-    if let Ok(store) = app.vault_session.services.read_store.lock()
+    if let Ok(store) = services.read_store.lock()
         && let Ok(rows) = store.all_note_paths()
     {
         for rel in rows {
@@ -1151,7 +1170,7 @@ fn mention_suggestions(app: &AppState, query: &str, cap: usize) -> Vec<String> {
     }
     // Fallback: vault walk. Same shape as before, kept for the
     // unindexed-vault case.
-    let root = app.vault_session.vault.root();
+    let root = vault.root();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -1191,15 +1210,14 @@ fn composer(
     // front so the borrow doesn't overlap the `&mut self.app` reborrow
     // taken for the composer body.
     let selection_text = self.active_buffer_selection();
-    let rt = self.rt;
     let app = &mut *self.app;
-    let active_id = app.session.chat.active.clone().unwrap_or_else(|| "_none".to_string());
+    let active_id = app.chat_state.registry.active.clone().unwrap_or_else(|| "_none".to_string());
     // Clone draft into a local so we can hand &mut to the TextEdit and
     // still read app immutably below for @-mention suggestions. The clone
     // is cheap (draft is typically a short prompt) and we write the
     // updated value back at the end of the function.
     let mut draft: String = app
-        .session.chat
+        .chat_state.registry
         .drafts
         .get(&active_id)
         .cloned()
@@ -1228,14 +1246,14 @@ fn composer(
         // in-flight turn to halt via the per-session StopSignal stored
         // in `ChatRegistry::stop_signals` (`chat-panel-stop-button`).
         let pending = app
-            .session.chat
+            .chat_state.registry
             .sessions
             .get(&active_id)
             .map(|s| s.pending)
             .unwrap_or(false);
         if pending {
             if ui.button("Stop").on_hover_text("Halt this turn").clicked()
-                && let Some(sig) = app.session.chat.stop_signals.get(&active_id)
+                && let Some(sig) = app.chat_state.registry.stop_signals.get(&active_id)
             {
                 sig.user_halt();
             }
@@ -1340,7 +1358,13 @@ fn composer(
         let mention_popup_id = ui.make_persistent_id("chat::mention_popup");
         let mention_state = draft.active_at_mention();
         if let Some((_, ref query)) = mention_state {
-            let has_any = !mention_suggestions(app, query, 1).is_empty();
+            let has_any = !mention_suggestions(
+                &app.vault_session.services,
+                &app.vault_session.vault,
+                query,
+                1,
+            )
+            .is_empty();
             if has_any {
                 egui::Popup::open_id(ui.ctx(), mention_popup_id);
             } else {
@@ -1355,7 +1379,12 @@ fn composer(
         }
 
         if let Some((prefix_start, query)) = mention_state {
-            let suggestions = mention_suggestions(app, &query, 8);
+            let suggestions = mention_suggestions(
+                &app.vault_session.services,
+                &app.vault_session.vault,
+                &query,
+                8,
+            );
             let popup_w = resp.rect.width().max(160.0);
             egui::Popup::from_response(&resp)
                 .id(mention_popup_id)
@@ -1389,10 +1418,10 @@ fn composer(
     });
         });
     // Sync back the (possibly edited) draft.
-    app.session.chat.drafts.insert(active_id.clone(), draft);
+    app.chat_state.registry.drafts.insert(active_id.clone(), draft);
 
     if send_now {
-        let mut text = std::mem::take(app.session.chat.drafts.entry(active_id).or_default());
+        let mut text = std::mem::take(app.chat_state.registry.drafts.entry(active_id).or_default());
         if !text.trim().is_empty() {
             // Active-context injection (`chat-active-note-context-injection`):
             // when an editable note OR a board tab is focused and the user
@@ -1412,9 +1441,8 @@ fn composer(
             let vault_root = app.vault_session.vault_root.clone();
             let config = app.vault_session.config.clone();
             let mcp_handler = app.vault_session.services.mcp.as_ref().map(|h| h.agent_handler());
-            app.session.chat.send(
+            app.chat_state.registry.send(
                 &vault_root,
-                rt,
                 config,
                 &mcp_handler,
                 &text,
@@ -1431,3 +1459,4 @@ fn composer(
     }
     }
 }
+

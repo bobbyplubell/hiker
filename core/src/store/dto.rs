@@ -172,9 +172,8 @@ pub struct WaypointRow {
     pub waypoint_path: String,
     pub waypoint_id: String,
     pub trail_id: String,
-    /// `None` when the source note hasn't been ingested (or had its ULID
-    /// stamped) yet. Filled in on a later indexing pass.
-    pub source_id: Option<String>,
+    /// Vault-relative path of the source note. The derived table keys on
+    /// path only (path-as-identity); `trails_containing_note` matches here.
     pub source_path: String,
     /// `None` for root-level waypoints; otherwise the ULID of the
     /// parent waypoint.
@@ -207,9 +206,8 @@ pub struct TrailContainingHit {
 pub struct BoardCardRow {
     pub board_id: String,
     pub board_path: String,
-    /// The referenced note's recorded ULID (the card's `id` half).
-    pub card_note_id: String,
-    /// The referenced note's recorded rel-path (the card's `path` half).
+    /// The referenced note's vault-relative path. The derived table keys on
+    /// path only (path-as-identity); `boards_containing_note` matches here.
     pub card_note_path: String,
     pub column_name: String,
     /// 0-based position within the column.

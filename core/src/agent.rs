@@ -71,7 +71,7 @@ pub enum Event {
         summary: String,
         /// Full tool output (JSON string). Present when the tool
         /// successfully returned structured data; absent for errors.
-        /// Chat panel uses this to extract staging_ids for accept/reject
+        /// Chat panel uses this to extract proposal_ids for accept/reject
         /// per `staging-accept-reject-from-chat-card`.
         #[serde(default)]
         output: Option<String>,

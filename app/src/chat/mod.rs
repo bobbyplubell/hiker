@@ -19,5 +19,51 @@ pub mod md_preview;
 pub mod render;
 pub mod send;
 pub mod session;
+pub mod sidebar;
 pub mod state;
+
+use eframe::egui;
+
+use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::icons;
+
+/// Zero-sized `Feature` impl for the docked chat sidebar. Pure
+/// descriptor: holds no state. The real state (the in-memory session
+/// registry + lazy-discover gate) lives in `AppState::chat_state`; the
+/// sidebar surface reaches it via `Ctx::state.downcast_mut::<State>()`
+/// and routes broad effects (open a linked note, accept/reject a pending
+/// op, the active-note send injection) through `Ctx::defer`.
+///
+/// Scope: only the docked secondary-side-bar chat region. The full-tab
+/// agent conversation is a separate `TabKind::Agent` surface that still
+/// renders against `&mut AppState` via `render::show_tab`.
+pub struct Chat;
+
+impl Feature for Chat {
+    fn id(&self) -> &'static str {
+        "chat"
+    }
+    fn label(&self) -> &'static str {
+        "Chat"
+    }
+    fn icon(&self) -> egui::Image<'static> {
+        icons::ICONS.image(icons::Icon::Chat)
+    }
+    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
+        Some(&ChatSidebar)
+    }
+    /// Chat docks into the secondary (right) side bar, not the primary
+    /// activity bar. [feature-consumer-activity-bar]
+    fn primary_activity(&self) -> bool {
+        false
+    }
+}
+
+struct ChatSidebar;
+
+impl SidebarSurface for ChatSidebar {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+        sidebar::render_sidebar(ui, ctx);
+    }
+}
 

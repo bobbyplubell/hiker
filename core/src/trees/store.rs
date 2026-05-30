@@ -109,9 +109,9 @@ pub(super) struct TreeDoc {
     body: String,
     /// Non-`hiker` frontmatter keys, preserved on round-trip.
     extra_fm: serde_yml::Mapping,
-    /// node_id → recorded note rel-path, so the double-link survives a
-    /// round-trip even though `EditableNode` only carries the id half.
-    note_paths: HashMap<String, String>,
+    /// node_id → recorded note op-log id, so the double-link survives a
+    /// round-trip even though `EditableNode` only carries the path half.
+    note_ids: HashMap<String, String>,
 }
 
 impl TreeDoc {
@@ -151,11 +151,9 @@ impl TreeDoc {
     }
 
     pub(super) fn insert(&mut self, n: EditableNode) {
-        if let Some(path) = &n.note_ref {
-            self.note_paths
-                .entry(n.id.clone())
-                .or_insert_with(|| path.clone());
-        }
+        // No id half is known from an `EditableNode` alone (it carries the
+        // path); leave any previously-recorded id for this node intact so a
+        // load → mutate → save round-trip preserves the double-link.
         if let Some(idx) = self.position(&n.id) {
             self.nodes[idx] = n;
         } else {
@@ -165,7 +163,7 @@ impl TreeDoc {
 
     pub(super) fn remove(&mut self, node_id: &str) {
         self.nodes.retain(|n| n.id != node_id);
-        self.note_paths.remove(node_id);
+        self.note_ids.remove(node_id);
     }
 
     /// Node + all ancestors up to the root, as a set. Mirrors the old SQL
@@ -260,22 +258,25 @@ impl Db {
             return Err(Error::TreeNotFound(tree_id.to_string()));
         }
 
-        let mut note_paths = HashMap::new();
+        let mut note_ids = HashMap::new();
         let mut nodes: Vec<EditableNode> = fm
             .nodes
             .iter()
             .map(|nf| {
-                let note_ref = nf.note.as_ref().map(|n| {
-                    if !n.path.is_empty() {
-                        note_paths.insert(nf.id.clone(), n.path.clone());
+                // Path-as-identity: surface the rel-path in memory. The on-disk
+                // `note` double-link keeps both id + path; we stash the id in
+                // `note_ids` so a round-trip re-emits it unchanged.
+                let note_path = nf.note.as_ref().map(|n| {
+                    if !n.id.is_empty() {
+                        note_ids.insert(nf.id.clone(), n.id.clone());
                     }
-                    n.id.clone()
+                    n.path.clone()
                 });
                 EditableNode {
                     id: nf.id.clone(),
                     parent: nf.parent.clone(),
                     kind: nf.kind,
-                    note_ref,
+                    note_path,
                     name: nf.name.clone(),
                     summary: nf.summary.clone(),
                     user_edited_name: nf.user_edited_name,
@@ -314,7 +315,7 @@ impl Db {
             nodes,
             body,
             extra_fm: top,
-            note_paths,
+            note_ids,
         })
     }
 
@@ -339,9 +340,9 @@ impl Db {
                     id: n.id.clone(),
                     parent: n.parent.clone(),
                     kind: n.kind,
-                    note: n.note_ref.as_ref().map(|id| NoteRefFm {
-                        id: id.clone(),
-                        path: doc.note_paths.get(&n.id).cloned().unwrap_or_default(),
+                    note: n.note_path.as_ref().map(|path| NoteRefFm {
+                        id: doc.note_ids.get(&n.id).cloned().unwrap_or_default(),
+                        path: path.clone(),
                     }),
                     name: n.name.clone(),
                     summary: n.summary.clone(),
@@ -395,7 +396,7 @@ impl Db {
             nodes: Vec::new(),
             body: BODY_STUB.to_string(),
             extra_fm: serde_yml::Mapping::new(),
-            note_paths: HashMap::new(),
+            note_ids: HashMap::new(),
         };
         self.save(&doc)?;
         Ok(id)
@@ -610,7 +611,7 @@ pub(super) fn snapshot_full(n: &EditableNode) -> serde_json::Value {
     serde_json::json!({
         "parent_id": n.parent,
         "kind": n.kind.as_str(),
-        "note_id": n.note_ref,
+        "note_id": n.note_path,
         "name": n.name,
         "summary": n.summary,
         "user_edited_name": n.user_edited_name,
@@ -626,7 +627,7 @@ pub(super) fn node_from_insert(n: &NodeInsert) -> EditableNode {
         id: n.node_id.clone(),
         parent: n.parent_id.clone(),
         kind: n.kind,
-        note_ref: n.note_id.clone(),
+        note_path: n.note_id.clone(),
         name: n.name.clone(),
         summary: n.summary.clone(),
         user_edited_name: n.user_edited_name,

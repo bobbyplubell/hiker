@@ -19,26 +19,15 @@ pub mod state;
 
 use eframe::egui;
 
-use crate::feature::{Feature, SidebarSurface};
-use crate::feature::Ctx;
+use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::icons;
-use crate::state::AppState;
-
-/// Render entry point for the Trails sidebar body. Bridges the static
-/// `panels_registry::DockPanel::render` `fn` pointer to the inherent
-/// rendering on `TrailsView`.
-pub fn render_sidebar(ui: &mut egui::Ui, app: &mut AppState) {
-    egui::ScrollArea::vertical()
-        .id_salt("panel-trails-body")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            sidebar::TrailsView { ui, state: app }.render();
-        });
-}
 
 /// Zero-sized `Feature` impl for the Trails feature. Pure descriptor:
-/// holds no state. The real state lives in `AppState::trails_state`;
-/// surfaces reach it via `Ctx::state.downcast_mut::<State>()`.
+/// holds no state. The real state (the trail forest + sidebar UI state)
+/// lives in `AppState::trails_state`; the sidebar surface reaches it via
+/// `Ctx::state.downcast_mut::<State>()` and routes broad effects (open a
+/// note, the remove-confirm modal, the trail-doc write) through
+/// `Ctx::defer`.
 pub struct Trails;
 
 impl Feature for Trails {
@@ -60,13 +49,11 @@ struct TrailsSidebar;
 
 impl SidebarSurface for TrailsSidebar {
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
-        // v1 wraps the legacy free-fn body. Same shape as
-        // `ClustersSidebar` — the downcast proves the wiring; the
-        // legacy renderer is invoked via the panels_registry path.
-        let _state = ctx
-            .state
-            .downcast_mut::<state::State>()
-            .expect("TrailsSidebar invoked with the wrong state type");
-        ui.weak("(trails sidebar — routed via panels_registry in v1)");
+        egui::ScrollArea::vertical()
+            .id_salt("panel-trails-body")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                sidebar::TrailsCtx { ctx }.render(ui);
+            });
     }
 }

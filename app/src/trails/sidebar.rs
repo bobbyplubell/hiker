@@ -1,20 +1,33 @@
 //! Trails sidebar - named trails with ordered waypoints. Per
 //! `docs/trails.md` and the legacy `ui/src/trails/index.ts` reference
-//! implementation. Read-only editing surface (no drag-to-reorder, no
-//! inline annotation editing); the single in-sidebar editing verbs are
-//! the per-card "Remove waypoint" and "Append from here" context-menu
-//! entries plus the overflow menu (New / Rename / Delete).
+//! implementation. In-sidebar editing verbs: per-card "Remove waypoint"
+//! / "Append from here" context-menu entries, drag-and-drop reparenting,
+//! inline annotation editing, and the overflow menu (New / Rename /
+//! Delete).
+//!
+//! Migrated onto the Trails `Feature`'s `SidebarSurface`: rendering goes
+//! through the narrow `feature::Ctx` instead of `&mut AppState`. The
+//! trail forest + sidebar UI state live in the feature's own
+//! `trails::state::State` (reached via `ctx.state`); the vault root comes
+//! from `ctx.vault`; toasts via `ctx.toasts`. Broad effects that need
+//! full `&mut AppState` (open a note, raise the remove-confirm modal,
+//! invalidate the file-tree cache for a written trail-doc) are queued via
+//! `ctx.defer`.
+
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::state::{create_trail, AppState, Waypoint};
+use crate::feature::Ctx;
+use crate::state::Waypoint;
 use crate::theme;
+use crate::trails::state::State;
 
 /// Deferred mutations collected while rendering the waypoint forest.
-/// Rendering only borrows `&AppState`; each picked verb lands here and is
-/// applied against `&mut AppState` after the render pass, dodging the
-/// mutable-borrow overlap that one-shot closures would otherwise hit.
+/// Rendering only borrows `&State`; each picked verb lands here and is
+/// applied afterward, dodging the mutable-borrow overlap that one-shot
+/// closures would otherwise hit.
 #[derive(Default)]
 struct TrailActions {
     open: Option<String>,
@@ -29,146 +42,272 @@ struct TrailActions {
     move_op: Option<(String, crate::state::MoveOp)>,
 }
 
-/// Render context for the trails sidebar. Bundles `ui` + `state` so the
-/// per-row helpers are `&mut self` methods (exempt from
-/// `single_call_fn`) instead of free functions threading the same refs.
-/// Construct with `TrailsView { ui, state }` and call `render`.
-pub(crate) struct TrailsView<'a> {
-    pub(crate) ui: &'a mut egui::Ui,
-    pub(crate) state: &'a mut AppState,
+/// Shared per-frame context for the trails sidebar. Wraps the narrow
+/// feature `Ctx` so the render/mutation helpers can be `&mut self`
+/// methods on one receiver (exempt from `single_call_fn`). The trail
+/// forest + UI state live in the feature's own `State` (reached via
+/// `ctx.state`); persistence reads the vault root from `ctx.vault`;
+/// broad effects (open a note, the remove-confirm modal, the trail-doc
+/// write) are queued via `ctx.defer`. `ui` is threaded as a method arg
+/// rather than held here so the deferred closures don't contend with the
+/// `ui` borrow.
+pub(crate) struct TrailsCtx<'a, 'c> {
+    pub(crate) ctx: &'a mut Ctx<'c>,
 }
 
-impl TrailsView<'_> {
-pub(crate) fn render(&mut self) {
-    // Pick a visible trail: prefer the active one, else fall back to the
-    // first trail. When no trails exist, surface a "New trail" prompt and
-    // bail — the header/cursor rows have nothing to render.
-    let visible_id = self
-        .state.session.active_trail
-        .clone()
-        .filter(|id| self.state.session.trails.iter().any(|t| &t.id == id))
-        .or_else(|| self.state.session.trails.first().map(|t| t.id.clone()));
-    let Some(visible_id) = visible_id else {
-        self.render_empty_state();
-        return;
-    };
-
-    if self.state.trails_state.all_trails_picker_open {
-        self.render_all_trails_picker(&visible_id);
+impl TrailsCtx<'_, '_> {
+    /// Mutable handle to the feature's own state slice.
+    fn st(&mut self) -> &mut State {
+        self.ctx.state.downcast_mut::<State>().expect("trails state")
     }
 
-    self.header_row(&visible_id);
-    self.rename_row(&visible_id);
-    self.cursor_hint_row(&visible_id);
+    /// Immutable handle to the feature's own state slice.
+    fn st_ref(&self) -> &State {
+        self.ctx.state.downcast_ref::<State>().expect("trails state")
+    }
 
-    self.ui.separator();
+    /// Absolute vault root, for trail-doc writes + waypoint existence
+    /// checks. Cloned so callers can borrow `self` mutably afterward.
+    fn vault_root(&self) -> PathBuf {
+        self.ctx.vault.root().to_path_buf()
+    }
 
-    let snapshot = self
-        .state.session.trails
-        .iter()
-        .find(|t| t.id == visible_id)
-        .map(|t| (t.name.clone(), t.waypoints.clone(), t.append_under.clone()))
-        .unwrap_or_default();
+    /// Persist the current trail forest to `<root>/.hiker/trails.json`.
+    fn persist(&self) {
+        let _ = crate::bootstrap::save_trails(self.ctx.vault.root(), &self.st_ref().trails);
+    }
 
-    self.ui.label(
-        egui::RichText::new(format!(
-            "{} ({} waypoint{})",
-            snapshot.0,
-            snapshot.1.len(),
-            if snapshot.1.len() == 1 { "" } else { "s" }
-        ))
-        .color(theme::muted())
-        .small(),
-    );
+    /// Push a toast onto the shared sink (the narrow `Ctx` carries the
+    /// `Vec<Toast>` directly; there is no `&mut AppState` here for
+    /// `push_toast`).
+    fn toast(&mut self, message: impl Into<String>, level: crate::state::ToastLevel) {
+        self.ctx.toasts.push(crate::state::Toast {
+            message: message.into(),
+            level,
+            created_at: std::time::Instant::now(),
+            undo: None,
+        });
+    }
 
-    if snapshot.1.is_empty() {
-        self.ui.add_space(8.0);
-        self.ui.label(
-            egui::RichText::new("Empty trail - use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb to add waypoints.")
+    /// Append a fresh trail named `Trail N` and make it active.
+    fn create_active_trail(&mut self) {
+        let n = self.st_ref().trails.len() + 1;
+        let id = format!("trail-{}", crate::state::now_ms_i64());
+        let now = crate::state::now_ms_i64();
+        self.st().trails.push(crate::state::Trail {
+            id: id.clone(),
+            name: format!("Trail {n}"),
+            waypoints: Vec::new(),
+            created_at_ms: now,
+            last_activated_at_ms: now,
+            append_under: None,
+        });
+        self.st().active_trail = Some(id);
+        self.persist();
+    }
+
+    /// Activate the trail with `id`, bumping its recency timestamp.
+    fn activate_trail(&mut self, id: &str) {
+        let now = crate::state::now_ms_i64();
+        self.st().active_trail = Some(id.to_string());
+        if let Some(t) = self.st().trails.iter_mut().find(|t| t.id == id) {
+            t.last_activated_at_ms = now;
+        }
+        self.persist();
+    }
+
+    pub(crate) fn render(&mut self, ui: &mut egui::Ui) {
+        // Pick a visible trail: prefer the active one, else fall back to
+        // the first trail. When no trails exist, surface a "New trail"
+        // prompt and bail — the header/cursor rows have nothing to render.
+        let visible_id = self
+            .st_ref()
+            .active_trail
+            .clone()
+            .filter(|id| self.st_ref().trails.iter().any(|t| &t.id == id))
+            .or_else(|| self.st_ref().trails.first().map(|t| t.id.clone()));
+        let Some(visible_id) = visible_id else {
+            self.render_empty_state(ui);
+            return;
+        };
+
+        if self.st_ref().all_trails_picker_open {
+            self.render_all_trails_picker(ui, &visible_id);
+        }
+
+        self.header_row(ui, &visible_id);
+        self.rename_row(ui, &visible_id);
+        self.cursor_hint_row(ui, &visible_id);
+
+        ui.separator();
+
+        let snapshot = self
+            .st_ref()
+            .trails
+            .iter()
+            .find(|t| t.id == visible_id)
+            .map(|t| (t.name.clone(), t.waypoints.clone(), t.append_under.clone()))
+            .unwrap_or_default();
+
+        ui.label(
+            egui::RichText::new(format!(
+                "{} ({} waypoint{})",
+                snapshot.0,
+                snapshot.1.len(),
+                if snapshot.1.len() == 1 { "" } else { "s" }
+            ))
+            .color(theme::muted())
+            .small(),
+        );
+
+        if snapshot.1.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Empty trail - use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb to add waypoints.")
+                    .color(theme::muted())
+                    .italics()
+                    .small(),
+            );
+            return;
+        }
+
+        let cursor_path = self.ctx.active_path.clone();
+
+        let mut actions = TrailActions::default();
+        // Reorder via drag-and-drop: dropping in a card's top edge band
+        // inserts before it (top band of the first card = trail head), the
+        // bottom edge band inserts after it (bottom band of the last card =
+        // trail tail), and the middle band nests as a child. See
+        // `resolve_drop` / `drop_band`.
+        self.render_waypoints(
+            ui,
+            &snapshot.1,
+            cursor_path.as_deref(),
+            snapshot.2.as_deref(),
+            &mut Vec::new(),
+            &mut actions,
+        );
+        self.apply_actions(&visible_id, actions);
+    }
+
+    /// Empty-trails fallback: trail icon + "New trail" prompt + usage tip.
+    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
+            ui.label(
+                egui::RichText::new("No trails yet")
+                    .color(theme::muted())
+                    .small(),
+            );
+        });
+        ui.add_space(8.0);
+        if ui.button("New trail").clicked() {
+            self.create_active_trail();
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Tip: with a trail active, use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb in the file tree to add waypoints.")
                 .color(theme::muted())
                 .italics()
                 .small(),
         );
-        return;
     }
 
-    let cursor_path: Option<String> = self
-        .state.session.active_tab
-        .and_then(|id| self.state.tab_by_id(id))
-        .and_then(|t| t.buffer_path().map(str::to_string));
-
-    let mut actions = TrailActions::default();
-    // Reorder via drag-and-drop: dropping in a card's top edge band inserts
-    // before it (top band of the first card = trail head), the bottom edge
-    // band inserts after it (bottom band of the last card = trail tail), and
-    // the middle band nests as a child. See `resolve_drop` / `drop_band`.
-    self.render_waypoints(
-        &snapshot.1,
-        cursor_path.as_deref(),
-        snapshot.2.as_deref(),
-        &mut Vec::new(),
-        &mut actions,
-    );
-    self.apply_actions(&visible_id, actions);
-}
-
-/// Empty-trails fallback: trail icon + "New trail" prompt + usage tip.
-fn render_empty_state(&mut self) {
-    let state = &mut *self.state;
-    self.ui.horizontal(|ui| {
-        ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
-        ui.label(
-            egui::RichText::new("No trails yet")
-                .color(theme::muted())
-                .small(),
-        );
-    });
-    self.ui.add_space(8.0);
-    if self.ui.button("New trail").clicked() {
-        let name = format!("Trail {}", state.session.trails.len() + 1);
-        let id = create_trail(state, &name);
-        state.session.active_trail = Some(id);
-        let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+    /// Apply the deferred verbs collected during a render pass against the
+    /// trail identified by `visible_id`, persisting where the verb mutates
+    /// the trail forest.
+    fn apply_actions(&mut self, visible_id: &str, actions: TrailActions) {
+        if let Some((src, op)) = actions.move_op {
+            self.apply_move(visible_id, &src, op);
+        }
+        if let Some(path) = actions.open {
+            self.ctx.defer(move |app| editor_pane::open_file(app, &path, false));
+        }
+        if let Some(path) = actions.remove {
+            self.queue_remove_modal(visible_id, &path);
+        }
+        if let Some(path) = actions.set_append {
+            if let Some(trail) = self.st().trails.iter_mut().find(|t| t.id == visible_id) {
+                trail.append_under = Some(path.clone());
+            }
+            self.persist();
+            self.toast(
+                format!("Appending under {}", basename(&path)),
+                crate::state::ToastLevel::Info,
+            );
+        }
+        if let Some(path) = actions.toggle_expand {
+            self.st().toggle_expanded(&path);
+        }
+        if let Some(path) = actions.toggle_side {
+            if !self.st().side_trail_collapsed.remove(&path) {
+                self.st().side_trail_collapsed.insert(path);
+            }
+        }
+        if let Some(path) = actions.start_annot {
+            let cur = self
+                .st_ref()
+                .trails
+                .iter()
+                .find(|t| t.id == visible_id)
+                .and_then(|t| find_waypoint(&t.waypoints, &path).map(|w| w.annotation.clone()))
+                .unwrap_or_default();
+            self.st().annotation_edit = Some((path, cur));
+        }
+        if let Some(text) = actions.update_annot
+            && let Some((_, draft)) = self.st().annotation_edit.as_mut()
+        {
+            *draft = text;
+        }
+        if actions.cancel_annot {
+            self.st().annotation_edit = None;
+        }
+        if let Some((path, body)) = actions.save_annot {
+            self.apply_save_annot(visible_id, &path, body);
+        }
     }
-    self.ui.add_space(8.0);
-    self.ui.label(
-        egui::RichText::new("Tip: with a trail active, use the \"+\" pill in the editor toolbar or the \"Add to trail\" right-click verb in the file tree to add waypoints.")
-            .color(theme::muted())
-            .italics()
-            .small(),
-    );
-}
 
-/// Apply the deferred verbs collected during a render pass against the
-/// trail identified by `visible_id`, persisting where the verb mutates
-/// the trail forest.
-fn apply_actions(&mut self, visible_id: &str, actions: TrailActions) {
-    let state = &mut *self.state;
-    if let Some((src, op)) = actions.move_op {
-        if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id) {
+    /// Move-waypoint verb: reparent `src` per `op`, reset the (possibly
+    /// dangling) append cursor, and persist on a real change.
+    fn apply_move(&mut self, visible_id: &str, src: &str, op: crate::state::MoveOp) {
+        let mut changed = false;
+        if let Some(trail) = self.st().trails.iter_mut().find(|t| t.id == visible_id) {
             // Resetting the append cursor whenever it might dangle is
             // simpler than tracking subtree moves precisely.
             trail.append_under = None;
-            if trail.move_waypoint(&src, op) {
-                let _ = crate::bootstrap::save_trails(
-                    &state.vault_session.vault_root,
-                    &state.session.trails,
-                );
-            }
+            changed = trail.move_waypoint(src, op);
+        }
+        if changed {
+            self.persist();
         }
     }
-    if let Some(path) = actions.open {
-        editor_pane::open_file(state, &path, false);
+
+    /// Save the inline annotation editor's draft onto the waypoint and
+    /// close the editor.
+    fn apply_save_annot(&mut self, visible_id: &str, path: &str, body: String) {
+        let mut changed = false;
+        if let Some(trail) = self.st().trails.iter_mut().find(|t| t.id == visible_id)
+            && let Some(wp) = crate::state::find_waypoint_mut(&mut trail.waypoints, path)
+        {
+            wp.annotation = body;
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+        self.st().annotation_edit = None;
     }
-    if let Some(path) = actions.remove {
-        // Mirrors the legacy `removeWaypoint` flow: compute the cascade
-        // size and raise a danger-styled confirm modal; the actual drop
-        // happens in the modal's confirm handler.
-        let total = state
-            .session.trails
+
+    /// Raise the danger-styled remove-confirm modal. Mirrors the legacy
+    /// `removeWaypoint` flow: compute the cascade size, defer setting
+    /// `session.modal`; the actual drop happens in the confirm handler.
+    fn queue_remove_modal(&mut self, visible_id: &str, path: &str) {
+        let total = self
+            .st_ref()
+            .trails
             .iter()
             .find(|t| t.id == visible_id)
-            .map(|t| descendant_count(&t.waypoints, &path))
+            .map(|t| descendant_count(&t.waypoints, path))
             .unwrap_or(0);
         let sides = total.saturating_sub(1);
         let body = if sides > 0 {
@@ -181,247 +320,225 @@ fn apply_actions(&mut self, visible_id: &str, actions: TrailActions) {
             "Remove this waypoint? The trail entry is dropped - the underlying note stays on disk."
                 .to_string()
         };
-        state.session.modal = Some(crate::state::Modal::Confirm {
-            title: "Remove waypoint".to_string(),
-            body,
-            confirm_label: "Remove".to_string(),
-            cancel_label: "Cancel".to_string(),
-            danger: true,
-            intent: crate::state::ConfirmIntent::DeleteTrailWaypoint {
-                trail_id: visible_id.to_string(),
-                path,
-            },
+        let trail_id = visible_id.to_string();
+        let path = path.to_string();
+        self.ctx.defer(move |app| {
+            app.session.modal = Some(crate::state::Modal::Confirm {
+                title: "Remove waypoint".to_string(),
+                body,
+                confirm_label: "Remove".to_string(),
+                cancel_label: "Cancel".to_string(),
+                danger: true,
+                intent: crate::state::ConfirmIntent::DeleteTrailWaypoint { trail_id, path },
+            });
         });
     }
-    if let Some(path) = actions.set_append {
-        if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id) {
-            trail.append_under = Some(path.clone());
-        }
-        let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-        state.push_toast(
-            format!("Appending under {}", basename(&path)),
-            crate::state::ToastLevel::Info,
-        );
-    }
-    if let Some(path) = actions.toggle_expand {
-        if state.trails_state.expanded_path.as_deref() == Some(&path) {
-            state.trails_state.expanded_path = None;
-        } else {
-            state.trails_state.expanded_path = Some(path);
-        }
-    }
-    if let Some(path) = actions.toggle_side {
-        if !state.trails_state.side_trail_collapsed.remove(&path) {
-            state.trails_state.side_trail_collapsed.insert(path);
-        }
-    }
-    if let Some(path) = actions.start_annot {
-        let cur = state
-            .session.trails
+
+    fn header_row(&mut self, ui: &mut egui::Ui, visible_id: &str) {
+        let visible_name = self
+            .st_ref()
+            .trails
             .iter()
             .find(|t| t.id == visible_id)
-            .and_then(|t| find_waypoint(&t.waypoints, &path).map(|w| w.annotation.clone()))
-            .unwrap_or_default();
-        state.trails_state.annotation_edit = Some((path, cur));
-    }
-    if let Some(text) = actions.update_annot
-        && let Some((_, draft)) = state.trails_state.annotation_edit.as_mut()
-    {
-        *draft = text;
-    }
-    if actions.cancel_annot {
-        state.trails_state.annotation_edit = None;
-    }
-    if let Some((path, body)) = actions.save_annot {
-        if let Some(trail) = state.session.trails.iter_mut().find(|t| t.id == visible_id)
-            && let Some(wp) = crate::state::find_waypoint_mut(&mut trail.waypoints, &path)
-        {
-            wp.annotation = body;
-            let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut open_trail_doc: Option<String> = None;
+        let mut new_active: Option<String> = None;
+        let mut open_picker = false;
+        let mut do_new_trail = false;
+        let mut do_rename = false;
+        let mut do_delete = false;
+
+        ui.horizontal(|ui| {
+            ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
+            self.header_dropdown(ui, visible_id, &visible_name, &mut new_active, &mut open_picker);
+
+            // Trail-head icon (legacy `trails-mode-trail-head-icon`): opens
+            // the trail-doc. The new app generates the doc on demand under
+            // `.hiker/trails/<slug>.md`.
+            let head_btn = ui
+                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Compass)))
+                .on_hover_text("Open trail-doc");
+            if head_btn.clicked() {
+                open_trail_doc = Some(visible_id.to_string());
+            }
+
+            self.expand_all_toggle(ui, visible_id);
+            self.overflow_menu(ui, visible_id, &mut do_new_trail, &mut do_rename, &mut do_delete);
+        });
+
+        if open_picker {
+            self.st().all_trails_picker_open = true;
         }
-        state.trails_state.annotation_edit = None;
+        if let Some(id) = new_active {
+            self.activate_trail(&id);
+        }
+        if do_new_trail {
+            self.create_active_trail();
+        }
+        if do_rename {
+            let cur = self
+                .st_ref()
+                .trails
+                .iter()
+                .find(|t| t.id == visible_id)
+                .map(|t| t.name.clone())
+                .unwrap_or_default();
+            self.st().trail_rename = Some((visible_id.to_string(), cur));
+        }
+        if do_delete {
+            self.st().trails.retain(|t| t.id != visible_id);
+            self.st().active_trail = None;
+            self.st().trail_rename = None;
+            self.persist();
+        }
+        if let Some(id) = open_trail_doc {
+            self.write_and_open_trail_doc(&id);
+        }
     }
-}
 
-fn header_row(&mut self, visible_id: &str) {
-    let ui = &mut *self.ui;
-    let state = &mut *self.state;
-    let visible_name = state
-        .session.trails
-        .iter()
-        .find(|t| t.id == visible_id)
-        .map(|t| t.name.clone())
-        .unwrap_or_else(|| "-".to_string());
-
-    let mut open_trail_doc: Option<String> = None;
-
-    ui.horizontal(|ui| {
-        ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
-
-        // Dropdown button - popover with "None"-like behavior replaced
-        // by the always-present "Recent" trail (the new app's stand-in
-        // for legacy's None). Legacy `trails-mode-active-trail-dropdown`
-        // ordering: most-recently-activated first, alphabetical on tie.
-        let mut ordered: Vec<crate::state::Trail> = state.session.trails.clone();
+    /// Active-trail dropdown: recency-ordered recent trails + an "All
+    /// trails..." entry into the flat picker. Legacy
+    /// `trails-mode-active-trail-dropdown` ordering: most-recently-
+    /// activated first, alphabetical on tie.
+    fn header_dropdown(
+        &self,
+        ui: &mut egui::Ui,
+        visible_id: &str,
+        visible_name: &str,
+        new_active: &mut Option<String>,
+        open_picker: &mut bool,
+    ) {
+        let mut ordered: Vec<crate::state::Trail> = self.st_ref().trails.clone();
         ordered.sort_by(|a, b| {
             b.last_activated_at_ms
                 .cmp(&a.last_activated_at_ms)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        let mut new_active: Option<String> = None;
         let dropdown_btn = ui.add(
-            egui::Button::new(format!("{visible_name} v"))
-                .min_size(egui::vec2(0.0, 22.0)),
+            egui::Button::new(format!("{visible_name} v")).min_size(egui::vec2(0.0, 22.0)),
         );
         const RECENT_CAP: usize = 8;
-        let mut open_picker = false;
         egui::Popup::menu(&dropdown_btn).show(|ui| {
             for t in ordered.iter().take(RECENT_CAP) {
-                let selected = t.id == visible_id;
-                let prefix = if selected { "* " } else { "  " };
-                if ui
-                    .button(format!("{prefix}{}", t.name))
-                    .clicked()
-                {
-                    new_active = Some(t.id.clone());
+                let prefix = if t.id == visible_id { "* " } else { "  " };
+                if ui.button(format!("{prefix}{}", t.name)).clicked() {
+                    *new_active = Some(t.id.clone());
                     ui.close();
                 }
             }
-            if ordered.len() > RECENT_CAP {
-                ui.separator();
-                if ui.button("All trails...").clicked() {
-                    open_picker = true;
-                    ui.close();
-                }
-            } else {
-                // Always offer the flat picker - even with a small list
-                // it's a familiar entry point (legacy parity).
-                ui.separator();
-                if ui.button("All trails...").clicked() {
-                    open_picker = true;
-                    ui.close();
-                }
+            // Always offer the flat picker - even with a small list it's a
+            // familiar entry point (legacy parity).
+            ui.separator();
+            if ui.button("All trails...").clicked() {
+                *open_picker = true;
+                ui.close();
             }
         });
-        if open_picker {
-            state.trails_state.all_trails_picker_open = true;
-        }
-        if let Some(id) = new_active {
-            activate_trail(state, &id);
-        }
+    }
 
-        // Trail-head icon (legacy `trails-mode-trail-head-icon`): opens
-        // the trail-doc. The new app generates the doc on demand under
-        // `.hiker/trails/<slug>.md`.
-        let head_btn = ui
-            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Compass)))
-            .on_hover_text("Open trail-doc");
-        if head_btn.clicked() {
-            open_trail_doc = Some(visible_id.to_string());
-        }
-
-        // Expand-all toggle (legacy header chevron).
-        let has_waypoints = state
-            .session.trails
+    /// Expand-all toggle (legacy header chevron).
+    fn expand_all_toggle(&mut self, ui: &mut egui::Ui, visible_id: &str) {
+        let has_waypoints = self
+            .st_ref()
+            .trails
             .iter()
             .find(|t| t.id == visible_id)
             .map(|t| !t.waypoints.is_empty())
             .unwrap_or(false);
-        let (icon, tip) = if state.trails_state.expand_all {
+        let (icon, tip) = if self.st_ref().expand_all {
             (crate::icons::ICONS.image(crate::icons::Icon::ChevronDown), "Collapse all")
         } else {
             (crate::icons::ICONS.image(crate::icons::Icon::ChevronRight), "Expand all")
         };
+        let mut toggled = false;
         ui.add_enabled_ui(has_waypoints, |ui| {
             if ui
                 .add(egui::Button::image(icon).small())
                 .on_hover_text(tip)
                 .clicked()
             {
-                state.trails_state.expand_all = !state.trails_state.expand_all;
-                if !state.trails_state.expand_all {
-                    state.trails_state.expanded_path = None;
-                }
+                toggled = true;
             }
         });
+        if toggled {
+            let on = !self.st_ref().expand_all;
+            self.st().expand_all = on;
+            if !on {
+                self.st().expanded_path = None;
+            }
+        }
+    }
 
-        // Overflow menu - New / Rename / Delete. Legacy keeps these out
-        // of the always-visible sidebar; the overflow is the new-app
-        // affordance so users can still manage trails without opening
-        // the editor.
+    /// Overflow menu - New / Rename / Delete. Legacy keeps these out of
+    /// the always-visible sidebar; the overflow is the new-app affordance
+    /// so users can still manage trails without opening the editor. Sets
+    /// the caller's flags so the actual mutation runs outside the popup
+    /// closure (which borrows `ui`).
+    fn overflow_menu(
+        &self,
+        ui: &mut egui::Ui,
+        _visible_id: &str,
+        do_new: &mut bool,
+        do_rename: &mut bool,
+        do_delete: &mut bool,
+    ) {
         let overflow = ui
             .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Menu)))
             .on_hover_text("Trail actions");
         egui::Popup::menu(&overflow).show(|ui| {
             if ui.button("New trail").clicked() {
-                let name = format!("Trail {}", state.session.trails.len() + 1);
-                let id = create_trail(state, &name);
-                state.session.active_trail = Some(id);
-                let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+                *do_new = true;
                 ui.close();
             }
-            {
-                if ui.button("Rename trail").clicked() {
-                    let cur = state
-                        .session.trails
-                        .iter()
-                        .find(|t| t.id == visible_id)
-                        .map(|t| t.name.clone())
-                        .unwrap_or_default();
-                    state.session.trail_rename = Some((visible_id.to_string(), cur));
-                    ui.close();
-                }
-                if ui.button("Delete trail").clicked() {
-                    state.session.trails.retain(|t| t.id != visible_id);
-                    state.session.active_trail = None;
-                    state.session.trail_rename = None;
-                    let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-                    ui.close();
-                }
+            if ui.button("Rename trail").clicked() {
+                *do_rename = true;
+                ui.close();
+            }
+            if ui.button("Delete trail").clicked() {
+                *do_delete = true;
+                ui.close();
             }
         });
-    });
-
-    if let Some(id) = open_trail_doc {
-        self.write_and_open_trail_doc(&id);
     }
-}
 
-/// Floating "All trails" picker - flat alphabetical list over every
-/// trail in the vault, with a search box. Legacy `openAllTrailsPicker`
-/// equivalent; useful when the dropdown's recent cap hides the trail
-/// the user wants.
-fn render_all_trails_picker(&mut self, visible_id: &str) {
-    let ctx = self.ui.ctx().clone();
-    let state = &mut *self.state;
-    let mut open = true;
-    let mut to_activate: Option<String> = None;
-    let mut close_after = false;
-    egui::Window::new("All trails")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(320.0)
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
-        .show(&ctx, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{} trail{}", state.session.trails.len(),
-                    if state.session.trails.len() == 1 { "" } else { "s" }))
+    /// Floating "All trails" picker - flat alphabetical list over every
+    /// trail in the vault. Legacy `openAllTrailsPicker` equivalent; useful
+    /// when the dropdown's recent cap hides the trail the user wants.
+    fn render_all_trails_picker(&mut self, ui: &mut egui::Ui, visible_id: &str) {
+        let egui_ctx = ui.ctx().clone();
+        let mut open = true;
+        let mut to_activate: Option<String> = None;
+        let mut close_after = false;
+        let trails = self.st_ref().trails.clone();
+        egui::Window::new("All trails")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(320.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
+            .show(&egui_ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} trail{}",
+                        trails.len(),
+                        if trails.len() == 1 { "" } else { "s" }
+                    ))
                     .color(theme::muted())
                     .small(),
-            );
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    let mut sorted: Vec<&crate::state::Trail> = state.session.trails.iter().collect();
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    let mut sorted: Vec<&crate::state::Trail> = trails.iter().collect();
                     sorted.sort_by_key(|t| t.name.to_lowercase());
                     for t in sorted {
-                        let selected = t.id == visible_id;
-                        let prefix = if selected { "* " } else { "  " };
+                        let prefix = if t.id == visible_id { "* " } else { "  " };
                         if ui
-                            .add(egui::Button::new(format!("{prefix}{}", t.name))
-                                .min_size(egui::vec2(ui.available_width(), 0.0)))
+                            .add(
+                                egui::Button::new(format!("{prefix}{}", t.name))
+                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+                            )
                             .clicked()
                         {
                             to_activate = Some(t.id.clone());
@@ -429,123 +546,159 @@ fn render_all_trails_picker(&mut self, visible_id: &str) {
                         }
                     }
                 });
-        });
-    if let Some(id) = to_activate {
-        activate_trail(state, &id);
+            });
+        if let Some(id) = to_activate {
+            self.activate_trail(&id);
+        }
+        if !open || close_after {
+            self.st().all_trails_picker_open = false;
+        }
     }
-    if !open || close_after {
-        state.trails_state.all_trails_picker_open = false;
-    }
-}
 
-fn rename_row(&mut self, visible_id: &str) {
-    let ui = &mut *self.ui;
-    let state = &mut *self.state;
-    let Some((rename_id, _)) = state.session.trail_rename.clone() else {
-        return;
-    };
-    if rename_id != visible_id {
-        return;
-    }
-    let mut draft = state
-        .session.trail_rename
-        .as_ref()
-        .map(|(_, t)| t.clone())
-        .unwrap_or_default();
-    ui.horizontal(|ui| {
-        let resp = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Trail name"));
-        resp.request_focus();
-        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if enter {
-            if let Some(t) = state.session.trails.iter_mut().find(|t| t.id == visible_id)
+    fn rename_row(&mut self, ui: &mut egui::Ui, visible_id: &str) {
+        let Some((rename_id, _)) = self.st_ref().trail_rename.clone() else {
+            return;
+        };
+        if rename_id != visible_id {
+            return;
+        }
+        let mut draft = self
+            .st_ref()
+            .trail_rename
+            .as_ref()
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        let mut commit = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Trail name"));
+            resp.request_focus();
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if enter {
+                commit = true;
+            } else if escape || (resp.lost_focus() && !enter) {
+                cancel = true;
+            }
+        });
+        if commit {
+            if let Some(t) = self.st().trails.iter_mut().find(|t| t.id == visible_id)
                 && !draft.trim().is_empty()
             {
                 t.name = draft.trim().to_string();
-                let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+                self.persist();
             }
-            state.session.trail_rename = None;
-        } else if escape || (resp.lost_focus() && !enter) {
-            state.session.trail_rename = None;
-        } else if let Some((_, text)) = state.session.trail_rename.as_mut() {
+            self.st().trail_rename = None;
+        } else if cancel {
+            self.st().trail_rename = None;
+        } else if let Some((_, text)) = self.st().trail_rename.as_mut() {
             *text = draft;
         }
-    });
-}
+    }
 
-fn cursor_hint_row(&mut self, visible_id: &str) {
-    let ui = &mut *self.ui;
-    let state = &mut *self.state;
-    let (under, exists) = state
-        .session.trails
-        .iter()
-        .find(|t| t.id == visible_id)
-        .map(|t| {
-            let exists = t
-                .append_under
-                .as_ref()
-                .map(|p| find_waypoint(&t.waypoints, p).is_some())
-                .unwrap_or(false);
-            (t.append_under.clone(), exists)
-        })
-        .unwrap_or((None, false));
+    fn cursor_hint_row(&mut self, ui: &mut egui::Ui, visible_id: &str) {
+        let (under, exists) = self
+            .st_ref()
+            .trails
+            .iter()
+            .find(|t| t.id == visible_id)
+            .map(|t| {
+                let exists = t
+                    .append_under
+                    .as_ref()
+                    .map(|p| find_waypoint(&t.waypoints, p).is_some())
+                    .unwrap_or(false);
+                (t.append_under.clone(), exists)
+            })
+            .unwrap_or((None, false));
 
-    // Legacy `trail-append-cursor-indicator`: header hint row beneath
-    // the dropdown / expand-all row. When the cursor is set we render
-    // the label in the accent color and surface a "Reset to root"
-    // button - without that button the user has no way to clear an
-    // active append cursor (`trail-reset-cursor-verb`).
-    ui.horizontal(|ui| {
-        let (label, color) = match under.as_deref() {
-            Some(p) if exists => (
-                format!("Appending under {}", basename(p)),
-                theme::accent(),
-            ),
-            Some(_) => ("Appending under (missing)".to_string(), theme::accent()),
-            None => ("Appending to root".to_string(), theme::muted()),
-        };
-        ui.label(egui::RichText::new(label).color(color).small());
-        if under.is_some()
-            && ui
-                .small_button("Reset to root")
-                .on_hover_text("Stop appending under cursor - new visits land at the trail root")
-                .clicked()
-        {
-            if let Some(t) = state.session.trails.iter_mut().find(|t| t.id == visible_id) {
+        // Legacy `trail-append-cursor-indicator`: header hint row beneath
+        // the dropdown / expand-all row. When the cursor is set we render
+        // the label in the accent color and surface a "Reset to root"
+        // button - without that button the user has no way to clear an
+        // active append cursor (`trail-reset-cursor-verb`).
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            let (label, color) = match under.as_deref() {
+                Some(p) if exists => (format!("Appending under {}", basename(p)), theme::accent()),
+                Some(_) => ("Appending under (missing)".to_string(), theme::accent()),
+                None => ("Appending to root".to_string(), theme::muted()),
+            };
+            ui.label(egui::RichText::new(label).color(color).small());
+            if under.is_some()
+                && ui
+                    .small_button("Reset to root")
+                    .on_hover_text("Stop appending under cursor - new visits land at the trail root")
+                    .clicked()
+            {
+                reset = true;
+            }
+        });
+        if reset {
+            if let Some(t) = self.st().trails.iter_mut().find(|t| t.id == visible_id) {
                 t.append_under = None;
             }
-            let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
+            self.persist();
         }
-    });
+    }
+
+    fn render_waypoints(
+        &mut self,
+        ui: &mut egui::Ui,
+        waypoints: &[Waypoint],
+        cursor_path: Option<&str>,
+        append_under: Option<&str>,
+        ordinal: &mut Vec<usize>,
+        actions: &mut TrailActions,
+    ) {
+        let vault_root = self.vault_root();
+        let state = self.st_ref();
+        let mut wv = WaypointView { ui, state, vault_root: &vault_root };
+        wv.forest(waypoints, cursor_path, append_under, ordinal, actions);
+    }
+
+    /// Regenerate `.hiker/trails/<slug>.md` from the trail's current
+    /// waypoint forest and open it in the editor. Legacy parity for the
+    /// trail-head verb - in the new app the JSON is authoritative, so the
+    /// doc is overwritten each open. The file-tree cache invalidation +
+    /// editor open run through `ctx.defer` (they need `&mut AppState`).
+    fn write_and_open_trail_doc(&mut self, trail_id: &str) {
+        let Some(trail) = self.st_ref().trails.iter().find(|t| t.id == trail_id) else {
+            return;
+        };
+        let rel = format!(".hiker/trails/{}.md", slug_trail(&trail.name, trail_id));
+        let mut body = String::new();
+        body.push_str(&format!("# {}\n\n", trail.name));
+        if trail.waypoints.is_empty() {
+            body.push_str("_(no waypoints yet)_\n");
+        } else {
+            write_trail_doc_section(&mut body, &trail.waypoints, &mut Vec::new());
+        }
+        let abs = self.vault_root().join(&rel);
+        if let Some(parent) = abs.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&abs, body).is_err() {
+            self.toast("Failed to write trail-doc", crate::state::ToastLevel::Error);
+            return;
+        }
+        self.ctx.defer(move |app| {
+            app.file_tree_state.dir_cache.remove(".hiker/trails");
+            app.file_tree_state.dir_cache.remove(".hiker");
+            crate::editor_pane::open_file(app, &rel, false);
+        });
+    }
 }
 
-fn render_waypoints(
-    &mut self,
-    waypoints: &[Waypoint],
-    cursor_path: Option<&str>,
-    append_under: Option<&str>,
-    ordinal: &mut Vec<usize>,
-    actions: &mut TrailActions,
-) {
-    let state: &AppState = self.state;
-    let mut wv = WaypointView { ui: self.ui, state };
-    wv.forest(waypoints, cursor_path, append_under, ordinal, actions);
-}
+// ===== free helpers =====
 
-/// Regenerate `.hiker/trails/<slug>.md` from the trail's current
-/// waypoint forest and open it in the editor. Legacy parity for the
-/// trail-head verb - in the new app the JSON is authoritative, so the
-/// doc is overwritten each open.
-fn write_and_open_trail_doc(&mut self, trail_id: &str) {
-    let state = &mut *self.state;
-    let Some(trail) = state.session.trails.iter().find(|t| t.id == trail_id) else {
-        return;
-    };
-    // Slug the trail name into a filesystem-safe stem: lowercase,
-    // collapse non-alphanumeric runs to a single `-`, trim edge dashes.
+/// Slug a trail name into a filesystem-safe stem: lowercase, collapse
+/// non-alphanumeric runs to a single `-`, trim edge dashes. Falls back to
+/// `trail_id` when the name slugs to empty.
+fn slug_trail(name: &str, trail_id: &str) -> String {
     let mut stem = String::new();
     let mut last_dash = false;
-    for ch in trail.name.chars() {
+    for ch in name.chars() {
         if ch.is_alphanumeric() {
             stem.extend(ch.to_lowercase());
             last_dash = false;
@@ -555,35 +708,12 @@ fn write_and_open_trail_doc(&mut self, trail_id: &str) {
         }
     }
     let stem = stem.trim_matches('-').to_string();
-    let stem = if stem.is_empty() {
+    if stem.is_empty() {
         trail_id.to_string()
     } else {
         stem
-    };
-    let rel = format!(".hiker/trails/{}.md", stem);
-    let mut body = String::new();
-    body.push_str(&format!("# {}\n\n", trail.name));
-    if trail.waypoints.is_empty() {
-        body.push_str("_(no waypoints yet)_\n");
-    } else {
-        write_trail_doc_section(&mut body, &trail.waypoints, &mut Vec::new());
     }
-    let abs = state.vault_session.vault_root.join(&rel);
-    if let Some(parent) = abs.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(&abs, body).is_err() {
-        state.push_toast("Failed to write trail-doc", crate::state::ToastLevel::Error);
-        return;
-    }
-    state.session.file_tree.dir_cache.remove(".hiker/trails");
-    state.session.file_tree.dir_cache.remove(".hiker");
-    crate::editor_pane::open_file(state, &rel, false);
 }
-
-}
-
-// ===== free helpers =====
 
 fn write_trail_doc_section(out: &mut String, waypoints: &[Waypoint], ordinal: &mut Vec<usize>) {
     for (idx, wp) in waypoints.iter().enumerate() {
@@ -607,18 +737,6 @@ fn write_trail_doc_section(out: &mut String, waypoints: &[Waypoint], ordinal: &m
     }
 }
 
-fn activate_trail(state: &mut AppState, id: &str) {
-    state.session.active_trail = Some(id.to_string());
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    if let Some(t) = state.session.trails.iter_mut().find(|t| t.id == id) {
-        t.last_activated_at_ms = now_ms;
-    }
-    let _ = crate::bootstrap::save_trails(&state.vault_session.vault_root, &state.session.trails);
-}
-
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -635,14 +753,15 @@ fn find_waypoint<'a>(waypoints: &'a [Waypoint], path: &str) -> Option<&'a Waypoi
     None
 }
 
-/// Read-only render context for the waypoint forest. Rendering only
-/// reads `AppState` (a shared ref), so the recursive forest walk can
-/// freely re-borrow `state` inside `ui.indent` closures while writing
-/// picked verbs into `TrailActions`. The per-card helpers are `&mut
-/// self` methods, exempt from `single_call_fn`.
+/// Read-only render context for the waypoint forest. Rendering only reads
+/// the feature `State` (a shared ref) + the vault root, so the recursive
+/// forest walk can freely re-borrow inside `ui.indent` closures while
+/// writing picked verbs into `TrailActions`. The per-card helpers are
+/// `&mut self` methods, exempt from `single_call_fn`.
 struct WaypointView<'a> {
     ui: &'a mut egui::Ui,
-    state: &'a AppState,
+    state: &'a State,
+    vault_root: &'a Path,
 }
 
 impl WaypointView<'_> {
@@ -664,13 +783,13 @@ impl WaypointView<'_> {
                 .collect::<Vec<_>>()
                 .join(".");
             self.single(wp, &tree_path, cursor_path, append_under, actions);
-            let side_collapsed =
-                self.state.trails_state.side_trail_collapsed.contains(&wp.path);
+            let side_collapsed = self.state.side_trail_collapsed.contains(&wp.path);
             if !wp.children.is_empty() && !side_collapsed {
                 let state = self.state;
+                let vault_root = self.vault_root;
                 self.ui.indent(("trail-children", &wp.path), |ui| {
                     ui.add_space(2.0);
-                    let mut child = WaypointView { ui, state };
+                    let mut child = WaypointView { ui, state, vault_root };
                     child.forest(&wp.children, cursor_path, append_under, ordinal, actions);
                 });
             }
@@ -690,11 +809,10 @@ impl WaypointView<'_> {
         actions: &mut TrailActions,
     ) {
         let base = basename(&wp.path);
-        let exists = self.state.vault_session.vault_root.join(&wp.path).exists();
+        let exists = self.vault_root.join(&wp.path).exists();
         let is_cursor = append_under == Some(wp.path.as_str());
         let is_active_tab = cursor_path == Some(wp.path.as_str());
-        let expanded = self.state.trails_state.expand_all
-            || self.state.trails_state.expanded_path.as_deref() == Some(wp.path.as_str());
+        let expanded = self.state.is_expanded(&wp.path);
 
         let (fill, stroke_color) = if !exists {
             (
@@ -714,15 +832,15 @@ impl WaypointView<'_> {
         let drag_id = self.ui.make_persistent_id(("trail-wp-drag", &wp.path));
         let card = CardCtx { wp, tree_path, base, exists, is_cursor, is_active_tab, expanded };
         let state = self.state;
-        let (zone_resp, drop_payload) =
-            self.ui.dnd_drop_zone::<String, _>(card_frame, |ui| {
-                let drag = ui.dnd_drag_source(drag_id, wp.path.clone(), |ui| {
-                    let mut row = WaypointView { ui, state };
-                    row.card_header(&card, actions);
-                    row.card_body(&card, actions);
-                });
-                drag.response
+        let vault_root = self.vault_root;
+        let (zone_resp, drop_payload) = self.ui.dnd_drop_zone::<String, _>(card_frame, |ui| {
+            let drag = ui.dnd_drag_source(drag_id, wp.path.clone(), |ui| {
+                let mut row = WaypointView { ui, state, vault_root };
+                row.card_header(&card, actions);
+                row.card_body(&card, actions);
             });
+            drag.response
+        });
         let drag_resp = zone_resp.inner;
         self.resolve_drop(wp, &drag_resp, drop_payload, exists, actions);
         self.waypoint_context_menu(wp, &drag_resp, exists, is_cursor, actions);
@@ -737,8 +855,7 @@ impl WaypointView<'_> {
         self.ui.horizontal(|ui| {
             // Side-trail collapse chevron (only when has children).
             if !wp.children.is_empty() {
-                let side_collapsed =
-                    state.trails_state.side_trail_collapsed.contains(&wp.path);
+                let side_collapsed = state.side_trail_collapsed.contains(&wp.path);
                 let (icon, tip) = if side_collapsed {
                     (crate::icons::ICONS.image(crate::icons::Icon::ChevronRight), "Expand side trail")
                 } else {
@@ -799,19 +916,16 @@ impl WaypointView<'_> {
             }
 
             // Right-edge expand chevron.
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let icon = if card.expanded {
-                        crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
-                    } else {
-                        crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
-                    };
-                    if ui.add(egui::Button::image(icon).small()).clicked() {
-                        actions.toggle_expand = Some(wp.path.clone());
-                    }
-                },
-            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let icon = if card.expanded {
+                    crate::icons::ICONS.image(crate::icons::Icon::ChevronDown)
+                } else {
+                    crate::icons::ICONS.image(crate::icons::Icon::ChevronRight)
+                };
+                if ui.add(egui::Button::image(icon).small()).clicked() {
+                    actions.toggle_expand = Some(wp.path.clone());
+                }
+            });
         });
     }
 
@@ -819,14 +933,11 @@ impl WaypointView<'_> {
     /// parent path, timestamp, annotation editor/text, and action row.
     fn card_body(&mut self, card: &CardCtx, actions: &mut TrailActions) {
         let wp = card.wp;
-        let state = self.state;
         if !card.expanded {
-            let snippet = self.first_non_empty_line(&wp.annotation);
+            let snippet = first_non_empty_line(&wp.annotation);
             if !snippet.is_empty() {
                 self.ui.label(
-                    egui::RichText::new(snippet)
-                        .color(theme::muted())
-                        .small(),
+                    egui::RichText::new(snippet).color(theme::muted()).small(),
                 );
             }
             return;
@@ -841,26 +952,28 @@ impl WaypointView<'_> {
             );
         }
         if wp.at_ms > 0 {
-            let ts = self.format_ts(wp.at_ms);
-            self.ui.label(
-                egui::RichText::new(ts)
-                    .color(theme::muted())
-                    .small(),
-            );
+            let ts = format_ts(wp.at_ms);
+            self.ui.label(egui::RichText::new(ts).color(theme::muted()).small());
         }
         self.ui.add_space(2.0);
+        let editing = self.card_annotation(card, actions);
+        self.card_action_row(card, editing, actions);
+    }
 
-        // Annotation body - inline editor when this waypoint is the
-        // current annotation-edit target, else a paragraph / placeholder.
-        let editing = state
-            .trails_state
+    /// Render the annotation block (inline editor when this waypoint is
+    /// the current edit target, else paragraph / placeholder). Returns
+    /// whether the inline editor is active for this card.
+    fn card_annotation(&mut self, card: &CardCtx, actions: &mut TrailActions) -> bool {
+        let wp = card.wp;
+        let editing = self
+            .state
             .annotation_edit
             .as_ref()
             .map(|(p, _)| p == &wp.path)
             .unwrap_or(false);
         if editing {
-            let mut draft = state
-                .trails_state
+            let mut draft = self
+                .state
                 .annotation_edit
                 .as_ref()
                 .map(|(_, t)| t.clone())
@@ -893,7 +1006,13 @@ impl WaypointView<'_> {
         } else {
             self.ui.label(egui::RichText::new(&wp.annotation).small());
         }
+        editing
+    }
 
+    /// Bottom action row of an expanded card: Open / Edit annotation /
+    /// Append here.
+    fn card_action_row(&mut self, card: &CardCtx, editing: bool, actions: &mut TrailActions) {
+        let wp = card.wp;
         self.ui.horizontal(|ui| {
             if card.exists && ui.small_button("Open").clicked() {
                 actions.open = Some(wp.path.clone());
@@ -930,8 +1049,7 @@ impl WaypointView<'_> {
         let band = drop_band(pointer_y, card_rect.top(), card_rect.bottom());
 
         // Live feedback while a waypoint is being dragged over this card.
-        let dragging =
-            egui::DragAndDrop::has_payload_of_type::<String>(self.ui.ctx());
+        let dragging = egui::DragAndDrop::has_payload_of_type::<String>(self.ui.ctx());
         if dragging && self.ui.rect_contains_pointer(card_rect) {
             self.paint_drop_indicator(card_rect, band);
         }
@@ -964,11 +1082,7 @@ impl WaypointView<'_> {
                 } else {
                     card_rect.bottom()
                 };
-                painter.hline(
-                    card_rect.x_range(),
-                    y,
-                    egui::Stroke::new(2.0, accent),
-                );
+                painter.hline(card_rect.x_range(), y, egui::Stroke::new(2.0, accent));
             }
             DropBand::Into => {
                 painter.rect_stroke(
@@ -1014,35 +1128,32 @@ impl WaypointView<'_> {
             }
         });
     }
+}
 
-    /// First non-empty, trimmed line of `s` (collapsed-card snippet).
-    fn first_non_empty_line(&self, s: &str) -> String {
-        for raw in s.lines() {
-            let line = raw.trim();
-            if !line.is_empty() {
-                return line.to_string();
-            }
+/// First non-empty, trimmed line of `s` (collapsed-card snippet).
+fn first_non_empty_line(s: &str) -> String {
+    for raw in s.lines() {
+        let line = raw.trim();
+        if !line.is_empty() {
+            return line.to_string();
         }
-        String::new()
     }
+    String::new()
+}
 
-    /// Coarse "visited Xm ago" relative timestamp from epoch millis. We
-    /// avoid pulling in chrono for a muted footnote.
-    fn format_ts(&self, ms: i64) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let delta = (now - ms).max(0) / 1000;
-        if delta < 60 {
-            format!("visited {}s ago", delta)
-        } else if delta < 3600 {
-            format!("visited {}m ago", delta / 60)
-        } else if delta < 86400 {
-            format!("visited {}h ago", delta / 3600)
-        } else {
-            format!("visited {}d ago", delta / 86400)
-        }
+/// Coarse "visited Xm ago" relative timestamp from epoch millis. We avoid
+/// pulling in chrono for a muted footnote.
+fn format_ts(ms: i64) -> String {
+    let now = crate::state::now_ms_i64();
+    let delta = (now - ms).max(0) / 1000;
+    if delta < 60 {
+        format!("visited {}s ago", delta)
+    } else if delta < 3600 {
+        format!("visited {}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("visited {}h ago", delta / 3600)
+    } else {
+        format!("visited {}d ago", delta / 86400)
     }
 }
 
@@ -1201,4 +1312,3 @@ mod remove_tests {
         assert_eq!(v.len(), 1);
     }
 }
-

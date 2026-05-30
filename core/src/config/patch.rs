@@ -28,9 +28,6 @@ impl EligibleKey {
                 s.as_str(),
                 "name_asc" | "name_desc" | "mtime_desc" | "mtime_asc"
             ),
-            (ValueType::SidebarMode, J::String(s)) => {
-                matches!(s.as_str(), "files" | "clusters" | "trails")
-            }
             (ValueType::MinimapStyle, J::String(s)) => {
                 matches!(s.as_str(), "glyphs" | "bars")
             }
@@ -196,8 +193,6 @@ pub(super) enum ValueType {
     StringArray,
     /// `name_asc | name_desc | mtime_desc | mtime_asc`.
     TreeSortBy,
-    /// `files | clusters | trails`.
-    SidebarMode,
     /// `glyphs | bars` for `[editor.minimap] style`.
     MinimapStyle,
     /// Floating-point fraction in `[0.0, 1.0]`.
@@ -292,7 +287,6 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
-    EligibleKey { path: "vault.sidebar_mode",            ty: ValueType::SidebarMode },
     // status: active-trail-state
     EligibleKey { path: "vault.active_trail",            ty: ValueType::String },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },

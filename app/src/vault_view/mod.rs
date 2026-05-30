@@ -13,15 +13,16 @@
 //! provenance index column land; the lens dispatch below has a slot for
 //! each.
 //!
-//! Registered as a `Feature` (`Vault`) + a `panels_registry` panel
-//! (`PANEL_VAULT`) + a `HikerMode::Vault` sidebar mode, exactly like the
-//! Clusters / Trails features. The Feature carries the icon/label
-//! metadata; the actual rendering routes through `panels_registry`
-//! (which has `&mut AppState`) since the read-only tree needs the index
-//! + the open-file path. status: vault-view-mode
+//! Migrated off `panels_registry` to a real `Feature` (`Vault`) whose
+//! `SidebarSurface` renders through the narrow `feature::Ctx`: note paths
+//! come from `ctx.services.read_store`, lens/collapse state from
+//! `ctx.state`, and opening a note is deferred via `ctx.defer`. The lens
+//! picker stays a free `actions_menu` invoked from the workbench `⋯`
+//! menu. status: vault-view-mode
 
 use eframe::egui;
 
+use crate::editor_pane;
 use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::icons;
 use crate::state::AppState;
@@ -40,7 +41,8 @@ pub enum Lens {
 }
 
 /// Per-session Vault-view UI state. In-memory; the lens choice is display
-/// state per `vault-view-readonly-lens`.
+/// state per `vault-view-readonly-lens`. Owned by `AppState::vault_state`
+/// (top-level, per `feature-state-ownership`).
 #[derive(Default)]
 pub struct State {
     pub lens: Lens,
@@ -48,107 +50,94 @@ pub struct State {
     pub collapsed: std::collections::HashSet<String>,
 }
 
-/// Render entry point invoked from `panels_registry`'s `Vault` record.
-/// Read-only: builds a derived tree from the index and opens notes in
-/// the preview slot on click. Never mutates placement.
-pub fn render_sidebar(ui: &mut egui::Ui, app: &mut AppState) {
-    egui::ScrollArea::vertical()
-        .id_salt("panel-vault-body")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            VaultView { ui, app }.render();
-        });
+/// Render the read-only derived tree through the narrow feature `Ctx`:
+/// note paths from the read store, lens/collapse from `ctx.state`,
+/// open-note via `ctx.defer`. Never mutates placement.
+fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    let lens = ctx.state.downcast_ref::<State>().expect("vault state").lens;
+    let paths = match ctx.services.read_store.lock() {
+        Ok(s) => s.all_note_paths().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if paths.is_empty() {
+        ui.add_space(8.0);
+        ui.weak("No indexed notes yet.");
+        return;
+    }
+    match lens {
+        Lens::Flat => render_flat(ui, ctx, paths),
+        Lens::ByFolder => render_by_folder(ui, ctx, paths),
+    }
 }
 
-struct VaultView<'a, 'b> {
-    ui: &'a mut egui::Ui,
-    app: &'b mut AppState,
+fn render_flat(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, mut paths: Vec<String>) {
+    paths.sort_by(|a, b| basename(a).cmp(basename(b)));
+    for rel in paths {
+        note_row(ui, ctx, &rel, 0);
+    }
 }
 
-impl VaultView<'_, '_> {
-    fn render(&mut self) {
-        let lens = self.app.panels.vault_view.lens;
-        let paths = {
-            let store = self.app.vault_session.services.read_store.lock();
-            match store {
-                Ok(s) => s.all_note_paths().unwrap_or_default(),
-                Err(_) => Vec::new(),
-            }
+fn render_by_folder(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, paths: Vec<String>) {
+    // Group by top-level folder segment; root notes under "(root)".
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for rel in paths {
+        groups.entry(top_group(&rel)).or_default().push(rel);
+    }
+    for (group, mut members) in groups {
+        members.sort_by(|a, b| basename(a).cmp(basename(b)));
+        let collapsed = ctx
+            .state
+            .downcast_ref::<State>()
+            .expect("vault state")
+            .collapsed
+            .contains(&group);
+        let chevron = if collapsed {
+            icons::ICONS.image(icons::Icon::ChevronRight)
+        } else {
+            icons::ICONS.image(icons::Icon::ChevronDown)
         };
-        if paths.is_empty() {
-            self.ui.add_space(8.0);
-            self.ui.weak("No indexed notes yet.");
-            return;
-        }
-        match lens {
-            Lens::Flat => self.render_flat(paths),
-            Lens::ByFolder => self.render_by_folder(paths),
-        }
-    }
-
-    fn render_flat(&mut self, mut paths: Vec<String>) {
-        paths.sort_by(|a, b| basename(a).cmp(basename(b)));
-        for rel in paths {
-            self.note_row(&rel, 0);
-        }
-    }
-
-    fn render_by_folder(&mut self, paths: Vec<String>) {
-        // Group by top-level folder segment; root notes under "(root)".
-        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        for rel in paths {
-            groups.entry(top_group(&rel)).or_default().push(rel);
-        }
-        for (group, mut members) in groups {
-            members.sort_by(|a, b| basename(a).cmp(basename(b)));
-            let collapsed = self.app.panels.vault_view.collapsed.contains(&group);
-            let chevron = if collapsed {
-                icons::ICONS.image(icons::Icon::ChevronRight)
+        let header = format!("{group}  ({})", members.len());
+        if ui
+            .add(egui::Button::image_and_text(chevron, header).frame(false))
+            .clicked()
+        {
+            let set = &mut ctx.state.downcast_mut::<State>().expect("vault state").collapsed;
+            if collapsed {
+                set.remove(&group);
             } else {
-                icons::ICONS.image(icons::Icon::ChevronDown)
-            };
-            let header = format!("{group}  ({})", members.len());
-            if self
-                .ui
-                .add(egui::Button::image_and_text(chevron, header).frame(false))
-                .clicked()
-            {
-                let set = &mut self.app.panels.vault_view.collapsed;
-                if collapsed {
-                    set.remove(&group);
-                } else {
-                    set.insert(group.clone());
-                }
+                set.insert(group.clone());
             }
-            if !collapsed {
-                for rel in members {
-                    self.note_row(&rel, 1);
-                }
+        }
+        if !collapsed {
+            for rel in members {
+                note_row(ui, ctx, &rel, 1);
             }
         }
     }
+}
 
-    /// One clickable, read-only note row. Click opens in the preview slot
-    /// (`editor-preview-tab-from-open-callsites`); Mod-click opens sticky.
-    fn note_row(&mut self, rel: &str, depth: usize) {
-        let indent = 8.0 + depth as f32 * 14.0;
-        self.ui.horizontal(|ui| {
-            ui.add_space(indent);
-            let resp = ui.add(
+/// One clickable, read-only note row. Click opens in the preview slot
+/// (`editor-preview-tab-from-open-callsites`); Mod-click opens sticky.
+fn note_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, rel: &str, depth: usize) {
+    let indent = 8.0 + depth as f32 * 14.0;
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        let resp = ui
+            .add(
                 egui::Button::image_and_text(
                     icons::ICONS.image(icons::Icon::File),
                     basename(rel),
                 )
                 .frame(false),
-            );
-            let resp = resp.on_hover_text(rel);
-            if resp.clicked() {
-                let sticky = ui.input(|i| i.modifiers.command);
-                crate::editor_pane::open_file(self.app, rel, sticky);
-            }
-        });
-    }
+            )
+            .on_hover_text(rel);
+        if resp.clicked() {
+            let sticky = ui.input(|i| i.modifiers.command);
+            let rel_owned = rel.to_string();
+            ctx.defer(move |app| editor_pane::open_file(app, &rel_owned, sticky));
+        }
+    });
 }
 
 /// Basename without the indexable extension, for display.
@@ -190,7 +179,8 @@ mod tests {
 }
 
 /// `⋯`-menu entries for Vault mode: the lens picker. Invoked from
-/// `workbench_host`'s `side_bar_actions_menu` for the Vault mode.
+/// `workbench_host`'s `side_bar_actions_menu` for the Vault mode (which
+/// has full `&mut AppState`, unlike the registry sidebar render path).
 /// status: vault-view-mode
 pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
     ui.label(
@@ -198,11 +188,11 @@ pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
             .color(crate::theme::muted())
             .small(),
     );
-    let cur = app.panels.vault_view.lens;
+    let cur = app.vault_state.lens;
     for (label, lens) in [("Folder", Lens::ByFolder), ("Flat (all notes)", Lens::Flat)] {
         let prefix = if cur == lens { "* " } else { "  " };
         if ui.button(format!("{prefix}{label}")).clicked() {
-            app.panels.vault_view.lens = lens;
+            app.vault_state.lens = lens;
             ui.close();
         }
     }
@@ -210,11 +200,9 @@ pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
 
 // ---- Feature impl ----------------------------------------------------
 
-/// Zero-sized `Feature` descriptor for the Vault lens. Holds no state —
-/// the lens state lives in `AppState::panels.vault_view`; rendering
-/// routes through `panels_registry` (which has `&mut AppState`). The
-/// `SidebarSurface` here is the registry-metadata stub, matching the
-/// Clusters / Trails pattern. status: vault-view-mode
+/// Zero-sized `Feature` descriptor for the Vault lens. State lives in
+/// `AppState::vault_state`; the surface reaches it via
+/// `Ctx::state.downcast_mut::<State>()`.
 pub struct Vault;
 
 impl Feature for Vault {
@@ -236,13 +224,11 @@ struct VaultSidebar;
 
 impl SidebarSurface for VaultSidebar {
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
-        // The real render runs via `panels_registry` (it needs `&mut
-        // AppState`); the downcast proves the wiring, matching
-        // Clusters / Trails. status: vault-view-mode
-        let _state = ctx
-            .state
-            .downcast_mut::<State>()
-            .expect("VaultSidebar invoked with the wrong state type");
-        ui.weak("(vault lens — routed via panels_registry in v1)");
+        egui::ScrollArea::vertical()
+            .id_salt("panel-vault-body")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                render_body(ui, ctx);
+            });
     }
 }

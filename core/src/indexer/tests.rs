@@ -254,11 +254,9 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     let dir = tempdir().unwrap();
     let trail_id = "01HTRAILTEST";
     let waypoint_id = "01HWPTEST";
-    let source_id = "01HSRCTEST"; // not used directly; source uses path-based lookup
-    let _ = source_id;
 
-    // Write the source note first so the indexer assigns an id we can
-    // look up on the waypoint's source_id column.
+    // Write the source note first so the indexer records its rel-path on
+    // the waypoint's source_path column.
     std::fs::create_dir_all(dir.path().join("research")).unwrap();
     std::fs::write(
         dir.path().join("research/raptor.md"),
@@ -353,8 +351,6 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     assert_eq!(waypoints[0].tree_path, "1");
     assert_eq!(waypoints[0].source_path, "research/raptor.md");
     assert!(waypoints[0].parent_waypoint_id.is_none());
-    // source_id was looked up via the just-ingested source note.
-    assert!(waypoints[0].source_id.is_some());
 
     let containing = store2.trails_containing_note("research/raptor.md").unwrap();
     assert_eq!(containing.len(), 1);

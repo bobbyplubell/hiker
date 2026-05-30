@@ -13,24 +13,30 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
-use crate::workbench_host::HikerMode;
 
 /// Schema version. Bumped when the shape changes; unknown versions are
 /// ignored on load (the bar falls back to its default single section).
-const VERSION: u32 = 1;
+///
+/// v2: the activity `Mode` type changed from the `HikerMode` enum to the
+/// feature-id `String`, so the serialized section keys are now lowercase
+/// ids (`"files"`) instead of enum names (`"Files"`). A v1 file is
+/// treated as a version mismatch and reset to the default layout — no
+/// migration shim. [feature-consumer-activity-bar]
+const VERSION: u32 = 2;
 
-/// Serializable snapshot of the accordion arrangement.
+/// Serializable snapshot of the accordion arrangement. Sections are keyed
+/// by feature id.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SidePanelState {
     pub version: u32,
     /// Open sections, top to bottom.
-    pub sections: Vec<HikerMode>,
+    pub sections: Vec<String>,
     /// Which sections are collapsed (header only).
-    pub collapsed: Vec<HikerMode>,
+    pub collapsed: Vec<String>,
     /// Per-section height weights, parallel-ish to `sections`.
-    pub weights: Vec<(HikerMode, f32)>,
+    pub weights: Vec<(String, f32)>,
     /// The focused section (drives the activity-bar highlight).
-    pub focused: Option<HikerMode>,
+    pub focused: Option<String>,
     /// Whether the primary side bar is visible.
     pub visible: bool,
 }

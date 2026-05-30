@@ -8,7 +8,7 @@
 //!
 //! Implements: board-view, board-view-toggle, board-move, board-remove-card,
 //! board-column-management. The "Add to board…" verb and create flow live in
-//! the file tree / sidebar; the file-tree glyph in `sidebar::files`.
+//! the file tree / sidebar; the file-tree glyph in `crate::files::sidebar`.
 //
 // status: board-view
 
@@ -955,7 +955,7 @@ fn rename_board(app: &mut AppState, tab_id: TabId, from: &str, new_title: &str) 
         app.push_toast(format!("Rename board failed: {err}"), ToastLevel::Error);
         return;
     }
-    app.session.file_tree.dir_cache.remove(parent);
+    app.file_tree_state.dir_cache.remove(parent);
     // Repoint this board tab + any editor/buffer tabs at the old path.
     if let Some(tab) = app.tab_by_id_mut(tab_id) {
         if let crate::tab::TabKind::Board { path } = &mut tab.kind {
@@ -1004,15 +1004,31 @@ pub type PickerEntry = (String, String, Vec<String>);
 
 /// Gather every board-doc + its columns, the set of board paths `note_rel`
 /// is already a card on, and whether `note_rel` is itself a board-doc.
-/// Read-only; runs on menu open. Used by the file-tree "Add to board…" verb.
+/// Read-only; runs on menu open. Used by the file-tree "Add to board…" verb,
+/// reading the vault + read-store + oplog off the narrow `feature::Ctx`.
 ///
 /// status: board-add-card
-pub fn picker_context(
-    app: &AppState,
+pub fn picker_context_ctx(
+    ctx: &crate::feature::Ctx<'_>,
     note_rel: &str,
 ) -> (Vec<PickerEntry>, std::collections::HashSet<String>, bool) {
-    let vault = &app.vault_session.vault;
-    let Ok(store) = app.vault_session.services.read_store.lock() else {
+    picker_context_parts(
+        ctx.vault,
+        &ctx.services.read_store,
+        &ctx.services.oplog,
+        note_rel,
+    )
+}
+
+/// Shared body for `picker_context_ctx`. Takes the services it needs by
+/// handle so the narrow `feature::Ctx` can drive it without an `&AppState`.
+fn picker_context_parts(
+    vault: &hiker_core::vault::Vault,
+    read_store: &std::sync::Mutex<hiker_core::store::Store>,
+    log: &hiker_core::oplog::OpLog,
+    note_rel: &str,
+) -> (Vec<PickerEntry>, std::collections::HashSet<String>, bool) {
+    let Ok(store) = read_store.lock() else {
         return (Vec::new(), std::collections::HashSet::new(), false);
     };
     let is_board = vault
@@ -1020,7 +1036,6 @@ pub fn picker_context(
         .ok()
         .map(|s| hiker_core::boards::parse_board_for(note_rel, &s).is_ok())
         .unwrap_or(false);
-    let log = &app.vault_session.services.oplog;
     let mut boards: Vec<PickerEntry> = Vec::new();
     for item in hiker_core::boards::list(vault, &store, log).unwrap_or_default() {
         let columns = vault

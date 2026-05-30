@@ -70,7 +70,7 @@ impl AppState {
                         && let Some(tab) =
                             app.session.tabs.iter_mut().find(|t| t.id == active)
                     {
-                        tab.kind = TabKind::snapshot_preview(path.to_string(), op_id);
+                        tab.kind = TabKind::version_preview(path.to_string(), op_id);
                     }
                     ui.close();
                 }

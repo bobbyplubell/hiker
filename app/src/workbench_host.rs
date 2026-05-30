@@ -1,7 +1,8 @@
 //! Hiker ↔ `egui_workbench` bridge.
 //!
-//! Owns the host-side `Workbench` integration: the activity-mode enum,
-//! the per-frame `Host` adapter, and the sync helper that
+//! Owns the host-side `Workbench` integration: the per-frame `Host`
+//! adapter (activity modes are feature ids, sourced from the registry),
+//! and the sync helper that
 //! keeps `AppState::session.tabs` (the canonical list of open buffers
 //! and pages) in lock-step with the workbench's editor area.
 //!
@@ -22,103 +23,10 @@ use egui_workbench::tab::State;
 use egui_workbench::tab::UiContext;
 use egui_workbench::behavior::Host;
 use egui_workbench::theme::Palette;
-use crate::icons;
 use crate::panels;
 use crate::clusters;
-use crate::panels_registry::{
-    PANEL_BACKLINKS, PANEL_CHAT, PANEL_CLUSTERS, PANEL_FILES, PANEL_RELATED, PANEL_SEARCH, PANEL_TRASH,
-    PANEL_TRAILS, PANEL_VAULT, PanelRegistry,
-};
 use crate::state::AppState;
-use crate::tab::{TabId, TabKind};
-
-/// Activity-bar mode. Each variant maps to one entry in the left-edge
-/// activity strip and selects the corresponding sidebar content.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum HikerMode {
-    Files,
-    Clusters,
-    Trails,
-    Vault,
-    Search,
-    Related,
-    Backlinks,
-    Trash,
-}
-
-impl HikerMode {
-    /// All sidebar modes, in activity-bar order. Used by the
-    /// multi-region split control to offer each as a pinnable region.
-    const fn all() -> [HikerMode; 8] {
-        [
-            HikerMode::Files,
-            HikerMode::Clusters,
-            HikerMode::Trails,
-            HikerMode::Vault,
-            HikerMode::Search,
-            HikerMode::Related,
-            HikerMode::Backlinks,
-            HikerMode::Trash,
-        ]
-    }
-
-    const fn label(&self) -> &'static str {
-        match self {
-            HikerMode::Files => "Files",
-            HikerMode::Clusters => "Clusters",
-            HikerMode::Trails => "Trails",
-            HikerMode::Vault => "Vault",
-            HikerMode::Search => "Search",
-            HikerMode::Related => "Related",
-            HikerMode::Backlinks => "Backlinks",
-            HikerMode::Trash => "Trash",
-        }
-    }
-
-    const fn panel_id(&self) -> &'static str {
-        match self {
-            HikerMode::Files => PANEL_FILES,
-            HikerMode::Clusters => PANEL_CLUSTERS,
-            HikerMode::Trails => PANEL_TRAILS,
-            HikerMode::Vault => PANEL_VAULT,
-            HikerMode::Search => PANEL_SEARCH,
-            HikerMode::Related => PANEL_RELATED,
-            HikerMode::Backlinks => PANEL_BACKLINKS,
-            HikerMode::Trash => PANEL_TRASH,
-        }
-    }
-
-    /// Inverse of [`HikerMode::panel_id`]: resolve a registered panel id
-    /// back to the activity-bar mode that hosts it in the primary side
-    /// bar, if any. `PANEL_CHAT` lives in the secondary side bar and has
-    /// no activity mode, so it returns `None`.
-    pub fn from_panel_id(panel_id: &str) -> Option<HikerMode> {
-        match panel_id {
-            PANEL_FILES => Some(HikerMode::Files),
-            PANEL_CLUSTERS => Some(HikerMode::Clusters),
-            PANEL_TRAILS => Some(HikerMode::Trails),
-            PANEL_VAULT => Some(HikerMode::Vault),
-            PANEL_SEARCH => Some(HikerMode::Search),
-            PANEL_RELATED => Some(HikerMode::Related),
-            PANEL_BACKLINKS => Some(HikerMode::Backlinks),
-            PANEL_TRASH => Some(HikerMode::Trash),
-            _ => None,
-        }
-    }
-
-    fn icon(&self) -> egui::Image<'static> {
-        match self {
-            HikerMode::Files => icons::ICONS.image(crate::icons::Icon::Folder),
-            HikerMode::Clusters => icons::ICONS.image(crate::icons::Icon::ClusterTree),
-            HikerMode::Trails => icons::ICONS.trail(),
-            HikerMode::Vault => icons::ICONS.image(crate::icons::Icon::Vault),
-            HikerMode::Search => icons::ICONS.image(crate::icons::Icon::Search),
-            HikerMode::Related => icons::ICONS.image(crate::icons::Icon::Graph),
-            HikerMode::Backlinks => icons::ICONS.image(crate::icons::Icon::Bookmark),
-            HikerMode::Trash => icons::ICONS.image(crate::icons::Icon::Trash),
-        }
-    }
-}
+use crate::tab::{PANEL_CHAT, TabId, TabKind};
 
 /// View-model for an editor tab inside the workbench. Carries a
 /// `TabId` pointer back into `Session::tabs` plus enough cached state
@@ -269,7 +177,7 @@ pub struct HikerWbBehavior<'a> {
     pub rt: &'a Arc<tokio::runtime::Runtime>,
 }
 
-impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
+impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -311,64 +219,59 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
         false
     }
 
-    fn activity_items(&self) -> Vec<Item<HikerMode>> {
-        // Hardcoded mode list below. Plus: any feature that opts into
-        // an `ActivityItem` override surfaces from the registry at the
-        // tail. Phase 2 has no overrides yet (Clusters/Trails ride the
-        // hardcoded modes); the iteration is wired so Phase 3 plugins
-        // can drop in. [feature-consumer-activity-bar]
-        let _override_items: Vec<()> = self
-            .app
+    fn activity_items(&self) -> Vec<Item<String>> {
+        // Activity bar = the registry's PRIMARY features, in registry
+        // order. `primary_activity()` excludes secondary-dock-only
+        // features (chat). Each item's mode is the feature id; its
+        // icon/label come straight from the feature.
+        // [feature-consumer-activity-bar]
+        self.app
             .features
             .iter()
-            .filter_map(|f| f.activity_bar().map(|_| ()))
-            .collect();
-        // Visible item list:
-        // Files/Trails/Search/Related/Backlinks still come from the
-        // hardcoded list (they haven't migrated to the feature registry
-        // yet — Phase 2+). Each hardcoded mode's icon/label resolves
-        // from the registry when its feature id has migrated, so the
-        // visible affordance for `clusters` is driven by
-        // `feature::Feature::{label,icon}` instead of `HikerMode`'s
-        // inherent table. `feature-consumer-sidebar`.
-        HikerMode::all()
-            .into_iter()
-            .map(|m| {
-            let feature_id = match m {
-                HikerMode::Clusters => Some("clusters"),
-                HikerMode::Trails => Some("trails"),
-                HikerMode::Vault => Some("vault"),
-                _ => None,
-            };
-            let (label, icon) = feature_id
-                .and_then(|id| self.app.features.by_id(id))
-                .map(|f| (f.label().to_string(), f.icon()))
-                .unwrap_or_else(|| (m.label().to_string(), m.icon()));
-            Item {
-                label,
-                icon: Some(icon),
-                mode: m,
+            .filter(|f| f.primary_activity())
+            .map(|f| Item {
+                label: f.label().to_string(),
+                icon: Some(f.icon()),
+                mode: f.id().to_string(),
                 badge: None,
+            })
+            .collect()
+    }
+
+    fn side_bar_title(&self, mode: &String) -> egui::WidgetText {
+        self.app
+            .features
+            .by_id(mode)
+            .map_or_else(|| mode.clone().into(), |f| f.label().to_string().into())
+    }
+
+    fn side_bar_ui(&mut self, ui: &mut egui::Ui, mode: &String) {
+        let panel_id = mode.as_str();
+        // Every sidebar mode is now a registered Feature with a real
+        // `SidebarSurface`: render through the narrow `feature::Ctx`, then
+        // drain its deferred effects with full `&mut AppState`. The old
+        // `panels_registry` fallback was retired once Files (the last
+        // hardcoded panel) migrated. [feature-consumer-sidebar]
+        let feature = self.app.features.by_id(panel_id).cloned();
+        match feature.as_ref().and_then(|f| f.sidebar()) {
+            Some(sidebar) => {
+                let mut effects: Vec<crate::feature::Effect> = Vec::new();
+                crate::feature::with_ctx(self.app, panel_id, &mut effects, |ctx| {
+                    sidebar.render(ui, ctx);
+                });
+                for eff in effects {
+                    eff(self.app);
+                }
             }
-        })
-        .collect()
-    }
-
-    fn side_bar_title(&self, mode: &HikerMode) -> egui::WidgetText {
-        mode.label().into()
-    }
-
-    fn side_bar_ui(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
-        if let Some(panel) = PanelRegistry::all().by_id(mode.panel_id()) {
-            (panel.render)(ui, self.app, self.rt);
-        } else {
-            ui.weak(format!("(panel '{}' missing)", mode.panel_id()));
+            None => {
+                ui.weak(format!("(panel '{panel_id}' has no sidebar surface)"));
+            }
         }
     }
 
 
-    fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
-        if matches!(mode, HikerMode::Files) {
+    fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &String) {
+        if mode == "files" {
             // Left-click → new note; right-click → cross-type picker
             // (note / board), per `sidebar-new-item-button`.
             // status: board-create
@@ -395,8 +298,8 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
 
     }
 
-    fn side_bar_actions_menu(&mut self, ui: &mut egui::Ui, mode: &HikerMode) {
-        if matches!(mode, HikerMode::Trash) {
+    fn side_bar_actions_menu(&mut self, ui: &mut egui::Ui, mode: &String) {
+        if mode == "trash" {
             // status: feature-trash-panel
             let count = hiker_core::trash::Trash::open(&self.app.vault_session.vault_root)
                 .list_from_disk()
@@ -421,14 +324,14 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
             }
             return;
         }
-        if matches!(mode, HikerMode::Vault) {
+        if mode == "vault" {
             // Vault-mode `⋯`: the lens / grouping picker. status: vault-view-mode
             crate::vault_view::actions_menu(ui, self.app);
             return;
         }
-        if matches!(mode, HikerMode::Files) {
+        if mode == "files" {
             if ui.button("Refresh tree").clicked() {
-                self.app.session.file_tree.dir_cache.clear();
+                self.app.file_tree_state.dir_cache.clear();
                 self.app.push_toast("File tree refreshed", crate::state::ToastLevel::Info);
                 ui.close();
             }
@@ -456,13 +359,10 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
                 let prefix = if cur == val { "* " } else { "  " };
                 if ui.button(format!("{prefix}{label}")).clicked() {
                     let s = match val {
-                        TreeSortBy::NameAsc => "name_asc",
-                        TreeSortBy::NameDesc => "name_desc",
-                        TreeSortBy::MtimeDesc => "mtime_desc",
-                        TreeSortBy::MtimeAsc => "mtime_asc",
+                        s => s.as_str(),
                     };
                     self.app.persist_tree_sort(s);
-                    self.app.session.file_tree.dir_cache.clear();
+                    self.app.file_tree_state.dir_cache.clear();
                     ui.close();
                 }
             }
@@ -470,7 +370,7 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
     }
 
     fn secondary_side_bar_action_buttons(&mut self, ui: &mut egui::Ui) {
-        let active_id = self.app.session.chat.active.clone();
+        let active_id = self.app.chat_state.registry.active.clone();
         if active_id.is_some()
             && ui
                 .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Trash)).small())
@@ -480,7 +380,7 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
         {
             let vault_root = self.app.vault_session.vault_root.clone();
             if let Err(err) =
-                crate::chat::session::delete(&mut self.app.session.chat, &vault_root, id)
+                crate::chat::session::delete(&mut self.app.chat_state.registry, &vault_root, id)
             {
                 tracing::warn!(error = %err, "chat: delete failed");
             }
@@ -499,7 +399,7 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
                 .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
                 .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
             if let Err(err) = crate::chat::session::create_new(
-                &mut self.app.session.chat,
+                &mut self.app.chat_state.registry,
                 &vault_root,
                 &model,
                 &provider,
@@ -515,8 +415,20 @@ impl<'a> Host<HikerWbTab, HikerMode> for HikerWbBehavior<'a> {
     }
 
     fn secondary_side_bar_ui(&mut self, ui: &mut egui::Ui) {
-        if let Some(panel) = PanelRegistry::all().by_id(PANEL_CHAT) {
-            (panel.render)(ui, self.app, self.rt);
+        // The docked chat region is a migrated `Feature`'s sidebar
+        // surface. It renders through the narrow `feature::Ctx` (chat state
+        // via `ctx.state`, broad mutations deferred), mirroring
+        // `side_bar_ui` — but on the secondary (right) side bar rather than
+        // a primary activity mode. [feature-consumer-sidebar]
+        let feature = self.app.features.by_id(PANEL_CHAT).cloned();
+        if let Some(sidebar) = feature.as_ref().and_then(|f| f.sidebar()) {
+            let mut effects: Vec<crate::feature::Effect> = Vec::new();
+            crate::feature::with_ctx(self.app, PANEL_CHAT, &mut effects, |ctx| {
+                sidebar.render(ui, ctx);
+            });
+            for eff in effects {
+                eff(self.app);
+            }
         }
     }
 
@@ -629,7 +541,7 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::Graph => panels::graph::show(ui, app),
             TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
             TabKind::BoardsIndex => panels::boards_index::show(ui, app),
-            TabKind::Agent { session_id } => panels::agent::show(ui, app, session_id, rt),
+            TabKind::Agent { session_id } => crate::chat::render::show_tab(ui, app, session_id),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
             TabKind::Plugins => panels::plugins::show(ui, app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, app, rt),

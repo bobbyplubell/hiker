@@ -246,21 +246,10 @@ fn vault_section(&mut self) {
                 "vault.tree.sort_by",
                 snap.vault.tree.sort_by,
                 &[
-                    (TreeSortBy::NameAsc, "Name (A-Z)", "name_asc"),
-                    (TreeSortBy::NameDesc, "Name (Z-A)", "name_desc"),
-                    (TreeSortBy::MtimeDesc, "Modified (newest)", "mtime_desc"),
-                    (TreeSortBy::MtimeAsc, "Modified (oldest)", "mtime_asc"),
-                ],
-            );
-            enum_combo(
-                ui, app, st,
-                "Sidebar mode",
-                "vault.sidebar_mode",
-                snap.vault.sidebar_mode,
-                &[
-                    (hiker_core::config::sections::SidebarMode::Files, "Files", "files"),
-                    (hiker_core::config::sections::SidebarMode::Clusters, "Cluster trees", "clusters"),
-                    (hiker_core::config::sections::SidebarMode::Trails, "Trails", "trails"),
+                    (TreeSortBy::NameAsc, "Name (A-Z)", TreeSortBy::NameAsc.as_str()),
+                    (TreeSortBy::NameDesc, "Name (Z-A)", TreeSortBy::NameDesc.as_str()),
+                    (TreeSortBy::MtimeDesc, "Modified (newest)", TreeSortBy::MtimeDesc.as_str()),
+                    (TreeSortBy::MtimeAsc, "Modified (oldest)", TreeSortBy::MtimeAsc.as_str()),
                 ],
             );
             bool_row(ui, app, st, "Show sessions in tree", "vault.show_sessions_in_tree", snap.vault.show_sessions_in_tree);

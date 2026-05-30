@@ -18,11 +18,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::{
-    collect_descendant_paths, find_waypoint, find_waypoint_mut,
+    collect_descendant_paths, drafts_dir, find_waypoint, find_waypoint_mut,
     parse_trail_doc_for, parse_waypoint, random_alphanumeric_6,
-    remove_waypoint_from_tree, waypoint_filename, waypoints_dir_for,
-    write_trail_doc_frontmatter, write_waypoint_frontmatter, WaypointEntry,
-    WaypointFrontmatter,
+    dir_prefix, remove_waypoint_from_tree, trail_root_for, waypoint_filename,
+    waypoints_dir_for, write_trail_doc_frontmatter, write_waypoint_frontmatter,
+    WaypointEntry, WaypointFrontmatter, WAYPOINTS_DIRNAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ pub async fn create_trail(
     // the hidden `.hiker/trails/drafts/` carve-out; accepted trails use
     // the configured `new_trail_dir`.
     let placement_dir = if draft {
-        ".hiker/trails/drafts".to_string()
+        drafts_dir()
     } else {
         folder.to_string()
     };
@@ -391,7 +391,7 @@ pub async fn reject_draft(
 
     // Hard-delete the trail's hidden subsystem dir (waypoint-notes), then
     // clear each waypoint-note's index rows.
-    let trail_root = format!(".hiker/trails/{trail_id}");
+    let trail_root = trail_root_for(&trail_id);
     let root_abs = vault.abs_path(&trail_root)?;
     if root_abs.exists() {
         std::fs::remove_dir_all(&root_abs)
@@ -735,7 +735,7 @@ pub async fn delete_trail(
         // The dir lives at `.hiker/trails/<id>/waypoints` but the spec's
         // delete-cascade scope is the parent `.hiker/trails/<id>/` so a
         // future `manifest/` sibling rides along. Delete the parent.
-        let trail_root = format!(".hiker/trails/{tid}");
+        let trail_root = trail_root_for(&tid);
         let abs = vault.abs_path(&trail_root)?;
         if abs.exists() {
             // TODO(trail-delete-cascade): atomic-pair semantics in trash
@@ -952,7 +952,9 @@ impl<'a> RewriteCtx<'a> {
         old_rel: &str,
         new_rel: &str,
     ) -> usize {
-        if !(old_rel.starts_with(".hiker/trails/") && old_rel.contains("/waypoints/")) {
+        if !(old_rel.starts_with(&dir_prefix())
+            && old_rel.contains(&format!("/{WAYPOINTS_DIRNAME}/")))
+        {
             return 0;
         }
         // Look up the row's trail_id by walking trails_containing_note

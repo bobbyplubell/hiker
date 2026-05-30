@@ -82,7 +82,14 @@ use vec::read_chunk_vecs_dim;
 /// note's `doc_id` from there on upsert and uses it as `notes.id`, so the
 /// indexer no longer needs its own parallel mapping. See `docs/index.md`
 /// §"Store: sqlite-vec" — `store-id-from-oplog`.
-pub const SCHEMA_VERSION: i32 = 10;
+///
+/// v11 dropped the dead `trail_waypoints.source_id` and
+/// `board_cards.card_note_id` columns (+ their indexes). Under path-as-identity
+/// the derived-table lookups (`trails_containing_note` /
+/// `boards_containing_note`) key purely on the note's rel-path; the parallel
+/// ULID columns were populated by the indexer but never queried by production
+/// callers, so they're gone.
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Default embedding dimension — matches the v1 default model
 /// (`bge-small-en-v1.5`). Used as the initial `chunk_vecs` column width on
@@ -209,39 +216,35 @@ impl Store {
             -- status: trail-waypoints-derived-table
             -- Derived index of trail waypoints. Re-derived from frontmatter on
             -- every ingest of a trail-doc or waypoint-note; deletes cascade via
-            -- the ops layer. `source_id` is nullable: a waypoint may reference
-            -- a source note that hasn't been ingested (or stamped) yet.
+            -- the ops layer. Keyed on the source note's rel-path
+            -- (`source_path`); `trails_containing_note` matches on path only.
             CREATE TABLE IF NOT EXISTS trail_waypoints (
                 waypoint_path        TEXT PRIMARY KEY,
                 waypoint_id          TEXT NOT NULL,
                 trail_id             TEXT NOT NULL,
-                source_id            TEXT,
                 source_path          TEXT NOT NULL,
                 parent_waypoint_id   TEXT,
                 tree_path            TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS trail_waypoints_trail_id        ON trail_waypoints(trail_id);
-            CREATE INDEX IF NOT EXISTS trail_waypoints_source_id       ON trail_waypoints(source_id);
             CREATE INDEX IF NOT EXISTS trail_waypoints_source_path     ON trail_waypoints(source_path);
             CREATE INDEX IF NOT EXISTS trail_waypoints_parent_waypoint ON trail_waypoints(parent_waypoint_id);
 
             -- status: board-cards-derived-table
             -- Derived index of board cards. Re-derived from each board-doc's
             -- `hiker.columns` frontmatter on ingest (clear-by-board +
-            -- re-insert), cleared on board-doc delete. `card_note_id` may be
-            -- empty: a card may reference a source note that hasn't been
-            -- ingested (or stamped) yet. Rowid PK (no declared key) since a
-            -- board re-derive replaces the whole row set atomically.
+            -- re-insert), cleared on board-doc delete. Keyed on the card
+            -- note's rel-path (`card_note_path`); `boards_containing_note`
+            -- matches on path only. Rowid PK (no declared key) since a board
+            -- re-derive replaces the whole row set atomically.
             CREATE TABLE IF NOT EXISTS board_cards (
                 board_id        TEXT NOT NULL,
                 board_path      TEXT NOT NULL,
-                card_note_id    TEXT NOT NULL DEFAULT '',
                 card_note_path  TEXT NOT NULL,
                 column_name     TEXT NOT NULL,
                 ordinal         INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS board_cards_board_id   ON board_cards(board_id);
-            CREATE INDEX IF NOT EXISTS board_cards_note_id    ON board_cards(card_note_id);
             CREATE INDEX IF NOT EXISTS board_cards_note_path  ON board_cards(card_note_path);
             CREATE INDEX IF NOT EXISTS board_cards_board_path ON board_cards(board_path);
 

@@ -17,6 +17,14 @@ use crate::tab::TabId;
 /// Outcome posted by a background LLM-naming task. `(succeeded, failed)`.
 pub type LlmJobOutcome = (usize, usize);
 
+impl State {
+    /// Mark the surface dirty so the next frame re-lists trees + nodes
+    /// from disk. Called by every mutating cluster op.
+    pub const fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+}
+
 #[derive(Default)]
 pub struct State {
     pub trees: Vec<hiker_core::trees::types::TreeRow>,

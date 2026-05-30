@@ -107,8 +107,8 @@ fn tool_card_structured_render_runs_clean() {
         }],
         ..ChatSession::default()
     };
-    state.session.chat.sessions.insert(session_id.clone(), session);
-    state.session.chat.active = Some(session_id.clone());
+    state.chat_state.registry.sessions.insert(session_id.clone(), session);
+    state.chat_state.registry.active = Some(session_id.clone());
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(1400.0, 900.0))
@@ -119,7 +119,6 @@ fn tool_card_structured_render_runs_clean() {
                     &mut state,
                     Some(&session_id),
                     crate::chat::render::Layout::FullTab,
-                    &runtime,
                 );
             });
         });
@@ -231,15 +230,15 @@ fn snapshot_open_and_back_round_trips_in_the_active_tab() {
     let tab_count = state.session.tabs.len();
 
     // Pick a snapshot from the dropdown → swaps the ACTIVE tab in place.
-    editor_pane::open_snapshot_in_tab(&mut state, "note.md", &op_id);
+    editor_pane::open_version_in_tab(&mut state, "note.md", &op_id);
     assert_eq!(state.session.tabs.len(), tab_count, "snapshot must NOT open a new tab");
     assert!(active_is_preview_of(&state, "note.md"), "active tab now shows the snapshot");
     assert_eq!(
         state.session.nav.current(),
-        Some(&NavTarget::Snapshot { path: "note.md".to_string(), op_id: op_id.clone() }),
+        Some(&NavTarget::HistoryVersion { path: "note.md".to_string(), op_id: op_id.clone() }),
     );
     // And the snapshot content actually loads (no "couldn't load the buffer").
-    let src = crate::tab::BufferSource::Snapshot { path: "note.md".to_string(), op_id: op_id.clone() };
+    let src = crate::tab::BufferSource::HistoryVersion { path: "note.md".to_string(), op_id: op_id.clone() };
     assert!(
         editor_pane::ensure_readonly_buffer_loaded(&mut state, &src).is_some(),
         "snapshot buffer materializes",
@@ -331,7 +330,7 @@ fn returning_to_live_from_a_snapshot_loads_the_buffer() {
         .clone();
 
     editor_pane::open_file(&mut state, "note.md", true);
-    editor_pane::open_snapshot_in_tab(&mut state, "note.md", &op_id);
+    editor_pane::open_version_in_tab(&mut state, "note.md", &op_id);
     assert!(active_is_preview_of(&state, "note.md"));
     // Drop the cached live buffer to mimic a snapshot opened in a fresh tab.
     state.session.buffers.remove("note.md");

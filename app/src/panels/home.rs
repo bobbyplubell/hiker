@@ -106,10 +106,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
 
     ui.add_space(16.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Snapshots").strong());
+        ui.label(egui::RichText::new("Version history").strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("See all").clicked() {
-                open_home_detail(app, HomeDetail::Snapshots);
+                open_home_detail(app, HomeDetail::VersionHistory);
             }
         });
     });
@@ -139,8 +139,8 @@ impl AppState {
 
 pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
     match which {
-        HomeDetail::Snapshots => {
-            ui.heading("Snapshots");
+        HomeDetail::VersionHistory => {
+            ui.heading("Version history");
             ui.add_space(8.0);
             render_snapshots(ui, app, 200);
         }
@@ -269,7 +269,7 @@ fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
     };
     if rows.is_empty() {
         ui.label(
-            egui::RichText::new("(no snapshots yet)")
+            egui::RichText::new("(no versions yet)")
                 .color(theme::muted())
                 .small(),
         );
@@ -296,22 +296,22 @@ fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
                 let label = format!("{}  {}  {}", ts, short, row.path);
                 if ui
                     .selectable_label(false, label)
-                    .on_hover_text("Open snapshot preview")
+                    .on_hover_text("Open version preview")
                     .clicked()
                 {
-                    app.open_snapshot(&row.path, &op_id);
+                    app.open_version(&row.path, &op_id);
                 }
             }
         });
 }
 
 impl AppState {
-    fn open_snapshot(&mut self, path: &str, op_id: &str) {
+    fn open_version(&mut self, path: &str, op_id: &str) {
         use crate::tab::{Tab, TabKind};
         let id = self.next_tab_id();
         self.session.tabs.push(Tab {
             id,
-            kind: TabKind::snapshot_preview(path.to_string(), op_id.to_string()),
+            kind: TabKind::version_preview(path.to_string(), op_id.to_string()),
             sticky: true,
         });
         self.session.active_tab = Some(id);

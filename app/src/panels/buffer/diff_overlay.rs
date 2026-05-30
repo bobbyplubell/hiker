@@ -45,7 +45,7 @@ use crate::tab::DiffSource;
 ///   interleaves both edits); keep-theirs first reverts the user's overlapping
 ///   `working` edit to the accepted text (`revert` carries the precomputed
 ///   `apply_working_edit` args) then accepts.
-/// - `Restore`: snapshot-owned hunks — write the historical text the hunk
+/// - `Restore`: history-version-owned hunks — write the historical text the hunk
 ///   represents back to disk for that byte range.
 #[derive(Clone, Debug)]
 pub enum HunkAction {
@@ -163,7 +163,7 @@ impl<'a> Compute<'a> {
         let hunks = self.layer_hunks(layer.hunks());
 
         let (decorations, click_map) = match owner {
-            DiffOwner::Snapshot => self.attach_snapshot_hunk_widgets(&base_decos, &hunks),
+            DiffOwner::HistoryVersion => self.attach_history_version_hunk_widgets(&base_decos, &hunks),
             _ => (base_decos, HashMap::new()),
         };
 
@@ -200,7 +200,7 @@ impl<'a> Compute<'a> {
     /// the owner (which drives per-hunk verb shape). The agent overlay is
     /// handled separately in [`Self::agent_overlay`] before this is reached.
     /// Priority:
-    /// 1. Snapshot / PendingProposal / Trash buffer → owner derived from
+    /// 1. HistoryVersion / PendingProposal / Trash buffer → owner derived from
     ///    `BufferSource`; "before" is the tab's `DiffSource` (typically
     ///    `Disk(path)` for snapshot + pending so the diff reads as "how
     ///    does this preview differ from current disk").
@@ -209,7 +209,7 @@ impl<'a> Compute<'a> {
     fn resolve_base(&self) -> Option<(String, DiffOwner)> {
         use crate::tab::BufferSource;
         let source_owner = match &self.buffer.source {
-            BufferSource::Snapshot { .. } => Some(DiffOwner::Snapshot),
+            BufferSource::HistoryVersion { .. } => Some(DiffOwner::HistoryVersion),
             BufferSource::PendingProposal { .. } => Some(DiffOwner::Pending),
             BufferSource::Trash { .. } => Some(DiffOwner::Manual),
             BufferSource::Vault { .. } => None,
@@ -222,7 +222,7 @@ impl<'a> Compute<'a> {
             // Inlined `diff_owner_for`: owner derived from the DiffSource
             // discriminant when no BufferSource carries one.
             match src {
-                DiffSource::HistoryVersion { .. } => DiffOwner::Snapshot,
+                DiffSource::HistoryVersion { .. } => DiffOwner::HistoryVersion,
                 DiffSource::PendingProposal { .. } => DiffOwner::Pending,
                 DiffSource::Disk { .. }
                 | DiffSource::LiveBuffer { .. }
@@ -544,10 +544,10 @@ impl<'a> Compute<'a> {
         }
     }
 
-    /// Snapshot-owner per-hunk Restore widgets. Each non-context hunk
-    /// gets a single Restore button; clicking writes the snapshot's text
+    /// History-version-owner per-hunk Restore widgets. Each non-context hunk
+    /// gets a single Restore button; clicking writes the historical text
     /// for the hunk's current byte range back to disk at the source path.
-    fn attach_snapshot_hunk_widgets(
+    fn attach_history_version_hunk_widgets(
         &self,
         base: &Set,
         hunks: &[HunkInfo],

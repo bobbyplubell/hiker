@@ -1,13 +1,15 @@
-//! Command palette popover — the discoverability surface for the
-//! window-level keybind registry. Per `command-palette`: every entry in
-//! [`crate::keybinds::Keybinds::known_keybindings`] is a palette row;
-//! Enter / click dispatches the same action the chord runs, fuzzy
-//! filter on label + id, per-session MRU floats recent picks up,
-//! AI-touching rows hide when `[llm] enabled = false`.
+//! Command palette popover — the discoverability surface over the one
+//! shared [`crate::actions::ActionRegistry`]. Per `command-palette`:
+//! every registered action is a palette row (so everything reachable from
+//! the toolbar is reachable here too); Enter / click dispatches it through
+//! the same [`crate::actions::dispatch`] path the toolbar uses; the chord
+//! (if any) comes from [`crate::keybinds`]; fuzzy filter on label + id;
+//! per-session MRU floats recent picks up.
 
 use eframe::egui;
 
-use crate::keybinds::{self, KnownKeybind, Keybinds};
+use crate::actions::{self, Action, ActionRegistry};
+use crate::keybinds::{self, Keybinds};
 use crate::state::AppState;
 use crate::theme;
 
@@ -151,7 +153,9 @@ pub fn command_palette(&mut self, ctx: &egui::Context) {
         // state on its own — e.g. re-opening the palette via its own
         // id) so the order is stable regardless.
         record_mru(&mut app.ui.palette_mru, id);
-        keybinds::dispatch_action(app, id);
+        // Dispatch through the shared registry — the same path the
+        // toolbar buttons use — so palette and toolbar can never diverge.
+        actions::dispatch(app, id);
     }
 }
 }
@@ -172,11 +176,12 @@ struct Row {
 struct Palette;
 
 impl Palette {
-    /// Assemble the visible row list for this frame: filter on the LLM
-    /// gate first (the spec hides AI-touching rows entirely when
-    /// disabled — they don't appear greyed), then fuzzy-match the query
-    /// against label + id, then re-order by MRU so recent picks float
-    /// above their fuzzy rank.
+    /// Assemble the visible row list for this frame: iterate the one
+    /// shared [`ActionRegistry`] (so every toolbar-reachable command is
+    /// also palette-reachable), filter on the LLM gate first (the spec
+    /// hides AI-touching rows entirely when disabled — they don't appear
+    /// greyed), then fuzzy-match the query against label + id, then
+    /// re-order by MRU so recent picks float above their fuzzy rank.
     fn build_rows(
         self,
         app: &AppState,
@@ -185,17 +190,17 @@ impl Palette {
         llm_enabled: bool,
     ) -> Vec<Row> {
         let q = query.trim().to_lowercase();
-        let mut rows: Vec<Row> = Keybinds
-            .known_keybindings()
+        let mut rows: Vec<Row> = ActionRegistry::all()
+            .list()
             .iter()
-            .filter(|k| llm_enabled || !keybinds::is_action_ai_touching(k.id))
-            .filter(|k| q.is_empty() || row_matches_query(k, &q))
-            .map(|k| Row {
-                id: k.id,
-                label: k.label,
-                chord: k.chord,
-                area: keybinds::action_area_badge(k.id),
-                dispatchable: keybinds::is_action_dispatchable(app, k.id),
+            .filter(|a| llm_enabled || !is_action_ai_touching(a.id))
+            .filter(|a| q.is_empty() || row_matches_query(a, &q))
+            .map(|a| Row {
+                id: a.id,
+                label: a.label,
+                chord: chord_for_id(a.id),
+                area: keybinds::action_area_badge(a.id),
+                dispatchable: a.enabled.map(|f| f(app)).unwrap_or(true),
             })
             .collect();
 
@@ -279,16 +284,37 @@ impl Palette {
     }
 }
 
-/// Fuzzy match a known-keybind row against the (lowercased) query. The
+/// Fuzzy match a registry action against the (lowercased) query. The
 /// spec ranks label hits over id hits; we approximate by checking both
 /// and returning true on either — sort order falls out of MRU plus the
 /// list's natural order. Substring is enough for v1; a full fuzzy
 /// matcher (`nucleo` / `fuzzy-matcher`) can drop in later via the same
 /// predicate slot.
-fn row_matches_query(k: &KnownKeybind, q: &str) -> bool {
-    let label = k.label.to_lowercase();
-    let id = k.id.to_lowercase();
+fn row_matches_query(a: &Action, q: &str) -> bool {
+    let label = a.label.to_lowercase();
+    let id = a.id.to_lowercase();
     subseq_match(q, &label) || subseq_match(q, &id)
+}
+
+/// First chord bound to a registry action id, or `""` if the command has
+/// no keyboard binding. Multiple chords may map to one id (e.g. Ctrl-K
+/// and Mod-Shift-P both open the palette); the palette shows the first.
+fn chord_for_id(id: &str) -> &'static str {
+    Keybinds
+        .known_keybindings()
+        .iter()
+        .find(|k| k.id == id)
+        .map(|k| k.chord)
+        .unwrap_or("")
+}
+
+/// True when the action touches LLM-backed features. Per
+/// `command-palette`, those rows hide entirely when `[llm] enabled =
+/// false` so the palette doesn't surface dead verbs. No registry action
+/// currently routes into LLM features, but the gate stays so future
+/// additions just extend this match.
+const fn is_action_ai_touching(_id: &str) -> bool {
+    false
 }
 
 /// Push `id` to the front of `mru`, removing any earlier copy and

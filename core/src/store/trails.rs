@@ -14,13 +14,12 @@ impl Store {
     ) -> Result<(), Error> {
         self.conn.execute(
             "INSERT INTO trail_waypoints
-               (waypoint_path, waypoint_id, trail_id, source_id, source_path,
+               (waypoint_path, waypoint_id, trail_id, source_path,
                 parent_waypoint_id, tree_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(waypoint_path) DO UPDATE SET
                waypoint_id        = excluded.waypoint_id,
                trail_id           = excluded.trail_id,
-               source_id          = excluded.source_id,
                source_path        = excluded.source_path,
                parent_waypoint_id = excluded.parent_waypoint_id,
                tree_path          = excluded.tree_path",
@@ -28,7 +27,6 @@ impl Store {
                 row.waypoint_path,
                 row.waypoint_id,
                 row.trail_id,
-                row.source_id,
                 row.source_path,
                 row.parent_waypoint_id,
                 row.tree_path,
@@ -67,23 +65,23 @@ impl Store {
         Ok(n)
     }
 
-    /// Trails that contain a given source note. `note_id_or_path` is
-    /// matched against both `source_id` and `source_path` so the caller
-    /// doesn't have to pre-resolve.
+    /// Trails that contain a given source note, matched on the note's
+    /// vault-relative path (path-as-identity — the derived table is keyed on
+    /// path only).
     ///
     /// status: trail-waypoints-derived-table
     pub fn trails_containing_note(
         &self,
-        note_id_or_path: &str,
+        note_path: &str,
     ) -> Result<Vec<TrailContainingHit>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT trail_id, waypoint_path, waypoint_id, tree_path
              FROM trail_waypoints
-             WHERE source_id = ?1 OR source_path = ?1
+             WHERE source_path = ?1
              ORDER BY trail_id, tree_path",
         )?;
         let rows = stmt
-            .query_map(params![note_id_or_path], |row| {
+            .query_map(params![note_path], |row| {
                 Ok(TrailContainingHit {
                     trail_id: row.get(0)?,
                     waypoint_path: row.get(1)?,
@@ -101,7 +99,7 @@ impl Store {
     /// status: trail-waypoints-derived-table
     pub fn waypoints_of(&self, trail_id: &str) -> Result<Vec<WaypointRow>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_path, waypoint_id, trail_id, source_id, source_path,
+            "SELECT waypoint_path, waypoint_id, trail_id, source_path,
                     parent_waypoint_id, tree_path
              FROM trail_waypoints
              WHERE trail_id = ?1
@@ -113,10 +111,9 @@ impl Store {
                     waypoint_path: row.get(0)?,
                     waypoint_id: row.get(1)?,
                     trail_id: row.get(2)?,
-                    source_id: row.get(3)?,
-                    source_path: row.get(4)?,
-                    parent_waypoint_id: row.get(5)?,
-                    tree_path: row.get(6)?,
+                    source_path: row.get(3)?,
+                    parent_waypoint_id: row.get(4)?,
+                    tree_path: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

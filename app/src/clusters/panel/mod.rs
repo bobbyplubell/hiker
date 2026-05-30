@@ -1001,7 +1001,7 @@ fn render_cluster_row(
 /// The per-tree layout cache is keyed on a tab-scoped synthetic id
 /// (`review:<tab>`) so it survives frame-to-frame and never collides
 /// with a persisted tree's cache. Clicks on leaves are disabled since
-/// the leaf `note_ref` here is a vault-relative path from the build
+/// the leaf `note_path` here is a vault-relative path from the build
 /// walk, not necessarily a `read_store`-addressable id.
 ///
 /// status: cluster-review-tab-result-graph-view

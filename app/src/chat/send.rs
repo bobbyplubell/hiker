@@ -34,7 +34,6 @@ impl ChatRegistry {
 pub fn send(
     &mut self,
     vault_root: &Path,
-    rt: &Arc<tokio::runtime::Runtime>,
     config: Arc<std::sync::RwLock<Config>>,
     mcp_handler: &Option<Arc<hiker_mcp::handler::App>>,
     message: &str,
@@ -117,7 +116,11 @@ pub fn send(
         mcp_handler: mcp_handler_owned,
         stop,
     };
-    rt.spawn(async move {
+    // The whole egui frame runs inside `runtime.enter()`, so the ambient
+    // tokio handle is live during render — no explicit runtime handle is
+    // threaded through. Both the docked sidebar surface (narrow `Ctx`, no
+    // runtime handle) and the full-tab view share this path.
+    tokio::spawn(async move {
         task.run().await;
     });
 }

@@ -4,12 +4,10 @@
 //! bar) lives inside `buffer::show` since it's only meaningful when a
 //! buffer is the active tab.
 
-pub mod agent;
 pub mod buffer;
 pub mod changes;
 pub mod command_palette;
 pub mod cluster_graph;
-pub mod backlinks;
 pub mod board;
 pub mod boards_index;
 pub mod graph;
@@ -20,7 +18,5 @@ pub mod plugin_panel;
 pub mod plugins;
 pub mod properties;
 pub mod queue;
-pub mod related;
-pub mod search;
 pub mod settings;
 pub mod sync;

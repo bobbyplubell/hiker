@@ -10,11 +10,24 @@
 
 use std::collections::HashSet;
 
-/// Per-feature UI state for the trails sidebar. Held on `AppState` as
-/// the top-level `trails_state` field; the trails sidebar surface
-/// downcasts the `feature::Ctx::state` opaque slot to `&mut State`.
+/// Per-feature domain + UI state for the trails feature. Held on
+/// `AppState` as the top-level `trails_state` field; the trails sidebar
+/// surface downcasts the `feature::Ctx::state` opaque slot to
+/// `&mut State`. Owns both the trail forest (the feature's core data,
+/// persisted to `.hiker/trails.json`) and the sidebar's transient UI
+/// state.
 #[derive(Debug, Default)]
 pub struct State {
+    /// The trail forest — the feature's core data. Persisted to
+    /// `<vault>/.hiker/trails.json`. Relocated off `Session::trails`
+    /// during the trails feature migration.
+    pub trails: Vec<crate::state::Trail>,
+    /// Id of the trail that receives manual append-waypoint actions.
+    /// `None` = no active trail; the Add-to-trail verbs hide/disable.
+    pub active_trail: Option<String>,
+    /// Inline-rename draft for the trails sidebar:
+    /// `(trail_id, draft_name)`. `None` = no rename in progress.
+    pub trail_rename: Option<(String, String)>,
     /// Path of the single waypoint card currently rendered in its
     /// expanded form (parent path + timestamp + annotation body).
     /// `expand_all` overrides this when set.

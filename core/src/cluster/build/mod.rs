@@ -178,7 +178,7 @@ pub fn rebuild_and_persist(
             for k in kids {
                 if let Some(node) = old_node_by_id.get(k) {
                     if matches!(node.kind, NodeKind::Leaf) {
-                        if let Some(nid) = &node.note_ref {
+                        if let Some(nid) = &node.note_path {
                             acc.insert(nid.clone());
                         }
                     } else {

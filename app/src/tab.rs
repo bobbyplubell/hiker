@@ -6,7 +6,7 @@
 //! buffer source and looks up the buffer when it needs it.
 //!
 //! The `Editor` variant is the only buffer-backed kind: it carries a
-//! `BufferSource` (what's *in* the editor — a vault file, a snapshot blob,
+//! `BufferSource` (what's *in* the editor — a vault file, a history version,
 //! a pending proposal, or a trash entry) plus an optional `DiffSource`
 //! (the comparison target when diff mode is active). Diff is a mode of
 //! this tab, not a separate kind.
@@ -19,6 +19,20 @@ pub struct TabId(pub u64);
 /// Identifier for a registered panel mounted in the dock. Stable string
 /// so layout files survive panel-registry shuffles.
 pub type PanelId = &'static str;
+
+// Stable panel-id vocabulary. These equal the corresponding feature ids
+// and are referenced by the activity-bar toggle actions
+// (`actions::toggle_panel`) and a few features' reveal calls. The values
+// match `Feature::id()`; `vault`/`trash` have no remaining const callers
+// (their toggles route through the feature id directly), so they aren't
+// listed here.
+pub const PANEL_FILES: PanelId = "files";
+pub const PANEL_CLUSTERS: PanelId = "clusters";
+pub const PANEL_TRAILS: PanelId = "trails";
+pub const PANEL_SEARCH: PanelId = "search";
+pub const PANEL_RELATED: PanelId = "related";
+pub const PANEL_BACKLINKS: PanelId = "backlinks";
+pub const PANEL_CHAT: PanelId = "chat";
 
 #[derive(Debug, Clone)]
 pub struct Tab {
@@ -38,7 +52,7 @@ pub enum BufferSource {
     Vault { path: String },
     /// Historical version materialized from the op log — read-only.
     /// `op_id` is the accepted op (ulid) the content is reconstructed at.
-    Snapshot { path: String, op_id: String },
+    HistoryVersion { path: String, op_id: String },
     /// Pending op-log proposal content — read-only.
     PendingProposal { proposal_id: String, target_path: String },
     /// Trash entry — read-only.
@@ -51,7 +65,7 @@ impl BufferSource {
     pub fn path(&self) -> &str {
         match self {
             BufferSource::Vault { path } => path,
-            BufferSource::Snapshot { path, .. } => path,
+            BufferSource::HistoryVersion { path, .. } => path,
             BufferSource::PendingProposal { target_path, .. } => target_path,
             BufferSource::Trash { original_path, .. } => original_path,
         }
@@ -84,11 +98,11 @@ pub enum DiffSource {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TabKind {
-    /// Editor tab: a buffer (vault file, snapshot, proposal, or trash
+    /// Editor tab: a buffer (vault file, history version, proposal, or trash
     /// entry) optionally layered with a diff against another source.
     Editor { buffer: BufferSource, diff: Option<DiffSource> },
     Home,
-    /// "Recent activity" / "Snapshots" home-detail sub-page.
+    /// "Recent activity" / "Version history" home-detail sub-page.
     HomeDetail { which: HomeDetail },
     Queue,
     QueueDetail { task_id: String },
@@ -112,7 +126,7 @@ pub enum TabKind {
     BoardsIndex,
     /// Chat session as a full tab (vs. docked at bottom of discovery).
     Agent { session_id: String },
-    /// Patch review: lists pending staging proposals with accept/reject.
+    /// Patch review: lists pending proposals with accept/reject.
     PatchReview,
     /// Plugins host (stub): lists `.hiker/plugins.json` entries.
     Plugins,
@@ -135,7 +149,7 @@ pub enum TabKind {
 
 #[derive(Debug, Clone)]
 pub enum HomeDetail {
-    Snapshots,
+    VersionHistory,
     /// Per-row version history view: lists every accepted op that
     /// touched the given vault-relative path, newest first.
     ActivityRow { path: String },
@@ -150,13 +164,13 @@ impl TabKind {
         }
     }
 
-    /// Construct a snapshot-preview editor tab. The buffer holds the
+    /// Construct a history-version preview editor tab. The buffer holds the
     /// version's content read-only; the diff layer shows how the
     /// version differs from the current on-disk text of the same path.
-    pub fn snapshot_preview(path: impl Into<String>, op_id: impl Into<String>) -> Self {
+    pub fn version_preview(path: impl Into<String>, op_id: impl Into<String>) -> Self {
         let p = path.into();
         TabKind::Editor {
-            buffer: BufferSource::Snapshot { path: p.clone(), op_id: op_id.into() },
+            buffer: BufferSource::HistoryVersion { path: p.clone(), op_id: op_id.into() },
             diff: Some(DiffSource::Disk { path: p }),
         }
     }
@@ -214,11 +228,11 @@ impl TabKind {
             // doesn't change the label.
             TabKind::Editor { buffer, .. } => match buffer {
                 BufferSource::Vault { path } => path_basename(path),
-                BufferSource::Snapshot { path, .. } => {
-                    format!("Snapshot · {}", path_basename(path))
+                BufferSource::HistoryVersion { path, .. } => {
+                    format!("Version · {}", path_basename(path))
                 }
                 BufferSource::PendingProposal { target_path, .. } => {
-                    format!("Staging · {}", path_basename(target_path))
+                    format!("Pending · {}", path_basename(target_path))
                 }
                 BufferSource::Trash { original_path, .. } => {
                     format!("Trash · {}", path_basename(original_path))
@@ -226,9 +240,9 @@ impl TabKind {
             },
             TabKind::Home => "Home".to_string(),
             TabKind::HomeDetail { which } => match which {
-                HomeDetail::Snapshots => "Snapshots".to_string(),
+                HomeDetail::VersionHistory => "Version history".to_string(),
                 HomeDetail::ActivityRow { path } => {
-                    format!("History · {}", path_basename(path))
+                    format!("Version history · {}", path_basename(path))
                 }
             },
             TabKind::Queue => "Queue".to_string(),
@@ -259,7 +273,7 @@ impl TabKind {
         match self {
             TabKind::Editor { buffer, .. } => match buffer {
                 BufferSource::Vault { .. } => icons::ICONS.image(crate::icons::Icon::File),
-                BufferSource::Snapshot { .. } => icons::ICONS.image(crate::icons::Icon::Clock),
+                BufferSource::HistoryVersion { .. } => icons::ICONS.image(crate::icons::Icon::Clock),
                 BufferSource::PendingProposal { .. } => icons::ICONS.image(crate::icons::Icon::Edit),
                 BufferSource::Trash { .. } => icons::ICONS.image(crate::icons::Icon::Trash),
             },

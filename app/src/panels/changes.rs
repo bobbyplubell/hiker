@@ -373,7 +373,7 @@ impl AppState {
                 if let Some(existing) = self.session.tabs.iter().find(|t| matches!(
                     &t.kind,
                     TabKind::Editor {
-                        buffer: crate::tab::BufferSource::Snapshot { path: p, op_id: c },
+                        buffer: crate::tab::BufferSource::HistoryVersion { path: p, op_id: c },
                         ..
                     } if p == &path && c == &op_id
                 )) {
@@ -382,7 +382,7 @@ impl AppState {
                     let id = self.next_tab_id();
                     self.session.tabs.push(Tab {
                         id,
-                        kind: TabKind::snapshot_preview(path, op_id),
+                        kind: TabKind::version_preview(path, op_id),
                         sticky: true,
                     });
                     self.session.active_tab = Some(id);

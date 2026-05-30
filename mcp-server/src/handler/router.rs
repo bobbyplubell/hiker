@@ -157,7 +157,7 @@ impl App {
         name = "write_note",
         description = "Create or replace a note's body. Returns the new content hash on a direct write. \
                        NOTE: when the server is in review-required mode, the write is STAGED as a pending proposal \
-                       instead of hitting disk — the response is `{ status: \"staged\", staging_id }`. A follow-up \
+                       instead of hitting disk — the response is `{ status: \"staged\", proposal_id }`. A follow-up \
                        `get_note` reflects your own staged edits (you read your pending replica), but the change does \
                        not reach disk for the user until they accept the proposal. A brand-new note that does not yet \
                        exist on disk still returns 1002 not_found from `get_note` until accepted. Use \
@@ -191,7 +191,7 @@ impl App {
                        Validation (path exists, per-edit anchor uniqueness, no textual overlap, anchors resolve against \
                        the pre-application file) runs atomically — on any failure the whole call rejects. \
                        NOTE: in review-required mode each edit STAGES as its own pending proposal (sharing a batch_id); \
-                       response carries `status: \"staged\"` + `staging_ids` and disk is unchanged until accepts."
+                       response carries `status: \"staged\"` + `proposal_ids` and disk is unchanged until accepts."
     )]
     pub async fn edit_note(
         &self,
@@ -214,7 +214,7 @@ impl App {
         name = "set_frontmatter",
         description = "Deep-merge fields into a note's YAML frontmatter (auto-stamps hiker.author=agent-authored). \
                        NOTE: in review-required mode the merged result is STAGED as a pending proposal — the file on \
-                       disk is unchanged until the user accepts. Response carries `status: \"staged\"` + `staging_id` \
+                       disk is unchanged until the user accepts. Response carries `status: \"staged\"` + `proposal_id` \
                        in that case. Use `list_pending_proposals` to confirm."
     )]
     pub async fn set_frontmatter(
@@ -237,7 +237,7 @@ impl App {
         name = "apply_tag",
         description = "Append a tag to a note's tags frontmatter list (idempotent). \
                        NOTE: in review-required mode the tagged result is STAGED as a pending proposal — disk is \
-                       unchanged until the user accepts. Response carries `status: \"staged\"` + `staging_id` in that case."
+                       unchanged until the user accepts. Response carries `status: \"staged\"` + `proposal_id` in that case."
     )]
     pub async fn apply_tag(
         &self,
@@ -259,7 +259,7 @@ impl App {
         name = "remove_tag",
         description = "Remove a tag from a note's tags frontmatter list (no-op if absent). \
                        NOTE: in review-required mode the result is STAGED as a pending proposal — disk is unchanged \
-                       until the user accepts. Response carries `status: \"staged\"` + `staging_id` in that case."
+                       until the user accepts. Response carries `status: \"staged\"` + `proposal_id` in that case."
     )]
     pub async fn remove_tag(
         &self,
@@ -329,7 +329,7 @@ impl App {
         description = "Append a note (by source_rel_path) as a card to a board column. \
                        Idempotent per board — a note already on the board returns status=\"noop\". \
                        NOTE: in review-required mode the board-doc edit is STAGED as a pending proposal \
-                       (status=\"staged\" + staging_id); disk is unchanged until the user accepts."
+                       (status=\"staged\" + proposal_id); disk is unchanged until the user accepts."
     )]
     pub async fn board_add_card(
         &self,
@@ -354,7 +354,7 @@ impl App {
         name = "board_create",
         description = "Create a new board-doc with default Todo/Doing/Done columns under the configured new_board_dir. \
                        Returns rel_path + board_id. NOTE: in review-required mode the new board-doc is STAGED as a \
-                       pending proposal (status=\"staged\" + staging_id); it does not reach disk until the user accepts."
+                       pending proposal (status=\"staged\" + proposal_id); it does not reach disk until the user accepts."
     )]
     pub async fn board_create(
         &self,
@@ -377,7 +377,7 @@ impl App {
     #[tool(
         name = "board_add_text_card",
         description = "Append a freeform (non-note) text card to a board column. Returns the new card_id. \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id) \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id) \
                        and unchanged on disk until the user accepts."
     )]
     pub async fn board_add_text_card(
@@ -401,7 +401,7 @@ impl App {
     #[tool(
         name = "board_move_card",
         description = "Move/reorder a card (by card_id from board_get) to to_column at to_index (tail when omitted). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_move_card(
@@ -425,7 +425,7 @@ impl App {
     #[tool(
         name = "board_set_card_text",
         description = "Rewrite a freeform card's text in place (errors on a note card). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_set_card_text(
@@ -449,7 +449,7 @@ impl App {
     #[tool(
         name = "board_remove_card",
         description = "Remove a card from the board by card_id (the referenced note is untouched). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_remove_card(
@@ -473,7 +473,7 @@ impl App {
     #[tool(
         name = "board_add_column",
         description = "Add a new empty column to a board (appended at the tail; no-op if the name exists). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_add_column(
@@ -497,7 +497,7 @@ impl App {
     #[tool(
         name = "board_rename_column",
         description = "Rename a board column in place (cards keep their order and membership). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_rename_column(
@@ -521,7 +521,7 @@ impl App {
     #[tool(
         name = "board_reorder_column",
         description = "Move a board column to a new index in the column order (clamps to the tail). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_reorder_column(
@@ -545,7 +545,7 @@ impl App {
     #[tool(
         name = "board_delete_column",
         description = "Delete a board column (drops that column's card references; referenced notes are untouched). \
-                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + staging_id); \
+                       NOTE: in review-required mode the board-doc edit is STAGED (status=\"staged\" + proposal_id); \
                        disk is unchanged until the user accepts."
     )]
     pub async fn board_delete_column(

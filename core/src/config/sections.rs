@@ -1328,10 +1328,15 @@ pub struct VaultConfig {
     /// status: chat-session-show-in-tree-toggle
     #[serde(default = "no")]
     pub show_sessions_in_tree: bool,
-    /// Active sidebar mode (Files / Cluster trees / Trails).
-    /// status: sidebar-mode-switcher
-    #[serde(default)]
-    pub sidebar_mode: SidebarMode,
+    /// Retired: the multi-region egui-workbench sidebar (`HikerMode` +
+    /// `side_panel_persist`) is the real persistence path; this field no
+    /// longer drives runtime layout. Kept only as an ignored, deserialize-
+    /// tolerant sink so existing `.hiker/config.toml` files carrying a
+    /// `[vault] sidebar_mode = "..."` line still load under
+    /// `deny_unknown_fields`. Not exposed in settings and not in the
+    /// eligible-write set, so it is never written back.
+    #[serde(rename = "sidebar_mode", default, skip_serializing)]
+    pub sidebar_mode_legacy_ignored: Option<String>,
     /// Vault-relative path of the currently active trail-doc, or `None`
     /// if no trail is active. At most one active trail per vault. Persisted
     /// via `set_setting` so it survives restarts.
@@ -1358,7 +1363,7 @@ impl Default for VaultConfig {
             sidebar_width: default_sidebar_width(),
             discovery_width: default_discovery_width(),
             show_sessions_in_tree: false,
-            sidebar_mode: SidebarMode::default(),
+            sidebar_mode_legacy_ignored: None,
             active_trail: None,
             chat_input_height: 0,
             tree: TreeConfig::default(),
@@ -1395,13 +1400,18 @@ pub enum TreeSortBy {
     MtimeAsc,
 }
 
-/// Active sidebar mode. Persisted per-vault under `vault.sidebar_mode`.
-/// status: sidebar-mode-switcher
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SidebarMode {
-    #[default]
-    Files,
-    Clusters,
-    Trails,
+impl TreeSortBy {
+    /// Canonical wire string for each variant — the single source of truth
+    /// for the `TreeSortBy` ↔ string mapping. Matches the serde
+    /// `rename_all = "snake_case"` encoding exactly so UI code (sort menus,
+    /// settings dropdown) and serde agree. Route every hand-written match
+    /// through this rather than re-spelling the strings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TreeSortBy::NameAsc => "name_asc",
+            TreeSortBy::NameDesc => "name_desc",
+            TreeSortBy::MtimeDesc => "mtime_desc",
+            TreeSortBy::MtimeAsc => "mtime_asc",
+        }
+    }
 }

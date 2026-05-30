@@ -837,20 +837,37 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // exists — see the `auto_restore_recovered` call below, before the
     // tab-state restore. `autosave-recovery-auto-restore`.
     let session = Session {
-        trails,
         modal: None,
         ..Session::default()
     };
 
-    let panels = seed_panel_states(&config);
+    // Seed the search surface from persisted vault settings (mode
+    // toggles, lexical/semantic tuning, section collapse); everything
+    // else on `PanelStates`/the feature states defaults. Read the config
+    // guard once here — `with_config` is a no-op fallback if it's
+    // poisoned. [feature-search-migration]
+    let search_state = match config.read().ok().as_deref() {
+        Some(c) => crate::search::state::State::default().with_config(c),
+        None => crate::search::state::State::default(),
+    };
 
     let mut state = AppState {
         vault_session,
         session,
+        file_tree_state: crate::state::FileTreeState::default(),
         ui_cache: UiCache::default(),
-        panels,
+        panels: PanelStates::default(),
         clusters_state: crate::clusters::state::State::default(),
-        trails_state: crate::trails::state::State::default(),
+        trails_state: crate::trails::state::State {
+            trails,
+            ..crate::trails::state::State::default()
+        },
+        backlinks_state: crate::backlinks::State::default(),
+        related_state: crate::related::State::default(),
+        search_state,
+        vault_state: crate::vault_view::State::default(),
+        trash_state: crate::trash::State,
+        chat_state: crate::chat::state::State::default(),
         // Per-vault feature registry: built-ins (Clusters in v1) plus
         // (Phase 3) plugin-derived features. `feature-registry`.
         features: crate::feature::Registry::build(crate::feature::builtin_features()),
@@ -863,7 +880,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
             // region, the Chat (secondary) side bar visible, and the
             // global bottom status strip on.
             let mut wb = egui_workbench::workspace::Workbench::default();
-            wb.open_primary_panel(crate::workbench_host::HikerMode::Files);
+            wb.open_primary_panel("files".to_string());
             wb.secondary_side_bar.visible = true;
             wb.status_bar.visible = true;
             wb
@@ -905,27 +922,6 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     state.ui.toolbars = load_toolbar_layout(&state.vault_session.vault_root);
 
     Ok(state)
-}
-
-/// Seed `PanelStates` from the loaded vault config. Search / related /
-/// backlinks pull persisted toggles + collapse flags; everything else
-/// defaults. Lifted out of `open_vault` to keep that function under the
-/// length budget.
-fn seed_panel_states(config: &Arc<std::sync::RwLock<Config>>) -> PanelStates {
-    let cfg_guard = config.read().ok();
-    let (search, related, backlinks) = match cfg_guard.as_deref() {
-        Some(c) => (
-            crate::panels::search::State::default().with_config(c),
-            crate::panels::related::State::default().with_config(c),
-            crate::panels::backlinks::State::default().with_config(c),
-        ),
-        None => (
-            crate::panels::search::State::default(),
-            crate::panels::related::State::default(),
-            crate::panels::backlinks::State::default(),
-        ),
-    };
-    PanelStates { search, related, backlinks, ..PanelStates::default() }
 }
 
 /// Load the data-driven toolbar layout from `.hiker/toolbars.json`,

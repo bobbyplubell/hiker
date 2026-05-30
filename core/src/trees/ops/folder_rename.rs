@@ -6,24 +6,24 @@ use super::super::types::{Db, EditableNode, Error, NodeKind};
 
 impl Db {
     /// Live-update a FromFolders tree to reflect a vault rename. The leaf
-    /// with `note_ref = note_id` (if present in this tree) is re-parented
-    /// under the folder cluster matching `new_folder`, creating that cluster
-    /// lazily. Emptied folder clusters are dropped unless they carry a policy
-    /// (so the user's rule survives a transient empty state). `new_folder` is
-    /// the folder portion of the new path (`""` = vault root).
+    /// whose `note_path` equals `note_path` (if present in this tree) is
+    /// re-parented under the folder cluster matching `new_folder`, creating
+    /// that cluster lazily. Emptied folder clusters are dropped unless they
+    /// carry a policy (so the user's rule survives a transient empty state).
+    /// `new_folder` is the folder portion of the new path (`""` = vault root).
     ///
     /// status: cluster-build-from-folders-live-update
     /// status: cluster-build-from-folders-summary-staleness
     pub fn update_for_folder_rename(
         &self,
         tree_id: &str,
-        note_id: &str,
+        note_path: &str,
         new_folder: &str,
     ) -> Result<bool, Error> {
         // Decide (read-only) whether anything changes before writing.
         let nodes = self.list_nodes(tree_id)?;
         let Some(leaf) = nodes.iter().find(|n| {
-            matches!(n.kind, NodeKind::Leaf) && n.note_ref.as_deref() == Some(note_id)
+            matches!(n.kind, NodeKind::Leaf) && n.note_path.as_deref() == Some(note_path)
         }) else {
             return Ok(false);
         };
@@ -54,7 +54,7 @@ impl Db {
                     id: new_folder_cluster_id.clone(),
                     parent: root_id.clone(),
                     kind: NodeKind::Cluster,
-                    note_ref: None,
+                    note_path: None,
                     name: display_name.clone(),
                     summary: String::new(),
                     user_edited_name: false,
@@ -86,7 +86,7 @@ impl Db {
         })?;
 
         let args = serde_json::json!({
-            "note_id": note_id,
+            "note_path": note_path,
             "leaf_id": leaf_id,
             "new_folder": new_folder,
         });

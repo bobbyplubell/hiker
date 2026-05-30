@@ -91,11 +91,11 @@ impl App {
                     "status": "noop",
                 })));
             };
-            let staging_id = self.stage_whole_body(op_log, &p.board_rel_path, &new_src)?;
+            let proposal_id = self.stage_whole_body(op_log, &p.board_rel_path, &new_src)?;
             Ok(structured(serde_json::json!({
                 "board_rel_path": p.board_rel_path,
                 "status": "staged",
-                "staging_id": staging_id,
+                "proposal_id": proposal_id,
             })))
         } else {
             let op_log = self.state.oplog.as_ref().ok_or_else(|| {
@@ -152,7 +152,7 @@ impl App {
     /// The shared review-vs-direct staging path for the board write tools that
     /// edit an EXISTING board-doc. `new_src` is the post-edit board-doc source
     /// (`None` = idempotent no-op → `status: "noop"`). In review mode it stages
-    /// one anchorless pending op and returns `status: "staged"` + `staging_id`;
+    /// one anchorless pending op and returns `status: "staged"` + `proposal_id`;
     /// in direct mode it commits via `op_writes::user_save` + re-index and
     /// returns `status: "written"`. `extra` fields are merged into the response
     /// (e.g. a minted `card_id`). The board core verbs and the preview share
@@ -181,10 +181,10 @@ impl App {
             }
         }
         if self.review_required() {
-            let staging_id = self.stage_whole_body(op_log, board_rel_path, &new_src)?;
+            let proposal_id = self.stage_whole_body(op_log, board_rel_path, &new_src)?;
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("status".into(), "staged".into());
-                obj.insert("staging_id".into(), serde_json::to_value(staging_id).unwrap_or(serde_json::Value::Null));
+                obj.insert("proposal_id".into(), serde_json::to_value(proposal_id).unwrap_or(serde_json::Value::Null));
             }
         } else {
             op_writes::user_save(op_log, &self.state.vault, board_rel_path, &new_src)

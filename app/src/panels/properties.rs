@@ -184,7 +184,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     // waypoint. Per `properties` spec — surfaces the note's role in
     // user-curated structure.
     let trail_hits: Vec<(String, usize)> = app
-        .session.trails
+        .trails_state.trails
         .iter()
         .filter_map(|t| {
             let idx = t.waypoints.iter().position(|w| w.path == path)?;
@@ -242,20 +242,8 @@ impl View<'_> {
     use hiker_core::trees::types::NodeKind;
     let app = self.app;
     let trees = app.vault_session.services.trees.as_ref();
-    let store_mutex = app.vault_session.services.read_store.as_ref();
-    // Resolve path → note_id via the op-log. Without an id we can't
-    // join into the leaf rows.
-    // status: store-id-from-oplog
-    let _ = store_mutex; // store not needed once id comes from op-log
-    let note_id_opt: Option<String> = app
-        .vault_session
-        .services
-        .oplog
-        .doc_id_for_path(path)
-        .unwrap_or(None);
-    let Some(note_id) = note_id_opt else {
-        return Vec::new();
-    };
+    // Path-as-identity: leaves carry the note's rel-path directly, so we
+    // join on `path` without any doc-id resolution.
     let mut out: Vec<ClusterMembership> = Vec::new();
     let Ok(tree_list) = trees.list_trees() else {
         return out;
@@ -270,7 +258,7 @@ impl View<'_> {
             if !matches!(n.kind, NodeKind::Leaf) {
                 continue;
             }
-            if n.note_ref.as_deref() != Some(note_id.as_str()) {
+            if n.note_path.as_deref() != Some(path) {
                 continue;
             }
             let mut chain: Vec<String> = Vec::new();

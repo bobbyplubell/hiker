@@ -80,7 +80,7 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
     // via sync (or a fresh open against an existing vault) need op-log
     // `doc_id`s exactly like vault-root notes so trail integrity holds
     // without waiting for an individual ingest event. status: op-log-doc-id-bootstrap
-    for rel in walk_hidden_md_subtree(vault, ".hiker/trails")? {
+    for rel in walk_hidden_md_subtree(vault, &crate::trails::dir())? {
         seeded += seed_one(vault, log, &rel)? as usize;
     }
     // TODO: `.hiker/trees/` cluster-tree docs (per `cluster-editor.md` and

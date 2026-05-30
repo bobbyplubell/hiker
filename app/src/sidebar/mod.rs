@@ -5,24 +5,11 @@
 //!
 //! `SidebarMode` survives as a compatibility shim for the persisted
 //! `Config::ui.default_sidebar_mode` setting in Settings — it no longer
-//! drives runtime layout. Trash is its own dockable panel
-//! (`sidebar::trash`), not pinned inside the Files body.
-
-pub(crate) mod files;
-pub(crate) mod trash;
+//! drives runtime layout. Trash is its own dockable surface — migrated
+//! to the `crate::trash` feature — not pinned inside the Files body.
 
 use crate::editor_pane;
 use crate::state::{AppState, ToastLevel};
-
-/// Legacy mode discriminant — kept because Settings persists a
-/// `default_sidebar_mode` field. Runtime no longer reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum SidebarMode {
-    Files,
-    Clusters,
-    Trails,
-}
 
 impl AppState {
     pub fn persist_tree_sort(&mut self, sort_str: &str) {
@@ -37,8 +24,7 @@ impl AppState {
     pub fn new_note(&mut self) {
     let state = self;
     let target_dir = state
-        .session
-        .file_tree
+        .file_tree_state
         .selected_folder
         .as_deref()
         .unwrap_or("");
@@ -86,7 +72,7 @@ impl AppState {
     };
     match result {
         Ok(actual) => {
-            state.session.file_tree.dir_cache.remove(target_dir);
+            state.file_tree_state.dir_cache.remove(target_dir);
             editor_pane::open_file(state, &actual, /* sticky */ true);
         }
         Err(err) => {
@@ -125,7 +111,7 @@ impl AppState {
         });
         match result {
             Ok(outcome) => {
-                state.session.file_tree.dir_cache.clear();
+                state.file_tree_state.dir_cache.clear();
                 // Open in the board view with inline-rename active so the
                 // user names it before submitting (mirrors new-trail /
                 // new-file). status: board-create

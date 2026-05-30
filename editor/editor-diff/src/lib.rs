@@ -12,7 +12,7 @@ use editor_core::decoration::Set as DecorationSet;
 use editor_core::rope::Rope;
 use editor_core::theme::Theme;
 /// Who owns the diff, which drives per-hunk verb affordances rendered by the
-/// host (accept/reject for `Agent` / `Pending`, restore for `Snapshot`,
+/// host (accept/reject for `Agent` / `Pending`, restore for `HistoryVersion`,
 /// nothing for `Index` / `Manual`). Rendering of the underlying hunks is
 /// identical across owners — only the host-side overlay widget content
 /// differs.
@@ -25,14 +25,14 @@ pub enum DiffOwner {
     /// Pending agent edits hydrated into the live buffer. Per-hunk
     /// accept / reject.
     Agent,
-    /// Historical snapshot materialized from the op log. Per-hunk restore.
-    Snapshot,
+    /// A historical version of the note materialized from the op log. Per-hunk restore.
+    HistoryVersion,
     /// User-initiated diff (e.g. between two buffers). No host verbs.
     Manual,
 }
 
 /// A single diff between two ropes plus the host's intent (owner). The
-/// primitive every diff surface uses: snapshot review, dirty-buffer diff,
+/// primitive every diff surface uses: history-version review, dirty-buffer diff,
 /// pending agent edits, history browser.
 ///
 /// Hunks are computed once via [`DiffLayer::from_ropes`] (or cheaply on

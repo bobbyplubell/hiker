@@ -455,7 +455,7 @@ pub(super) struct GetNoteFull {
 }
 
 /// Response shape for `edit_note`. Either `status: "staged"` with the per-edit
-/// `staging_ids` (review mode) or `status: "written"` with the final
+/// `proposal_ids` (review mode) or `status: "written"` with the final
 /// `content_hash` (direct mode). `edit_count` is the number of edits in the
 /// originating call.
 ///
@@ -468,7 +468,7 @@ pub(super) struct EditOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) staging_ids: Vec<String>,
+    pub(super) proposal_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) batch_id: Option<String>,
 }
@@ -478,13 +478,13 @@ pub(super) struct WriteOutcome {
     pub(super) rel_path: String,
     pub(super) content_hash: String,
     /// When `review_required` is on, `"staged"` with the proposal id in
-    /// `staging_id`. When off, absent (the default is `"written"`).
+    /// `proposal_id`. When off, absent (the default is `"written"`).
     ///
     /// status: staging-review-pending-response
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) staging_id: Option<String>,
+    pub(super) proposal_id: Option<String>,
 }
 
 // ---------- params Serialize for audit ----------
