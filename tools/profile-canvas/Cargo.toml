@@ -1,0 +1,24 @@
+[package]
+name = "profile-canvas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "profile-canvas"
+path = "src/main.rs"
+
+[dependencies]
+canvas-view = { path = "../../hiker-canvas/view" }
+canvas-view-core = { path = "../../hiker-canvas/view-core" }
+hiker-canvas = { path = "../../hiker-canvas/core" }
+editor-core = { path = "../../editor/editor-core" }
+editor-view = { path = "../../editor/editor-view" }
+editor-egui = { path = "../../editor/editor-egui" }
+editor-md = { path = "../../editor/editor-md" }
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

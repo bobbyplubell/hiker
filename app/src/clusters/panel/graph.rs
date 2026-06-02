@@ -13,7 +13,7 @@ use hiker_core::trees::types::{EditableNode, NodeKind};
 
 /// Adapter (post-Done): synthesize an `EditableNode` row for every
 /// cluster in `tree.levels` + every leaf member. Mirrors the shape
-/// `result_to_node_inserts_pub` writes the tree's `.md`, but as
+/// `node_inserts` writes the tree's `.md`, but as
 /// `EditableNode` (the graph renderer's input shape) instead of
 /// `NodeInsert`.
 ///

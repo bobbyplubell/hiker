@@ -14,7 +14,8 @@ use rusqlite::params;
 use rusqlite::types::ToSql;
 
 use super::dto::{
-    title_from_path, MetaEntry, MetaFilter, NoteOrder, NoteQuery, NoteQueryRow, OrderDir,
+    title_from_path, MetaEntry, MetaFilter, NoteMetaRow, NoteOrder, NoteQuery, NoteQueryRow,
+    OrderDir,
 };
 use super::error::Error;
 use super::Store;
@@ -61,6 +62,48 @@ impl Store {
         self.conn
             .execute("DELETE FROM note_meta WHERE note_id = ?1", params![note_id])?;
         Ok(())
+    }
+
+    /// Project every indexed, non-skipped note plus its relationship /
+    /// provenance frontmatter (`hiker.parent` / `hiker.author` /
+    /// `hiker.provenance` / `hiker.kind`) in one query. Backs the Vault-view
+    /// lens (`vault-view.md`), which groups and nests on these fields per
+    /// render and so cannot afford a per-note disk read.
+    ///
+    /// The four keys are read from the existing `note_meta` index
+    /// (`store-note-metadata-index`) via correlated scalar subqueries — a
+    /// note missing a key yields `None` rather than dropping out of the
+    /// result. A list-valued key (none of these four are, in practice)
+    /// collapses to its first value.
+    ///
+    /// status: vault-view-source-groups
+    pub fn notes_with_meta(&self) -> Result<Vec<NoteMetaRow>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.path,
+                    (SELECT m.value FROM note_meta m
+                       WHERE m.note_id = n.id AND m.key = 'hiker.parent' LIMIT 1),
+                    (SELECT m.value FROM note_meta m
+                       WHERE m.note_id = n.id AND m.key = 'hiker.author' LIMIT 1),
+                    (SELECT m.value FROM note_meta m
+                       WHERE m.note_id = n.id AND m.key = 'hiker.provenance' LIMIT 1),
+                    (SELECT m.value FROM note_meta m
+                       WHERE m.note_id = n.id AND m.key = 'hiker.kind' LIMIT 1)
+             FROM notes n
+             WHERE n.skipped = 0",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(NoteMetaRow {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    parent: row.get(2)?,
+                    author: row.get(3)?,
+                    provenance: row.get(4)?,
+                    kind: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Structured retrieval over the metadata index. Each filter becomes an

@@ -88,6 +88,14 @@ pub async fn on_note_moved(
             "shared rename-rewrite: boards sweep failed"),
     }
 
+    // status: canvas-file-ref-rewrite
+    // Canvas: rewrite every JSON Canvas File-node `file` path pointing at the
+    // moved note across every `.canvas` document in the vault. No derived
+    // referrer index exists (deferred `canvas-search-index`), so the sweep
+    // walks the vault for `.canvas` files itself.
+    touched +=
+        crate::canvas::on_note_moved(watcher_ref, Some(jobs), log_ref, vault, from, to).await;
+
     // status: wikilink-rename-rewrite
     // Wikilinks: rewrite every `[[…]]` body whose resolved path was `from`
     // to the new shortest-unambiguous form for `to`.

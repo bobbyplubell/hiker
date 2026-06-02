@@ -444,20 +444,44 @@ pub(super) async fn handle_simple_job(
             // The caller suppresses the watcher around this; we don't
             // need to here. Run vault::move_note on the indexer's owned
             // store so all writes flow through one connection.
-            let result = crate::vault::move_note(vault, store, None, &from, &to);
+            // status: note-companion-folder
+            // move_note pairs the note's companion folder (when present),
+            // returning every contained `(old, new)` member pair so the
+            // reference-rewrite pass below covers the moved children too —
+            // e.g. a renamed trail-doc whose waypoint-notes carry an
+            // `hiker.in_trail` path that must follow the rename.
+            let move_result = crate::vault::move_note(vault, store, None, &from, &to);
             // status: wikilink-rename-rewrite
             // After the path remap succeeds, run the shared rename-rewrite
             // pass over every referrer (trails, boards, wikilinks). Errors
             // inside each domain helper are logged, never propagated, so a
             // partial referrer update can't fail the move's reply.
-            if result.is_ok() {
-                record_oplog_rename(ctx.oplog_cell, &from, &to);
-                crate::links_rename::on_note_moved(
-                    watcher_cell, ctx.oplog_cell, self_tx, vault, store, &from, &to,
-                )
-                .await;
-            }
-            let _ = reply.send(result);
+            let reply_result = match move_result {
+                Ok(companion_members) => {
+                    record_oplog_rename(ctx.oplog_cell, &from, &to);
+                    // status: note-companion-folder
+                    // Run the companion-folder members FIRST: each member's
+                    // pass updates the derived `trail_waypoints.waypoint_path`
+                    // to its new path (and rewrites the trail-doc's
+                    // `hiker.waypoints[]` entry). The trail-doc's own pass
+                    // below then reads the *fresh* waypoint paths when
+                    // rewriting each waypoint's `hiker.in_trail`.
+                    for (old, new) in &companion_members {
+                        record_oplog_rename(ctx.oplog_cell, old, new);
+                        crate::links_rename::on_note_moved(
+                            watcher_cell, ctx.oplog_cell, self_tx, vault, store, old, new,
+                        )
+                        .await;
+                    }
+                    crate::links_rename::on_note_moved(
+                        watcher_cell, ctx.oplog_cell, self_tx, vault, store, &from, &to,
+                    )
+                    .await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            let _ = reply.send(reply_result);
         }
         IndexJob::MoveFolder { from, to, reply } => {
             // Compute the (old, new) member pairs *before* the rename so
@@ -929,9 +953,14 @@ fn update_trail_waypoints_if_relevant(
         return;
     }
     let ingest = WaypointIngest { store, oplog, rel_path, contents };
-    if rel_path.starts_with(&crate::trails::dir_prefix())
-        && rel_path.contains(&format!("/{}/", crate::trails::WAYPOINTS_DIRNAME))
-    {
+    // status: note-companion-folder
+    // Waypoints now live in the trail-doc's visible companion folder, so a
+    // path prefix no longer distinguishes them from trail-docs. Dispatch on
+    // `hiker.kind` instead: a note that parses as a waypoint
+    // (`hiker.kind: waypoint`) writes a waypoint row; anything else routes
+    // to the trail-doc rebuild path (which itself no-ops on a note that
+    // isn't a trail-doc).
+    if crate::trails::parse_waypoint(contents).is_ok() {
         ingest.upsert_waypoint_row();
     } else {
         ingest.rebuild_trail_doc_rows();

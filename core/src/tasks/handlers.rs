@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::StopSignal;
 use crate::audit::{AgentLog, Entry};
-use crate::llm::{Client, Message};
+use hiker_llm::{Client, Message};
 
 use super::queue::{duration_ms, validate_against_schema, Queue};
 use super::types::Task;

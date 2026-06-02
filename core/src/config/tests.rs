@@ -48,6 +48,56 @@ fn auto_create_writes_defaults() {
 }
 
 #[test]
+fn extract_section_loads() {
+    // status: settings-section-extract
+    // A well-formed [extract] table must load under strict-load (it was
+    // deferred before; it lands now). Defaults fill in omitted keys.
+    let toml = r#"schema_version = 1
+[extract]
+auto_globs = ["inbox/", "**/*.pdf"]
+clip_folder = "captures/"
+"#;
+    let cfg: Config = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.extract.auto_globs, vec!["inbox/".to_string(), "**/*.pdf".to_string()]);
+    assert_eq!(cfg.extract.clip_folder, "captures/");
+    // Omitted keys take their in-code defaults.
+    assert_eq!(cfg.extract.artifact_retention, "latest");
+    assert_eq!(cfg.extract.feed_default_poll, "6h");
+    assert_eq!(cfg.extract.feed_item_retention, "keep:200");
+}
+
+#[test]
+fn extract_section_rejects_unknown_key() {
+    let bad = "[extract]\nmystery = true\n";
+    let err = toml::from_str::<Config>(bad).unwrap_err();
+    assert!(err.to_string().contains("mystery"));
+}
+
+#[test]
+fn chat_section_round_trips() {
+    // status: settings-section-chat
+    // A well-formed [chat] table loads under strict-load; `chats_dir`
+    // overrides the default and an omitted table takes the default.
+    let toml = "schema_version = 1\n[chat]\nchats_dir = \"conversations/\"\n";
+    let cfg: Config = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.chat.chats_dir, "conversations/");
+    // Default when absent.
+    let cfg2: Config = toml::from_str("schema_version = 1\n").unwrap();
+    assert_eq!(cfg2.chat.chats_dir, "chats/");
+    // Default round-trips through serialize → deserialize.
+    let s = toml::to_string_pretty(&Config::default()).unwrap();
+    let back: Config = toml::from_str(&s).unwrap();
+    assert_eq!(back.chat.chats_dir, "chats/");
+}
+
+#[test]
+fn chat_section_rejects_unknown_key() {
+    let bad = "[chat]\nmystery = true\n";
+    let err = toml::from_str::<Config>(bad).unwrap_err();
+    assert!(err.to_string().contains("mystery"));
+}
+
+#[test]
 fn deep_merge_vault_wins() {
     let mut base: toml::Value = toml::from_str(
         r#"schema_version = 1

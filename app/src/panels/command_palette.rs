@@ -11,7 +11,7 @@ use eframe::egui;
 use crate::actions::{self, Action, ActionRegistry};
 use crate::keybinds::{self, Keybinds};
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 impl AppState {
 /// Render the palette overlay if `self.ui.palette_open`. Mirrors the

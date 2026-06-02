@@ -120,6 +120,35 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every waypoint row across all trails, ordered by `(trail_id,
+    /// tree_path)` so each trail's rows arrive in reading order. Backs the
+    /// Vault-view trail-nesting lens (`vault-view-trail-nesting`), which
+    /// nests every trail-doc's waypoints in one pass and so wants the whole
+    /// table at once rather than a per-trail query per render.
+    ///
+    /// status: vault-view-trail-nesting
+    pub fn all_trail_waypoints(&self) -> Result<Vec<WaypointRow>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT waypoint_path, waypoint_id, trail_id, source_path,
+                    parent_waypoint_id, tree_path
+             FROM trail_waypoints
+             ORDER BY trail_id, tree_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WaypointRow {
+                    waypoint_path: row.get(0)?,
+                    waypoint_id: row.get(1)?,
+                    trail_id: row.get(2)?,
+                    source_path: row.get(3)?,
+                    parent_waypoint_id: row.get(4)?,
+                    tree_path: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Bulk-rewrite waypoint paths whose `waypoint_path` starts with
     /// `old_prefix` to start with `new_prefix` instead. Used by the
     /// auto-update-on-move path (slice 3) when a trail's waypoint dir is

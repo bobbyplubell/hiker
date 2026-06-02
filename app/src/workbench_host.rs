@@ -184,6 +184,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
         tab: &mut HikerWbTab,
         _ctx: UiContext<'_>,
     ) {
+        let _g = crate::profiling::FrameProf::guard("wb:pane_ui");
         let Some(kind) = self.app.tab_by_id(tab.id).map(|t| t.kind.clone()) else {
             ui.centered_and_justified(|ui| {
                 ui.label("(missing tab)");
@@ -246,6 +247,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     }
 
     fn side_bar_ui(&mut self, ui: &mut egui::Ui, mode: &String) {
+        let _g = crate::profiling::FrameProf::guard("wb:side_bar");
         let panel_id = mode.as_str();
         // Every sidebar mode is now a registered Feature with a real
         // `SidebarSurface`: render through the narrow `feature::Ctx`, then
@@ -293,6 +295,22 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
                     self.app.new_board();
                     ui.close();
                 }
+                // status: canvas-create
+                if ui.button("New canvas").clicked() {
+                    self.app.new_canvas();
+                    ui.close();
+                }
+                // Capture entry points (`crawl-job-form` /
+                // `rss-subscription-lifecycle`): each creates a capture-spec
+                // note and opens it in the form-over-frontmatter tab.
+                if ui.button("New crawl…").clicked() {
+                    self.app.new_crawl();
+                    ui.close();
+                }
+                if ui.button("New feed…").clicked() {
+                    self.app.new_feed();
+                    ui.close();
+                }
             });
         }
 
@@ -338,7 +356,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
             ui.separator();
             ui.label(
                 egui::RichText::new("Sort by")
-                    .color(crate::theme::muted())
+                    .color(hiker_theme::muted())
                     .small(),
             );
             use hiker_core::config::sections::TreeSortBy;
@@ -379,9 +397,13 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
             && let Some(id) = active_id.as_deref()
         {
             let vault_root = self.app.vault_session.vault_root.clone();
-            if let Err(err) =
-                crate::chat::session::delete(&mut self.app.chat_state.registry, &vault_root, id)
-            {
+            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
+            if let Err(err) = crate::chat::session::delete(
+                &mut self.app.chat_state.registry,
+                &vault_root,
+                &chats_dir,
+                id,
+            ) {
                 tracing::warn!(error = %err, "chat: delete failed");
             }
         }
@@ -398,9 +420,11 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
                 .read()
                 .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
                 .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
             if let Err(err) = crate::chat::session::create_new(
                 &mut self.app.chat_state.registry,
                 &vault_root,
+                &chats_dir,
                 &model,
                 &provider,
             ) {
@@ -415,6 +439,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     }
 
     fn secondary_side_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let _g = crate::profiling::FrameProf::guard("wb:secondary_side_bar");
         // The docked chat region is a migrated `Feature`'s sidebar
         // surface. It renders through the narrow `feature::Ctx` (chat state
         // via `ctx.state`, broad mutations deferred), mirroring
@@ -502,6 +527,8 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
 /// so the match doesn't fight the behavior trait's borrow contract.
 impl<'a> HikerWbBehavior<'a> {
     fn render_tab_body(&mut self, ui: &mut egui::Ui, tab_id: TabId, kind: &TabKind) {
+        crate::profile_scope!("render_tab_body", tab_kind_name(kind));
+        let _g = crate::profiling::FrameProf::guard(tab_kind_name(kind));
         let app = &mut *self.app;
         let rt = self.rt;
         match kind {
@@ -540,6 +567,7 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::Properties { path } => panels::properties::show(ui, app, path),
             TabKind::Graph => panels::graph::show(ui, app),
             TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
+            TabKind::Canvas { path } => panels::canvas::show(ui, app, tab_id, path, rt),
             TabKind::BoardsIndex => panels::boards_index::show(ui, app),
             TabKind::Agent { session_id } => crate::chat::render::show_tab(ui, app, session_id),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
@@ -551,7 +579,40 @@ impl<'a> HikerWbBehavior<'a> {
                 clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
+            TabKind::Capture { note_path } => {
+                panels::capture::show(ui, app, tab_id, note_path, rt)
+            }
+            TabKind::ZimView { zim_path, article } => {
+                panels::zim::show(ui, app, tab_id, zim_path, article)
+            }
         }
     }
 
+}
+
+/// Stable per-kind label for the frame profiler / puffin scopes.
+fn tab_kind_name(kind: &TabKind) -> &'static str {
+    match kind {
+        TabKind::Editor { .. } => "tab:Editor",
+        TabKind::Home => "tab:Home",
+        TabKind::HomeDetail { .. } => "tab:HomeDetail",
+        TabKind::Queue => "tab:Queue",
+        TabKind::QueueDetail { .. } => "tab:QueueDetail",
+        TabKind::Settings => "tab:Settings",
+        TabKind::Properties { .. } => "tab:Properties",
+        TabKind::Graph => "tab:Graph",
+        TabKind::Board { .. } => "tab:Board",
+        TabKind::Canvas { .. } => "tab:Canvas",
+        TabKind::BoardsIndex => "tab:BoardsIndex",
+        TabKind::Agent { .. } => "tab:Agent",
+        TabKind::PatchReview => "tab:PatchReview",
+        TabKind::Plugins => "tab:Plugins",
+        TabKind::IndexerDetail => "tab:IndexerDetail",
+        TabKind::Sync => "tab:Sync",
+        TabKind::Changes => "tab:Changes",
+        TabKind::ClusterReview { .. } => "tab:ClusterReview",
+        TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
+        TabKind::Capture { .. } => "tab:Capture",
+        TabKind::ZimView { .. } => "tab:ZimView",
+    }
 }

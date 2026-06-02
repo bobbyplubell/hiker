@@ -135,7 +135,7 @@ fn change_set_between(old: &str, new: &str) -> editor_core::change::Set {
 ///    can diff the buffer (`working`) against the proposal and render the
 ///    pending ops as a suggestion overlay. When equal (no pending),
 ///    `agent_proposal` clears and the buffer is plain editing.
-pub(super) fn run(
+pub(crate) fn run(
     app: &mut AppState,
     path: &str,
     txns: &[editor_core::transaction::Transaction],

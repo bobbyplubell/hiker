@@ -6,11 +6,14 @@
 //! and the derived `trail_waypoints` index table land in slice 2.
 //!
 //! A trail-doc is a regular markdown note with `hiker.kind: trail` in its
-//! frontmatter; a waypoint-note lives under
-//! `<vault>/.hiker/trails/<trail-id>/waypoints/<seq>--<source-basename>.md`
-//! and carries `hiker.kind: waypoint`. Per-spec (see `docs/trails.md`
-//! §"Trail-doc shape"), a non-`.md` file with `hiker.kind: trail` is NOT a
-//! trail — callers verify the extension before parsing.
+//! frontmatter; a waypoint-note lives in the trail-doc's *visible
+//! companion folder* (`<dir>/<trail>/<source-basename>--<rand6>.md`, per
+//! `note-companion-folder`) and carries `hiker.kind: waypoint`. Draft
+//! trails are the exception: their doc + companion folder stay hidden
+//! under `.hiker/trails/drafts/` until accepted. Per-spec (see
+//! `docs/trails.md` §"Trail-doc shape"), a non-`.md` file with
+//! `hiker.kind: trail` is NOT a trail — callers verify the extension
+//! before parsing.
 //
 // status: trail-doc-shape
 // status: waypoint-note-shape
@@ -79,7 +82,7 @@ pub struct TrailDocFrontmatter {
     /// `docs/trails.md` §"Append cursor — branching the trail".
     ///
     /// The cursor names a waypoint by its vault-relative `path` (the
-    /// waypoint-note's path under `.hiker/trails/<trail-id>/waypoints/`).
+    /// waypoint-note's path in the trail-doc's companion folder).
     ///
     /// status: trail-append-cursor
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,19 +422,13 @@ fn path_ref_to_json(rel: &str) -> serde_json::Value {
     serde_json::json!({ "path": rel })
 }
 
-/// Leaf directory name of the hidden trails tree under `.hiker/`. Mirrors
-/// `trash::TRASH_DIRNAME` / `autosave::AUTOSAVE_DIRNAME` — the single source
-/// of truth for the on-disk path shape so the watcher carve-out and every
-/// trail writer/reader stay in sync.
+/// Leaf directory name of the hidden trails tree under `.hiker/`. Used now
+/// only for the draft staging area (`.hiker/trails/drafts/`) and the
+/// op-log bootstrap / watcher carve-out — accepted trails store their
+/// waypoints in the trail-doc's *visible* companion folder instead.
 ///
 /// status: trail-storage-layout
 pub const TRAILS_DIRNAME: &str = "trails";
-
-/// Leaf directory name holding a trail's waypoint-notes:
-/// `.hiker/trails/<trail-id>/waypoints/`.
-///
-/// status: trail-storage-layout
-pub const WAYPOINTS_DIRNAME: &str = "waypoints";
 
 /// Leaf directory name holding draft trail-docs: `.hiker/trails/drafts/`.
 ///
@@ -439,7 +436,7 @@ pub const WAYPOINTS_DIRNAME: &str = "waypoints";
 pub const DRAFTS_DIRNAME: &str = "drafts";
 
 /// Vault-relative path of the hidden trails dir (`.hiker/trails`). Always
-/// forward-slashed. The single source for the trails path shape — route
+/// forward-slashed. Now only the parent of the drafts staging dir; route
 /// every `.hiker/trails` literal through this (or the helpers below).
 ///
 /// status: trail-storage-layout
@@ -447,38 +444,46 @@ pub fn dir() -> String {
     format!(".hiker/{TRAILS_DIRNAME}")
 }
 
-/// Vault-relative prefix used to match anything under the trails tree:
-/// `.hiker/trails/`. Use with `str::starts_with` (watcher carve-out,
-/// indexer/job routing, app trail-doc detection).
+/// Vault-relative prefix used to match anything under the hidden trails
+/// tree: `.hiker/trails/`. Use with `str::starts_with` (the watcher
+/// carve-out for drafts, op-log bootstrap's second pass).
 ///
 /// status: trail-storage-layout
 pub fn dir_prefix() -> String {
     format!("{}/", dir())
 }
 
-/// Vault-relative path of the drafts dir (`.hiker/trails/drafts`).
+/// Vault-relative path of the drafts dir (`.hiker/trails/drafts`). Draft
+/// trail-docs live here as `<id>.md` with their waypoints in the sibling
+/// companion folder `<id>/`; accepting a draft relocates both out to the
+/// configured `new_trail_dir`.
 ///
 /// status: trail-storage-layout
+/// status: trail-draft-review-surface
 pub fn drafts_dir() -> String {
     format!("{}/{DRAFTS_DIRNAME}", dir())
 }
 
-/// Vault-relative path of the hidden trail root for `trail_id`
-/// (`.hiker/trails/<trail-id>`). Parent of the waypoints dir; also the
-/// delete-cascade scope.
+/// Vault-relative path of a trail's waypoints directory: the trail-doc's
+/// *companion folder* (`note-companion-folder` in `files.md`). A trail-doc
+/// at `<dir>/<trail>.md` stores its waypoint-notes in `<dir>/<trail>/`.
+/// This holds for both accepted trails (visible, e.g. `trails/my-trail/`)
+/// and drafts (hidden, e.g. `.hiker/trails/drafts/<id>/`) — the companion
+/// folder is always the sibling of the trail-doc, wherever it lives.
+///
+/// The waypoint dir is derived from the trail-doc's *path*, not its
+/// `doc_id`: the identity is still the op-log `doc_id`, but the physical
+/// home now follows the doc on disk (so a rename moves the folder via
+/// `move_note`'s companion-folder pairing).
+///
+/// Returns `None` only for a non-`.md` trail-doc path (which can't be a
+/// trail per spec, so it never reaches the waypoint writers).
 ///
 /// status: trail-storage-layout
-pub fn trail_root_for(trail_id: &str) -> String {
-    format!("{}/{trail_id}", dir())
-}
-
-/// Vault-relative path of the hidden waypoints dir for `trail_id`.
-/// Always uses forward slashes, matching the rest of the vault path
-/// surface.
-///
-/// status: trail-storage-layout
-pub fn waypoints_dir_for(trail_id: &str) -> String {
-    format!("{}/{WAYPOINTS_DIRNAME}", trail_root_for(trail_id))
+/// status: note-companion-folder
+#[must_use]
+pub fn waypoints_dir_for_doc(trail_doc_rel: &str) -> Option<String> {
+    crate::vault::companion_folder_for(trail_doc_rel)
 }
 
 /// Filename for a waypoint-note. Per spec

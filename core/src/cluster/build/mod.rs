@@ -1,9 +1,13 @@
 //! Offline build pipeline: cluster → summarize → flatten, plus the
-//! `Db`-persistence wrappers (`persist`, `rebuild_and_persist`)
-//! and the FromFolders alternate method. The placement classifier in
-//! `tree.rs` shares the `Node` shape but lives on the online
-//! path; this module produces the richer `BuiltClusterNode` described
-//! in `clustering.md` §"Output: what suggestions consume".
+//! FromFolders alternate method. The pipeline returns the neutral
+//! `BuiltClusterTree` only — converting that into the tree-storage
+//! representation (`Db` rows) and the `persist` / `rebuild_and_persist`
+//! wrappers live on the storage side in `crate::trees::build_adapter`,
+//! so the clustering algorithm never reaches up into `trees::types`.
+//! The placement classifier in `tree.rs` shares the `Node` shape but
+//! lives on the online path; this module produces the richer
+//! `BuiltClusterNode` described in `clustering.md` §"Output: what
+//! suggestions consume".
 //!
 //! status: cluster-build-recursive
 //! status: cluster-tree-output
@@ -21,7 +25,6 @@ use super::{
     FolderDeriveParams, MemberInfo, NoteInput, OUTLIER_LABEL, Phase, SummarizeInput, SummarizeMode,
     SummaryOutput, Summarizer,
 };
-use crate::trees::types::{Db, EditableNode, NodeInsert, NodeKind, TreeInsert};
 
 /// Build a cluster tree from a resolved set of notes. Per
 /// `cluster-build-recursive` + `cluster-build-cluster-method` (and
@@ -64,385 +67,6 @@ pub fn tree(
         method,
         tree,
     })
-}
-
-/// Convenience: build a fresh tree and persist it as a tree `.md`. The
-/// resulting `cluster_trees` row + `cluster_nodes` rows are written
-/// under one transaction (per `cluster-editor-draft-persistence` —
-/// every node is editable from the moment it lands). Returns the new
-/// `tree_id`.
-pub fn persist(
-    trees: &Db,
-    name: &str,
-    source: &str,
-    scope: &BuildScope,
-    method: &BuildMethod,
-    notes: &[NoteInput],
-    summarizer: &dyn Summarizer,
-) -> Result<String, BuildError> {
-    let result = tree(scope.clone(), method.clone(), notes, summarizer)?;
-    let scope_json = serde_json::to_string(&result.scope)
-        .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
-    let method_json = serde_json::to_string(&result.method)
-        .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
-    let tree_id = trees
-        .insert_tree(TreeInsert {
-            id: None,
-            name: name.to_string(),
-            source: source.to_string(),
-            state: "draft".to_string(),
-            scope_json,
-            method_json,
-            vault_snapshot: None,
-        })
-        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
-    let inserts = result_to_node_inserts(&result.tree);
-    trees
-        .insert_nodes(&tree_id, &inserts)
-        .map_err(|e| BuildError::Summarizer(format!("insert_nodes: {e}")))?;
-    Ok(tree_id)
-}
-
-/// Re-build an existing tree against the current vault state. Re-uses
-/// the tree's saved `scope` + `method` (from `cluster_trees.scope` /
-/// `.method`), re-runs `tree`, and persists a *new* tree row —
-/// the original tree is left intact so the user can compare / discard.
-/// User-edited fields (`user_edited_name`, `user_edited_summary`,
-/// `policy`) on the old tree are preserved onto new clusters whose
-/// member-set Jaccard against the old cluster exceeds `merge_threshold`
-/// (0.5 by default — matches the spec's "preserve where membership
-/// overlaps significantly" wording in the rollout doc).
-///
-/// Returns the new tree id.
-///
-/// Per `cluster-build-rebuild`.
-///
-/// status: cluster-build-rebuild
-pub fn rebuild_and_persist(
-    trees: &Db,
-    old_tree_id: &str,
-    new_name: &str,
-    notes: &[NoteInput],
-    summarizer: &dyn Summarizer,
-    merge_threshold: f32,
-) -> Result<String, BuildError> {
-    let old_row = trees
-        .get_tree(old_tree_id)
-        .map_err(|e| BuildError::Summarizer(format!("get_tree: {e}")))?
-        .ok_or_else(|| BuildError::Summarizer(format!("tree not found: {old_tree_id}")))?;
-    let scope: BuildScope = serde_json::from_str(&old_row.scope_json)
-        .map_err(|e| BuildError::Summarizer(format!("scope deserialize: {e}")))?;
-    let method: BuildMethod = serde_json::from_str(&old_row.method_json)
-        .map_err(|e| BuildError::Summarizer(format!("method deserialize: {e}")))?;
-    let old_nodes = trees
-        .list_nodes(old_tree_id)
-        .map_err(|e| BuildError::Summarizer(format!("list_nodes: {e}")))?;
-
-    let result = tree(scope.clone(), method.clone(), notes, summarizer)?;
-    let scope_json = serde_json::to_string(&result.scope)
-        .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
-    let method_json = serde_json::to_string(&result.method)
-        .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
-    let new_tree_id = trees
-        .insert_tree(TreeInsert {
-            id: None,
-            name: new_name.to_string(),
-            source: old_row.source.clone(),
-            state: "draft".to_string(),
-            scope_json,
-            method_json,
-            vault_snapshot: None,
-        })
-        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
-
-    let mut inserts = result_to_node_inserts(&result.tree);
-
-    // Compute per-old-cluster note-id member sets. Walk old_nodes once
-    // to build child→parent map + leaf note ids per cluster.
-    use std::collections::{HashMap, HashSet};
-    let mut old_children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut old_node_by_id: HashMap<String, &EditableNode> = HashMap::new();
-    for n in &old_nodes {
-        old_node_by_id.insert(n.id.clone(), n);
-        if let Some(p) = &n.parent {
-            old_children.entry(p.clone()).or_default().push(n.id.clone());
-        }
-    }
-    fn collect_old_notes(
-        id: &str,
-        old_children: &HashMap<String, Vec<String>>,
-        old_node_by_id: &HashMap<String, &EditableNode>,
-        acc: &mut HashSet<String>,
-    ) {
-        if let Some(kids) = old_children.get(id) {
-            for k in kids {
-                if let Some(node) = old_node_by_id.get(k) {
-                    if matches!(node.kind, NodeKind::Leaf) {
-                        if let Some(nid) = &node.note_path {
-                            acc.insert(nid.clone());
-                        }
-                    } else {
-                        collect_old_notes(k, old_children, old_node_by_id, acc);
-                    }
-                }
-            }
-        }
-    }
-    let mut old_cluster_members: HashMap<String, HashSet<String>> = HashMap::new();
-    for n in &old_nodes {
-        if matches!(n.kind, NodeKind::Cluster) {
-            let mut s = HashSet::new();
-            collect_old_notes(&n.id, &old_children, &old_node_by_id, &mut s);
-            old_cluster_members.insert(n.id.clone(), s);
-        }
-    }
-
-    // Build new clusters' note-id member sets from `inserts`.
-    let mut new_children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut new_node_kind: HashMap<String, NodeKind> = HashMap::new();
-    let mut new_note_ref: HashMap<String, Option<String>> = HashMap::new();
-    for n in &inserts {
-        if let Some(p) = &n.parent_id {
-            new_children.entry(p.clone()).or_default().push(n.node_id.clone());
-        }
-        new_node_kind.insert(n.node_id.clone(), n.kind);
-        new_note_ref.insert(n.node_id.clone(), n.note_id.clone());
-    }
-    fn collect_new_notes(
-        id: &str,
-        new_children: &HashMap<String, Vec<String>>,
-        new_node_kind: &HashMap<String, NodeKind>,
-        new_note_ref: &HashMap<String, Option<String>>,
-        acc: &mut HashSet<String>,
-    ) {
-        if let Some(kids) = new_children.get(id) {
-            for k in kids {
-                if let Some(kind) = new_node_kind.get(k) {
-                    if matches!(kind, NodeKind::Leaf) {
-                        if let Some(Some(nid)) = new_note_ref.get(k) {
-                            acc.insert(nid.clone());
-                        }
-                    } else {
-                        collect_new_notes(k, new_children, new_node_kind, new_note_ref, acc);
-                    }
-                }
-            }
-        }
-    }
-
-    // For each new cluster, find the old cluster with the highest
-    // Jaccard. If above the threshold, transfer user-edited name /
-    // summary + policy.
-    for ins in inserts.iter_mut() {
-        if !matches!(ins.kind, NodeKind::Cluster) {
-            continue;
-        }
-        let mut new_members: HashSet<String> = HashSet::new();
-        collect_new_notes(
-            &ins.node_id,
-            &new_children,
-            &new_node_kind,
-            &new_note_ref,
-            &mut new_members,
-        );
-        if new_members.is_empty() {
-            continue;
-        }
-        let mut best_id: Option<&String> = None;
-        let mut best_jaccard: f32 = 0.0;
-        for (old_id, old_members) in &old_cluster_members {
-            if old_members.is_empty() {
-                continue;
-            }
-            let inter = new_members.intersection(old_members).count() as f32;
-            let union = new_members.union(old_members).count() as f32;
-            if union <= 0.0 {
-                continue;
-            }
-            let j = inter / union;
-            if j > best_jaccard {
-                best_jaccard = j;
-                best_id = Some(old_id);
-            }
-        }
-        if best_jaccard >= merge_threshold
-            && let Some(old_id) = best_id
-            && let Some(old_node) = old_node_by_id.get(old_id)
-        {
-            if old_node.user_edited_name {
-                ins.name = old_node.name.clone();
-                ins.user_edited_name = true;
-            }
-            if old_node.user_edited_summary {
-                ins.summary = old_node.summary.clone();
-                ins.user_edited_summary = true;
-            }
-            if old_node.policy.is_some() {
-                ins.policy = old_node.policy.clone();
-            }
-        }
-    }
-
-    trees
-        .insert_nodes(&new_tree_id, &inserts)
-        .map_err(|e| BuildError::Summarizer(format!("insert_nodes: {e}")))?;
-    Ok(new_tree_id)
-}
-
-/// Flatten a `BuiltClusterTree` into the row shape `core::trees`
-/// consumes. Top of the tree is the highest-level cluster (root); levels
-/// descend with cluster-kind rows; the leaf level produces `leaf`-kind
-/// rows under their parent clusters. Outliers attach as `leaf`-kind rows
-/// under a dedicated `outlier-bucket` node parented at the root.
-/// Public view onto `result_to_node_inserts` for callers outside this
-/// module (e.g. the `cluster_persist_built_tree` command that drives
-/// the clustering review tab's Confirm-and-name step).
-///
-/// status: cluster-review-tab-confirm-single-path
-pub fn result_to_node_inserts_pub(tree: &BuiltClusterTree) -> Vec<NodeInsert> {
-    result_to_node_inserts(tree)
-}
-
-pub(super) fn result_to_node_inserts(tree: &BuiltClusterTree) -> Vec<NodeInsert> {
-    let mut out: Vec<NodeInsert> = Vec::new();
-    if tree.levels.is_empty() {
-        return out;
-    }
-    // Determine the root. If the top level has exactly one node, that's
-    // root. Otherwise synthesize a root that owns the top-level nodes.
-    let top_level = tree.levels.len() - 1;
-    let top = &tree.levels[top_level];
-    let (root_id, synthesized_root) = if top.len() == 1 {
-        (top[0].id.clone(), false)
-    } else {
-        ("root".to_string(), true)
-    };
-
-    // Build a parent lookup: for each child id, who's its parent?
-    // The build process records `members` on each `BuiltClusterNode`:
-    // - cluster levels (1..N): members are child cluster ids
-    // - level 0: members are note ids
-    let mut parent_of: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for level in tree.levels.iter().skip(1) {
-        for node in level {
-            for child in &node.members {
-                parent_of.insert(child.clone(), node.id.clone());
-            }
-        }
-    }
-    if synthesized_root {
-        for n in top {
-            parent_of.insert(n.id.clone(), root_id.clone());
-        }
-    }
-
-    // Write the synthesized root, if any.
-    if synthesized_root {
-        // Centroid for the synthesized root = mean of top-level
-        // centroids, L2-normalized.
-        let top_centroids: Vec<&[f32]> = top.iter().map(|n| n.centroid.as_slice()).collect();
-        let centroid = mean_normalize(&top_centroids);
-        out.push(NodeInsert {
-            node_id: root_id.clone(),
-            parent_id: None,
-            kind: NodeKind::Cluster,
-            note_id: None,
-            name: "Vault root".to_string(),
-            summary: String::new(),
-            user_edited_name: false,
-            user_edited_summary: false,
-            policy: None,
-            centroid: Some(centroid),
-            confidence: 1.0,
-            summary_membership_churn: 0,
-        });
-    }
-
-    // Emit cluster nodes for every level.
-    for (level_idx, level) in tree.levels.iter().enumerate() {
-        for node in level {
-            let parent = if level_idx == top_level && !synthesized_root {
-                None
-            } else {
-                parent_of.get(&node.id).cloned()
-            };
-            out.push(NodeInsert {
-                node_id: node.id.clone(),
-                parent_id: parent,
-                kind: NodeKind::Cluster,
-                note_id: None,
-                name: node.name.clone(),
-                summary: node.summary.clone(),
-                user_edited_name: false,
-                user_edited_summary: false,
-                policy: None,
-                centroid: Some(node.centroid.clone()),
-                confidence: node.confidence,
-                summary_membership_churn: 0,
-            });
-        }
-    }
-
-    // Emit leaf nodes under their level-0 cluster.
-    if let Some(leaf_level) = tree.levels.first() {
-        for cluster in leaf_level {
-            for note_id in &cluster.members {
-                let leaf_id = format!("leaf-{}", note_id);
-                out.push(NodeInsert {
-                    node_id: leaf_id,
-                    parent_id: Some(cluster.id.clone()),
-                    kind: NodeKind::Leaf,
-                    note_id: Some(note_id.clone()),
-                    name: note_id.clone(),
-                    summary: String::new(),
-                    user_edited_name: false,
-                    user_edited_summary: false,
-                    policy: None,
-                    centroid: None,
-                    confidence: cluster.confidence,
-                    summary_membership_churn: 0,
-                });
-            }
-        }
-    }
-
-    // Outliers bucket, parented at root.
-    if !tree.outliers.is_empty() {
-        let bucket_id = "outliers".to_string();
-        out.push(NodeInsert {
-            node_id: bucket_id.clone(),
-            parent_id: Some(root_id.clone()),
-            kind: NodeKind::OutlierBucket,
-            note_id: None,
-            name: "Outliers".to_string(),
-            summary: String::new(),
-            user_edited_name: false,
-            user_edited_summary: false,
-            policy: None,
-            centroid: None,
-            confidence: 0.0,
-            summary_membership_churn: 0,
-        });
-        for note_id in &tree.outliers {
-            out.push(NodeInsert {
-                node_id: format!("leaf-{}", note_id),
-                parent_id: Some(bucket_id.clone()),
-                kind: NodeKind::Leaf,
-                note_id: Some(note_id.clone()),
-                name: note_id.clone(),
-                summary: String::new(),
-                user_edited_name: false,
-                user_edited_summary: false,
-                policy: None,
-                centroid: None,
-                confidence: 0.0,
-                summary_membership_churn: 0,
-            });
-        }
-    }
-
-    out
 }
 
 // ── Build recipe: top-down divisive Split ────────────────────────────
@@ -807,7 +431,7 @@ impl<'a> SplitBranchCtx<'a> {
 
         // Add a synthetic vault root when there's more than one top-level
         // cluster. With exactly one, the persistence flatten
-        // (`result_to_node_inserts`) treats it as root naturally.
+        // (`trees::build_adapter::node_inserts`) treats it as root naturally.
         if top_ids.len() > 1 {
             let refs: Vec<&[f32]> =
                 top_centroids.iter().map(std::vec::Vec::as_slice).collect();
@@ -1176,7 +800,7 @@ fn fold_into_first_leaf(node: &mut SplitNode, extra_idxs: &[usize], notes: &[Not
 /// sits at level 0; its parent at level 1; etc., taking the *max* of
 /// each child's level so parents always sit above all their children).
 ///
-/// To keep `result_to_node_inserts`'s "synthesize a root iff top.len() != 1"
+/// To keep `trees::build_adapter::node_inserts`'s "synthesize a root iff top.len() != 1"
 /// machinery happy when the virtual-root Split produces top-level
 /// clusters at different levels (which happens when some branches went
 /// deeper than others), we **always** add a synthetic vault root to
@@ -1413,7 +1037,7 @@ pub(super) fn build_from_folders(
     }
 
     // FromFolders is a single-level tree (root synthesized at flatten
-    // time per `result_to_node_inserts` when level0.len() > 1).
+    // time per `trees::build_adapter::node_inserts` when level0.len() > 1).
     Ok(BuiltClusterTree {
         levels: vec![level0],
         outliers: Vec::new(),

@@ -5,7 +5,9 @@
 
 use super::*;
 
+mod migrate;
 mod parse;
+mod rename;
 
 pub(super) fn we(path: &str) -> WaypointEntry {
     WaypointEntry {

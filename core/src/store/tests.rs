@@ -834,3 +834,90 @@ fn replace_note_metadata_overwrites_prior() {
     assert!(store.query_notes(&active).unwrap().is_empty());
     assert_eq!(store.query_notes(&done).unwrap().len(), 1);
 }
+
+// ---- vault-view lens projection (vault-view-source-groups) ----
+
+#[test]
+fn notes_with_meta_projects_relationship_keys() {
+    let (_dir, mut store) = fresh_store();
+    // A crawl job, a child stamped with the job's parent, and a plain note.
+    let job = put_note(
+        &mut store,
+        "captures/job.md",
+        1,
+        &[("hiker.kind", "capture", None), ("hiker.author", "user-authored", None)],
+    );
+    put_note(
+        &mut store,
+        "captures/job/page-1.md",
+        2,
+        &[
+            ("hiker.parent", &job, None),
+            ("hiker.author", "imported", None),
+            ("hiker.provenance", "web-crawl", None),
+        ],
+    );
+    put_note(&mut store, "plain.md", 3, &[]);
+
+    let rows = store.notes_with_meta().unwrap();
+    assert_eq!(rows.len(), 3);
+
+    let child = rows.iter().find(|r| r.path == "captures/job/page-1.md").unwrap();
+    assert_eq!(child.parent.as_deref(), Some(job.as_str()));
+    assert_eq!(child.author.as_deref(), Some("imported"));
+    assert_eq!(child.provenance.as_deref(), Some("web-crawl"));
+
+    let job_row = rows.iter().find(|r| r.path == "captures/job.md").unwrap();
+    assert_eq!(job_row.kind.as_deref(), Some("capture"));
+    assert!(job_row.parent.is_none());
+
+    // A note with no hiker.* frontmatter projects all-None, not dropped.
+    let plain = rows.iter().find(|r| r.path == "plain.md").unwrap();
+    assert!(plain.parent.is_none() && plain.author.is_none() && plain.kind.is_none());
+}
+
+#[test]
+fn notes_with_meta_excludes_skipped() {
+    let (_dir, mut store) = fresh_store();
+    let id = new_id();
+    store
+        .upsert_skipped(&id, "huge.md", "file too large", 1, 1)
+        .unwrap();
+    put_note(&mut store, "ok.md", 2, &[]);
+    let rows = store.notes_with_meta().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, "ok.md");
+}
+
+#[test]
+fn all_trail_waypoints_orders_by_trail_then_tree_path() {
+    let (_dir, mut store) = fresh_store();
+    // Two trails, interleaved insert order; rows for trail B's side-trail
+    // child arrive before its root to test the ORDER BY.
+    for (trail, wid, parent, tree) in [
+        ("B", "b1", None, "1"),
+        ("A", "a1", None, "1"),
+        ("B", "b2", Some("b1"), "1.1"),
+        ("A", "a2", None, "2"),
+    ] {
+        store
+            .upsert_trail_waypoint(&WaypointRow {
+                waypoint_path: format!("trails/{trail}/{wid}.md"),
+                waypoint_id: wid.into(),
+                trail_id: trail.into(),
+                source_path: format!("src/{wid}.md"),
+                parent_waypoint_id: parent.map(str::to_string),
+                tree_path: tree.into(),
+            })
+            .unwrap();
+    }
+    let rows = store.all_trail_waypoints().unwrap();
+    let order: Vec<_> = rows
+        .iter()
+        .map(|r| (r.trail_id.as_str(), r.tree_path.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        vec![("A", "1"), ("A", "2"), ("B", "1"), ("B", "1.1")],
+    );
+}

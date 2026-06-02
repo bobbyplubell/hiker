@@ -11,7 +11,7 @@ use eframe::egui;
 
 use crate::state::{AppState, ToastLevel};
 use crate::tab::{Tab, TabKind};
-use crate::theme;
+use hiker_theme as theme;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Patch review");

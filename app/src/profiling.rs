@@ -44,7 +44,7 @@ pub struct Profiler;
 impl Profiler {
 /// Start the puffin_http server + the in-process frame mirror. Call
 /// once at boot. Idempotent.
-pub const fn init_server(self) {
+pub fn init_server(self) {
     #[cfg(feature = "profiling")]
     {
         // FrameView mirror: every recorded frame is also pushed here so
@@ -277,7 +277,7 @@ fn summarize_frames(view: &puffin::FrameView) -> String {
 impl Profiler {
 /// Mark the start of a new frame. Call once at the top of `update`.
 /// No-op without the `profiling` feature.
-pub const fn new_frame(self) {
+pub fn new_frame(self) {
     #[cfg(feature = "profiling")]
     {
         puffin::GlobalProfiler::lock().new_frame();
@@ -336,4 +336,152 @@ macro_rules! profile_scope {
         #[cfg(feature = "profiling")]
         puffin::profile_scope!($name, $extra);
     };
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight always-on frame profiler — independent of the `profiling`
+// feature and of `puffin_viewer`, so a plain `cargo run --release` can measure
+// the real per-frame cost and print a section breakdown to stderr.
+//
+// Env-gated (read once; zero overhead when off):
+//   HIKER_FRAMELOG=1   print wall-time stats + per-section breakdown each ~180 frames
+//   HIKER_BENCH=1      also force continuous repaint, to simulate a scroll/redraw load
+//
+// Usage: call `FrameProf::tick(ctx)` once at the top of `update()`, and wrap
+// hot sections with `let _g = FrameProf::guard("name");`.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static FP_STATE: AtomicU8 = AtomicU8::new(0); // 0 = uninit, 1 = off, 2 = on
+
+/// Cheap enabled check; resolves the env vars exactly once.
+fn fp_enabled() -> bool {
+    match FP_STATE.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let on = std::env::var_os("HIKER_FRAMELOG").is_some()
+                || std::env::var_os("HIKER_BENCH").is_some();
+            FP_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+fn fp_bench() -> bool {
+    std::env::var_os("HIKER_BENCH").is_some()
+}
+
+/// A frame slower than this (ms) is logged individually with its breakdown —
+/// at 60Hz vsync the budget is 16.67ms, so >24ms means a missed vblank / stutter.
+const SPIKE_MS: f32 = 24.0;
+
+struct FrameProfState {
+    last: Option<std::time::Instant>,
+    dts: Vec<f32>, // ms
+    /// Section ms for the frame currently being built (reset every frame).
+    cur: std::collections::HashMap<&'static str, f64>,
+    /// Rolling per-section sums for the periodic report.
+    roll: std::collections::HashMap<&'static str, (f64, u32)>,
+}
+
+fn fp_state() -> &'static std::sync::Mutex<FrameProfState> {
+    static S: std::sync::OnceLock<std::sync::Mutex<FrameProfState>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(FrameProfState {
+            last: None,
+            dts: Vec::new(),
+            cur: std::collections::HashMap::new(),
+            roll: std::collections::HashMap::new(),
+        })
+    })
+}
+
+/// Zero-sized handle for the frame profiler (methods, not free fns, to match
+/// the `Profiler` style and avoid `single_call_fn` churn).
+pub struct FrameProf;
+
+impl FrameProf {
+    /// Record the inter-frame wall time; print a report every ~180 frames.
+    /// In `HIKER_BENCH` mode also drives continuous repaint.
+    pub fn tick(ctx: &egui::Context) {
+        if !fp_enabled() {
+            return;
+        }
+        if fp_bench() {
+            ctx.request_repaint();
+        }
+        let mut s = fp_state().lock().unwrap();
+        let now = std::time::Instant::now();
+        if let Some(prev) = s.last {
+            let dt = (now - prev).as_secs_f32() * 1e3;
+            s.dts.push(dt);
+            // Finalize the frame that just ended: fold its section times into the
+            // rolling report, and if it was a stutter, print its breakdown now.
+            let cur = std::mem::take(&mut s.cur);
+            if dt > SPIKE_MS {
+                let mut secs: Vec<_> = cur.iter().map(|(k, v)| (*k, *v)).collect();
+                secs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let top: String = secs
+                    .iter()
+                    .take(5)
+                    .map(|(k, v)| format!("{k} {v:.1}ms"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("[frameprof] SPIKE {dt:.1}ms  | {top}");
+            }
+            for (k, v) in cur {
+                let e = s.roll.entry(k).or_insert((0.0, 0));
+                e.0 += v;
+                e.1 += 1;
+            }
+        }
+        s.last = Some(now);
+        if s.dts.len() >= 180 {
+            let mut d = std::mem::take(&mut s.dts);
+            let sections = std::mem::take(&mut s.roll);
+            drop(s);
+            d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = d.len();
+            let mean = d.iter().sum::<f32>() / n as f32;
+            let p = |q: f32| d[((n as f32 * q) as usize).min(n - 1)];
+            eprintln!(
+                "\n[frameprof] {n} frames | wall mean {:.2}ms p50 {:.2} p99 {:.2} max {:.2} => {:.0} fps",
+                mean, p(0.50), p(0.99), p(1.0), 1000.0 / mean.max(0.001)
+            );
+            let mut secs: Vec<_> = sections
+                .into_iter()
+                .map(|(k, (sum, c))| (k, sum / c.max(1) as f64, c))
+                .collect();
+            secs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (name, meanms, c) in secs.into_iter().take(12) {
+                eprintln!("[frameprof]   {meanms:>7.2}ms  x{c:<4} {name}");
+            }
+        }
+    }
+
+    /// Time a named section; the returned guard records on drop. Returns `None`
+    /// (and costs nothing) when the frame profiler is disabled.
+    pub fn guard(name: &'static str) -> Option<SectionGuard> {
+        if fp_enabled() {
+            Some(SectionGuard { name, start: std::time::Instant::now() })
+        } else {
+            None
+        }
+    }
+}
+
+pub struct SectionGuard {
+    name: &'static str,
+    start: std::time::Instant,
+}
+
+impl Drop for SectionGuard {
+    fn drop(&mut self) {
+        let ms = self.start.elapsed().as_secs_f64() * 1e3;
+        if let Ok(mut s) = fp_state().lock() {
+            *s.cur.entry(self.name).or_insert(0.0) += ms;
+        }
+    }
 }

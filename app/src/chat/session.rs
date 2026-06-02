@@ -3,16 +3,29 @@
 //! materialises `ChatSession` values for the renderer.
 
 use std::path::Path;
+use std::sync::RwLock;
 
+use hiker_core::config::Config;
 use hiker_core::sessions::{self, SessionId, SessionMeta};
 
 use crate::chat::state::{ChatRegistry, ChatRole, ChatSession, ChatTurn, ToolCard};
 
-/// Walk `<vault>/.hiker/sessions/` and hydrate the registry with one
-/// `ChatSession` per file. Called once after `bootstrap::open_vault`
-/// so the picker shows historic sessions.
-pub fn discover(reg: &mut ChatRegistry, vault_root: &Path) {
-    let infos = match sessions::list(vault_root) {
+/// Read the configured chat-session folder (`[chat] chats_dir`) from the
+/// shared config, falling back to the default `"chats/"` if the lock is
+/// poisoned. Sessions live at `<chats_dir>/<date>-<id>.md` per
+/// `chat-session-markdown-store`.
+pub fn chats_dir(config: &RwLock<Config>) -> String {
+    config
+        .read()
+        .map(|c| c.chat.chats_dir.clone())
+        .unwrap_or_else(|_| "chats/".to_string())
+}
+
+/// Walk `<vault>/<chats_dir>/` (and its `imported/` subfolder) and hydrate
+/// the registry with one `ChatSession` per file. Called once after
+/// `bootstrap::open_vault` so the picker shows historic sessions.
+pub fn discover(reg: &mut ChatRegistry, vault_root: &Path, chats_dir: &str) {
+    let infos = match sessions::list(vault_root, chats_dir) {
         Ok(v) => v,
         Err(err) => {
             tracing::warn!(error = %err, "chat: list failed");
@@ -96,6 +109,7 @@ pub fn discover(reg: &mut ChatRegistry, vault_root: &Path) {
 pub fn create_new(
     reg: &mut ChatRegistry,
     vault_root: &Path,
+    chats_dir: &str,
     model: &str,
     provider: &str,
 ) -> std::io::Result<String> {
@@ -110,8 +124,8 @@ pub fn create_new(
         model: model.to_string(),
         provider: provider.to_string(),
     };
-    sessions::create_session_file(vault_root, &meta)?;
-    let rel = sessions::session_rel_path(&id, now);
+    sessions::create_session_file(vault_root, chats_dir, &meta)?;
+    let rel = sessions::session_rel_path(chats_dir, &id, now);
     reg.upsert(ChatSession {
         id: id.0.clone(),
         preview: "(new session)".to_string(),
@@ -129,7 +143,12 @@ pub fn create_new(
 /// Soft-delete: rm the on-disk file and forget the registry entry.
 /// Stretch goal: route through `core::ops::delete` to land in the
 /// vault trash; for now we just unlink.
-pub fn delete(reg: &mut ChatRegistry, vault_root: &Path, id: &str) -> std::io::Result<()> {
+pub fn delete(
+    reg: &mut ChatRegistry,
+    vault_root: &Path,
+    chats_dir: &str,
+    id: &str,
+) -> std::io::Result<()> {
     // Look up the file path; fall back to a directory scan if the
     // entry was discovered without rel_path.
     let abs = if let Some(s) = reg.sessions.get(id)
@@ -137,7 +156,7 @@ pub fn delete(reg: &mut ChatRegistry, vault_root: &Path, id: &str) -> std::io::R
     {
         vault_root.join(&s.rel_path)
     } else {
-        let infos = sessions::list(vault_root)?;
+        let infos = sessions::list(vault_root, chats_dir)?;
         let Some(info) = infos.into_iter().find(|i| i.id.0 == id) else {
             reg.forget(id);
             return Ok(());

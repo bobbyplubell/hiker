@@ -5,11 +5,13 @@
 //! buffer is the active tab.
 
 pub mod buffer;
+pub mod capture;
 pub mod changes;
 pub mod command_palette;
 pub mod cluster_graph;
 pub mod board;
 pub mod boards_index;
+pub mod canvas;
 pub mod graph;
 pub mod home;
 pub mod indexer_detail;
@@ -20,3 +22,4 @@ pub mod properties;
 pub mod queue;
 pub mod settings;
 pub mod sync;
+pub mod zim;

@@ -18,7 +18,7 @@ use hiker_core::trees::types::Db;
 use crate::clusters::state::State;
 use crate::feature::Ctx;
 use crate::state::{AppState, Toast, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 /// Shared per-frame context for the cluster sidebar. Wraps the narrow
 /// feature `Ctx` with the `trees` handle (cloned once at the top of
@@ -167,7 +167,7 @@ fn regenerate_names(cx: &mut ClusterCtx<'_, '_>, tree_id: &str) {
                 "Provide a short name (<6 words) for this cluster.\nMembers:\n{}\n\nRespond with only the name.",
                 members.join("\n")
             );
-            let messages = vec![hiker_core::llm::Message::user(prompt)];
+            let messages = vec![hiker_llm::Message::user(prompt)];
             let resp = match client.chat(&messages).await {
                 Ok(r) => r,
                 Err(err) => {
@@ -200,8 +200,7 @@ fn regenerate_names(cx: &mut ClusterCtx<'_, '_>, tree_id: &str) {
 /// Construct an `Arc<dyn Client>` from current settings, pushing an
 /// error toast if the LLM is disabled or the client failed to build.
 /// Returns `None` in either failure case; callers should early-return.
-fn build_llm_client(cx: &mut ClusterCtx<'_, '_>) -> Option<Arc<dyn hiker_core::llm::Client>> {
-    use hiker_core::llm::GraniteLlmClient;
+fn build_llm_client(cx: &mut ClusterCtx<'_, '_>) -> Option<Arc<dyn hiker_llm::Client>> {
     let llm_cfg = cx
         .ctx
         .config
@@ -212,8 +211,8 @@ fn build_llm_client(cx: &mut ClusterCtx<'_, '_>) -> Option<Arc<dyn hiker_core::l
         cx.toast("LLM is disabled in settings", ToastLevel::Warn);
         return None;
     }
-    match GraniteLlmClient::from_config(&llm_cfg) {
-        Ok(c) => Some(Arc::new(c) as Arc<dyn hiker_core::llm::Client>),
+    match hiker_core::llm::client_from_config(&llm_cfg) {
+        Ok(c) => Some(Arc::new(c) as Arc<dyn hiker_llm::Client>),
         Err(err) => {
             cx.toast(format!("LLM client error: {err}"), ToastLevel::Error);
             None
@@ -367,7 +366,7 @@ pub(super) fn summarize_subset(
                 "Write a 1-sentence summary for this cluster.\nMembers:\n{}",
                 members.join("\n")
             );
-            let messages = vec![hiker_core::llm::Message::user(prompt)];
+            let messages = vec![hiker_llm::Message::user(prompt)];
             let summary = match client.chat(&messages).await {
                 Ok(s) => s.trim().to_string(),
                 Err(err) => {

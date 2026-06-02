@@ -299,20 +299,12 @@ fn evict_expired(map: &mut HashMap<String, Instant>) {
 
 /// Hard-coded ignore list. Mirrors docs/watcher.md.
 pub fn is_ignored(rel: &str) -> bool {
-    // status: chat-session-show-in-tree-toggle
-    // `.hiker/sessions/` is the one carve-out: session markdown files
-    // ride the indexer (and watcher) so search / related-notes can
-    // surface past investigations regardless of the show-in-tree toggle.
-    if rel.starts_with(".hiker/sessions/") {
-        return false;
-    }
-    // status: trail-watcher-carve-out
-    // `.hiker/trails/` is similarly carved out: trail-docs and waypoint-
-    // notes ride the indexer so they're searchable like any other note.
-    // Same shape as the sessions carve-out above.
-    if rel.starts_with(".hiker/trails/") {
-        return false;
-    }
+    // Everything under `.hiker/` is ignored — nothing indexable lives there
+    // anymore. Chat sessions live in the visible `<chats_dir>/` folder and
+    // accepted trails in a trail-doc's visible companion folder
+    // (`subsystem-notes-visible` in `design.md`); trail *drafts*
+    // (`.hiker/trails/drafts/`) are pre-acceptance machinery and stay
+    // unindexed by design. No per-subsystem carve-out is needed.
     if rel.starts_with(".hiker/") || rel == ".hiker" {
         return true;
     }
@@ -396,9 +388,17 @@ mod tests {
         assert!(!is_ignored("note.md"));
         assert!(!is_ignored("project/notes.md"));
         assert!(!is_ignored("inbox/today.md"));
-        // Carve-outs: sessions and trails ride through the watcher.
-        assert!(!is_ignored(".hiker/sessions/2026-05-01-abc.md"));
-        assert!(!is_ignored(".hiker/trails/01HRX/waypoints/0001--note.md"));
+        // Sessions are now visible notes in `chats/`, indexed like any
+        // other note — not under `.hiker/`.
+        assert!(!is_ignored("chats/2026-05-01-abc.md"));
+        assert!(!is_ignored("chats/imported/claude-code-2026-05-01-xyz.md"));
+        // No subsystem carve-out: everything under `.hiker/` is ignored,
+        // including the former sessions/trails locations. Trail drafts at
+        // `.hiker/trails/drafts/` are correctly unindexed (pre-acceptance
+        // machinery).
+        assert!(is_ignored(".hiker/sessions/2026-05-01-abc.md"));
+        assert!(is_ignored(".hiker/trails/01HRX/waypoints/0001--note.md"));
+        assert!(is_ignored(".hiker/trails/drafts/01DRAFT.md"));
         // Hidden-dir contents are NOT ignored unless under .hiker/ or .git/.
         // That's intentional: a user vault might have legitimate dotted
         // subdirs we shouldn't silently skip beyond the documented two.

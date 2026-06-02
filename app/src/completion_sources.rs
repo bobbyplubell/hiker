@@ -2,7 +2,10 @@
 //!
 //! Currently provides a wikilink autocomplete that fires on `[[` and
 //! offers vault paths whose basename matches the partial typed after the
-//! opening brackets.
+//! opening brackets. Ranking is delegated to the shared core in
+//! `editor_view::autocomplete::rank` (the same one the standalone pickers
+//! and the chat `@`-mention use) — the wikilink source owns only the
+//! `[[`/`]]` trigger + close-fixup + shortest-unambiguous insert form.
 
 use std::sync::Arc;
 
@@ -10,8 +13,15 @@ use editor_core::state::Editor;
 use editor_view::autocomplete::CompletionItem;
 use editor_view::autocomplete::CompletionKind;
 use editor_view::autocomplete::CompletionSource;
+use editor_view::autocomplete::RankCandidate;
 use hiker_core::vault::Vault;
 use smol_str::SmolStr;
+
+use crate::autocomplete::vault_source::Scope;
+use crate::autocomplete::vault_source::VaultSource;
+
+/// How many ranked wikilink candidates to surface in the popup.
+const WIKILINK_RESULT_CAP: usize = 20;
 
 /// Wikilink completion: opens after the user types `[[` and offers a
 /// ranked list of vault notes by basename match against the chars typed
@@ -45,40 +55,16 @@ impl CompletionSource for WikilinkSource {
         let (consume, suffix) = close_fixup(after);
         let replace_end = pos + consume;
 
-        // Walk vault, score basename matches. Cheap for thousands of notes;
-        // for larger vaults we'd cache the path list and only rebuild on
-        // watcher events. Insert form is the shortest-unambiguous path-form
-        // per `wikilink-autocomplete`: bare basename when unique vault-wide,
-        // otherwise the minimal folder-prefix path that disambiguates.
-        let paths = self.vault.walk_indexable_files("").unwrap_or_default();
-        let needle = query.to_lowercase();
-        let mut items: Vec<(i32, CompletionItem)> = Vec::new();
-        for rel in paths.iter().take(5000) {
-            let basename = rel
-                .rsplit('/')
-                .next()
-                .unwrap_or(rel)
-                .trim_end_matches(".md");
-            let bn_lower = basename.to_lowercase();
-            let score = self.score_basename(&bn_lower, &needle);
-            if score <= 0 && !needle.is_empty() {
-                continue;
-            }
-            let insert_form = hiker_core::wikilink::shortest_unambiguous(&paths, rel);
-            items.push((
-                score,
-                CompletionItem {
-                    label: SmolStr::from(basename),
-                    detail: Some(SmolStr::from(rel.as_str())),
-                    insert: SmolStr::from(format!("{insert_form}{suffix}")),
-                    replace_range: Some(query_start..replace_end),
-                    kind: CompletionKind::Wikilink,
-                },
-            ));
-        }
-        items.sort_by_key(|x| std::cmp::Reverse(x.0));
-        items.truncate(20);
-        items.into_iter().map(|(_, item)| item).collect()
+        // Enumerate + rank through the shared `VaultSource` (notes-only
+        // scope) so wikilink uses the one definition of "linkable vault
+        // item" and the one ranking core. The per-candidate insert form is
+        // the shortest-unambiguous path-form per `wikilink-autocomplete`:
+        // bare basename when unique vault-wide, otherwise the minimal
+        // folder-prefix path that disambiguates.
+        let source = VaultSource::new(self.vault.clone(), Scope::NotesOnly);
+        source.ranked_with(query, WIKILINK_RESULT_CAP, |rel, paths| {
+            wikilink_candidate(rel, paths, suffix, query_start, replace_end)
+        })
     }
 
     /// status: bug-wikilink-edit-reopens-popup
@@ -87,6 +73,33 @@ impl CompletionSource for WikilinkSource {
         // popup re-open when the user types inside an existing
         // `[[wikilink]]` (which doesn't re-fire the `[` trigger).
         wikilink_query_start(&state.doc.to_string(), pos).is_some()
+    }
+}
+
+/// Build the wikilink [`RankCandidate`] for one path `rel` (given the full
+/// vault `paths` for disambiguation): scored on its basename (weighted above
+/// the folder prefix by the shared core) with the committed insert being the
+/// shortest-unambiguous path-form plus the close-fixup `suffix`, replacing
+/// `query_start..replace_end`.
+fn wikilink_candidate(
+    rel: &str,
+    paths: &[String],
+    suffix: &str,
+    query_start: usize,
+    replace_end: usize,
+) -> RankCandidate {
+    let basename = rel.rsplit('/').next().unwrap_or(rel).trim_end_matches(".md");
+    let insert_form = hiker_core::wikilink::shortest_unambiguous(paths, rel);
+    RankCandidate {
+        label: SmolStr::from(rel),
+        basename: Some(SmolStr::from(basename)),
+        item: CompletionItem {
+            label: SmolStr::from(basename),
+            detail: Some(SmolStr::from(rel)),
+            insert: SmolStr::from(format!("{insert_form}{suffix}")),
+            replace_range: Some(query_start..replace_end),
+            kind: CompletionKind::Wikilink,
+        },
     }
 }
 
@@ -148,7 +161,7 @@ fn close_fixup(after: &str) -> (usize, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{close_fixup, wikilink_query_start};
+    use super::{close_fixup, wikilink_candidate, wikilink_query_start};
 
     #[test]
     fn close_fixup_swallows_autopaired_close() {
@@ -194,32 +207,24 @@ mod tests {
         let doc = "[[foo\nbar";
         assert_eq!(wikilink_query_start(doc, doc.len()), None);
     }
-}
 
-impl WikilinkSource {
-    fn score_basename(&self, name: &str, needle: &str) -> i32 {
-    if needle.is_empty() {
-        return 1;
+    #[test]
+    fn candidate_insert_carries_suffix_and_unique_basename() {
+        // Unique basename → bare form; suffix appended for the unclosed case.
+        let paths = vec!["notes/architecture.md".to_string()];
+        let cand = wikilink_candidate(&paths[0], &paths, "]]", 2, 2);
+        assert_eq!(cand.item.insert.as_str(), "architecture]]");
+        assert_eq!(cand.item.label.as_str(), "architecture");
+        assert_eq!(cand.item.replace_range, Some(2..2));
     }
-    if name == needle {
-        return 1000;
-    }
-    if name.starts_with(needle) {
-        return 500;
-    }
-    if name.contains(needle) {
-        return 200;
-    }
-    // Subsequence match (each needle char appears in order in name).
-    let mut ni = needle.bytes();
-    let mut next = ni.next();
-    for b in name.bytes() {
-        if let Some(c) = next {
-            if c == b {
-                next = ni.next();
-            }
-        }
-    }
-    if next.is_none() { 50 } else { 0 }
+
+    #[test]
+    fn candidate_disambiguates_colliding_basenames() {
+        // Two `index.md` collide → shortest-unambiguous extends the prefix.
+        let paths = vec!["a/index.md".to_string(), "b/index.md".to_string()];
+        let a = wikilink_candidate(&paths[0], &paths, "", 0, 0);
+        let b = wikilink_candidate(&paths[1], &paths, "", 0, 0);
+        assert_eq!(a.item.insert.as_str(), "a/index");
+        assert_eq!(b.item.insert.as_str(), "b/index");
     }
 }

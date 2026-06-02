@@ -16,15 +16,21 @@
 //! `result_card`) live here and are imported by `crate::related`, which
 //! renders the same card row for vector-similar notes.
 
+use std::sync::{Arc, Mutex};
+
 use eframe::egui;
 
+use hiker_core::embed::Embedder;
 use hiker_core::search::Modes;
+use hiker_core::store::Store;
+use hiker_core::vault::Vault;
 
 use crate::editor_pane;
 use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::panels::zim;
 use crate::search::state::{OrderBy, State};
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 pub mod state;
 
@@ -54,6 +60,9 @@ struct SearchSidebar;
 
 impl SidebarSurface for SearchSidebar {
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+        // Apply any background-query results that landed since last frame
+        // (`search-query-embed-spawn-blocking`) before drawing, so the freshest hits show.
+        drain_results(ctx.state.downcast_mut::<State>().expect("search state"));
         // The workbench accordion owns the section header + collapse;
         // the body is the search input followed by the result list.
         // [feature-panel-single-accordion]
@@ -77,6 +86,17 @@ pub struct DiscoveryHit {
     /// Index of the matched chunk in the note. Drives the click-to-chunk
     /// navigation per `search-result-click-opens-chunk`.
     pub chunk_index: u32,
+}
+
+/// The finished product of one background query, sent from the
+/// `spawn_blocking` task back to the panel (`search-query-embed-spawn-blocking`). `epoch` is
+/// the `query_epoch` the query was fired at, so the panel can drop outcomes
+/// that newer typing has already superseded.
+pub struct SearchOutcome {
+    pub epoch: u64,
+    pub results: Vec<DiscoveryHit>,
+    pub zim_results: Vec<zim::TitleHit>,
+    pub zim_fulltext_results: Vec<zim::FullTextHit>,
 }
 
 /// Persist a search-related setting through `core::config::Config::set`
@@ -294,7 +314,17 @@ fn search_input_and_run(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         run = true;
     }
     if run {
-        fire_query(ctx);
+        fire_query(ctx, ui.ctx());
+    }
+    // While a background query is in flight, show a small spinner + hint. The
+    // spinner self-animates (egui repaints each frame it's shown), which also
+    // keeps `drain_results` polling until the outcome lands. Previous results
+    // stay visible underneath so the list doesn't flash empty mid-type.
+    if ctx.state.downcast_ref::<State>().expect("search state").in_flight {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(egui::RichText::new("Searching…").small().color(theme::muted()));
+        });
     }
 }
 
@@ -440,20 +470,112 @@ fn honour_debounce(ui: &egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
     }
 }
 
-/// Fire the current query: bump the epoch, record it as last-fired, run
-/// the index query, and stash the results back on state (clearing the row
-/// selection so the next ↓ press lands fresh).
-fn fire_query(ctx: &mut Ctx<'_>) {
-    let q = ctx.state.downcast_ref::<State>().expect("search state").query.clone();
-    {
+/// Fire the current query off the UI thread (`search-query-embed-spawn-blocking`): bump the
+/// epoch, snapshot the query + params, and hand the work to a `spawn_blocking`
+/// task. The task embeds the query, runs the index + federated-ZIM searches,
+/// and ships a [`SearchOutcome`] back over the result channel; [`drain_results`]
+/// applies it on a later frame. The UI never blocks on the query (embedding is
+/// the slow part), so typing stays smooth.
+///
+/// Outside a Tokio runtime (tests / headless) the work runs inline; the result
+/// still flows through the channel and is drained on the next `render`.
+fn fire_query(ctx: &mut Ctx<'_>, egui_ctx: &egui::Context) {
+    let (q, epoch, params, tx) = {
         let st = ctx.state.downcast_mut::<State>().expect("search state");
         st.query_epoch = st.query_epoch.wrapping_add(1);
-        st.last_fired_query = q.clone();
+        st.last_fired_query = st.query.clone();
+        st.in_flight = true;
+        (
+            st.query.clone(),
+            st.query_epoch,
+            QueryParams::from_state(st),
+            st.result_tx.clone(),
+        )
+    };
+
+    // Clone the `Send` handles the query needs so it can run on another thread.
+    // Embedding only happens in semantic mode, so skip grabbing the embedder
+    // otherwise.
+    let read_store = Arc::clone(&ctx.services.read_store);
+    let embedder = if params.semantic_on {
+        ctx.services.indexer.embedder()
+    } else {
+        None
+    };
+    let vault = Arc::clone(ctx.vault);
+    let egui_ctx = egui_ctx.clone();
+
+    let job = move || {
+        let outcome = compute_outcome(epoch, &read_store, embedder.as_deref(), &vault, &params, &q);
+        // A send error means the panel (and its receiver) is gone — drop it.
+        if tx.send(outcome).is_ok() {
+            // Wake the UI so the next frame drains the result.
+            egui_ctx.request_repaint();
+        }
+    };
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(job);
+        }
+        Err(_) => job(),
     }
-    let results = run_query(ctx, &q);
-    let st = ctx.state.downcast_mut::<State>().expect("search state");
-    st.results = results;
-    st.selected_row = None;
+}
+
+/// Run the full query (index + federated ZIM) and package it as a
+/// [`SearchOutcome`] tagged with `epoch`. Pure of any UI/`Ctx` state so it can
+/// run on a background `spawn_blocking` task.
+fn compute_outcome(
+    epoch: u64,
+    read_store: &Mutex<Store>,
+    embedder: Option<&dyn Embedder>,
+    vault: &Vault,
+    params: &QueryParams,
+    q: &str,
+) -> SearchOutcome {
+    let results = run_query(read_store, embedder, vault, params, q);
+    // Federated ZIM search over the vault's `.zim` archives (now against the
+    // global, thread-safe registry). Two complementary paths:
+    //   * title-prefix (instant binary search), bounded per archive;
+    //   * full-text body search (BM25 over the embedded Xapian index),
+    //     bounded per archive — matches words in article bodies, not titles.
+    // Both no-op on an empty query / archives that lack the relevant index.
+    let (zim_results, zim_fulltext_results) = if q.trim().is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            zim::federated_search(vault.root(), q, 20),
+            zim::federated_fulltext_search(vault.root(), q, 10),
+        )
+    };
+    SearchOutcome {
+        epoch,
+        results,
+        zim_results,
+        zim_fulltext_results,
+    }
+}
+
+/// Drain finished background queries, applying the one matching the current
+/// `query_epoch` (the latest) and dropping any the user's newer typing has
+/// already superseded (`search-query-embed-spawn-blocking`). Clears the row selection so the
+/// next ↓ press lands fresh.
+fn drain_results(st: &mut State) {
+    let mut latest: Option<SearchOutcome> = None;
+    if let Ok(rx) = st.result_rx.lock() {
+        while let Ok(outcome) = rx.try_recv() {
+            if outcome.epoch == st.query_epoch {
+                latest = Some(outcome);
+            }
+        }
+    }
+    if let Some(outcome) = latest {
+        st.results = outcome.results;
+        st.zim_results = outcome.zim_results;
+        st.zim_fulltext_results = outcome.zim_fulltext_results;
+        st.selected_row = None;
+        st.in_flight = false;
+    }
 }
 
 /// Render the Results section: the grouped hit list and the Open / Copy /
@@ -494,13 +616,74 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     if let Some(rel) = reveal {
         ctx.defer(move |app| reveal_in_files(app, &rel));
     }
-    if results.is_empty() {
+    let zim_empty = render_zim_results(ui, ctx);
+    if results.is_empty() && zim_empty {
         ui.label(
             egui::RichText::new("(no matches)")
                 .color(theme::muted())
                 .small(),
         );
     }
+}
+
+/// Render the federated ZIM hit group(s): per archive, a title-prefix section
+/// ("<archive>  ·  ZIM") and a full-text body section ("<archive>  ·
+/// full-text"), each row a clickable title that opens the ZIM viewer at that
+/// article. Returns `true` when there were no ZIM hits of either kind (so the
+/// caller can decide whether to show "(no matches)").
+fn render_zim_results(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) -> bool {
+    let st = ctx.state.downcast_ref::<State>().expect("search state");
+    if st.zim_results.is_empty() && st.zim_fulltext_results.is_empty() {
+        return true;
+    }
+    // (title, zim_path, article_url) rows, grouped under a section header.
+    type Row = (String, String, String);
+    let mut order: Vec<String> = Vec::new();
+    let mut by_section: std::collections::HashMap<String, Vec<Row>> =
+        std::collections::HashMap::new();
+    let mut push = |header: String, row: Row,
+                    order: &mut Vec<String>,
+                    by: &mut std::collections::HashMap<String, Vec<Row>>| {
+        if !by.contains_key(&header) {
+            order.push(header.clone());
+        }
+        by.entry(header).or_default().push(row);
+    };
+    // Title-prefix sections first, then full-text — keeps the instant matches
+    // on top and the body matches clearly distinguished below.
+    for hit in &st.zim_results {
+        push(
+            format!("{}  ·  ZIM", hit.archive_label),
+            (hit.title.clone(), hit.zim_path.clone(), hit.article_url.clone()),
+            &mut order,
+            &mut by_section,
+        );
+    }
+    for hit in &st.zim_fulltext_results {
+        push(
+            format!("{}  ·  full-text", hit.archive_label),
+            (hit.title.clone(), hit.zim_path.clone(), hit.article_url.clone()),
+            &mut order,
+            &mut by_section,
+        );
+    }
+    let mut to_open: Option<(String, String)> = None;
+    ui.add_space(6.0);
+    for header in &order {
+        ui.label(
+            egui::RichText::new(header).strong().small().color(theme::muted()),
+        );
+        for (title, zim_path, url) in &by_section[header] {
+            if ui.add(egui::Button::selectable(false, title)).clicked() {
+                to_open = Some((zim_path.clone(), url.clone()));
+            }
+        }
+        ui.add_space(4.0);
+    }
+    if let Some((zim_path, url)) = to_open {
+        ctx.defer(move |app| zim::open_at_article(app, &zim_path, &url));
+    }
+    false
 }
 
 /// Group hits by note (`search-result-grouped-by-note`): the first chunk
@@ -613,6 +796,7 @@ fn reveal_in_files(app: &mut AppState, rel: &str) {
 /// Immutable snapshot of the query-affecting state slice, cloned out
 /// before the index query so the read borrow on `ctx.state` is released
 /// while the query runs against `ctx.services`/`ctx.vault`.
+#[derive(Clone)]
 struct QueryParams {
     lexical_on: bool,
     semantic_on: bool,
@@ -641,20 +825,26 @@ impl QueryParams {
 /// toggles + tuning), falling back to a filename grep when the store is
 /// unavailable, errors, or returns nothing. Reads the index via
 /// `ctx.services` and the vault via `ctx.vault`.
-fn run_query(ctx: &mut Ctx<'_>, q: &str) -> Vec<DiscoveryHit> {
+fn run_query(
+    read_store: &Mutex<Store>,
+    embedder: Option<&dyn Embedder>,
+    vault: &Vault,
+    params: &QueryParams,
+    q: &str,
+) -> Vec<DiscoveryHit> {
     if q.is_empty() {
         return Vec::new();
     }
-    let params = QueryParams::from_state(ctx.state.downcast_ref::<State>().expect("search state"));
 
     // Each mode honours the user's toggle; semantic additionally requires
-    // the embedder to be loaded.
+    // the embedder to be loaded. The embed call (ONNX inference) is the
+    // slow part — it runs here on the background task, never the UI thread.
     let mut modes = Modes {
         lexical: params.lexical_on,
         semantic: false,
     };
     let embedding = if params.semantic_on
-        && let Some(emb) = ctx.services.indexer.embedder()
+        && let Some(emb) = embedder
     {
         modes.semantic = true;
         emb.embed_batch(&[q.to_string()]).ok().and_then(|mut v| v.pop())
@@ -675,9 +865,9 @@ fn run_query(ctx: &mut Ctx<'_>, q: &str) -> Vec<DiscoveryHit> {
         sem_opts.top_k = limit;
     }
 
-    let store = match ctx.services.read_store.lock() {
+    let store = match read_store.lock() {
         Ok(s) => s,
-        Err(_) => return apply_post_filters(ctx.vault, &params, filename_search(ctx.vault, q)),
+        Err(_) => return apply_post_filters(vault, params, filename_search(vault, q)),
     };
     let resp = hiker_core::search::query(
         &store,
@@ -693,7 +883,7 @@ fn run_query(ctx: &mut Ctx<'_>, q: &str) -> Vec<DiscoveryHit> {
         Err(err) => {
             drop(store);
             tracing::warn!(error = %err, "search failed; falling back to filename grep");
-            return filename_search(ctx.vault, q);
+            return filename_search(vault, q);
         }
     };
 
@@ -726,9 +916,9 @@ fn run_query(ctx: &mut Ctx<'_>, q: &str) -> Vec<DiscoveryHit> {
     }
     drop(store);
     if out.is_empty() {
-        return apply_post_filters(ctx.vault, &params, filename_search(ctx.vault, q));
+        return apply_post_filters(vault, params, filename_search(vault, q));
     }
-    apply_post_filters(ctx.vault, &params, out)
+    apply_post_filters(vault, params, out)
 }
 
 /// Apply source-types filter, order-by sort, and the global limit cap.

@@ -12,7 +12,7 @@ use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole};
 use crate::state::AppState;
 use crate::tab::{BufferSource, TabKind};
-use crate::theme;
+use hiker_theme as theme;
 
 /// The active-context label prepended to a chat message so the agent knows
 /// what the user is looking at: an editable vault note, or a board. Returns
@@ -64,7 +64,8 @@ pub fn show(
 pub fn show_tab(ui: &mut egui::Ui, app: &mut AppState, session_id: &str) {
     if !app.chat_state.discovered {
         let vault_root = app.vault_session.vault_root.clone();
-        session::discover(&mut app.chat_state.registry, &vault_root);
+        let chats_dir = session::chats_dir(&app.vault_session.config);
+        session::discover(&mut app.chat_state.registry, &vault_root, &chats_dir);
         app.chat_state.discovered = true;
     }
     let id = if session_id.is_empty() { None } else { Some(session_id) };
@@ -230,9 +231,11 @@ impl Chat<'_> {
             .read()
             .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
             .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+        let chats_dir = session::chats_dir(&app.vault_session.config);
         if let Err(err) = session::create_new(
             &mut app.chat_state.registry,
             &vault_root,
+            &chats_dir,
             &model,
             &provider,
         ) {
@@ -241,7 +244,10 @@ impl Chat<'_> {
     }
     if let Some(id) = delete {
         let vault_root = app.vault_session.vault_root.clone();
-        if let Err(err) = session::delete(&mut app.chat_state.registry, &vault_root, &id) {
+        let chats_dir = session::chats_dir(&app.vault_session.config);
+        if let Err(err) =
+            session::delete(&mut app.chat_state.registry, &vault_root, &chats_dir, &id)
+        {
             tracing::warn!(error = %err, "chat: delete failed");
         }
     }
@@ -1142,62 +1148,36 @@ impl AtMentionScan for str {
     }
 }
 
-/// Walk the vault root for `.md` paths whose basename (or full path)
-/// matches `query` case-insensitively, returning up to `cap` results.
-/// Cheap O(n) scan — good enough for the default vault size; future
-/// work routes this through the indexer's lexical engine.
+/// Vault paths matching `query`, ranked by the shared autocomplete core
+/// (`autocomplete-mention`): the same prefix/subsequence/basename-aware
+/// ranking the wikilink completion and standalone pickers use, so `@`
+/// suggestions stop being a bespoke `contains` scan. Returns up to `cap`
+/// relative paths (the popup builds `@<path>` from each). The `@`-token
+/// trigger scan ([`AtMentionScan`]) stays chat-specific; only the ranking
+/// is shared. Notes-and-sources scope so a mention can reference any
+/// indexed file, matching the previous `md`/`txt` behavior.
 pub(crate) fn mention_suggestions(
-    services: &crate::state::Services,
-    vault: &hiker_core::vault::Vault,
+    vault: std::sync::Arc<hiker_core::vault::Vault>,
     query: &str,
     cap: usize,
 ) -> Vec<String> {
-    let q = query.to_lowercase();
-    let mut out: Vec<String> = Vec::new();
-    // Prefer the indexer's path list when it's online — no disk walk.
-    if let Ok(store) = services.read_store.lock()
-        && let Ok(rows) = store.all_note_paths()
-    {
-        for rel in rows {
-            if q.is_empty() || rel.to_lowercase().contains(&q) {
-                out.push(rel);
-                if out.len() >= cap {
-                    return out;
-                }
-            }
-        }
-        return out;
-    }
-    // Fallback: vault walk. Same shape as before, kept for the
-    // unindexed-vault case.
-    let root = vault.root();
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
+    use editor_view::autocomplete::CandidateSource;
+    let source = crate::autocomplete::vault_source::VaultSource::new(
+        vault,
+        crate::autocomplete::vault_source::Scope::NotesAndSources,
+    );
+    source
+        .candidates(query, cap)
         .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !matches!(ext.to_ascii_lowercase().as_str(), "md" | "txt") {
-            continue;
-        }
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if q.is_empty() || rel_str.to_lowercase().contains(&q) {
-            out.push(rel_str);
-            if out.len() >= cap {
-                break;
-            }
-        }
-    }
-    out
+        // `VaultSource` puts the relative path in `detail`; fall back to
+        // `insert` (also the rel path) so a mention always carries the full
+        // path the composer references.
+        .map(|item| {
+            item.detail
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| item.insert.to_string())
+        })
+        .collect()
 }
 
 impl Chat<'_> {
@@ -1359,8 +1339,7 @@ fn composer(
         let mention_state = draft.active_at_mention();
         if let Some((_, ref query)) = mention_state {
             let has_any = !mention_suggestions(
-                &app.vault_session.services,
-                &app.vault_session.vault,
+                app.vault_session.vault.clone(),
                 query,
                 1,
             )
@@ -1380,8 +1359,7 @@ fn composer(
 
         if let Some((prefix_start, query)) = mention_state {
             let suggestions = mention_suggestions(
-                &app.vault_session.services,
-                &app.vault_session.vault,
+                app.vault_session.vault.clone(),
                 &query,
                 8,
             );

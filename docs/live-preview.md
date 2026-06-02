@@ -19,7 +19,7 @@ Live preview can mean very different things; pinning the v1 scope explicitly so 
 
 **Tier 2 (deferred):** block widgets — render HRs as actual rules, checkboxes as toggles, tables as styled tables, callouts as colored gutters. Doable on top of Tier 1's decoration plumbing without rewriting it.
 
-**Tier 3 (deferred):** media widgets — inline images, KaTeX-rendered math, embeds, transclusions, drag-to-resize. This is the inline-widget layer left for later in the editor's decoration pipeline (see `editor.md`). Much larger surface (image fetching, math runtime, alt-text fallback, security model for inline HTML); deliberately separated from live preview proper.
+**Tier 3 (`editor-widgets.md`):** media widgets — rendered LaTeX math, Mermaid diagrams, tables, and inline images, drawn in place of their source via `BlockWidget` / `InlineWidget` decorations. The rendered-widget layer over this Tier-1 plumbing; much larger surface (renderers, SVG→texture, alt-text fallback, security model for remote images), so it owns its own spec rather than living here.
 
 The split is doc-level too — Tiers 2 and 3 land as their own specs when they're built.
 
@@ -58,7 +58,7 @@ These markers fade when their line lacks the cursor and the line lacks selection
 ## Block elements
 
 - **Headings.** `#`, `##`, ... markers fade on lines without the cursor. Heading text always renders at the appropriate size and weight; the fade is just the marker itself plus the trailing space. ATX (`# heading`) is the only form supported in v1; setext-style underlined headings (`===` / `---`) keep their underline visible (they're a marker spread across two lines and per-line reveal logic gets weird). [live-preview-heading-style-fade-marker]
-- **Code fences (` ``` `).** Per-block reveal, not per-line: when the cursor is anywhere *inside the fenced block* (between the opening and closing ` ``` ` lines, inclusive), the fences reveal. Outside, they fade and the block renders with a monospace background. Per-line would have shown a fence-line on top of an "indented" block which looks broken; per-block reads cleanly. Code-block content stays the literal source — language-specific syntax highlighting inside fenced blocks is a separate feature, not part of live preview. [live-preview-code-fence-block-reveal]
+- **Code fences (` ``` `).** Per-block reveal, not per-line: when the cursor is anywhere *inside the fenced block* (between the opening and closing ` ``` ` lines, inclusive) **or a selection overlaps the block**, the fences reveal. Outside, they fade and the block renders with a monospace background. Per-line would have shown a fence-line on top of an "indented" block which looks broken; per-block reads cleanly. The selection-overlap path is the per-block form of `live-preview-selection-reveal-all`: highlighting a fenced block (including a rendered Mermaid/WaveDrom widget's source, whose caret head can land past the closing fence) keeps the ` ``` ` delimiters visible — `style_fenced_code_block` keys its reveal on cursor-line OR selection-overlap, so the styling layer doesn't half-reveal a block the widget layer already expanded. Code-block content stays the literal source — language-specific syntax highlighting inside fenced blocks is a separate feature, not part of live preview. [live-preview-code-fence-block-reveal]
 - **Blockquotes (`>`).** The `>` marker is *always* visible. It's a useful structural cue and fading it (turning quoted text into bare-but-italic prose) is more disorienting than helpful. The text after the marker can pick up subtle styling (muted color, italic) but the marker itself stays. [live-preview-block-markers-keep]
 - **Lists.** Bullets (`-`/`*`/`+`) and numbered prefixes (`1.`, `2.`) are *always* visible. Same reasoning as blockquotes — they're structural, not decorative. v1 does not prettify bullets to `•` glyphs; the literal marker is what shows. [live-preview-block-markers-keep]
 - **Horizontal rules (`---`).** v1 leaves them as literal text on a styled line (subtle muted color). Tier 2 will replace them with an actual rule decoration.
@@ -86,7 +86,7 @@ The providers live in the `editor-md` crate (e.g. `editor/editor-md/src/styling.
 ## Deferred
 
 - **Tier 2 — block widgets.** Real `<hr>`, real checkbox toggles, real styled tables, callout gutters. Builds on Tier 1's decoration plumbing.
-- **Tier 3 — media widgets.** Inline images, KaTeX math, embeds/transclusions, drag-to-resize. Left for later in the editor's decoration pipeline (see `editor.md`); gets its own spec when built.
+- **Tier 3 — media widgets.** Rendered LaTeX math, Mermaid diagrams, tables, inline images, drag-to-resize. Specced in `editor-widgets.md`.
 - **Setext-style heading marker fade.** Skipped in v1 because per-line reveal misbehaves on multi-line markers; revisit if real content uses them.
 - **Bullet-glyph prettification** (`-` → `•`). Out of v1 to keep "what you typed" visually present. Easy to add later as a styling-only change.
 - **Per-vault / per-user persistence of the toggle.** Lands with `settings.md`'s editor section.

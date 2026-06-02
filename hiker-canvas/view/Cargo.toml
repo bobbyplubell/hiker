@@ -1,0 +1,21 @@
+[package]
+name = "canvas-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = { workspace = true }
+# The egui-free view + interaction layer (camera / edges / handles / hit-testing
+# / gesture state / undo). This crate is the thin egui shell over it: painter,
+# widget, pointer plumbing, and the `NodeContentRenderer` content seam.
+canvas-view-core = { workspace = true }
+# The egui-agnostic JSON Canvas core (document model + `EditOp`s reported back to
+# the host). This crate does NOT depend on any content engine (editor-egui /
+# hiker-htmlview): node content is painted by a host-supplied trait so it stays
+# engine-free.
+hiker-canvas = { workspace = true }

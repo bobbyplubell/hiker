@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::cluster::algo::{cosine_similarity, l2_normalize, partition, partition_leiden};
 use crate::cluster::build::stream::build_tree_structural_streaming;
-use crate::cluster::build::{persist, tree};
+use crate::cluster::build::tree;
 use crate::cluster::tree::place_beam_descent;
 use crate::cluster::{
     detect_reading_order_chain, plan_sample_merge, Algorithm, Assignment, BuildError, BuildEvent,
@@ -290,44 +290,6 @@ fn build_tree_from_folders_one_cluster_per_folder() {
     for n in &result.tree.levels[0] {
         assert!(n.confidence >= 1.0, "FromFolders nodes carry confidence 1.0");
     }
-}
-
-#[test]
-fn build_and_persist_writes_rows() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let trees = crate::trees::types::Db::new(
-        std::sync::Arc::new(crate::oplog::OpLog::open(dir.path()).unwrap()),
-        std::sync::Arc::new(crate::vault::Vault::open(dir.path()).unwrap()),
-    )
-    .unwrap();
-    let mut notes: Vec<NoteInput> = Vec::new();
-    for i in 0..6 {
-        notes.push(mk_note(&format!("a{i}"), "research", 0.0 + (i as f32) * 0.001));
-    }
-    for i in 0..6 {
-        notes.push(mk_note(&format!("b{i}"), "cooking", 10.0 + (i as f32) * 0.001));
-    }
-    let params = Params {
-        min_cluster_size: 3,
-        disable_recursion: true,
-        ..Default::default()
-    };
-    let summarizer = MockSummarizer;
-    let tree_id = persist(
-        &trees,
-        "test build",
-        "one-shot",
-        &BuildScope::Vault { source_types: Vec::new() },
-        &BuildMethod::Cluster { params },
-        &notes,
-        &summarizer,
-    )
-    .unwrap();
-    let row = trees.get_tree(&tree_id).unwrap().unwrap();
-    assert_eq!(row.state, "draft");
-    let nodes = trees.list_nodes(&tree_id).unwrap();
-    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::types::NodeKind::Cluster)));
-    assert!(nodes.iter().any(|n| matches!(n.kind, crate::trees::types::NodeKind::Leaf)));
 }
 
 #[test]

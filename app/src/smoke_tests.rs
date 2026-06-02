@@ -171,6 +171,81 @@ fn close_tab_with_dirty_guard_dirty_raises_modal() {
     );
 }
 
+/// `embedded-buffer-view-lifecycle`: a vault buffer with unsaved work survives
+/// its tab closing (a non-tab host — e.g. a canvas card — may still be editing
+/// the shared `Editor`; autosave will commit it). A clean tabless buffer is
+/// dropped. Pins the eviction rule in `editor_pane::close_tab`.
+#[test]
+fn dirty_buffer_survives_tab_close_clean_one_is_dropped() {
+    let (mut state, _rt) = open_temp_vault();
+    std::fs::write(state.vault_session.vault_root.join("dirty.md"), "hello\n").unwrap();
+    std::fs::write(state.vault_session.vault_root.join("clean.md"), "world\n").unwrap();
+
+    // Dirty buffer: open it, then mutate its text without advancing the loaded
+    // hash so `is_dirty()` is true.
+    crate::editor_pane::open_file(&mut state, "dirty.md", /* sticky */ true);
+    if let Some(buf) = state.session.buffers.get_mut("dirty.md") {
+        let h = buf.loaded_hash.clone();
+        buf.replace_text("hello world\n".to_string(), h);
+    }
+    assert!(
+        state.session.buffers.get("dirty.md").is_some_and(crate::buffer::Buffer::is_dirty),
+        "dirty buffer is dirty before close",
+    );
+    let dirty_tab = state
+        .session
+        .tabs
+        .iter()
+        .find(|t| t.kind.vault_path() == Some("dirty.md"))
+        .map(|t| t.id)
+        .expect("dirty tab open");
+    crate::editor_pane::close_tab(&mut state, dirty_tab);
+    assert!(
+        state.session.buffers.contains_key("dirty.md"),
+        "a dirty buffer with no tab is retained (a non-tab host may be editing it)",
+    );
+
+    // Clean buffer: open and close with no edits — it has no tab and no unsaved
+    // work, so it's evicted on tab close.
+    crate::editor_pane::open_file(&mut state, "clean.md", /* sticky */ true);
+    assert!(state.session.buffers.contains_key("clean.md"), "clean buffer loaded");
+    let clean_tab = state
+        .session
+        .tabs
+        .iter()
+        .find(|t| t.kind.vault_path() == Some("clean.md"))
+        .map(|t| t.id)
+        .expect("clean tab open");
+    crate::editor_pane::close_tab(&mut state, clean_tab);
+    assert!(
+        !state.session.buffers.contains_key("clean.md"),
+        "a clean tabless buffer is dropped on close",
+    );
+}
+
+#[test]
+fn open_file_routes_canvas_to_canvas_view_not_a_text_buffer() {
+    // Regression: back/forward nav (and any `open_file` caller) must open a
+    // `.canvas` in the spatial canvas view, not as a raw-JSON text buffer.
+    // status: canvas-nav-stack
+    let (mut state, _rt) = open_temp_vault();
+    std::fs::write(state.vault_session.vault_root.join("board.canvas"), "{\"nodes\":[],\"edges\":[]}\n").unwrap();
+
+    crate::editor_pane::open_file(&mut state, "board.canvas", /* sticky */ true);
+
+    let active = state.session.active_tab.expect("a tab is active");
+    let kind = &state.session.tabs.iter().find(|t| t.id == active).expect("active tab exists").kind;
+    assert!(
+        matches!(kind, crate::tab::TabKind::Canvas { path } if path == "board.canvas"),
+        "open_file on a .canvas must land on a Canvas tab, got {kind:?}",
+    );
+    // It must NOT have created a text buffer for the canvas JSON.
+    assert!(
+        !state.session.buffers.contains_key("board.canvas"),
+        "a .canvas open must not load a text buffer of its JSON",
+    );
+}
+
 /// Build a real `AppState` over a tempdir vault containing a single note, with
 /// MCP + LLM disabled. Leaks the tempdir (the OS reaps it) and returns the
 /// runtime so its background services stay alive for the test's lifetime.
@@ -341,4 +416,80 @@ fn returning_to_live_from_a_snapshot_loads_the_buffer() {
         state.session.buffers.contains_key("note.md"),
         "the live buffer was (re)loaded, not left blank",
     );
+}
+
+/// `new_crawl` creates a `mode: crawl` capture-spec note, opens a Capture tab
+/// over it, and the form renders for a few frames without panicking. Pins the
+/// crawl-job-form entry point + frontmatter creation (`crawl-job-form`).
+#[test]
+fn new_crawl_creates_note_and_renders_form() {
+    let (mut state, runtime) = open_temp_vault();
+    let _guard = runtime.enter();
+
+    state.new_crawl();
+    // A Capture tab is active over the freshly created note.
+    let (tab_id, note_path) = state
+        .session
+        .active_tab
+        .and_then(|id| state.tab_by_id(id))
+        .and_then(|t| match &t.kind {
+            crate::tab::TabKind::Capture { note_path } => Some((t.id, note_path.clone())),
+            _ => None,
+        })
+        .expect("active tab is a Capture tab");
+    assert!(note_path.ends_with(".md"), "capture note has a path");
+
+    // The note on disk parses as a `mode: crawl` capture with fill_body: false.
+    let (content, _h) = state.vault_session.vault.read_file_with_hash(&note_path).unwrap();
+    let fm = hiker_core::frontmatter::split(&content).frontmatter.expect("frontmatter");
+    let spec = hiker_extract::capture::Spec::from_frontmatter(&fm).expect("capture note");
+    assert_eq!(spec.mode, hiker_extract::capture::Mode::Crawl);
+    assert!(!spec.fill_body, "crawl body stays user-owned");
+
+    // Render the form for a few frames.
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build(|ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::panels::capture::show(ui, &mut state, tab_id, &note_path, &runtime);
+            });
+        });
+    for _ in 0..3 {
+        harness.run();
+    }
+}
+
+/// `new_feed` creates a `mode: feed` capture note and the subscription form
+/// renders cleanly. Pins the RSS subscription GUI entry point.
+#[test]
+fn new_feed_creates_note_and_renders_form() {
+    let (mut state, runtime) = open_temp_vault();
+    let _guard = runtime.enter();
+
+    state.new_feed();
+    let (tab_id, note_path) = state
+        .session
+        .active_tab
+        .and_then(|id| state.tab_by_id(id))
+        .and_then(|t| match &t.kind {
+            crate::tab::TabKind::Capture { note_path } => Some((t.id, note_path.clone())),
+            _ => None,
+        })
+        .expect("active tab is a Capture tab");
+
+    let (content, _h) = state.vault_session.vault.read_file_with_hash(&note_path).unwrap();
+    let fm = hiker_core::frontmatter::split(&content).frontmatter.unwrap();
+    let spec = hiker_extract::capture::Spec::from_frontmatter(&fm).unwrap();
+    assert_eq!(spec.mode, hiker_extract::capture::Mode::Feed);
+
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build(|ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::panels::capture::show(ui, &mut state, tab_id, &note_path, &runtime);
+            });
+        });
+    for _ in 0..3 {
+        harness.run();
+    }
 }

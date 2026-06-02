@@ -108,15 +108,19 @@ Storage modes (each row maps unambiguously to one combination of source-location
 | --------------- | ----------- | ---------- | ------------------ | ------------------------------------------------- | --------------------------------------------- |
 | Vault-internal  | markdown    | no         | (none)             | the file itself is the note                       | the file's own contents                       |
 | Vault-internal  | non-md      | no         | `sidecar`          | next to source as `<full-source-filename>.md`     | extracted text (cached)                       |
-| External        | markdown    | no         | `external-pointer` | `.hiker/external/<id>--slug.md`                   | annotations only; original re-read on refresh |
-| External        | non-md      | no         | `external-cached`  | `.hiker/external/<id>--slug.md`                   | extracted text (cached)                       |
+| URL capture     | web/feed    | no         | `capture`          | a visible capture note in the vault (`clips/`, a crawl/feed companion folder) | extracted text; see `extract.md` `capture-spec-note` |
+| External (file) | markdown    | no         | `external-pointer` | `.hiker/external/<id>--slug.md`                   | annotations only; original re-read on refresh |
+| External (file) | non-md      | no         | `external-cached`  | `.hiker/external/<id>--slug.md`                   | extracted text (cached)                       |
 | Either          | any         | yes        | `versioned`        | sidecar note (op-log history) + `.hiker/refs/<id>/` retained artifacts | extracted text, versioned via the op-log; old artifacts kept per `extract-artifact-retention` |
 
 Notes:
 
 - Vault-internal markdown needs no source-derived note — the file is the note. All other rows produce a hiker note.
-- External-pointer is the only mode without a content cache; markdown is already plain text and cheap to re-read, so caching adds drift without benefit.
+- A captured **URL** (a one-off scrape, a crawled page, a feed entry) is a visible capture note, not a hidden cache file — `capture` mode in `extract.md`. The `external-cached` / `external-pointer` rows cover **external files on disk outside the vault** that hiker watches read-only, a distinct case from URL capture.
+- External-pointer is the only file mode without a content cache; markdown is already plain text and cheap to re-read, so caching adds drift without benefit.
 - Versioned mode is reached by opt-in (per-glob in vault config or per-source frontmatter); it supersedes sidecar / external-cached / external-pointer when active.
+
+**Subsystem notes are first-class visible files.** Any document a subsystem produces that carries a *user-authored body* — trail waypoints, chat sessions, captured pages — lives at a real vault path (a folder, a companion folder) and is an ordinary indexed note, surfaced cleanly in Vault mode by source-type/provenance grouping. `.hiker/` is reserved for non-note machinery only: regenerable caches (`index.db`, `doc-index.db`, `changes.db`), in-flight scratch (`autosave/`), deleted content (`trash/`), retained binary artifacts (`refs/`), external-file caches (`external/`), and config. This is why the watcher needs no per-subsystem carve-out of its `.hiker/` ignore — nothing indexable lives under `.hiker/`. [subsystem-notes-visible]
 
 Per-type extractors:
 
@@ -328,6 +332,7 @@ Single window, fixed layout:
 - `Changes` — unified activity / changes feed (replaces the prior `AgentChanges` tab). One filterable view over `core::activity::list` (a projection over the op log carrying both pending and accepted ops) with author / source / op filter chips. The legacy `:agent_changes` persist key maps forward to this tab.
 - `Agent { session_id }` — full-tab chat.
 - `Plugins` — manifest viewer for `<vault>/.hiker/plugins.json`. No host runtime — manifest edits only.
+- `ZimView { zim_path, article }` — offline `.zim` archive viewer with browser-style link nav (`zim.md`).
 
 Buffer tabs autosave per vault path; singleton page-kinds persist via a synthetic `:<kind>` key. `bootstrap::restore_tab_state` rehydrates both on vault open; payload-bearing previews (Trash/Snapshot/Staging) drop silently.
 

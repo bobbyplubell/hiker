@@ -129,20 +129,30 @@ Behavior on Cancel: the dropdown reverts to the previous value; no write occurs.
 
 The warning is only on the **settings UI** path. Hand-edits to the vault TOML don't surface a warning — strict-load picks up the new value on the *next launch*, the embedder loads at the new model id, and the re-embed runs. (Hot-reload is a UI-driven path only; the TOML hand-edit case is rare enough that "restart to apply" is acceptable, same posture as the rest of `settings-load-once-at-startup`.) Documented in the inline "Notes" comment of the auto-created TOML.
 
-### [extract] (deferred — lands when `core::extract` ships) [settings-section-extract]
+### [extract] [settings-section-extract]
 
-> **Deferred — not yet loaded.** There is no `ExtractConfig` field on the
-> strict-load `Config` struct (`core/src/config/mod.rs`), so a well-formed
-> `[extract]` table in a live vault's TOML currently aborts vault open with a
-> `HikerError::Config` ("unknown field") under `settings-strict-load`. The
-> schema below is the *planned* shape; it lands with the extract feature. Until
-> then, do not add an `[extract]` table to a vault TOML.
+Loaded: `ExtractConfig` is a field on the strict-load `Config` struct
+(`core/src/config/content_dirs.rs::ExtractConfig`, wired in
+`core/src/config/mod.rs`), so a well-formed `[extract]` table in a vault TOML
+is accepted. The extraction *work* lives in the decoupled `hiker-extract`
+crate (`extract-crate-decoupled`); `core` only loads this config so the
+strict-load `Config` recognizes the section.
 
 Extraction tunables (`extract.md`). Vault-level is the natural scope (which folders hold extractable sources is per-vault), with a user-level default fine for the common case.
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
 | `auto_globs` | array of strings | `[]` | Folders/globs whose non-md sources auto-extract on appear/change (`extract-trigger-auto-glob`). gitignore-style globs over vault-relative paths; replaces, doesn't concatenate, per the array-merge rule. Default empty = no auto-extraction; non-md elsewhere extracts only on the explicit "Make searchable" action (`extract-trigger-on-demand`) |
+| `clip_folder` | string | `"clips/"` | Destination folder for one-off URL captures (`scrape-cmd`); `hiker scrape --into` overrides per call |
+| `artifact_retention` | string | `"latest"` | Vault default for the binary-artifact retention cascade (`extract-artifact-retention`): `latest` / `keep:N` / `forever`; per-crawl/per-feed/per-source frontmatter overrides it |
+| `feed_default_poll` | string | `"6h"` | Default `poll_interval` for a new RSS/feed capture note when none is set (`rss-poll-schedule`); a feed may set its own |
+| `feed_item_retention` | string | `"keep:200"` | Vault default child-count bound for feeds (`rss-item-retention`): `keep:N` / `forever`; per-feed frontmatter overrides |
+
+### [chat] [settings-section-chat]
+
+| Key | Type | Default | Notes |
+| --- | ---- | ------- | ----- |
+| `chats_dir` | string | `"chats/"` | Visible folder holding native + imported chat-session notes (`chat-session-markdown-store`); imports land in its `imported/` subfolder |
 
 ### [inbox] [settings-section-inbox]
 

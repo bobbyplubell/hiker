@@ -46,7 +46,7 @@ impl AppState {
                     };
                     egui::Frame::default()
                         .fill(bg)
-                        .stroke(egui::Stroke::new(1.0, crate::theme::divider()))
+                        .stroke(egui::Stroke::new(1.0, hiker_theme::divider()))
                         .corner_radius(4.0)
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {

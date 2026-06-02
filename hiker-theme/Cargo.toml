@@ -1,0 +1,13 @@
+[package]
+name = "hiker-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Shared egui theme/style, extracted from `hiker-app` (status:
+# crawler-shared-theme). Depends ONLY on egui; consumed by both `hiker-app` and
+# `hiker-crawler` so the two match colors/fonts/spacing, not just layout.
+
+[dependencies]
+egui.workspace = true

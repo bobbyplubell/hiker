@@ -32,6 +32,18 @@ Multi-buffer / tabs deferred. When tabs land, the same per-buffer state moves in
 The editor widget exposes the change sets it applied from user input — the per-edit list of retain / delete / insert ops over byte ranges, the forward half of the editor binding (per `op-log-editor-binding`). The host drains this stream each frame and mirrors each change set into the document's CRDT `working` layer as `user` ops, so the editor stays the source of *what changed* rather than the host re-diffing the whole buffer to guess. Reverse-direction edits (an accepted/pending/external change applied back into the editor) carry a sync origin and are not re-emitted on `transactions_out`, so the binding can't echo. The seam is editor-crate-owned and host-agnostic — the same exposed transactions feed any consumer that needs a precise edit log, not just the op log. [editor-transactions-out]
 
 
+### Embedded buffer view (one note, many places)
+
+A reusable primitive for rendering an **editable** view of a vault note *anywhere* in the UI — not only in its dedicated buffer tab — so the same note can appear in two places at once (a canvas file-node card, a board's Markdown view, a split pane) and "typing on a note shows up wherever the note is." The model is **one shared editor, many views**: [embedded-buffer-view]
+
+- **Shared (one per path):** the note's `Editor` — document + selection/cursor + undo history — lives in the single `session.buffers[path]` buffer. There is never a second dirty copy of a note; loading a note that already has a dirty buffer just attaches to that buffer. Cursor and undo are shared across every view, because they live on the one `Editor`.
+- **Per-view (one per embedding site):** each host owns its own `ViewState` + `PaintCache` (scroll offset, content zoom, wrap, viewport, galley cache). So a 300px canvas card and a full-height tab of the same note scroll and zoom independently while showing the same text.
+- **Host-agnostic render call:** a single helper renders `session.buffers[path]`'s `Editor` through the editor widget against a caller-supplied `(ViewState, PaintCache)` at the caller's rect, drains `editor-transactions-out`, and runs the op-log editor binding (`op-log-editor-binding`) for that path. Because the binding runs from *whichever host drew the editor this frame*, edits reach `working` even when no buffer tab is open — so save / autosave / agent-review / dirty-tracking all work identically regardless of where the editing happened. (Only the focused view receives keystrokes in a frame, so the binding is driven by one host at a time; views render sequentially, never holding two `&mut Editor` borrows at once.)
+- **Lifecycle.** Buffer eviction is reference-counted across *all* hosts, not just tabs: a note kept open only by a canvas card (no tab) stays loaded, dirty-tracked, and autosaved until the last host releases it. The tab-only "drop when no tab references this path" rule generalizes to "drop when no tab **or embed** references it." [embedded-buffer-view-lifecycle]
+
+Consumers: the canvas inline editor (`canvas-inline-edit`), and — as they adopt it — the board Markdown view (`board-view-toggle`) and editor split panes, which today each load the buffer but render their own editor. The buffer tab panel is the reference renderer; the helper is the extracted, chrome-free core it and every embed share.
+
+
 ## Save UX
 
 Save action: commits the buffer's `working` layer (`commit_working`, per `op-log.md`'s "Disk write invariant"), which folds the user's uncommitted edits into `accepted` and materializes that to `currentPath`. On success, updates `loadedHash` to the new doc text, which clears `isDirty`. On error, surfaces a non-blocking error toast and leaves the dirty state alone (so the user can retry).
@@ -661,7 +673,7 @@ The editor state is created once at startup and reused across buffer switches; s
 
 - Live-preview decorations (syntax-marker hiding on cursor-out) — specced in `live-preview.md`
 - Wikilink rendering and autocomplete
-- Widget-based rendering (images, math, embeds, callouts)
+- Widget-based rendering (LaTeX math, Mermaid, tables, images) — specced in `editor-widgets.md`
 - Multi-buffer / tabs / split panes
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)

@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::editor_pane;
 use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::icons;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Per-feature UI state for the Trash sidebar. The panel is effectively
 /// stateless — the listing is read fresh from disk each frame — but the

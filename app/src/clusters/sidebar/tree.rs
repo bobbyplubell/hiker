@@ -27,7 +27,7 @@ use super::{push_toast, regenerate_names, summarize_subset, ClusterCtx};
 use crate::clusters::state::State;
 use crate::feature::Ctx;
 use crate::state::{Toast, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 /// Drag-and-drop payload — the node id being dragged.
 #[derive(Clone, Debug)]
@@ -709,6 +709,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     let mut summarize_ids: Option<Vec<String>> = None;
     let mut regenerate_clicked = false;
     let mut graph_clicked = false;
+    let mut export_style: Option<hiker_core::canvas::export::TreeCanvasStyle> = None;
     let trees = self.trees.clone();
     let Ctx { state, toasts, .. } = &mut *self.ctx;
     let state = state.downcast_mut::<State>().expect("clusters state");
@@ -820,6 +821,28 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         {
             graph_clicked = true;
         }
+        // status: canvas-export-tree-verb
+        ui.menu_button("Export to canvas", |ui| {
+            use hiker_core::canvas::export::TreeCanvasStyle;
+            if ui
+                .button("Grouped")
+                .on_hover_text("Nested group containers; hierarchy is spatial nesting")
+                .clicked()
+            {
+                export_style = Some(TreeCanvasStyle::Grouped);
+                ui.close();
+            }
+            if ui
+                .button("Force-directed")
+                .on_hover_text("Node-link graph relaxed into an organic cluster shape")
+                .clicked()
+            {
+                export_style = Some(TreeCanvasStyle::ForceDirected);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Snapshot this tree (in its current edited state) into a new .canvas");
         if ui
             .add(egui::Button::image_and_text(crate::icons::ICONS.image(crate::icons::Icon::Trash), "Discard tree").small())
             .on_hover_text("Delete this tree from the registry")
@@ -868,6 +891,15 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
                 || TabKind::ClusterGraph { tree_id: tid_for_build },
             );
         });
+    }
+    if let Some(style) = export_style {
+        // Snapshot the tree → a fresh `.canvas` and open it framed-to-fit.
+        // The export reads vault + oplog + the trees Db, so it needs full
+        // `&mut AppState`; defer past the narrow ctx borrow. status:
+        // canvas-export-tree-verb
+        let tid = tree_id.clone();
+        self.ctx
+            .defer(move |app| crate::clusters::export_tree_to_canvas(app, &tid, style));
     }
     if self.st().showing_advanced_params {
         self.advanced_params_popover(ui);

@@ -1,0 +1,25 @@
+[package]
+name = "hiker-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Shared generative-LLM client, extracted from `hiker-core` (status:
+# crawler-shared-llm). Module discipline mirrors the old `core::llm`: the `llm`
+# crate is imported here and nowhere else, so every backend (Anthropic, OpenAI,
+# Ollama, ...) reaches callers through one narrow trait. Consumed by both
+# `hiker-core` and `hiker-crawler` — one client, not a per-consumer copy.
+
+[dependencies]
+llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+# tokio: the Mock-client tests exercise the async trait methods via
+# `#[tokio::test]` (current-thread runtime).
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -822,3 +822,50 @@ fn list_pending_proposals_covers_every_pending_op_kind() {
     assert_eq!(props[0].target_path, "b.md");
     assert_eq!(bridge::pending_op_count(&log).unwrap(), 1);
 }
+
+#[test]
+fn reextract_replaces_linked_skips_unlinked() {
+    use crate::ops::op_writes::{self as bridge, ReextractOutcome};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    let log = OpLog::open(td.path()).unwrap();
+
+    // A LINKED sidecar (fill_body: true / link_state: linked) — the default for
+    // an extracted body.
+    let linked = "---\nhiker:\n  fill_body: true\n  link_state: linked\n---\nold extracted\n";
+    std::fs::create_dir_all(td.path().join("clips")).unwrap();
+    std::fs::write(td.path().join("clips/linked.md"), linked).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+
+    // Re-extraction of a LINKED sidecar replaces the body in place.
+    let out = bridge::reextract(&log, &vault, "clips/linked.md", "new extracted\n", "web").unwrap();
+    assert_eq!(out, ReextractOutcome::Replaced);
+    let id = log.doc_id_for_path("clips/linked.md").unwrap().unwrap();
+    assert!(log.materialize_accepted(&id).unwrap().text.contains("new extracted"));
+    assert_eq!(log.doc_history(&id, 100).unwrap()[0].author,
+        crate::oplog::shapes::Author::Extractor("web".to_string()));
+
+    // An identical re-extraction is a no-op (no new version).
+    let body_now = {
+        let t = log.materialize_accepted(&id).unwrap().text;
+        let fe = crate::oplog::shapes::frontmatter_fence_end(&t).unwrap();
+        t[fe..].to_string()
+    };
+    let before = log.doc_history(&id, 100).unwrap().len();
+    let again = bridge::reextract(&log, &vault, "clips/linked.md", &body_now, "web").unwrap();
+    assert_eq!(again, ReextractOutcome::Unchanged);
+    assert_eq!(log.doc_history(&id, 100).unwrap().len(), before);
+
+    // An UNLINKED sidecar: re-extraction must NOT overwrite the user's body.
+    let unlinked = "---\nhiker:\n  fill_body: false\n  link_state: unlinked\n---\nhand-edited\n";
+    std::fs::write(td.path().join("clips/unlinked.md"), unlinked).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let uid = log.doc_id_for_path("clips/unlinked.md").unwrap().unwrap();
+    let out = bridge::reextract(&log, &vault, "clips/unlinked.md", "robot text\n", "web").unwrap();
+    assert_eq!(out, ReextractOutcome::Skipped);
+    // Body untouched; no extractor op landed.
+    assert!(log.materialize_accepted(&uid).unwrap().text.contains("hand-edited"));
+    assert!(log.doc_history(&uid, 100).unwrap().iter()
+        .all(|m| !matches!(m.author, crate::oplog::shapes::Author::Extractor(_))));
+}

@@ -20,6 +20,60 @@ pub(super) struct Menus<'a> {
     pub(super) path: &'a str,
 }
 
+/// The three buffer-rendering toggles in the view-options menu: live preview
+/// (markdown decoration layer), render widgets (in-place math/mermaid), and
+/// live edit preview (the floating popup). Grouped because they're the
+/// rendering cluster and share the read-flag / checkbox / write-back shape;
+/// `live_preview` + `render_widgets` clear the decoration cache and persist,
+/// `live_edit_preview` is an in-memory popup gate that does neither.
+/// status: widget-render-toggle, widget-edit-popup-preview
+fn render_toggles(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
+    let mut live_preview = false;
+    let mut render_widgets = false;
+    let mut live_edit_preview = false;
+    if let Some(buffer) = app.session.buffers.get(path) {
+        live_preview = buffer.live_preview;
+        render_widgets = buffer.render_widgets;
+        live_edit_preview = buffer.live_edit_preview;
+    }
+    if ui
+        .checkbox(&mut live_preview, "Live preview")
+        .on_hover_text("Inline-render wikilinks, math, callouts (view-live-preview-toggle)")
+        .changed()
+    {
+        if let Some(buffer) = app.session.buffers.get_mut(path) {
+            buffer.live_preview = live_preview;
+            buffer.decoration_cache = DecorationCache::default();
+        }
+        super::persist_view_setting(app, "editor.live_preview", &serde_json::json!(live_preview));
+    }
+    // Rendered widgets (LaTeX math + Mermaid). In-memory per-buffer flip, not
+    // persisted — distinct from Live preview. status: widget-render-toggle
+    if ui
+        .checkbox(&mut render_widgets, "Render widgets")
+        .on_hover_text("Replace LaTeX math source with rendered formulas (widget-render-toggle)")
+        .changed()
+        && let Some(buffer) = app.session.buffers.get_mut(path)
+    {
+        buffer.render_widgets = render_widgets;
+        buffer.decoration_cache = DecorationCache::default();
+    }
+    // Floating live edit-preview popup (`widget-edit-popup-preview`). Default
+    // on. Independent of `Render widgets` — turning this off suppresses only
+    // the popup; in-place widget rendering + region interactivity stay on. No
+    // deco-cache clear: the popup isn't a decoration layer.
+    if ui
+        .checkbox(&mut live_edit_preview, "Live edit preview")
+        .on_hover_text(
+            "Float a live render while editing a math / mermaid source span (widget-edit-popup-preview)",
+        )
+        .changed()
+        && let Some(buffer) = app.session.buffers.get_mut(path)
+    {
+        buffer.live_edit_preview = live_edit_preview;
+    }
+}
+
 impl Menus<'_> {
     pub(super) fn view_options_menu(&mut self) {
     let ui = &mut *self.ui;
@@ -106,32 +160,16 @@ impl Menus<'_> {
             );
         }
         ui.separator();
-        let mut live_preview = false;
+        render_toggles(ui, app, path);
         let mut chunk_boundaries = false;
         let mut render_txt_as_md = false;
         let mut intraline_diff = false;
         let mut heading_breadcrumb = false;
         if let Some(buffer) = app.session.buffers.get(path) {
-            live_preview = buffer.live_preview;
             chunk_boundaries = buffer.chunk_boundaries;
             render_txt_as_md = buffer.render_txt_as_markdown;
             intraline_diff = buffer.intraline_diff;
             heading_breadcrumb = buffer.heading_breadcrumb;
-        }
-        if ui
-            .checkbox(&mut live_preview, "Live preview")
-            .on_hover_text("Inline-render wikilinks, math, callouts (view-live-preview-toggle)")
-            .changed()
-        {
-            if let Some(buffer) = app.session.buffers.get_mut(path) {
-                buffer.live_preview = live_preview;
-                buffer.decoration_cache = DecorationCache::default();
-            }
-            super::persist_view_setting(
-                app,
-                "editor.live_preview",
-                &serde_json::json!(live_preview),
-            );
         }
         if ui
             .checkbox(&mut chunk_boundaries, "Show chunk boundaries")
@@ -360,7 +398,7 @@ impl Menus<'_> {
         .add(
             egui::Button::new(
                 egui::RichText::new(format!("v {label}"))
-                    .color(crate::theme::muted())
+                    .color(hiker_theme::muted())
                     .small(),
             )
             .small(),
@@ -402,7 +440,7 @@ impl Menus<'_> {
             ui.label(
                 egui::RichText::new("Pending proposals")
                     .small()
-                    .color(crate::theme::muted()),
+                    .color(hiker_theme::muted()),
             );
             for p in &mine {
                 let short = &p.op_id[..p.op_id.len().min(8)];
@@ -429,7 +467,7 @@ impl Menus<'_> {
             ui.label(
                 egui::RichText::new("Versions")
                     .small()
-                    .color(crate::theme::muted()),
+                    .color(hiker_theme::muted()),
             );
             for (i, row) in history.iter().enumerate() {
                 let ts = VersionTimeFmt.hms(row.timestamp_ms);
@@ -454,7 +492,7 @@ impl Menus<'_> {
                 egui::RichText::new("(no prior versions)")
                     .small()
                     .italics()
-                    .color(crate::theme::muted()),
+                    .color(hiker_theme::muted()),
             );
         }
     });

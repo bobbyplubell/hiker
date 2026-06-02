@@ -11,7 +11,7 @@ use eframe::egui;
 use hiker_core::plugins::vdom::{Node, Row, TextStyle};
 
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// An interaction the renderer collected this frame, drained after painting so
 /// the plugin host can be mutated without holding a borrow of the VDOM.

@@ -1,6 +1,8 @@
-//! Per-vault persistence of the primary side-panel accordion: which
-//! feature sections are open (top-to-bottom), which are collapsed, their
-//! height weights, the focused section, and whether the bar is visible.
+//! Per-vault persistence of the workbench chrome: the primary side-panel
+//! accordion (which feature sections are open top-to-bottom, which are
+//! collapsed, their height weights, the focused section, and whether the
+//! bar is visible) plus the secondary side bar (Chat) and bottom status
+//! bar visibility, so the user's show/hide choices survive a restart.
 //!
 //! Stored as `.hiker/side-panel.json`. Decoupled from the editor dock
 //! layout (`layout.rs` / `.hiker/layout.json`) because the accordion
@@ -39,6 +41,19 @@ pub struct SidePanelState {
     pub focused: Option<String>,
     /// Whether the primary side bar is visible.
     pub visible: bool,
+    /// Whether the secondary side bar (Chat) is visible. Defaults to
+    /// visible so pre-existing files (written before this field) keep the
+    /// historical always-shown behaviour rather than hiding the bar.
+    #[serde(default = "default_true")]
+    pub secondary_visible: bool,
+    /// Whether the bottom status bar is visible. Defaults to visible for
+    /// the same backward-compat reason as `secondary_visible`.
+    #[serde(default = "default_true")]
+    pub status_bar_visible: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn state_path(vault_root: &Path) -> PathBuf {
@@ -55,12 +70,31 @@ impl SidePanelState {
             .iter()
             .map(|m| (m.clone(), panels.section_weight(m)))
             .collect();
+        // While reader view has temporarily hidden the chrome, the live
+        // workbench flags are all false; persist the user's underlying
+        // choices (snapshotted before reader view took over) so we don't
+        // write — and later restore — the transient all-hidden state.
+        let (primary, secondary, status) = if app.ui.reader_view_chrome_hidden {
+            (
+                app.ui.reader_view_prev_primary_visible,
+                app.ui.reader_view_prev_secondary_visible,
+                app.ui.reader_view_prev_status_visible,
+            )
+        } else {
+            (
+                app.workbench.primary_side_bar.visible,
+                app.workbench.secondary_side_bar.visible,
+                app.workbench.status_bar.visible,
+            )
+        };
         Self {
             version: VERSION,
             collapsed: panels.collapsed_modes(),
             weights,
             focused: panels.focused().cloned(),
-            visible: app.workbench.primary_side_bar.visible,
+            visible: primary,
+            secondary_visible: secondary,
+            status_bar_visible: status,
             sections,
         }
     }
@@ -90,6 +124,8 @@ pub fn restore(app: &mut AppState, vault_root: &Path) {
         saved.focused.clone(),
     );
     app.workbench.primary_side_bar.visible = saved.visible;
+    app.workbench.secondary_side_bar.visible = saved.secondary_visible;
+    app.workbench.status_bar.visible = saved.status_bar_visible;
     let focused = app.workbench.primary_panels.focused().cloned();
     app.workbench.activity_bar.set_active(focused);
     // Seed the dedup cache so the first autosave tick doesn't rewrite an

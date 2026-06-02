@@ -16,7 +16,7 @@ use eframe::egui;
 
 use crate::state::{AppState, ToastLevel};
 use crate::tab::TabId;
-use crate::theme;
+use hiker_theme as theme;
 use hiker_core::boards::{BoardDetail, ResolvedCard, ResolvedColumn};
 use hiker_core::trails::ops::ResolutionOutcome;
 

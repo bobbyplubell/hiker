@@ -759,13 +759,13 @@ pub enum BuildEvent {
 ///
 /// status: cluster-summarize-llm
 pub struct LlmSummarizer {
-    client: std::sync::Arc<dyn crate::llm::Client>,
+    client: std::sync::Arc<dyn hiker_llm::Client>,
     prompt_template: String,
 }
 
 impl LlmSummarizer {
     pub fn new(
-        client: std::sync::Arc<dyn crate::llm::Client>,
+        client: std::sync::Arc<dyn hiker_llm::Client>,
         prompt_template: String,
     ) -> Self {
         Self { client, prompt_template }
@@ -788,7 +788,7 @@ impl Summarizer for LlmSummarizer {
             .prompt_template
             .replace("{{level}}", &input.level.to_string())
             .replace("{{members}}", members_txt.trim_end());
-        let msgs = vec![crate::llm::Message::user(rendered)];
+        let msgs = vec![hiker_llm::Message::user(rendered)];
         // Each call spins a dedicated worker thread with its own
         // multi-thread runtime so it stays isolated from whatever
         // runtime context the caller is in (host sync commands run on

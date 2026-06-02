@@ -1,0 +1,79 @@
+[package]
+name = "hiker-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Leaf crate: the extraction subsystem. All format/network dependencies
+# (PDF parser, HTTP client, HTML parser — added in later phases) live ONLY
+# here. `hiker-core` must NOT depend on this crate; the `.md` sidecar written
+# to the vault is the seam, ingested by core's ordinary markdown path. See
+# docs/extract.md `extract-crate-decoupled`.
+#
+# Phase 3 adds the PDF fast path: `pdf-extract` (a pure-Rust text-extraction
+# crate built on `lopdf`). It pulls in NO C/native dependency — no poppler, no
+# pdfium, no `*-sys` crate, no `cc`/`bindgen` build script (verified via
+# `cargo tree`) — so hiker keeps its single-binary / clean-SBOM posture. The
+# whole PDF tree (lopdf, euclid, encoding_rs, ttf-parser, nom, flate2, …) is
+# confined to this leaf crate; `hiker-core` never links it. The web (Phase 4)
+# extractor will add reqwest/rustls/an-html-parser here, likewise confined.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+blake3 = "1"
+ulid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Pure-Rust PDF text extraction (no poppler/pdfium/C deps). See note above.
+pdf-extract = "0.10"
+
+# --- Phase 4: website-to-markdown extractor (all pure Rust, confined here) ---
+# HTTP with a pure-Rust TLS stack: `rustls` (no system OpenSSL / native-tls).
+# `blocking` because the `Extractor::extract` trait is synchronous; `gzip` so
+# we can accept compressed responses. The only `-sys`-adjacent transitive on
+# this path is `ring` (rustls's standard crypto backend — a tiny vendored
+# C/asm core), which is how rustls works; flagged for the owner.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "gzip"] }
+# HTML5 parsing (html5ever-backed) with CSS selectors — used for the data-blob
+# probe (`__NEXT_DATA__` / `__NUXT__` / JSON-LD) and archive DOM walk.
+scraper = "0.21"
+# Pure-Rust readability extractor (markup5ever DOM, no network of its own):
+# isolates the main article content from page chrome. Chosen over the
+# `readability` crate because that one drags a default `reqwest` (+ native-tls
+# / OpenSSL) into the tree; this one is a pure DOM transform.
+readable-readability = "0.4"
+# Pure-Rust HTML -> markdown serializer for the sidecar body.
+htmd = "0.1"
+# URL resolution for the single-file archiver (relative subresource -> absolute).
+url = "2"
+# data: URI base64 for inlined subresources in the archive.
+base64 = "0.22"
+# ISO-8601 `captured_at` stamp on URL clips (`scrape-cmd`).
+time = { workspace = true }
+
+# --- Phase 5: governed crawl frontier loop (all pure Rust, confined here) ---
+# Pure-Rust regex for the crawl scope-pattern `re:<regex>` escape hatch
+# (`crawl-scope-patterns`) when gitignore-style globs are too blunt on URLs.
+regex = { workspace = true }
+
+# --- Phase 6: RSS / Atom / JSON-Feed parsing (all pure Rust, confined here) ---
+# `feed-rs` is the unified parser (on `quick-xml`) that normalizes RSS 0.9x /
+# 1.0 / 2.0, Atom, and JSON Feed into one model, so the dialect / date /
+# namespace tail isn't ours to maintain (`rss-feed-extractor`). The whole tree
+# is pure Rust — verified via `cargo tree`: NO `-sys` crate, NO `cc`/`bindgen`
+# build script, NO OpenSSL/ring (its transitives are quick-xml, chrono, url,
+# uuid, mediatype, siphasher, serde_json, regex — all pure Rust). The opt-in
+# `sanitize` feature (which would pull in `ammonia`) is left OFF: the feed
+# extractor parses-never-executes and the entry body is handled downstream by
+# the same htmd path the rest of the crate already uses, so we don't need
+# feed-rs to sanitize HTML.
+feed-rs = { version = "2", default-features = false }
+# `feed-rs` normalizes feed dates to `chrono::DateTime<Utc>`; we re-format them
+# to RFC-3339 strings for the entry stamp. Pure Rust (no `clock`/`oldtime`
+# features → no `iana-time-zone`/`js-sys`), and already in the feed-rs tree.
+chrono = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

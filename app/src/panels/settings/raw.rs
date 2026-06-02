@@ -7,7 +7,7 @@ use eframe::egui;
 use hiker_core::config::{Paths, SettingsScope};
 
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Render context for the raw-TOML fallback view. A struct so the
 /// single-call entry stays an inherent method.

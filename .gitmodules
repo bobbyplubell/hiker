@@ -1,0 +1,12 @@
+[submodule "zxr"]
+	path = zxr
+	url = git@github.com:bobbyplubell/zxr.git
+[submodule "editor"]
+	path = editor
+	url = git@github.com:bobbyplubell/editor.git
+[submodule "egui-workbench"]
+	path = egui-workbench
+	url = git@github.com:bobbyplubell/egui-workbench.git
+[submodule "hiker-render"]
+	path = hiker-render
+	url = https://github.com/bobbyplubell/hiker-render

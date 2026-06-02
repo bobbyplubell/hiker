@@ -25,7 +25,7 @@ use hiker_sync::config::SyncMode;
 use hiker_sync::identity::Resolution;
 
 use crate::state::{AppState, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 /// The mDNS discovery window length (matches `docs/sync.md`'s ~30s manual,
 /// time-boxed window). [sync-mdns-discovery]

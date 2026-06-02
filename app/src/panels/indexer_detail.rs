@@ -9,7 +9,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::state::{AppState, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 pub fn show(
     ui: &mut egui::Ui,

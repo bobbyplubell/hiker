@@ -6,12 +6,23 @@
 //! struct + its `with_config`/`Default` impls run well over the 20-line
 //! minimum `scripts/check-splits.py` enforces. [feature-search-migration]
 
-use crate::search::DiscoveryHit;
+use std::sync::{mpsc, Mutex};
+
+use crate::panels::zim;
+use crate::search::{DiscoveryHit, SearchOutcome};
 
 pub struct State {
     pub query: String,
     /// Cached card-shaped results from the last query.
     pub results: Vec<DiscoveryHit>,
+    /// Federated title hits from the vault's `.zim` archives, surfaced as a
+    /// distinct result group (title-only, binary-search, bounded). Cleared
+    /// and refilled on each fired query.
+    pub zim_results: Vec<zim::TitleHit>,
+    /// Federated full-text (body) hits from the vault's `.zim` archives'
+    /// embedded Xapian indexes (BM25-ranked), surfaced as a distinct
+    /// "full-text" result group. Cleared and refilled on each fired query.
+    pub zim_fulltext_results: Vec<zim::FullTextHit>,
     /// Search-mode toggles. Both default-on; either can be disabled.
     pub lexical_on: bool,
     pub semantic_on: bool,
@@ -48,6 +59,18 @@ pub struct State {
     /// the next frame and the flag clears. Driven by the Ctrl-Space
     /// keybind (`search-keybind-ctrl-space`).
     pub focus_query_next_frame: bool,
+    /// Background-search result delivery (`search-query-embed-spawn-blocking`). A fired query
+    /// runs on a `spawn_blocking` task that sends its finished [`SearchOutcome`]
+    /// here, tagged with the `query_epoch` it ran for. The panel drains the
+    /// receiver each frame and applies only the outcome matching the current
+    /// epoch — stale ones (superseded by newer typing) are dropped. The
+    /// receiver is wrapped in a `Mutex` so `State` stays `Sync`, matching the
+    /// `Mutex<Receiver>` convention on `Services`.
+    pub result_tx: mpsc::Sender<SearchOutcome>,
+    pub result_rx: Mutex<mpsc::Receiver<SearchOutcome>>,
+    /// True while a fired query is still running in the background; drives the
+    /// inline "Searching…" hint and clears when its outcome is applied.
+    pub in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +104,12 @@ impl State {
 
 impl Default for State {
     fn default() -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
         Self {
             query: String::new(),
             results: Vec::new(),
+            zim_results: Vec::new(),
+            zim_fulltext_results: Vec::new(),
             lexical_on: true,
             semantic_on: true,
             limit: 25,
@@ -97,6 +123,9 @@ impl Default for State {
             selected_row: None,
             results_expanded: true,
             focus_query_next_frame: false,
+            result_tx,
+            result_rx: Mutex::new(result_rx),
+            in_flight: false,
         }
     }
 }

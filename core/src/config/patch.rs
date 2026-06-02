@@ -286,7 +286,6 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "vault.chat_input_height",       ty: ValueType::NonNegativeInt },
     EligibleKey { path: "vault.sidebar_width",           ty: ValueType::PositiveInt },
     EligibleKey { path: "vault.discovery_width",         ty: ValueType::PositiveInt },
-    EligibleKey { path: "vault.show_sessions_in_tree",   ty: ValueType::Bool },
     // status: active-trail-state
     EligibleKey { path: "vault.active_trail",            ty: ValueType::String },
     EligibleKey { path: "vault.tree.sort_by",            ty: ValueType::TreeSortBy },

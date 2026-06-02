@@ -2,6 +2,7 @@
 //! placeholders so the rest of the app can call into them; rendering
 //! shells land here as features get ported.
 
+pub mod autocomplete_picker;
 pub mod force_graph;
 pub mod modal;
 pub mod profiler_overlay;

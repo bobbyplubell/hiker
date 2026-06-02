@@ -117,6 +117,13 @@ pub enum TabKind {
     ///
     /// status: board-view
     Board { path: String },
+    /// Canvas: a per-doc spatial editor over a `.canvas` JSON Canvas document
+    /// at `path`. Nodes + edges come from the file's JSON; an edit
+    /// re-serializes and persists through the op-log exactly like a note.
+    /// Per-doc (like Board), not a singleton. See `docs/canvas.md`.
+    ///
+    /// status: canvas-tab
+    Canvas { path: String },
     /// Boards index: a singleton meta-page listing every board-doc in the
     /// vault (title + column/card counts) with click-to-open, New board,
     /// and per-row Delete. A non-buffer app-page like Home / Queue, since
@@ -145,6 +152,23 @@ pub enum TabKind {
     /// Cluster tree visualised as a radial dendrogram. Payload is the
     /// `tree_id` to render.
     ClusterGraph { tree_id: String },
+    /// Capture tab: the form-over-frontmatter surface for a capture-spec
+    /// note (`hiker.kind: capture`). One renderer parameterized by the
+    /// note's `capture.mode` — `crawl` shows the crawl-job form
+    /// (`crawl-job-form`), `feed` shows the RSS subscription form
+    /// (`rss-subscription-lifecycle`). Editing a field writes the note's
+    /// `CrawlParams` / `FeedParams` frontmatter; Run launches the engine
+    /// off the UI thread. Per-doc (like Board), keyed by the note path.
+    ///
+    /// status: crawl-job-form
+    Capture { note_path: String },
+    /// ZIM viewer: an offline `.zim` archive (e.g. a Wikipedia export)
+    /// rendered as HTML via the `hiker-htmlview` renderer. `zim_path`
+    /// is the archive's vault-relative path; `article` is the currently
+    /// shown article (`None` = the archive's main page). Clicking an
+    /// in-archive link navigates within this same tab. Per-archive, keyed
+    /// by path (like Board / Capture). status: zim-view
+    ZimView { zim_path: String, article: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +277,7 @@ impl TabKind {
             TabKind::Properties { path } => format!("Properties · {}", path_basename(path)),
             TabKind::Graph => "Graph".to_string(),
             TabKind::Board { path } => format!("Board · {}", path_basename(path)),
+            TabKind::Canvas { path } => format!("Canvas · {}", path_basename(path)),
             TabKind::BoardsIndex => "Boards".to_string(),
             TabKind::Agent { .. } => "Chat".to_string(),
             TabKind::PatchReview => "Patch review".to_string(),
@@ -262,6 +287,12 @@ impl TabKind {
             TabKind::Changes => "Changes".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
+            TabKind::Capture { note_path } => {
+                format!("Capture · {}", path_basename(note_path))
+            }
+            TabKind::ZimView { zim_path, .. } => {
+                format!("ZIM · {}", path_basename(zim_path))
+            }
         }
     }
 
@@ -285,6 +316,9 @@ impl TabKind {
             TabKind::Properties { .. } => icons::ICONS.image(crate::icons::Icon::Info),
             TabKind::Graph => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::Board { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
+            // The spatial-graph glyph reads closest for a canvas of nodes +
+            // edges in the icon set.
+            TabKind::Canvas { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::BoardsIndex => icons::ICONS.image(crate::icons::Icon::Clipboard),
             TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
             TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
@@ -296,6 +330,12 @@ impl TabKind {
             TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            // The capture tab drives the web crawl / feed engine; the
+            // compass glyph reads as "go fetch from out there".
+            TabKind::Capture { .. } => icons::ICONS.image(crate::icons::Icon::Compass),
+            // Offline encyclopedia archive — the compass "go read out
+            // there, but cached" reads closest in the icon set.
+            TabKind::ZimView { .. } => icons::ICONS.image(crate::icons::Icon::Compass),
         }
     }
 }
@@ -335,8 +375,27 @@ impl Tab {
             // disambiguates from a plain buffer tab on the same path).
             // status: board-view
             TabKind::Board { path } => (format!("board:{path}"), "board".into()),
+            // Canvas tabs are per-doc: persist the `.canvas` path so the tab
+            // reopens in canvas view on restore (the "canvas:" prefix
+            // disambiguates from a plain buffer tab on the same path).
+            // status: canvas-tab
+            TabKind::Canvas { path } => (format!("canvas:{path}"), "canvas".into()),
             // Singleton Boards index page. status: board-index-page
             TabKind::BoardsIndex => (":boards_index".into(), "boards_index".into()),
+            // Capture tabs are per-doc: persist the capture-note path so
+            // the tab reopens in the form view on restore (the "capture:"
+            // prefix disambiguates from a plain buffer tab on the same
+            // path). status: crawl-job-form
+            TabKind::Capture { note_path } => {
+                (format!("capture:{note_path}"), "capture".into())
+            }
+            // ZIM tabs are per-archive: persist the archive path so the tab
+            // reopens on the main page after restart. The current article
+            // (if any) is intentionally not persisted — restore lands on the
+            // archive's main page. status: zim-view
+            TabKind::ZimView { zim_path, article: None } => {
+                (format!("zim:{zim_path}"), "zim".into())
+            }
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
             TabKind::Plugins => (":plugins".into(), "plugins".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
@@ -355,6 +414,9 @@ impl Tab {
         match &self.kind {
             TabKind::Editor { buffer, .. } => Some(buffer.path()),
             TabKind::Properties { path } => Some(path.as_str()),
+            // A canvas tab is about its `.canvas` vault path, so tab-switch nav
+            // and dirty-marker lookups resolve it. status: canvas-nav-stack
+            TabKind::Canvas { path } => Some(path.as_str()),
             _ => None,
         }
     }

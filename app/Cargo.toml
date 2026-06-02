@@ -26,15 +26,52 @@ profiling = ["dep:puffin", "dep:puffin_http"]
 
 [dependencies]
 hiker-core.workspace = true
+# Shared LLM client (extracted from core); the chat + cluster-summary paths
+# build a GraniteLlmClient via core's config bridge. status: crawler-shared-llm
+hiker-llm.workspace = true
 hiker-sync = { path = "../hiker-sync" }
+# Extraction subsystem (decoupled leaf crate). The app wires the registry +
+# sidecar write; `core` never links it. See docs/extract.md.
+hiker-extract.workspace = true
 puffin = { version = "0.19", optional = true, features = ["serialization"] }
 puffin_http = { version = "0.16", optional = true }
 
 # UI
+hiker-theme.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 egui_workbench = { workspace = true, features = ["serde"] }
 graph-widgets.workspace = true
+# JSON Canvas editor: the egui-agnostic core (`hiker-canvas`), the egui-free
+# view layer (`canvas-view-core`, for `CreateKind` and friends), and the egui
+# shell (`canvas-view`). The canvas panel glues them to the op-log + tab spine;
+# node content is injected through `canvas_view`'s `NodeContentRenderer` seam.
+# status: canvas-tab
+hiker-canvas.workspace = true
+canvas-view-core.workspace = true
+canvas-view.workspace = true
+# Vector-free layout types (`LayoutParams`, `LayoutKind`, `LayoutTree`, the
+# tree builders) come from here directly; `graph-widgets` façades only the
+# egui-wrapped pieces (the project bans `pub use` re-exports).
+hiker-graph.workspace = true
+# HTML/CSS rendering for the ZIM viewer tab — the from-scratch `hiker-htmlview`
+# renderer (Stylo + our layout + egui paint) from the `hiker-render` submodule.
+# The app drives it directly (host owns scroll/clip/input). status: zim-view
+hiker-htmlview = { workspace = true }
+# Pure-Rust .zim archive reader (+ full-text Xapian search) feeding the ZIM
+# viewer. The `zxr` git submodule. status: zim-view
+zxr = { path = "../zxr" }
+# Editor-widget renderers from the `hiker-render` submodule: egui-agnostic
+# LaTeX math (`hiker-math`), mermaid (`hiker-mermaid`), and WaveDrom
+# (`hiker-wavedrom`), all SVG-string out. The app rasterizes their SVG to RGBA
+# via resvg (same path `hiker-htmlview` uses) in panels/buffer/widgets/render.rs.
+# status: widget-render-pipeline, widget-wavedrom-render
+hiker-math = { path = "../hiker-render/hiker-render/math" }
+hiker-mermaid = { path = "../hiker-render/hiker-render/mermaid" }
+hiker-wavedrom = { path = "../hiker-render/hiker-render/wavedrom" }
+# SVG → RGBA rasterization (usvg parse + tiny-skia pixmap). Same version
+# `hiker-htmlview` already pulls in, so the dep set stays consistent.
+resvg = "0.47.0"
 eframe.workspace = true
 petgraph.workspace = true
 rfd.workspace = true

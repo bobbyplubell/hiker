@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::{AgentLog, Entry};
 use crate::config::sections::LlmAgentConfig;
-use crate::llm::{AgentChunk, Client, Error as LlmError, Message, ToolCall, ToolDef, ToolResult};
+use hiker_llm::{AgentChunk, Client, Error as LlmError, Message, ToolCall, ToolDef, ToolResult};
 
 /// Discriminated union of events the chat panel renders. One per LLM call
 /// (`StepStarted` / `StepFinished`), one per delta (`TextDelta`), one per
@@ -712,7 +712,7 @@ fn summarize(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{AgentChunk, ChatStream, Role, ToolCall, ToolChatResponse, ToolStream};
+    use hiker_llm::{AgentChunk, ChatStream, Role, ToolCall, ToolChatResponse, ToolStream};
     use std::sync::Mutex;
 
     fn agent_cfg(cap: u32, tool_timeout_secs: u64) -> LlmAgentConfig {

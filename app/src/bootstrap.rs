@@ -466,11 +466,11 @@ impl Spawner {
         if !llm_cfg.enabled {
             return;
         }
-        let Ok(client) = hiker_core::llm::GraniteLlmClient::from_config(llm_cfg) else {
+        let Ok(client) = hiker_core::llm::client_from_config(llm_cfg) else {
             return;
         };
         let queue_for_worker = (**tasks).clone();
-        let client_arc: Arc<dyn hiker_core::llm::Client> = Arc::new(client);
+        let client_arc: Arc<dyn hiker_llm::Client> = Arc::new(client);
         let audit_for_worker = Some(audit.clone());
         let worker_cancel = self.cancel.clone();
         tokio::spawn(async move {
@@ -539,13 +539,53 @@ fn open_and_seed_oplog(
     let oplog = Arc::new(
         OpLog::open_with_threshold(root, compact_threshold).with_context(|| "open op log")?,
     );
+    // Relocate any legacy hidden `.hiker/sessions/` content into the visible
+    // chats folder *before* the op-log seed below, so the moved notes are in
+    // the main walk and get doc_ids + indexing on this same open. Idempotent.
+    run_sessions_migration_on_open(root, config);
     match hiker_core::ops::op_writes::bootstrap(vault, &oplog) {
         Ok(n) if n > 0 => tracing::info!(seeded = n, "oplog: seeded documents on first open"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "oplog: bootstrap seed failed (non-fatal)"),
     }
+    run_trails_companion_migration_on_open(vault, &oplog);
     run_oplog_retention_gc_on_open(&oplog, config);
     Ok(oplog)
+}
+
+/// One-time chat-sessions storage-layout migration
+/// (`bug-sessions-to-visible-chats-folder`): relocate any legacy hidden
+/// `.hiker/sessions/` content (incl. `imported/`) into the visible
+/// `<chats_dir>/` folder (default `chats/`). Idempotent — a no-op on vaults
+/// already on the new layout or freshly created. Mirrors the trails
+/// companion-folder migration's shape. Failures are logged, not fatal.
+fn run_sessions_migration_on_open(root: &std::path::Path, config: &std::sync::RwLock<Config>) {
+    let chats_dir = config
+        .read()
+        .map(|c| c.chat.chats_dir.clone())
+        .unwrap_or_else(|_| "chats/".to_string());
+    match hiker_core::sessions::migrate_to_chats_dir(root, &chats_dir) {
+        Ok(n) if n > 0 => {
+            tracing::info!(migrated = n, "sessions: relocated to visible chats folder")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "sessions: migration failed (non-fatal)"),
+    }
+}
+
+/// One-time trails storage-layout migration (`trail-storage-layout`):
+/// relocate any legacy hidden `.hiker/trails/<id>/waypoints/` dirs to the
+/// trail-doc's visible companion folder. Idempotent — a no-op on vaults
+/// already on the new layout. Runs after the op-log seed so trail-doc paths
+/// resolve from their doc_ids. Failures are logged, not fatal.
+fn run_trails_companion_migration_on_open(vault: &Vault, oplog: &Arc<OpLog>) {
+    match hiker_core::trails::ops::migrate_waypoints_to_companion_folders(vault, oplog) {
+        Ok(n) if n > 0 => {
+            tracing::info!(migrated = n, "trails: migrated waypoints to companion folders")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "trails: waypoint migration failed (non-fatal)"),
+    }
 }
 
 /// On-open retention GC (`op-log-retention`): drop accepted/rejected
@@ -966,6 +1006,12 @@ impl AppState {
         let state = self;
     use crate::tab::{Tab, TabKind};
 
+    // Restore persisted canvas view state into the session map; each canvas
+    // pane applies its entry on first creation (`apply_persisted_view`), so a
+    // canvas opens where the user left it across a restart.
+    // status: canvas-view-state-persist
+    state.session.canvas_views = ts.canvas_views;
+
     let mut first_id: Option<crate::tab::TabId> = None;
     let mut active_id: Option<crate::tab::TabId> = None;
     let mut preview_id: Option<crate::tab::TabId> = None;
@@ -980,6 +1026,23 @@ impl AppState {
             p if p.starts_with("board:") => {
                 Some(TabKind::Board { path: p["board:".len()..].to_string() })
             }
+            // status: canvas-tab
+            // Per-doc canvas tab: the persist key is `canvas:<doc-path>`.
+            p if p.starts_with("canvas:") => {
+                Some(TabKind::Canvas { path: p["canvas:".len()..].to_string() })
+            }
+            // status: crawl-job-form
+            // Per-doc capture tab: the persist key is `capture:<note-path>`.
+            p if p.starts_with("capture:") => {
+                Some(TabKind::Capture { note_path: p["capture:".len()..].to_string() })
+            }
+            // status: zim-view
+            // Per-archive ZIM viewer tab: persist key is `zim:<archive-path>`;
+            // restore lands on the archive's main page (`article: None`).
+            p if p.starts_with("zim:") => Some(TabKind::ZimView {
+                zim_path: p["zim:".len()..].to_string(),
+                article: None,
+            }),
             ":patch_review" => Some(TabKind::PatchReview),
             // status: board-index-page
             ":boards_index" => Some(TabKind::BoardsIndex),

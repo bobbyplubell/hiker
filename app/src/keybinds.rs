@@ -47,6 +47,7 @@ pub const fn known_keybindings(self) -> &'static [KnownKeybind] {
         KnownKeybind { id: "editor.save",         chord: "Mod-S",          label: "Save the active buffer" },
         KnownKeybind { id: "editor.find",         chord: "Mod-F",          label: "Find in note" },
         KnownKeybind { id: "editor.reader_view",  chord: "Mod-Shift-R",    label: "Toggle reader / focus view" },
+        KnownKeybind { id: "file.new_note",       chord: "Mod-N",          label: "New note (on the active canvas, or a new tab)" },
         KnownKeybind { id: "file.close_tab",      chord: "Mod-W",          label: "Close the active tab" },
         KnownKeybind { id: "vault.open_settings", chord: "Mod-,",          label: "Open Settings" },
         KnownKeybind { id: "palette.open",        chord: "Mod-Shift-P",    label: "Open the command palette" },
@@ -139,6 +140,15 @@ pub fn handle_keybinds(&mut self, ctx: &egui::Context) {
         && let Some(id) = state.session.active_tab
     {
         close_tab_with_dirty_guard(state, id);
+    }
+
+    // Mod-N: new note. Context-dependent (`file.new_note`): on a Canvas tab it
+    // creates a note ON that canvas (mint + drop a File pointer node, the
+    // right-click "New note" verb); otherwise it opens a fresh note in a new
+    // tab. Consumed so it doesn't also type 'n' or reach the editor.
+    // status: canvas-new-note
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::N)) {
+        crate::actions::dispatch(state, "file.new_note");
     }
 
     // Ctrl-Tab / Shift-Ctrl-Tab: cycle tabs forward / backward.

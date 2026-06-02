@@ -20,6 +20,52 @@ Hiker renders extracted markdown only; sources are viewed in the user's OS apps 
 
 - **High-fidelity WARC capture + replay** — recording the real HTTP request/response set of a visit to a `.warc`, more faithful than the self-contained single-file HTML archive (`extract-web-archive-singlefile`). The static fetch path can capture the resource set it fetches as a basic WARC; full dynamic-page capture (the JS-driven request set, auto-scroll behaviors) needs an external browser-driven tool feeding the manifest-import path (`extract-manifest-import`). The extracted-md sidecar stays the search layer; the WARC is the fidelity/replay layer under design.md versioned sources, and replay opens in an external WARC viewer rather than an in-app renderer. [servo-warc-capture]
 
+## Embedded web engine
+
+A compile-time-optional in-app web engine for rendering — and optionally executing — real web pages. **Under evaluation, not committed.** The lean default build ships no engine; a `cef` feature flag pulls it in. Leading candidate: **CEF** (Chromium, off-screen rendering → egui texture); **Servo** is the Rust-native alternative. A native system webview (`wry`) is ruled out for tight integration — it's an OS overlay window, not a texture, so it can't be a proper egui tab; **Blitz** (Rust, no-JS) is the clean *viewer* if JS is never needed. This revisits the "external viewer only" stance above (`servo-warc-capture`) and `extract.md`'s no-JS / no-in-app-renderer posture. [embedded-web-engine]
+
+Could unlock — a self-contained "web vertical" that leaves the editor / clustering / sync core untouched:
+
+- **Visual + agent-assisted scraper authoring** (the standout) — load a site live, click an element, feed its selector + the rendered DOM to the agent to author a reusable source-plugin (`plugins.md`, `mcp-extract-preview`). Turns the per-site scraper long tail from blind CSS selectors into point-and-click; needs the *interactive* viewer, not just headless.
+- **Agent-driven web research** — the agent navigates / reads / interacts and captures findings to the vault; the concrete instance of `agent-session-partitions` (the sandbox is what breaks the lethal trifecta).
+- **In-app browsing + native trail capture** — browse in hiker, one-click a page as a trail waypoint; subsumes `browser-extension-capture`.
+- **JS-rendered crawl / extraction** — fixes the SPA gap in `extract.md`, retires `extract-manifest-import`, improves `recipe-source-ingest` / `rss-feed-ingest`.
+- **Faithful in-app viewing of web archives (WARC)** — rendering a recorded request/response set offline through the engine, more faithful than the single-file HTML archive. (Offline `.zim` / Wikipedia viewing is served without an engine by the no-JS `zim.md` viewer.)
+
+Architecture if pursued: out-of-process renderer + capability starvation (no vault handles; network only via hiker's governed fetcher) breaks the lethal trifecta cross-platform, with the OS sandbox as defense-in-depth — CEF ships Chromium's own sandbox + Google security patches for free, where Servo needs `gaol` hand-wired. Lazy-download the ~150–250 MB engine blob on first enable so the default install stays lean.
+
+Downsides being weighed:
+
+- **Heavy + not pure Rust** — a ~200 MB C++ Chromium blob + real per-page RAM; clears the npm bar but breaks the lean / pure-Rust posture.
+- **Two-tier product + permanent maintenance** — even gated off, the ON path is a browser-engine subsystem (CEF version-tracking for security, OSR / input plumbing, sandbox config) the lean build must stay a first-class peer to.
+- **macOS packaging** — Chromium needs nested, individually code-signed helper `.app` bundles with per-helper entitlements (JIT, etc.) + notarization; `cargo` can't produce this, so it requires a bespoke macOS build / sign pipeline.
+- **Security responsibility** — embedding a JS engine is a CVE surface; CEF's sandbox + patch stream largely mitigate (Servo does not), but it's a posture shift for a local-first tool.
+- **Opportunity cost** — a multi-month vertical vs. the core roadmap + the bug backlog.
+- **Engine fork unresolved** — CEF (mature, Chromium-grade compat, free sandbox; big C++, fiddly packaging) vs Servo (Rust-native, lighter; immature embedding, partial compat, you own the sandbox).
+
+## Generalized crawler engines
+
+A future refactoring of `hiker-crawler.md`, captured from a brainstorm. The *baseline* it builds on is now committed: the two-lane ingestion model and the one tool-agnostic import format any external crawler can target are specced in `extract.md` (`ingest-two-lane-model`, `import-format-contract`). This section is the still-open part — letting hiker-crawler *host* **off-the-shelf platform crawlers** (yt-dlp, gallery-dl, snscrape, instaloader, RSS-Bridge, per-platform API clients) as engines it drives, alongside the custom CEF point-and-click flow. Today the crawler is built around a single engine shape, `BrowserEngine` (CEF / `NullEngine`, `crawler-engine-trait`), which is fundamentally *CEF-shaped*: load → paint an OSR texture → point-and-click `pick_at` → `rendered_html`.
+
+The reframe: an OTS media crawler is a **whole acquisition pipeline**, not a page renderer. Given a channel URL or a handle it does its own discovery, fetches media + metadata, and dumps a set of artifacts — no live texture, no DOM to pick, and it usually manages its own frontier rather than wanting hiker's frontier loop to drive it URL-by-URL. So it doesn't fit `BrowserEngine` at all; generalizing means splitting that one trait into a small taxonomy. [crawler-engine-taxonomy]
+
+- **Base `Engine`** (`id`, `matches(url)`, `config_ui`) with capability traits layered on: **`Interactive`** (`render` + `pick_at`) — CEF only, the point-and-click authoring path unchanged; **`Acquire`** (`run(target, cfg) → artifacts`) — CEF's crawl-run *and* every OTS tool implement this. All engines feed the *same* preview + emit surface in the bench.
+
+Two roles fall out, and which one an engine has is decided purely by which seam its output lands in:
+
+- **Authoring engines** — hiker-crawler-only; may be heavy / in-crate / CEF. They run (or are point-and-clicked) against a live target and emit a *one-shot* artifact (a manifest-import dir, a source plugin, or a crawl-job note). They are never something hiker itself runs. **Constraint: in-crate "tier-2" engines (CEF and any Rust OTS adapter compiled into the bench) live only in hiker-crawler — hiker-core never deals with a CEF-like engine.** [crawler-authoring-engines]
+- **Runtime engines** — the only engines hiker *re-runs* are the two seams core already has: a **subprocess command** (the `extract-pdf-command-escape` `{input}`/`{output}` escape hatch) and a **source plugin** (Lua/wasm, `plugin-source-api-fetch`). Nothing new enters core. An OTS tool hiker re-runs on a schedule is just "a configured command whose output gets `import_dir`'d" — i.e. an **engine-job note** is `CommandExtractor` + `extract-manifest-import` composed into a capture note, no CEF and no heavy dep. [crawler-runtime-engines] [crawler-engine-job-note]
+
+The integration spectrum, cheapest-to-purest: a **source plugin** (native, in-vault, API-fetch) → an **in-crate Rust adapter** (bench-only, may pull sketchy deps since hiker-crawler is already the quarantine zone) → an **external subprocess** (bench-runnable *and* hiker-re-runnable via the command seam + manifest handoff). CEF is just the *interactive* member of the in-crate tier.
+
+- **Live-test bench.** Generalize the side panel so an engine dropdown drives the mode: CEF → today's point-and-click; an OTS engine → a config form + "Run" that executes into a temp dir, parses the output into the manifest model, and previews the resulting markdown through the *same* `hiker-extract` transform (`crawler-preview-fidelity`) plus a media/metadata view. This is the "live test the engine before emitting" capability, and the bench is the right home because it can hold the messy deps. [crawler-live-test-bench]
+- **Credentials are pass-through config, never managed by hiker.** Platform auth (cookies file, env var, profile dir) is the engine's own concern; the crawler config just *names where to load them* and forwards the string. hiker / hiker-crawler stores no secrets and runs no login flow — keeps the whole auth surface out of the quarantine. [crawler-engine-credentials]
+
+Open decisions deferred to whenever this firms up:
+
+- **Media output shape** — the biggest unsolved modeling problem. `manifest::Page` is single-doc-shaped (`{ output_file (md), archive_file, links }`), but a gallery-dl / yt-dlp pull is *N media files + per-item metadata*. Options: extend `Page` to carry multiple attachments per note; emit one note per media item with metadata as frontmatter + the media as a companion file; or start **text-only** (titles / descriptions / transcripts) and treat media archival as a later phase. Shapes whether hiker becomes a media archiver or stays text-first.
+- **Phasing** — a plausible phase 1 is "generalize `BrowserEngine` → the `Engine`/`Acquire` taxonomy in the bench + one real OTS subprocess engine end-to-end to a one-shot manifest dir, text-only," which touches zero core code and proves the taxonomy + live-test against (say) yt-dlp before any re-runnable engine-job-note work.
+
 ## Editor
 
 - **Split view** — shift-clicking a top-strip tab splits the center pane and renders that tab beside the current one. Tile orientation user-selectable. Splits compose with tab kinds (buffer + agent, buffer + graph, two buffers). Each split holds its own active tab and scroll/selection state; closing a split's last tab collapses it. Open splits ride the autosave tab-state snapshot for workspace restore. Lands after `tab-kinds`.
@@ -32,6 +78,15 @@ Hiker renders extracted markdown only; sources are viewed in the user's OS apps 
     - The same per-tab source/target wiring extends to the cluster vector-space visualization (`cluster-vector-viz`) — a viz tab can highlight the active editor's note within the projection or open clicked points into a chosen editor tab.
 
   Generalizes v1's "Related stays bound to the active editor file" (`search-related-stays-bound`) into explicit per-tab source/target wiring. [tabs-linked-targeting]
+
+## Rendered-diagram node navigation
+
+- **Click a diagram node → its source, with footprint highlight** — clicking a node in a rendered mermaid diagram selects the first occurrence of that node's id in the fenced source. One action, two payoffs: it drops the caret into the node for editing, and — because the existing occurrence-highlight fires on any non-empty selection (`editor-view/src/highlight.rs`) — every other place that node appears lights up. That turns "a node is referenced many times" from a problem into the feature: you see the node's whole footprint. Extends `editor-widgets.md` (`widget-block-click-to-edit`, `widget-table-cell-edit`, `editor-widget-click-regions`); the whole-diagram body click (caret at source top) stays the fallback. The app-side logic (emit click-zones for *all* regions a diagram reports, select the first occurrence of `region.id`) is **diagram-type-agnostic** — built once, it works for whatever types report hit regions, and new types light up with zero app change.
+
+  Why deferred — the blockers:
+  - **Only 4 of ~30 types report per-node regions today.** `hiker_mermaid::render_with_regions` derives `HitRegion`s only for flowchart / class / state / ER, whose renderers expose positioned, identified node boxes; every other type goes through `dispatch()`, which returns the SVG only. There's no shared positioned-element representation — each diagram type is a bespoke renderer — so full coverage is ~26 separate per-type changes in the `hiker-render` mermaid submodule (each a `render_X_with_regions` that surfaces its elements + a source-meaningful id).
+  - **Not every type has a sensible node→source mapping.** Node-ish types do (sequence participants/messages, gantt tasks, pie slices, mindmap/timeline/journey nodes, gitgraph commits, requirements); chart-ish types (xychart, quadrant, radar, sankey, packet, info, treemap) have no discrete addressable source token.
+  - **`HitRegion` carries the node id string, not a source byte span** — so the app maps id→source by first-occurrence (word-boundary) search, inheriting the occurrence-highlight feature's substring imprecision (selecting `A` also lights `A` inside `AB`). A renderer that reported per-element source spans would remove both this and the heuristic.
 
 ## Plugins
 
@@ -52,6 +107,10 @@ Hiker renders extracted markdown only; sources are viewed in the user's OS apps 
     - Cross-note thread surfacing — tightly-clustered chunks from different notes hint at a thread crossing several notes (a "you might be writing about X across these places" hint, not an auto-built trail; trails are user-authored only). [cluster-chunk-thread-hint]
     - Multi-topic flagging — a note whose chunks scatter across many clusters is a split candidate (soft suggestion, not auto-action). [cluster-chunk-multitopic-flag]
     - Section reorganization — chunk clusters within a single note suggest heading reorganization.
+
+- **Reusable clustering recipes (named param presets).** A way to save a `cluster-review` configuration (scope + method + params + naming) as a named, reusable preset decoupled from any one tree, so a build setup can be re-applied across vaults / trees without re-tuning. Today an Evergreen tree already carries its own recipe (`clustering.md` build-scope/method), so the lighter version is "clone a tree to inherit its params"; this is the explicit-preset upgrade if that proves too implicit. Surfaced as a save/load on the review tab's config section — *not* a separate job-note (the tree `.md` already fuses recipe + artifact, unlike the external-input extractor jobs). [cluster-config-presets]
+- **Seeded / anchored clusters.** Let the user supply a list of expected clusters as a build input — anchor topics the partitioner is biased toward (semi-supervised: seed centroids / must-link hints), instead of a purely unsupervised pass. A new `ClusterParams` input + a config-section affordance, gated on its own merit. [cluster-seeded-anchors]
+- **Sticky manual overrides across re-runs.** Make a user's manual reassignments (move note → cluster) and per-note pins survive a rebuild / re-triage, so curation isn't lost when an Evergreen tree re-runs against fresh data. The cluster editor already does the reassignment (`cluster-editor-node-operations`); the new part is persisting those decisions as build/triage constraints the next pass respects. [cluster-sticky-overrides]
 
 ## RAG chat
 
@@ -90,7 +149,6 @@ These are mostly small but visible gaps in the editor surface:
 - **Sidebar list-style tabs** — a leftmost button-strip item that opens a vertical tab list in the leftmost panel; supports tab hierarchy (parent / child) so deep tab sets stay scannable. [tab-list-sidebar]
 - **Close-all-tabs verb** — context-menu entry on the tab strip; "Close others" / "Close to the right" follow the same surface. [tab-close-all]
 - **Vertical split in the left sidebar** — split the left panel vertically to show two sidebar modes at once (e.g. filetree + trails). Each pane has its own mode switcher. [sidebar-vertical-split]
-- **Inline editor widgets** — render Mermaid, LaTeX, and tables inline in the live-preview layer as widget decorations (the same `Replace { display }` shape as other live-preview decorations). LaTeX first (no external runtime), Mermaid + tables follow. [editor-inline-widgets]
 
 ## Markdown editing affordances
 

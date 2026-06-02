@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use hiker_core::agent::StopSignal;
-use hiker_core::llm::Message;
+use hiker_llm::Message;
 
 /// One message in a session transcript. Most turns are plain
 /// user/assistant text; `Tool` turns carry the structured tool-call

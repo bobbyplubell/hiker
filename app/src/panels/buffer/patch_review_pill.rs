@@ -12,7 +12,7 @@
 use eframe::egui;
 
 use super::diff_overlay::HunkInfo;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Outcome of a pill-row interaction. Resolved by the buffer panel after
 /// the frame is drawn so accept/reject can call into the op log with the

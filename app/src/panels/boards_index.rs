@@ -16,7 +16,7 @@
 use eframe::egui;
 
 use crate::state::{AppState, Modal};
-use crate::theme;
+use hiker_theme as theme;
 use hiker_core::boards::BoardListItem;
 
 /// A row action requested this frame, applied after the list render so the

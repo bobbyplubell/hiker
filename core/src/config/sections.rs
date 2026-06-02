@@ -1321,13 +1321,6 @@ pub struct VaultConfig {
     /// status: side-panel-resize
     #[serde(default = "default_discovery_width")]
     pub discovery_width: u32,
-    /// Surface `.hiker/sessions/` as a virtual top-level "Sessions" group
-    /// in the tree. Default off — sessions stay hidden alongside other
-    /// `.hiker/` sidecars. Search and related-notes always include
-    /// sessions regardless of this toggle.
-    /// status: chat-session-show-in-tree-toggle
-    #[serde(default = "no")]
-    pub show_sessions_in_tree: bool,
     /// Retired: the multi-region egui-workbench sidebar (`HikerMode` +
     /// `side_panel_persist`) is the real persistence path; this field no
     /// longer drives runtime layout. Kept only as an ignored, deserialize-
@@ -1362,7 +1355,6 @@ impl Default for VaultConfig {
             chat_height: default_chat_height(),
             sidebar_width: default_sidebar_width(),
             discovery_width: default_discovery_width(),
-            show_sessions_in_tree: false,
             sidebar_mode_legacy_ignored: None,
             active_trail: None,
             chat_input_height: 0,

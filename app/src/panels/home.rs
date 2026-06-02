@@ -13,7 +13,7 @@ use hiker_core::activity::ChangeRow;
 use crate::editor_pane;
 use crate::state::AppState;
 use crate::tab::{HomeDetail, Tab, TabKind};
-use crate::theme;
+use hiker_theme as theme;
 
 /// How long a cached snapshot-feed read stays fresh. The feed is a SQLite
 /// metadata query under the vault-wide op-log lock; running it every frame

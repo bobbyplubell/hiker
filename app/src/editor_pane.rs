@@ -61,6 +61,15 @@ pub(crate) fn ensure_vault_buffer_loaded(state: &mut AppState, rel: &str) -> boo
 /// sticky (Mod-click / "Keep open" / drag); otherwise it lands in the
 /// preview slot, replacing any prior preview tab.
 pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
+    // A `.canvas` file opens in the spatial canvas view, never as a raw-JSON text
+    // buffer. Route it to the canvas open path so back/forward navigation (and
+    // any other `open_file` caller, e.g. the tree's Open verb) lands on the
+    // canvas editor instead of its JSON. `canvas::open` owns its own nav push and
+    // respects `nav.locked`, so it isn't double-recorded. status: canvas-nav-stack
+    if rel.ends_with(".canvas") {
+        crate::panels::canvas::open(state, rel);
+        return;
+    }
     // Navigation history: skip when we're already navigating via
     // back/forward (the index points at this entry already).
     if !state.session.nav.locked {
@@ -222,6 +231,11 @@ fn navigate_to(state: &mut AppState, target: &NavTarget) {
         }
         NavTarget::HistoryVersion { path, op_id } => {
             set_active_tab_kind(state, TabKind::version_preview(path.clone(), op_id.clone()));
+        }
+        NavTarget::ZimArticle { zim_path, article } => {
+            // `nav.locked` is set by `nav_go`, so this in-place restore doesn't
+            // re-push onto the stack.
+            crate::panels::zim::restore_nav(state, zim_path, article.clone());
         }
     }
 }
@@ -474,11 +488,22 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
             .map(|t| t.id);
     }
 
-    // If no other tab references this buffer, drop it from memory.
+    // If no other tab references this buffer, drop it from memory — *unless*
+    // it has unsaved work. A note kept open only by a non-tab host (a canvas
+    // card editing it via `embedded-buffer-view`) survives tab close while
+    // dirty: autosave commits it, and once clean + tabless it's dropped on a
+    // later close. Without this guard, closing the tab while a card edits the
+    // same shared `Editor` would evict the buffer (and its unsaved edits) out
+    // from under the card. status: embedded-buffer-view-lifecycle
     if let Some(path) = removed.kind.vault_path().map(std::string::ToString::to_string) {
         let still_open =
             state.session.tabs.iter().any(|t| t.kind.vault_path() == Some(&path));
-        if !still_open {
+        let dirty = state
+            .session
+            .buffers
+            .get(&path)
+            .is_some_and(crate::buffer::Buffer::is_dirty);
+        if !still_open && !dirty {
             state.session.buffers.remove(&path);
         }
     }
@@ -514,6 +539,32 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
     // user persists, keyed by the closed tab's id.
     if matches!(&removed.kind, TabKind::ClusterReview { .. }) {
         state.clusters_state.review_panes.remove(&id);
+    }
+
+    // Drop the capture pane state, flipping any in-flight engine run's
+    // cancel flag so its background thread stops promptly. status: crawl-job-form
+    if matches!(&removed.kind, TabKind::Capture { .. }) {
+        crate::panels::capture::on_tab_closed(&mut state.panels.captures, id);
+    }
+
+    // Drop the ZIM viewer pane (archive handle + render texture), which
+    // lives in a UI-thread-local store. status: zim-view
+    if matches!(&removed.kind, TabKind::ZimView { .. }) {
+        crate::panels::zim::forget(id);
+    }
+
+    // Drop a canvas tab's per-tab pane (parsed doc + view widget) and its
+    // node-content panes (editor / htmlview state), the latter in a
+    // UI-thread-local store keyed by tab + node id. status: canvas-tab
+    if let TabKind::Canvas { path } = &removed.kind {
+        // Snapshot the pane's view state (camera pan/zoom + per-card scroll/zoom)
+        // into the session map keyed by path BEFORE dropping the pane, so a
+        // reopen in the same session restores it. status: canvas-view-state-persist
+        let path = path.clone();
+        crate::panels::canvas::capture_view(state, id, &path);
+        state.panels.canvases.remove(&id);
+        crate::panels::canvas::content::forget(id);
+        crate::panels::canvas::edit::forget(id);
     }
 }
 

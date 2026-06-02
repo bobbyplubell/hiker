@@ -39,11 +39,19 @@ fn map_err(e: SubstrateError) -> HikerError {
 
 /// The op-log document `kind` for a vault-relative path. Native vault
 /// markdown is `"markdown"`; a `*.<ext>.md` next to a non-md source is a
-/// `"sidecar"` per `design.md`'s storage-mode table. The string is recorded
-/// in the Yrs Doc's `meta.kind` for the re-extraction / lifecycle surfaces
-/// that read it later; bootstrap and create both stamp it.
+/// `"sidecar"` per `design.md`'s storage-mode table; a `.canvas` file is a
+/// `"canvas"` JSON Canvas document. The string is recorded in the Yrs Doc's
+/// `meta.kind` for the re-extraction / lifecycle surfaces that read it later;
+/// bootstrap and create both stamp it.
+//
+// status: canvas-doc-kind
 fn kind_for(rel: &str) -> &'static str {
     let name = rel.rsplit('/').next().unwrap_or(rel);
+    // A `.canvas` file is a first-class JSON Canvas op-log document — its
+    // JSON text rides op-log exactly like a note, under the `canvas` kind.
+    if name.ends_with(".canvas") {
+        return "canvas";
+    }
     // A sidecar is `<full-source-filename>.md` — i.e. a `.md` whose stem
     // still carries a source extension (`diagram.png.md`, `contract.pdf.md`).
     let stem = name.strip_suffix(".md").unwrap_or(name);
@@ -123,10 +131,14 @@ fn seed_one(vault: &Vault, log: &OpLog, rel: &str) -> Result<bool, HikerError> {
 }
 
 /// Walk a hidden vault subtree (e.g. `.hiker/trails`) returning every `.md`
-/// file as a vault-relative path. Used by [`bootstrap`] to reach files the
-/// main [`Vault::walk_indexable_files`] pass prunes at `.hiker/`. Symlinks
-/// are not followed, mirroring the main walker's policy.
-fn walk_hidden_md_subtree(vault: &Vault, rel_subtree: &str) -> Result<Vec<String>, HikerError> {
+/// file as a vault-relative path. Used by [`bootstrap`] (and the trails
+/// storage-layout migration) to reach files the main
+/// [`Vault::walk_indexable_files`] pass prunes at `.hiker/`. Symlinks are not
+/// followed, mirroring the main walker's policy.
+pub(crate) fn walk_hidden_md_subtree(
+    vault: &Vault,
+    rel_subtree: &str,
+) -> Result<Vec<String>, HikerError> {
     let abs = vault.root().join(rel_subtree);
     if !abs.is_dir() {
         return Ok(Vec::new());
@@ -199,6 +211,104 @@ pub fn user_save(log: &OpLog, vault: &Vault, rel: &str, new_text: &str) -> Resul
     let doc_id = doc_id_or_seed(log, vault, rel, "")?;
     log.apply_user_text(&doc_id, new_text).map_err(map_err)?;
     Ok(())
+}
+
+/// The outcome of a re-extraction routed through [`reextract`]: which policy
+/// fired and whether a new version landed. The host surfaces this to decide
+/// whether to re-index the sidecar / report "no change".
+///
+/// status: op-log-reextract-replace
+/// status: op-log-reextract-skip
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReextractOutcome {
+    /// A previously-LINKED sidecar: the new body was applied as an `extractor`
+    /// op on `accepted` and a new version landed.
+    Replaced,
+    /// A previously-LINKED sidecar whose re-extraction produced *identical*
+    /// content — no op, no version (the no-op-on-identical contract).
+    Unchanged,
+    /// A previously-UNLINKED sidecar (the user unlinked to hand-edit): the
+    /// extractor did not overwrite the body (`op-log-reextract-skip`).
+    Skipped,
+}
+
+/// Route a re-extraction's new body onto an existing LINKED sidecar as an
+/// `extractor`-authored op (`op-log-reextract-replace`), or skip it when the
+/// sidecar is UNLINKED (`op-log-reextract-skip`). The policy is selected from
+/// the sidecar's *current* on-disk link state: a `fill_body: false` /
+/// `link_state: unlinked` sidecar means the user took the body over by hand, so
+/// re-extraction must not clobber it; anything else (the linked default) lands
+/// the new body in place, leaving prior bodies in op-log history rather than a
+/// blind overwrite.
+///
+/// `rel` is the sidecar's vault-relative path; `new_body` is the freshly
+/// extracted body (the `Extracted.markdown` the leaf crate produced);
+/// `extractor_id` is the producing extractor's name (the `extractor:<id>`
+/// author identity). The doc must already exist (a first-time extraction of a
+/// brand-new sidecar uses the direct write path, not this) — an unmapped path
+/// resolves no policy and is reported `Skipped`.
+///
+/// This is the seam between `hiker-extract`'s output and `core::oplog`: the
+/// leaf crate produces the body; the host calls here to apply it as an op so
+/// the sidecar's version history, diff, per-hunk restore, and the status-bar
+/// version dropdown all come from the existing op-log / `core::changes`
+/// surfaces — no bespoke version store.
+///
+/// status: op-log-reextract-replace
+/// status: op-log-reextract-skip
+/// status: extract-version-oplog
+pub fn reextract(
+    log: &OpLog,
+    vault: &Vault,
+    rel: &str,
+    new_body: &str,
+    extractor_id: &str,
+) -> Result<ReextractOutcome, HikerError> {
+    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
+        // No op-log document: not a previously-extracted linked sidecar. The
+        // first-time-extraction direct write path owns this case.
+        return Ok(ReextractOutcome::Skipped);
+    };
+    if sidecar_is_unlinked(vault, rel) {
+        return Ok(ReextractOutcome::Skipped);
+    }
+    if log.reextract_replace(&doc_id, new_body, extractor_id).map_err(map_err)? {
+        Ok(ReextractOutcome::Replaced)
+    } else {
+        Ok(ReextractOutcome::Unchanged)
+    }
+}
+
+/// Whether the sidecar at `rel` is UNLINKED — the user-unlinked-to-hand-edit
+/// escape hatch (`capture-fill-body-toggle` / `extract-sidecar-linked-state`).
+/// Reads the on-disk frontmatter: a sidecar is unlinked when `hiker.link_state`
+/// is `unlinked` *or* `hiker.fill_body` is `false`. Anything else (linked
+/// default, missing fields, unreadable file) is treated as LINKED so the
+/// re-extraction replaces in place — the conservative default that keeps
+/// extraction working for the source-type.
+fn sidecar_is_unlinked(vault: &Vault, rel: &str) -> bool {
+    let Ok(source) = vault.read_file(rel) else {
+        return false;
+    };
+    let Some(fm) = crate::frontmatter::split(&source).frontmatter else {
+        return false;
+    };
+    let Some(hiker) = fm.get("hiker") else {
+        return false;
+    };
+    if hiker
+        .get("link_state")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("unlinked"))
+    {
+        return true;
+    }
+    // `fill_body: false` is the capture-spec note's body-link switch — an
+    // explicit "don't fill the body" is the same as unlinked for re-extraction.
+    hiker
+        .get("fill_body")
+        .and_then(serde_yml::Value::as_bool)
+        == Some(false)
 }
 
 /// One anchored or whole-body edit handed to [`stage_agent_edits`]. Mirrors

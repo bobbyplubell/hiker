@@ -277,9 +277,11 @@ static A_CHAT_NEW: Action = Action {
             .read()
             .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
             .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+        let chats_dir = crate::chat::session::chats_dir(&state.vault_session.config);
         if let Err(err) = crate::chat::session::create_new(
             &mut state.chat_state.registry,
             &vault_root,
+            &chats_dir,
             &model,
             &provider,
         ) {
@@ -370,6 +372,29 @@ static A_FILE_CLOSE_TAB: Action = Action {
     run: |s| {
         if let Some(id) = s.session.active_tab {
             crate::editor_pane::close_tab_with_dirty_guard(s, id);
+        }
+    },
+    category: ActionCategory::File,
+};
+
+static A_FILE_NEW_NOTE: Action = Action {
+    id: "file.new_note",
+    icon: icons::Icon::Plus,
+    label: "New note",
+    badge: None,
+    enabled: None,
+    // Context-dependent: when the active tab is a Canvas, create a note ON that
+    // canvas (the same as the right-click "New note" verb — mint a vault note and
+    // drop a File pointer node); otherwise open a fresh note in a new tab.
+    // status: canvas-new-note
+    run: |s| {
+        let canvas_tab = s.session.active_tab.and_then(|id| {
+            let tab = s.tab_by_id(id)?;
+            matches!(tab.kind, TabKind::Canvas { .. }).then_some(id)
+        });
+        match canvas_tab {
+            Some(id) => crate::panels::canvas::new_note_on_canvas(s, id),
+            None => s.new_note(),
         }
     },
     category: ActionCategory::File,
@@ -649,6 +674,7 @@ static ALL: &[&Action] = &[
     &A_VIEW_TOOLBAR_CUSTOMIZE,
     &A_VIEW_TOOLBAR_RESET,
     &A_FILE_CLOSE_TAB,
+    &A_FILE_NEW_NOTE,
     &A_PALETTE_OPEN,
     &A_EDITOR_SAVE,
     &A_EDITOR_FIND,

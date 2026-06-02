@@ -14,7 +14,7 @@ use eframe::egui;
 use hiker_core::plugins::manifest::{blake3_pin, Manifest, PinnedEntry, PluginsFile};
 
 use crate::state::{AppState, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 /// A plugin picked from disk, parsed + hashed, awaiting the user's consent
 /// before it's copied into the vault and pinned. Stored in egui memory.

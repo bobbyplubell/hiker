@@ -22,7 +22,7 @@ use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole, State};
 use crate::feature::Ctx;
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Render the docked chat sidebar body through the narrow feature `Ctx`.
 /// Mirrors `Chat::render_full_tab(show_header=false)`: a transcript area
@@ -47,7 +47,8 @@ impl SideBar<'_, '_> {
         // then fold in this frame's reply-task events.
         if !self.st().discovered {
             let root = self.ctx.vault.root().to_path_buf();
-            session::discover(&mut self.st().registry, &root);
+            let chats_dir = session::chats_dir(self.ctx.config);
+            session::discover(&mut self.st().registry, &root, &chats_dir);
             self.st().discovered = true;
         }
         self.st().registry.pump_events();
@@ -272,7 +273,7 @@ impl SideBar<'_, '_> {
         let mention_state = draft.active_at_mention();
         if let Some((_, ref query)) = mention_state {
             let has_any =
-                !mention_suggestions(self.ctx.services, self.ctx.vault, query, 1).is_empty();
+                !mention_suggestions(self.ctx.vault.clone(), query, 1).is_empty();
             if has_any {
                 egui::Popup::open_id(ui.ctx(), mention_popup_id);
             } else if egui::Popup::is_id_open(ui.ctx(), mention_popup_id) {
@@ -285,7 +286,7 @@ impl SideBar<'_, '_> {
         let Some((prefix_start, query)) = mention_state else {
             return;
         };
-        let suggestions = mention_suggestions(self.ctx.services, self.ctx.vault, &query, 8);
+        let suggestions = mention_suggestions(self.ctx.vault.clone(), &query, 8);
         let popup_w = resp.rect.width().max(160.0);
         egui::Popup::from_response(resp)
             .id(mention_popup_id)

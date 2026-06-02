@@ -1,10 +1,12 @@
 //! Persisted chat sessions. See `docs/llm.md` §Sessions.
 //!
 //! A session is the unit of conversational continuity — many turns share
-//! one accumulating message history, persisted as markdown under
-//! `vault/.hiker/sessions/<YYYY-MM-DD>-<id>.md`. Markdown is the
-//! source of truth; the in-memory `SessionState` in the chat command
-//! surface is a working cache rebuilt from it on resume.
+//! one accumulating message history, persisted as markdown under the
+//! visible chats folder `vault/<chats_dir>/<YYYY-MM-DD>-<id>.md` (default
+//! `chats/`, configurable via `[chat] chats_dir`). Sessions are ordinary
+//! visible notes, not hidden under `.hiker/` (`subsystem-notes-visible`).
+//! Markdown is the source of truth; the in-memory `SessionState` in the
+//! chat command surface is a working cache rebuilt from it on resume.
 //!
 //! File shape:
 //!
@@ -38,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{Message, Role, ToolCall, ToolResult};
+use hiker_llm::{Message, Role, ToolCall, ToolResult};
 
 /// Wraps the per-session id. Cheap to clone, opaque to callers; the
 /// chat command surface mints fresh ones via `SessionId::generate`.
@@ -91,33 +93,53 @@ pub struct SessionFileInfo {
     pub mtime_unix: i64,
 }
 
-/// `<vault_root>/.hiker/sessions/`.
-pub fn dir(vault_root: &Path) -> PathBuf {
-    vault_root.join(".hiker").join("sessions")
+/// Normalize a configured `chats_dir` to a vault-relative path with no
+/// leading/trailing slashes (`"chats/"` → `"chats"`). Falls back to the
+/// default `"chats"` when the value is empty after trimming.
+fn normalize_chats_dir(chats_dir: &str) -> &str {
+    let trimmed = chats_dir.trim_matches('/');
+    if trimmed.is_empty() {
+        "chats"
+    } else {
+        trimmed
+    }
 }
 
-/// `vault/.hiker/sessions/<YYYY-MM-DD>-<id>.md`.
-pub fn session_file_path(vault_root: &Path, id: &SessionId, created_at_unix: i64) -> PathBuf {
+/// Absolute path of the chats folder: `<vault_root>/<chats_dir>/`.
+pub fn dir(vault_root: &Path, chats_dir: &str) -> PathBuf {
+    vault_root.join(normalize_chats_dir(chats_dir))
+}
+
+/// `vault/<chats_dir>/<YYYY-MM-DD>-<id>.md`.
+pub fn session_file_path(
+    vault_root: &Path,
+    chats_dir: &str,
+    id: &SessionId,
+    created_at_unix: i64,
+) -> PathBuf {
     let date = format_date_yyyy_mm_dd(created_at_unix);
-    dir(vault_root).join(format!("{}-{}.md", date, id.0))
+    dir(vault_root, chats_dir).join(format!("{}-{}.md", date, id.0))
 }
 
 /// Vault-relative path matching `session_file_path`'s on-disk shape.
-/// Used by callers that want to enqueue an `IndexJob::Upsert` without
-/// going through the watcher (sessions live under `.hiker/` which the
-/// watcher carves out specifically; see `core::watcher::is_ignored`).
-pub fn session_rel_path(id: &SessionId, created_at_unix: i64) -> String {
+/// Sessions are ordinary visible notes in `<chats_dir>/`, so the watcher
+/// + indexer pick them up like any other note (no `.hiker/` carve-out).
+pub fn session_rel_path(chats_dir: &str, id: &SessionId, created_at_unix: i64) -> String {
     let date = format_date_yyyy_mm_dd(created_at_unix);
-    format!(".hiker/sessions/{}-{}.md", date, id.0)
+    format!("{}/{}-{}.md", normalize_chats_dir(chats_dir), date, id.0)
 }
 
 /// Create the session file with the YAML frontmatter header. Idempotent
 /// over the directory (creates if missing); errors if the file already
 /// exists so a duplicate id is loud rather than silent.
-pub fn create_session_file(vault_root: &Path, meta: &SessionMeta) -> io::Result<PathBuf> {
-    let dir = dir(vault_root);
+pub fn create_session_file(
+    vault_root: &Path,
+    chats_dir: &str,
+    meta: &SessionMeta,
+) -> io::Result<PathBuf> {
+    let dir = dir(vault_root, chats_dir);
     fs::create_dir_all(&dir)?;
-    let path = session_file_path(vault_root, &meta.id, meta.created_at_unix);
+    let path = session_file_path(vault_root, chats_dir, &meta.id, meta.created_at_unix);
     if path.exists() {
         return Ok(path);
     }
@@ -234,40 +256,49 @@ pub fn append_turn_structured(
     f.flush()
 }
 
-/// Discover all session files under `<vault>/.hiker/sessions/`, sorted
-/// newest-first by filesystem mtime. Empty when the directory doesn't
-/// exist yet.
-pub fn list(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
-    let dir = dir(vault_root);
-    let read = match fs::read_dir(&dir) {
+/// Discover all session files under `<vault>/<chats_dir>/`, sorted
+/// newest-first by filesystem mtime. Recurses one level into the
+/// `imported/` subfolder so imported sessions surface in the picker
+/// alongside native ones. Empty when the directory doesn't exist yet.
+pub fn list(vault_root: &Path, chats_dir: &str) -> io::Result<Vec<SessionFileInfo>> {
+    let root = dir(vault_root, chats_dir);
+    let mut out = Vec::new();
+    collect_sessions(&root, vault_root, &mut out)?;
+    let imported = root.join("imported");
+    if imported.is_dir() {
+        collect_sessions(&imported, vault_root, &mut out)?;
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.mtime_unix));
+    Ok(out)
+}
+
+/// Append every `*.md` session file directly under `dir` to `out`. A
+/// missing directory is treated as empty (not an error) so a fresh vault
+/// lists cleanly.
+fn collect_sessions(
+    dir: &Path,
+    vault_root: &Path,
+    out: &mut Vec<SessionFileInfo>,
+) -> io::Result<()> {
+    let read = match fs::read_dir(dir) {
         Ok(r) => r,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    let mut out = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        // `<YYYY-MM-DD>-<id>` — the id is everything after the third '-'.
+        // `<YYYY-MM-DD>-<id>` (native) or `<source>-<YYYY-MM-DD>-<id>`
+        // (imported) — the id is the final hyphen-delimited segment.
         let id_opt = (|| -> Option<SessionId> {
             let stem = path.file_stem()?.to_str()?;
-            let mut hyphens = 0;
-            let mut idx = 0;
-            for (i, ch) in stem.char_indices() {
-                if ch == '-' {
-                    hyphens += 1;
-                    if hyphens == 3 {
-                        idx = i + 1;
-                        break;
-                    }
-                }
-            }
-            if idx == 0 || idx >= stem.len() {
+            let tail = stem.rsplit('-').next()?;
+            if tail.is_empty() || tail == stem {
                 return None;
             }
-            Some(SessionId(stem[idx..].to_string()))
+            Some(SessionId(tail.to_string()))
         })();
         let Some(id) = id_opt else { continue };
         let mtime = entry
@@ -289,15 +320,91 @@ pub fn list(vault_root: &Path) -> io::Result<Vec<SessionFileInfo>> {
             mtime_unix: mtime,
         });
     }
-    out.sort_by_key(|s| std::cmp::Reverse(s.mtime_unix));
-    Ok(out)
+    Ok(())
 }
 
 /// Most recent session file (newest mtime) or `None` if the dir is
 /// empty / absent.
-pub fn most_recent_session(vault_root: &Path) -> io::Result<Option<SessionFileInfo>> {
-    let mut all = list(vault_root)?;
+pub fn most_recent_session(
+    vault_root: &Path,
+    chats_dir: &str,
+) -> io::Result<Option<SessionFileInfo>> {
+    let mut all = list(vault_root, chats_dir)?;
     Ok(if all.is_empty() { None } else { Some(all.swap_remove(0)) })
+}
+
+/// One-time storage-layout migration: relocate any legacy hidden
+/// `<vault>/.hiker/sessions/` content (native sessions at the top level and
+/// imports under `imported/`) into the visible chats folder
+/// `<vault>/<chats_dir>/`, then remove the now-empty legacy directory.
+/// Sessions are ordinary visible notes per `subsystem-notes-visible`; this
+/// brings vaults created under the old hidden layout forward.
+///
+/// **Idempotent.** A vault already on the new layout has no
+/// `.hiker/sessions/` directory, so the function returns `Ok(0)` after a
+/// cheap existence check. A destination file that already exists is left
+/// untouched (the move already happened, or a name collision the user must
+/// resolve by hand) and the legacy copy is kept rather than clobbering.
+///
+/// Returns the number of files relocated. Runs off disk only — the relocated
+/// notes are picked up by the op-log bootstrap seed and the initial full
+/// scan on the same vault open, so the caller need not re-index explicitly.
+pub fn migrate_to_chats_dir(vault_root: &Path, chats_dir: &str) -> io::Result<usize> {
+    let legacy_root = vault_root.join(".hiker").join("sessions");
+    if !legacy_root.is_dir() {
+        return Ok(0);
+    }
+    let dest_root = dir(vault_root, chats_dir);
+    let mut moved = 0usize;
+    // Native sessions sit directly under the legacy dir; imports under its
+    // `imported/` subfolder. Mirror that structure into the destination.
+    moved += move_md_files(&legacy_root, &dest_root)?;
+    let legacy_imported = legacy_root.join("imported");
+    if legacy_imported.is_dir() {
+        moved += move_md_files(&legacy_imported, &dest_root.join("imported"))?;
+        let _ = fs::remove_dir(&legacy_imported);
+    }
+    // Best-effort cleanup of the now-empty legacy shell so a second open
+    // takes the early-return path above.
+    let _ = fs::remove_dir(&legacy_root);
+    Ok(moved)
+}
+
+/// Move every `*.md` file directly under `from` into `to`, creating `to` on
+/// first move. A destination file that already exists is skipped (kept in
+/// place at `from`) so the migration never clobbers. Returns the count
+/// moved.
+fn move_md_files(from: &Path, to: &Path) -> io::Result<usize> {
+    let read = match fs::read_dir(from) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut moved = 0usize;
+    let mut created_dest = false;
+    for entry in read.flatten() {
+        let src = entry.path();
+        if src.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(name) = src.file_name() else { continue };
+        let dest = to.join(name);
+        if dest.exists() {
+            tracing::warn!(
+                src = %src.display(),
+                dest = %dest.display(),
+                "sessions migration: destination exists; leaving legacy copy in place"
+            );
+            continue;
+        }
+        if !created_dest {
+            fs::create_dir_all(to)?;
+            created_dest = true;
+        }
+        fs::rename(&src, &dest)?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 /// One reconstructed turn, used to seed the in-memory cache when
@@ -512,7 +619,7 @@ mod tests {
             model: "claude-sonnet-4-7".into(),
             provider: "anthropic".into(),
         };
-        let path = create_session_file(dir.path(), &meta).unwrap();
+        let path = create_session_file(dir.path(), "chats/", &meta).unwrap();
         append_turn(&path, "hello", "hi there", &[]).unwrap();
         append_turn(
             &path,
@@ -539,7 +646,7 @@ mod tests {
             model: "claude-sonnet-4-7".into(),
             provider: "anthropic".into(),
         };
-        let path = create_session_file(dir.path(), &meta).unwrap();
+        let path = create_session_file(dir.path(), "chats/", &meta).unwrap();
         let tc = ToolCall {
             id: "call_1".into(),
             name: "search_notes".into(),
@@ -592,7 +699,7 @@ mod tests {
             model: "claude-sonnet-4-7".into(),
             provider: "anthropic".into(),
         };
-        let path = create_session_file(dir.path(), &meta).unwrap();
+        let path = create_session_file(dir.path(), "chats/", &meta).unwrap();
         append_turn(&path, "hello", "hi", &[]).unwrap();
         let tc = ToolCall {
             id: "c1".into(),
@@ -648,8 +755,8 @@ mod tests {
             model: "m".into(),
             provider: "p".into(),
         };
-        let p1 = create_session_file(dir.path(), &m1).unwrap();
-        let p2 = create_session_file(dir.path(), &m2).unwrap();
+        let p1 = create_session_file(dir.path(), "chats/", &m1).unwrap();
+        let p2 = create_session_file(dir.path(), "chats/", &m2).unwrap();
         // Touch p2 last so its mtime is newer regardless of birth order.
         // Sleep ensures the file system registers a distinct timestamp;
         // some CoW / overlay filesystems have coarse (1s) mtime granularity.
@@ -658,32 +765,106 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(&p2, fs::read(&p2).unwrap()).unwrap();
         let _ = p1;
-        let list = list(dir.path()).unwrap();
+        let list = list(dir.path(), "chats/").unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id.0, "bbb");
     }
 
     #[test]
-    fn parse_id_strips_date_prefix() {
-        let p = PathBuf::from("/x/.hiker/sessions/2026-05-08-abc123def.md");
-        let parse = |path: &Path| -> Option<SessionId> {
-            let stem = path.file_stem()?.to_str()?;
-            let mut hyphens = 0;
-            let mut idx = 0;
-            for (i, ch) in stem.char_indices() {
-                if ch == '-' {
-                    hyphens += 1;
-                    if hyphens == 3 {
-                        idx = i + 1;
-                        break;
-                    }
-                }
-            }
-            if idx == 0 || idx >= stem.len() {
-                return None;
-            }
-            Some(SessionId(stem[idx..].to_string()))
-        };
-        assert_eq!(parse(&p).unwrap().0, "abc123def");
+    fn list_parses_native_and_imported_ids() {
+        // Native sessions live at <chats_dir>/<date>-<id>.md; imported
+        // sessions at <chats_dir>/imported/<source>-<date>-<id>.md. `list`
+        // recurses one level into `imported/` and extracts the trailing
+        // hyphen-delimited segment as the id in both cases.
+        let dir = tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let imported = chats.join("imported");
+        fs::create_dir_all(&imported).unwrap();
+        fs::write(chats.join("2026-05-08-abc123def.md"), "---\n---\n").unwrap();
+        fs::write(
+            imported.join("claude-code-2026-05-01-xyz789.md"),
+            "---\n---\n",
+        )
+        .unwrap();
+        let infos = list(dir.path(), "chats/").unwrap();
+        let mut ids: Vec<String> = infos.iter().map(|i| i.id.0.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["abc123def".to_string(), "xyz789".to_string()]);
+        // The imported entry's rel_path is under chats/imported/.
+        assert!(infos
+            .iter()
+            .any(|i| i.rel_path == "chats/imported/claude-code-2026-05-01-xyz789.md"));
+    }
+
+    #[test]
+    fn migrate_relocates_legacy_sessions_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join(".hiker").join("sessions");
+        let legacy_imported = legacy.join("imported");
+        fs::create_dir_all(&legacy_imported).unwrap();
+        fs::write(legacy.join("2026-05-08-abc123def.md"), "native\n").unwrap();
+        fs::write(
+            legacy_imported.join("claude-code-2026-05-01-xyz789.md"),
+            "imported\n",
+        )
+        .unwrap();
+
+        let moved = migrate_to_chats_dir(dir.path(), "chats/").unwrap();
+        assert_eq!(moved, 2);
+        // Relocated to the visible folder.
+        let native = dir.path().join("chats").join("2026-05-08-abc123def.md");
+        let imported = dir
+            .path()
+            .join("chats")
+            .join("imported")
+            .join("claude-code-2026-05-01-xyz789.md");
+        assert!(native.exists());
+        assert!(imported.exists());
+        assert_eq!(fs::read_to_string(&native).unwrap(), "native\n");
+        // Legacy directory gone.
+        assert!(!dir.path().join(".hiker").join("sessions").exists());
+
+        // Second run is a cheap no-op (nothing left to move).
+        let again = migrate_to_chats_dir(dir.path(), "chats/").unwrap();
+        assert_eq!(again, 0);
+
+        // The relocated sessions are discoverable via `list`.
+        let infos = list(dir.path(), "chats/").unwrap();
+        assert_eq!(infos.len(), 2);
+    }
+
+    #[test]
+    fn migrate_skips_when_destination_collides() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join(".hiker").join("sessions");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("2026-05-08-abc.md"), "legacy\n").unwrap();
+        // A file already at the destination with the same name.
+        let dest_dir = dir.path().join("chats");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("2026-05-08-abc.md"), "existing\n").unwrap();
+
+        let moved = migrate_to_chats_dir(dir.path(), "chats/").unwrap();
+        assert_eq!(moved, 0);
+        // The destination is untouched; the legacy copy is kept in place.
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("2026-05-08-abc.md")).unwrap(),
+            "existing\n"
+        );
+        assert!(legacy.join("2026-05-08-abc.md").exists());
+    }
+
+    #[test]
+    fn session_rel_path_normalizes_trailing_slash() {
+        let id = SessionId("deadbeef".into());
+        assert_eq!(
+            session_rel_path("chats/", &id, 1_754_654_400),
+            "chats/2025-08-08-deadbeef.md"
+        );
+        // A bare value without trailing slash works identically.
+        assert_eq!(
+            session_rel_path("conversations", &id, 1_754_654_400),
+            "conversations/2025-08-08-deadbeef.md"
+        );
     }
 }

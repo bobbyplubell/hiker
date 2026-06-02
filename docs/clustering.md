@@ -497,7 +497,7 @@ struct ClusterNode {
 
 ## Module discipline
 
-All clustering logic lives in `core::cluster`. Outside the module: `partition()` returns plain assignments, `build_tree()` returns a `ClusterTree` of plain Rust types. No HDBSCAN-crate types leak past the boundary. Same reasoning as `core::store` and `core::embed` — algorithm choice is a defensible default, not a permanent commitment, and the future swap (GMM, agglomerative, leiden) should be a one-file rewrite. [cluster-module-discipline]
+All clustering logic lives in `core::cluster`. Outside the module: `partition()` returns plain assignments, the build returns a neutral `BuiltClusterTree` of plain Rust types. No HDBSCAN-crate types leak past the boundary — **and `core::cluster` has no dependency on tree *storage* types either**: turning a `BuiltClusterTree` into `trees::types::{Db, NodeKind}` storage rows is the job of the storage-side adapter `core::trees::build_adapter` (`node_inserts` / `persist` / `rebuild_and_persist`), which depends downward on `core::cluster`. So the dependency is one-way (`trees → cluster`) — the algorithm never reaches up into storage. Same reasoning as `core::store` and `core::embed` — algorithm choice is a defensible default, not a permanent commitment, and the future swap (GMM, agglomerative, leiden) should be a one-file rewrite. [cluster-module-discipline]
 
 Summarization is its own module (`core::summarize`) since it has independent failure modes (LLM unavailable, slow, low-quality) and an independent swap surface (local model vs cloud vs extractive fallback).
 

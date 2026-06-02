@@ -328,6 +328,49 @@ impl OpLog {
         )
     }
 
+    /// Re-extraction `Replace`: apply a single Yrs update to `accepted` that
+    /// replaces the document's **body region** (everything after the leading
+    /// frontmatter fence) with `new_body`, authored `extractor:<id>`. The
+    /// frontmatter fence is left byte-for-byte untouched — only the body bytes
+    /// that actually differ become Yrs ops (the commit path diffs the assembled
+    /// `frontmatter + new_body` against the current `accepted` into minimal
+    /// localized spans), so a concurrent user edit elsewhere merges via Yrs's
+    /// text CRDT and the frontmatter is never rewritten.
+    ///
+    /// An **identical** re-extraction (the resulting body equals the current
+    /// body) produces an empty diff and is a **no-op**: no Yrs op, no metadata
+    /// row, no history frame, no version. Returns `Ok(true)` when a new version
+    /// landed, `Ok(false)` on the identical-content no-op. This is the default
+    /// re-extraction policy for a previously-LINKED sidecar (`fill_body: true`).
+    /// Per `op-log.md`'s "Re-extraction" table (`Replace`) and `extract.md`'s
+    /// "Versioning and retention".
+    ///
+    /// status: op-log-reextract-replace
+    /// status: extract-version-oplog
+    pub fn reextract_replace(
+        &self,
+        doc_id: &str,
+        new_body: &str,
+        extractor_id: &str,
+    ) -> Result<bool, Error> {
+        // Read the current accepted text, keep its leading frontmatter fence
+        // verbatim, and splice the new body after it. The full assembled text
+        // is committed through the shared text-commit path, which diffs it into
+        // minimal localized spans — so untouched frontmatter bytes carry no op
+        // and an unchanged body produces no op at all.
+        let current = self.materialize_accepted(doc_id)?.text;
+        let fence_end = shapes::frontmatter_fence_end(&current).unwrap_or(0);
+        let mut assembled = String::with_capacity(fence_end + new_body.len());
+        assembled.push_str(&current[..fence_end]);
+        assembled.push_str(new_body);
+        self.commit_text_edit(
+            doc_id,
+            EditInput::FullText(&assembled),
+            &Author::Extractor(extractor_id.to_string()),
+            Some("extractor"),
+        )
+    }
+
     /// Save: fold the user's `working` overlay into `accepted`. Returns
     /// `Ok(false)` when the buffer is clean (no `working`). Otherwise reads
     /// `materialize(working).text` and commits it through the shared text-commit

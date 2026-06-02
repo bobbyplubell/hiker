@@ -9,7 +9,7 @@ use eframe::egui;
 
 use crate::icons::{self, Icon};
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Preferred command-center width: a fraction of the strip, clamped to a
 /// sensible pill size.

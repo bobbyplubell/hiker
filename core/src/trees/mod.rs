@@ -13,6 +13,9 @@
 //! Submodule layout (per `trees-module-discipline`):
 //!
 //! - `types`         — public DTOs (`Db`, `EditableNode`, `NodeKind`, …)
+//! - `build_adapter` — converts `cluster::BuiltClusterTree` (the algorithm's
+//!   neutral output) into `NodeInsert`/`NodeKind` rows + the `persist` /
+//!   `rebuild_and_persist` wrappers — the one-way `trees → cluster` seam
 //! - `store`         — frontmatter load/serialize, the in-memory `TreeDoc`,
 //!   op-log writes, and the basic CRUD
 //! - `history`       — in-memory session undo/redo log + `record_*` helpers
@@ -33,6 +36,7 @@
 //! status: cluster-editor-tree-shape
 //! status: cluster-editor-edit-history
 
+pub mod build_adapter;
 pub mod history;
 pub mod ops;
 pub mod store;

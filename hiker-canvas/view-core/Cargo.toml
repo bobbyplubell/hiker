@@ -1,0 +1,21 @@
+[package]
+name = "canvas-view-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The egui-FREE view + interaction layer of the JSON Canvas editor: the
+# pan/zoom camera, cubic-Bézier edge routing, resize/connector handle geometry,
+# pointer hit-testing + gesture→`EditOp` decisions, selection, and the in-session
+# undo stack. It depends only on `emath` (egui's math types, no rendering) and
+# the egui-agnostic `hiker-canvas` core — the analog of the editor's egui-free
+# `editor-view` layer. The thin egui shell (`canvas-view`) builds on top.
+# See docs/canvas.md `canvas-crate-split`.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+emath = { workspace = true }
+hiker-canvas = { workspace = true }

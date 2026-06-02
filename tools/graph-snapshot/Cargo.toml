@@ -17,4 +17,7 @@ path = "src/main.rs"
 eframe = { workspace = true }
 egui = { workspace = true }
 graph-widgets.workspace = true
+# Vector-free layout types/builders come from `hiker-graph` directly;
+# `graph-widgets` façades only the egui-wrapped position fns.
+hiker-graph.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

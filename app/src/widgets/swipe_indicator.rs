@@ -11,7 +11,7 @@
 use eframe::egui;
 
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 const THRESHOLD: f32 = 120.0;
 const PILL_WIDTH: f32 = 56.0;

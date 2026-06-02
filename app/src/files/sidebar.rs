@@ -22,7 +22,7 @@ use hiker_core::vault::{DirEntryDto, EntryKind};
 
 use crate::feature::Ctx;
 use crate::state::{AppState, FileTreeState};
-use crate::theme;
+use hiker_theme as theme;
 
 /// A context-menu verb picked on a file row. The menu render records one
 /// of these; the mutation runs afterwards as a deferred effect so the
@@ -39,8 +39,27 @@ enum FileVerb {
     SetActiveTrail,
     /// Open a board-doc in the board view (vs. the default buffer).
     OpenAsBoard,
+    /// Open a `.canvas` file in the spatial canvas editor (the default
+    /// click already routes here). status: canvas-file-tree-glyph
+    OpenAsCanvas,
+    /// Open a `.canvas` file's raw JSON in the standard editor (the
+    /// "View as JSON" escape hatch). status: canvas-file-tree-glyph
+    ViewCanvasAsJson,
     /// Append this note as a card to `board_rel`'s `column`.
     AddToBoard { board_rel: String, column: String },
+    /// Insert this row's vault path as a file-node pointer into the `.canvas`
+    /// at `canvas_rel` (whether or not that canvas is open).
+    /// status: canvas-add-to-canvas-verb
+    AddToCanvas { canvas_rel: String },
+    /// Snapshot this trail-doc into a fresh `.canvas` and open it framed-to-fit.
+    /// Only offered on `.hiker/trails/*.md` rows. status: canvas-export-trail-verb
+    ExportTrailToCanvas,
+    /// Extract a non-md source into a `.md` sidecar and index it
+    /// (`extract-trigger-on-demand`).
+    MakeSearchable,
+    /// Open a non-md source in the OS default handler
+    /// (`extract-open-original-external`).
+    OpenExternal,
     Delete,
 }
 
@@ -84,6 +103,7 @@ impl FilesCtx<'_, '_> {
         // keeping the render path within the narrow `Ctx`.
         self.ctx.defer(refresh_deco);
         self.sort_header(ui);
+        let _g = crate::profiling::FrameProf::guard("files:tree");
         self.show_dir(ui, "", 0);
     }
 
@@ -245,7 +265,8 @@ impl FilesCtx<'_, '_> {
 
         let is_active = self.ctx.active_path.as_deref() == Some(entry.rel_path.as_str());
         let label = format!(
-            "{}{}{}",
+            "{}{}{}{}",
+            canvas_glyph_marker(&entry.rel_path),
             entry.name,
             self.dirty_marker(&entry.rel_path),
             self.index_state_marker(&entry.rel_path),
@@ -285,8 +306,20 @@ impl FilesCtx<'_, '_> {
     fn open_row(&mut self, rel: &str) {
         let rel = rel.to_string();
         self.ctx.defer(move |app| {
-            if is_board_doc(app, &rel) {
+            if rel.ends_with(".zim") {
+                // Offline encyclopedia archive — open the ZIM viewer tab
+                // (HTML rendered via the `hiker-htmlview` renderer).
+                // status: zim-view
+                crate::panels::zim::open(app, &rel);
+            } else if is_canvas_doc(&rel) {
+                // A `.canvas` file opens in the spatial canvas editor by
+                // default; "View as JSON" is the escape hatch.
+                // status: canvas-file-tree-glyph
+                crate::panels::canvas::open(app, &rel);
+            } else if is_board_doc(app, &rel) {
                 crate::panels::board::open(app, &rel);
+            } else if is_capture_doc(app, &rel) {
+                crate::panels::capture::open(app, &rel);
             } else {
                 crate::editor_pane::open_file(app, &rel, /* sticky */ false);
             }
@@ -321,22 +354,30 @@ impl FilesCtx<'_, '_> {
     /// Pure rendering: every branch maps a clicked button to a `FileVerb`;
     /// no mutation happens here.
     fn file_row_menu(&mut self, resp: &egui::Response, rel: &str) -> Option<FileVerb> {
-        // Board context (read-only) via the narrow Ctx: every board-doc +
-        // its columns, the set of boards this note is already a card on,
-        // and whether this row is itself a board-doc.
-        let (boards, membership, board_doc) =
-            crate::panels::board::picker_context_ctx(self.ctx, rel);
-        // Active-trail context comes from the decoration snapshot, not a
-        // reach into another feature's state.
-        let active_trail = self
-            .st_ref()
-            .deco
-            .active_trail
-            .as_ref()
-            .map(|(name, paths)| (name.clone(), paths.contains(rel)));
         let mut verb = None;
+        // Gather the menu context LAZILY, inside the closure: egui only runs it
+        // when the menu is actually open (right-click), not every frame for every
+        // visible row. These reads — every board-doc + its columns + this note's
+        // memberships (`picker_context_ctx`), and every `.canvas` doc in the vault
+        // (`list_canvases`) — are O(boards)/O(vault) and were previously computed
+        // eagerly per row per frame, which dominated the file tree's render time.
         resp.context_menu(|ui| {
-            verb = file_menu_body(ui, rel, &active_trail, &boards, &membership, board_doc);
+            let (boards, membership, board_doc) =
+                crate::panels::board::picker_context_ctx(self.ctx, rel);
+            let active_trail = self
+                .st_ref()
+                .deco
+                .active_trail
+                .as_ref()
+                .map(|(name, paths)| (name.clone(), paths.contains(rel)));
+            let canvases = crate::panels::canvas::list_canvases(self.ctx.vault);
+            verb = file_menu_body(
+                ui,
+                MenuArgs { rel, active_trail: &active_trail, board_doc },
+                &boards,
+                &membership,
+                &canvases,
+            );
         });
         verb
     }
@@ -428,9 +469,25 @@ fn apply_file_verb(app: &mut AppState, verb: FileVerb, rel: &str) {
         FileVerb::OpenAsBoard => {
             crate::panels::board::open(app, rel);
         }
+        FileVerb::OpenAsCanvas => {
+            crate::panels::canvas::open(app, rel);
+        }
+        FileVerb::ViewCanvasAsJson => {
+            // Open the canvas tab and flip it to the raw-JSON editor view —
+            // the escape hatch for hand-editing a `.canvas` file's text.
+            // status: canvas-file-tree-glyph
+            crate::panels::canvas::open_as_json(app, rel);
+        }
         FileVerb::AddToBoard { board_rel, column } => {
             crate::panels::board::add_card(app, &board_rel, &column, rel);
         }
+        FileVerb::AddToCanvas { canvas_rel } => {
+            crate::panels::canvas::add_file_node(app, &canvas_rel, rel);
+        }
+        // status: canvas-export-trail-verb
+        FileVerb::ExportTrailToCanvas => export_trail_to_canvas(app, rel),
+        FileVerb::MakeSearchable => crate::extract::make_searchable(app, rel),
+        FileVerb::OpenExternal => crate::extract::open_external(app, rel),
         FileVerb::Delete => {
             app.session.modal = Some(crate::state::Modal::ConfirmDelete {
                 path: rel.to_string(),
@@ -462,6 +519,38 @@ fn add_to_trail(app: &mut AppState, rel: &str, trail_name: &str) {
         format!("Added {rel} to '{trail_name}'"),
         crate::state::ToastLevel::Info,
     );
+}
+
+/// Snapshot the trail-doc at `rel` into a fresh `.canvas` (the core export
+/// builder), then open the new file framed-to-fit in the canvas view. On
+/// success toasts the new basename; on failure surfaces the core error as an
+/// error toast (never panics). status: canvas-export-trail-verb
+fn export_trail_to_canvas(app: &mut AppState, rel: &str) {
+    let result = {
+        let Ok(store) = app.vault_session.services.read_store.lock() else {
+            app.push_toast("index store unavailable", crate::state::ToastLevel::Error);
+            return;
+        };
+        hiker_core::canvas::export::write_trail_canvas(
+            &app.vault_session.vault,
+            &store,
+            &app.vault_session.services.oplog,
+            rel,
+        )
+    };
+    match result {
+        Ok(new_rel) => {
+            crate::panels::canvas::open_fresh(app, &new_rel);
+            app.push_toast(
+                format!("Exported to {}", basename_of(&new_rel)),
+                crate::state::ToastLevel::Info,
+            );
+        }
+        Err(e) => app.push_toast(
+            format!("Export to canvas failed: {e}"),
+            crate::state::ToastLevel::Error,
+        ),
+    }
 }
 
 /// Activate the trail whose name matches the doc basename (trail-doc paths
@@ -726,17 +815,26 @@ fn repoint_open_buffer(app: &mut AppState, from: &str, to: &str) {
 
 // ----- free helpers (pure / UI) -----
 
+/// The precomputed per-row context the menu renders against (everything the
+/// pure-rendering `file_menu_body` can't reach through the narrow `Ctx`).
+#[derive(Clone, Copy)]
+struct MenuArgs<'a> {
+    rel: &'a str,
+    active_trail: &'a Option<(String, bool)>,
+    board_doc: bool,
+}
+
 /// Build the body of the per-file context menu, returning the picked verb.
-/// Pure rendering — no `AppState` access; the `active_trail` /
-/// `boards` / `membership` reads are passed in precomputed.
+/// Pure rendering — no `AppState` access; the `active_trail` / `boards` /
+/// `membership` / `canvases` reads are passed in precomputed.
 fn file_menu_body(
     ui: &mut egui::Ui,
-    rel: &str,
-    active_trail: &Option<(String, bool)>,
+    args: MenuArgs<'_>,
     boards: &[crate::panels::board::PickerEntry],
     membership: &std::collections::HashSet<String>,
-    board_doc: bool,
+    canvases: &[(String, String)],
 ) -> Option<FileVerb> {
+    let MenuArgs { rel, active_trail, board_doc } = args;
     let mut verb = None;
     for (label, made) in [
         ("Open", FileVerb::Open),
@@ -748,6 +846,21 @@ fn file_menu_body(
     ] {
         if ui.button(label).clicked() {
             verb = Some(made);
+            ui.close();
+        }
+    }
+    // Non-markdown sources get the extraction affordances: "Make searchable"
+    // (extract a sidecar + index it) and "Open original externally" (hand the
+    // source to the OS handler — there is no in-app renderer). Indexable
+    // rows (`.md` / `.txt`) ride the ordinary ingest path and don't need
+    // them. See docs/extract.md.
+    if !hiker_core::indexer::is_indexable_path(rel) {
+        if ui.button("Make searchable").clicked() {
+            verb = Some(FileVerb::MakeSearchable);
+            ui.close();
+        }
+        if ui.button("Open original externally").clicked() {
+            verb = Some(FileVerb::OpenExternal);
             ui.close();
         }
     }
@@ -769,19 +882,36 @@ fn file_menu_body(
             ui.close();
         }
     }
-    // "Set as active trail" — only on a `.hiker/trails/*.md` row.
-    if rel.starts_with(".hiker/trails/")
-        && rel.ends_with(".md")
-        && ui.button("Set as active trail").clicked()
-    {
-        verb = Some(FileVerb::SetActiveTrail);
-        ui.close();
+    // "Set as active trail" + "Export to canvas" — only on a `.hiker/trails/*.md`
+    // row (the trail-doc detection). status: canvas-export-trail-verb
+    if rel.starts_with(".hiker/trails/") && rel.ends_with(".md") {
+        if ui.button("Set as active trail").clicked() {
+            verb = Some(FileVerb::SetActiveTrail);
+            ui.close();
+        }
+        if ui.button("Export to canvas").clicked() {
+            verb = Some(FileVerb::ExportTrailToCanvas);
+            ui.close();
+        }
     }
     // Board-docs get an explicit "Open as board" verb (the default click
     // already routes there).
     if board_doc && ui.button("Open as board").clicked() {
         verb = Some(FileVerb::OpenAsBoard);
         ui.close();
+    }
+    // `.canvas` files: an explicit "Open as canvas" (the default click route)
+    // and a "View as JSON" escape hatch that opens the raw text in the editor.
+    // status: canvas-file-tree-glyph
+    if is_canvas_doc(rel) {
+        if ui.button("Open as canvas").clicked() {
+            verb = Some(FileVerb::OpenAsCanvas);
+            ui.close();
+        }
+        if ui.button("View as JSON").clicked() {
+            verb = Some(FileVerb::ViewCanvasAsJson);
+            ui.close();
+        }
     }
     // "Add to board…" on indexable note rows: a board → column nested
     // picker. Hidden on board-doc rows and non-`.md` rows; disabled
@@ -792,6 +922,21 @@ fn file_menu_body(
             crate::panels::board::column_picker(ui, boards, membership, &mut pick);
             if let Some((board_rel, column)) = pick {
                 verb = Some(FileVerb::AddToBoard { board_rel, column });
+            }
+        });
+    }
+    // "Add to canvas…" on non-`.canvas` rows: a nested picker listing every
+    // `.canvas` doc in the vault. Selecting one inserts this row's vault path
+    // as a file-node pointer (whether or not that canvas is open). A canvas can
+    // hold the same note twice, so there's no already-present disabling.
+    // status: canvas-add-to-canvas-verb
+    if !is_canvas_doc(rel) && !canvases.is_empty() {
+        ui.menu_button("Add to canvas…", |ui| {
+            for (canvas_rel, title) in canvases {
+                if ui.button(title).clicked() {
+                    verb = Some(FileVerb::AddToCanvas { canvas_rel: canvas_rel.clone() });
+                    ui.close();
+                }
             }
         });
     }
@@ -856,6 +1001,46 @@ fn is_board_doc(app: &AppState, rel: &str) -> bool {
         .read_file(rel)
         .ok()
         .map(|src| hiker_core::boards::parse_board_for(rel, &src).is_ok())
+        .unwrap_or(false)
+}
+
+/// A leading glyph marker distinguishing a `.canvas` row in the file tree.
+/// The row renderer paints a left-aligned galley with no per-file icon slot
+/// (only folders get a chevron), so a label prefix is the in-pattern way to
+/// flag the row — the same label-decoration approach as the dirty / index-state
+/// markers. status: canvas-file-tree-glyph
+fn canvas_glyph_marker(rel: &str) -> &'static str {
+    if is_canvas_doc(rel) {
+        "⬚ "
+    } else {
+        ""
+    }
+}
+
+/// True if `rel` is a JSON Canvas document, recognized purely by its
+/// `.canvas` extension (no file read needed — cheap enough to call per-row).
+/// status: canvas-file-tree-glyph
+fn is_canvas_doc(rel: &str) -> bool {
+    rel.ends_with(".canvas")
+}
+
+/// True if the `.md` at `rel` is a capture-spec note (frontmatter
+/// `hiker.kind: capture` — a crawl job or RSS feed). Reads + parses the
+/// file — called on click / menu open, never per-frame. Routes the row to
+/// the capture form (`crawl-job-form`) rather than the raw markdown editor.
+fn is_capture_doc(app: &AppState, rel: &str) -> bool {
+    if !rel.ends_with(".md") {
+        return false;
+    }
+    app.vault_session
+        .vault
+        .read_file(rel)
+        .ok()
+        .and_then(|src| {
+            let split = hiker_core::frontmatter::split(&src);
+            let fm = split.frontmatter.as_ref()?;
+            Some(hiker_extract::capture::Spec::from_frontmatter(fm).is_ok())
+        })
         .unwrap_or(false)
 }
 

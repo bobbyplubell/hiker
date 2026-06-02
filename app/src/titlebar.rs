@@ -7,7 +7,7 @@ use eframe::egui::{self, ViewportCommand};
 
 use crate::icons;
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Height of the merged titlebar strip.
 const TITLEBAR_HEIGHT: f32 = 34.0;

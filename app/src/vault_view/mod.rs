@@ -4,14 +4,17 @@
 //!
 //! Files mode shows where bytes live (the real, nested directory tree);
 //! Vault mode shows how the knowledge is organized — derived from the
-//! index + frontmatter, never moving a file. v1 ships the grouping
-//! that's derivable from data that exists today (by top-level folder,
-//! flattened; or flat-by-name). The richer groupings the spec describes
-//! — crawl-job nesting (`vault-view-crawl-nesting`), sidecar surfacing
-//! (`vault-view-sidecar-surfacing`), source-type / provenance groups
-//! (`vault-view-source-groups`) — light up when `extract.md` + a
-//! provenance index column land; the lens dispatch below has a slot for
-//! each.
+//! index + frontmatter, never moving a file. The default `Composed` lens
+//! nests crawl/feed children under their job note
+//! (`vault-view-crawl-nesting`), trail waypoints under their trail-doc
+//! (`vault-view-trail-nesting`), extracted sidecars under their source
+//! (`vault-view-sidecar-surfacing`), and groups the rest by source-type /
+//! authorship (`vault-view-source-groups`). The nesting authority (parent
+//! stamp / resolved waypoint tree, not folder membership) lives in
+//! `tree.rs`; the simpler by-folder / flat lenses remain selectable. The
+//! relationship/provenance metadata is read in one cheap query
+//! (`Store::notes_with_meta`, projected from the `note_meta` index) so the
+//! lens never touches frontmatter on disk per render.
 //!
 //! Migrated off `panels_registry` to a real `Feature` (`Vault`) whose
 //! `SidebarSurface` renders through the narrow `feature::Ctx`: note paths
@@ -27,14 +30,23 @@ use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::icons;
 use crate::state::AppState;
 
+mod tree;
+use tree::{NodeKind, VaultNode};
+
 /// Which derived grouping the Vault lens renders. Display state only —
 /// never stored on a note (`vault-view-readonly-lens`). Selectable from
 /// the mode's `⋯` menu.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Lens {
-    /// Notes grouped under a virtual node per top-level folder, flattened
-    /// within each (distinct from Files' fully-nested tree). Default.
+    /// The composed default: crawl/feed children nested under their job
+    /// note (`vault-view-crawl-nesting`), trail waypoints under their
+    /// trail-doc (`vault-view-trail-nesting`), extracted sidecars under
+    /// their source (`vault-view-sidecar-surfacing`), and everything else
+    /// grouped by source-type / authorship (`vault-view-source-groups`).
     #[default]
+    Composed,
+    /// Notes grouped under a virtual node per top-level folder, flattened
+    /// within each (distinct from Files' fully-nested tree).
     ByFolder,
     /// Every note in one flat, alphabetically-sorted list.
     Flat,
@@ -55,6 +67,10 @@ pub struct State {
 /// open-note via `ctx.defer`. Never mutates placement.
 fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     let lens = ctx.state.downcast_ref::<State>().expect("vault state").lens;
+    if lens == Lens::Composed {
+        render_composed(ui, ctx);
+        return;
+    }
     let paths = match ctx.services.read_store.lock() {
         Ok(s) => s.all_note_paths().unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -67,6 +83,98 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     match lens {
         Lens::Flat => render_flat(ui, ctx, paths),
         Lens::ByFolder => render_by_folder(ui, ctx, paths),
+        Lens::Composed => unreachable!("handled above"),
+    }
+}
+
+/// The composed lens: build the derived forest from the store's
+/// relationship/provenance projection + resolved waypoint rows, then walk
+/// it. Tree construction (the nesting authority) lives in `tree.rs`; this is
+/// the egui paint over its output.
+fn render_composed(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    let (notes, waypoints) = match ctx.services.read_store.lock() {
+        Ok(s) => (
+            s.notes_with_meta().unwrap_or_default(),
+            s.all_trail_waypoints().unwrap_or_default(),
+        ),
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    if notes.is_empty() {
+        ui.add_space(8.0);
+        ui.weak("No indexed notes yet.");
+        return;
+    }
+    let forest = tree::build_composed(&notes, &waypoints);
+    for node in &forest {
+        render_node(ui, ctx, node, 0);
+    }
+}
+
+/// Icon for a node, by its derived kind.
+fn node_icon(kind: NodeKind) -> egui::Image<'static> {
+    let icon = match kind {
+        NodeKind::Group => icons::Icon::Folder,
+        NodeKind::Capture => icons::Icon::Compass,
+        NodeKind::Trail => icons::Icon::Boot,
+        NodeKind::Waypoint => icons::Icon::Bookmark,
+        NodeKind::Session => icons::Icon::Chat,
+        NodeKind::Note => icons::Icon::File,
+    };
+    icons::ICONS.image(icon)
+}
+
+/// Recursively render one derived node. Nodes with children get a collapse
+/// chevron (keyed by path or label); leaves open their note on click.
+/// Read-only: no drag, no placement mutation (`vault-view-readonly-lens`).
+fn render_node(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, node: &VaultNode, depth: usize) {
+    let indent = 8.0 + depth as f32 * 14.0;
+    let has_children = !node.children.is_empty();
+    let key = node.path.clone().unwrap_or_else(|| format!("group:{}", node.label));
+    let collapsed = ctx
+        .state
+        .downcast_ref::<State>()
+        .expect("vault state")
+        .collapsed
+        .contains(&key);
+
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        if has_children {
+            let chevron = if collapsed {
+                icons::ICONS.image(icons::Icon::ChevronRight)
+            } else {
+                icons::ICONS.image(icons::Icon::ChevronDown)
+            };
+            if ui.add(egui::Button::image(chevron).frame(false)).clicked() {
+                let set = &mut ctx.state.downcast_mut::<State>().expect("vault state").collapsed;
+                if collapsed {
+                    set.remove(&key);
+                } else {
+                    set.insert(key.clone());
+                }
+            }
+        } else {
+            ui.add_space(16.0);
+        }
+        let btn = egui::Button::image_and_text(node_icon(node.kind), node.label.clone())
+            .frame(false);
+        let resp = ui.add(btn);
+        let resp = match &node.path {
+            Some(p) => resp.on_hover_text(p.clone()),
+            None => resp,
+        };
+        if resp.clicked()
+            && let Some(p) = node.path.clone()
+        {
+            let sticky = ui.input(|i| i.modifiers.command);
+            ctx.defer(move |app| editor_pane::open_file(app, &p, sticky));
+        }
+    });
+
+    if has_children && !collapsed {
+        for child in &node.children {
+            render_node(ui, ctx, child, depth + 1);
+        }
     }
 }
 
@@ -185,11 +293,15 @@ mod tests {
 pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
     ui.label(
         egui::RichText::new("Group by")
-            .color(crate::theme::muted())
+            .color(hiker_theme::muted())
             .small(),
     );
     let cur = app.vault_state.lens;
-    for (label, lens) in [("Folder", Lens::ByFolder), ("Flat (all notes)", Lens::Flat)] {
+    for (label, lens) in [
+        ("Relationships", Lens::Composed),
+        ("Folder", Lens::ByFolder),
+        ("Flat (all notes)", Lens::Flat),
+    ] {
         let prefix = if cur == lens { "* " } else { "  " };
         if ui.button(format!("{prefix}{label}")).clicked() {
             app.vault_state.lens = lens;

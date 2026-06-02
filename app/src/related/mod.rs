@@ -16,7 +16,7 @@ use crate::editor_pane;
 use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::search::{CardAction, DiscoveryHit, result_card};
 use crate::state::Services;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Per-feature UI state for the related-notes surface — a cached
 /// similarity query, recomputed when the active note changes. Owned by

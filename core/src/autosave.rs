@@ -46,7 +46,7 @@ pub enum Error {
 /// (or `None` when no preview tab existed at flush time).
 /// `open_tab_kinds` records the `kind` discriminator per tab so the
 /// restore path knows whether to restore as buffer or page-kind.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TabState {
     #[serde(default)]
     pub open_paths: Vec<String>,
@@ -59,6 +59,41 @@ pub struct TabState {
     // status: tab-kinds
     #[serde(default)]
     pub open_tab_kinds: HashMap<String, String>,
+    /// Per-canvas view state (camera pan/zoom + per-card scroll/zoom),
+    /// keyed by the canvas's vault-relative path. View state only — it
+    /// rides this tab-state store rather than the op-log / `.canvas` file
+    /// (the camera is view state and never enters the op-log). Restored on
+    /// reopen and across restart. status: canvas-view-state-persist
+    #[serde(default)]
+    pub canvas_views: HashMap<String, CanvasViewState>,
+}
+
+/// One card's view state on a canvas: the per-card content zoom (font
+/// multiplier) and vertical scroll offset, both decoupled from camera zoom.
+/// Plain primitives so the app can convert to/from `canvas_view`'s `CardView`
+/// without that crate needing serde. status: canvas-view-state-persist
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CardViewState {
+    #[serde(default)]
+    pub zoom: f32,
+    #[serde(default)]
+    pub scroll_y: f32,
+}
+
+/// A canvas's persisted view state: the camera pan (canvas-space point pinned
+/// to the viewport top-left) + zoom scale, plus each touched card's view state
+/// keyed by node id. Rides the tab-state store, NOT the op-log / `.canvas` file
+/// — consistent with the camera being view state. status: canvas-view-state-persist
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CanvasViewState {
+    #[serde(default)]
+    pub pan_x: f64,
+    #[serde(default)]
+    pub pan_y: f64,
+    #[serde(default)]
+    pub scale: f32,
+    #[serde(default)]
+    pub cards: HashMap<String, CardViewState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -459,19 +494,53 @@ mod tests {
         let dir = tempdir().unwrap();
         let a = Autosave::open(dir.path()).unwrap();
         assert!(a.load_tab_state().unwrap().is_none());
+        let mut cards = HashMap::new();
+        cards.insert("n1".to_string(), CardViewState { zoom: 1.5, scroll_y: 42.0 });
+        let mut canvas_views = HashMap::new();
+        canvas_views.insert(
+            "boards/plan.canvas".to_string(),
+            CanvasViewState { pan_x: -120.5, pan_y: 33.0, scale: 0.75, cards },
+        );
         let s = TabState {
             open_paths: vec!["a.md".into(), "b.md".into()],
             active_path: Some("b.md".into()),
             preview_path: Some("c.md".into()),
             open_tab_kinds: HashMap::new(),
             saved_at_ms: 0,
+            canvas_views,
         };
         a.save_tab_state(s.clone()).unwrap();
         let loaded = a.load_tab_state().unwrap().unwrap();
         assert_eq!(loaded.open_paths, s.open_paths);
         assert_eq!(loaded.active_path, s.active_path);
         assert_eq!(loaded.preview_path, s.preview_path);
+        assert_eq!(loaded.canvas_views, s.canvas_views);
+        let cv = &loaded.canvas_views["boards/plan.canvas"];
+        assert!((cv.scale - 0.75).abs() < 1e-6);
+        assert!((cv.pan_x - (-120.5)).abs() < 1e-9);
+        assert_eq!(cv.cards["n1"].scroll_y, 42.0);
         assert!(loaded.saved_at_ms > 0);
+    }
+
+    #[test]
+    fn old_snapshot_without_canvas_views_still_loads() {
+        // A pre-canvas-view-state index.json has no `canvas_views` key;
+        // `#[serde(default)]` keeps it loadable as an empty map.
+        let dir = tempdir().unwrap();
+        let a = Autosave::open(dir.path()).unwrap();
+        let raw = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "entries": {},
+            "tab_state": {
+                "open_paths": ["a.md"],
+                "active_path": "a.md",
+                "saved_at_ms": 123,
+            },
+        });
+        std::fs::write(a.index_path(), raw.to_string()).unwrap();
+        let loaded = a.load_tab_state().unwrap().unwrap();
+        assert_eq!(loaded.open_paths, vec!["a.md".to_string()]);
+        assert!(loaded.canvas_views.is_empty());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use eframe::egui;
 use crate::editor_pane;
 use crate::feature::Ctx;
 use crate::state::Waypoint;
-use crate::theme;
+use hiker_theme as theme;
 use crate::trails::state::State;
 
 /// Deferred mutations collected while rendering the waypoint forest.

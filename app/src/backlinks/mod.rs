@@ -16,7 +16,7 @@ use hiker_core::vault::Vault;
 use crate::editor_pane;
 use crate::feature::{Ctx, Feature, SidebarSurface};
 use crate::icons;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Per-feature UI state for the backlinks surface — a cached vault-wide
 /// wikilink scan, recomputed when the active note changes. Owned by

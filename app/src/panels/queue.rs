@@ -9,7 +9,7 @@ use hiker_core::tasks::types::{TaskKind, TaskRecord, TaskState};
 
 use crate::editor_pane;
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Task queue");

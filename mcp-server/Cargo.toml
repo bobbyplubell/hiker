@@ -10,6 +10,9 @@ path = "src/lib.rs"
 
 [dependencies]
 hiker-core.workspace = true
+# Shared LLM client (extracted from core) for the agent-bridge ToolDef type.
+# status: crawler-shared-llm
+hiker-llm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yml.workspace = true

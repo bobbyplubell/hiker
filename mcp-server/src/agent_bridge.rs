@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hiker_core::agent::{ToolDispatchError, ToolDispatcher};
-use hiker_core::llm::ToolDef;
+use hiker_llm::ToolDef;
 
 use crate::handler::App;
 

@@ -29,6 +29,30 @@ pub struct NoteRow {
     pub last_accessed_at: Option<i64>,
 }
 
+/// Per-note relationship/provenance metadata, projected from the
+/// `note_meta` index for the Vault-view lens (`vault-view.md`). One row
+/// per indexed, non-skipped note; the four optional fields are the
+/// `hiker.*` frontmatter keys the lens groups and nests on, pulled in a
+/// single query so the lens never reads frontmatter from disk per render.
+///
+/// `parent` is the logical-nesting authority for crawl/feed children
+/// (`hiker.parent`, a job-note ULID) — not companion-folder membership.
+/// `author` is the coarse authorship trichotomy (`user-authored` /
+/// `agent-authored` / `imported`); `provenance` the fine-grained label;
+/// `kind` the note discriminator (`capture` / `trail` / `waypoint` /
+/// `session` / ...). All `None` when the note carries no such frontmatter.
+///
+/// status: vault-view-source-groups
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteMetaRow {
+    pub id: String,
+    pub path: String,
+    pub parent: Option<String>,
+    pub author: Option<String>,
+    pub provenance: Option<String>,
+    pub kind: Option<String>,
+}
+
 /// One row in the chat `@`-mention autocomplete popover. Vault-relative
 /// path with the indexable extension stripped (token format is
 /// `@<rel-path-without-extension>`), plus the basename and parent

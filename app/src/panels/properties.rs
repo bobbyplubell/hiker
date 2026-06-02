@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use eframe::egui;
 
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     let basename = path.rsplit('/').next().unwrap_or(path).to_string();

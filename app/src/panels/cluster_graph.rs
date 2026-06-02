@@ -14,13 +14,13 @@ use eframe::egui;
 
 use crate::icons;
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 use crate::widgets::force_graph::{View, ZoomBounds};
-use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::force_layout::LayoutWorker;
 use graph_widgets::graph_layouts::{
-    LayoutKind, LayoutTree, horizontal_tree_positions, radial_positions,
-    vertical_tree_positions,
+    horizontal_tree_positions, radial_positions, vertical_tree_positions,
 };
+use hiker_graph::{LayoutKind, LayoutParams, LayoutTree};
 
 /// Persistent per-tree state. Held on `AppState`, not egui memory,
 /// because `LayoutWorker` isn't `Clone`.

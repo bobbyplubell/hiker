@@ -12,7 +12,7 @@ use editor_core::selection::Selection;
 use editor_view::find::{run_search, search_decorations};
 
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 
 /// Debounce window for rebuilding the match index off the buffer's text.
 /// 150ms matches the typical "debounced as the user types" feel; toggles

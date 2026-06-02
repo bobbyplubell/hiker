@@ -19,13 +19,13 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::editor_pane;
 use crate::icons;
 use crate::state::AppState;
-use crate::theme;
+use hiker_theme as theme;
 use crate::widgets::force_graph::{View, ZoomBounds};
-use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::force_layout::LayoutWorker;
 use graph_widgets::graph_layouts::{
-    LayoutKind, bfs_tree, dfs_tree, horizontal_tree_positions, radial_positions,
-    vertical_tree_positions,
+    horizontal_tree_positions, radial_positions, vertical_tree_positions,
 };
+use hiker_graph::{bfs_tree, dfs_tree, LayoutKind, LayoutParams};
 
 /// Cached graph + layout state. Lives on `AppState::graph_state`.
 pub struct State {

@@ -1,0 +1,59 @@
+# Autocomplete
+
+One shared autocomplete substrate behind every "type a few characters, pick a ranked candidate" surface in hiker: the editor's in-buffer `[[wikilink]]` completion, the chat composer's `@`-mention, and the standalone vault pickers (canvas **Insert from vault**, and board add-card as it adopts it). Today these are three separate implementations with duplicated ranking; this doc specs the package they converge on.
+
+The headline decisions:
+
+- **One ranking core, not three.** A single candidate-matching + scoring function (prefix / subsequence / word-boundary fuzzy over a label, basename-aware for vault paths) lives in one place and every surface calls it. It replaces the wikilink source's private `score_basename` and the chat composer's bespoke `@`-token scan. [autocomplete-shared-core]
+- **A candidate-source abstraction over the buffer-bound trait.** `editor-view`'s `CompletionSource` stays the in-buffer contract (it needs `EditorState` + a byte position), but its candidate-production half is factored onto a smaller `CandidateSource` (query string → ranked `CompletionItem`s) that the standalone picker and the in-buffer trait both build on. The matching/ranking is shared; only the *trigger + replace* differs between in-buffer and standalone. [autocomplete-candidate-source]
+- **A reusable popup-picker widget for standalone surfaces.** Surfaces that aren't inside a text buffer (the canvas insert picker; a future command-style picker) use one egui widget: a query field + a ranked, keyboard-navigable list (↑/↓, Enter, Esc), rendered as a popup/overlay, returning the chosen item. The in-buffer surfaces keep their inline anchored popup but share the same list rendering + key handling. [autocomplete-picker-widget]
+- **Vault notes + sources are one candidate source.** A `VaultSource` enumerates vault paths (notes and other indexed sources), ranked by the shared core, and feeds both the wikilink completion and the canvas/board pickers — so "what can I link / insert" is one definition, not re-derived per surface. [autocomplete-vault-source]
+
+
+## Current state
+
+Three surfaces, three implementations — the duplication this doc retires:
+
+| Surface | Today | Trigger | Lives in |
+| ------- | ----- | ------- | -------- |
+| `[[wikilink]]` | `CompletionSource` + private `score_basename` | `[[` in a markdown buffer | `editor-view::autocomplete`, `app::completion_sources::WikilinkSource` |
+| Chat `@`-mention | bespoke trailing-token scan + hand-built popup | `@` in the chat composer | `app::chat::render` (`active_at_mention`, `mention_suggestions`) |
+| Canvas insert / board add-card | none (canvas: not built; board: a nested menu) | a toolbar / context action | — |
+
+`editor-view::autocomplete` already defines `CompletionItem`, `CompletionKind`, and `CompletionState` (the open/selected/anchor state machine) — those are kept; the wikilink path keeps `CompletionSource`. What changes is that the *ranking* and the *list UI* stop being per-surface.
+
+
+## The shared core
+
+`autocomplete-shared-core` — a pure function (no egui, no buffer) from `(query, candidates)` to a ranked, filtered `Vec<CompletionItem>`:
+
+- **Matching.** Case-insensitive; a candidate matches when the query is a subsequence of its label, with score boosts for prefix matches, contiguous runs, and word/`/`-segment boundaries (so `arch` ranks `notes/architecture.md` well, and a basename match beats a deep-path match). For vault paths the basename is weighted above the folder prefix — the behavior the wikilink source hand-codes today.
+- **Determinism.** Equal scores break ties by label, so results don't reshuffle frame to frame.
+- **Bounded.** Caller passes a result cap; the core returns the top-N. Enumeration cost (walking the vault) is the candidate source's concern, not the core's.
+
+Placement: a small `autocomplete` module reachable by both `editor-view` consumers and `app` standalone surfaces. If it can be egui-free it lives beside `CompletionItem` in `editor-view::autocomplete`; the picker *widget* (egui) layers on top in `app`.
+
+
+## Candidate sources
+
+`autocomplete-candidate-source` — `CandidateSource { fn candidates(&self, query: &str, limit: usize) -> Vec<CompletionItem> }`, the query→items half with no buffer coupling. The existing `CompletionSource` (in-buffer: `triggers()` + `matches(state, pos)`) is expressed in terms of a `CandidateSource` plus the buffer-specific trigger/replace logic, so the ranking is shared and only the seam differs.
+
+Concrete sources:
+
+- **`VaultSource`** (`autocomplete-vault-source`) — vault notes + other indexed sources, enumerated from the vault/indexer and ranked by the shared core. The single definition of "linkable / insertable vault item," consumed by wikilink completion and the canvas/board pickers. A scope flag selects notes-only (wikilink) vs. notes + sources (canvas insert).
+- **`MentionSource`** (`autocomplete-mention`) — the chat `@`-mention candidates, migrated off the bespoke scan onto `VaultSource` + the shared core (the `@`-trigger token scan stays chat-specific; the ranking does not).
+
+
+## Consumers
+
+- **Wikilink** (`autocomplete-wikilink`) — keeps `CompletionSource` + the `[[`/`]]` close-fixup, but ranks through the shared core via `VaultSource`. Behavior (shortest-unambiguous path form, double-close fixup) is unchanged; the private `score_basename` is removed.
+- **Chat `@`-mention** (`autocomplete-mention`) — the composer's trailing-token detection stays, but suggestions and the popup list come from the shared core + the shared picker list rendering.
+- **Canvas Insert from vault** (`canvas-insert-from-vault` in `canvas.md`) — the standalone picker widget over `VaultSource` (notes + sources); the chosen item becomes a file-node pointer.
+- **Board add-card** — may adopt the same picker in place of its nested menu; not required by this doc, noted so the convergence is intentional.
+
+
+## Out of scope
+
+- **Command palette / action search.** A fuzzy *action* runner is a separate surface; it could reuse `autocomplete-shared-core`, but its candidate set (commands) and execution model aren't this doc's concern.
+- **Network / remote candidates.** All sources here enumerate local vault/index state. Remote completion (e.g. URL suggestions) is not modeled.
+- **Replacing `CompletionState`.** The in-buffer open/anchor/selected state machine is kept as-is; this doc shares ranking + list UI, not that state model.

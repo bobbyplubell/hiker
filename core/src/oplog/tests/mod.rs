@@ -1230,3 +1230,67 @@ fn bug_sync_accept_pending_trusts_metadata_newpath() {
     );
 }
 
+
+#[test]
+fn reextract_replace_applies_extractor_op_and_replaces_body() {
+    // status: op-log-reextract-replace
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("clips/a.md", "sidecar", FRONTMATTER_DOC, &Author::User)
+        .unwrap();
+    let before = log.doc_history(&doc_id, 100).unwrap().len();
+
+    // A changed re-extraction lands one new version, authored extractor:<id>.
+    let new_body = "\n# Heading\n\nUpdated extracted text.\n";
+    let landed = log.reextract_replace(&doc_id, new_body, "web").unwrap();
+    assert!(landed, "a changed re-extraction must land a version");
+
+    let after = log.materialize_accepted(&doc_id).unwrap().text;
+    // Frontmatter fence preserved verbatim; only the body is the new extraction.
+    let fence_end = super::shapes::frontmatter_fence_end(FRONTMATTER_DOC).unwrap();
+    assert_eq!(&after[..fence_end], &FRONTMATTER_DOC[..fence_end]);
+    assert_eq!(&after[fence_end..], new_body);
+
+    // History grew by exactly one, and the newest op is extractor-authored.
+    let hist = log.doc_history(&doc_id, 100).unwrap();
+    assert_eq!(hist.len(), before + 1);
+    assert_eq!(hist[0].author, Author::Extractor("web".to_string()));
+
+    // Disk == materialize(accepted) (the canonical invariant).
+    let on_disk = std::fs::read_to_string(dir.path().join("clips/a.md")).unwrap();
+    assert_eq!(on_disk, after);
+}
+
+#[test]
+fn reextract_replace_identical_is_a_noop() {
+    // status: op-log-reextract-replace
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("clips/a.md", "sidecar", FRONTMATTER_DOC, &Author::User)
+        .unwrap();
+    let before = log.doc_history(&doc_id, 100).unwrap().len();
+
+    // Re-extracting the *same* body produces no op, no version.
+    let fence_end = super::shapes::frontmatter_fence_end(FRONTMATTER_DOC).unwrap();
+    let same_body = &FRONTMATTER_DOC[fence_end..];
+    let landed = log.reextract_replace(&doc_id, same_body, "web").unwrap();
+    assert!(!landed, "an identical re-extraction must be a no-op");
+    assert_eq!(log.doc_history(&doc_id, 100).unwrap().len(), before);
+    assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, FRONTMATTER_DOC);
+}
+
+#[test]
+fn reextract_replace_leaves_frontmatter_when_no_fence() {
+    // status: op-log-reextract-replace
+    // A doc with no frontmatter fence: the whole text is body.
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("clips/b.md", "sidecar", "old body\n", &Author::User)
+        .unwrap();
+    let landed = log.reextract_replace(&doc_id, "new body\n", "pdf").unwrap();
+    assert!(landed);
+    assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, "new body\n");
+}

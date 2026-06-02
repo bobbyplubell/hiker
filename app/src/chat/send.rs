@@ -16,7 +16,7 @@ use hiker_core::agent::{
     TurnId,
 };
 use hiker_core::config::Config;
-use hiker_core::llm::{GraniteLlmClient, Client, Message, ToolCall, ToolResult};
+use hiker_llm::{Client, Message, ToolCall, ToolResult};
 use hiker_core::sessions;
 
 use crate::chat::session;
@@ -52,7 +52,8 @@ pub fn send(
                 .read()
                 .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
                 .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
-            match session::create_new(reg, vault_root, &model, &provider) {
+            let chats_dir = session::chats_dir(&config);
+            match session::create_new(reg, vault_root, &chats_dir, &model, &provider) {
                 Ok(id) => id,
                 Err(err) => {
                     tracing::warn!(error = %err, "chat: create_new on lazy-send failed");
@@ -172,7 +173,7 @@ async fn run(self) {
             return;
         }
     };
-    let client = match GraniteLlmClient::from_config(&llm_cfg) {
+    let client = match hiker_core::llm::client_from_config(&llm_cfg) {
         Ok(c) => Arc::new(c) as Arc<dyn Client>,
         Err(err) => {
             let _ = tx.send(ChatEvent::Delta {

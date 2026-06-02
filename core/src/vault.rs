@@ -358,6 +358,28 @@ impl Vault {
     }
 }
 
+/// A note's *companion folder* path (`note-companion-folder` in
+/// `files.md`): a note at `<dir>/<name>.md` pairs with a sibling folder
+/// `<dir>/<name>/` that physically holds its child notes (trail
+/// waypoints, crawl/feed captures). Returns the vault-relative folder
+/// path (no trailing slash) for any `.md` path; `None` for non-`.md`
+/// paths, which never own a companion folder.
+///
+/// This computes the path only — it does NOT imply the folder exists on
+/// disk (creation is lazy, on first child write) and does NOT define
+/// nesting authority (that's `hiker.parent` / the trail waypoint tree,
+/// not folder membership). The folder is just the physical home.
+///
+/// status: note-companion-folder
+#[must_use]
+pub fn companion_folder_for(rel: &str) -> Option<String> {
+    let stem = rel.strip_suffix(".md")?;
+    if stem.is_empty() || stem.ends_with('/') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
 /// Atomic rename of a note: fs rename + index path update, with watcher
 /// suppression around both writes so the move isn't re-observed as a
 /// Deleted/Created pair. Errors leave the source untouched (or restored, if
@@ -369,23 +391,37 @@ impl Vault {
 /// - target parent missing → `NotFound`
 /// - non-indexed source (e.g. a non-md file) → fs rename only, no error
 ///
-/// Folder-level moves are out of scope here — the caller walks the folder
-/// and invokes `move_note` per file (drag-and-drop-move handles the walk).
+/// **Companion-folder pairing** (`note-companion-folder`): when the moved
+/// note owns a companion folder on disk (`<dir>/<name>/` beside
+/// `<dir>/<name>.md`), that folder is fs-renamed to the destination's
+/// companion folder (`<dir2>/<new>/`) in the same op and every contained
+/// indexed note's store path is bulk-remapped. The list of contained
+/// `(old, new)` member pairs is returned so the caller (the indexer's
+/// `IndexJob::Move` handler) can run the shared reference-rewrite pass
+/// (`wikilink-rename-rewrite`) over each moved child — rewriting a moved
+/// trail-doc's waypoint `in_trail` paths and `hiker.waypoints[].path`
+/// entries. A note with no companion folder returns an empty vec.
+///
+/// Folder-level moves of arbitrary directories are still out of scope
+/// here — `move_folder` handles those; this only pairs the *companion*
+/// folder a note owns.
 ///
 /// `watcher` is optional because the CLI runs without one. When present,
-/// both `from` and `to` get suppressed before the rename so any
-/// platform-specific ordering of the resulting events is filtered.
+/// both `from` and `to` (plus every companion-folder member at its old
+/// and new path) get suppressed before the rename so any platform-specific
+/// ordering of the resulting events is filtered.
 ///
 /// status: move-note-core-cmd
+/// status: note-companion-folder
 pub fn move_note(
     vault: &Vault,
     store: &mut Store,
     watcher: Option<&Watcher>,
     from: &str,
     to: &str,
-) -> Result<(), HikerError> {
+) -> Result<Vec<(String, String)>, HikerError> {
     if from == to {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let from_abs = vault.resolve(from)?;
     let to_abs = vault.resolve(to)?;
@@ -402,18 +438,74 @@ pub fn move_note(
         _ => {}
     }
 
+    // status: note-companion-folder
+    // Detect a companion folder beside the moved note and compute the
+    // (old, new) member pairs *before* the rename so we can pre-suppress
+    // and bulk-remap the store after the fs move.
+    let companion = companion_folder_for(from)
+        .zip(companion_folder_for(to))
+        .filter(|(from_dir, _)| {
+            vault
+                .resolve(from_dir)
+                .map(|p| p.is_dir())
+                .unwrap_or(false)
+        });
+    let companion_members: Vec<(String, String)> = match &companion {
+        Some((from_dir, to_dir)) => {
+            let members = vault.walk_indexable_files(from_dir).unwrap_or_default();
+            let from_prefix = format!("{from_dir}/");
+            members
+                .iter()
+                .map(|m| {
+                    let suffix = m.strip_prefix(&from_prefix).unwrap_or(m);
+                    (m.clone(), format!("{to_dir}/{suffix}"))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
     if let Some(w) = watcher {
         w.suppress(from);
         w.suppress(to);
+        if let Some((from_dir, to_dir)) = &companion {
+            w.suppress(from_dir.clone());
+            w.suppress(to_dir.clone());
+        }
+        for (old, new) in &companion_members {
+            w.suppress(old.clone());
+            w.suppress(new.clone());
+        }
     }
 
     fs::rename(&from_abs, &to_abs)?;
+
+    // Move the companion folder alongside the note in the same op. A
+    // failure here rolls the note rename back so the pair never desyncs.
+    if let Some((from_dir, to_dir)) = &companion {
+        let from_dir_abs = vault.resolve(from_dir)?;
+        let to_dir_abs = vault.resolve(to_dir)?;
+        if let Err(e) = fs::rename(&from_dir_abs, &to_dir_abs) {
+            let _ = fs::rename(&to_abs, &from_abs);
+            return Err(HikerError::Io(format!(
+                "move companion folder {from_dir} -> {to_dir}: {e}"
+            )));
+        }
+    }
 
     // Re-register suppression so the TTL window starts close to when notify
     // surfaces its events (post-rename + debounce), not at function entry.
     if let Some(w) = watcher {
         w.suppress(from);
         w.suppress(to);
+        if let Some((from_dir, to_dir)) = &companion {
+            w.suppress(from_dir.clone());
+            w.suppress(to_dir.clone());
+        }
+        for (old, new) in &companion_members {
+            w.suppress(old.clone());
+            w.suppress(new.clone());
+        }
     }
 
     // Index update. If the source isn't in the index (e.g. a non-md file or
@@ -426,10 +518,36 @@ pub fn move_note(
     // directly by its old path. Non-indexed `from` is a silent no-op
     // (`rename_note_by_path` returns false).
     if let Err(e) = store.rename_note_by_path(from, to) {
-        let _ = fs::rename(&to_abs, &from_abs);
+        rollback_companion(vault, &companion, &to_abs, &from_abs);
         return Err(HikerError::Io(e.to_string()));
     }
-    Ok(())
+    // Bulk-remap every companion-folder member's store path. A failure
+    // rolls back both the folder and the note rename.
+    if !companion_members.is_empty()
+        && let Err(e) = store.rename_notes_by_paths(&companion_members)
+    {
+        let _ = store.rename_note_by_path(to, from);
+        rollback_companion(vault, &companion, &to_abs, &from_abs);
+        return Err(HikerError::Io(e.to_string()));
+    }
+    Ok(companion_members)
+}
+
+/// Best-effort fs rollback of a companion-folder move + the note rename,
+/// used when a store remap fails after the fs renames committed.
+fn rollback_companion(
+    vault: &Vault,
+    companion: &Option<(String, String)>,
+    to_abs: &Path,
+    from_abs: &Path,
+) {
+    if let Some((from_dir, to_dir)) = companion
+        && let (Ok(from_dir_abs), Ok(to_dir_abs)) =
+            (vault.resolve(from_dir), vault.resolve(to_dir))
+    {
+        let _ = fs::rename(&to_dir_abs, &from_dir_abs);
+    }
+    let _ = fs::rename(to_abs, from_abs);
 }
 
 /// Atomic folder rename: fs rename of the whole folder + bulk index path
@@ -825,6 +943,82 @@ use crate::store::Store;
             })
             .unwrap();
         id
+    }
+
+    // status: note-companion-folder
+    #[test]
+    fn companion_folder_path_computation() {
+        assert_eq!(
+            companion_folder_for("trails/my-trail.md").as_deref(),
+            Some("trails/my-trail")
+        );
+        assert_eq!(
+            companion_folder_for("note.md").as_deref(),
+            Some("note")
+        );
+        // Non-.md paths never own a companion folder.
+        assert_eq!(companion_folder_for("note.txt"), None);
+        assert_eq!(companion_folder_for("dir/"), None);
+        // A bare ".md" has no name half.
+        assert_eq!(companion_folder_for(".md"), None);
+    }
+
+    // status: note-companion-folder
+    #[test]
+    fn move_note_moves_companion_folder_and_returns_members() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("trails")).unwrap();
+        fs::write(dir.path().join("trails/t.md"), b"trail").unwrap();
+        // Companion folder beside the note, holding a child note.
+        fs::create_dir(dir.path().join("trails/t")).unwrap();
+        fs::write(dir.path().join("trails/t/child--AAAAAA.md"), b"child").unwrap();
+
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        upsert_stub(&mut store, "trails/t.md");
+        upsert_stub(&mut store, "trails/t/child--AAAAAA.md");
+
+        let members =
+            move_note(&vault, &mut store, None, "trails/t.md", "trails/renamed.md").unwrap();
+
+        // Note + its companion folder both moved.
+        assert!(!dir.path().join("trails/t.md").exists());
+        assert!(!dir.path().join("trails/t").exists());
+        assert!(dir.path().join("trails/renamed.md").exists());
+        assert!(dir.path().join("trails/renamed/child--AAAAAA.md").exists());
+
+        // Store paths remapped for both the note and the child.
+        assert!(store.get_note_by_path("trails/t.md").unwrap().is_none());
+        assert!(store.get_note_by_path("trails/renamed.md").unwrap().is_some());
+        assert!(store
+            .get_note_by_path("trails/t/child--AAAAAA.md")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_note_by_path("trails/renamed/child--AAAAAA.md")
+            .unwrap()
+            .is_some());
+
+        // The returned member pairs let the caller rewrite child references.
+        assert_eq!(
+            members,
+            vec![(
+                "trails/t/child--AAAAAA.md".to_string(),
+                "trails/renamed/child--AAAAAA.md".to_string()
+            )]
+        );
+    }
+
+    // status: note-companion-folder
+    #[test]
+    fn move_note_without_companion_folder_returns_empty() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), b"a").unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        upsert_stub(&mut store, "a.md");
+        let members = move_note(&vault, &mut store, None, "a.md", "b.md").unwrap();
+        assert!(members.is_empty());
     }
 
     #[test]

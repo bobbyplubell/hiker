@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui;
-use hiker_core::cluster::build::result_to_node_inserts_pub;
 use hiker_core::cluster::build::stream::build_tree_structural_streaming;
+use hiker_core::trees::build_adapter::node_inserts;
 use hiker_core::cluster::{
     BuildEvent, BuildMethod, BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree,
     Algorithm, Params, FolderDeriveParams, NoteInput, Phase, SummarizeMode,
@@ -39,7 +39,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::state::{AppState, ToastLevel};
 use crate::tab::TabId;
-use crate::theme;
+use hiker_theme as theme;
 
 mod graph;
 
@@ -1318,7 +1318,7 @@ fn confirm(
             return;
         }
     };
-    let mut inserts = result_to_node_inserts_pub(&build.tree);
+    let mut inserts = node_inserts(&build.tree);
     if !renamed.is_empty() {
         for ins in inserts.iter_mut() {
             if let Some(new_name) = renamed.get(&ins.node_id) {
@@ -1359,7 +1359,7 @@ fn confirm(
         // `renamed`).
         //
         // Ordering: bottom-up. We iterate the persisted node list in
-        // insertion order — the same order `result_to_node_inserts_pub`
+        // insertion order — the same order `node_inserts`
         // writes — children before parents at the top of the loop, plus
         // the (optional) synthesized root last. We re-list from the
         // freshly persisted tree to pick up that natural order without
@@ -1388,7 +1388,7 @@ fn confirm(
 /// number of tasks queued.
 ///
 /// Lists the freshly persisted nodes (insertion order = child-then-
-/// parent, matching `result_to_node_inserts_pub`), filters to
+/// parent, matching `node_inserts`), filters to
 /// non-user-edited clusters, builds the task envelope, and submits.
 ///
 /// Submits are async; here we spawn the per-task submits onto the

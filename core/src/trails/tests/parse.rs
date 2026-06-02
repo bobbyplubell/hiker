@@ -5,12 +5,21 @@
 
 use super::*;
 
+// status: trail-storage-layout / note-companion-folder
 #[test]
-fn waypoints_dir_for_uses_forward_slashes() {
+fn waypoints_dir_is_trail_doc_companion_folder() {
+    // Accepted trail: waypoints live in the visible companion folder.
     assert_eq!(
-        waypoints_dir_for("01HRX"),
-        ".hiker/trails/01HRX/waypoints"
+        waypoints_dir_for_doc("trails/my-trail.md").as_deref(),
+        Some("trails/my-trail")
     );
+    // Draft trail: companion folder is the sibling of the hidden draft doc.
+    assert_eq!(
+        waypoints_dir_for_doc(".hiker/trails/drafts/01ABC.md").as_deref(),
+        Some(".hiker/trails/drafts/01ABC")
+    );
+    // Non-.md path is never a trail-doc.
+    assert_eq!(waypoints_dir_for_doc("trails/my-trail.txt"), None);
 }
 
 #[test]
@@ -26,13 +35,13 @@ fn waypoint_filename_uses_rand6_suffix() {
 
 #[test]
 fn parse_trail_doc_round_trip() {
-    let src = "---\nhiker:\n  kind: trail\n  last_activated_at: 2026-05-10T12:00:00Z\n  waypoints:\n    - path: .hiker/trails/01HTRAIL/waypoints/a--AAAAAA.md\n    - path: .hiker/trails/01HTRAIL/waypoints/b--BBBBBB.md\n---\nbody prose\n";
+    let src = "---\nhiker:\n  kind: trail\n  last_activated_at: 2026-05-10T12:00:00Z\n  waypoints:\n    - path: trails/my-trail/a--AAAAAA.md\n    - path: trails/my-trail/b--BBBBBB.md\n---\nbody prose\n";
     let parsed = parse_trail_doc(src).unwrap();
     assert_eq!(parsed.last_activated_at.as_deref(), Some("2026-05-10T12:00:00Z"));
     assert_eq!(parsed.waypoints.len(), 2);
     assert_eq!(
         parsed.waypoints[0],
-        we(".hiker/trails/01HTRAIL/waypoints/a--AAAAAA.md")
+        we("trails/my-trail/a--AAAAAA.md")
     );
 
     let written = write_trail_doc_frontmatter(src, &parsed).unwrap();
@@ -44,7 +53,7 @@ fn parse_trail_doc_round_trip() {
 // status: trail-side-trail-shape
 #[test]
 fn parse_trail_doc_round_trips_nested_tree() {
-    let src = "---\nhiker:\n  kind: trail\n  waypoints:\n    - path: .hiker/trails/01HTRAIL/waypoints/r1--AAAAAA.md\n      waypoints:\n        - path: .hiker/trails/01HTRAIL/waypoints/c1--BBBBBB.md\n          waypoints:\n            - path: .hiker/trails/01HTRAIL/waypoints/g1--CCCCCC.md\n    - path: .hiker/trails/01HTRAIL/waypoints/r2--DDDDDD.md\n---\nbody\n";
+    let src = "---\nhiker:\n  kind: trail\n  waypoints:\n    - path: trails/my-trail/r1--AAAAAA.md\n      waypoints:\n        - path: trails/my-trail/c1--BBBBBB.md\n          waypoints:\n            - path: trails/my-trail/g1--CCCCCC.md\n    - path: trails/my-trail/r2--DDDDDD.md\n---\nbody\n";
     let parsed = parse_trail_doc(src).unwrap();
     assert_eq!(parsed.waypoints.len(), 2);
     assert_eq!(parsed.waypoints[0].waypoints.len(), 1);

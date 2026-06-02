@@ -14,7 +14,7 @@ use hiker_core::config::{Config, SettingsScope};
 use hiker_core::config::sections::{RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
-use crate::theme;
+use hiker_theme as theme;
 
 mod raw;
 
@@ -252,7 +252,6 @@ fn vault_section(&mut self) {
                     (TreeSortBy::MtimeAsc, "Modified (oldest)", TreeSortBy::MtimeAsc.as_str()),
                 ],
             );
-            bool_row(ui, app, st, "Show sessions in tree", "vault.show_sessions_in_tree", snap.vault.show_sessions_in_tree);
             bool_row(ui, app, st, "Sidebar open at startup", "vault.sidebar_open", snap.vault.sidebar_open);
             bool_row(ui, app, st, "Related panel open at startup", "vault.related_open", snap.vault.related_open);
         });

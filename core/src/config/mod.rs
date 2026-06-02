@@ -27,14 +27,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::HikerError;
 
+pub mod content_dirs;
 mod io;
 mod patch;
 pub mod sections;
 
+use content_dirs::{ChatConfig, ExtractConfig};
 use sections::{
-    AcpConfig, BoardsConfig, ClusteringConfig, EditorConfig, InboxConfig, IndexingConfig,
-    LlmConfig, McpConfig, OpLogConfig, SearchConfig, SuggestionsConfig, SyncSection, TasksConfig,
-    TrailsConfig, VaultConfig, WikilinksConfig,
+    AcpConfig, BoardsConfig, ClusteringConfig, EditorConfig, InboxConfig, IndexingConfig, LlmConfig,
+    McpConfig, OpLogConfig, SearchConfig, SuggestionsConfig, SyncSection, TasksConfig, TrailsConfig,
+    VaultConfig, WikilinksConfig,
 };
 
 use io::{atomic_write, deep_merge, display_path, write_defaults};
@@ -112,6 +114,12 @@ pub struct Config {
     /// status: inbox-rules
     #[serde(default)]
     pub inbox: InboxConfig,
+    /// status: settings-section-extract
+    #[serde(default)]
+    pub extract: ExtractConfig,
+    /// status: settings-section-chat
+    #[serde(default)]
+    pub chat: ChatConfig,
     #[serde(default)]
     pub ui: Ui,
 }
@@ -162,6 +170,8 @@ impl Default for Config {
             suggestions: SuggestionsConfig::default(),
             clustering: ClusteringConfig::default(),
             inbox: InboxConfig::default(),
+            extract: ExtractConfig::default(),
+            chat: ChatConfig::default(),
             ui: Ui::default(),
         }
     }

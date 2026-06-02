@@ -49,6 +49,38 @@ impl Feature for Clusters {
     }
 }
 
+/// Snapshot the cluster tree `tree_id` (in its current on-disk / in-memory
+/// edited state) into a fresh `.canvas` in the chosen `style` via the core
+/// export builder, then open the new file framed-to-fit in the canvas view.
+/// On success toasts the new basename; on failure surfaces the core error as
+/// an error toast (never panics). The cluster-editor toolbar's "Export to
+/// canvas" menu defers here, one entry per style.
+/// status: canvas-export-tree-verb
+pub(crate) fn export_tree_to_canvas(
+    app: &mut crate::state::AppState,
+    tree_id: &str,
+    style: hiker_core::canvas::export::TreeCanvasStyle,
+) {
+    let result = hiker_core::canvas::export::write_tree_canvas(
+        &app.vault_session.services.trees,
+        &app.vault_session.vault,
+        &app.vault_session.services.oplog,
+        tree_id,
+        style,
+    );
+    match result {
+        Ok(new_rel) => {
+            let base = new_rel.rsplit('/').next().unwrap_or(&new_rel).to_string();
+            crate::panels::canvas::open_fresh(app, &new_rel);
+            app.push_toast(format!("Exported to {base}"), crate::state::ToastLevel::Info);
+        }
+        Err(e) => app.push_toast(
+            format!("Export to canvas failed: {e}"),
+            crate::state::ToastLevel::Error,
+        ),
+    }
+}
+
 struct ClustersSidebar;
 
 impl SidebarSurface for ClustersSidebar {

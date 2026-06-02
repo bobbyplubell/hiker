@@ -14,7 +14,7 @@ use hiker_core::activity::{
 use crate::editor_pane;
 use crate::state::AppState;
 use crate::tab::{Tab, TabKind};
-use crate::theme;
+use hiker_theme as theme;
 
 /// Author-side filter applied on top of the activity feed. `All` skips
 /// the predicate; the others narrow by the `author` column on change

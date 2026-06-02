@@ -90,6 +90,10 @@ icons! {
     SidebarLeft => "sidebar_left.svg",
     SidebarRight => "sidebar_right.svg",
     Vault => "vault.svg",
+    Cursor => "cursor.svg",
+    Hand => "hand.svg",
+    Canvas => "canvas.svg",
+    Braces => "braces.svg",
 }
 
 pub struct Icons;
@@ -120,9 +124,9 @@ impl Icons {
     // calls across panels is what we're trying to avoid.
 
     /// Amber-tinted warning glyph: stale buffer, indexer offline, tool error
-    /// in chat. Pair with `crate::theme::warn()` for matching text colour.
+    /// in chat. Pair with `hiker_theme::warn()` for matching text colour.
     pub fn warn(&self) -> egui::Image<'static> {
-        self.image(crate::icons::Icon::Warning).tint(crate::theme::warn())
+        self.image(crate::icons::Icon::Warning).tint(hiker_theme::warn())
     }
 
     /// White-tinted check used inside coloured "primary affirmative"
@@ -146,6 +150,6 @@ impl Icons {
     /// Accent-tinted dot used as a "current selection" marker in the buffer
     /// header / status bar (dirty / active indicators).
     pub fn current_dot(&self) -> egui::Image<'static> {
-        self.image(crate::icons::Icon::Dot).tint(crate::theme::accent())
+        self.image(crate::icons::Icon::Dot).tint(hiker_theme::accent())
     }
 }

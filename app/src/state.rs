@@ -275,6 +275,12 @@ pub struct Session {
     /// Paths with a `NoteMutation` task we just submitted. Gates the
     /// wand-icon menu so concurrent mutations don't pile up.
     pub pending_mutations: HashSet<String>,
+    /// Persisted canvas view state (camera pan/zoom + per-card scroll/zoom),
+    /// keyed by canvas vault-relative path. The single source that survives a
+    /// canvas tab close (the ephemeral `Pane` is dropped on close) and feeds the
+    /// tab-state persistence on exit; restored on startup and applied to each
+    /// pane on first creation. status: canvas-view-state-persist
+    pub canvas_views: HashMap<String, hiker_core::autosave::CanvasViewState>,
 }
 
 impl Default for Session {
@@ -290,6 +296,7 @@ impl Default for Session {
             nav: NavState::default(),
             last_autosave_tick: Instant::now(),
             pending_mutations: HashSet::new(),
+            canvas_views: HashMap::new(),
         }
     }
 }
@@ -305,6 +312,10 @@ pub enum NavTarget {
     File(String),
     /// A historical version of `path` at a specific accepted op.
     HistoryVersion { path: String, op_id: String },
+    /// An article in an open `.zim` archive (`None` = the archive's main
+    /// page). Lets the global Back/Forward stack walk in-archive link history
+    /// the same way it walks notes. [zim-nav-stack]
+    ZimArticle { zim_path: String, article: Option<String> },
 }
 
 #[derive(Default)]
@@ -359,6 +370,13 @@ pub struct PanelStates {
     /// Per-board-tab UI state (View-as toggle, inline-rename drafts,
     /// pending column-delete confirm). Keyed by tab id.
     pub boards: HashMap<TabId, crate::panels::board::Pane>,
+    /// Per-capture-tab UI + run state (form drafts, in-flight engine run,
+    /// captured-page index). Keyed by tab id. status: crawl-job-form
+    pub captures: HashMap<TabId, crate::panels::capture::Pane>,
+    /// Per-canvas-tab UI state (parsed `Canvas`, the `CanvasView` widget,
+    /// View-as toggle, dirty / reload tracking). Keyed by tab id.
+    /// status: canvas-tab
+    pub canvases: HashMap<TabId, crate::panels::canvas::Pane>,
     pub graph: Option<crate::panels::graph::State>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterGraph>,
     pub home: crate::panels::home::State,
@@ -368,6 +386,10 @@ pub struct PanelStates {
     /// One instance is enough — at most one preview card is up at a time
     /// across all buffer panes. [wikilink-hover-preview]
     pub wikilink_hover: crate::panels::buffer::wikilink_nav::HoverState,
+    /// Floating live edit-preview overlay render cache. One slot suffices —
+    /// at most one popup is up at a time (the span under the main caret).
+    /// status: widget-edit-popup-preview
+    pub edit_preview: crate::panels::buffer::widgets::edit_preview::Cache,
 }
 
 // ===========================================================================
@@ -1264,6 +1286,12 @@ mod nav_tests {
     fn snap(p: &str, op: &str) -> NavTarget {
         NavTarget::HistoryVersion { path: p.to_string(), op_id: op.to_string() }
     }
+    fn zim(z: &str, article: Option<&str>) -> NavTarget {
+        NavTarget::ZimArticle {
+            zim_path: z.to_string(),
+            article: article.map(str::to_string),
+        }
+    }
 
     #[test]
     fn empty_stack_has_no_moves() {
@@ -1350,6 +1378,40 @@ mod nav_tests {
         assert_eq!(nav.forward(), Some(snap("a", "op1")));
         // A different snapshot of the same path is a distinct entry.
         assert_ne!(snap("a", "op1"), snap("a", "op2"));
+    }
+
+    #[test]
+    fn zim_articles_walk_the_stack_like_browser_history() {
+        // ZIM in-archive links record as first-class nav targets so the
+        // top-bar Back/Forward walk article history. [zim-nav-stack]
+        let mut nav = NavState::default();
+        nav.push(zim("wiki.zim", None)); // main page
+        nav.push(zim("wiki.zim", Some("Rust")));
+        nav.push(zim("wiki.zim", Some("Borrow_checker")));
+        assert_eq!(nav.back(), Some(zim("wiki.zim", Some("Rust"))));
+        assert_eq!(nav.back(), Some(zim("wiki.zim", None)), "Back reaches the main page");
+        assert_eq!(nav.forward(), Some(zim("wiki.zim", Some("Rust"))));
+        // Distinct articles (and the main page) are distinct entries.
+        assert_ne!(zim("wiki.zim", None), zim("wiki.zim", Some("Rust")));
+        // ZIM articles interleave with note files on the one global stack.
+        nav.push(file("notes/x.md"));
+        assert_eq!(nav.back(), Some(zim("wiki.zim", Some("Rust"))));
+    }
+
+    #[test]
+    fn canvas_opens_record_as_file_targets_and_interleave() {
+        // Opening a `.canvas` records a `NavTarget::File` on the one global
+        // stack (canvas::open → nav_push → NavTarget::File), interleaved with
+        // notes and snapshots like every other surface. [canvas-nav-stack]
+        let mut nav = NavState::default();
+        nav.push(file("notes/a.md"));
+        nav.push(file("boards/plan.canvas"));
+        nav.push(file("notes/b.md"));
+        assert_eq!(nav.back(), Some(file("boards/plan.canvas")));
+        assert_eq!(nav.back(), Some(file("notes/a.md")), "Back reaches the prior note");
+        assert_eq!(nav.forward(), Some(file("boards/plan.canvas")), "Forward returns to the canvas");
+        // A canvas file is an ordinary File target — no distinct variant.
+        assert_eq!(nav.current(), Some(&file("boards/plan.canvas")));
     }
 
     #[test]

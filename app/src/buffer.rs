@@ -129,6 +129,19 @@ pub struct Buffer {
     /// buffer renders as plain monospace text. Per `view-live-preview-toggle`
     /// this is a per-buffer flip, not vault-wide.
     pub live_preview: bool,
+    /// View toggle: when true (default), rendered widgets (LaTeX math today;
+    /// Mermaid / tables later) replace their markdown source in the buffer.
+    /// Off shows the tinted-source marks instead. Distinct from
+    /// `live_preview` — a user can have live preview on and widgets off, or
+    /// either alone. In-memory per-buffer flag (`widget-render-toggle`).
+    pub render_widgets: bool,
+    /// View toggle: when true (default), the floating live edit-preview popup
+    /// shows the rendered result while the caret sits in a math / mermaid
+    /// source span. Gated additionally on `render_widgets && is_markdown`.
+    /// Independent of in-place widget rendering — turning this off keeps
+    /// rendered widgets + region interactivity, just suppresses the popup.
+    /// In-memory per-buffer flag (`widget-edit-popup-preview`).
+    pub live_edit_preview: bool,
     /// View toggle: when true, render `.txt` files with the markdown
     /// decoration stack. Default off — plain text stays plain.
     /// (`view-render-txt-as-markdown-toggle`)
@@ -248,7 +261,22 @@ pub struct DecorationCache {
     pub transclusion: Option<CachedDeco>,
     pub footnote: Option<CachedDeco>,
     pub math: Option<CachedDeco>,
+    /// Rendered LaTeX math widgets (`widget-render-cache`); separate from the
+    /// tinted-source `math` slot so the two layers cache independently.
+    pub math_widget: Option<CachedDeco>,
     pub mermaid: Option<CachedDeco>,
+    /// Rendered Mermaid diagram widgets (`widget-mermaid-render`); separate from
+    /// the tinted-source `mermaid` slot so the two layers cache independently.
+    pub mermaid_widget: Option<CachedDeco>,
+    /// Tinted-source fallback for ```` ```wavedrom ```` blocks
+    /// (`widget-wavedrom-render`), the WaveDrom counterpart to `mermaid`.
+    pub wavedrom: Option<CachedDeco>,
+    /// Rendered WaveDrom diagram widgets (`widget-wavedrom-render`); separate
+    /// from the tinted-source `wavedrom` slot so the layers cache independently.
+    pub wavedrom_widget: Option<CachedDeco>,
+    /// Natively-painted pipe-table widgets (`widget-table-render`); fingerprinted
+    /// on the shared `render_fp` like `math_widget` / `mermaid_widget`.
+    pub table_widget: Option<CachedDeco>,
     pub index_diff: Option<CachedDeco>,
     pub active_line: Option<CachedDeco>,
     pub occurrence: Option<CachedDeco>,
@@ -389,6 +417,12 @@ impl Buffer {
             highlight_trailing_whitespace: highlight_trailing_ws,
             hide_frontmatter: hide_fm,
             live_preview,
+            // Rendered widgets default on (`widget-render-toggle`); in-memory
+            // v1 with no config field yet.
+            render_widgets: true,
+            // Live edit-preview popup defaults on (preserves prior behavior);
+            // in-memory per-buffer (`widget-edit-popup-preview`).
+            live_edit_preview: true,
             render_txt_as_markdown,
             // Heading breadcrumb isn't yet a config-level toggle — drives
             // the status bar add-on; default off.

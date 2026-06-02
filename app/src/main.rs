@@ -4,14 +4,17 @@
 //! default vault, opens it, and launches the eframe loop.
 
 mod actions;
+mod autocomplete;
 mod backlinks;
 mod buffer;
+mod buffer_view;
 mod bootstrap;
 mod chat;
 mod clusters;
 mod command_center;
 mod completion_sources;
 mod editor_pane;
+mod extract;
 mod feature;
 mod files;
 mod icons;
@@ -28,7 +31,6 @@ mod sidebar;
 mod state;
 mod sync_service;
 mod tab;
-mod theme;
 mod titlebar;
 mod toolbar;
 mod trails;
@@ -47,8 +49,14 @@ use eframe::egui;
 use crate::state::{AppState, VaultSwitchState};
 
 fn main() -> eframe::Result<()> {
+    // Logging level/targets are runtime-configurable via `RUST_LOG`
+    // (e.g. `RUST_LOG=info,hiker::widget_click=debug`); defaults to `info`
+    // when the env var is unset or unparseable.
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     profiling::Profiler.init_server();
 
@@ -105,6 +113,9 @@ fn main() -> eframe::Result<()> {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // Bench knob: HIKER_NO_VSYNC=1 uncaps the frame rate so a profiling run
+        // measures the real CPU+GPU frame cost instead of the vsync wait.
+        vsync: std::env::var_os("HIKER_NO_VSYNC").is_none(),
         ..Default::default()
     };
 
@@ -118,7 +129,7 @@ fn main() -> eframe::Result<()> {
         // `single_call_fn`: install the theme + user fonts + image loaders
         // against the freshly-created egui context, then hand back the App.
         Box::new(move |cc| {
-            theme::Theme.install(&cc.egui_ctx);
+            hiker_theme::Theme.install(&cc.egui_ctx);
             state.install_user_fonts(&cc.egui_ctx);
             // Seed the per-frame `refresh_user_fonts` fingerprint so it
             // doesn't redundantly re-install on the first paint. Live-flip
@@ -134,6 +145,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(HikerApp {
                 state,
                 runtime: app_runtime,
+                bench_focused: false,
             }))
         }),
     )
@@ -144,6 +156,8 @@ fn main() -> eframe::Result<()> {
 pub(crate) struct HikerApp {
     state: AppState,
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
+    /// One-shot latch for the `HIKER_FOCUS` bench helper (see `update`).
+    bench_focused: bool,
 }
 
 impl AppState {
@@ -211,12 +225,62 @@ impl AppState {
 }
 
 impl eframe::App for HikerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Drop ZIM panes (each owning a `hiker-htmlview` view with cached egui
+        // textures + a stylo-styled document, plus a memmap-backed archive)
+        // while the main thread's TLS is still alive, releasing those resources
+        // deterministically instead of during TLS teardown at process exit.
+        // See `panels::zim::shutdown`.
+        crate::panels::zim::shutdown();
+        // Likewise drop the canvas node-content panes (read-only editor + HTML
+        // view state) from their UI-thread-local store before TLS teardown.
+        crate::panels::canvas::content::shutdown();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Mark a new puffin frame so the in-app viewer can slice the
         // timeline correctly. No-op when the `profiling` feature is
         // off. See `app/src/profiling.rs`.
         profiling::Profiler.new_frame();
         crate::profile_function!();
+        // Always-on (env-gated) frame profiler: HIKER_FRAMELOG=1 prints per-frame
+        // wall + section breakdown; HIKER_BENCH=1 also forces continuous repaint.
+        crate::profiling::FrameProf::tick(ctx);
+        // Whole-update CPU (everything below until this fn returns). `wall - this`
+        // ≈ tessellation + GPU upload + draw + present, i.e. the non-CPU frame cost.
+        let _update_total = crate::profiling::FrameProf::guard("update_total");
+
+        // Bench helper: `HIKER_FOCUS=zim|editor|...` activates the first tab of
+        // that kind once it exists (session restore is async), so a profiling run
+        // measures a specific panel. No-op unless the env var is set.
+        if !self.bench_focused {
+            if let Some(want) = std::env::var_os("HIKER_FOCUS").and_then(|s| s.into_string().ok()) {
+                let pick = self.state.session.tabs.iter().find_map(|t| {
+                    let k = match &t.kind {
+                        crate::tab::TabKind::ZimView { .. } => "zim",
+                        crate::tab::TabKind::Editor { .. } => "editor",
+                        crate::tab::TabKind::Canvas { .. } => "canvas",
+                        crate::tab::TabKind::Graph => "graph",
+                        _ => "",
+                    };
+                    (k.eq_ignore_ascii_case(&want)).then_some(t.id)
+                });
+                if let Some(id) = pick {
+                    crate::state::activate_tab(&mut self.state, id);
+                    self.bench_focused = true;
+                } else if want.eq_ignore_ascii_case("zim") {
+                    // No zim tab open — open one from HIKER_ZIM_PATH so a bench
+                    // run can profile the ZIM viewer.
+                    if let Some(zp) = std::env::var_os("HIKER_ZIM_PATH").and_then(|s| s.into_string().ok()) {
+                        let id = crate::panels::zim::open(&mut self.state, &zp);
+                        crate::state::activate_tab(&mut self.state, id);
+                        self.bench_focused = true;
+                    }
+                }
+            } else {
+                self.bench_focused = true;
+            }
+        }
 
         // Enter the tokio runtime context for the whole frame. Several
         // crates we hand control to (e.g. `rfd`'s xdg-portal backend via
@@ -245,12 +309,14 @@ impl eframe::App for HikerApp {
         // for the next frame's keybinds read.
         {
             crate::profile_scope!("keybinds");
+            let _g = crate::profiling::FrameProf::guard("keybinds");
             self.state.handle_keybinds(ctx);
         }
         self.state.session.nav.swipe_skip_rects.clear();
 
         {
             crate::profile_scope!("drains");
+            let _g = crate::profiling::FrameProf::guard("drains");
             self.state.drain_fs_events();
             self.state.drain_indexer_events();
             self.state.drain_sync_events();
@@ -261,6 +327,7 @@ impl eframe::App for HikerApp {
 
         {
             crate::profile_scope!("snapshots");
+            let _g = crate::profiling::FrameProf::guard("snapshots");
             self.state.refresh_task_snapshot();
             self.state.refresh_pending_proposals();
             self.state.refresh_whole_file_proposals();
@@ -356,6 +423,7 @@ impl eframe::App for HikerApp {
         // bars + editor area + status bar in one render call.
         {
             crate::profile_scope!("workbench");
+            let _g = crate::profiling::FrameProf::guard("workbench");
             self.state.sync_workbench_tabs();
             // Snapshot the workbench's active tab AFTER `sync_tabs`
             // pushed `session.active_tab` into the strip. Comparing
@@ -451,7 +519,7 @@ fn help_overlay(&mut self, ctx: &egui::Context) {
                 )
                 .small()
                 .italics()
-                .color(crate::theme::muted()),
+                .color(hiker_theme::muted()),
             );
         });
     if !open {
@@ -482,9 +550,12 @@ fn drain_fs_events(&mut self) {
 
     for ev in &events {
         match ev {
-            FileEvent::Created { path }
-            | FileEvent::Modified { path }
-            | FileEvent::Deleted { path } => {
+            FileEvent::Created { path } | FileEvent::Modified { path } => {
+                state.invalidate_for_path(path);
+                state.maybe_reload_clean_buffer(path);
+                state.maybe_auto_extract(path);
+            }
+            FileEvent::Deleted { path } => {
                 state.invalidate_for_path(path);
                 state.maybe_reload_clean_buffer(path);
             }
@@ -503,6 +574,31 @@ fn drain_fs_events(&mut self) {
 fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     self.file_tree_state.dir_cache.remove(parent);
+}
+
+/// Auto-extract a watcher-seen non-md source if it sits under an
+/// `[extract].auto_globs` folder. Indexable paths (`.md` / `.txt`) ride the
+/// ordinary ingest path and are skipped here; non-md elsewhere stays ignored
+/// until an explicit "Make searchable". The startup-scan counterpart is the
+/// indexer's initial pass — auto-globbed sources present at open are picked
+/// up the same way the next time they change; an initial bulk pass is a
+/// follow-up. See docs/extract.md `extract-trigger-auto-glob`.
+//
+// status: extract-trigger-auto-glob
+fn maybe_auto_extract(&mut self, path: &str) {
+    if hiker_core::indexer::is_indexable_path(path) {
+        return;
+    }
+    let auto = self
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.extract.auto_globs.clone())
+        .unwrap_or_default();
+    if auto.is_empty() || !hiker_extract::trigger::matches_any_glob(path, &auto) {
+        return;
+    }
+    crate::extract::make_searchable(self, path);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`
@@ -998,8 +1094,24 @@ fn autosave_tick(&mut self) {
     state.persist_side_panel();
 }
 
-fn persist_tab_state(&self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
+fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
     let state = self;
+    // Snapshot every currently-open Canvas tab's view state (camera pan/zoom +
+    // per-card scroll/zoom) into the session map first, so the persisted
+    // `canvas_views` below covers what's open now alongside what was captured on
+    // earlier closes. status: canvas-view-state-persist
+    let open_canvas_tabs: Vec<(crate::tab::TabId, String)> = state
+        .session
+        .tabs
+        .iter()
+        .filter_map(|t| match &t.kind {
+            crate::tab::TabKind::Canvas { path } => Some((t.id, path.clone())),
+            _ => None,
+        })
+        .collect();
+    for (id, path) in open_canvas_tabs {
+        crate::panels::canvas::capture_view(state, id, &path);
+    }
     let mut open_paths = Vec::new();
     let mut open_tab_kinds = std::collections::HashMap::new();
     for tab in &state.session.tabs {
@@ -1030,13 +1142,21 @@ fn persist_tab_state(&self, autosave: &std::sync::Arc<hiker_core::autosave::Auto
         preview_path,
         saved_at_ms: 0,
         open_tab_kinds,
+        // status: canvas-view-state-persist
+        canvas_views: state.session.canvas_views.clone(),
     };
     if let Err(err) = autosave.save_tab_state(snapshot) {
         tracing::warn!(error = %err, "tab-state snapshot failed");
     }
 }
 
-fn maybe_reload_clean_buffer(&mut self, path: &str) {
+/// Reload a cached buffer's text from disk in place when it's clean (no
+/// unsaved edits) and disk has advanced past the loaded bytes — preserving
+/// scroll, cursor, and folds. Used by the watcher's external-edit path and by
+/// the capture pane's Form → Markdown toggle (`capture-view-toggle`), where a
+/// buffer cached in a prior Markdown session can lag the form's later direct
+/// disk writes. A dirty buffer is left untouched so unsaved edits never vanish.
+pub(crate) fn maybe_reload_clean_buffer(&mut self, path: &str) {
     let Some(buffer) = self.session.buffers.get_mut(path) else {
         return;
     };

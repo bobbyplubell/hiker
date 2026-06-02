@@ -105,7 +105,11 @@ impl Rules {
             if let Some(target_dir) = rule.move_to.as_deref() {
                 let new_rel = join_dir_basename(target_dir, &basename);
                 if new_rel != current {
-                    crate::vault::move_note(vault, store, watcher, &current, &new_rel)?;
+                    // Inbox triage moves plain notes; a companion folder is
+                    // possible but the per-child reference rewrites ride the
+                    // indexer's own move path, so the returned member pairs
+                    // are not needed here.
+                    let _ = crate::vault::move_note(vault, store, watcher, &current, &new_rel)?;
                     current = new_rel.clone();
                     moved_to = Some(new_rel);
                 }

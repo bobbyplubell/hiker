@@ -12,10 +12,11 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use egui::Vec2;
-use graph_widgets::force_layout::{LayoutParams, LayoutWorker};
+use graph_widgets::force_layout::LayoutWorker;
 use graph_widgets::graph_layouts::{
-    bfs_tree, dfs_tree, horizontal_tree_positions, radial_positions, vertical_tree_positions,
+    horizontal_tree_positions, radial_positions, vertical_tree_positions,
 };
+use hiker_graph::{bfs_tree, dfs_tree, LayoutParams};
 use image::{Rgba, RgbaImage};
 
 /// CLI configuration. Hand-parsed instead of pulling clap to keep the

@@ -11,3 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }
+# The egui-agnostic layout engines (ForceAtlas2 worker + tree/radial layouts)
+# live here; this crate is the egui adapter that re-exports them with
+# `egui::Vec2` signatures, converting at the boundary.
+hiker-graph = { workspace = true }

@@ -143,22 +143,21 @@ State is supplied by `cmd-file-index-state` (see `index.md`), called lazily for 
 
 ### Tree source visibility
 
-The file tree shows regular vault notes by default. Other source categories — chat sessions, imported sessions from other agents, future categories — are hidden by default and opt in via per-category vault settings, each surfacing its category as a virtual top-level group in the tree.
+The file tree shows every note at its real on-disk path, including the subsystem note collections that carry user-authored bodies — chat sessions and trail waypoints — which live in **visible vault folders** (`chats/`, a trail-doc's companion folder), not hidden under `.hiker/` (per `subsystem-notes-visible` in `design.md`). They are ordinary folders/notes in the tree; their clean grouping/labelling is Vault mode's job (`vault-view-source-groups`).
 
-Mechanism: a small registry that names each visible-in-tree source category, the setting key that controls it, the on-disk path the category covers, and the group label. The registry is consulted by the tree renderer when assembling the top-level list; categories whose toggles are off skip the rendering pass but stay indexed and search-reachable. Each source-providing spec adds a row to the registry — `llm.md` adds the native-sessions row and the imported-sessions row; future categories (e.g., snapshots, derived files if they ever surface) plug in the same way. [tree-source-visibility-toggles]
+A registry remains for any *genuinely hidden* source category that might surface later (one whose payload isn't a user-authored note): it names the category, an optional `vault.show_<category>_in_tree` toggle, the path it covers, and a group label, consulted by the tree renderer when assembling the top-level list. Categories whose toggle is off skip rendering but stay indexed and search-reachable. **v1 seeds no categories** — sessions and waypoints are visible notes, and sidecars-next-to-source hide via their own rule (`extract-sidecar-tree-hidden`), so nothing currently rides this registry; it's the hook for future hidden categories. [tree-source-visibility-toggles]
 
-Default values for every category are `false` — tree starts quiet, the user opts each category in. Settings live under `vault.show_<category>_in_tree` and ride the existing eligibility model (per `settings-vault-config-toml`) so they persist per-vault. The settings UI gets a small "Tree visibility" group under the vault settings section listing every registered category as a checkbox. [tree-source-visibility-settings-ui]
+Search and related-notes are independent of any such toggle — a category hidden from the tree is never removed from search. The toggles are navigation chrome, not data scoping. [tree-source-visibility-orthogonal-to-search]
 
-Search and related-notes are independent of these toggles — a category being hidden from the tree never removes it from search. The toggles are about navigation chrome, not data scoping. [tree-source-visibility-orthogonal-to-search]
 
-v1 categories at registry seeding:
+## Companion folders
 
-| Category           | Setting key                          | Path                              | Owning spec |
-| ------------------ | ------------------------------------ | --------------------------------- | ----------- |
-| Native sessions    | `vault.show_sessions_in_tree`        | `.hiker/sessions/`                | `llm.md` (`chat-session-show-in-tree-toggle`) |
-| Imported sessions  | `vault.show_imported_sessions_in_tree` | `.hiker/sessions/imported/`     | `llm.md` (`chat-session-imported-show-in-tree-toggle`) |
+A note can own a sibling folder of child notes: a note at `<dir>/<name>.md` pairs with a folder `<dir>/<name>/` holding notes that logically belong to it. Used by extraction's crawl/feed captures (`crawl-job-note` in `extract.md`) and trail waypoints (`trail-storage-layout` in `trails.md`); a general primitive, not specific to either. [note-companion-folder]
 
-Future categories slot in by adding a row, an eligibility entry, and a one-line render rule. No changes to the tree-rendering code beyond the registry pull.
+- **Pairing rule.** A folder whose name exactly matches a sibling `.md` basename is that note's companion folder. The Files tree renders it as an ordinary folder (real bytes, real path); Vault mode collapses its contents *as children of the note* (`vault-view.md`).
+- **`hiker.parent` is the nesting authority, not folder membership.** Child notes stamp `hiker.parent` (or, for trails, ride the `hiker.waypoints` tree). A file dropped into the folder *without* a parent stamp is a plain file, not a logical child — so the physical folder is a convenience/discoverability home, and the metadata is the truth. This keeps the two decoupled: stray files never become false children.
+- **Rename keeps the pair in sync.** Renaming `<name>.md` renames `<name>/` in the same `move_note` transaction (and rewrites child→parent references via `wikilink-rename-rewrite`). The companion folder is cosmetic — losing or mismatching it never breaks nesting, which resolves through the parent stamp regardless. [note-companion-folder]
+- **Creation is lazy.** The folder is created on first child write, not when the note is created. A capture note with `fill_body: true` (single clip) or zero children has no companion folder.
 
 
 ## Multi-select
@@ -175,6 +174,7 @@ The anchor lives on the file-tree UI state and is cleared when the vault swaps. 
 
 **What it powers:**
 
-- **Bulk file-tree verbs.** The selection set is the target for multi-note actions — move (one `move_note` per selected path under a single transaction, same shape as folder drag), delete (one `delete_note` per path into trash), add-to-board, and add-to-tree-cluster. The right-click context menu (`tree-context-menu`) shows the bulk forms of its verbs when more than one row is selected ("Move N notes to trash?" reuses the folder-delete confirm copy shape). [note-multi-select-bulk-verbs]
+- **Bulk file-tree verbs.** The selection set is the target for multi-note actions — move (one `move_note` per selected path under a single transaction, same shape as folder drag), delete (one `delete_note` per path into trash), add-to-board, add-to-canvas (`canvas-add-to-canvas-verb` in `canvas.md` — inserts each selected path as a pointer node on a chosen canvas), and add-to-tree-cluster. The right-click context menu (`tree-context-menu`) shows the bulk forms of its verbs when more than one row is selected ("Move N notes to trash?" reuses the folder-delete confirm copy shape). [note-multi-select-bulk-verbs]
+- **Drag-into-canvas (pending).** A file row (or a multi-selection) dragged onto an open canvas should drop pointer nodes at the drop point — the canvas side of this is the deferred `canvas-dnd-add` (in `canvas.md`); it rides the uniform vault-path drag payload (`design.md` `trails-dnd-ingestion`) alongside drag-into-cluster. Until it lands, the **Add to canvas** verb and the canvas **Insert from vault** picker cover insertion. [note-multi-select-bulk-verbs]
 - **Selected-notes clustering build scope.** When notes are multi-selected, the clustering build-scope picker (`cluster-editor-build-scope-picker` in `cluster-editor.md`) defaults to `BuildScope::Notes` (per `cluster-build-scope` in `clustering.md`) — the scope already exists; the selection feeds it the set of note ids.
 - **Drag-into-cluster authoring.** A multi-selected set can be dragged into a cluster in the cluster editor's graphical surface to author membership by example (`tree-author-blank` in `cluster-editor.md`).

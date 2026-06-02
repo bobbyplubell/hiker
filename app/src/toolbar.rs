@@ -19,7 +19,7 @@ use crate::actions::{self, ActionRegistry, ID_ACTIONS_MENU, ID_SEP, ID_SPACER, I
 use crate::icons;
 use crate::state::{AppState, Toolbar, ToolbarSide, ToastLevel};
 use crate::tab::TabKind;
-use crate::theme;
+use hiker_theme as theme;
 
 impl AppState {
 /// Render every configured toolbar. Call once per frame, BEFORE side
