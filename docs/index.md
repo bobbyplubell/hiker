@@ -9,64 +9,34 @@ v1 goal: open a note, see a panel listing semantically related notes from the sa
 
 Single SQLite database at `vault/.hiker/index.db`. Vectors via the `sqlite-vec` extension, FTS via SQLite's built-in FTS5 (used in v2; schema reserved here so v1 doesn't migrate). One file per vault, regenerable from content — never the source of truth, only a cache. [store-schema-v1]
 
-Brute-force search over sqlite-vec is fine at this scale (10k–500k chunks); one transaction spans vectors and future FTS, and the whole store is a single-file backup. Revisit ANN if a vault pushes past ~500k chunks.
+Brute-force search over sqlite-vec is fine at this scale (10k–500k chunks); one transaction spans vectors and future FTS. Revisit ANN if a vault pushes past ~500k chunks.
 
-Schema (initial):
+Schema (initial) — three tables:
 
-```sql
--- one row per indexed file
-CREATE TABLE notes (
-  id            TEXT PRIMARY KEY,           -- ulid; THE SAME id as op-log's doc_id for this path
-  path          TEXT NOT NULL UNIQUE,       -- vault-relative
-  content_hash  TEXT NOT NULL,              -- blake3 of file body; skip re-embed if unchanged
-  mtime         INTEGER NOT NULL,           -- unix seconds; cheap pre-check before hashing
-  size          INTEGER NOT NULL,
-  indexed_at    INTEGER NOT NULL,
-  embedder_version TEXT NOT NULL,           -- forces re-embed when the model changes
-  note_embedding BLOB                       -- packed f32 mean-pool of chunk embeddings; lazy, per cluster-note-embeddings
-);
-
--- one row per chunk
-CREATE TABLE chunks (
-  id            TEXT PRIMARY KEY,           -- "<note_id>:<chunk_index>"
-  note_id       TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-  chunk_index   INTEGER NOT NULL,           -- 0-based, contiguous within a note
-  byte_start    INTEGER NOT NULL,           -- offset into note body
-  byte_end      INTEGER NOT NULL,
-  text          TEXT NOT NULL,              -- the chunk content (for snippet rendering)
-  heading_path  TEXT,                       -- e.g. "Setup > Database" or NULL
-  UNIQUE(note_id, chunk_index)
-);
-
--- vec0 virtual table; one row per chunk. The `N` is filled in at CREATE
--- time from the loaded embedder's `dim()`; 384 for bge-small, 768 for
--- embedding-gemma-300m, 1024 for bge-m3. See "Dim-from-model" below.
-CREATE VIRTUAL TABLE chunk_vecs USING vec0(
-  chunk_id      TEXT PRIMARY KEY,
-  embedding     FLOAT[N]
-);
-```
+- **`notes`** (one row per indexed file): `id` PK, `path` (vault-relative, unique), `content_hash` (blake3 of body, skip re-embed if unchanged), `mtime` (cheap pre-check before hashing), `size`, `indexed_at`, `embedder_version` (forces re-embed on model change), `note_embedding` (packed-f32 mean-pool of chunk embeddings, lazy, per `cluster-note-embeddings`).
+- **`chunks`** (one row per chunk): `id` = `"<note_id>:<chunk_index>"`, `note_id` FK → `notes(id)` ON DELETE CASCADE, `chunk_index` (0-based, contiguous), `byte_start` / `byte_end`, `text` (chunk content, for snippets), `heading_path` (e.g. `"Setup > Database"` or NULL), `UNIQUE(note_id, chunk_index)`.
+- **`chunk_vecs`** (vec0 virtual table, one row per chunk): `chunk_id` PK, `embedding FLOAT[N]` where `N` is filled at CREATE time from the loaded embedder's `dim()` (384 bge-small / 768 embedding-gemma-300m / 1024 bge-m3 — see "Dim-from-model").
 
 Notes:
 
-- `chunks.text` is duplicated from the source file for snippet rendering and to decouple the index from filesystem reads on every query. Cheap; vault sizes don't justify cleverness here.
-- **`notes.id` is op-log's `doc_id` for this path** — one ULID per document, minted by op-log on first ingest. The indexer reads it from op-log's `doc-index.db` (`oplog::doc_id_for_path`) when upserting a note; it never mints its own. This is why there is no separate `path_ids` table: the authoritative path↔id mapping lives in op-log. Renames update the mapping there; the id never changes. [store-id-from-oplog]
+- `chunks.text` is duplicated from the source file for snippet rendering and to decouple the index from filesystem reads on every query.
+- **`notes.id` is op-log's `doc_id` for this path** — one ULID per document, minted by op-log on first ingest. The indexer reads it from op-log's `doc-index.db` (`oplog::doc_id_for_path`) when upserting; it never mints its own. This is why there is no separate `path_ids` table: the authoritative path↔id mapping lives in op-log, renames update it there, the id never changes. [store-id-from-oplog]
 - Schema version pragma (`PRAGMA user_version = N`) so future migrations have a hook.
 
 **Static linking.** Both SQLite itself and the sqlite-vec extension are statically linked into the Hiker binary — `rusqlite` with the `bundled` feature compiles the SQLite C source in, and the `sqlite-vec` crate compiles the vec extension's C source in via its `cc` build-script. No system libsqlite3 dependency, no runtime extension load, no separate `vec0.so` to ship. One binary, no surprises across OS/distro versions. [store-sqlite-vec-static]
 
-**Open semantics (`Store::open(vault_root)`).** Creates `vault/.hiker/index.db` if missing, runs idempotent schema setup (every `CREATE TABLE` uses `IF NOT EXISTS`) on a matching `user_version`, and **fails loudly on version mismatch** rather than auto-migrating. v1 ships at version 1; if a future binary opens a v2 db (or vice-versa), the user gets a clear error rather than silent breakage. [store-version-fail-loud]
+**Open semantics (`Store::open(vault_root)`).** Creates `vault/.hiker/index.db` if missing, runs idempotent schema setup (`CREATE TABLE IF NOT EXISTS`) on a matching `user_version`, and **fails loudly on version mismatch** rather than auto-migrating — a future binary opening a mismatched db gets a clear error, not silent breakage. [store-version-fail-loud]
 
-**Migration policy (pre-real-use).** Until the project crosses into "I'm storing my actual notes in this" territory, no migration code is written. Schema bumps are handled by deleting `.hiker/index.db` and re-indexing — the db is regenerable from content, so the cost is one rescan. Saves a lot of effort writing migrations against a schema that's still moving. When real-data use begins, the policy flips: every schema bump from that point ships a migration alongside it. Worth a one-line note in the changelog when that line is crossed.
+**Migration policy (pre-real-use).** Until the project crosses into real-data use, no migration code is written: schema bumps are handled by deleting `.hiker/index.db` and re-indexing (the db is regenerable from content). When real-data use begins, the policy flips — every schema bump from that point ships a migration, noted in the changelog when the line is crossed.
 
-**Writer connection ownership.** The single writer connection lives *inside* the indexer task, not behind an `Arc<Mutex<Connection>>`. Only the indexer task ever writes; the design's mpsc job queue already serializes access. No mutex needed, no shared state to reason about. Read connections are entirely independent (fresh per call as described above), so writer/reader concurrency is handled at the SQLite WAL level rather than in Rust locking.
+**Writer connection ownership.** The single writer connection lives *inside* the indexer task, not behind an `Arc<Mutex<Connection>>` — only the indexer writes, and the mpsc job queue already serializes access. Read connections are fresh per call (see above), so writer/reader concurrency is handled at the SQLite WAL level, not in Rust locking.
 
 
 ## Store module discipline
 
 All sqlite-vec / rusqlite usage is confined to a single `core::store` module (start as `core/src/store.rs`; split into `core/src/store/sqlite.rs` etc. if/when a second backend lands). Everything outside `store` — ingest, search, related, CLI handlers — interacts via a narrow API of plain Rust types: `upsert_note`, `delete_note`, `rename_note`, `get_note_chunks`, `knn_chunks`, returning owned structs (`ChunkHit`, `NoteRow`, ...) not driver types. [store-module-discipline]
 
-Keeping all SQL inside one module makes swapping the store backend a one-file rewrite, not a codebase-wide grep. The cost of the discipline is near-zero now; not having it scales with every callsite that learns to write SQL directly.
+Keeping all SQL inside one module makes swapping the store backend a one-file rewrite, not a codebase-wide grep.
 
 Specifically forbidden outside `store`: importing `rusqlite`, returning `rusqlite::Row` or `sqlite_vec`-specific types, embedding SQL strings in handler code. The trait/struct boundary is the whole point.
 
@@ -75,7 +45,7 @@ Specifically forbidden outside `store`: importing `rusqlite`, returning `rusqlit
 
 v1 is permissive about what's already in the user's vault. No "init" step rewrites files; no migration mutates content.
 
-**Non-markdown files are silently ignored.** PDFs, images, audio, office docs, code files — all sit in the vault untouched. The indexer doesn't error, doesn't warn, doesn't produce sidecars. They simply aren't searchable until the extractor pipeline lands per design.md:419 (v4+). Users importing an existing mixed-content folder get a working v1 over their markdown subset on day one; non-md content waits its turn.
+**Non-markdown files are silently ignored.** PDFs, images, audio, office docs, code files — all sit in the vault untouched. The indexer doesn't error, doesn't warn, doesn't produce sidecars. They aren't searchable until the extractor pipeline lands (`design.md` extractor section, v4+). A mixed-content folder gets a working v1 over its markdown subset on day one.
 
 **Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. The path→id table in the store is the authoritative id source in v1; the `hiker.id` field in frontmatter only starts being written when an explicit user action requires a stable id in the file itself (creating a wikilink target, pinning a trail waypoint, etc.) — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, other markdown apps, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
 
@@ -92,7 +62,7 @@ Heading-bounded splits over the markdown AST, with a soft size cap.
 
 `heading_path` is the breadcrumb (`"Section > Subsection"`) of the heading whose body the chunk falls under, or `NULL` for content above any heading. Not used for v1 ranking; stored for future use (snippet rendering, structural index). [chunker-heading-path]
 
-`chunk_index` is contiguous and 0-based per note. The chunk id `<note_id>:<idx>` is stable as long as a note's chunk count and order don't change. Edits invalidate ids — that's fine for v1; agent stable-reference concerns from design.md:402 are an MCP-era problem.
+`chunk_index` is contiguous and 0-based per note. The chunk id `<note_id>:<idx>` is stable as long as a note's chunk count and order don't change. Edits invalidate ids — fine for v1; agent stable-reference concerns (`design.md` MCP section) are an MCP-era problem.
 
 
 ## Embedder
@@ -119,7 +89,7 @@ Batching: embed in batches of 64 chunks. Run on a dedicated tokio task; never bl
 
 **First-run UX:** model download is non-blocking. Vault opens normally; the indexer starts but defers any embedding work until the model is on disk. Status bar / settings surface the download progress. Search/related queries return empty with a "indexing not yet ready" indicator until the first batch completes. See `settings.md` for tunables (download timing, model selection, batch size, manual reindex triggers). [embedder-first-run-nonblocking]
 
-**Model load as a queue task.** Both first-run download and hot-swap (`embedder-hot-reload-on-model-change`) can take from seconds (cached) to minutes (cold download of `bge-m3`'s ~1.2GB). To make the work visible, the indexer wraps every `FastembedEmbedder::load_id` call in a task queue row — a new `TaskKind::EmbedderModelLoad { model_id }` enqueued just before the `spawn_blocking` load and marked complete (or failed) when the load returns. The row is **indeterminate**: no byte-progress, no percentage — fastembed v5 doesn't expose a download-progress callback, and the v1 goal is just "the user can see something is happening." Queue badge counts the row like any other task; queue detail page shows the model id and elapsed time. Failed loads stay as a failed-task row with the error so the user can see why the swap didn't take. [embedder-model-load-as-task]
+**Model load as a queue task.** First-run download and hot-swap (`embedder-hot-reload-on-model-change`) can take seconds (cached) to minutes (cold `bge-m3` ~1.2GB). The indexer wraps every `FastembedEmbedder::load_id` in a task-queue row — `TaskKind::EmbedderModelLoad { model_id }` enqueued just before the `spawn_blocking` load, marked complete/failed on return. The row is **indeterminate** (no byte-progress — fastembed v5 exposes no download-progress callback). Queue badge counts it like any task; detail page shows model id + elapsed time; failed loads stay as a failed-task row with the error. [embedder-model-load-as-task]
 
 ### Dim-from-model and schema rebuild
 
@@ -138,25 +108,7 @@ The `Embedder` trait that hides fastembed-rs also hides any other backend. A sec
 
 fastembed stays the default (zero-config first run, no per-call cost, offline, no cloud egress of every chunk); cloud / Ollama backends are opt-in for quality, longer chunks, or reusing an existing Ollama runtime.
 
-Config in `[embedder]` in user/vault TOML, same shape as `[llm]`: [embedder-config-section]
-
-```toml
-[embedder]
-provider = "fastembed"          # default
-model = "bge-small-en-v1.5"
-
-# or:
-# provider = "openai"
-# model = "text-embedding-3-large"
-# api_key_env = "OPENAI_API_KEY"
-
-# or:
-# provider = "ollama"
-# model = "nomic-embed-text"
-# base_url = "http://localhost:11434"
-```
-
-API keys live in environment variables (`api_key_env` names the variable), never in TOML. Same posture as `[llm]`'s provider config.
+Config in `[embedder]` in user/vault TOML, same shape as `[llm]`: `provider` (`fastembed` default / `openai` / `ollama` / …), `model`, and provider-specific keys (`api_key_env`, `base_url`). API keys live in environment variables (`api_key_env` names the variable), never in TOML. Same posture as `[llm]`'s provider config. [embedder-config-section]
 
 The existing `embedder_version` column on `notes` (`embedder-version-tag`) keys off provider + model, not just model name — so switching provider naturally triggers re-embed via the existing fail-loud machinery. No new migration code; the schema-version contract already covers it. [embedder-version-tag-includes-provider]
 
@@ -172,8 +124,6 @@ Triggered three ways, all funnel into the same upsert path:
 1. **Startup scan** — walk vault, compare `mtime`/`size` against `notes` rows, queue any new/changed/missing. [ingest-startup-scan]
 2. **Watcher event** — single file changed/created/deleted/renamed (see `watcher.md`). [ingest-watcher-driven]
 3. **Manual** — `hiker reindex [path]` CLI subcommand and a future "reindex" UI button. [ingest-manual-cli]
-
-The startup scan and watcher additionally enqueue *extract* jobs for non-md sources per `extract.md`'s trigger model (`extract-trigger-auto-glob` / `extract-trigger-on-demand`); those produce sidecar `.md` files that re-enter this same upsert path.
 
 Per-file pipeline:
 
@@ -217,7 +167,7 @@ Algorithm:
 4. Group hits by their `note_id`; score each candidate note as `max(similarity)` across its hit chunks.
 5. Return top 10 notes by score, with: title (filename stem until frontmatter parsing lands), path, score, best-matching chunk's `heading_path` and a short snippet. [related-notes-query, related-notes-snippet]
 
-This is intentionally crude. No reranking, no rank fusion, no entity boosting. Good enough to validate the pipeline; the design.md:227 query pipeline arrives in v2 alongside lexical search.
+No reranking, no rank fusion, no entity boosting — good enough to validate the pipeline; the full query pipeline (`design.md` query-pipeline section) arrives in v2 alongside lexical search.
 
 The full algorithm lives behind a single `Store::related_notes(source_note_id, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (host command handlers, MCP later) hand it a note id and receive note-shaped hits.
 
@@ -226,14 +176,14 @@ Latency budget: the panel updates on file-open and on save (debounced 500ms). Br
 
 ## Structured metadata index
 
-A queryable index over each note's frontmatter, backing *structured* retrieval — "notes tagged `project` with `status: active`, newest first" — distinct from the semantic / lexical content indexes. Powers `search-tag-scope` and the plugin query archetype (`plugins.md`'s `notes.query` host call).
+A queryable index over each note's frontmatter, backing *structured* retrieval — "notes tagged `project` with `status: active`, newest first" — distinct from the semantic / lexical content indexes. Powers `search-tag-scope`.
 
 - **`note_meta` table.** The note's frontmatter flattened to `(note_id, key, value, num)` rows: nested maps use dotted keys (`hiker.author`), list elements explode to one row each (`tags: [a, b]` → two rows), null values are skipped. `num` mirrors `value` for YAML numbers / bools so range filters and numeric ordering need no parse at query time. Re-derived from frontmatter on every ingest (mirrors `trail_waypoints`), cleared on skip / delete. Entries are capped per note to bound pathological frontmatter. [store-note-metadata-index]
 - **`query_notes(NoteQuery)`.** Structured query: AND-ed filters (`Equals` / `Exists` / `NumRange`), a `folder` subtree restriction, `order` (mtime / path / a meta key's numeric or text value), `limit`, and a `select` projection that packs chosen keys into each row's `fields`. Each filter compiles to an EXISTS subquery against `note_meta`; every user-supplied string is a bound parameter, never interpolated. Skipped notes are excluded. [store-note-query]
 
 Tags ride this index as `Equals { key: "tags", value: "<tag>" }` — there is no separate tag table; list-valued frontmatter is simply multiple rows under one key. Lifecycle (`hiker.archived` …), authorship (`hiker.author`), and source type (`hiker.type`) are likewise plain frontmatter keys, so the lifecycle / authorship / source-type filters from `design.md` fall out of the same query surface with no new structure.
 
-Schema bumps to v8 (the `note_meta` table); per `store-version-fail-loud` the bump is handled by deleting `.hiker/index.db` and re-indexing until real-data use begins.
+Schema bumps to v8 (the `note_meta` table); handled per the `store-version-fail-loud` migration policy.
 
 
 ## Command surface (v1 additions)
@@ -241,24 +191,13 @@ Schema bumps to v8 (the `note_meta` table); per `store-version-fail-loud` the bu
 Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_hash`, `write_file_checked`). v1 adds three:
 
 - `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [cmd-related-notes]
-- `index_status() -> IndexStatus` — snapshot of indexer state for the status bar / settings UI. Shape: `{ model_ready: bool, queued: u32, total_notes: u32, last_error: Option<String> }`. `queued` here is the mpsc-channel depth, which sits at ~1 during a `FullScan` because that handler processes per-file Upserts inline. The indexer-detail panel surfaces work-remaining via `IndexerHandle::pending_count()` instead (the size of the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start) so the user sees a number that counts down from N to 0 across the scan. [cmd-index-status, indexer-detail-pending-counter]
-- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time indexing and re-indexing — there's no semantic difference between them, just whether rows existed before. Returns immediately; progress comes via indexer-progress events. [cmd-index]
-- `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds for the note at `path`. `ChunkBounds = { chunk_index: u32, byte_start: u64, byte_end: u64, heading_path: Option<String> }`. Empty vec for unindexed or empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
+- `index_status() -> IndexStatus` — indexer-state snapshot (`{ model_ready, queued, total_notes, last_error }`) for the status bar / settings UI. `queued` is the mpsc-channel depth, ~1 during a `FullScan` (that handler processes per-file Upserts inline). The indexer-detail panel instead surfaces work-remaining via `IndexerHandle::pending_count()` — the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start — so the user sees a count down from N to 0. [cmd-index-status, indexer-detail-pending-counter]
+- `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time and re-indexing (only difference is whether rows existed before). Returns immediately; progress via indexer-progress events. [cmd-index]
+- `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds (`{ chunk_index, byte_start, byte_end, heading_path: Option<String> }`) for the note at `path`. Empty vec for unindexed/empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
 
-`RelatedHit` shape (note-level, since the v1 panel renders by note):
+`RelatedHit` (note-level): `note_id`, `path`, `title` (filename stem until frontmatter parsing lands), `score`, `best_heading_path: Option<String>`, `snippet` (text from the highest-scoring chunk).
 
-```rust
-struct RelatedHit {
-    note_id: String,
-    path: String,
-    title: String,                 // filename stem until frontmatter parsing lands
-    score: f32,
-    best_heading_path: Option<String>,
-    snippet: String,               // text from the highest-scoring chunk
-}
-```
-
-DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` per design.md:371.
+DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` (per `design.md`'s DTO/ts-rs convention).
 
 
 ## Per-file index state
@@ -269,7 +208,7 @@ The `notes` row already answers "is this file indexed" — presence + non-zero c
 - **Skipped** — a chunker exists but ingest refused: file exceeded the 5MB sanity cap, failed UTF-8 decode, or (future) hit a corrupted-source signal. The indexer records the attempt as a `notes` row with a `skipped` flag set and a short `skip_reason` string. Storing the row (rather than dropping silently) is what lets the UI distinguish "skipped on purpose" from "never seen."
 - **Queued** — the file is in the indexer's mpsc queue or actively processing. Transient; not stored — exposed via indexer-progress events.
 
-Schema addition (v1 schema bumps to `user_version = 2`): `notes.skipped` (BOOLEAN, default 0) and `notes.skip_reason` (TEXT, NULL when not skipped). Per the migration policy in `store-version-fail-loud`, the bump is handled by deleting `.hiker/index.db` and re-indexing until real-data use begins.
+Schema addition (bumps to `user_version = 2`): `notes.skipped` (BOOLEAN, default 0) and `notes.skip_reason` (TEXT, NULL when not skipped). Handled per the `store-version-fail-loud` migration policy.
 
 Surface:
 
@@ -305,7 +244,7 @@ The startup-scan walker (`walkdir` or `ignore` crate) must match the watcher's s
 ## Out of scope for v1 (lands later)
 
 - FTS5 lexical index and hybrid query fusion (v2)
-- MCP exposure of search/related (v3 per design.md:413)
+- MCP exposure of search/related (v3 per `design.md`'s MCP section)
 - Chunk stability under edits (chunk_id needs to survive small edits before MCP agents pin to them — needs a content-addressed scheme)
 - Entity / tag / structural / temporal / provenance indexes
 - Curated-tree placement and the reconcile flow

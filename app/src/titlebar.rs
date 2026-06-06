@@ -7,7 +7,6 @@ use eframe::egui::{self, ViewportCommand};
 
 use crate::icons;
 use crate::state::AppState;
-use hiker_theme as theme;
 
 /// Height of the merged titlebar strip.
 const TITLEBAR_HEIGHT: f32 = 34.0;
@@ -21,11 +20,16 @@ impl AppState {
     pub fn titlebar(&mut self, ctx: &egui::Context, show_command_center: bool) {
         egui::TopBottomPanel::top("custom-titlebar")
             .exact_height(TITLEBAR_HEIGHT)
+            // No frame border AND no panel separator line: the titlebar shares
+            // the panel fill with the side bars, so any divider here would cut a
+            // dark line across an otherwise continuous surface. egui's panel draws
+            // a separator at its inner edge by default — turn it off too so the
+            // titlebar flows straight into the side bars below.
+            .show_separator_line(false)
             .frame(
                 egui::Frame::default()
                     .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(6, 2))
-                    .stroke(egui::Stroke::new(1.0, theme::divider())),
+                    .inner_margin(egui::Margin::symmetric(6, 2)),
             )
             .show(ctx, |ui| {
                 let full = ui.max_rect();

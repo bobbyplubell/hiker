@@ -234,7 +234,7 @@ fn apply_binding(
     // editable buffer *is* `materialize_working` (the agent's pending ops live
     // in the overlay, not the buffer text), so the change-set byte offsets are
     // already working coordinates — applied directly, no translation.
-    for txn in txns {
+    'forward: for txn in txns {
         if txn.changes.is_identity() {
             continue;
         }
@@ -242,7 +242,40 @@ fn apply_binding(
             if let Err(e) =
                 log.apply_working_edit(doc_id, edit.byte_start, edit.delete_len, &edit.insert)
             {
-                tracing::warn!(error = %e, path, "oplog: apply_working_edit failed");
+                // status: op-log-binding-fidelity-invariant
+                //
+                // Fidelity invariant: the forward mirror may not silently drop
+                // an edit. A failed apply must REPAIR `working` so that
+                // `materialize(working) == editor text` before the frame ends,
+                // never log-and-continue — otherwise the reverse step (which
+                // treats `working` as source of truth) re-points the editor on
+                // the next frame and erases the user's keystroke, and Save would
+                // commit the stale `working`. We re-derive `working` from the
+                // editor's *full* current text rather than retrying the failed
+                // incremental op (which would just fail again). `error!` because
+                // a forward-apply failure here indicates a real bug, but the
+                // code path repairs rather than swallows. The resync writes
+                // `working` directly (not via the widget input path), so it
+                // emits no forward transaction and cannot echo. This is the
+                // failure branch only — the success hot path above is unchanged.
+                let editor_text = buffer.editor.doc.to_string();
+                tracing::error!(
+                    error = %e,
+                    path,
+                    "oplog: apply_working_edit failed; forcing working resync from editor text"
+                );
+                if let Err(re) = resync_working_to_editor(log, doc_id, &editor_text) {
+                    tracing::error!(
+                        error = %re,
+                        path,
+                        "oplog: working resync after forward-apply failure also failed"
+                    );
+                }
+                // `working` was re-derived from the editor's *full* current
+                // text, which already reflects every txn this frame — so stop
+                // all remaining forward processing, not just this change-set,
+                // or the later txns would double-apply onto the resynced state.
+                break 'forward;
             }
         }
     }
@@ -305,6 +338,27 @@ fn apply_binding(
         buffer.loaded_hash = hiker_core::hash_string(&accepted);
         buffer.loaded_text = accepted;
     }
+}
+
+/// Force the `working` layer back into agreement with the editor's full text,
+/// restoring the fidelity invariant `materialize(working) == editor text` after
+/// a forward `apply_working_edit` failed. Per `op-log-binding-fidelity-invariant`
+/// in `op-log.md`: a failed forward apply is a hard error that re-derives
+/// `working` from the editor's text, not a logged-and-ignored warning.
+///
+/// We do not retry the incremental op that failed — it would just fail again.
+/// Instead `working` is reset to `accepted` (`discard_working`) and the editor's
+/// *entire* current text is applied as a single replace over the accepted span,
+/// so the result is byte-identical to the editor. The replace seeds `working` as
+/// a clone of `accepted`, then overwrites `[0, accepted_len)` with `editor_text`.
+fn resync_working_to_editor(
+    log: &hiker_core::oplog::OpLog,
+    doc_id: &str,
+    editor_text: &str,
+) -> Result<(), hiker_core::oplog::error::Error> {
+    log.discard_working(doc_id)?;
+    let accepted_len = log.materialize_accepted(doc_id)?.text.len();
+    log.apply_working_edit(doc_id, 0, accepted_len, editor_text)
 }
 
 #[cfg(test)]
@@ -408,7 +462,7 @@ mod merge_scenarios {
     use hiker_core::vault::Vault;
     use tempfile::TempDir;
 
-    use super::apply_binding;
+    use super::{apply_binding, resync_working_to_editor};
     use crate::buffer::Buffer;
 
     /// A real op-log-backed vault + editable `Buffer` for `a.md`, seeded from
@@ -421,19 +475,26 @@ mod merge_scenarios {
         doc_id: String,
     }
 
-    fn setup(initial: &str) -> Fixture {
+    /// Build a test fixture. When `with_source` is set, the wikilink
+    /// completion source is registered on the buffer (vault handle supplied) so
+    /// the autocomplete trigger path runs — the way every real open builds the
+    /// buffer; the restored-note `[[` autocomplete regression relies on it.
+    fn setup(initial: &str, with_source: bool) -> Fixture {
         let td = TempDir::new().unwrap();
         std::fs::write(td.path().join("a.md"), initial).unwrap();
+        std::fs::write(td.path().join("target.md"), "# Target\n").unwrap();
         let vault = Vault::open(td.path()).unwrap();
         let log = Arc::new(OpLog::open(td.path()).unwrap());
         op_writes::bootstrap(&vault, &log).unwrap();
         let doc_id = log.doc_id_for_path("a.md").unwrap().unwrap();
+        let vault_handle =
+            with_source.then(|| Arc::new(Vault::open(td.path()).unwrap()));
         let buffer = Buffer::with_config_and_vault(
             "a.md".to_string(),
             initial,
             hiker_core::hash_string(initial),
             None,
-            None,
+            vault_handle,
         );
         Fixture { td, log, vault, buffer, doc_id }
     }
@@ -518,6 +579,28 @@ mod merge_scenarios {
             apply_binding(&self.log, &mut self.buffer, &self.doc_id, "a.md", &[txn]);
         }
 
+        /// Type one character *over the current (possibly multi-line) selection*
+        /// exactly as the widget does for a selection-replace: build the
+        /// replace change set spanning the selection (`insert_at_selections`),
+        /// apply it via `Editor::apply` (which advances the doc AND maps the
+        /// selection — including biases — forward), then run the binding. This
+        /// is the path the multi-line-replace bug lived on: a point insert
+        /// (`type_char`) never exercises the delete-then-insert boundary in
+        /// `Set::map_pos`, but a selection-replace does.
+        fn type_replacing(&mut self, ch: &str) {
+            let txn = self.buffer.editor.insert_at_selections(ch);
+            self.buffer.editor = self.buffer.editor.apply(txn.clone());
+            apply_binding(&self.log, &mut self.buffer, &self.doc_id, "a.md", &[txn]);
+        }
+
+        /// Select `[start, end)` as the main range (anchor=start, head=end),
+        /// the orientation a left-to-right drag produces.
+        fn select(&mut self, start: usize, end: usize) {
+            use editor_core::selection::{SelRange, Selection};
+            self.buffer.editor.selection =
+                Selection::from_range(SelRange::new(start, end));
+        }
+
         /// The agent's proposal overlay (`materialize_review`) the binding
         /// stashed this frame — `None` when there are no pending ops. In Model 1
         /// the agent's edits live here, NOT in the buffer text.
@@ -552,7 +635,7 @@ mod merge_scenarios {
         // that change (not clamp it) so the user keeps typing at the end of
         // "three!" instead of landing inside the agent's new text — the
         // cursor-jump that read as scrambled / reversed typing.
-        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n");
+        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n", false);
         fx.set_cursor(13);
         fx.type_char("!");
         assert_eq!(fx.buffer_text(), "one\ntwo\nthree!\nfour\nfive\n");
@@ -577,7 +660,7 @@ mod merge_scenarios {
         // edit present (as an overlay), the user types on the working buffer.
         // Each char must land to the RIGHT of the last — the forward step
         // applies directly to working with no remap, so the cursor never stalls.
-        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n");
+        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n", false);
         let _a = fx.stage_agent("five", "FIVE");
         fx.frame();
         // Buffer shows working (agent edit is the overlay, not buffer text).
@@ -598,7 +681,7 @@ mod merge_scenarios {
         // The pending agent edit is above the cursor, but it's an OVERLAY — the
         // buffer (working) is unchanged and the cursor is a plain working offset,
         // so typing advances normally with no coordinate translation at all.
-        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n");
+        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n", false);
         let _a = fx.stage_agent("two", "TWO-EDITED");
         fx.frame();
         assert_eq!(fx.buffer_text(), "one\ntwo\nthree\nfour\nfive\n", "agent edit is an overlay, not in the buffer");
@@ -620,7 +703,7 @@ mod merge_scenarios {
         // the user just edited, (4) the user keeps typing. In Model 1 the agent
         // edits stay in the overlay (proposal) and never disturb the buffer or
         // the cursor; the user's typing stays L→R throughout.
-        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n");
+        let mut fx = setup("one\ntwo\nthree\nfour\nfive\n", false);
         // (1) agent edits a "random" lower line.
         let _a = fx.stage_agent("five", "FIVE");
         fx.frame();
@@ -650,7 +733,7 @@ mod merge_scenarios {
         // Accepting an agent edit that SHRINKS text above the cursor pulls the
         // cursor back by the deleted length (mapped through the reverse step,
         // not clamped to the old offset).
-        let mut fx = setup("alpha\nbravo\ncharlie\n");
+        let mut fx = setup("alpha\nbravo\ncharlie\n", false);
         // Cursor at start of "charlie": "alpha\n"=6 + "bravo\n"=6 = 12.
         fx.set_cursor(12);
         let ops = fx.stage_agent("bravo", "b"); // line 2 shrinks by 4 bytes
@@ -669,7 +752,7 @@ mod merge_scenarios {
         // In Model 1 a staged agent edit is NOT folded into the buffer text; it
         // surfaces as the proposal overlay on the next frame, leaving the buffer
         // (working) untouched until the user accepts.
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         let ops = fx.stage_agent("beta", "BETA");
         assert!(!ops.is_empty());
         assert_eq!(fx.buffer_text(), "alpha\nbeta\ngamma\n");
@@ -683,7 +766,7 @@ mod merge_scenarios {
     fn user_edit_below_agent_edit_accept_then_commit_lands_both() {
         // The canonical bug the user hit: edit a line below the one the agent
         // proposed; accepting must keep both edits.
-        let mut fx = setup("line one\nline two\nline three\n");
+        let mut fx = setup("line one\nline two\nline three\n", false);
         let ops = fx.stage_agent("line two", "LINE TWO");
         fx.frame();
         assert_eq!(fx.buffer_text(), "line one\nline two\nline three\n", "buffer = working");
@@ -710,7 +793,7 @@ mod merge_scenarios {
 
     #[test]
     fn user_edit_above_agent_edit_both_survive_accept_and_commit() {
-        let mut fx = setup("line one\nline two\nline three\n");
+        let mut fx = setup("line one\nline two\nline three\n", false);
         let ops = fx.stage_agent("line three", "LINE THREE");
         fx.frame();
         assert_eq!(fx.buffer_text(), "line one\nline two\nline three\n", "buffer = working");
@@ -729,7 +812,7 @@ mod merge_scenarios {
 
     #[test]
     fn reject_agent_edit_keeps_user_edit() {
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         let ops = fx.stage_agent("gamma", "GAMMA");
         fx.frame();
         assert_eq!(fx.buffer_text(), "alpha\nbeta\ngamma\n", "buffer = working");
@@ -750,7 +833,7 @@ mod merge_scenarios {
         // The reported Ctrl+Z bug at the binding level: typing then undo must
         // leave both the buffer AND the working layer reverted — the undo's
         // change set reaches working, so the reverse step has nothing to revert.
-        let mut fx = setup("hello world\n");
+        let mut fx = setup("hello world\n", false);
         fx.set_cursor(11); // end of "world"
         fx.type_char("!");
         assert_eq!(fx.buffer_text(), "hello world!\n");
@@ -763,7 +846,7 @@ mod merge_scenarios {
 
     #[test]
     fn redo_reapplies_to_working() {
-        let mut fx = setup("hello world\n");
+        let mut fx = setup("hello world\n", false);
         fx.set_cursor(11);
         fx.type_char("!");
         fx.undo();
@@ -779,7 +862,7 @@ mod merge_scenarios {
         // undone on working; the agent's pending op is untouched (it's not in
         // the buffer or the user's history), and the proposal tracks the new
         // working.
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         let _ops = fx.stage_agent("gamma", "GAMMA");
         fx.frame();
         assert_eq!(fx.buffer_text(), "alpha\nbeta\ngamma\n", "buffer = working");
@@ -798,7 +881,7 @@ mod merge_scenarios {
         // I never edited." The agent edit is an overlay; reject drops the
         // pending op and touches neither `working` nor `accepted`, so the
         // buffer must stay clean.
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         fx.frame();
         assert!(!fx.buffer.is_dirty(), "clean on open");
         let ops = fx.stage_agent("beta", "BETA");
@@ -813,7 +896,7 @@ mod merge_scenarios {
     fn accepting_an_agent_edit_does_not_dirty_the_buffer() {
         // Accept advances `accepted` (and disk); the buffer must follow without
         // reading dirty (the user has no uncommitted edits of their own).
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         let ops = fx.stage_agent("beta", "BETA");
         fx.frame();
         fx.accept(&ops);
@@ -826,7 +909,7 @@ mod merge_scenarios {
     fn a_real_user_edit_does_mark_the_buffer_dirty() {
         // The flip side: a genuine uncommitted user edit MUST read dirty until
         // saved (commit_working).
-        let mut fx = setup("hello world\n");
+        let mut fx = setup("hello world\n", false);
         fx.frame();
         assert!(!fx.buffer.is_dirty());
         fx.type_edit(11..11, "!");
@@ -840,7 +923,7 @@ mod merge_scenarios {
     fn plain_typing_no_pending_tracks_working_with_no_overlay() {
         // With no agent ops the buffer is plain editing: the keystroke lands 1:1
         // on working and no proposal overlay is set.
-        let mut fx = setup("hello world\n");
+        let mut fx = setup("hello world\n", false);
         fx.type_edit(11..11, "!");
         assert_eq!(fx.buffer_text(), "hello world!\n");
         assert_eq!(fx.working(), "hello world!\n", "working tracks the keystroke 1:1");
@@ -850,11 +933,127 @@ mod merge_scenarios {
     }
 
     #[test]
+    fn fidelity_invariant_holds_across_a_run_of_typed_edits() {
+        // The fidelity invariant (`op-log-binding-fidelity-invariant`):
+        // `materialize(working)` equals the editor's text at all times. After a
+        // sequence of ordinary keystrokes (the forward hot path), `working` must
+        // be byte-equal to the buffer the editor shows — no silent drop.
+        let mut fx = setup("hello\n", false);
+        fx.set_cursor(5); // end of "hello"
+        for ch in [" ", "w", "o", "r", "l", "d", "!"] {
+            fx.type_char(ch);
+            assert_eq!(
+                fx.working(),
+                fx.buffer_text(),
+                "materialize(working) == editor text after typing {ch:?}"
+            );
+        }
+        assert_eq!(fx.buffer_text(), "hello world!\n");
+        assert_eq!(fx.working(), "hello world!\n");
+    }
+
+    #[test]
+    fn resync_restores_invariant_after_a_corrupted_working() {
+        // The forced-resync recovery (`op-log-binding-fidelity-invariant`): when
+        // a forward `apply_working_edit` fails, `working` is re-derived from the
+        // editor's *full* text so `materialize(working) == editor text` before
+        // the frame ends. A genuine forward-apply failure can't be induced
+        // through the public API without a contrived test-only injection hook in
+        // production code (which the spec forbids), so we instead deliberately
+        // drive `working` out of agreement with the editor and assert the
+        // extracted helper repairs it — the exact recovery the failure branch
+        // runs.
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
+        // Put the editor's doc somewhere the user "typed to" ...
+        let editor_text = "alpha EDITED\nbeta\ngamma\nappended\n";
+        fx.buffer.set_doc_clamping_selection(editor_text);
+        // ... while `working` is left deliberately disagreeing with it (a stale
+        // single-char edit, standing in for a swallowed forward failure).
+        fx.log
+            .apply_working_edit(&fx.doc_id, 0, 0, "Z")
+            .unwrap();
+        assert_ne!(fx.working(), editor_text, "working starts out of sync");
+
+        // The recovery: force `working` back into agreement with the editor.
+        resync_working_to_editor(&fx.log, &fx.doc_id, editor_text).unwrap();
+        assert_eq!(
+            fx.working(),
+            editor_text,
+            "resync restores materialize(working) == editor text"
+        );
+        // And the repaired `working` commits exactly the editor's text to disk.
+        fx.commit();
+        assert_eq!(fx.disk(), editor_text);
+    }
+
+    #[test]
+    fn multiline_reversed_selection_replace_types_left_to_right() {
+        // bug: bug-editor-multiline-replace-reversed-insert
+        //
+        // Select a MULTI-LINE region right-to-left (anchor > head — what a drag
+        // or shift-select upward produces) and type over it. Before the fix the
+        // reversed range carried `Bias::Left` on its start, so the
+        // selection-replace collapsed the caret to the LEFT of the insert: the
+        // new text stayed selected and each keystroke replaced the last, so
+        // "edit" came out reversed as "tide" with the caret stuck at byte 4.
+        let mut fx = setup("one\ntwo\nthree\n", false);
+        // "two\nthree" is bytes 4..13 — select it reversed (head at the left).
+        fx.select(13, 4);
+        fx.type_replacing("e");
+        // (1) forward fidelity — the binding's invariant holds on a multi-line
+        //     replace: `materialize(working)` equals the editor's text.
+        assert_eq!(fx.working(), fx.buffer_text(), "forward fidelity after replace");
+        assert_eq!(fx.buffer_text(), "one\ne\n", "selection replaced by the typed char");
+        // (2) caret sits AFTER the inserted text, not stranded at its left.
+        assert_eq!(fx.cursor(), 5, "caret after the inserted 'e'");
+        // (3) a second char APPENDS after the first (L→R), not prepends.
+        fx.type_replacing("d");
+        assert_eq!(fx.buffer_text(), "one\ned\n", "second char appends, not prepends");
+        assert_eq!(fx.cursor(), 6);
+        fx.type_replacing("i");
+        fx.type_replacing("t");
+        assert_eq!(fx.buffer_text(), "one\nedit\n", "typed in order, not reversed");
+        assert_eq!(fx.working(), fx.buffer_text(), "forward fidelity across the run");
+        assert_eq!(fx.cursor(), 8, "caret advanced past every typed char");
+    }
+
+    #[test]
+    fn singleline_reversed_selection_replace_types_left_to_right() {
+        // Regression guard for the single-line replace the report said "works":
+        // it must keep working, including the reversed-orientation case.
+        let mut fx = setup("hello world\n", false);
+        // select "world" (bytes 6..11) reversed.
+        fx.select(11, 6);
+        fx.type_replacing("W");
+        assert_eq!(fx.buffer_text(), "hello W\n");
+        assert_eq!(fx.cursor(), 7, "caret after the replacement");
+        fx.type_replacing("X");
+        assert_eq!(fx.buffer_text(), "hello WX\n", "appends L→R");
+        assert_eq!(fx.cursor(), 8);
+        assert_eq!(fx.working(), fx.buffer_text(), "forward fidelity");
+    }
+
+    #[test]
+    fn forward_oriented_multiline_replace_still_types_left_to_right() {
+        // The forward-oriented (anchor < head) multi-line selection the report
+        // didn't break — pinned so the fix doesn't regress it.
+        let mut fx = setup("one\ntwo\nthree\n", false);
+        fx.select(4, 13); // "two\nthree", left-to-right
+        fx.type_replacing("e");
+        fx.type_replacing("d");
+        fx.type_replacing("i");
+        fx.type_replacing("t");
+        assert_eq!(fx.buffer_text(), "one\nedit\n");
+        assert_eq!(fx.cursor(), 8);
+        assert_eq!(fx.working(), fx.buffer_text());
+    }
+
+    #[test]
     fn two_agent_ops_accept_one_reject_other_around_a_user_edit() {
         // Two disjoint agent ops + a user edit between them: accept the first,
         // reject the second; the accepted one + the user edit survive, the
         // rejected one vanishes.
-        let mut fx = setup("alpha\nbeta\ngamma\n");
+        let mut fx = setup("alpha\nbeta\ngamma\n", false);
         let op_alpha = fx.stage_agent("alpha", "ALPHA");
         let op_gamma = fx.stage_agent("gamma", "GAMMA");
         fx.frame();
@@ -872,5 +1071,62 @@ mod merge_scenarios {
         assert!(fx.proposal().is_none());
         fx.commit();
         assert_eq!(fx.disk(), "ALPHA\nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn typing_double_bracket_on_an_oplog_buffer_opens_completion_and_survives_the_binding() {
+        // Repro for "autocomplete doesn't appear when typing `[[` on a note that
+        // was open from a prior session." A restored note is an op-log-backed
+        // buffer: every frame runs `apply_binding` AFTER the widget applied the
+        // keystroke. This drives the REAL input path (`command::handle`, with the
+        // wikilink source registered) for `[` then `[`, running the binding after
+        // each — exactly the per-frame sequence — and asserts the popup opens and
+        // the binding's reverse step doesn't clobber it or the typed brackets.
+        use editor_view::command::{self, Action};
+        use editor_view::events::InputEvent;
+
+        let mut fx = setup("---\ntitle: Old\n---\n\nbody text\n", true);
+        assert_eq!(
+            fx.buffer.view.completion_sources.len(),
+            1,
+            "restored op-log buffer must carry the wikilink source",
+        );
+        // Caret at end of the body, where the user types.
+        let end = fx.buffer.editor.doc.len_bytes();
+        fx.buffer.editor.selection = editor_core::selection::Selection::single(end);
+
+        // One real keystroke: route through `command::handle`, fold the new
+        // state back into the editor, then run the binding with the change set —
+        // the live per-frame order.
+        let mut keystroke = |fx: &mut Fixture, ch: &str| {
+            let action =
+                command::handle(&fx.buffer.editor, &mut fx.buffer.view, &InputEvent::Text(ch.into()));
+            let tx = match action {
+                Action::Replace { state, tx } => {
+                    fx.buffer.editor = state;
+                    tx
+                }
+                _ => None,
+            };
+            let txns: Vec<_> = tx.into_iter().collect();
+            apply_binding(&fx.log, &mut fx.buffer, &fx.doc_id, "a.md", &txns);
+        };
+
+        keystroke(&mut fx, "[");
+        keystroke(&mut fx, "[");
+
+        assert!(
+            fx.buffer_text().ends_with("[[]]"),
+            "`[[` must nest to `[[]]` after the binding, got {:?}",
+            fx.buffer_text(),
+        );
+        assert!(
+            fx.buffer.view.completion.active,
+            "completion popup must stay open through the op-log binding",
+        );
+        assert!(
+            !fx.buffer.view.completion.items.is_empty(),
+            "popup offers the vault's notes",
+        );
     }
 }

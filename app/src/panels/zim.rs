@@ -323,7 +323,7 @@ fn open_preview(app: &mut AppState, zim_path: &str, article: Option<String>) -> 
         return prev_id;
     }
     let id = app.next_tab_id();
-    app.session.tabs.push(Tab { id, kind, sticky: false });
+    app.session.tabs.push(Tab::new(id, kind, false));
     app.session.active_tab = Some(id);
     app.session.preview_tab = Some(id);
     id

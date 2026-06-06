@@ -1,12 +1,18 @@
-//! Sidebar surfaces (Files, Clusters, Trails) — each is an independently
-//! dockable panel after step 4 of the egui_dock migration. The legacy
-//! mode-switcher is gone; each panel renders its own internal toolbar
-//! (new note / refresh / sort for Files, etc.) at the top of the body.
+//! Sidebar-adjacent `AppState` helpers. The sidebar surfaces themselves
+//! now live with their activities (`crate::files`, `crate::clusters`,
+//! `crate::trails`, ...) and render through the activity registry; what
+//! remains here is a small set of `AppState` methods the sidebar toolbar
+//! buttons (the `+` new-item menu, the sort control) call into:
 //!
-//! `SidebarMode` survives as a compatibility shim for the persisted
-//! `Config::ui.default_sidebar_mode` setting in Settings — it no longer
-//! drives runtime layout. Trash is its own dockable surface — migrated
-//! to the `crate::trash` feature — not pinned inside the Files body.
+//! - [`AppState::new_note`] / [`AppState::create_new_note`] — create a
+//!   fresh blank vault note (the latter without opening a tab).
+//! - [`AppState::new_board`] — create a board and open it in the board view.
+//! - [`AppState::new_canvas`] — create an empty `.canvas` and open it.
+//! - [`AppState::persist_tree_sort`] — persist the file-tree sort choice.
+//!
+//! All three create paths route through the indexer-driven
+//! `core::ops::file::create_at` so the new file is indexed without a
+//! duplicate watcher-driven ingest.
 
 use crate::editor_pane;
 use crate::state::{AppState, ToastLevel};

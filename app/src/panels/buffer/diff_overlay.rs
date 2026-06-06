@@ -25,12 +25,11 @@ use editor_core::decoration::Decoration;
 use editor_core::decoration::Set;
 use editor_core::rangeset::RangeSet;
 
-use editor_core::rope::Rope;
 use editor_diff::DiffLayer;
 use editor_diff::DiffOwner;
 use smol_str::SmolStr;
 
-use super::conflict;
+use editor_diff::conflict;
 use crate::buffer::Buffer;
 use crate::state::AppState;
 use crate::tab::DiffSource;
@@ -96,21 +95,6 @@ impl HunkInfo {
     pub const fn is_change(&self) -> bool {
         !matches!(self.kind, HunkKind::Context)
     }
-}
-
-/// Byte offset of the start of each physical line in `text`, with a trailing
-/// entry equal to `text.len()`. `offsets[i]` is where line `i` begins (line
-/// terminators counted, since the diff's line indices count physical lines);
-/// `line_byte_offsets(text)[text.lines().count()]` is `text.len()`. Lets a
-/// half-open line range be mapped to a byte range over the diff's base side.
-fn line_byte_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = vec![0usize];
-    let mut acc = 0usize;
-    for line in text.split_inclusive('\n') {
-        acc += line.len();
-        offsets.push(acc);
-    }
-    offsets
 }
 
 /// Widget-id namespace for per-hunk Accept/Reject buttons. Separate from
@@ -314,30 +298,16 @@ impl<'a> Compute<'a> {
     /// the proposal (right side) span where the pending op's content lives, used
     /// to resolve which ops the hunk covers (an insertion has width there).
     fn agent_hunks(&self, hunks: &[Hunk], proposal: &str) -> Vec<HunkInfo> {
-        let current = &self.buffer.editor.doc; // = working
-        let buf_byte = |line: usize| -> usize {
-            if line >= current.len_lines() {
-                current.len_bytes()
-            } else {
-                current.line_to_byte(line)
-            }
-        };
-        let prop_offsets = line_byte_offsets(proposal);
-        let prop_byte = |line: usize| -> usize {
-            prop_offsets.get(line).copied().unwrap_or(proposal.len())
-        };
-        let mut out = Vec::new();
-        for h in hunks {
-            if matches!(h.kind, HunkKind::Context) {
-                continue;
-            }
-            let byte_start = buf_byte(h.left_lines.start);
-            let byte_end = buf_byte(h.left_lines.end).max(byte_start);
-            let op_start = prop_byte(h.right_lines.start);
-            let op_end = prop_byte(h.right_lines.end).max(op_start);
-            out.push(HunkInfo { byte_start, byte_end, op_start, op_end, kind: h.kind.clone() });
-        }
-        out
+        editor_diff::overlay::agent_hunks(&self.buffer.editor.doc, proposal, hunks)
+            .into_iter()
+            .map(|g| HunkInfo {
+                byte_start: g.byte_start,
+                byte_end: g.byte_end,
+                op_start: g.op_start,
+                op_end: g.op_end,
+                kind: g.kind,
+            })
+            .collect()
     }
 
     /// For an Agent-owner overlay, layer per-hunk Accept/Reject buttons on
@@ -404,7 +374,7 @@ impl<'a> Compute<'a> {
                     .any(|op| log.is_pending_drifted(d, op).unwrap_or(false))
             });
             let hunk_working = hunk.byte_start..hunk.byte_end;
-            let row = if conflict::hunk_overlaps_user_edit(&hunk_working, &user_edits) {
+            let mut row = if conflict::hunk_overlaps_user_edit(&hunk_working, &user_edits) {
                 Self::conflict_row(
                     &mut next_id,
                     &mut click_map,
@@ -416,7 +386,9 @@ impl<'a> Compute<'a> {
             } else {
                 Self::accept_reject_row(&mut next_id, &mut click_map, &op_ids, any_drifted)
             };
-            let anchor = Self::anchor_for_hunk_end(current, hunk);
+            let (anchor, side) =
+                editor_diff::overlay::anchor_and_side(current, hunk.byte_start, hunk.byte_end);
+            row.side = side;
             entries.push((anchor..anchor, Decoration::Block(row)));
         }
 
@@ -573,7 +545,7 @@ impl<'a> Compute<'a> {
                     byte_end: hunk.byte_end,
                 },
             );
-            let row = BlockDeco {
+            let mut row = BlockDeco {
                 side: BlockSide::Below,
                 height: 24.0,
                 kind: BlockKind::ActionRow {
@@ -589,35 +561,14 @@ impl<'a> Compute<'a> {
                     }],
                 },
             };
-            let anchor = Self::anchor_for_hunk_end(current, hunk);
+            let (anchor, side) =
+                editor_diff::overlay::anchor_and_side(current, hunk.byte_start, hunk.byte_end);
+            row.side = side;
             entries.push((anchor..anchor, Decoration::Block(row)));
         }
         (RangeSet::from_iter(entries), click_map)
     }
 
-    /// Pick the byte position to anchor a per-hunk ActionRow at: just
-    /// after the hunk's last line so the buttons sit beneath the change,
-    /// not floating inside it. Associated (non-self) — the two widget
-    /// attachers above call this from inside their hot loop, so it has
-    /// multiple call sites and is exempt from `single_call_fn`.
-    fn anchor_for_hunk_end(current: &Rope, hunk: &HunkInfo) -> usize {
-        let line_to_byte = |line: usize| -> usize {
-            if line >= current.len_lines() {
-                current.len_bytes()
-            } else {
-                current.line_to_byte(line)
-            }
-        };
-        if hunk.byte_end > hunk.byte_start {
-            let last_line_end = hunk.byte_end.saturating_sub(1).min(current.len_bytes());
-            let line = current.byte_to_line(last_line_end);
-            line_to_byte(line)
-        } else {
-            let pos = hunk.byte_start.min(current.len_bytes());
-            let line = current.byte_to_line(pos);
-            line_to_byte(line)
-        }
-    }
 }
 
 impl AppState {

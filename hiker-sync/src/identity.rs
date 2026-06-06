@@ -7,9 +7,12 @@
 //! [sync-path-identity]
 //!
 //! A rename produces a new identity. Concurrent rename on two devices is
-//! explicitly NOT a supported merge case — last arriving rename wins on path,
-//! and a collision with another document at the new path surfaces as a
-//! conflict via the conflict-copy path. [sync-concurrent-rename-not-merged]
+//! explicitly NOT an auto-merge case: a collision with another document at the
+//! new path BLOCKS both for user resolution (Keep mine / theirs / both) rather
+//! than silently picking a winner. [sync-concurrent-rename-not-merged]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,10 +51,11 @@ pub struct BlockedDoc {
     /// The vault-relative path of the local replica — the stable key a
     /// resolution decision targets. [sync-path-identity]
     pub path: String,
-    /// Why the doc is blocked (currently always `"fork"`).
+    /// Why the doc is blocked: `"fork"`, `"same-region"`, `"delete-vs-edit"`,
+    /// or `"rename-collision"`.
     pub reason: String,
-    /// The fingerprint of the peer device the fork was detected against — what
-    /// the UI renders as "forked with <alias-or-fingerprint>".
+    /// The fingerprint of the peer device the conflict was detected against —
+    /// what the UI renders as "forked with <alias-or-fingerprint>".
     pub peer_fingerprint: DeviceFingerprint,
 }
 
@@ -63,19 +67,149 @@ pub struct BlockedDoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resolution {
-    /// Our side is canonical: unblock and offer our lineage to the peer. Full
-    /// convergence is bilateral — the other device must choose keep-theirs.
+    /// Our side wins. For a fork / same-region block: our lineage is canonical
+    /// and we push it for the peer to adopt. For a rename collision: our doc
+    /// keeps the contended path and the peer's doc yields to a `conflict-`
+    /// sibling. [sync-concurrent-rename-not-merged]
     KeepMine,
-    /// The peer's side is canonical: adopt the peer's lineage and converge.
+    /// The peer's side wins. For a fork / same-region block: adopt the peer's
+    /// lineage. For a rename collision: the peer's doc keeps the contended path
+    /// and ours moves to a `conflict-` sibling. [sync-concurrent-rename-not-merged]
     KeepTheirs,
-    /// Preserve the local version as a conflict copy in the vault, then adopt
-    /// the peer's lineage at the original path. Both versions survive.
+    /// Both versions survive. For a fork / same-region block: ours stays at the
+    /// path, the peer's lands as a `conflict-` sibling. For a rename collision:
+    /// both docs survive at distinct paths, the loser (deterministic by
+    /// fingerprint) taking the `conflict-` suffix. [sync-concurrent-rename-not-merged]
     KeepBoth,
+    /// Delete-vs-edit only: the delete wins — tombstone the doc (and trash the
+    /// `.md`), converging the peer to deleted. [sync-conflict-delete-vs-edit]
+    KeepDeleted,
+    /// Delete-vs-edit only: resurrect — the doc stays/comes back live with the
+    /// edit, converging the peer to the edited live doc.
+    /// [sync-conflict-delete-vs-edit]
+    KeepEdit,
+}
+
+/// Durable per-vault store for the blocked-conflict set, so a held conflict
+/// survives an app restart and re-surfaces rather than silently clearing — the
+/// exact silent-resolution failure the conflict model exists to eliminate.
+/// Without this the blocked set lives only in a `Mutex<HashMap>` on the node
+/// and evaporates the moment the process exits. [sync-conflict-block-persistence]
+///
+/// Stored as a single JSON file at `<vault>/.hiker/sync/blocked.json` — vault-
+/// scoped local state alongside the op-log, NOT user-scope (blocks are not
+/// secrets, unlike the device/content keys, so the `sync-secrets-user-scope`
+/// rule doesn't apply; this is recoverable, vault-relative conflict bookkeeping
+/// that belongs next to the vault it describes). The whole `path -> BlockedDoc`
+/// map is rewritten on every change; the set is small (one entry per blocked
+/// doc), so a full rewrite is simpler and atomic enough than incremental edits.
+///
+/// A missing or unreadable file hydrates to an empty set (a fresh vault, or a
+/// corrupt file we'd rather start clean from than wedge on) — the node logs the
+/// corruption case via `tracing` so it isn't silent.
+#[derive(Debug, Clone)]
+pub struct BlockStore {
+    path: PathBuf,
+}
+
+impl BlockStore {
+    /// The block store for a vault, rooted at `<vault>/.hiker/sync/blocked.json`.
+    pub fn for_vault(vault_root: &Path) -> Self {
+        Self {
+            path: vault_root
+                .join(".hiker")
+                .join("sync")
+                .join("blocked.json"),
+        }
+    }
+
+    /// Construct a store at an explicit file path — the test seam.
+    pub const fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Hydrate the persisted `path -> BlockedDoc` map. A missing file is an
+    /// empty set; an unreadable / corrupt file logs a warning and also yields an
+    /// empty set rather than wedging the node.
+    pub fn load(&self) -> HashMap<String, BlockedDoc> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<BlockedDoc>>(&bytes) {
+                Ok(docs) => docs.into_iter().map(|d| (d.path.clone(), d)).collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %e,
+                        "sync: blocked.json unreadable, starting with an empty blocked set"
+                    );
+                    HashMap::new()
+                }
+            },
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Rewrite the persisted set from the current in-memory map. Best-effort:
+    /// an I/O failure is logged (via the caller) but never panics the node — a
+    /// failed persist means the block is still held in memory this session and
+    /// will be re-recorded next round if the conflict persists.
+    pub fn save(&self, blocked: &HashMap<String, BlockedDoc>) -> std::io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut docs: Vec<&BlockedDoc> = blocked.values().collect();
+        // Stable order on disk so the file doesn't churn on every rewrite.
+        docs.sort_by(|a, b| a.path.cmp(&b.path));
+        let bytes =
+            serde_json::to_vec_pretty(&docs).map_err(|e| std::io::Error::other(e.to_string()))?;
+        std::fs::write(&self.path, bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_store_round_trips_across_reconstruct() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::for_vault(dir.path());
+        assert!(store.load().is_empty(), "fresh vault has no blocks");
+
+        let mut blocked = HashMap::new();
+        blocked.insert(
+            "notes/a.md".to_string(),
+            BlockedDoc {
+                path: "notes/a.md".into(),
+                reason: "fork".into(),
+                peer_fingerprint: DeviceFingerprint("DEV-PEER".into()),
+            },
+        );
+        store.save(&blocked).unwrap();
+
+        // A fresh store over the same vault dir (a "restart") re-hydrates it.
+        let reopened = BlockStore::for_vault(dir.path()).load();
+        assert_eq!(reopened, blocked, "block survives reconstruct");
+
+        // Clearing the last block persists an empty set (no stale resurrection).
+        store.save(&HashMap::new()).unwrap();
+        assert!(
+            BlockStore::for_vault(dir.path()).load().is_empty(),
+            "cleared block does not resurrect on reload"
+        );
+    }
+
+    #[test]
+    fn block_store_corrupt_file_hydrates_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::for_vault(dir.path());
+        std::fs::create_dir_all(dir.path().join(".hiker").join("sync")).unwrap();
+        std::fs::write(
+            dir.path().join(".hiker").join("sync").join("blocked.json"),
+            b"{ not json",
+        )
+        .unwrap();
+        assert!(store.load().is_empty(), "corrupt file starts clean, not wedged");
+    }
 
     #[test]
     fn serde_round_trip_status_and_resolution() {

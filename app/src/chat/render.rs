@@ -254,49 +254,6 @@ impl Chat<'_> {
     }
 }
 
-impl AppState {
-    /// Standalone session picker — the same combobox `Chat::header` builds,
-    /// but rendered into an arbitrary ui so it can sit in the secondary
-    /// side bar's chrome title row alongside the +/trash buttons that
-    /// `secondary_side_bar_action_buttons` already places there.
-    pub fn chat_session_picker(&mut self, ui: &mut egui::Ui) {
-        let active_id = self.chat_state.registry.active.clone();
-        let active_label = active_label_for(&self.chat_state.registry, active_id.as_deref());
-        let mut switch_to: Option<String> = None;
-
-        let picker_width = ui.available_width().min(280.0).max(0.0);
-        egui::ComboBox::from_id_salt("chat_picker_sidebar_title")
-            .selected_text(active_label)
-            .width(picker_width)
-            .show_ui(ui, |ui| {
-                let mut rows: Vec<(String, String, i64)> = self
-                    .chat_state.registry
-                    .sessions
-                    .values()
-                    .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
-                    .collect();
-                rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-                if rows.is_empty() {
-                    ui.label(
-                        egui::RichText::new("(no sessions yet)")
-                            .color(theme::muted())
-                            .small(),
-                    );
-                }
-                for (id, preview, _mtime) in rows {
-                    let selected = active_id.as_deref() == Some(id.as_str());
-                    if ui.selectable_label(selected, &preview).clicked() {
-                        switch_to = Some(id);
-                    }
-                }
-            });
-
-        if let Some(id) = switch_to {
-            session::set_active(&mut self.chat_state.registry, &id);
-        }
-    }
-}
-
 fn active_label_for(reg: &ChatRegistry, id: Option<&str>) -> String {
     match id.and_then(|i| reg.sessions.get(i)) {
         Some(s) => s.preview.clone(),

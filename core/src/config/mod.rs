@@ -27,16 +27,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::HikerError;
 
-pub mod content_dirs;
 mod io;
 mod patch;
 pub mod sections;
 
-use content_dirs::{ChatConfig, ExtractConfig};
 use sections::{
-    AcpConfig, BoardsConfig, ClusteringConfig, EditorConfig, InboxConfig, IndexingConfig, LlmConfig,
-    McpConfig, OpLogConfig, SearchConfig, SuggestionsConfig, SyncSection, TasksConfig, TrailsConfig,
-    VaultConfig, WikilinksConfig,
+    AcpConfig, BoardsConfig, ChatConfig, ClusteringConfig, EditorConfig, InboxConfig,
+    IndexingConfig, LlmConfig, McpConfig, OpLogConfig, RenderConfig, SearchConfig, SuggestionsConfig,
+    SyncSection, TasksConfig, TrailsConfig, VaultConfig, WikilinksConfig,
 };
 
 use io::{atomic_write, deep_merge, display_path, write_defaults};
@@ -114,14 +112,46 @@ pub struct Config {
     /// status: inbox-rules
     #[serde(default)]
     pub inbox: InboxConfig,
-    /// status: settings-section-extract
-    #[serde(default)]
-    pub extract: ExtractConfig,
+    /// Legacy `[extract]` table from old vaults: web-source acquisition
+    /// (scrape / crawl / feed) moved to external producers, so `core` no
+    /// longer interprets these tunables. The field is kept solely to keep
+    /// strict-load (`deny_unknown_fields`) from rejecting an old vault TOML
+    /// that still carries the table; it's parsed as an opaque value and never
+    /// written back (`skip_serializing`).
+    #[serde(default, skip_serializing)]
+    pub extract: Option<toml::Value>,
     /// status: settings-section-chat
     #[serde(default)]
     pub chat: ChatConfig,
+    /// status: render-cache-diagrams-toggle
+    #[serde(default)]
+    pub render: RenderConfig,
     #[serde(default)]
     pub ui: Ui,
+}
+
+/// How a plain (no-modifier) scroll behaves in the canvas view. `auto` picks per
+/// device (mouse wheel → zoom to cursor, touchpad → pan); `pan` / `zoom` force one
+/// behavior. Serialized lowercase in `[ui] canvas_scroll_mode`. [canvas-scroll-mode]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CanvasScrollMode {
+    #[default]
+    Auto,
+    Pan,
+    Zoom,
+}
+
+impl CanvasScrollMode {
+    /// The lowercase wire string (`auto` / `pan` / `zoom`), for `Config::set`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Pan => "pan",
+            Self::Zoom => "zoom",
+        }
+    }
 }
 
 /// UI-layer preferences. Currently just the custom-titlebar toggle;
@@ -134,11 +164,63 @@ pub struct Ui {
     /// controls + merged top bar) and asks eframe to hide native chrome.
     #[serde(default = "default_true")]
     pub custom_titlebar: bool,
+    /// When true, reader / focus mode also hides the global top bar (the
+    /// custom titlebar or the native top toolbar), leaving only the editor
+    /// and — in frameless mode — the window resize grips. Default false.
+    #[serde(default)]
+    pub reader_hide_top_bar: bool,
+    /// When true, reader / focus mode also hides the tab strip (the row of tab
+    /// handles above the focused tab). Reader mode shows tabs by default; this
+    /// opts into hiding them. Default false.
+    #[serde(default)]
+    pub reader_hide_tabs: bool,
+    /// When true, reader / focus mode also hides each view's in-tab toolbar (the
+    /// canvas create toolbar, the editor toolbar, the board/graph action rows,
+    /// …). Reader mode shows these by default; this opts into hiding them.
+    /// Default false.
+    #[serde(default)]
+    pub reader_hide_toolbar: bool,
+    /// How a plain (no-modifier) two-finger / wheel scroll behaves in the canvas
+    /// view. `auto` (default) — **detect the device**: a mouse wheel **zooms** to
+    /// the cursor, a touchpad two-finger scroll **pans** the camera. `pan` / `zoom`
+    /// force one behavior (e.g. a high-res wheel that reports pixel deltas and is
+    /// misread as a touchpad). Ctrl/Cmd+scroll and pinch always zoom regardless;
+    /// scrolling over a note card always scrolls that card. [canvas-scroll-mode]
+    #[serde(default)]
+    pub canvas_scroll_mode: CanvasScrollMode,
+    /// Legacy `[ui] canvas_scroll_zooms` bool, superseded by `canvas_scroll_mode`.
+    /// Kept (opaque, never written back via `skip_serializing`) only so strict
+    /// load (`deny_unknown_fields`) doesn't reject an old vault TOML that still
+    /// carries it; the value is ignored, so an existing vault adopts the new
+    /// `auto` default. [canvas-scroll-mode]
+    #[serde(default, skip_serializing)]
+    pub canvas_scroll_zooms: Option<bool>,
+    /// Whether a two-finger horizontal trackpad swipe navigates Back/Forward
+    /// (browser-style). Default `true`. Turn off if it misfires during ordinary
+    /// horizontal scrolling. [navigation-swipe-disable]
+    #[serde(default = "default_true")]
+    pub swipe_nav_enabled: bool,
+    /// Whether hovering a sidebar row shows a rich hover preview (the canvas /
+    /// cluster-tree thumbnail expand and the note markdown+diagram popup). Default
+    /// `true`; toggled from any preview-showing view's eye menu. Disabling leaves
+    /// any always-on inline thumbnails but suppresses the hover-expand popup.
+    /// [preview-toggle]
+    #[serde(default = "default_true")]
+    pub hover_previews_enabled: bool,
 }
 
 impl Default for Ui {
     fn default() -> Self {
-        Self { custom_titlebar: true }
+        Self {
+            custom_titlebar: true,
+            reader_hide_top_bar: false,
+            reader_hide_tabs: false,
+            reader_hide_toolbar: false,
+            canvas_scroll_mode: CanvasScrollMode::Auto,
+            canvas_scroll_zooms: None,
+            swipe_nav_enabled: true,
+            hover_previews_enabled: true,
+        }
     }
 }
 
@@ -170,8 +252,9 @@ impl Default for Config {
             suggestions: SuggestionsConfig::default(),
             clustering: ClusteringConfig::default(),
             inbox: InboxConfig::default(),
-            extract: ExtractConfig::default(),
+            extract: None,
             chat: ChatConfig::default(),
+            render: RenderConfig::default(),
             ui: Ui::default(),
         }
     }

@@ -43,7 +43,9 @@ use crate::tab::TabId;
 
 pub mod content;
 pub mod edit;
-mod render;
+pub mod menu;
+pub(crate) mod render;
+pub mod thumbnail;
 
 /// Which render the canvas pane shows. The toggle is a render choice over the
 /// one underlying op-log document, not two tabs — switching to `Json` hosts the
@@ -103,6 +105,17 @@ pub struct Pane {
     /// `canvas_body` frame for this pane, so a restored canvas opens where the
     /// user left it rather than re-fitting. status: canvas-view-state-persist
     view_restored: bool,
+    /// The last note path this canvas FOLLOWED into focus (when linked to a
+    /// source group). Dedupes the select-and-center so the camera only moves
+    /// when the linked group's active note actually changes, leaving the
+    /// user free to pan/zoom in between. status: tab-linking
+    followed: Option<String>,
+    /// One-shot "snap to the node referencing this note on the next render",
+    /// set when the canvas is opened from the "Appears in" sidebar so the view
+    /// lands on the referencing file-node rather than the whole board. Consumed
+    /// (and cleared) by `apply_pending_focus`, the same posture as `fit_pending`.
+    /// status: canvas-appears-in
+    focus_note_pending: Option<String>,
 }
 
 impl Default for Pane {
@@ -118,6 +131,8 @@ impl Default for Pane {
             insert_picker: crate::widgets::autocomplete_picker::PickerState::default(),
             editing: None,
             view_restored: false,
+            followed: None,
+            focus_note_pending: None,
         }
     }
 }
@@ -144,11 +159,7 @@ pub fn open(app: &mut AppState, path: &str) -> TabId {
         return id;
     }
     let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::Canvas { path: path.to_string() },
-        sticky: true,
-    });
+    app.session.tabs.push(Tab::new(id, TabKind::Canvas { path: path.to_string() }, true));
     app.session.active_tab = Some(id);
     id
 }
@@ -168,6 +179,34 @@ pub fn open_as_json(app: &mut AppState, path: &str) {
     app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Json;
 }
 
+/// Open `path` in a canvas tab and queue a one-shot "snap to the file-node that
+/// references `note`" for the next render. Drives the "Appears in" sidebar, so
+/// clicking a canvas there lands the view on the referencing node (selected)
+/// rather than the whole board. status: canvas-appears-in
+pub fn open_focused(app: &mut AppState, path: &str, note: &str) {
+    let tab_id = open(app, path);
+    app.panels.canvases.entry(tab_id).or_default().focus_note_pending = Some(note.to_string());
+}
+
+/// The vault path of the note currently inline-edited on canvas tab `tab_id` —
+/// the `file` of the File node in edit mode. `None` when nothing is being edited,
+/// the edited node is a Text node, or its path is empty. Lets the host treat the
+/// edited note as the "active note" so the context panel (backlinks / related /
+/// appears-in) follows what you're editing on the canvas rather than the
+/// `.canvas` file itself. status: canvas-inline-edit
+#[must_use]
+pub fn inline_edited_note(app: &AppState, tab_id: TabId) -> Option<String> {
+    let pane = app.panels.canvases.get(&tab_id)?;
+    let node_id = pane.editing.as_deref()?;
+    let canvas = pane.canvas.as_ref()?;
+    canvas.nodes.iter().find(|n| n.id == node_id).and_then(|n| match &n.kind {
+        hiker_canvas::model::NodeKind::File { file, .. } if !file.trim().is_empty() => {
+            Some(file.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Render the canvas tab body. Mirrors `panels::board::show`.
 pub fn show(
     ui: &mut egui::Ui,
@@ -183,8 +222,16 @@ pub fn show(
         ui.colored_label(render::error_color(), "Couldn't load this .canvas file.");
         return;
     }
-    render::header(ui, app, tab_id, path);
-    ui.separator();
+    // The toolbar/header keeps a padded band of its own (the pane itself is
+    // edge-to-edge, so without this the title would sit flush against the window
+    // chrome). The canvas body below is edge-to-edge and sits FLUSH under the
+    // toolbar — no separator line, no inter-element gap.
+    egui::Frame::default()
+        .inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 })
+        .show(ui, |ui| {
+            render::header(ui, app, tab_id, path);
+        });
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     let view = app
         .panels
@@ -274,13 +321,24 @@ pub fn list_canvases(vault: &hiker_core::vault::Vault) -> Vec<(String, String)> 
 /// `canvas_rel`, whether or not that canvas is currently open — the right-click
 /// "Add to canvas…" write path, mirroring `panels::board::add_card`'s
 /// open-or-closed posture. Reads the canvas's current text (the open buffer if
-/// present, else disk = materialized accepted), parses it, appends a uniquely-id'd
-/// pointer at a non-overlapping cascade position, and persists through the SAME
-/// `op_writes::user_save` path `persist_canvas` uses. If the target canvas is
-/// open, the reverse op-log binding re-parses the change next frame.
+/// present, else disk = materialized accepted), parses it, and appends a
+/// uniquely-id'd pointer at a non-overlapping cascade position.
+///
+/// Routing follows the dirty/save model the in-editor binding now uses
+/// (`canvas-oplog-binding`):
+/// - **Open canvas** → the edit is mirrored into the op-log `working` layer
+///   (the buffer goes DIRTY) exactly like a spatial edit, and the user commits
+///   it with Ctrl+S. The reverse binding re-parses the new working text next
+///   frame, so the node appears on the open canvas immediately. We don't touch
+///   `loaded_hash`, so the dirty dot lights up.
+/// - **Closed canvas** → there's no open buffer/tab to hold a dirty state, so
+///   the edit commits straight to `accepted` + disk via `op_writes::user_save`,
+///   the same one-shot posture `board::add_card` has for a closed board.
+///
 /// status: canvas-add-to-canvas-verb
 pub fn add_file_node(app: &mut AppState, canvas_rel: &str, vault_rel: &str) {
     use crate::state::ToastLevel;
+    let is_open = app.session.buffers.contains_key(canvas_rel);
     let current = app
         .session
         .buffers
@@ -298,9 +356,34 @@ pub fn add_file_node(app: &mut AppState, canvas_rel: &str, vault_rel: &str) {
     let node = build_file_pointer(&canvas, vault_rel);
     canvas.nodes.push(node);
     let json = canvas.to_canonical_json();
-    if let Some(buf) = app.session.buffers.get_mut(canvas_rel) {
-        buf.set_doc_clamping_selection(&json);
+    let log = &app.vault_session.services.oplog;
+    if is_open {
+        // Open canvas: route through `working` so it's a dirty edit the user
+        // saves with Ctrl+S, consistent with `render::persist_canvas`.
+        let doc_id = match log.doc_id_for_path(canvas_rel) {
+            Ok(Some(id)) => id,
+            Ok(None) | Err(_) => {
+                app.push_toast("Add to canvas failed: no op-log document".to_string(), ToastLevel::Error);
+                return;
+            }
+        };
+        let mirror = log
+            .materialize_working(&doc_id)
+            .and_then(|c| log.apply_working_edit(&doc_id, 0, c.text.len(), &json));
+        match mirror {
+            Ok(()) => {
+                // Lockstep the editable buffer (DIRTY — loaded baseline left as
+                // the last save) so the JSON view + dirty dot follow.
+                if let Some(buf) = app.session.buffers.get_mut(canvas_rel) {
+                    buf.set_doc_clamping_selection(&json);
+                }
+                app.push_toast("Added to canvas".to_string(), ToastLevel::Info);
+            }
+            Err(e) => app.push_toast(format!("Add to canvas failed: {e}"), ToastLevel::Error),
+        }
+        return;
     }
+    // Closed canvas: no dirty-buffer surface, so commit straight to disk.
     let result = hiker_core::ops::op_writes::user_save(
         &app.vault_session.services.oplog,
         &app.vault_session.vault,

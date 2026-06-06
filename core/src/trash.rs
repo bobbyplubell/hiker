@@ -45,6 +45,16 @@ pub struct Entry {
     /// removed from the index. None for files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<String>>,
+    /// The op-log `doc_id` this entry's note was tracked under, when known.
+    /// A tracked note's Yrs history is retained keyed by `doc_id` rather than
+    /// purged on delete (per `op-log.md`'s "Offline delete and rename"), so
+    /// restore can rebind `path → doc_id` to recover full history instead of
+    /// minting a fresh document. `None` for a hand-dropped file or a note that
+    /// was never seeded into the op-log (its restore takes the fresh-import
+    /// path). Folder entries leave this `None` — their members are rebound
+    /// individually by path on re-ingest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
 }
 
 /// Disk-derived view of one trash entry. Built by joining a directory walk
@@ -63,6 +73,10 @@ pub struct ListItem {
     /// file" (the UI infers from `kind`) or "we can't tell" (orphan folder).
     pub member_count: Option<usize>,
     pub orphaned: bool,
+    /// The op-log `doc_id` recorded for this entry, when known. Carried so a
+    /// history-preserving restore can rebind `path → doc_id`. `None` for files
+    /// never seeded into the op-log, folder entries, and orphans.
+    pub doc_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -126,6 +140,45 @@ impl Trash {
             deleted_at: now.unix_timestamp(),
             kind: Kind::File,
             members: None,
+            doc_id: None,
+        })
+    }
+
+    /// Create a trash entry for a file whose disk bytes are *already gone* —
+    /// the offline-delete case (`op-log-startup-disk-reconcile`). The original
+    /// `.md` vanished while hiker was closed, so the recoverable artifact is
+    /// the document's last known content (`materialize(accepted)`), supplied by
+    /// the caller, rather than an fs move. Mirrors [`move_file_in`]'s naming
+    /// and manifest shape so restore treats it identically; only the byte
+    /// source differs. The caller appends the returned entry via [`append`].
+    ///
+    /// status: op-log-startup-disk-reconcile
+    pub fn capture_content_in(
+        &self,
+        rel: &str,
+        content: &str,
+        doc_id: Option<String>,
+    ) -> Result<Entry, HikerError> {
+        self.ensure_dir()?;
+        let now = OffsetDateTime::now_utc();
+        let basename = Path::new(rel)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rel.to_string());
+        let trashed_name = pick_unique_name(&self.dir, &timestamp_prefix(now), &basename)?;
+        let dest = self.dir.join(&trashed_name);
+        fs::write(&dest, content.as_bytes())?;
+        Ok(Entry {
+            id: crate::store::dto::new_id(),
+            original_path: rel.to_string(),
+            trashed_name,
+            // No surviving source file, so deletion-time is the best mtime we
+            // can record for the artifact.
+            original_mtime: now.unix_timestamp(),
+            deleted_at: now.unix_timestamp(),
+            kind: Kind::File,
+            members: None,
+            doc_id,
         })
     }
 
@@ -185,6 +238,7 @@ impl Trash {
             deleted_at: now.unix_timestamp(),
             kind: Kind::Folder,
             members: Some(members),
+            doc_id: None,
         })
     }
 
@@ -266,6 +320,7 @@ impl Trash {
                     kind,
                     member_count: m.members.as_ref().map(std::vec::Vec::len),
                     orphaned: false,
+                    doc_id: m.doc_id.clone(),
                 },
                 None => {
                     // Orphan — pull deletion time from fs metadata as a fallback.
@@ -284,6 +339,7 @@ impl Trash {
                         kind,
                         member_count: None,
                         orphaned: true,
+                        doc_id: None,
                     }
                 }
             };

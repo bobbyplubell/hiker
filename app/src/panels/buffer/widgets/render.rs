@@ -21,6 +21,8 @@ use hiker_mermaid::{
 };
 use hiker_wavedrom::{WaveDromOptions, render as render_wavedrom_svg};
 
+use super::disk_cache::{DiagramCacheCtx, Domain};
+
 /// A rasterized widget: straight RGBA8 pixels plus the metrics the editor needs
 /// to size, baseline-align, and cache it.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,8 +63,10 @@ impl MathKind {
 }
 
 /// Guard against a pathological SVG viewBox or `dpr` blowing up memory — the
-/// same cap `hiker-htmlview` uses for its inline diagrams.
-const MAX_DIM_PX: f32 = 8192.0;
+/// same cap `hiker-htmlview` uses for its inline diagrams. `pub(crate)` so the
+/// reusable preview-thumbnail renderer (`widgets::preview`) shares this cap
+/// instead of redefining it.
+pub(crate) const MAX_DIM_PX: f32 = 8192.0;
 
 /// Render a LaTeX `src` to RGBA pixels at `font_px * dpr` physical size.
 ///
@@ -79,7 +83,16 @@ pub fn render_math(
     dpr: f32,
     fg: [u8; 4],
     preamble: &str,
+    cache: Option<&DiagramCacheCtx>,
 ) -> Option<RenderedWidget> {
+    // Disk-cache hit short-circuits both the LaTeX layout and the resvg blit:
+    // the hash folds in every input that affects the pixels, so a hit is the
+    // exact render we'd have produced (`widget-render-disk-cache`).
+    let content_hash = hash_math(src, kind, font_px, dpr, fg, preamble);
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::Math, content_hash)) {
+        return Some(hit);
+    }
+
     let opts = MathOptions {
         font_size_px: font_px,
         color: fg,
@@ -92,7 +105,6 @@ pub fn render_math(
         baseline_px,
     } = render_latex_with_preamble(src, preamble, &opts)?;
 
-    let content_hash = hash_math(src, kind, font_px, dpr, fg, preamble);
     let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
 
     // The SVG is authored at logical (CSS) px; rasterizing at `dpr` scales the
@@ -102,13 +114,17 @@ pub fn render_math(
         MathKind::Display => None,
     };
 
-    Some(RenderedWidget {
+    let rendered = RenderedWidget {
         rgba,
         width,
         height,
         baseline,
         content_hash,
-    })
+    };
+    if let Some(c) = cache {
+        c.store(Domain::Math, &rendered);
+    }
+    Some(rendered)
 }
 
 /// Render mermaid `src` to RGBA pixels at `font_px * dpr` physical size.
@@ -121,7 +137,13 @@ pub fn render_mermaid(
     font_px: f32,
     dpr: f32,
     colors: MermaidColors,
+    cache: Option<&DiagramCacheCtx>,
 ) -> Option<RenderedWidget> {
+    let content_hash = hash_mermaid(src, font_px, dpr, colors);
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::Mermaid, content_hash)) {
+        return Some(hit);
+    }
+
     let mut opts = MermaidOptions {
         font_size_px: font_px,
         ..MermaidOptions::default()
@@ -129,17 +151,20 @@ pub fn render_mermaid(
     colors.apply(&mut opts);
 
     let rendered = render_mermaid_svg(src, &opts).ok()?;
-    let content_hash = hash_mermaid(src, font_px, dpr, colors);
     let (rgba, width, height) = rasterize_svg(rendered.svg.as_bytes(), dpr)?;
 
-    Some(RenderedWidget {
+    let out = RenderedWidget {
         rgba,
         width,
         height,
         // Block widget: no baseline alignment.
         baseline: None,
         content_hash,
-    })
+    };
+    if let Some(c) = cache {
+        c.store(Domain::Mermaid, &out);
+    }
+    Some(out)
 }
 
 /// Render WaveDrom WaveJSON `src` to RGBA pixels at `font_px * dpr` physical
@@ -153,7 +178,13 @@ pub fn render_wavedrom(
     font_px: f32,
     dpr: f32,
     colors: WaveDromColors,
+    cache: Option<&DiagramCacheCtx>,
 ) -> Option<RenderedWidget> {
+    let content_hash = hash_wavedrom(src, font_px, dpr, colors);
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::WaveDrom, content_hash)) {
+        return Some(hit);
+    }
+
     let opts = WaveDromOptions {
         font_size_px: font_px,
         foreground: colors.foreground,
@@ -162,17 +193,20 @@ pub fn render_wavedrom(
     };
 
     let rendered = render_wavedrom_svg(src, &opts).ok()?;
-    let content_hash = hash_wavedrom(src, font_px, dpr, colors);
     let (rgba, width, height) = rasterize_svg(rendered.svg.as_bytes(), dpr)?;
 
-    Some(RenderedWidget {
+    let out = RenderedWidget {
         rgba,
         width,
         height,
         // Block widget: no baseline alignment.
         baseline: None,
         content_hash,
-    })
+    };
+    if let Some(c) = cache {
+        c.store(Domain::WaveDrom, &out);
+    }
+    Some(out)
 }
 
 /// A clickable / hoverable sub-region of a rendered mermaid diagram, in
@@ -212,22 +246,31 @@ pub fn render_mermaid_with_regions(
     font_px: f32,
     dpr: f32,
     colors: MermaidColors,
+    cache: Option<&DiagramCacheCtx>,
 ) -> Option<(RenderedWidget, Vec<DiagramRegion>)> {
+    // The mermaid parse/layout is cheap relative to the resvg blit, and it
+    // also yields the interaction regions (which the disk cache doesn't store).
+    // So always run the layout, but let a disk-cache hit skip the rasterize.
     let MermaidLayout { svg, content_hash, regions } =
         mermaid_layout(src, font_px, dpr, colors)?;
-    let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
 
-    Some((
-        RenderedWidget {
-            rgba,
-            width,
-            height,
-            // Block widget: no baseline alignment.
-            baseline: None,
-            content_hash,
-        },
-        regions,
-    ))
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::Mermaid, content_hash)) {
+        return Some((hit, regions));
+    }
+
+    let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
+    let rendered = RenderedWidget {
+        rgba,
+        width,
+        height,
+        // Block widget: no baseline alignment.
+        baseline: None,
+        content_hash,
+    };
+    if let Some(c) = cache {
+        c.store(Domain::Mermaid, &rendered);
+    }
+    Some((rendered, regions))
 }
 
 /// The raster-free product of a mermaid parse + layout: the SVG, the
@@ -346,7 +389,10 @@ pub struct WaveDromColors {
 /// but every label is blank. Mirrors `hiker-htmlview`'s `svg_fontdb`, and also
 /// loads the bundled face so labels resolve even on a system with no
 /// `sans-serif`.
-fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+/// `pub(crate)` so the reusable preview-thumbnail renderer (`widgets::preview`)
+/// reuses the same populated font database (system fonts + bundled sans) when
+/// rasterizing canvas / tree SVGs, rather than building its own.
+pub(crate) fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     use std::sync::{Arc, OnceLock};
     static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
     DB.get_or_init(|| {
@@ -372,7 +418,11 @@ fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
 /// pixels *premultiplied*, so we un-premultiply to straight RGBA8 (the natural
 /// `RGBA8` contract callers and egui's `from_rgba_unmultiplied` expect).
 /// Returns `None` on a parse failure or a degenerate size.
-fn rasterize_svg(bytes: &[u8], dpr: f32) -> Option<(Vec<u8>, u32, u32)> {
+///
+/// `pub(crate)` so the reusable preview-thumbnail renderer (`widgets::preview`,
+/// canvas + cluster-tree thumbnails) shares the exact resvg setup rather than
+/// duplicating it (`preview-canvas-thumbnail` / `preview-tree-thumbnail`).
+pub(crate) fn rasterize_svg(bytes: &[u8], dpr: f32) -> Option<(Vec<u8>, u32, u32)> {
     let opt = resvg::usvg::Options {
         fontdb: svg_fontdb(),
         ..resvg::usvg::Options::default()
@@ -508,7 +558,7 @@ mod tests {
 
     #[test]
     fn inline_math_renders_with_baseline() {
-        let w = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "")
+        let w = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "", None)
             .expect("x^2 should render");
         assert_well_formed(&w);
         assert!(w.baseline.is_some(), "inline math carries a baseline");
@@ -516,7 +566,7 @@ mod tests {
 
     #[test]
     fn display_math_renders_without_baseline() {
-        let w = render_math("\\frac{a}{b}", MathKind::Display, 18.0, 1.5, FG, "")
+        let w = render_math("\\frac{a}{b}", MathKind::Display, 18.0, 1.5, FG, "", None)
             .expect("\\frac{a}{b} should render");
         assert_well_formed(&w);
         assert!(w.baseline.is_none(), "block math has no baseline");
@@ -524,7 +574,7 @@ mod tests {
 
     #[test]
     fn mermaid_renders() {
-        let w = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors())
+        let w = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors(), None)
             .expect("a trivial flowchart should render");
         assert_well_formed(&w);
         assert!(w.baseline.is_none(), "mermaid is a block widget");
@@ -537,6 +587,7 @@ mod tests {
             16.0,
             1.0,
             mermaid_colors(),
+            None,
         );
         assert!(w.is_none(), "an unparseable diagram falls back (None)");
     }
@@ -550,6 +601,7 @@ mod tests {
             16.0,
             1.0,
             mermaid_colors(),
+            None,
         )
         .expect("flowchart should render");
         assert_well_formed(&w);
@@ -568,7 +620,7 @@ mod tests {
     fn mermaid_with_regions_empty_for_non_interactive() {
         // A pie chart has no interaction model: it renders, with no regions.
         let (w, regions) =
-            render_mermaid_with_regions("pie\n \"A\" : 10\n \"B\" : 20", 16.0, 1.0, mermaid_colors())
+            render_mermaid_with_regions("pie\n \"A\" : 10\n \"B\" : 20", 16.0, 1.0, mermaid_colors(), None)
                 .expect("pie should render");
         assert_well_formed(&w);
         assert!(regions.is_empty(), "non-interactive diagram has no regions");
@@ -578,9 +630,9 @@ mod tests {
     fn mermaid_with_regions_hash_matches_plain() {
         // The region-bearing render shares the plain render's content hash for
         // the same inputs, so the texture cache key is identical.
-        let plain = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors()).unwrap();
+        let plain = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors(), None).unwrap();
         let (with, _) =
-            render_mermaid_with_regions("graph TD; A-->B", 16.0, 1.0, mermaid_colors()).unwrap();
+            render_mermaid_with_regions("graph TD; A-->B", 16.0, 1.0, mermaid_colors(), None).unwrap();
         assert_eq!(plain.content_hash, with.content_hash);
     }
 
@@ -592,7 +644,7 @@ mod tests {
         // edit-target ids and cache keys match without paying the resvg blit.
         let src = "graph TD\n A[Start]\n click A \"https://x\" \"go\"";
         let (rendered, regions) =
-            render_mermaid_with_regions(src, 16.0, 1.0, mermaid_colors()).expect("rasterized");
+            render_mermaid_with_regions(src, 16.0, 1.0, mermaid_colors(), None).expect("rasterized");
         let (hash, raster_free) =
             mermaid_regions(src, 16.0, 1.0, mermaid_colors()).expect("raster-free");
         assert_eq!(rendered.content_hash, hash, "content hash matches");
@@ -602,22 +654,22 @@ mod tests {
 
     #[test]
     fn same_inputs_same_hash() {
-        let a = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "").unwrap();
-        let b = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "").unwrap();
+        let a = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "", None).unwrap();
+        let b = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "", None).unwrap();
         assert_eq!(a.content_hash, b.content_hash);
     }
 
     #[test]
     fn different_font_px_different_hash() {
-        let a = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "").unwrap();
-        let b = render_math("x^2", MathKind::Inline, 20.0, 2.0, FG, "").unwrap();
+        let a = render_math("x^2", MathKind::Inline, 16.0, 2.0, FG, "", None).unwrap();
+        let b = render_math("x^2", MathKind::Inline, 20.0, 2.0, FG, "", None).unwrap();
         assert_ne!(a.content_hash, b.content_hash);
     }
 
     #[test]
     fn math_and_mermaid_hashes_dont_collide() {
-        let m = render_math("x^2", MathKind::Inline, 16.0, 1.0, FG, "").unwrap();
-        let d = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors()).unwrap();
+        let m = render_math("x^2", MathKind::Inline, 16.0, 1.0, FG, "", None).unwrap();
+        let d = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors(), None).unwrap();
         assert_ne!(m.content_hash, d.content_hash);
     }
 
@@ -635,6 +687,7 @@ mod tests {
             16.0,
             1.0,
             wavedrom_colors(),
+            None,
         )
         .expect("a trivial waveform should render");
         assert_well_formed(&w);
@@ -644,15 +697,15 @@ mod tests {
     #[test]
     fn broken_wavedrom_returns_none() {
         // Not WaveJSON at all → parse error → None (fall back to tinted source).
-        let w = render_wavedrom("this is not wavejson", 16.0, 1.0, wavedrom_colors());
+        let w = render_wavedrom("this is not wavejson", 16.0, 1.0, wavedrom_colors(), None);
         assert!(w.is_none(), "unparseable WaveJSON falls back (None)");
     }
 
     #[test]
     fn wavedrom_same_inputs_same_hash() {
         let src = "{ signal: [{ name: 'clk', wave: 'p..' }] }";
-        let a = render_wavedrom(src, 16.0, 1.0, wavedrom_colors()).unwrap();
-        let b = render_wavedrom(src, 16.0, 1.0, wavedrom_colors()).unwrap();
+        let a = render_wavedrom(src, 16.0, 1.0, wavedrom_colors(), None).unwrap();
+        let b = render_wavedrom(src, 16.0, 1.0, wavedrom_colors(), None).unwrap();
         assert_eq!(a.content_hash, b.content_hash);
         assert_eq!(
             a.content_hash,
@@ -665,7 +718,7 @@ mod tests {
     fn wavedrom_hash_distinct_from_math_and_mermaid() {
         // Same source string through different domains must not collide.
         let wd = wavedrom_content_hash("graph TD; A-->B", 16.0, 1.0, wavedrom_colors());
-        let mm = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors()).unwrap();
+        let mm = render_mermaid("graph TD; A-->B", 16.0, 1.0, mermaid_colors(), None).unwrap();
         assert_ne!(wd, mm.content_hash, "wavedrom vs mermaid domain-tagged");
     }
 }

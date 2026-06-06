@@ -238,4 +238,81 @@ impl OpLog {
             Ok(())
         })
     }
+
+    /// Restore a tombstoned document at `path`, recovering its full history.
+    /// The inverse of [`tombstone_document`] for the trash round trip: rebind
+    /// `doc-index.db` so `path → doc_id` resolves to this retained doc, clear
+    /// `meta.tombstone` on `accepted`, write a `Create` side-table row marking
+    /// the resurrection, and persist the Yrs Doc. The on-disk `.md` is restored
+    /// by the caller (the trash fs-move); this records the logical half so the
+    /// document comes back with its prior history rather than as a fresh import.
+    ///
+    /// `path` is the location the file is restored to — usually its original
+    /// path, but `repoint_doc` handles a restore-to-new-location too. A no-op
+    /// (returns `Ok`) on a doc that is already live and already bound to `path`,
+    /// so a redundant restore mints nothing.
+    ///
+    /// status: vault-trash-restore
+    /// status: op-log-startup-disk-reconcile
+    /// status: op-log-atomic-write
+    pub fn restore_document(
+        &self,
+        doc_id: &str,
+        path: &str,
+        author: &Author,
+    ) -> Result<(), Error> {
+        let now = now_ms();
+        self.locked(|inner| {
+            // Rebind first so a later path lookup resolves to the retained doc
+            // even if the tombstone-clear below is interrupted; the repoint is
+            // idempotent and a tombstoned-but-bound doc is the same state we
+            // recover from on a crashed restore.
+            meta::repoint_doc(&inner.index, doc_id, path)?;
+            let op_id = ulid::Ulid::new().to_string();
+            let (client_id, lo, hi, hash) = {
+                let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
+                // Already-live + already-bound → nothing to resurrect.
+                if !doc::materialize(&state.accepted).tombstone {
+                    return Ok(());
+                }
+                let cid = state.accepted.client_id();
+                let lo = doc::state_clock(&state.accepted, cid);
+                doc::clear_tombstone(&state.accepted);
+                doc::apply_rename(&state.accepted, path);
+                let hi = doc::state_clock(&state.accepted, cid);
+                Self::persist_accepted(&self.oplog_dir, doc_id, state)?;
+                let materialized = doc::materialize(&state.accepted);
+                Self::retain_frame(
+                    &self.oplog_dir,
+                    doc_id,
+                    state,
+                    op_id.clone(),
+                    &materialized.text,
+                    materialized.tombstone,
+                    now,
+                )?;
+                (cid.get() as i64, lo, hi, content_hash(&materialized.text))
+            };
+            meta::insert_metadata(
+                &inner.meta,
+                &MetadataInsert {
+                    doc_id,
+                    op_id: &op_id,
+                    yrs_client_id: client_id,
+                    yrs_clock_lo: lo,
+                    yrs_clock_hi: hi,
+                    author,
+                    op_kind: &OpKind::Create,
+                    status: OpStatus::Accepted,
+                    timestamp_ms: now,
+                    content_hash: Some(&hash),
+                    surface: None,
+                    session_id: None,
+                    batch_id: None,
+                    metadata: &serde_json::Value::Null,
+                },
+            )?;
+            Ok(())
+        })
+    }
 }

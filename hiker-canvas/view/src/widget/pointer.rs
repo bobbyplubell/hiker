@@ -50,7 +50,18 @@ impl CanvasView {
             self.menu_anchor = response.interact_pointer_pos();
         }
         if response.drag_started() {
-            if let Some(p) = response.interact_pointer_pos() {
+            // Resolve the press TARGET at the press-DOWN position (`press_origin`),
+            // NOT the current pointer (`interact_pointer_pos`). By the time
+            // `drag_started` fires, egui's drag threshold has already nudged the
+            // pointer a few px off where the button went down — enough to slip off
+            // a small resize handle, so a resize the user pressed ON would resolve
+            // to the node body and become a move. The drag delta below still
+            // tracks the live pointer; only the initial hit-test uses the origin.
+            // status: canvas-node-resize
+            let press_at = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(p) = press_at {
                 self.on_press(canvas, viewport, p, shift, space);
             }
         }
@@ -103,6 +114,20 @@ impl CanvasView {
         if let Target::SideHandle { node, side } = target {
             self.interaction = Interaction::Connecting { from_node: node, from_side: side };
             return;
+        }
+        // Click-again-to-edit: a plain (no-shift) click on a node that is ALREADY
+        // the sole selection asks the host to enter inline-edit — the Finder
+        // rename gesture (first click selects, second click edits). The host
+        // enters edit only for an editable node; a click-again elsewhere is just a
+        // redundant select. status: canvas-inline-edit
+        if let Target::Node(id) = &target {
+            let already_sole = !shift
+                && self.selection.edges.is_empty()
+                && self.selection.nodes.len() == 1
+                && self.selection.nodes.contains(id);
+            if already_sole {
+                out.edit_requested = Some(id.clone());
+            }
         }
         interaction::click_select(&mut self.selection, &target, shift);
     }

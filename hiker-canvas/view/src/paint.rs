@@ -13,7 +13,7 @@ use hiker_canvas::geometry::{node_bounds, Point};
 use hiker_canvas::model::{Canvas, Edge, Node, NodeKind, Side};
 
 use canvas_view_core::camera::Camera;
-use canvas_view_core::edges::{anchor_pos, arrowhead, build_geometry, resolve_sides};
+use canvas_view_core::edges::{anchor_pos, arrowhead, build_geometry, resolve_sides, EdgeGeometry};
 use canvas_view_core::handles::{grown_about_center, handle_rects, Handle, ALL_HANDLES, HANDLE_SIZE, HOVER_GROW};
 use canvas_view_core::interaction::{connector_handle_center, GROUP_HEADER_H};
 
@@ -123,6 +123,19 @@ pub fn group_backgrounds(
     }
 }
 
+/// The on-screen point size for a group label, or `None` to drop it.
+///
+/// Scales with the camera (a readable `12.0` at scale 1) but never grows past the
+/// on-screen header band `header_h`: at fit / LOD zoom a tiny group must NOT paint
+/// an 8px label over a few-pixel card (the `8.0` floor is for readable interactive
+/// zoom, not for a group shrunk to a sliver). Below a readable size, or when the
+/// group is too narrow to show even a glyph or two, returns `None` — the same way
+/// a node card falls back to an LOD placeholder instead of unreadable text.
+fn group_label_size(scale: f32, header_h: f32, screen_w: f32) -> Option<f32> {
+    let size = (12.0 * scale).clamp(8.0, 18.0).min(header_h);
+    (size >= 6.0 && screen_w >= size * 2.0).then_some(size)
+}
+
 /// Paint one group's body tint, its header band (the grab strip), the frame
 /// border, and the label. Split out of the loop so the visibility styling lives
 /// in one place and the loop stays small. `header_hover` brightens the grab strip
@@ -159,9 +172,10 @@ fn paint_group_frame(
     // Frame border on top of the fills.
     painter.rect_stroke(screen, radius, Stroke::new(1.5, frame), StrokeKind::Inside);
     if let Some(text) = label {
-        let size = (12.0 * camera.scale()).clamp(8.0, 18.0);
-        let pos = header.left_center() + Vec2::new(6.0, 0.0);
-        painter.text(pos, egui::Align2::LEFT_CENTER, text, FontId::proportional(size), group_label_color(node.color.as_ref(), visuals));
+        if let Some(size) = group_label_size(camera.scale(), header_h, screen.width()) {
+            let pos = header.left_center() + Vec2::new(6.0, 0.0);
+            painter.text(pos, egui::Align2::LEFT_CENTER, text, FontId::proportional(size), group_label_color(node.color.as_ref(), visuals));
+        }
     }
 }
 
@@ -350,7 +364,7 @@ fn one_edge(
         Stroke::new(width, color),
     );
     painter.add(curve);
-    edge_caps(painter, edge, geo.start, geo.ctrl_a, geo.end, geo.ctrl_b, color);
+    edge_caps(painter, edge, &geo, color, camera.scale());
     if let Some(label) = &edge.label {
         let mid = bezier_midpoint(geo.start, geo.ctrl_a, geo.ctrl_b, geo.end);
         let size = (11.0 * camera.scale()).clamp(8.0, 16.0);
@@ -359,17 +373,30 @@ fn one_edge(
 }
 
 /// Paint arrowheads at whichever ends carry an `arrow` cap (`to_end` defaults to
-/// arrow when absent; `from_end` defaults to none).
-fn edge_caps(painter: &egui::Painter, edge: &Edge, start: Pos2, ctrl_a: Pos2, end: Pos2, ctrl_b: Pos2, color: Color32) {
+/// arrow when absent; `from_end` defaults to none). The head shrinks with the
+/// camera so it stays proportionate to the (tiny) cards and short edges at fit /
+/// LOD zoom instead of a full-size 12px head dwarfing them; capped at its natural
+/// size and floored so it never disappears.
+fn edge_caps(painter: &egui::Painter, edge: &Edge, geo: &EdgeGeometry, color: Color32, scale: f32) {
     use hiker_canvas::model::EndCap;
+    let (len, half_w) = arrowhead_size(scale);
     if matches!(edge.to_end, None | Some(EndCap::Arrow)) {
-        let tri = arrowhead(end, end - ctrl_b, 12.0, 6.0);
+        let tri = arrowhead(geo.end, geo.end - geo.ctrl_b, len, half_w);
         painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
     }
     if matches!(edge.from_end, Some(EndCap::Arrow)) {
-        let tri = arrowhead(start, start - ctrl_a, 12.0, 6.0);
+        let tri = arrowhead(geo.start, geo.start - geo.ctrl_a, len, half_w);
         painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
     }
+}
+
+/// Arrowhead `(length, half-width)` in screen px for the current camera `scale`.
+/// Natural size is 12×6 at scale 1; it scales down when zoomed out (so it stays
+/// proportionate to the shrunken edges) but never past a small floor that keeps
+/// it legible, and never grows beyond the natural size when zoomed in.
+fn arrowhead_size(scale: f32) -> (f32, f32) {
+    let len = (12.0 * scale).clamp(5.0, 12.0);
+    (len, len * 0.5)
 }
 
 /// Evaluate a cubic Bézier at t = 0.5 for label placement.
@@ -402,7 +429,7 @@ pub const fn handle_size() -> f32 {
 
 #[cfg(test)]
 mod lod_tests {
-    use super::{file_basename, first_nonempty_line, is_tiny, lod_title, url_host, LOD_MIN_PX};
+    use super::{arrowhead_size, file_basename, first_nonempty_line, group_label_size, is_tiny, lod_title, url_host, LOD_MIN_PX};
     use egui::{Pos2, Rect, Vec2};
     use hiker_canvas::model::{Node, NodeKind};
     use std::collections::BTreeMap;
@@ -425,6 +452,32 @@ mod lod_tests {
         // A card comfortably above both bounds renders full content.
         assert!(!is_tiny(rect(300.0, 200.0)));
         assert!(!is_tiny(rect(LOD_MIN_PX, LOD_MIN_PX)));
+    }
+
+    #[test]
+    fn group_label_drops_when_group_is_tiny() {
+        // Interactive zoom: 28px band, wide group → readable 12px label.
+        assert_eq!(group_label_size(1.0, 28.0, 300.0), Some(12.0));
+        // Zoomed out so the band is a sliver: label never exceeds the band, and
+        // below 6px it's dropped (no 8px text over a 3px card).
+        assert_eq!(group_label_size(0.02, 0.6, 200.0), None);
+        // The label can shrink with the band rather than being forced to the 8px
+        // floor — so it can't dwarf the card.
+        assert_eq!(group_label_size(0.5, 7.0, 200.0), Some(7.0));
+        // Too narrow to show a glyph or two → dropped even if tall enough.
+        assert_eq!(group_label_size(1.0, 28.0, 10.0), None);
+    }
+
+    #[test]
+    fn arrowhead_shrinks_when_zoomed_out_but_keeps_aspect() {
+        // Interactive zoom: natural 12x6 head.
+        assert_eq!(arrowhead_size(1.0), (12.0, 6.0));
+        // Zoomed in past 1: capped at the natural size, not larger.
+        assert_eq!(arrowhead_size(4.0), (12.0, 6.0));
+        // Fit / LOD zoom: shrinks toward the floor so it doesn't dwarf tiny cards.
+        let (len, half) = arrowhead_size(0.05);
+        assert_eq!(len, 5.0, "floored, not the 12px full-size head over a tiny edge");
+        assert!((half - len * 0.5).abs() < 1e-6, "half-width tracks length");
     }
 
     #[test]

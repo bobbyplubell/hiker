@@ -270,6 +270,12 @@ impl Spawner {
             }
         };
 
+        // Spawn the debounced poke-on-commit task (the sending side): each
+        // local commit calls `service.notify_local_change()`, which wakes this
+        // task to nudge enrolled peers to pull promptly. Respects the service
+        // cancel token. [sync-poke-on-commit]
+        service.spawn_poke_task();
+
         let node = service.node();
         let events_tx = service.events_tx();
         let svc = service.clone();
@@ -339,7 +345,7 @@ impl Spawner {
                         svc.auto_sync_round().await;
                     }
                     _ = async {
-                        let newly_discovered = {
+                        let (newly_discovered, poked) = {
                             let mut node = node.lock().await;
                             // Short window so the node lock is held only briefly
                             // between turns — a UI-spawned action that needs the
@@ -365,14 +371,19 @@ impl Spawner {
                                      enroll its fingerprint to sync"
                                 ));
                             }
-                            node.take_newly_discovered()
+                            // Drain both prompt-round triggers under the same
+                            // lock turn: a newly-seen enrolled peer AND an
+                            // inbound poke (a peer committed a change and asked
+                            // us to pull). [sync-poke-on-commit]
+                            (node.take_newly_discovered(), node.take_poked())
                         };
                         // Yield so a waiting dialer can grab the lock between
                         // the responder window and any on-discovery round.
                         tokio::task::yield_now().await;
-                        if newly_discovered {
-                            // A new enrolled peer just appeared — sync with it
-                            // promptly rather than waiting for the next tick.
+                        if newly_discovered || poked {
+                            // A new enrolled peer just appeared, or a peer poked
+                            // us after committing — pull promptly rather than
+                            // waiting for the next tick. [sync-poke-on-commit]
                             svc.auto_sync_round().await;
                         }
                     } => {}
@@ -527,6 +538,11 @@ impl Spawner {
 /// threshold comes from `[op-log] compact_threshold`. A bootstrap seed
 /// failure is non-fatal (logged) so a single unreadable note can't block
 /// the whole vault opening.
+///
+/// Ordering (`op-log.md` §External-edit sync): the startup disk-reconcile
+/// runs first, then the bootstrap seed, and this whole step completes
+/// synchronously before `open_vault` spawns the sync service — i.e.
+/// reconcile → seed → first sync round.
 fn open_and_seed_oplog(
     root: &std::path::Path,
     vault: &Vault,
@@ -543,6 +559,9 @@ fn open_and_seed_oplog(
     // chats folder *before* the op-log seed below, so the moved notes are in
     // the main walk and get doc_ids + indexing on this same open. Idempotent.
     run_sessions_migration_on_open(root, config);
+    // Startup disk-reconcile MUST run before the bootstrap seed (see the
+    // ordering invariant on `run_disk_reconcile_on_open`).
+    run_disk_reconcile_on_open(root, vault, &oplog);
     match hiker_core::ops::op_writes::bootstrap(vault, &oplog) {
         Ok(n) if n > 0 => tracing::info!(seeded = n, "oplog: seeded documents on first open"),
         Ok(_) => {}
@@ -551,6 +570,25 @@ fn open_and_seed_oplog(
     run_trails_companion_migration_on_open(vault, &oplog);
     run_oplog_retention_gc_on_open(&oplog, config);
     Ok(oplog)
+}
+
+/// Startup disk-reconcile (`op-log.md` §External-edit sync, Ordering
+/// invariant): walk every tracked doc and fold disk-vs-`accepted` drift
+/// (offline edits, deletes, renames) in as `author=external` ops. This MUST
+/// run BEFORE the bootstrap seed — bootstrap seeds an untracked path as a fresh
+/// document, so an offline rename's new path has to be claimed by reconcile
+/// while it is still untracked, or the rename degrades into a tombstone + a
+/// fresh, history-orphaned lineage. It runs synchronously here during vault
+/// open, before `open_vault` calls `spawn_sync_service` — so a stale `accepted`
+/// is never pushed and an offline edit is never clobbered by an inbound update
+/// that lands first. Failures are logged, not fatal. status: op-log-startup-disk-reconcile
+fn run_disk_reconcile_on_open(root: &std::path::Path, vault: &Vault, oplog: &Arc<OpLog>) {
+    let trash = hiker_core::trash::Trash::open(root);
+    match hiker_core::ops::op_writes::reconcile_disk(vault, oplog, &trash) {
+        Ok(n) if n > 0 => tracing::info!(reconciled = n, "oplog: reconciled disk drift on open"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "oplog: disk reconcile failed (non-fatal)"),
+    }
 }
 
 /// One-time chat-sessions storage-layout migration
@@ -613,48 +651,19 @@ fn run_oplog_retention_gc_on_open(oplog: &Arc<OpLog>, config: &std::sync::RwLock
 }
 
 /// Load the persisted session state for a freshly-opened vault: crash-recovery
-/// entries, the saved tab snapshot, and the trails list. Any missing or
-/// malformed file degrades to an empty value so a fresh vault still opens
-/// cleanly.
+/// entries and the saved tab snapshot. Any missing or malformed file degrades
+/// to an empty value so a fresh vault still opens cleanly. (Trails are
+/// markdown trail-docs on disk read live by the sidebar — no JSON model to
+/// load here.)
 fn load_persisted_session(
     autosave: &Autosave,
-    root: &std::path::Path,
 ) -> (
     Vec<hiker_core::autosave::RecoveredEntry>,
     Option<hiker_core::autosave::TabState>,
-    Vec<crate::state::Trail>,
 ) {
     let recovery_entries = autosave.recover().unwrap_or_default();
     let tab_state = autosave.load_tab_state().ok().flatten();
-    // Read `<root>/.hiker/trails.json`; any failure (missing file / bad JSON)
-    // becomes an empty list.
-    let trails = {
-        let path = root.join(".hiker/trails.json");
-        std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<crate::state::Trail>>(&bytes).ok())
-            .unwrap_or_default()
-    };
-    (recovery_entries, tab_state, trails)
-}
-
-/// Build the plugin host for a vault and load its enabled, hash-pinned
-/// plugins (per-plugin failures logged, not fatal). The host API reads through
-/// the shared index store so `notes.query` hits the same structured index as
-/// the rest of the app.
-fn build_plugin_host(
-    read_store: &Arc<Mutex<Store>>,
-    vault_root: &std::path::Path,
-) -> hiker_core::plugins::PluginHost {
-    let mut host = hiker_core::plugins::PluginHost::with_wasmi(Arc::new(
-        hiker_core::plugins::dispatch::StoreHostApi {
-            store: read_store.clone(),
-        },
-    ));
-    for (id, err) in host.load_enabled(vault_root) {
-        tracing::warn!(plugin = %id, error = %err, "plugin failed to load");
-    }
-    host
+    (recovery_entries, tab_state)
 }
 
 pub async fn open_vault(root: PathBuf) -> Result<AppState> {
@@ -730,6 +739,18 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
 
     // Wire watcher → indexer router so file events drive re-indexing.
     let _router = route_watcher_events(watcher.subscribe(), indexer.job_sender());
+
+    // status: cluster-tree-visible-note
+    // Hand the trees store its watcher + indexer handles and the configured
+    // tree directory now that both subsystems exist (they postdate `Db::new`).
+    // Tree saves now suppress + explicitly index the visible `.md`, the same
+    // discipline trail-docs use. The full_scan below indexes any trees the
+    // construction-time migration relocated.
+    let new_cluster_tree_dir = config
+        .read()
+        .map(|c| c.clustering.new_cluster_tree_dir.clone())
+        .unwrap_or_default();
+    trees.wire(watcher.clone(), indexer.job_sender(), &new_cluster_tree_dir);
 
     // Kick off the initial full scan. Errors are logged but non-fatal.
     if let Err(err) = indexer.full_scan(false).await {
@@ -815,8 +836,8 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         ui_context: mcp_ui_context.clone(),
     }).await;
 
-    // Crash recovery, persisted tab snapshot, and trails for the new Session.
-    let (recovery_entries, tab_state, trails) = load_persisted_session(&autosave, &root);
+    // Crash recovery + persisted tab snapshot for the new Session.
+    let (recovery_entries, tab_state) = load_persisted_session(&autosave);
 
     // Live sync engine: built + responder-spawned only when `[sync].enabled`.
     // When disabled, `None` — no keys, no swarm, no listener. The `sync_tx`
@@ -844,9 +865,6 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     drop(sync_tx);
     drop(fork_diff_tx);
 
-    // Plugin host: load the enabled, hash-pinned WASM plugins for this vault.
-    let plugins = build_plugin_host(&read_store, &root);
-
     // Assemble the compartments.
     let services = Services {
         read_store,
@@ -870,7 +888,6 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         services,
         events,
         cancel,
-        plugins,
     };
 
     // Recovered autosave buffers restore silently (no modal) once `AppState`
@@ -898,21 +915,21 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         ui_cache: UiCache::default(),
         panels: PanelStates::default(),
         clusters_state: crate::clusters::state::State::default(),
-        trails_state: crate::trails::state::State {
-            trails,
-            ..crate::trails::state::State::default()
-        },
+        trails_state: crate::trails::state::State::default(),
         backlinks_state: crate::backlinks::State::default(),
+        appears_in_state: crate::appears_in::State::default(),
         related_state: crate::related::State::default(),
         search_state,
         vault_state: crate::vault_view::State::default(),
         trash_state: crate::trash::State,
+        canvases_activity_state: crate::canvas_activity::State,
         chat_state: crate::chat::state::State::default(),
-        // Per-vault feature registry: built-ins (Clusters in v1) plus
-        // (Phase 3) plugin-derived features. `feature-registry`.
-        features: crate::feature::Registry::build(crate::feature::builtin_features()),
+        // Per-vault activity registry: built-ins (Clusters in v1) plus
+        // (Phase 3) plugin-derived activities. `feature-registry`.
+        activities: crate::activity::ActivityRegistry::build(crate::activity::builtin_activities()),
         ui: UiState::default(),
         toasts: Vec::new(),
+        sync_attention_seen: crate::state::SyncAttentionSeen::default(),
         vault_switch: VaultSwitchState::Idle,
         workbench: {
             // Inlined `new_workbench`: fresh workbench with the default
@@ -921,6 +938,10 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
             // global bottom status strip on.
             let mut wb = egui_workbench::workspace::Workbench::default();
             wb.open_primary_panel("files".to_string());
+            // Chat is a right-bar activity: seed the secondary stack with
+            // it so the default-shown right side bar renders chat through
+            // the same generic path as the primary. [feature-multi-region-sidebar]
+            wb.secondary_panels.switch_group("chat".to_string(), vec!["chat".to_string()]);
             wb.secondary_side_bar.visible = true;
             wb.status_bar.visible = true;
             wb
@@ -951,11 +972,11 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // never paints, leaving a visible void between the side zones.
     if state.session.tabs.is_empty() {
         let id = state.next_tab_id();
-        state.session.tabs.push(crate::tab::Tab {
+        state.session.tabs.push(crate::tab::Tab::new(
             id,
-            kind: crate::tab::TabKind::Home,
-            sticky: true,
-        });
+            crate::tab::TabKind::Home,
+            true,
+        ));
         state.session.active_tab = Some(id);
     }
 
@@ -979,24 +1000,10 @@ fn load_toolbar_layout(vault_root: &Path) -> crate::state::Toolbars {
     }
 }
 
-// Panel-state seeding, toolbar loading, and the `load_trails` reader are
-// inlined at their unique callers in `open_vault` (a `self`-less
-// associated fn would trip `single_call_fn`, and the inline keeps
-// channel/config ownership visible at the use site).
-
-/// Persist the trails list to `<root>/.hiker/trails.json`.
-pub fn save_trails(
-    root: &std::path::Path,
-    trails: &[crate::state::Trail],
-) -> std::io::Result<()> {
-    let dir = root.join(".hiker");
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)?;
-    }
-    let path = dir.join("trails.json");
-    let bytes = serde_json::to_vec(trails).unwrap_or_else(|_| b"[]".to_vec());
-    std::fs::write(path, bytes)
-}
+// Panel-state seeding and toolbar loading are inlined at their unique
+// callers in `open_vault` (a `self`-less associated fn would trip
+// `single_call_fn`, and the inline keeps channel/config ownership visible
+// at the use site).
 
 impl AppState {
     /// Re-open tabs saved by the autosave layer. Restores buffer paths
@@ -1031,11 +1038,6 @@ impl AppState {
             p if p.starts_with("canvas:") => {
                 Some(TabKind::Canvas { path: p["canvas:".len()..].to_string() })
             }
-            // status: crawl-job-form
-            // Per-doc capture tab: the persist key is `capture:<note-path>`.
-            p if p.starts_with("capture:") => {
-                Some(TabKind::Capture { note_path: p["capture:".len()..].to_string() })
-            }
             // status: zim-view
             // Per-archive ZIM viewer tab: persist key is `zim:<archive-path>`;
             // restore lands on the archive's main page (`article: None`).
@@ -1046,7 +1048,6 @@ impl AppState {
             ":patch_review" => Some(TabKind::PatchReview),
             // status: board-index-page
             ":boards_index" => Some(TabKind::BoardsIndex),
-            ":plugins" => Some(TabKind::Plugins),
             ":indexer" => Some(TabKind::IndexerDetail),
             ":sync" => Some(TabKind::Sync),
             // `:agent_changes` is the legacy persist key; map it forward
@@ -1076,11 +1077,7 @@ impl AppState {
             TabKind::vault_buffer(path.clone())
         };
         let id = state.next_tab_id();
-        state.session.tabs.push(Tab {
-            id,
-            kind,
-            sticky: true,
-        });
+        state.session.tabs.push(Tab::new(id, kind, true));
         if first_id.is_none() {
             first_id = Some(id);
         }
@@ -1097,8 +1094,18 @@ impl AppState {
     state.session.active_tab = active_id.or(first_id);
     state.session.preview_tab = preview_id;
 
-    if let Some(active) = ts.active_path.as_deref() {
-        crate::state::nav_push(state, active);
+    // Seed the nav stack with the active tab's REAL file path (note / canvas),
+    // resolved from the now-active tab rather than the persist-key form of
+    // `active_path` (which is prefixed for canvas/board and synthetic for
+    // singleton page tabs). Singleton tabs have no file path and don't enter nav.
+    let active_real_path = state
+        .session
+        .active_tab
+        .and_then(|id| state.tab_by_id(id))
+        .and_then(|t| t.buffer_path())
+        .map(str::to_string);
+    if let Some(active) = active_real_path {
+        crate::state::nav_push(state, &active);
     }
     }
 }

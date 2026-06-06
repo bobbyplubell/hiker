@@ -1,13 +1,13 @@
 # Watcher
 
-Filesystem watcher that drives both the indexer and the editor's live-buffer drift detection. Built on the `notify` crate; runs in core, not in the host. design.md names notify as the choice; this doc nails down event handling, debounce, ignored paths, and the dispatch path to frontend + indexer.
+Filesystem watcher that drives both the indexer and the editor's live-buffer drift detection. Built on the `notify` crate; runs in core, not in the host. This doc nails down event handling, debounce, ignored paths, and the dispatch path to frontend + indexer.
 
 
 ## Scope
 
 One watcher per open vault, rooted at the vault path. Started when a vault is opened, stopped when the vault is closed or swapped. Recursive. [watcher-per-vault]
 
-External-file ingestion (design.md:88) gets its own watcher instances per configured path/glob, but shares the same event-handling code. v1 watches only the vault root.
+External-file ingestion (design.md, External-file ingestion) gets its own watcher instances per configured path/glob, but shares the same event-handling code. v1 watches only the vault root.
 
 
 ## Event sources and consumers
@@ -15,7 +15,7 @@ External-file ingestion (design.md:88) gets its own watcher instances per config
 The watcher fans out events to two consumers:
 
 1. **Indexer** — for any file matching `*.md` (and v2+: extractor-handled types). Triggers re-chunk/re-embed via the ingest pipeline in index.md.
-2. **Editor frontend** — only for the *currently open file's* path. Drives the buffer drift behavior in editor.md:48 (silent reload if clean, conflict prompt if dirty).
+2. **Editor frontend** — only for the *currently open file's* path. Drives clean-buffer reload (see Editor integration); dirty external edits are reconciled out-of-band by op-log.
 
 Both consumers receive the same normalized event stream; each filters to the events it cares about.
 
@@ -32,6 +32,7 @@ enum FileEvent {
     Modified { path: PathBuf },
     Deleted { path: PathBuf },
     Renamed { from: PathBuf, to: PathBuf },
+    Overflow,
 }
 ```
 
@@ -39,7 +40,7 @@ Normalization steps:
 
 - **Debounce** — coalesce raw events within a 200ms window keyed by path. The last event for a path during the window wins. Catches editor swap-file patterns (`vim`'s write-temp-then-rename, VSCode's atomic save) where a logical save produces 3–5 raw events. [watcher-debounce-200ms]
 - **Rename pairing** — `notify` emits paired `RenameFrom`/`RenameTo` events on Linux/macOS. Pair them within the debounce window into a single `Renamed`. Unpaired `RenameFrom` after timeout → `Deleted`; unpaired `RenameTo` → `Created`. [watcher-rename-pairing]
-- **Drop self-writes** — when the indexer or the editor's save path writes a file, mark the path in a short-lived "we just wrote this" set (TTL 2s; sized to outlast the 200ms debounce window plus worst-case fs/sqlite latency on slower machines). Drop normalized events for those paths to avoid an infinite re-index loop. Implementation: indexer/save call `watcher.suppress(path)` immediately before the write and again after the write completes, so the TTL window starts close to when notify is most likely to surface the event. [watcher-suppress-self-writes]
+- **Drop self-writes** — when the indexer or the editor's save path writes a file, mark the path in a short-lived "we just wrote this" set (TTL 2s). Drop normalized events for those paths to avoid an infinite re-index loop. Indexer/save call `watcher.suppress(path)` immediately before the write and again after it completes, so the TTL window starts close to when notify surfaces the event. [watcher-suppress-self-writes]
 - **Drop ignored paths** — see below.
 
 Dispatch order: debounce window closes → normalize → check ignore list → check suppression set → fan out to consumers.
@@ -66,30 +67,22 @@ Indexer's own writes to `.hiker/index.db` would loop forever without the `.hiker
 Core exposes a broadcast channel (`tokio::sync::broadcast::channel<FileEvent>`) that anyone can subscribe to. Two subscribers in v1: [watcher-broadcast-channel]
 
 1. **Indexer task** — filters to `*.md` events, sends matching `IndexJob`s into its work queue. See index.md. [watcher-bridge-to-indexer]
-2. **Frontend bridge** — a host task that subscribes and forwards events to the app via `emit("watcher file events", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. (Could filter server-side instead, but pushing all events keeps the bridge stateless and a future tree-view-refresh consumer can use the same stream without a second subscription.) [watcher-bridge-to-frontend]
+2. **Frontend bridge** — a host task that subscribes and forwards events to the app via `emit("watcher file events", payload)`. The frontend filters to the open-buffer path; everything else is dropped client-side. Pushing all events keeps the bridge stateless so a future tree-view-refresh consumer reuses the same stream. [watcher-bridge-to-frontend]
 
-Event payload to frontend:
-
-```ts
-type FileChangedEvent = {
-  kind: "created" | "modified" | "deleted" | "renamed";
-  path: string;          // vault-relative
-  from?: string;         // for renamed only
-};
-```
+Wire shape to the frontend: the normalized `FileEvent` serialized with a `kind` discriminant, a vault-relative `path`, and a `from` (renamed only).
 
 
 ## Editor integration
 
-When the frontend receives watcher file events for the active buffer's path:
+What's built: clean-buffer reload only. On a `Modified` event for an open buffer that is **clean**, the buffer reloads from disk silently (`maybe_reload_clean_buffer`); a **dirty** buffer is left untouched and reconciled out-of-band by op-log. `Overflow` only clears the dir cache. Deleted and renamed buffers are not acted on. [watcher-editor-reload-clean]
 
-- `kind: "modified"` and buffer is **clean** → fetch fresh contents + hash via `read_file_with_hash`, dispatch a doc-replace transaction, update `loadedHash`. Silent reload. [watcher-editor-reload-clean]
-- `kind: "modified"` and buffer is **dirty** → fire the same conflict modal used by the pre-write drift check (Keep mine / Take theirs / Cancel). "Take theirs" reloads from disk; "Keep mine" leaves the buffer as-is — the next save will re-trigger the drift check, since the on-disk hash will differ from `loadedHash`. [watcher-editor-conflict-dirty]
-- `kind: "deleted"` and buffer is clean → close the buffer, clear the editor, surface a non-blocking toast ("file removed externally"). [watcher-editor-deleted-buffer]
-- `kind: "deleted"` and buffer is dirty → keep the buffer open, surface a toast ("file removed; save to recreate"). User's edits live only in memory until they save.
-- `kind: "renamed"` from the active buffer's path → update `currentPath` to the new path silently. The buffer follows. [watcher-editor-renamed-followup]
+**Deferred (not built)** — `bug-watcher-editor-conflict-matrix-unbuilt`. The fuller editor-conflict matrix was specced but none of it is wired:
 
-The pre-write drift check stays in place as a final guard. The watcher reduces but doesn't eliminate the stale-buffer window — events can be missed on network filesystems, dropped when notify's queue overflows, or simply arrive after the user has already hit save.
+- modified + dirty → conflict modal (Keep mine / Take theirs / Cancel)
+- deleted + clean → close the buffer + "file removed externally" toast
+- deleted + dirty → keep the buffer + "file removed; save to recreate" toast
+- renamed → silent path follow-up (buffer follows the new path)
+- an `Overflow` "watcher fell behind, scanning" toast
 
 
 ## Indexer integration
@@ -105,7 +98,7 @@ Non-markdown events are ignored by the v1 indexer; v2+ extractor types subscribe
 
 ## Lifecycle
 
-- **Vault open** — spawn the watcher, start the indexer task, kick a startup scan in parallel.
+- **Vault open** — spawn the watcher, start the indexer task, kick a startup scan in parallel. The op log runs its own startup disk-reconcile pass here too (`op-log-startup-disk-reconcile` in `op-log.md`), distinct from the indexer's search scan: it folds any disk-vs-`accepted` drift from changes made while hiker was closed, and completes before the first sync round.
 - **Vault close / swap** — drop the watcher (tokio task aborts when its handle drops), close the indexer's connection, flush any in-flight broadcast events.
 - **App shutdown** — same as close; no special teardown needed.
 
@@ -114,7 +107,7 @@ The watcher handle lives in the per-vault state held by the host. Vault-swap dro
 
 ## Failure modes
 
-- **notify queue overflow** — long bursts (mass file copy, git checkout) can exceed notify's internal buffer. Detect via the `Error::PathNotFound` / `Error::Generic` paths and surface a "watcher fell behind, scanning" event; the indexer triggers a startup-style rescan to catch up. Frontend just shows a brief progress indicator. [watcher-overflow-rescan]
+- **notify queue overflow** — long bursts (mass file copy, git checkout) can exceed notify's internal buffer. The indexer should trigger a startup-style rescan to catch up; today `FileEvent::Overflow` only clears the dir cache (the rescan + "watcher fell behind" toast are deferred, `bug-watcher-editor-conflict-matrix-unbuilt`). [watcher-overflow-rescan]
 - **Network filesystem** — notify's events are unreliable on NFS/SMB. v1 keeps the pre-write drift check as the trustworthy fallback. Long-term: a polling fallback mode for paths flagged as networked.
 - **Permissions** — file becomes unreadable mid-watch (parent dir chmod 000). Watcher emits an error; indexer marks the note as `orphaned` (per the design.md missing-source convention) and stops trying until the next event.
 - **Symlink loops** — `notify` follows symlinks by default. v1 disables symlink-following on the watcher to avoid surprise. External-file ingestion in v2 will revisit this with an explicit allowlist. [watcher-symlink-policy]

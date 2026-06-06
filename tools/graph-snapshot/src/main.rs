@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use egui::Vec2;
 use graph_widgets::force_layout::LayoutWorker;
-use graph_widgets::graph_layouts::{
+use graph_widgets::{
     horizontal_tree_positions, radial_positions, vertical_tree_positions,
 };
 use hiker_graph::{bfs_tree, dfs_tree, LayoutParams};

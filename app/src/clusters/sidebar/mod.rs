@@ -8,6 +8,7 @@
 //! stage-moves + stage-tags into the staging queue, undo/redo, graph
 //! view, advanced params. Save-as-triage isn't ported yet.
 
+mod node_menu;
 mod tree;
 
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use eframe::egui;
 use hiker_core::trees::types::Db;
 
 use crate::clusters::state::State;
-use crate::feature::Ctx;
+use crate::activity::Ctx;
 use crate::state::{AppState, Toast, ToastLevel};
 use hiker_theme as theme;
 
@@ -64,8 +65,9 @@ pub(super) fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 
     cx.hydrate_if_needed();
 
-    cx.header(ui);
-    ui.add_space(4.0);
+    // New-tree creation moved to the Clusters accordion-header `+` split-button
+    // (`cluster-editor-new-tree-action`), which also exposes presets; the panel
+    // body no longer repeats the activity title or carries its own button.
     cx.tree_picker(ui);
     cx.toolbar(ui);
     ui.separator();
@@ -397,39 +399,6 @@ pub(super) fn summarize_subset(
 }
 
 impl ClusterCtx<'_, '_> {
-fn header(&mut self, ui: &mut egui::Ui) {
-    // Single entry point per `cluster-editor-new-tree-action` — the
-    // review tab is the surface where the user picks algorithm (Cluster
-    // partitioners or From folders), tunes params, runs the structural
-    // pass, and confirms.
-    let mut new_tree_clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Cluster trees")
-                .color(theme::muted())
-                .strong(),
-        );
-    });
-    if ui
-        .add_sized(
-            [ui.available_width(), 22.0],
-            egui::Button::new("+ New tree"),
-        )
-        .on_hover_text("Open the cluster review tab to build a new tree")
-        .clicked()
-    {
-        new_tree_clicked = true;
-    }
-    if new_tree_clicked {
-        // status: cluster-editor-new-tree-action. Opening the review
-        // tab needs full `&mut AppState`, so defer it past the narrow
-        // ctx borrow.
-        self.ctx.defer(|app| {
-            crate::clusters::panel::ReviewConfig::default().open(app);
-        });
-    }
-}
-
 fn tree_picker(&mut self, ui: &mut egui::Ui) {
     let state = self.st();
     let trees = &state.trees;

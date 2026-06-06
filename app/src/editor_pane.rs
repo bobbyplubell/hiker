@@ -20,8 +20,44 @@ use crate::tab::{Tab, TabId, TabKind};
 /// `board-view-toggle`) can load the buffer before rendering the editor
 /// widget inline without opening a separate buffer tab.
 pub(crate) fn ensure_vault_buffer_loaded(state: &mut AppState, rel: &str) -> bool {
+    match try_ensure_vault_buffer_loaded(state, rel) {
+        Ok(()) => true,
+        Err(err) => {
+            state.push_toast(format!("Failed to open {}: {}", rel, err), ToastLevel::Error);
+            false
+        }
+    }
+}
+
+/// The non-toasting half of [`ensure_vault_buffer_loaded`]: load the buffer or
+/// return the read error to the caller. Used by passive, best-effort hosts
+/// (hover previews, embedded canvas/board views) that render every frame and
+/// must NOT spam an error toast when their target note is missing or its path
+/// can't be resolved — they simply draw nothing. Tab opens go through
+/// [`ensure_vault_buffer_loaded`], which surfaces the failure as a toast.
+pub(crate) fn try_ensure_vault_buffer_loaded(
+    state: &mut AppState,
+    rel: &str,
+) -> Result<(), hiker_core::errors::HikerError> {
     if state.session.buffers.contains_key(rel) {
-        return true;
+        return Ok(());
+    }
+    // Open-time disk-reconcile (`op-log.md` §External-edit sync): the per-doc
+    // backstop for a change the in-session watcher dropped (a suppressed-write
+    // window, a notify-queue overflow). Fold any disk-vs-`accepted` drift in as
+    // one `author=external` op BEFORE the buffer's text is read below, so the
+    // rope and the editor binding load from the now-reconciled `accepted`. The
+    // underlying `apply_external_edit` is hash-gated: byte-identical disk is a
+    // no-op (no op minted, no rewrite), so this stays cheap on a clean open.
+    // A new path with no doc yet resolves to `Ok(false)` and is a no-op; the
+    // `ensure_doc` call below still mints its document.
+    // status: op-log-open-time-disk-reconcile
+    if let Err(e) = hiker_core::ops::op_writes::external_edit(
+        &state.vault_session.services.oplog,
+        &state.vault_session.vault,
+        rel,
+    ) {
+        tracing::warn!(path = %rel, error = %e, "op-log: open-time disk reconcile failed (non-fatal)");
     }
     match state.vault_session.vault.read_file_with_hash(rel) {
         Ok((contents, hash)) => {
@@ -48,12 +84,9 @@ pub(crate) fn ensure_vault_buffer_loaded(state: &mut AppState, rel: &str) -> boo
             );
             drop(cfg_guard);
             state.session.buffers.insert(rel.to_string(), buf);
-            true
+            Ok(())
         }
-        Err(err) => {
-            state.push_toast(format!("Failed to open {}: {}", rel, err), ToastLevel::Error);
-            false
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -68,6 +101,21 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     // respects `nav.locked`, so it isn't double-recorded. status: canvas-nav-stack
     if rel.ends_with(".canvas") {
         crate::panels::canvas::open(state, rel);
+        return;
+    }
+    // A cluster-tree note opens in its force-graph view, not as raw markdown — it
+    // has no in-buffer view (unlike a board, which has a Markdown toggle), so a
+    // plain buffer would just show its YAML. The kind-routing sibling of the
+    // `.canvas` branch: every `open_file` caller (vault sidebar, backlinks,
+    // related, appears-in, wikilinks) lands on the graph. status: cluster-tree-open-routing
+    if rel.ends_with(".md")
+        && let Some(tree_id) = state.vault_session.services.trees.tree_id_at_path(rel)
+    {
+        let for_build = tree_id.clone();
+        state.find_or_open_tab(
+            |k| matches!(k, TabKind::ClusterGraph { tree_id: existing } if existing == &tree_id),
+            move || TabKind::ClusterGraph { tree_id: for_build },
+        );
         return;
     }
     // Navigation history: skip when we're already navigating via
@@ -108,15 +156,144 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     // Only allocate a fresh tab id on the branch that actually keeps it;
     // the preview-reuse branch above returns without using one.
     let tab_id = state.next_tab_id();
-    let tab = Tab {
-        id: tab_id,
-        kind: TabKind::vault_buffer(rel.to_string()),
-        sticky,
-    };
+    let tab = Tab::new(tab_id, TabKind::vault_buffer(rel.to_string()), sticky);
     state.session.tabs.push(tab);
     state.session.active_tab = Some(tab_id);
     if !sticky {
         state.session.preview_tab = Some(tab_id);
+    }
+}
+
+/// DRIVE seam for linked viz tabs: open `rel` as a buffer tab placed in the
+/// workbench editor `group`, rather than the viz tab's own preview slot. A
+/// graph/canvas tab with `link.target == Some(Group(g))` routes its
+/// node-clicks here so the note lands in the linked group.
+///
+/// Placement works through the one chokepoint: we point the workbench's
+/// focused group at `group` before delegating to [`open_file`], so the
+/// per-frame `sync_workbench_tabs` opens the freshly-added `Session::tabs`
+/// entry into that group (new workbench tabs open into the focused group).
+/// An already-open note is focused in place wherever it lives — the same
+/// "find-or-focus" posture `open_file` has. status: tab-linking
+pub fn open_file_in_group(
+    state: &mut AppState,
+    rel: &str,
+    group: egui_workbench::workspace::GroupId,
+    sticky: bool,
+) {
+    state.workbench.editor_area.set_focused_group(group);
+    open_file(state, rel, sticky);
+}
+
+/// Resolve a viz tab's FOLLOW `source` to the vault path of the note active
+/// in the referenced group/tab, if any. `Group(g)` reads the active tab in
+/// that editor group each frame; `Tab(id)` reads that specific tab. Returns
+/// `None` when the link is unset, the group is gone, or the active tab there
+/// isn't note-backed. status: tab-linking
+pub fn followed_note_path(state: &AppState, source: Option<crate::tab::LinkRef>) -> Option<String> {
+    use crate::tab::LinkRef;
+    let tab_id = match source? {
+        LinkRef::Group(g) => state.active_tab_in_group(g)?,
+        LinkRef::Tab(id) => id,
+    };
+    state
+        .tab_by_id(tab_id)
+        .and_then(|t| t.buffer_path())
+        .map(std::string::ToString::to_string)
+}
+
+/// Resolve a viz tab's DRIVE `target` to a concrete workbench `GroupId`.
+/// `Tab(id)` resolves to the group that tab currently lives in. Returns
+/// `None` when the link is unset or the referenced group/tab is gone.
+/// status: tab-linking
+pub fn drive_target_group(
+    state: &AppState,
+    target: Option<crate::tab::LinkRef>,
+) -> Option<egui_workbench::workspace::GroupId> {
+    use crate::tab::LinkRef;
+    match target? {
+        LinkRef::Group(g) => Some(g),
+        LinkRef::Tab(id) => state.group_of_tab(id),
+    }
+}
+
+/// Human label for an editor `group`: the title of its active tab, else a
+/// "Group N" fallback by traversal index. Used by the link-control menu.
+/// status: tab-linking
+fn group_label(state: &AppState, group: egui_workbench::workspace::GroupId, idx: usize) -> String {
+    state
+        .active_tab_in_group(group)
+        .and_then(|id| state.tab_by_id(id))
+        .map_or_else(|| format!("Group {}", idx + 1), super::tab::Tab::label)
+}
+
+/// Render the link-control popup body for the viz tab `tab_id`: a Source
+/// (FOLLOW) and Target (DRIVE) picker over the current editor groups, plus a
+/// clear option for each. Selecting a group writes the tab's `link`. Shared
+/// by the graph and canvas tab headers so both surfaces wire links the same
+/// way. status: tab-linking
+pub fn link_menu_ui(ui: &mut eframe::egui::Ui, app: &mut AppState, tab_id: TabId) {
+    use crate::tab::LinkRef;
+    let groups = app.workbench.groups();
+    let own_group = app.group_of_tab(tab_id);
+    let current = app.tab_by_id(tab_id).map(|t| t.link).unwrap_or_default();
+
+    let mut set_source: Option<Option<LinkRef>> = None;
+    let mut set_target: Option<Option<LinkRef>> = None;
+
+    ui.label(
+        eframe::egui::RichText::new("Follow (highlight active note in)")
+            .small()
+            .color(hiker_theme::muted()),
+    );
+    for (idx, g) in groups.iter().enumerate() {
+        // Linking a viz tab to its own group is a no-op loop; skip it.
+        if own_group == Some(*g) {
+            continue;
+        }
+        let selected = current.source == Some(LinkRef::Group(*g));
+        let prefix = if selected { "* " } else { "  " };
+        if ui.button(format!("{prefix}{}", group_label(app, *g, idx))).clicked() {
+            set_source = Some(Some(LinkRef::Group(*g)));
+            ui.close();
+        }
+    }
+    if current.source.is_some() && ui.button("  Clear follow").clicked() {
+        set_source = Some(None);
+        ui.close();
+    }
+
+    ui.separator();
+    ui.label(
+        eframe::egui::RichText::new("Drive (open clicked notes in)")
+            .small()
+            .color(hiker_theme::muted()),
+    );
+    for (idx, g) in groups.iter().enumerate() {
+        if own_group == Some(*g) {
+            continue;
+        }
+        let selected = current.target == Some(LinkRef::Group(*g));
+        let prefix = if selected { "* " } else { "  " };
+        if ui.button(format!("{prefix}{}", group_label(app, *g, idx))).clicked() {
+            set_target = Some(Some(LinkRef::Group(*g)));
+            ui.close();
+        }
+    }
+    if current.target.is_some() && ui.button("  Clear drive").clicked() {
+        set_target = Some(None);
+        ui.close();
+    }
+
+    if set_source.is_some() || set_target.is_some() {
+        if let Some(tab) = app.tab_by_id_mut(tab_id) {
+            if let Some(s) = set_source {
+                tab.link.source = s;
+            }
+            if let Some(t) = set_target {
+                tab.link.target = t;
+            }
+        }
     }
 }
 
@@ -276,7 +453,7 @@ pub fn open_trash_in_tab(state: &mut AppState, trash_path: &str, original_path: 
         return;
     }
     let tab_id = state.next_tab_id();
-    state.session.tabs.push(Tab { id: tab_id, kind, sticky: false });
+    state.session.tabs.push(Tab::new(tab_id, kind, false));
     state.session.active_tab = Some(tab_id);
     state.session.preview_tab = Some(tab_id);
 }
@@ -385,6 +562,19 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     // Path-form wikilinks (per `wikilink-path-form`) are stored as-typed —
     // no save-time normalize step. What the user typed reaches disk verbatim.
     let log = &state.vault_session.services.oplog;
+    // Fidelity invariant (`op-log-binding-fidelity-invariant`): the forward
+    // mirror keeps `materialize(working)` byte-equal to the editor's text, so
+    // the commit folds exactly the buffer the user sees. Asserted here at Save
+    // (debug-only, zero release cost) to catch any forward-mirror drift in
+    // tests/dev before it commits a stale `working`.
+    debug_assert_eq!(
+        log.materialize_working(&doc_id)
+            .map(|c| c.text)
+            .ok()
+            .as_deref(),
+        Some(text.as_str()),
+        "op-log-binding-fidelity-invariant: materialize(working) must equal the editor's text at Save"
+    );
     match log.commit_working(&doc_id) {
         Ok(_) => {
             let new_hash = hiker_core::hash_string(&text);
@@ -412,6 +602,13 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
                 )
             {
                 tracing::warn!(error = %e, path = %rel, "oplog: auto-reject-on-drift failed");
+            }
+            // Nudge enrolled peers to pull this just-committed change promptly
+            // instead of waiting for their own poll tick. Cheap, non-blocking,
+            // and a no-op when sync is off / there are no peers.
+            // status: sync-poke-on-commit
+            if let Some(sync) = &state.vault_session.services.sync {
+                sync.notify_local_change();
             }
             state.push_toast(format!("Saved {}", rel), ToastLevel::Info);
             Ok(())
@@ -539,12 +736,6 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
     // user persists, keyed by the closed tab's id.
     if matches!(&removed.kind, TabKind::ClusterReview { .. }) {
         state.clusters_state.review_panes.remove(&id);
-    }
-
-    // Drop the capture pane state, flipping any in-flight engine run's
-    // cancel flag so its background thread stops promptly. status: crawl-job-form
-    if matches!(&removed.kind, TabKind::Capture { .. }) {
-        crate::panels::capture::on_tab_closed(&mut state.panels.captures, id);
     }
 
     // Drop the ZIM viewer pane (archive handle + render texture), which

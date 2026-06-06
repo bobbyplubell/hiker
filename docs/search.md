@@ -1,14 +1,6 @@
 # Search
 
-Vault-wide retrieval over note content. Lexical (full-text) and semantic (embedding) results in one panel, type-ahead, with the user picking which signal sources are active. Lands the v2 milestone from `design.md`.
-
-The headline decisions:
-
-- **The right-hand panel is the discovery panel.** Search and related-notes both live there as collapsible sections. Renames (in framing, not the toggle slug — `panel-toggle-buttons` already exists) the v1 "related" panel to its more honest job: vault-wide retrieval surfaces the user might want to consult, of which related-notes was always just one. Future surfaces (landmarks, collections, clustering hints) plug in as additional sections following the same shape. [search-discovery-panel]
-- **Two mode toggles next to the input — semantic and lexical.** Both on by default = hybrid via reciprocal rank fusion. One on = single-source results, no fusion step. Both off = input disabled with a "pick a mode" hint; explicit failure beats silent fallback. State persists per-vault. [search-mode-toggles, search-modes-both-off-disabled, search-mode-state-persisted]
-- **Type-ahead with 250ms debounce.** Each keystroke advances an epoch number; in-flight queries that come back stamped stale get dropped before render. Same pattern the related-notes refresh already uses. [search-typeahead-debounce]
-- **SQLite FTS5 is the lexical backend, behind a swappable trait.** One database file, no second index lifecycle, no separate schema-version dance. Tantivy can swap in later as a single targeted change if ranking quality ever becomes a complaint — the engine trait is the seam. [search-engine-trait, search-fts5-lexical]
-- **Ctrl-Space focuses the search input on every platform.** Same on macOS — Cmd-Space is Spotlight; we don't take it. Opens the discovery panel if collapsed. The keybind registry takes precedence over the editor's own Ctrl-Space (start-autocomplete) binding inside the editor. [search-keybind-ctrl-space]
+Vault-wide retrieval over note content. Lexical (full-text) and semantic (embedding) results in one panel, type-ahead, with the user picking which signal sources are active. Lands the v2 milestone from `design.md`. Quickfind by name/metadata (`search-quickfind-names-metadata`) and source-type filtering (`search-source-type-filter`) ride alongside the content path.
 
 
 ## Discovery panel
@@ -42,7 +34,7 @@ Behavior:
 - **Empty query** — search-results section not rendered; Related-notes takes the whole panel (identical to v1). [search-empty-collapses-results]
 - **Non-empty query** — both sections visible, both expanded by default. Chevron collapses either; state persists per-vault via `settings-write-back` (`settings-section-vault`). [search-section-collapsible]
 - **Section headers carry live counts.** "Search results (8)" updates as type-ahead returns; "Related notes (5)" updates on active-file change. Subtle in-section spinner while a query is in flight. [search-section-counts, search-loading-shimmer]
-- **Related stays bound to the active editor file** even when search is active. Searching is exploration, editing is anchored. [search-related-stays-bound]
+- **Related stays bound to the active editor file** even when search is active. [search-related-stays-bound]
 
 The toggle button on the editor toolbar still flips the panel open/closed (existing `panel-toggle-buttons`); only the panel's contents change.
 
@@ -78,12 +70,12 @@ Both menus persist immediately via `settings-write-back` to `search.lexical.*` /
 
 Anchored under the `Aa` toggle. Rows: [search-lexical-options]
 
-- **Case sensitive** (default off) — post-filter top-25 hits in Rust for case-sensitive substring match. FTS5's `unicode61` tokenizer is case-folded at index time and can't be reconfigured per-query; the post-filter is cheap (few KB of text) and avoids a second FTS5 table. [search-lexical-case-sensitive]
-- **Match diacritics** (default off) — same shape as case sensitivity; tokenizer config `remove_diacritics 2` strips at index time, so a per-query flip is a post-filter pass (Unicode NFD-aware substring match against raw chunk text). Default off matches today's behavior and the common case for English-leaning users. [search-lexical-diacritic-sensitive]
-- **Prefix match** (default off) — rewrite each whitespace-separated query token to `token*` before FTS5's `MATCH` (so `auto` matches `automation`). FTS5 supports the prefix operator natively, so it's a query-string transform, no schema change. Default off keeps current exact-token matching to avoid silently changing precision. [search-lexical-prefix-match]
+- **Case sensitive** (default off) — post-filter top-25 hits in Rust for case-sensitive substring match. FTS5's `unicode61` tokenizer is case-folded at index time and can't be reconfigured per-query; the post-filter is cheap and avoids a second FTS5 table. [search-lexical-case-sensitive]
+- **Match diacritics** (default off) — same shape as case sensitivity; a per-query flip is a post-filter pass (Unicode NFD-aware substring match against raw chunk text), since `remove_diacritics 2` strips at index time. [search-lexical-diacritic-sensitive]
+- **Prefix match** (default off) — rewrite each whitespace-separated query token to `token*` before FTS5's `MATCH` (so `auto` matches `automation`). FTS5's native prefix operator, so a query-string transform, no schema change. [search-lexical-prefix-match]
 - **Phrase mode** (default off) — wrap the entire query in double quotes before FTS5, forcing exact-phrase matching. When off, FTS5's standard implicit-AND token semantics apply. Mutually exclusive with prefix match in practice (FTS5 ignores `*` inside a quoted phrase); the menu doesn't enforce that — checking both just yields phrase semantics, with a subtle hint in the prefix-match row tooltip. [search-lexical-phrase-mode]
 
-No stemming toggle: FTS5's tokenizer is fixed at table-creation time, so a per-query flip would need a second porter-stemmer FTS5 table (double write cost + disk). Stemming, if wanted, is a one-line tokenizer change at a schema bump, not a runtime knob.
+No stemming toggle: FTS5's tokenizer is fixed at table-creation time. Stemming, if wanted, is a one-line tokenizer change at a schema bump, not a runtime knob.
 
 
 ### Semantic options menu
@@ -92,7 +84,7 @@ Anchored under the brain toggle. Rows: [search-semantic-options]
 
 - **Minimum similarity** (slider `0.00`–`0.95`, 0.05 steps, default `0.00`) — hits below threshold dropped before fusion (or before render in single-mode). Default `0.00` = no filter, current behavior. Useful when the embedder returns weak global matches; raising the floor trades "always 20, some weak" for "fewer-but-stronger, sometimes empty." Empty-after-filter shows a hint row "No results above threshold X.XX — lower the threshold or refine your query." [search-semantic-min-similarity]
 - **Top-k override** (numeric input, 5–100, default 25, matches `PER_BACKEND_TOP_K`) — affects only the semantic side; lexical stays at 25. Enables a wider semantic net without touching the global budget. Capped at 100 to keep the panel responsive (sqlite-vec scan cost). [search-semantic-top-k-override]
-- **Recency bias** (radio `Off` / `Mild` / `Strong`, default Off) — fuses mtime-rank into the semantic score via the same RRF shape as cross-mode fusion: `score = 1/(k + sim_rank) + w · 1/(k + recency_rank)`, where `w` is `0.0` / `0.5` / `1.0` and `recency_rank` is the note's position sorted by `notes.mtime DESC`. Default Off — hiker doesn't otherwise privilege recent files in retrieval; recency boost should be a deliberate choice, not a silent default. [search-semantic-recency-bias]
+- **Recency bias** (radio `Off` / `Mild` / `Strong`, default Off) — fuses mtime-rank into the semantic score via the same RRF shape as cross-mode fusion: `score = 1/(k + sim_rank) + w · 1/(k + recency_rank)`, where `w` is `0.0` / `0.5` / `1.0` and `recency_rank` is the note's position sorted by `notes.mtime DESC`. Default Off. [search-semantic-recency-bias]
 
 No embedder/model picker here: switching embedders invalidates every cached vector, so it's a vault-level decision in `embedder-config-section` (config + reindex), not a per-query toggle.
 
@@ -102,15 +94,15 @@ No embedder/model picker here: switching embedders invalidates every cached vect
 Search runs as the user types. Mechanic:
 
 - **Debounce 250ms.** Keystroke schedules a query 250ms out; subsequent keystrokes cancel and reschedule. Empty query collapses results immediately, no debounce. [search-typeahead-debounce]
-- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch. The command runs both backends in parallel; stale-epoch results dropped on the frontend before render. Mirrors the related-notes file-switch cancel pattern.
-- **Lexical returns near-instantly** (sqlite). **Semantic embeds the query string** on the existing `spawn_blocking` pool (`embedder-spawn-blocking`), tens of ms with bge-small warm. Both run in parallel; panel renders each section as it arrives — lexical may paint a beat before semantic, covered by section spinners. [search-query-embed-spawn-blocking]
+- **Epoch / cancel-in-flight.** Each query carries a monotonically-increasing epoch; stale-epoch results dropped on the frontend before render. Mirrors the related-notes file-switch cancel pattern.
+- **Lexical returns near-instantly** (sqlite); **semantic embeds the query string** on the existing `spawn_blocking` pool (`embedder-spawn-blocking`), tens of ms with bge-small warm. Both run in parallel; panel renders each section as it arrives, covered by section spinners. [search-query-embed-spawn-blocking]
 
 
 ## Result rendering
 
 One row per *note*, not per chunk. The query may match many chunks within a note; the row shows the highest-ranked chunk as snippet. Mirrors `related-notes-snippet` and matches `design.md`'s "fuse → group by parent note" rule. [search-result-grouped-by-note]
 
-Rows are rendered as cards, not flat list items. Search results and related-notes share the same card primitive — both surfaces show the matched chunk excerpt, the answer to "why is this note here" lives inside the card next to the title. The two sections differ only in their headers and the query that fills them. [discovery-result-card]
+Rows are cards, not flat list items. Search results and related-notes share the same card primitive — both show the matched chunk excerpt; the two sections differ only in their headers and the query that fills them. [discovery-result-card]
 
 Card anatomy (top to bottom):
 
@@ -123,12 +115,12 @@ Cards are visually distinct from flat list rows: subtle bordered frame, small in
 
 **Click → open + scroll-to-chunk.** Opens the file and scrolls to the matched chunk via its stored line range (`cmd-chunks-for-path`). [search-result-click-opens-chunk]
 
-**Result budget.** Each backend returns top 25 internally; fused list shows 20. RRF benefits from a tail of below-the-fold candidates per side. Fixed for v2; configurability waits until MCP needs different budgets. [search-result-budget]
+**Result budget.** Each backend returns top 25 internally; fused list shows 20 (the per-side tail feeds RRF). Fixed for v2; configurability waits until MCP needs different budgets. [search-result-budget]
 
 
 ## Keyboard model
 
-- **Ctrl-Space** — focuses the search input; opens the discovery panel if collapsed. Same on macOS — we deliberately don't take Cmd-Space (Spotlight). Registers at document level (`keybind-registry` pattern) with precedence to win over the editor's own `Ctrl-Space` (start-autocomplete) binding inside the editor. Hiker doesn't lean on autocomplete in v2; revisit if a wikilinks-completion feature ever needs the binding back. [search-keybind-ctrl-space]
+- **Ctrl-Space** — focuses the search input; opens the discovery panel if collapsed. Same on macOS — we deliberately don't take Cmd-Space (Spotlight). Registers at document level (`keybind-registry` pattern) with precedence over the editor's own `Ctrl-Space` (start-autocomplete) binding inside the editor. [search-keybind-ctrl-space]
 - **↑ / ↓** — moves the active result within whichever section has focus. ↑ at the top of Related jumps to the bottom of Search results; ↓ at the bottom of Search results jumps to the top of Related. Stops at the panel boundaries.
 - **Enter** — opens the focused result.
 - **Tab** — moves focus from input → search results → related → out of panel.
@@ -141,21 +133,10 @@ Cards are visually distinct from flat list rows: subtle bordered frame, small in
 
 Two traits in `core::search`. The query pipeline composes them; the panel doesn't know which backend is which beyond the toggle state.
 
-```rust
-pub trait LexicalEngine: Send + Sync {
-    fn upsert_chunk(&self, chunk_id: &ChunkId, text: &str) -> Result<(), SearchError>;
-    fn delete_chunks_for_note(&self, note_id: &NoteId) -> Result<(), SearchError>;
-    fn query(&self, q: &str, top_k: usize) -> Result<Vec<LexicalHit>, SearchError>;
-    fn version(&self) -> &str;
-}
+- **`LexicalEngine`** — `upsert_chunk` / `delete_chunks_for_note` / `query(q, top_k)` / `version`.
+- **`SemanticEngine`** — `query(embedding, top_k)` / `version`.
 
-pub trait SemanticEngine: Send + Sync {
-    fn query(&self, embedding: &[f32], top_k: usize) -> Result<Vec<SemanticHit>, SearchError>;
-    fn version(&self) -> &str;
-}
-```
-
-Both traits live alongside the existing `Embedder` trait (`embedder-module-discipline`) and follow the same pattern: trait bound for the engine, concrete impls live in submodules (`core::search::fts5`, `core::search::semantic`). Adding a new lexical backend is one new module + one selection point in the search pipeline. [search-engine-trait]
+Both live alongside the existing `Embedder` trait (`embedder-module-discipline`) and follow the same pattern: trait bound for the engine, concrete impls in submodules (`core::search::fts5`, `core::search::semantic`). Adding a new lexical backend is one new module + one selection point in the search pipeline. [search-engine-trait]
 
 Hybrid query (both modes on):
 
@@ -183,9 +164,9 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 );
 ```
 
-`content='chunks'` makes FTS5 a contentless / external-content table, so the indexed text isn't duplicated — the virtual table just stores tokens and offsets pointing at `chunks.text`. Saves ~half the on-disk size that a content-storing FTS5 table would cost. [search-fts5-schema]
+`content='chunks'` makes FTS5 an external-content table, so the indexed text isn't duplicated — it stores tokens and offsets pointing at `chunks.text`. [search-fts5-schema]
 
-Writes ride alongside the existing chunk upsert in `core::store` — wherever an `ingest-tx-upsert` transaction inserts/updates rows in `chunks`, it also writes to `chunks_fts`. Same transaction, same atomicity guarantees. Deletes via `ingest-delete-cascade` similarly extend to clear the FTS rows.
+Writes ride alongside the existing chunk upsert in `core::store` — wherever an `ingest-tx-upsert` transaction touches `chunks`, it also writes `chunks_fts` (same transaction, same atomicity). Deletes via `ingest-delete-cascade` similarly extend to clear the FTS rows.
 
 Ranking and snippeting:
 
@@ -211,7 +192,7 @@ score(note_id) = Σ over each backend that returned the note:
                    1 / (k + rank_in_that_backend)   where k = 60
 ```
 
-Group-by-note happens *before* fusion: lexical hits are first reduced to one-row-per-note (taking the best chunk per note), same for semantic, then the two reduced lists fuse on `note_id`. The chunk shown in the panel is the best chunk from whichever backend ranked the note highest. RRF with k=60 is the standard choice and works well without per-backend score normalization (BM25 and cosine aren't on the same scale). [search-rrf-fusion]
+Group-by-note happens *before* fusion: lexical hits are first reduced to one-row-per-note (best chunk per note), same for semantic, then the two reduced lists fuse on `note_id`. The chunk shown is the best chunk from whichever backend ranked the note highest. RRF with k=60 needs no per-backend score normalization (BM25 and cosine aren't on the same scale). [search-rrf-fusion]
 
 
 ## Scope
@@ -225,24 +206,13 @@ v2 searches the whole vault. No folder scope, tag scope, or lifecycle filters (`
 
 ## Command surface
 
-A single new command:
+A single new command, `search_vault(query, modes, lexical_opts, semantic_opts, epoch) -> SearchResponse`:
 
-```rust
-async fn search_vault(
-    state: State<'_, AppState>,
-    query: String,
-    modes: SearchModes,        // { semantic: bool, lexical: bool }
-    lexical_opts: LexicalOpts, // { case_sensitive, diacritic_sensitive, prefix_match, phrase_mode }
-    semantic_opts: SemanticOpts, // { min_similarity, top_k, recency_bias }
-    epoch: u64,                // echoed back so the frontend can drop stale results
-) -> Result<SearchResponse, HikerError>;
-```
+- `modes` = `{ semantic, lexical }`; `lexical_opts` = `{ case_sensitive, diacritic_sensitive, prefix_match, phrase_mode }`; `semantic_opts` = `{ min_similarity, top_k, recency_bias }`. `epoch` is echoed back so the frontend can drop stale results.
+- `SearchResponse { epoch, lexical_hits, semantic_hits, fused }` (all `Vec<NoteHit>`). Frontend renders `fused` when both modes are on, else the relevant single list. Returning all three buckets is deliberate — lets UI affordances ("what each backend found separately") land later without a new command.
+- Both option structs use `#[serde(default)]` on every field, so older payloads decode to documented defaults — `settings-strict-load` discipline applies at config load only, not the command boundary.
 
-`SearchResponse { epoch, lexical_hits: Vec<NoteHit>, semantic_hits: Vec<NoteHit>, fused: Vec<NoteHit> }`. Frontend renders `fused` when both modes are on, else the relevant single list.
-
-Both option structs use `#[serde(default)]` on every field, so older payloads decode to documented defaults — `settings-strict-load` discipline applies at config load only, not at the command boundary.
-
-Returning all three buckets is deliberate: keeps the command flat and lets us add UI affordances later (e.g. "show me what each backend found separately") without a new command. Frontend ignores the buckets it doesn't need. [search-cmd]
+[search-cmd]
 
 Wires through `core::search::query()`, which composes the two engine traits. The command is a thin wrapper (~10 lines) per the layer-split rules in `design.md`.
 
@@ -254,38 +224,38 @@ Wires through `core::search::query()`, which composes the two engine traits. The
 - `core::search::semantic` — `SemanticEngine` impl over the existing `chunk_vecs` table.
 - `core::store` — gains FTS5 writes alongside existing chunk writes; `chunks_fts` schema lives here next to the rest of the schema, rusqlite confined as before (`store-module-discipline`).
 
-Adding tantivy later is: new file `core::search::tantivy.rs` implementing `LexicalEngine`, plus a selection point (config key or feature flag) in the engine factory. The FTS5 impl, the schema, and the existing call sites stay intact during the transition.
+Adding tantivy later: new file `core::search::tantivy.rs` implementing `LexicalEngine`, plus a selection point (config key or feature flag) in the engine factory. The FTS5 impl, schema, and existing call sites stay intact.
 
 
 ## Forward refs
 
-The same `core::search::query` is what the MCP server's `search_notes` tool will call when v3 lands — the response shape is intentionally agent-friendly (stable chunk ids, snippet detail, per-note grouping). Budget control (`design.md` MCP section) maps onto the existing `top_k` argument. The MCP integration is its own spec; this doc just leaves the seam clean.
+The same `core::search::query` is what the MCP server's `search_notes` tool will call when v3 lands — the response shape is intentionally agent-friendly (stable chunk ids, snippet detail, per-note grouping). Budget control (`design.md` MCP section) maps onto the existing `top_k` argument. MCP integration is its own spec; this doc leaves the seam clean.
 
 
 ## Deferred
 
 Slugs registered as `planned` so future work plugs in cleanly:
 
-- **`search-folder-scope`** — restrict search to a vault subtree. Useful once vaults grow; trivial to bolt onto the FTS5 query (`MATCH ... AND path GLOB ?`) and the semantic query (path-prefix filter on the joined notes row).
-- **`search-lifecycle-filters`** — exclude/include archived, redacted, retired notes. Lands when the lifecycle slugs from `design.md` (`hiker.archived` / `hiker.redacted` / `hiker.retired`) get implemented. Currently moot — none of those exist on disk yet.
+- **`search-folder-scope`** — restrict search to a vault subtree. FTS5 side `MATCH ... AND path GLOB ?`; semantic side path-prefix filter on the joined notes row.
+- **`search-lifecycle-filters`** — exclude/include archived, redacted, retired notes. Lands when the `design.md` lifecycle slugs (`hiker.archived` / `hiker.redacted` / `hiker.retired`) exist.
 - **`search-tag-scope`** — filter by frontmatter tag. Lands with the auto-tag enrichment stage (`design.md` enrichment pipeline).
-- **`search-tantivy-swap`** — implement `LexicalEngine` over tantivy as an alternate backend. Single config key picks between FTS5 and tantivy. Triggered by ranking-quality complaints, not on a schedule.
-- **`search-history`** — recent queries dropdown under the input. Cheap to add, defer until someone asks.
-- **`search-result-snippet-context`** — expand a result row to show surrounding chunks. The chunk-level neighbors are already addressable via `chunker-heading-path` / chunk index; needs a UI affordance.
-- **`search-multi-vault`** — `design.md` mentions a vault-level routing axis. Out of scope until multi-vault open is itself a feature.
-- **`search-result-pin-as-collection`** — promote a result set to a saved collection (`design.md` collections). Lands with the collections feature; the search panel is the natural entry point.
-- **`search-result-multi-select`** — checkbox-style selection on result rows + a select-all affordance in the section header. Backs the bulk-action slugs below; without it, the only target a bulk action has is "all current results." Selection state is per-query — clearing the input or running a new query drops it. [search-result-multi-select]
-- **`search-bulk-action-tag`** — apply (or remove) a frontmatter tag across a result set. Two targets: the entire current result list, or the multi-select subset when `search-result-multi-select` is engaged. Routes through whatever the auto-tag enrichment stage settles on for tag writes (`design.md` enrichment pipeline) so bulk-from-search and per-note tagging share one code path. Confirm-before-apply with a count ("Tag 12 notes as `topic:rust`?"). Depends on tags being a real feature first — not load-bearing for v2. [search-bulk-action-tag]
-- **`search-bulk-action-move`** — move all results (or the multi-select subset) into a target folder. Routes through `core::ops::move_note` per result so watcher suppression, index updates, and dirty-buffer-follow behavior come for free. Confirm-before-apply with a count + destination preview ("Move 8 notes to `archive/old-projects/`?"). Same shape as the tag bulk action, different terminal op. [search-bulk-action-move]
-- **`search-authorship-filter`** — filter results by the authorship trichotomy from `design.md`'s Provenance index axis: `user-authored / agent-authored / imported`. UI shape: small pill row above the result list, multi-select, defaults to all-on. Cheap to add once `hiker.author:` is populated (the index already carries the field; the filter is a `WHERE` predicate). [search-authorship-filter]
-- **`search-source-type-filter`** — filter results by source type — markdown, trail, pdf, epub, image, audio, archived-website, transcript, etc. Same UI shape as the authorship filter (pill row, multi-select, defaults to all-on). Type comes from `hiker.type:` in frontmatter (already part of the source-derived-notes shape). Visually pairs with the per-source-type tree icons seedling in `design.md`'s trails section — same axis, two consumers. [search-source-type-filter]
+- **`search-tantivy-swap`** — implement `LexicalEngine` over tantivy as an alternate backend; a single config key picks between FTS5 and tantivy.
+- **`search-history`** — recent queries dropdown under the input.
+- **`search-result-snippet-context`** — expand a result row to show surrounding chunks (neighbors already addressable via `chunker-heading-path` / chunk index; needs a UI affordance).
+- **`search-multi-vault`** — `design.md`'s vault-level routing axis. Out of scope until multi-vault open is itself a feature.
+- **`search-result-pin-as-collection`** — promote a result set to a saved collection (`design.md` collections); the search panel is the natural entry point.
+- **`search-result-multi-select`** — checkbox selection on result rows + a select-all in the section header. Backs the bulk-action slugs below. Selection state is per-query — clearing the input or running a new query drops it. [search-result-multi-select]
+- **`search-bulk-action-tag`** — apply/remove a frontmatter tag across a result set or the multi-select subset. Routes through the auto-tag enrichment stage's tag-write path (`design.md` enrichment pipeline) so bulk-from-search and per-note tagging share one code path. Confirm-before-apply with a count ("Tag 12 notes as `topic:rust`?"). [search-bulk-action-tag]
+- **`search-bulk-action-move`** — move all results (or the multi-select subset) into a target folder via `core::ops::move_note` per result (watcher suppression, index updates, dirty-buffer-follow come for free). Confirm-before-apply with a count + destination preview. [search-bulk-action-move]
+- **`search-authorship-filter`** — filter results by the authorship trichotomy from `design.md`'s Provenance axis (`user-authored / agent-authored / imported`). Pill row above the result list, multi-select, defaults all-on; the filter is a `WHERE` predicate on `hiker.author:`. [search-authorship-filter]
+- **`search-source-type-filter`** — filter results by source type (markdown, trail, pdf, epub, image, audio, archived-website, transcript, …). Same pill-row UI as the authorship filter. Type comes from `hiker.type:` in frontmatter. Pairs with the per-source-type tree icons in `design.md`'s trails section — same axis, two consumers. [search-source-type-filter]
 
 
 ## Out of scope
 
-- **In-file find / replace.** That's a within-buffer affordance the editor provides on its own. Different feature, different keybind (Cmd/Ctrl-F when it lands), no overlap with vault-wide search.
+- **In-file find / replace.** A within-buffer editor affordance; different keybind (Cmd/Ctrl-F when it lands), no overlap with vault-wide search.
 - **Search-and-replace across the vault.** Destructive bulk edit is its own feature with its own confirmation/undo story. Search is read-only.
-- **Saved searches as durable infrastructure.** That's the collections feature in `design.md`'s auto-organization layer; this doc leaves the seam (`search-result-pin-as-collection`) and stops there.
-- **Highlighting matches inside the open editor.** Implementable via editor decorations, but it's a different surface (editor view) and a different cognitive model (where am I, vs. what's in the vault). Possibly worth doing later — not a v2 concern.
-- **Query syntax** beyond what FTS5 natively understands. v2 passes the user's input straight to FTS5's `MATCH`, which already handles `"phrase queries"`, `term1 OR term2`, `NEAR()`, etc. We don't add a hiker-specific DSL on top.
-- **Single-row context-menu mutations** (right-click a result → delete this one note). The tree's context menu is the canonical place for per-note destructive actions; duplicating it in the discovery panel splits the mental model. *Bulk* actions across a whole result set or a multi-selected subset are explicitly *deferred*, not out of scope — see `search-bulk-action-tag` / `search-bulk-action-move` above.
+- **Saved searches as durable infrastructure.** The collections feature in `design.md`; this doc leaves the seam (`search-result-pin-as-collection`) and stops.
+- **Highlighting matches inside the open editor.** Different surface (editor view), different cognitive model. Possibly later — not a v2 concern.
+- **Query syntax** beyond what FTS5 natively understands. v2 passes input straight to FTS5's `MATCH` (already handles `"phrase queries"`, `term1 OR term2`, `NEAR()`); no hiker-specific DSL.
+- **Single-row context-menu mutations** (right-click a result → delete this note). The tree's context menu is the canonical place for per-note destructive actions. *Bulk* actions are explicitly *deferred*, not out of scope — see `search-bulk-action-tag` / `search-bulk-action-move`.

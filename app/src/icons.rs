@@ -71,7 +71,6 @@ icons! {
     Clock => "clock.svg",
     Edit => "edit.svg",
     Clipboard => "clipboard.svg",
-    Plugin => "plugin.svg",
     Compass => "compass.svg",
     Wrench => "wrench.svg",
     Boot => "boot.svg",
@@ -94,6 +93,8 @@ icons! {
     Hand => "hand.svg",
     Canvas => "canvas.svg",
     Braces => "braces.svg",
+    TabLink => "tab_link.svg",
+    Book => "book.svg",
 }
 
 pub struct Icons;

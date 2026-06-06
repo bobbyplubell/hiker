@@ -20,7 +20,7 @@ use crate::identity::SyncStatus;
 use crate::protocol::{ManifestEntry, Message};
 use crate::Error;
 
-use super::{parse_addr, SyncBehaviourEvent, SyncNode, SyncReport};
+use super::{parse_addr, ContentKeyOutcome, SyncBehaviourEvent, SyncNode, SyncReport};
 
 impl SyncNode {
     /// Dial `peer`, run the full Hello + Manifest + classify + adopt/stream
@@ -54,8 +54,8 @@ impl SyncNode {
 
         // 1b. In-band content-key convergence, BEFORE any docs — so subsequent
         // content-encrypted deltas + blind-ids match on both sides.
-        // [sync-vault-key-inband]
-        self.converge_content_key(peer_id, &peer_content_key_fp).await?;
+        // [sync-vault-key-inband, sync-content-key-confirm-on-change]
+        let key_outcome = self.converge_content_key(peer_id, &peer_content_key_fp).await?;
 
         // 2. Pull the peer's manifest.
         let manifest = match self.request(peer_id, Message::ManifestRequest).await? {
@@ -65,10 +65,34 @@ impl SyncNode {
             }
         };
 
-        // 3. Classify + act per entry.
+        // 3. Classify + act per entry. A single doc that fails to sync must NOT
+        // abort the rest of the round: a DOC-LEVEL error (a decrypt failure, a
+        // rename collision, a per-doc apply failure) is recorded against that
+        // path and we move on to the next entry. Only a TRANSPORT-LEVEL error —
+        // the connection itself is broken, so no subsequent entry can succeed —
+        // propagates and aborts this peer's round.
+        // status: bug-sync-round-aborts-on-one-doc
         let mut report = SyncReport::default();
+        // Carry the content-key convergence outcome onto the report so the app
+        // can surface an adoption or a held (pending) key change.
+        // [sync-content-key-confirm-on-change]
+        match key_outcome {
+            ContentKeyOutcome::Unchanged => {}
+            ContentKeyOutcome::Adopted { peer_fp } => {
+                report.adopted_content_key_from = Some(peer_fp);
+            }
+            ContentKeyOutcome::PendingChange { peer_fp } => {
+                report.pending_content_key_change = Some(peer_fp);
+            }
+        }
         for entry in manifest.entries {
-            self.sync_entry(peer_id, entry, &mut report).await?;
+            let path = entry.path.clone();
+            if let Err(e) = self.sync_entry(peer_id, entry, &mut report).await {
+                if matches!(e, Error::Transport(_)) {
+                    return Err(e);
+                }
+                report.errored.push((path, e.to_string()));
+            }
         }
         Ok(report)
     }
@@ -105,9 +129,47 @@ impl SyncNode {
             path: path.to_string(),
         };
         match self.request(peer_id, req).await? {
-            Message::DocContentResponse { text } => Ok(text),
+            Message::DocContentResponse { text, .. } => Ok(text),
             other => Err(Error::Transport(format!(
                 "expected DocContentResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Dial `peer`, Hello-handshake, and send a single content-free
+    /// [`Message::SyncPoke`] nudge so the peer pulls our just-committed change
+    /// promptly instead of waiting for its own ~15s poll tick. The peer must be
+    /// running `run` (or otherwise driving its swarm) to answer.
+    ///
+    /// Lightweight by design: it stops after the poke is acked — NO manifest,
+    /// NO deltas, no content. The Hello is sent first (like every dialer flow)
+    /// so enrollment is exercised and each side records the other's fingerprint
+    /// / name on the same round trip, exactly as `sync_once` starts; then a
+    /// single `SyncPoke → SyncPokeAck` exchange. The actual document transfer
+    /// happens when the poked peer runs its own pull round (the existing
+    /// `take_poked → auto_sync_round` trigger). [sync-poke-on-commit]
+    // status: sync-poke-on-commit
+    pub async fn poke(&mut self, peer: &str) -> Result<(), Error> {
+        self.ensure_swarm()?;
+        let addr = parse_addr(peer)?;
+        let peer_id = self.connect(addr).await?;
+
+        // Hello first, so the peer records our fingerprint and the poke rides an
+        // established, enrollment-gated session — same start as `sync_once`.
+        let hello = self.build_hello();
+        match self.request(peer_id, hello).await? {
+            Message::HelloAck { device_name, .. } => {
+                self.record_device_name(&self.peer_fingerprint(&peer_id), device_name.as_deref());
+            }
+            other => {
+                return Err(Error::Transport(format!("expected HelloAck, got {other:?}")));
+            }
+        }
+
+        match self.request(peer_id, Message::SyncPoke).await? {
+            Message::SyncPokeAck => Ok(()),
+            other => Err(Error::Transport(format!(
+                "expected SyncPokeAck, got {other:?}"
             ))),
         }
     }
@@ -118,24 +180,34 @@ impl SyncNode {
     /// exchange (before any docs). [sync-vault-key-inband]
     ///
     /// - If our content-key fingerprint already matches the peer's → both
-    ///   already share a key; do nothing.
+    ///   already share a key; do nothing ([`ContentKeyOutcome::Unchanged`]).
     /// - Else pick a deterministic key owner: `canonical = min(our device
-    ///   fingerprint, peer device fingerprint)`. If WE are non-canonical, request
-    ///   the canonical device's key in-band and adopt it (the shared handle
-    ///   persists it). If WE are canonical, do nothing — the peer requests from
-    ///   us on its own round.
+    ///   fingerprint, peer device fingerprint)`. If WE are canonical, do nothing
+    ///   — the peer requests from us on its own round.
+    /// - If WE are non-canonical the decision splits on whether OUR key is
+    ///   **established** (`sync-content-key-confirm-on-change`):
+    ///   - NOT established (a fresh, auto-generated key) → request the canonical
+    ///     device's key in-band and ADOPT it, marking it established
+    ///     ([`ContentKeyOutcome::Adopted`]). This is the brand-new-device case
+    ///     where silently converging is the desired UX.
+    ///   - established (deliberately set / previously converged) → do NOT
+    ///     silently switch. Hold our key this round and report the mismatch
+    ///     ([`ContentKeyOutcome::PendingChange`]) so the user can confirm the
+    ///     change (the manual import is the accept path for now). The decrypt
+    ///     failures that follow surface via `friendly_round_error`.
     ///
-    /// The deterministic rule means exactly one side adopts; after first contact
-    /// in both directions both hold the canonical device's key.
-    // status: sync-vault-key-inband
+    /// The deterministic rule means exactly one side ever adopts. Only the
+    /// non-canonical side is affected — a user's established key on the canonical
+    /// device is the source and is always preserved.
+    // status: sync-content-key-confirm-on-change
     pub(super) async fn converge_content_key(
         &mut self,
         peer_id: PeerId,
         peer_content_key_fp: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<ContentKeyOutcome, Error> {
         // Already the same key — nothing to transfer.
         if self.content_key.fingerprint() == peer_content_key_fp {
-            return Ok(());
+            return Ok(ContentKeyOutcome::Unchanged);
         }
         // Deterministic owner by device fingerprint (peer's via the enrolled set,
         // falling back to its peer-id string if the mapping is somehow missing).
@@ -147,10 +219,23 @@ impl SyncNode {
         let canonical_is_us = self.fingerprint().0 < peer_fp;
         if canonical_is_us {
             // We own the key this round; the peer will request it from us.
-            return Ok(());
+            return Ok(ContentKeyOutcome::Unchanged);
         }
-        // We are non-canonical: pull the canonical device's key in-band and adopt
-        // it. The raw bytes ride the Noise-encrypted channel and are NEVER logged.
+        // We are non-canonical. An ESTABLISHED key is one the user deliberately
+        // set (manual import) or that already converged — never silently switch
+        // it. Hold our key and surface the mismatch for confirmation; the
+        // manual import is the accept-the-change path.
+        // [sync-content-key-confirm-on-change]
+        if self.content_key.is_established() {
+            tracing::warn!(
+                peer = %peer_fp,
+                "sync: peer uses a different content key — holding our established key, not switching"
+            );
+            return Ok(ContentKeyOutcome::PendingChange { peer_fp });
+        }
+        // Fresh (non-established) key: pull the canonical device's key in-band and
+        // adopt it. The raw bytes ride the Noise-encrypted channel and are NEVER
+        // logged.
         let key = match self.request(peer_id, Message::ContentKeyRequest).await? {
             Message::ContentKeyResponse { key } => key,
             other => {
@@ -167,9 +252,11 @@ impl SyncNode {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&key);
-        // Routes through the shared handle: updates in place AND persists.
-        self.content_key.set(ContentKey::from_bytes(arr));
-        Ok(())
+        // Routes through the shared handle: updates in place, marks established,
+        // and persists.
+        self.content_key.adopt(ContentKey::from_bytes(arr));
+        tracing::info!(peer = %peer_fp, "sync: adopted peer's vault content key");
+        Ok(ContentKeyOutcome::Adopted { peer_fp })
     }
 
     /// Process one remote manifest entry: resolve by path (path IS the
@@ -222,27 +309,53 @@ impl SyncNode {
             Some(local) => {
                 match self.status_of_path(&entry.path) {
                     Some(SyncStatus::Bound) => {
-                        self.apply_delta_from_peer(peer_id, &local, &entry.path).await?;
-                        report.bound.push(entry.path.clone());
-                        report.converged.push(entry.path);
+                        // Steady-state: both sides share a lineage. Before folding
+                        // the peer delta into `accepted`, gate on a same-region
+                        // overlap — concurrent edits to the SAME byte ranges must
+                        // BLOCK for user resolution rather than silently
+                        // CRDT-interleave; disjoint-region edits still auto-merge.
+                        // [sync-conflict-detect-same-region, sync-conflict-block-and-resolve]
+                        self.sync_bound_doc(peer_id, &local, &entry, report).await?;
                     }
                     Some(SyncStatus::Blocked) => {
-                        // A doc that forked on a prior round runs its
-                        // resolution branch again — without this it would block
-                        // every round and the user's decision (keyed by path)
-                        // would never land. [sync-blocked-state]
-                        let ours_current = self.current_hash(&local.0)?;
-                        let ours_history = self.history_set(&local.0)?;
-                        let theirs_history: HashSet<String> =
-                            entry.recent_history_hashes.iter().cloned().collect();
-                        let class = enroll::classify(
-                            &ours_current,
-                            &ours_history,
-                            &entry.current_hash,
-                            &theirs_history,
-                        );
-                        self.act_on_classification(peer_id, &local, &entry, class, report)
-                            .await?;
+                        // A doc blocked on a prior round runs its resolution
+                        // branch again — without this it would block every round
+                        // and the user's decision (keyed by path) would never
+                        // land. A same-region block (bound lineage) resolves via
+                        // the same-region path; a fork (disjoint lineage) keeps
+                        // the enrollment-classification path.
+                        // [sync-blocked-state, sync-conflict-block-and-resolve]
+                        if self.blocked_reason(&entry.path).as_deref() == Some("delete-vs-edit") {
+                            // A delete-vs-edit block (bound lineage) resolves via
+                            // its own Keep-deleted / Keep-edit path.
+                            // [sync-conflict-delete-vs-edit]
+                            self.resolve_delete_vs_edit(peer_id, &local, &entry, report)
+                                .await?;
+                        } else if self.blocked_reason(&entry.path).as_deref() == Some("same-region") {
+                            self.sync_bound_doc(peer_id, &local, &entry, report).await?;
+                        } else if self.blocked_reason(&entry.path).as_deref()
+                            == Some("rename-collision")
+                        {
+                            // A concurrent-rename collision (disjoint lineages
+                            // both claiming the path) resolves via its own
+                            // Keep mine / Keep theirs / Keep both path.
+                            // [sync-concurrent-rename-not-merged]
+                            self.resolve_rename_collision(peer_id, &local, &entry, report)
+                                .await?;
+                        } else {
+                            let ours_current = self.current_hash(&local.0)?;
+                            let ours_history = self.history_set(&local.0)?;
+                            let theirs_history: HashSet<String> =
+                                entry.recent_history_hashes.iter().cloned().collect();
+                            let class = enroll::classify(
+                                &ours_current,
+                                &ours_history,
+                                &entry.current_hash,
+                                &theirs_history,
+                            );
+                            self.act_on_classification(peer_id, &local, &entry, class, report)
+                                .await?;
+                        }
                         // (path-keyed — no logical id rides the wire)
                     }
                     None => {

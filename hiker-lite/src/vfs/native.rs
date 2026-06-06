@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use super::{DirEntry, Vfs, VfsError, VfsPath, VfsResult};
+use super::{Vfs, VfsError, VfsPath, VfsResult};
 
 pub struct Backend {
     root: PathBuf,
@@ -52,7 +52,7 @@ impl Vfs for Backend {
             .map_err(|e| io_to_vfs(&e, path))
     }
 
-    async fn list(&self, dir: &VfsPath) -> VfsResult<Vec<DirEntry>> {
+    async fn list(&self, dir: &VfsPath) -> VfsResult<Vec<super::DirEntry>> {
         let abs = self.resolve(dir);
         let mut rd = tokio::fs::read_dir(&abs)
             .await
@@ -74,7 +74,7 @@ impl Vfs for Backend {
                 .await
                 .map_err(|e| io_to_vfs(&e, dir))?;
             let is_dir = ft.is_dir();
-            out.push(DirEntry {
+            out.push(super::DirEntry {
                 path: dir.join(&name),
                 name,
                 is_dir,

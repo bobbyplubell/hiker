@@ -110,9 +110,16 @@ pub const ID_ACTIONS_MENU: &str = "actions.menu";
 /// renderer special-cases this id to draw the existing label.
 pub const ID_VAULT_LABEL: &str = "vault.label";
 
+/// Global "View options" eye-icon menu. Not a registered action — the
+/// renderer special-cases this id to draw the popup of global view toggles.
+pub const ID_VIEW_MENU: &str = "view.menu";
+
 #[allow(dead_code)]
 pub fn is_layout_id(id: &str) -> bool {
-    matches!(id, ID_SEP | ID_SPACER | ID_ACTIONS_MENU | ID_VAULT_LABEL)
+    matches!(
+        id,
+        ID_SEP | ID_SPACER | ID_ACTIONS_MENU | ID_VAULT_LABEL | ID_VIEW_MENU
+    )
 }
 
 // ---- Action definitions -------------------------------------------------
@@ -253,16 +260,6 @@ static A_VAULT_CHANGES: Action = Action {
     category: ActionCategory::Vault,
 };
 
-static A_VAULT_PLUGINS: Action = Action {
-    id: "vault.open_plugins",
-    icon: icons::Icon::Plugin,
-    label: "Plugins",
-    badge: None,
-    enabled: None,
-    run: |s| open_singleton(s, TabKind::Plugins),
-    category: ActionCategory::Vault,
-};
-
 static A_CHAT_NEW: Action = Action {
     id: "chat.new_session",
     icon: icons::Icon::Plus,
@@ -287,11 +284,11 @@ static A_CHAT_NEW: Action = Action {
         ) {
             state.push_toast(format!("New chat failed: {err}"), ToastLevel::Error);
         } else {
+            // Chat lives in the workbench's right-bar `secondary_panels`,
+            // not the tile dock. `ensure_panel_visible` seeds the chat
+            // section and re-shows the secondary side bar so the freshly
+            // created session is visible.
             ensure_panel_visible(state, crate::tab::PANEL_CHAT);
-            // Chat lives in the workbench's secondary side bar, not the
-            // tile dock. If the user has collapsed that bar, re-show it so
-            // the freshly-created session is visible.
-            state.workbench.secondary_side_bar.visible = true;
         }
     },
     category: ActionCategory::Chat,
@@ -346,7 +343,10 @@ static A_VIEW_TOGGLE_RIGHT_SIDEBAR: Action = Action {
     label: "Toggle right sidebar",
     badge: None,
     enabled: None,
-    run: |s| s.workbench.secondary_side_bar.toggle(),
+    run: |s| {
+        ensure_chat_seeded(s);
+        s.workbench.secondary_side_bar.toggle();
+    },
     category: ActionCategory::View,
 };
 
@@ -454,20 +454,30 @@ static A_EDITOR_FIND: Action = Action {
     category: ActionCategory::Editor,
 };
 
+// Reader / focus mode is now a single workbench/session-level flag (not
+// per-buffer), so both ids below delegate to `workbench.toggle_reader_mode()`.
+// `view.reader_mode` is the canonical global toggle (book button, View menu,
+// Ctrl+R chord); `editor.reader_view` is kept registered because the keybind
+// table / known_keybindings still reference its id, and it delegates to the
+// same toggle so the two never diverge.
+static A_VIEW_READER_MODE: Action = Action {
+    id: "view.reader_mode",
+    icon: icons::Icon::Book,
+    label: "Toggle reader mode",
+    badge: None,
+    enabled: None,
+    run: |s| s.workbench.toggle_reader_mode(),
+    category: ActionCategory::View,
+};
+
 static A_EDITOR_READER_VIEW: Action = Action {
     id: "editor.reader_view",
-    icon: icons::Icon::Info,
-    label: "Toggle reader / focus view",
+    icon: icons::Icon::Book,
+    label: "Toggle reader mode",
     badge: None,
-    enabled: Some(|s| crate::keybinds::active_buffer_path(s).is_some()),
-    run: |s| {
-        if let Some(path) = crate::keybinds::active_buffer_path(s)
-            && let Some(b) = s.session.buffers.get_mut(&path)
-        {
-            b.reader_view = !b.reader_view;
-        }
-    },
-    category: ActionCategory::Editor,
+    enabled: None,
+    run: |s| s.workbench.toggle_reader_mode(),
+    category: ActionCategory::View,
 };
 
 static A_TAB_CYCLE_NEXT: Action = Action {
@@ -533,22 +543,35 @@ jump_action!(A_TAB_JUMP_9, "tab.jump_9", "Jump to the last tab", 8, true);
 
 /// Toggle a registered side-bar panel via the workbench. For a panel
 /// that maps to an activity-bar mode (Files/Clusters/Trails/Search/
-/// Related/Backlinks/Vault/Trash) this collapses the primary side bar
+/// Context/Vault/Trash) this collapses the primary side bar
 /// when that mode is already showing, and otherwise selects the mode +
 /// shows the bar. `PANEL_CHAT` lives in the secondary side bar, so its
 /// toggle flips that bar's visibility.
+/// Ensure the right-bar `secondary_panels` stack has chat seeded as a
+/// section, so the secondary side bar (which renders empty stacks as
+/// hidden) actually shows it. Idempotent. [feature-multi-region-sidebar]
+fn ensure_chat_seeded(state: &mut AppState) {
+    if !state.workbench.secondary_panels.contains(&crate::tab::PANEL_CHAT.to_string()) {
+        state
+            .workbench
+            .secondary_panels
+            .switch_group(crate::tab::PANEL_CHAT.to_string(), vec![crate::tab::PANEL_CHAT.to_string()]);
+    }
+}
+
 fn toggle_panel(state: &mut AppState, panel_id: &'static str) {
     if panel_id == crate::tab::PANEL_CHAT {
+        ensure_chat_seeded(state);
         state.workbench.secondary_side_bar.toggle();
         return;
     }
-    // The panel id IS the feature id / activity-bar mode. Skip if it
-    // doesn't resolve to a primary-activity feature (e.g. chat handled
+    // The panel id IS the activity id / activity-bar mode. Skip if it
+    // doesn't resolve to an activity-bar activity (e.g. chat handled
     // above, or an unknown id).
     if state
-        .features
+        .activities
         .by_id(panel_id)
-        .is_none_or(|f| !f.primary_activity())
+        .is_none_or(|f| !f.on_activity_bar())
     {
         return;
     }
@@ -570,13 +593,14 @@ fn toggle_panel(state: &mut AppState, panel_id: &'static str) {
 /// activate-trail, new-chat).
 pub fn ensure_panel_visible(state: &mut AppState, panel_id: &'static str) {
     if panel_id == crate::tab::PANEL_CHAT {
+        ensure_chat_seeded(state);
         state.workbench.secondary_side_bar.visible = true;
         return;
     }
     if state
-        .features
+        .activities
         .by_id(panel_id)
-        .is_some_and(|f| f.primary_activity())
+        .is_some_and(|f| f.on_activity_bar())
     {
         state.workbench.activity_bar.set_active(Some(panel_id.to_string()));
         state.workbench.primary_side_bar.visible = true;
@@ -625,7 +649,9 @@ static A_PANEL_TOGGLE_RELATED: Action = Action {
     label: "Toggle Related panel",
     badge: None,
     enabled: None,
-    run: |s| toggle_panel(s, crate::tab::PANEL_RELATED),
+    // `related` is now a view inside the `context` container; the toggle
+    // opens the whole container (backlinks + related stacked).
+    run: |s| toggle_panel(s, crate::tab::PANEL_CONTEXT),
     category: ActionCategory::Panel,
 };
 static A_PANEL_TOGGLE_BACKLINKS: Action = Action {
@@ -634,7 +660,9 @@ static A_PANEL_TOGGLE_BACKLINKS: Action = Action {
     label: "Toggle Backlinks panel",
     badge: None,
     enabled: None,
-    run: |s| toggle_panel(s, crate::tab::PANEL_BACKLINKS),
+    // `backlinks` is now a view inside the `context` container; the toggle
+    // opens the whole container (backlinks + related stacked).
+    run: |s| toggle_panel(s, crate::tab::PANEL_CONTEXT),
     category: ActionCategory::Panel,
 };
 static A_PANEL_TOGGLE_CHAT: Action = Action {
@@ -658,7 +686,6 @@ static ALL: &[&Action] = &[
     &A_VAULT_GRAPH,
     &A_VAULT_PATCH_REVIEW,
     &A_VAULT_CHANGES,
-    &A_VAULT_PLUGINS,
     &A_CHAT_NEW,
     &A_PANEL_TOGGLE_FILES,
     &A_PANEL_TOGGLE_CLUSTERS,
@@ -678,6 +705,7 @@ static ALL: &[&Action] = &[
     &A_PALETTE_OPEN,
     &A_EDITOR_SAVE,
     &A_EDITOR_FIND,
+    &A_VIEW_READER_MODE,
     &A_EDITOR_READER_VIEW,
     &A_TAB_CYCLE_NEXT,
     &A_TAB_CYCLE_PREV,

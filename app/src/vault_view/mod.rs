@@ -16,8 +16,8 @@
 //! (`Store::notes_with_meta`, projected from the `note_meta` index) so the
 //! lens never touches frontmatter on disk per render.
 //!
-//! Migrated off `panels_registry` to a real `Feature` (`Vault`) whose
-//! `SidebarSurface` renders through the narrow `feature::Ctx`: note paths
+//! Migrated off `panels_registry` to a real `Activity` (`Vault`) whose
+//! `View` renders through the narrow `activity::Ctx`: note paths
 //! come from `ctx.services.read_store`, lens/collapse state from
 //! `ctx.state`, and opening a note is deferred via `ctx.defer`. The lens
 //! picker stays a free `actions_menu` invoked from the workbench `⋯`
@@ -26,7 +26,7 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Activity, Ctx, View};
 use crate::icons;
 use crate::state::AppState;
 
@@ -62,7 +62,7 @@ pub struct State {
     pub collapsed: std::collections::HashSet<String>,
 }
 
-/// Render the read-only derived tree through the narrow feature `Ctx`:
+/// Render the read-only derived tree through the narrow activity `Ctx`:
 /// note paths from the read store, lens/collapse from `ctx.state`,
 /// open-note via `ctx.defer`. Never mutates placement.
 fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
@@ -104,9 +104,16 @@ fn render_composed(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         ui.weak("No indexed notes yet.");
         return;
     }
+    // Cluster-tree note paths (`hiker.kind: cluster-tree`) get a rich force-
+    // directed row preview (`vault-view-row-previews`); collect them once.
+    let tree_paths: std::collections::HashSet<String> = notes
+        .iter()
+        .filter(|n| n.kind.as_deref() == Some("cluster-tree"))
+        .map(|n| n.path.clone())
+        .collect();
     let forest = tree::build_composed(&notes, &waypoints);
     for node in &forest {
-        render_node(ui, ctx, node, 0);
+        render_node(ui, ctx, node, 0, &tree_paths);
     }
 }
 
@@ -126,7 +133,18 @@ fn node_icon(kind: NodeKind) -> egui::Image<'static> {
 /// Recursively render one derived node. Nodes with children get a collapse
 /// chevron (keyed by path or label); leaves open their note on click.
 /// Read-only: no drag, no placement mutation (`vault-view-readonly-lens`).
-fn render_node(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, node: &VaultNode, depth: usize) {
+///
+/// A row whose path is a cluster-tree note gets a rich force-directed preview
+/// thumbnail before its label (`vault-view-row-previews`); the generic
+/// `widgets::preview::thumbnail` widget owns rendering, caching, and the
+/// hover-expand.
+fn render_node(
+    ui: &mut egui::Ui,
+    ctx: &mut Ctx<'_>,
+    node: &VaultNode,
+    depth: usize,
+    tree_paths: &std::collections::HashSet<String>,
+) {
     let indent = 8.0 + depth as f32 * 14.0;
     let has_children = !node.children.is_empty();
     let key = node.path.clone().unwrap_or_else(|| format!("group:{}", node.label));
@@ -156,13 +174,39 @@ fn render_node(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, node: &VaultNode, depth: us
         } else {
             ui.add_space(16.0);
         }
+        if let Some(path) = node.path.as_deref()
+            && tree_paths.contains(path)
+        {
+            row_tree_thumbnail(ui, ctx, path);
+        }
         let btn = egui::Button::image_and_text(node_icon(node.kind), node.label.clone())
             .frame(false);
         let resp = ui.add(btn);
-        let resp = match &node.path {
-            Some(p) => resp.on_hover_text(p.clone()),
-            None => resp,
+        // Exactly one hover affordance per row, so nothing overlaps:
+        //  - a regular note row → the rich read-only markdown preview;
+        //  - a cluster-tree row → its own inline thumbnail + expand preview;
+        //  - a group / non-note source row → the plain path tooltip.
+        let path = node.path.as_deref();
+        let is_tree = path.is_some_and(|p| tree_paths.contains(p));
+        let previewable = path.is_some() && !is_tree && node.kind != NodeKind::Group;
+        let resp = if previewable {
+            if resp.hovered() {
+                crate::widgets::preview::register_note_hover(ui, resp.rect, path.unwrap());
+            }
+            resp
+        } else if let Some(p) = path.filter(|_| !is_tree) {
+            resp.on_hover_text(p.to_owned())
+        } else {
+            resp
         };
+        if let Some(p) = node.path.as_deref() {
+            crate::item_menu::attach_note_item_menu(
+                &resp,
+                ctx,
+                p,
+                crate::item_menu::BaseOpts { reveal: true },
+            );
+        }
         if resp.clicked()
             && let Some(p) = node.path.clone()
         {
@@ -173,9 +217,34 @@ fn render_node(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, node: &VaultNode, depth: us
 
     if has_children && !collapsed {
         for child in &node.children {
-            render_node(ui, ctx, child, depth + 1);
+            render_node(ui, ctx, child, depth + 1, tree_paths);
         }
     }
+}
+
+/// Render the inline cluster-tree preview thumbnail for a row. The tree id is
+/// the note's filename stem (`{dir}/<tree-id>.md`, per `cluster-tree-visible-note`);
+/// its nodes are loaded read-only via `trees.list_nodes`. A load failure draws
+/// nothing — the row still renders its label normally.
+/// status: vault-view-row-previews
+fn row_tree_thumbnail(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, path: &str) {
+    let Some(tree_id) = path.rsplit('/').next().and_then(|b| b.strip_suffix(".md")) else {
+        return;
+    };
+    let Ok(nodes) = ctx.services.trees.list_nodes(tree_id) else {
+        return;
+    };
+    if nodes.is_empty() {
+        return;
+    }
+    let provider = crate::panels::cluster_thumbnail::TreeThumbnail::new(&nodes);
+    crate::widgets::preview::thumbnail(
+        ui,
+        &provider,
+        ctx.vault.root(),
+        crate::widgets::preview::ThumbnailOpts::default(),
+    );
+    ui.add_space(4.0);
 }
 
 fn render_flat(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, mut paths: Vec<String>) {
@@ -231,15 +300,24 @@ fn note_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, rel: &str, depth: usize) {
     let indent = 8.0 + depth as f32 * 14.0;
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        let resp = ui
-            .add(
-                egui::Button::image_and_text(
-                    icons::ICONS.image(icons::Icon::File),
-                    basename(rel),
-                )
-                .frame(false),
+        let resp = ui.add(
+            egui::Button::image_and_text(
+                icons::ICONS.image(icons::Icon::File),
+                basename(rel),
             )
-            .on_hover_text(rel);
+            .frame(false),
+        );
+        // The rich markdown hover preview is this row's single hover affordance —
+        // no separate path tooltip, so the two don't overlap.
+        if resp.hovered() {
+            crate::widgets::preview::register_note_hover(ui, resp.rect, rel);
+        }
+        crate::item_menu::attach_note_item_menu(
+            &resp,
+            ctx,
+            rel,
+            crate::item_menu::BaseOpts { reveal: true },
+        );
         if resp.clicked() {
             let sticky = ui.input(|i| i.modifiers.command);
             let rel_owned = rel.to_string();
@@ -310,14 +388,14 @@ pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
     }
 }
 
-// ---- Feature impl ----------------------------------------------------
+// ---- Activity impl ----------------------------------------------------
 
-/// Zero-sized `Feature` descriptor for the Vault lens. State lives in
+/// Zero-sized `Activity` descriptor for the Vault lens. State lives in
 /// `AppState::vault_state`; the surface reaches it via
 /// `Ctx::state.downcast_mut::<State>()`.
 pub struct Vault;
 
-impl Feature for Vault {
+impl Activity for Vault {
     fn id(&self) -> &'static str {
         "vault"
     }
@@ -327,14 +405,17 @@ impl Feature for Vault {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Vault)
     }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&VaultSidebar)
+    fn views(&self) -> Vec<&dyn View> {
+        vec![&VaultSidebar]
     }
 }
 
 struct VaultSidebar;
 
-impl SidebarSurface for VaultSidebar {
+impl View for VaultSidebar {
+    fn id(&self) -> &'static str {
+        "vault"
+    }
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         egui::ScrollArea::vertical()
             .id_salt("panel-vault-body")

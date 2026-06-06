@@ -1,11 +1,11 @@
-//! Per-feature UI state for the Clusters feature.
+//! Per-activity UI state for the Clusters activity.
 //!
 //! Migrated out of `state::PanelStates::clusters` as part of the
-//! Feature registry Phase 1 work (`feature-state-ownership`,
-//! `feature-cluster-migration`). Each feature now owns its own state
-//! type; the registry shell never has to know what each feature stores.
+//! Activity registry Phase 1 work (`feature-state-ownership`,
+//! `feature-cluster-migration`). Each activity now owns its own state
+//! type; the registry shell never has to know what each activity stores.
 //! Held on `AppState` as a top-level `clusters_state` field, surfaced
-//! through `FeatureCtx::state` as `&mut dyn Any` downcastable to
+//! through `Ctx::state` as `&mut dyn Any` downcastable to
 //! `&mut State`.
 
 use std::collections::{HashMap, HashSet};
@@ -44,6 +44,10 @@ pub struct State {
     pub dirty: bool,
     pub loaded: bool,
     pub review_panes: HashMap<TabId, crate::clusters::panel::ReviewPane>,
+    /// Cached tree-creation presets for the Clusters `+` dropdown, so the header
+    /// doesn't re-read the presets dir every frame. `None` until first loaded;
+    /// cleared on a preset save so the next open reloads. status: cluster-preset
+    pub preset_cache: Option<Vec<crate::clusters::preset::Entry>>,
     /// True while a background LLM naming run (regenerate / summarize
     /// subset) is in flight. Gates the "Regenerate names" /
     /// "Summarize subset" buttons so the user can't double-fire.

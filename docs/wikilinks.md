@@ -4,20 +4,11 @@ References between notes, authored and stored as names. A wikilink's target is a
 
 This consolidates the sketch in `design.md` (the `[[…]]` widget + `core::store` resolution + the `[[` picker) and `editor.md` (the decoration layer + `CompletionSource`). The decoration scaffold lives in `editor/editor-md/src/links.rs`; resolution, autocomplete, rename-rewriting, and backlinks are the live slices.
 
-The headline decisions:
-
-- **Stored form is the path the user sees.** `[[Name]]` for unique basenames, `[[folder/sub/Name]]` when disambiguation is needed. No IDs in note bodies, no frontmatter stamping, no normalization on save — what the user types is what's stored and what's on disk. [wikilink-path-form]
-- **Rendered label is the target's title.** The pill shows the target's current title (its basename, or frontmatter `title` when set), resolved by path at render time. Renaming the target updates the rendered label naturally; a referrer whose path got rewritten on rename also sees the new label. [wikilink-render]
-- **Autocomplete picks the shortest unambiguous form.** Typing `[[` opens a title/path picker; selecting a note inserts `[[Name]]` if the basename is unique in the vault, otherwise `[[folder/sub/Name]]`. The user never has to think about disambiguation unless they want to override. [wikilink-autocomplete]
-- **Rename rewrites every referrer.** Moving a note rewrites every `[[…]]` body, trail waypoint path, and kanban card path that pointed at it. One transaction — no dangling links from a crash mid-rename. [wikilink-rename-rewrite]
-- **Ambiguity policy is configurable.** When a name has more than one match, the resolver default is `unresolved` (render as broken, force the user to disambiguate). Two opt-in modes — `lex-first` (lexicographically-first matching path, with a warning) and `nearest-folder` (nearest match in the folder tree) — for users who prefer a guess. [wikilink-ambiguous-resolution]
-- **Backlinks come from the structural index**, surfaced in the discovery panel. [wikilink-backlinks]
-
 
 ## Stored form and rendering
 
-- **Form.** `[[<path>]]` where `<path>` is either a bare basename (`[[meeting]]`) or a vault-relative path without the `.md` extension (`[[work/meeting]]`). The `.md` extension is implicit and dropped on insert. Subpaths use forward slashes regardless of platform. [wikilink-path-form]
-- **Decoration.** The live-preview decoration (`editor/editor-md/src/links.rs`) replaces the `[[…]]` span with a styled link pill when the cursor is off the line and reveals the raw markdown when the cursor is on it — the standard live-preview reveal that every other decoration uses. [wikilink-render]
+- **Form.** `[[<path>]]` where `<path>` is either a bare basename (`[[meeting]]`) or a vault-relative path without the `.md` extension (`[[work/meeting]]`). No IDs in note bodies, no frontmatter stamping, no normalization on save — what the user types is what's stored and what's on disk. The `.md` extension is implicit and dropped on insert. Subpaths use forward slashes regardless of platform. [wikilink-path-form]
+- **Decoration.** The live-preview decoration replaces the `[[…]]` span with a styled link pill when the cursor is off the line and reveals the raw markdown when the cursor is on it — the standard live-preview reveal that every other decoration uses. [wikilink-render]
 - **Rendered label.** The pill's label is the target's current title — frontmatter `title` if present, otherwise the basename without `.md`. Resolved by path at render time; renaming the target (which also rewrites every referrer's path) refreshes the label on the next decoration rebuild. If the target can't be resolved, the decoration falls back to the raw path the user typed in an unresolved style. [wikilink-render]
 
 
@@ -50,7 +41,7 @@ When a note is renamed or moved (`move-note-core-cmd`, `drag-and-drop-move`, or 
 
 All rewrites for a single rename commit through the op-log as one logical rename batch: each referrer's edit is its own op (so per-file history stays clean), but the indexer's referrer enumeration + edit application happens inside one transaction. A crash mid-rename leaves either all referrers rewritten or none — never dangling links. [wikilink-rename-rewrite]
 
-**Referrer enumeration** uses the structural index (per `wikilink-backlinks`): the indexer maintains a reverse map from target path to referrer paths so a rename is one indexed query plus N writes, not a vault scan. The same index serves backlinks display. A future Bloom filter over "does this note contain any wikilinks at all" is the obvious optimization if profiling shows the writes-per-rename are hot; not built first. [wikilink-rename-bloom-filter-deferred]
+**Referrer enumeration** uses the structural index (per `wikilink-backlinks`): the indexer maintains a reverse map from target path to referrer paths so a rename is one indexed query plus N writes, not a vault scan. The same index serves backlinks display. A Bloom-filter optimization is deferred (`wikilink-rename-bloom-filter-deferred`).
 
 **External renames** (a file changed outside hiker, e.g. via Syncthing arriving from another device or a terminal `mv`) trigger the same rewrite path through the watcher's rename detection. Unpaired Created+Deleted pairs are too speculative to treat as a rename and surface as a delete + create — the same posture trails uses today.
 
@@ -62,16 +53,15 @@ A click resolves the path and opens the target through the shared open-note path
 
 ## Hover preview card
 
-Hovering a resolved wikilink for ~400ms shows a small scrollable preview card with the target note's rendered content — title, frontmatter summary, and a scrollable body. Lets the user peek at what's behind a link without opening it. [wikilink-hover-preview]
+Hovering a resolved wikilink for ~400ms shows a small scrollable preview card with the target note's rendered content, letting the user peek at what's behind a link without opening it. [wikilink-hover-preview]
 
-- **Trigger.** Pointer enters a resolved wikilink pill; card appears after a short hover delay (~400ms) so transient sweeps of the pointer don't spam previews. Pointer leave (with a brief grace window so the user can move the cursor into the card itself) dismisses.
-- **Anchor.** Card paints over the editor canvas anchored to the pill's screen position, with quadrant-flip + canvas-clamp placement — same painter primitive as `cluster-editor-graph-view-hover-preview-card`. Reuses `panels::graph::paint_preview_card` so both consumers share styling.
-- **Body source.** Target note's rendered markdown: frontmatter `title` (or basename), first ~30 lines of body with frontmatter stripped via `panels::graph::skip_frontmatter`, and a scrollable region for more. Scrolling inside the card scrolls only the card body, not the editor.
-- **Style.** Same light-background / 1px-border treatment as the cluster-graph card; long titles wrap inside the card rather than expanding it.
-- **Unresolved / ambiguous links** don't get a preview card — the existing unresolved-style affordance (per `wikilink-unresolved`) is the right surface for "you need to disambiguate / create this." Hovering an unresolved pill is a no-op.
-- **Click through still opens the note** via `wikilink-click-open` — the card doesn't replace the click path, it's a peek-before-commit. Mod-click on a pill while its card is showing closes the card and opens the target sticky, same as without the card.
-- **Embed (`![[...]]`)** is the deferred sibling of this feature (per `wikilink-embed`) and renders inline rather than as a hover card; the two are separate features serving different needs.
-- **Module placement.** Hover detection + card lifecycle live in the wikilink decoration layer (`editor/editor-md/src/links.rs`); body resolution reuses the indexer's read path; painting reuses the shared card helper.
+- **Trigger.** Pointer enters a resolved pill; card appears after the hover delay so transient sweeps don't spam previews. Pointer leave (with a brief grace window so the user can move the cursor into the card itself) dismisses.
+- **Anchor.** Card paints over the editor canvas anchored to the pill's screen position, with quadrant-flip + canvas-clamp placement. Reuses `panels::graph::paint_preview_card` (same painter primitive as `cluster-editor-graph-view-hover-preview-card`) so both consumers share styling.
+- **Body source.** Frontmatter `title` (or basename) plus the first ~30 lines of body with frontmatter stripped, in a scrollable region. Scrolling inside the card scrolls only the card body, not the editor. Long titles wrap inside the card rather than expanding it.
+- **Unresolved / ambiguous links** don't get a preview card — the existing unresolved-style affordance (`wikilink-unresolved`) is the right surface for "you need to disambiguate / create this." Hovering one is a no-op.
+- **Click through still opens the note** via `wikilink-click-open` — the card is a peek-before-commit, not a replacement. Mod-click while the card is showing closes it and opens the target sticky.
+- **Embed (`![[...]]`)** is the deferred sibling (`wikilink-embed`), rendering inline rather than as a hover card.
+- **Module placement.** Hover detection + card lifecycle live in the wikilink decoration layer; body resolution reuses the indexer's read path; painting reuses the shared card helper.
 
 
 ## Backlinks
@@ -91,7 +81,6 @@ A wikilink whose target can't be resolved — a name with no match, an explicit 
 
 Path-form is the single representation every link producer emits:
 
-- **Crawl rewrite** (`extract.md`, `crawl-link-rewrite-wikilinks`) rewrites internal links among crawled pages to `[[<path>]]`, picking the shortest-unambiguous form against the crawl manifest.
 - **Trails** and **kanban** reference notes by path in YAML (`hiker.references.path` for trail waypoints, `cards[].path` for kanban cards) — the same path-based identity wikilinks use. The picker UI and rename-rewrite machinery is shared.
 - **MCP** returns paths as the stable handle on every note-shaped result.
 
@@ -105,5 +94,5 @@ Path-form is the single representation every link producer emits:
 
 ## Out of scope
 
-- **Opaque-ID-based links** (the prior ULID model). Rejected: the stamping was visible in user files, the ID had to be normalized into every typed link on save, and the user-facing identifier was an opaque string. Path-based identity keeps notes clean and round-trippable through external editors at the cost of one referrer-rewrite pass per rename — a cost the indexer's structural index makes cheap.
+- **Opaque-ID-based links** (the prior ULID model). Rejected for visible stamping and opaque identifiers; path-based identity keeps notes clean and round-trippable at the cost of one referrer-rewrite pass per rename.
 - **The vault-wide graph view.** Wikilinks are an edge source for it, but the graph view is its own `design.md` feature.

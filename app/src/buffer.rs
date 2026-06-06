@@ -190,11 +190,6 @@ pub struct Buffer {
     /// query draft, debounce timestamps, error / wrapped hints, and the
     /// saved selection restored when Esc closes the bar.
     pub find_ui: FindUi,
-    /// Per-buffer reader / focus view toggle (`editor-reader-view`).
-    /// When true, the buffer panel hides its toolbar + status bar, and
-    /// the host hides the window-level chrome (top toolbar, side bars,
-    /// activity bar, status bar) around the active editor.
-    pub reader_view: bool,
     pub agent_proposal: Option<String>,
     /// Which agent session's pending ops are in scope for the inline review.
     /// `None` selects the whole pending queue (all sessions). The file pill
@@ -437,7 +432,6 @@ impl Buffer {
             hide_scrollbar: cfg.map(|c| c.editor.hide_scrollbar).unwrap_or(false),
             click_patterns,
             find_ui: FindUi::default(),
-            reader_view: false,
             agent_proposal: None,
             active_session: None,
         }
@@ -500,9 +494,17 @@ impl Buffer {
             .ranges()
             .iter()
             .map(|r| {
-                let mut nr = SelRange::new(clamp(r.anchor.offset()), clamp(r.head.offset()));
-                nr.goal_col = r.goal_col;
-                nr
+                // PRESERVE each anchor's bias rather than letting `SelRange::new`
+                // recompute it from numeric order: a reversed selection (anchor >
+                // head) carries `Bias::Left` on its start, and recomputing would
+                // flip biases and strand a mapped caret on the wrong side of an
+                // insert. We only clamp the byte offsets to valid boundaries.
+                use editor_core::anchor::Anchor;
+                SelRange {
+                    anchor: Anchor::at(clamp(r.anchor.offset()), r.anchor.bias),
+                    head: Anchor::at(clamp(r.head.offset()), r.head.bias),
+                    goal_col: r.goal_col,
+                }
             })
             .collect();
         self.editor.doc = Rope::from_str(new_text);
@@ -545,11 +547,15 @@ impl Buffer {
             .ranges()
             .iter()
             .map(|r| {
-                let a = clamp(r.anchor.offset());
-                let h = clamp(r.head.offset());
-                let mut nr = SelRange::new(a, h);
-                nr.goal_col = r.goal_col;
-                nr
+                // Preserve each anchor's bias (see `set_doc_clamping_selection`):
+                // `SelRange::new` would recompute biases from numeric order and
+                // mis-orient a reversed selection. Clamp the offsets only.
+                use editor_core::anchor::Anchor;
+                SelRange {
+                    anchor: Anchor::at(clamp(r.anchor.offset()), r.anchor.bias),
+                    head: Anchor::at(clamp(r.head.offset()), r.head.bias),
+                    goal_col: r.goal_col,
+                }
             })
             .collect();
 

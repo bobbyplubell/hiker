@@ -418,78 +418,54 @@ fn returning_to_live_from_a_snapshot_loads_the_buffer() {
     );
 }
 
-/// `new_crawl` creates a `mode: crawl` capture-spec note, opens a Capture tab
-/// over it, and the form renders for a few frames without panicking. Pins the
-/// crawl-job-form entry point + frontmatter creation (`crawl-job-form`).
+/// Regression: the last active tab must survive a persist→restore cycle for a
+/// NON-note tab kind (canvas/board/home/…), not just plain vault notes. The save
+/// path used to store `active_path` from the raw `buffer_path`, which is
+/// prefixed (`canvas:`) for canvas/board and `None` for singleton page tabs — so
+/// it never matched the `persist_key`-form entries in `open_paths`, and restore
+/// silently fell back to the first tab. Both sides now key on `persist_key`.
 #[test]
-fn new_crawl_creates_note_and_renders_form() {
-    let (mut state, runtime) = open_temp_vault();
-    let _guard = runtime.enter();
+fn active_non_note_tab_survives_persist_restore() {
+    use crate::tab::{Tab, TabKind};
 
-    state.new_crawl();
-    // A Capture tab is active over the freshly created note.
-    let (tab_id, note_path) = state
+    let (mut state, _rt) = open_temp_vault();
+    // A fresh vault seeds a single Home tab. Add a canvas tab AFTER it and make
+    // the canvas active — so a fall-back-to-first-tab bug would re-activate Home.
+    let canvas_path = "boards/plan.canvas".to_string();
+    let id = state.next_tab_id();
+    state
+        .session
+        .tabs
+        .push(Tab::new(id, TabKind::Canvas { path: canvas_path.clone() }, true));
+    state.session.active_tab = Some(id);
+
+    // Persist to disk, reload the snapshot, and confirm the active tab was keyed
+    // by its `persist_key` (the prefixed canvas form), not dropped.
+    let autosave = state.vault_session.services.autosave.clone();
+    state.persist_tab_state(&autosave);
+    let ts = autosave
+        .load_tab_state()
+        .expect("load tab state")
+        .expect("a persisted snapshot");
+    assert_eq!(
+        ts.active_path.as_deref(),
+        Some("canvas:boards/plan.canvas"),
+        "active tab persisted by persist_key, not raw buffer_path"
+    );
+
+    // Restore into a fresh, tabless session and confirm the CANVAS is active —
+    // not the first-restored (Home) tab.
+    state.session.tabs.clear();
+    state.session.active_tab = None;
+    state.restore_tab_state(ts);
+    let active = state
         .session
         .active_tab
-        .and_then(|id| state.tab_by_id(id))
-        .and_then(|t| match &t.kind {
-            crate::tab::TabKind::Capture { note_path } => Some((t.id, note_path.clone())),
-            _ => None,
-        })
-        .expect("active tab is a Capture tab");
-    assert!(note_path.ends_with(".md"), "capture note has a path");
-
-    // The note on disk parses as a `mode: crawl` capture with fill_body: false.
-    let (content, _h) = state.vault_session.vault.read_file_with_hash(&note_path).unwrap();
-    let fm = hiker_core::frontmatter::split(&content).frontmatter.expect("frontmatter");
-    let spec = hiker_extract::capture::Spec::from_frontmatter(&fm).expect("capture note");
-    assert_eq!(spec.mode, hiker_extract::capture::Mode::Crawl);
-    assert!(!spec.fill_body, "crawl body stays user-owned");
-
-    // Render the form for a few frames.
-    let mut harness = egui_kittest::Harness::builder()
-        .with_size(egui::vec2(900.0, 700.0))
-        .build(|ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                crate::panels::capture::show(ui, &mut state, tab_id, &note_path, &runtime);
-            });
-        });
-    for _ in 0..3 {
-        harness.run();
-    }
-}
-
-/// `new_feed` creates a `mode: feed` capture note and the subscription form
-/// renders cleanly. Pins the RSS subscription GUI entry point.
-#[test]
-fn new_feed_creates_note_and_renders_form() {
-    let (mut state, runtime) = open_temp_vault();
-    let _guard = runtime.enter();
-
-    state.new_feed();
-    let (tab_id, note_path) = state
-        .session
-        .active_tab
-        .and_then(|id| state.tab_by_id(id))
-        .and_then(|t| match &t.kind {
-            crate::tab::TabKind::Capture { note_path } => Some((t.id, note_path.clone())),
-            _ => None,
-        })
-        .expect("active tab is a Capture tab");
-
-    let (content, _h) = state.vault_session.vault.read_file_with_hash(&note_path).unwrap();
-    let fm = hiker_core::frontmatter::split(&content).frontmatter.unwrap();
-    let spec = hiker_extract::capture::Spec::from_frontmatter(&fm).unwrap();
-    assert_eq!(spec.mode, hiker_extract::capture::Mode::Feed);
-
-    let mut harness = egui_kittest::Harness::builder()
-        .with_size(egui::vec2(900.0, 700.0))
-        .build(|ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                crate::panels::capture::show(ui, &mut state, tab_id, &note_path, &runtime);
-            });
-        });
-    for _ in 0..3 {
-        harness.run();
-    }
+        .and_then(|i| state.tab_by_id(i))
+        .expect("an active tab after restore");
+    assert!(
+        matches!(&active.kind, TabKind::Canvas { path } if *path == canvas_path),
+        "the canvas tab is re-activated across restart, got {:?}",
+        active.kind
+    );
 }

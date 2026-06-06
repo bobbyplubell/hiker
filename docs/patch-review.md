@@ -2,15 +2,7 @@
 
 In-editor surface for reviewing pending agent ops on the active buffer. Built on the op log (per `op-log.md`) and the `DiffLayer` primitive (per `diff.md`): the buffer renders the merge of the document's three op layers; the diff between the user's current view and that view plus the agent's pending ops renders as hunks; accept/reject flips op status.
 
-The headline decisions:
-
-- **The buffer renders `working`; the agent's proposal is an overlay.** The buffer's `current` rope is `materialize(accepted + working)` — the user's own text, the layer they edit directly. The agent's `pending` proposals are *not* in the buffer text; the review diffs the buffer against `materialize(accepted + working + pending(session))` (the proposal) and renders the pending ops as a suggestion overlay — additions as phantom blocks, deletions struck through (per `op-log-layered-model`). Keeping the buffer as `working` means user edits and the cursor live in one coordinate space; the proposal is a read-only overlay layered on top. [patch-review-buffer-state]
-- **Inline review is `DiffLayer { base: agent_base, current: buffer, owner: Agent }`.** Same primitive that powers snapshot diff and history diff. No anchor tracker; the diff recomputes from the two ropes each frame. [patch-review-diff-layer]
-- **Per-hunk accept/reject resolves ops, not text.** Accept finds the pending ops contributing to the hunk's `current_range`, applies their queued updates to `accepted`, removes them from the queue, and re-runs the save-to-disk projection. Reject drops them from the queue (writing a rejected audit row). The buffer's `current` recomputes from the new materialization on the next frame. [patch-review-per-hunk-accept]
-- **The op log is hot storage; the buffer is a view.** Pending ops persist in `<doc-id>.pending` regardless of whether a tab is open. Opening a tab is just "materialize and render"; closing a tab discards the buffer rope but leaves the queue untouched. Re-opening rehydrates fresh. [patch-review-buffer-is-view]
-- **User edits go to the `working` layer; agent edits wait in the queue.** Typing into a buffer with pending ops applies new `user` ops to the `working` layer (uncommitted; per `op-log-editor-binding`). They show up in `current` immediately (because the buffer materializes `accepted + working + pending`) but produce no diff hunks against themselves — the base is `materialize(accepted + working)`, so user edits are on both sides. Only the agent's pending ops produce hunks. Save (`commit_working`) folds `working` into `accepted`. [patch-review-coexisting-edits]
-- **The file pill carries bulk verbs and hunk navigation.** Thin strip above the editor when the open document has any pending ops in the active agent session: `N hunks (M drifted)` plus `[Accept all] [Reject all] [Next hunk]`. [patch-review-file-pill]
-- **Whole-file proposals (`write_note` shape, `SetFrontmatter`) open in diff mode against the user's current materialization.** Per-hunk doesn't compose with a single-op whole-document replacement; the editor tab opens with `diff = Some(PendingOp(op_id))`, owner `Agent`, and Accept / Reject in the toolbar's mode-controls slot. [write-note-review-surface]
+The buffer renders `working`; the agent's proposal is a read-only overlay. The buffer's `current` is `materialize(accepted + working)` — the user's own text, edited directly, with cursor and edits in one coordinate space. The agent's `pending` proposals are *not* in the buffer text; the review is `DiffLayer { base: agent_base, current: buffer, owner: Agent }` against `materialize(accepted + working + pending(session))`, rendering pending ops as a suggestion overlay — additions as phantom blocks, deletions struck through (per `op-log-layered-model`). Same primitive that powers snapshot and history diff; no anchor tracker, recomputed from the two ropes each frame. [patch-review-buffer-state, patch-review-diff-layer]
 
 
 ## Buffer state
@@ -26,13 +18,11 @@ pub struct Buffer {
 }
 ```
 
-`agent_base` is set only when at least one pending op for `active_session` exists on the document. It feeds the inline `DiffLayer`. It clears when every pending op is resolved (accepted or rejected) or when the buffer's active session changes.
+`agent_base` feeds the inline `DiffLayer`. It clears when every pending op is resolved or when the buffer's active session changes. `loaded_content` retains its role as the save-path drift baseline — the editor's existing `pre-write-drift-check` keys off it, not off `agent_base`.
 
-`loaded_content` retains its role as the save-path drift baseline — the editor's existing `pre-write-drift-check` keys off it, not off `agent_base`.
+The op log is hot storage; the buffer is a view. Pending ops persist in `<doc-id>.pending` regardless of whether a tab is open; opening a tab materializes and renders, closing discards the buffer rope but leaves the queue untouched, re-opening rehydrates fresh. [patch-review-buffer-is-view]
 
-When the user types, the editor binding applies the edit as a `user` op on the `working` layer (per `op-log-editor-binding`); `current` and `agent_base` recompute on the next frame (both include `working`, so the user's typing never renders as a hunk against itself).
-
-When the user accepts / rejects a hunk, the editor calls `core::ops::flip_op_status(op_ids, new_status)`; `current` and `agent_base` recompute on the next frame.
+When the user types, the editor binding applies the edit as a `user` op on the `working` layer (per `op-log-editor-binding`); `current` and `agent_base` recompute next frame. Because both include `working`, user edits sit on both sides of the diff base and never render as a hunk against themselves — only the agent's pending ops produce hunks. Save (`commit_working`) folds `working` into `accepted`. Accept / reject calls `core::ops::flip_op_status(op_ids, new_status)`; both ropes recompute next frame. [patch-review-coexisting-edits]
 
 
 ## Inline rendering
@@ -47,7 +37,7 @@ When `agent_base.is_some()` and the active tab is the buffer:
 
 ## Accept / reject
 
-The hunk's `(base_range, current_range)` mapping comes from `DiffLayer`.
+The hunk's `(base_range, current_range)` mapping comes from `DiffLayer`. Accept/reject resolves ops, not text. [patch-review-per-hunk-accept]
 
 **Accept:**
 1. Query the queue for pending ops in `active_session` whose CRDT position falls inside `current_range`. (Position-overlap query — `core::oplog::ops_in_range(doc_id, session, range)`.)
@@ -61,7 +51,7 @@ The hunk's `(base_range, current_range)` mapping comes from `DiffLayer`.
 
 When every pending op for `active_session` is resolved, `agent_base` clears to `None` and the file pill disappears.
 
-Accept and reject operate only on the agent's `pending` ops — the user's uncommitted `working` edits survive both. Accepting a hunk folds the contributing pending op into `accepted` and leaves `working` intact; rejecting drops the pending op and leaves `working` intact. Neither reloads the buffer from disk, so unsaved typing is never discarded.
+Accept and reject operate only on the agent's `pending` ops — the user's uncommitted `working` edits survive both, and neither reloads the buffer from disk, so unsaved typing is never discarded.
 
 **Accept-all / Reject-all** apply the per-hunk verbs sequentially over every pending op for the session. Drifted ops are skipped by Accept-all and resolved by Reject-all (the file pill's `(M drifted)` count covers them).
 
@@ -78,9 +68,7 @@ A conflict hunk routes through the same `flip_op_status` machinery as a plain hu
 
 ## Save semantics
 
-Save is `commit_working` (per `op-log.md`'s "Disk write invariant"): it folds the `working` layer into `accepted` and writes the result to disk per `op-log-atomic-write`. Pending ops are untouched — they stay in the queue and continue to show as hunks; the save path can't carry one to disk because pending lives outside both `working` and `accepted`. The "you saved without reviewing" failure mode is gone — there is no path by which a pending op reaches disk without being explicitly accepted.
-
-When the user types in a buffer with pending ops, the edits accumulate in `working` until Save commits them; the agent's pending ops keep waiting in the queue meanwhile.
+Save is `commit_working` (per `op-log.md`'s "Disk write invariant"): it folds the `working` layer into `accepted` and writes the result to disk per `op-log-atomic-write`. Pending ops are untouched — they stay in the queue and continue to show as hunks; the save path can't carry one to disk because pending lives outside both `working` and `accepted`. No pending op reaches disk without being explicitly accepted.
 
 Reject is independent of save — it only mutates the log; disk content is unchanged.
 
@@ -115,25 +103,15 @@ Some op kinds don't compose into the per-hunk view:
 
 These open the editor tab in diff mode: the buffer holds the proposed content read-only; the diff layer shows `base = materialize(accepted + working)` (or `Empty` for `Create` against a non-existent path), `current = proposed content`. Toolbar mode-controls slot carries `Review rewrite` / `Review new note` plus Accept / Reject verbs. [write-note-review-mode-label]
 
-- **Accept folds the proposal into `accepted` and preserves `working`.** A whole-body rewrite replaces the body region; where it overlaps the user's uncommitted `working` edits, the overlap surfaces as a conflict hunk on accept with **Keep mine / Keep theirs / Keep both** (per `op-log-merge-conflict`), the same resolution the inline path uses. Disjoint `working` edits merge automatically. Reject works regardless. [write-note-review-blocks-on-dirty]
-- **Accept navigates to the target note** as a preview tab. [staging-accept-navigates-to-preview]
+- **Accept** folds the proposal into `accepted` (preserving `working` like the inline path). A whole-body rewrite replaces the body region; where it overlaps uncommitted `working` edits, the overlap surfaces as a conflict hunk with **Keep mine / Keep theirs / Keep both** (per `op-log-merge-conflict`); disjoint `working` edits merge automatically. Then navigates to the target note as a preview tab. [write-note-review-blocks-on-dirty, staging-accept-navigates-to-preview]
 - **Drifted whole-file ops.** Accept disabled with reason as tooltip; proposed content still renders. Reject works. [write-note-review-conflicted-display]
 
 
-## Auto-routing on open
+## Open routing and precedence
 
-When `openFile(rel)` resolves a path that has at least one pending whole-file op, the open lands in the whole-file review surface rather than plain editing. The most recent such op by `timestamp_ms` is the one shown; older pending ops are accessible via the status-bar version dropdown. [note-open-routes-to-pending-review]
+On `openFile(rel)`, the whole-file review surface takes precedence over plain editing: a path with at least one pending whole-file op opens in the whole-file surface (most recent by `timestamp_ms`; older ones via the status-bar version dropdown), while a path with only hunk-shaped `Replace` ops opens in plain editing with the inline diff layer and file pill. When both shapes exist, accepting/rejecting the whole-file surface returns to plain editing where the hunk-shaped ops remain. [note-open-routes-to-pending-review]
 
-When a path has pending `Replace` ops (hunk-shaped) but no whole-file op, the open lands in plain editing with the inline diff layer and file pill visible.
-
-When both shapes exist, the whole-file surface takes precedence on open. Accepting or rejecting it returns the user to plain editing where the hunk-shaped ops remain.
-
-
-## Pending-rewrite banner
-
-When a buffer tab is in plain editing (not the whole-file review surface) and its path has at least one pending whole-file op, a thin banner above the editor reads `Pending rewrite for this note` (or `Pending new-note proposal` when the path doesn't exist), with a `Review` button that switches the tab into the whole-file review surface. [write-note-pending-banner]
-
-Stacks with the inline file pill — a path with both shapes pending renders pill above banner.
+When a tab is in plain editing but its path has a pending whole-file op, a thin **Pending-rewrite banner** above the editor reads `Pending rewrite for this note` (or `Pending new-note proposal` when the path doesn't exist) with a `Review` button into the whole-file surface; it stacks above the inline file pill when both shapes are pending. [write-note-pending-banner]
 
 
 ## Module placement

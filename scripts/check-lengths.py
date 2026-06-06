@@ -9,7 +9,8 @@ Function-length budgets are enforced by clippy (`clippy::too_many_lines`,
 configured in clippy.toml) for Rust.
 
 File cap:
-- Rust: 1500 lines (covers every Rust crate in the workspace)
+- Rust: 1500 lines (covers the production Rust crates listed in
+  `_rust_roots.py`, shared with `check-splits.py`)
 """
 
 from __future__ import annotations
@@ -18,21 +19,10 @@ import os
 import sys
 from pathlib import Path
 
+from _rust_roots import RUST_ROOTS
+
 RUST_FILE_CAP = 1500
 
-RUST_ROOTS = [
-    "core/src",
-    "mcp-server/src",
-    "cli/src",
-    "app/src",
-    "hiker-sync/src",
-    "editor/editor-core/src",
-    "editor/editor-view/src",
-    "editor/editor-egui/src",
-    "editor/editor-md/src",
-    "editor/editor-diff/src",
-    "editor/editor-ts/src",
-]
 SKIP_DIRS = ("node_modules", "dist", "target")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

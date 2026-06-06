@@ -36,6 +36,7 @@ use hiker_sync::identity::{BlockedDoc, DeviceFingerprint, Resolution};
 use hiker_sync::transport::{EnrolledPeers, PeerCandidate, SyncNode, SyncReport};
 
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// User-scope secret store for a vault's sync identity (`sync-secrets-user-scope`).
@@ -102,6 +103,21 @@ impl KeyStore {
         self.dir.join("content.key")
     }
 
+    /// Marker sidecar for whether the content key is "established" — deliberately
+    /// set (manual import) or converged in-band, vs the fresh key a brand-new
+    /// device auto-generated. Its mere PRESENCE means established; absence means
+    /// fresh. Lives next to `content.key` in the user-scope store, never the
+    /// synced vault. [sync-content-key-confirm-on-change]
+    fn established_path(&self) -> PathBuf {
+        self.dir.join("content.established")
+    }
+
+    /// Whether the persisted content key is established (the marker exists).
+    /// [sync-content-key-confirm-on-change]
+    pub fn content_established(&self) -> bool {
+        self.established_path().exists()
+    }
+
     /// Load the device keypair, generating + persisting a fresh one on first
     /// use. The on-disk form is the libp2p protobuf encoding.
     pub fn load_or_generate_device(&self) -> std::io::Result<DeviceKeypair> {
@@ -145,12 +161,23 @@ impl KeyStore {
         Ok(key)
     }
 
-    /// Overwrite the persisted content key with `key` (the manual content-key
-    /// import path), so an imported key survives a restart. Written 0600 via
-    /// [`write_secret`], same as the generated key.
-    pub fn store_content(&self, key: &ContentKey) -> std::io::Result<()> {
+    /// Overwrite the persisted content key with `key` AND its `established` flag
+    /// (the write-through both the manual import and the in-band auto-transfer
+    /// route through), so an imported / adopted key + its deliberate-ness survive
+    /// a restart. The key is written 0600 via [`write_secret`], same as the
+    /// generated key; the established marker is a zero-byte sidecar whose presence
+    /// IS the flag. [sync-content-key-confirm-on-change]
+    pub fn store_content(&self, key: &ContentKey, established: bool) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        write_secret(&self.content_path(), key.as_bytes())
+        write_secret(&self.content_path(), key.as_bytes())?;
+        let marker = self.established_path();
+        if established {
+            // Marker presence IS the flag; an empty file is enough.
+            write_secret(&marker, &[])?;
+        } else if marker.exists() {
+            let _ = std::fs::remove_file(&marker);
+        }
+        Ok(())
     }
 
     /// The local-only device-alias sidecar path: a `{ fingerprint: name }` JSON
@@ -277,6 +304,24 @@ pub struct SyncSnapshot {
     /// page can offer a one-click enroll and `None` when it can't be derived.
     /// [sync-mdns-discovery]
     pub seen_unenrolled: Vec<(String, String, Option<String>)>,
+    /// Set to a peer device fingerprint when our ESTABLISHED content key differs
+    /// from that peer's and we declined to silently switch — the signal the Sync
+    /// page renders a confirm action for (the manual Copy/Import is the accept
+    /// path for now). `None` when no key change is held.
+    /// [sync-content-key-confirm-on-change]
+    pub pending_content_key_change: Option<String>,
+}
+
+impl SyncSnapshot {
+    /// Count of items that NEED THE USER — drives the Sync tab attention badge
+    /// and the "is anything wrong" gate. Sums blocked (forked) docs, a held
+    /// content-key change, and a present surfaced last-error. Zero means
+    /// healthy (no badge). status: sync-attention-badge
+    pub fn attention_count(&self) -> usize {
+        self.blocked.len()
+            + usize::from(self.pending_content_key_change.is_some())
+            + usize::from(self.last_error.is_some())
+    }
 }
 
 /// Shared mutable state the spawned tasks and the UI read/update. Held behind a
@@ -317,6 +362,12 @@ struct Shared {
     /// without locking the node. The `fingerprint` is the one-click-enroll
     /// target when present. [sync-mdns-discovery]
     seen_unenrolled: Vec<(String, String, Option<String>)>,
+    /// The peer device fingerprint of a HELD content-key change: our established
+    /// key differs from this peer's and we declined to silently switch. The Sync
+    /// page renders a confirm action (for now, the manual Copy/Import is the
+    /// accept path); cleared on a successful import or once keys match.
+    /// [sync-content-key-confirm-on-change]
+    pending_content_key_change: Option<String>,
 }
 
 /// Targets for one sync round: the server flag/url. The LAN peer list is NOT
@@ -374,6 +425,13 @@ pub struct SyncService {
     /// waiting for a vault reopen. The responder loop also breaks on the
     /// session-wide cancel, so this is purely the *additional* in-session stop.
     cancel: CancellationToken,
+    /// Wake signal for the debounced poke-on-commit task: each local commit
+    /// calls [`notify_local_change`](Self::notify_local_change) →
+    /// `notify_one()` (cheap, callable from the UI thread). The spawned task
+    /// (see [`spawn_poke_task`](Self::spawn_poke_task)) coalesces a burst, then
+    /// dials each discovered enrolled peer with a content-free poke so they pull
+    /// promptly. [sync-poke-on-commit]
+    local_change: Arc<Notify>,
 }
 
 impl SyncService {
@@ -390,6 +448,10 @@ impl SyncService {
         let store = KeyStore::for_vault(vault_root);
         let keypair = store.load_or_generate_device()?;
         let content_key = store.load_or_generate_content()?;
+        // Whether the persisted key was deliberately set / converged, vs the
+        // fresh one a brand-new device auto-generated. Gates in-band adoption.
+        // [sync-content-key-confirm-on-change]
+        let content_established = store.content_established();
         let aliases = store.load_aliases();
         let config = section_to_config(section);
         let fingerprint = keypair.fingerprint().0;
@@ -418,8 +480,11 @@ impl SyncService {
         let persist_root = vault_root.to_path_buf();
         let content_key = SharedContentKey::with_persist(
             content_key,
-            Arc::new(move |k: &ContentKey| {
-                if let Err(e) = KeyStore::for_vault(&persist_root).store_content(k) {
+            content_established,
+            Arc::new(move |k: &ContentKey, established: bool| {
+                if let Err(e) =
+                    KeyStore::for_vault(&persist_root).store_content(k, established)
+                {
                     tracing::warn!(error = %e, "sync: failed to persist adopted content key");
                 }
             }),
@@ -432,6 +497,16 @@ impl SyncService {
             enrolled.clone(),
         );
         let device_name = config.device_name.clone().unwrap_or_default();
+
+        // Config-sanity warning (`sync-config-sanity-warning`): sync is enabled
+        // but the configuration can never reach a peer — peer mode with LAN
+        // discovery OFF and no `server_url` — so every round would be a silent
+        // no-op. Surface it once, both to the log and the events ring (the Sync
+        // page renders its own version from the snapshot bits).
+        if let Some(reason) = config_unreachable_warning(&config) {
+            tracing::warn!(target: "hiker::sync", "{reason}");
+            let _ = events_tx.send(format!("sync: {reason}"));
+        }
 
         Ok(Self {
             node: Arc::new(tokio::sync::Mutex::new(node)),
@@ -449,6 +524,7 @@ impl SyncService {
             events_tx,
             fork_diff_tx,
             cancel: CancellationToken::new(),
+            local_change: Arc::new(Notify::new()),
         })
     }
 
@@ -496,6 +572,8 @@ impl SyncService {
             Resolution::KeepMine => "keep mine",
             Resolution::KeepTheirs => "keep theirs",
             Resolution::KeepBoth => "keep both",
+            Resolution::KeepDeleted => "keep deleted",
+            Resolution::KeepEdit => "keep edit",
         };
         self.log(format!("sync: resolving conflict ({verb}) — syncing now"));
         // Spawn the node mutation off the egui thread (the responder/auto-sync
@@ -691,13 +769,18 @@ impl SyncService {
         // Parse + validate synchronously (lock-free) so a malformed key errors
         // immediately.
         let key = ContentKey::from_b58(b58).map_err(|e| e.to_string())?;
-        // Route through the shared handle: updates the live node's key in place
-        // AND persists it via the KeyStore hook. The node holds the SAME handle,
-        // so no node-lock spawn is needed — the egui thread never blocks.
-        self.content_key.set(key.clone());
-        // Refresh the cached string the page renders (std mutex, off the node).
+        // Route through the shared handle: updates the live node's key in place,
+        // marks it ESTABLISHED (a manual import is a deliberate choice — and the
+        // accept-the-change path for a held convergence), AND persists it via the
+        // KeyStore hook. The node holds the SAME handle, so no node-lock spawn is
+        // needed — the egui thread never blocks.
+        // [sync-content-key-confirm-on-change]
+        self.content_key.adopt(key.clone());
+        // Refresh the cached string the page renders, and clear any held
+        // pending-key-change now that the user has explicitly chosen a key.
         if let Ok(mut s) = self.shared.lock() {
             s.content_key_b58 = key.to_b58();
+            s.pending_content_key_change = None;
         }
         self.log("sync: imported content key (devices can now decrypt each other)");
         Ok(())
@@ -819,6 +902,18 @@ impl SyncService {
                     for (path, reason) in &report.blocked {
                         let _ = events_tx.send(format!("sync: conflict — {path} ({reason})"));
                     }
+                    // Surface a content-key adoption or a held (pending) key
+                    // change. [sync-content-key-confirm-on-change]
+                    if let Some(peer) = &report.adopted_content_key_from {
+                        let _ = events_tx.send(format!("sync: adopted {peer}'s vault content key"));
+                    }
+                    if let Some(peer) = &report.pending_content_key_change {
+                        tracing::warn!(peer = %peer, "sync: peer uses a different content key — confirm to adopt");
+                        let _ = events_tx.send(format!(
+                            "sync: peer {peer} uses a different content key — confirm to adopt it (Sync page), or Copy/Import to match"
+                        ));
+                    }
+                    let pending = report.pending_content_key_change.clone();
                     // Mirror the node's learned peer names from this round's
                     // handshake (read off the guard we still hold). [sync-device-name]
                     let learned = node.learned_device_names();
@@ -829,6 +924,7 @@ impl SyncService {
                         // Reflect any in-band content-key adoption. [sync-vault-key-inband]
                         s.content_key_b58 = content_key.get().to_b58();
                         s.learned_names = learned;
+                        s.pending_content_key_change = pending;
                     }
                 }
                 Err(e) => {
@@ -903,6 +999,7 @@ impl SyncService {
             content_key_b58,
             discovered,
             seen_unenrolled,
+            pending_content_key_change,
         ) = self
             .shared
             .lock()
@@ -918,9 +1015,10 @@ impl SyncService {
                         .map(|c| (c.fingerprint.0.clone(), c.addr.clone()))
                         .collect(),
                     s.seen_unenrolled.clone(),
+                    s.pending_content_key_change.clone(),
                 )
             })
-            .unwrap_or((None, None, None, Vec::new(), String::new(), Vec::new(), Vec::new()));
+            .unwrap_or((None, None, None, Vec::new(), String::new(), Vec::new(), Vec::new(), None));
         SyncSnapshot {
             enabled: self.enabled(),
             mode: self.config.mode,
@@ -935,6 +1033,7 @@ impl SyncService {
             content_key_b58,
             discovered,
             seen_unenrolled,
+            pending_content_key_change,
         }
     }
 
@@ -987,7 +1086,12 @@ impl SyncService {
         if peers.is_empty() {
             return Ok(None);
         }
-        // Sync against each known enrolled peer in turn, folding reports.
+        // Sync against each known enrolled peer in turn, folding reports. A peer
+        // whose round returns `Err` must not be silently dropped on a
+        // partial-success round: fold `(peer_addr, reason)` into the report's
+        // `errored` so the failure survives for later UI surfacing, in addition
+        // to keeping the `last_err` used for the all-peers-failed return below.
+        // status: bug-sync-partial-failure-swallowed
         let mut folded = SyncReport::default();
         let mut last_err: Option<String> = None;
         for addr in &peers {
@@ -996,8 +1100,13 @@ impl SyncService {
                     folded.bound.extend(r.bound);
                     folded.converged.extend(r.converged);
                     folded.blocked.extend(r.blocked);
+                    folded.errored.extend(r.errored);
                 }
-                Err(e) => last_err = Some(e.to_string()),
+                Err(e) => {
+                    let reason = e.to_string();
+                    folded.errored.push((addr.clone(), reason.clone()));
+                    last_err = Some(reason);
+                }
             }
         }
         match last_err {
@@ -1018,10 +1127,15 @@ impl SyncService {
             Ok(Some(report)) => {
                 let did_something = !report.bound.is_empty()
                     || !report.converged.is_empty()
-                    || !report.blocked.is_empty();
+                    || !report.blocked.is_empty()
+                    || !report.errored.is_empty();
                 if did_something {
                     self.report_line(&report);
                 }
+                // Surface a content-key adoption or a held (pending) key change
+                // before the report is moved into the snapshot.
+                // [sync-content-key-confirm-on-change]
+                self.surface_content_key_outcome(&report);
                 self.record_report(report);
                 self.clear_last_error();
                 // An in-band content-key adoption may have happened on the node;
@@ -1041,6 +1155,72 @@ impl SyncService {
         }
     }
 
+    /// Signal that a document was just committed (saved) on THIS device, so the
+    /// debounced poke task wakes and nudges enrolled peers to pull promptly
+    /// rather than waiting for their own ~15s poll tick. Cheap and non-blocking
+    /// — a single `notify_one()` — so it's safe to call straight from the UI
+    /// thread at every commit site. A no-op when no poke task is running (sync
+    /// disabled) or when there are no enrolled peers (the task finds none to
+    /// dial). [sync-poke-on-commit]
+    // status: sync-poke-on-commit
+    pub fn notify_local_change(&self) {
+        self.local_change.notify_one();
+    }
+
+    /// Spawn the debounced poke-on-commit task (the SENDING side of
+    /// `sync-poke-on-commit`). It loops on the `local_change` notify, coalesces
+    /// a burst of commits with a short sleep, then dials each discovered
+    /// enrolled peer with a content-free [`SyncNode::poke`] so they run their
+    /// existing pull path now. Failures are logged and non-fatal; with no peers
+    /// it's a quiet no-op. Respects the per-service cancel token (the kill
+    /// switch / vault swap stops it with the rest of the engine). Called by
+    /// bootstrap right after the service is built, on the tokio runtime.
+    // status: sync-poke-on-commit
+    pub fn spawn_poke_task(&self) {
+        // Gate on sync being enabled — a disabled service never builds a swarm
+        // or listens, so there's nothing to poke from. (bootstrap also only
+        // builds the service when enabled, but this keeps the task honest if
+        // called in another context.)
+        if !self.config.enabled {
+            return;
+        }
+        let node = self.node.clone();
+        let notify = self.local_change.clone();
+        let cancel = self.cancel.clone();
+        let events_tx = self.events_tx.clone();
+        // Coalesce a burst of rapid saves into one poke round.
+        const DEBOUNCE: Duration = Duration::from_millis(300);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    () = notify.notified() => {
+                        // Coalesce: a burst of commits within the window collapses
+                        // into one poke round. Don't hold the node lock across
+                        // this sleep — only lock it to dial, below.
+                        tokio::time::sleep(DEBOUNCE).await;
+                        // Snapshot the enrolled-discovered peers under one lock
+                        // turn, then dial each. The node lock here is the same
+                        // contention the auto-sync dialer already has with the
+                        // responder window — fine. [sync-poke-on-commit]
+                        let mut node = node.lock().await;
+                        let peers: Vec<String> = node
+                            .discovered_peers()
+                            .into_iter()
+                            .map(|c| c.addr)
+                            .collect();
+                        for addr in peers {
+                            if let Err(e) = node.poke(&addr).await {
+                                tracing::warn!(peer = %addr, error = %e, "sync: poke failed");
+                                let _ = events_tx.send(format!("sync: poke {addr} failed — {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Refresh the page's cached content-key string from the live shared handle.
     /// Called after a round so an in-band auto-transfer (`sync-vault-key-inband`)
     /// — which adopts the canonical device's key on the node side — is reflected
@@ -1050,6 +1230,35 @@ impl SyncService {
         let b58 = self.content_key.get().to_b58();
         if let Ok(mut s) = self.shared.lock() {
             s.content_key_b58 = b58;
+        }
+    }
+
+    /// Surface a round's content-key convergence outcome to the user: emit a
+    /// progress line for a fresh-key adoption, or — when an ESTABLISHED key
+    /// declined to switch — emit a warning AND record the held change as a
+    /// pending-key-change snapshot bit the Sync page can render a confirm action
+    /// for (the manual Copy/Import is the accept path for now). A round that
+    /// neither adopted nor held leaves any prior pending change in place (it
+    /// clears on a successful import or once the keys match — i.e. an
+    /// `Unchanged` outcome). [sync-content-key-confirm-on-change]
+    fn surface_content_key_outcome(&self, report: &SyncReport) {
+        if let Some(peer) = &report.adopted_content_key_from {
+            self.log(format!("sync: adopted {peer}'s vault content key"));
+        }
+        if let Some(peer) = &report.pending_content_key_change {
+            tracing::warn!(peer = %peer, "sync: peer uses a different content key — confirm to adopt");
+            self.log(format!(
+                "sync: peer {peer} uses a different content key — confirm to adopt it (Sync page), or Copy/Import to match"
+            ));
+            if let Ok(mut s) = self.shared.lock() {
+                s.pending_content_key_change = Some(peer.clone());
+            }
+        } else {
+            // The keys matched (or we adopted) — no change is being held this
+            // round, so clear any stale pending marker.
+            if let Ok(mut s) = self.shared.lock() {
+                s.pending_content_key_change = None;
+            }
         }
     }
 
@@ -1077,6 +1286,11 @@ impl SyncService {
         ));
         for (path, reason) in &report.blocked {
             self.log(format!("sync: conflict — {path} ({reason})"));
+        }
+        // Per-doc / per-peer failures that did NOT abort the round — surface
+        // each so a partial failure isn't silent. [bug-sync-partial-failure-swallowed]
+        for (label, reason) in &report.errored {
+            self.log(format!("sync: skipped — {label} ({reason})"));
         }
     }
 
@@ -1195,6 +1409,30 @@ fn friendly_round_error(e: &str) -> String {
     } else {
         e.to_string()
     }
+}
+
+/// A one-time config-sanity warning when sync is enabled but the configuration
+/// can never reach a peer: peer mode with LAN discovery OFF and no `server_url`,
+/// so discovery never browses and there is no server to relay — every round is
+/// a silent no-op. Returns `None` when the config has a plausible path to a peer
+/// (discovery on, OR a server configured, OR sync disabled). The Sync page
+/// renders its own equivalent from the snapshot; this drives the start-time
+/// log and events line for `sync-config-sanity-warning`, so a headless or
+/// page-never-opened session still warns.
+fn config_unreachable_warning(config: &Settings) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+    let has_server = matches!(config.mode, SyncMode::Server | SyncMode::Both)
+        && !config.server_url.is_empty();
+    if config.discovery || has_server {
+        return None;
+    }
+    Some(
+        "enabled but discovery is off and no server is configured — no peer will \
+         ever be found"
+            .to_string(),
+    )
 }
 
 fn now_ms() -> i64 {

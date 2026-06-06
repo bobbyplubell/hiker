@@ -103,6 +103,15 @@ impl Camera {
     /// Frame `content` within `viewport`, leaving a fractional `margin` of
     /// padding on each side. A degenerate (zero-area) content rect centers at
     /// scale 1.
+    ///
+    /// The fit scale is capped above by `MAX_SCALE` (framing a single tiny node
+    /// shouldn't zoom in absurdly) but is **not** floored at the gesture
+    /// `MIN_SCALE`: oversized content — a folder-derived tree or cluster tree
+    /// spanning far more world units than `viewport / MIN_SCALE` — must be free
+    /// to zoom out past the gesture floor, or "fit all" would clamp and overflow
+    /// the viewport instead of framing everything. A later zoom gesture re-clamps
+    /// into the gesture range. `sx`/`sy` are always positive here (the degenerate
+    /// case returned above), so no lower floor is needed.
     pub fn zoom_to_fit(&mut self, viewport: Rect, content: CanvasRect, margin: f32) {
         let vw = viewport.width();
         let vh = viewport.height();
@@ -114,8 +123,17 @@ impl Camera {
         let pad = 1.0 + 2.0 * margin.max(0.0);
         let sx = vw / (content.width as f32 * pad);
         let sy = vh / (content.height as f32 * pad);
-        self.scale = sx.min(sy).clamp(MIN_SCALE, MAX_SCALE);
+        self.scale = sx.min(sy).min(MAX_SCALE);
         self.center_on(viewport, content);
+    }
+
+    /// Pin pan so canvas-space `point` sits at the center of `viewport`,
+    /// keeping the current zoom. Used to bring a followed node into view
+    /// without disturbing the user's scale. status: tab-linking
+    pub fn center_on_point(&mut self, viewport: Rect, point: Point) {
+        let half_w = f64::from(viewport.width() / 2.0 / self.scale);
+        let half_h = f64::from(viewport.height() / 2.0 / self.scale);
+        self.pan = Point::new(point.x - half_w, point.y - half_h);
     }
 
     /// Pin pan so the center of `content` sits at the center of `viewport`.
@@ -217,5 +235,26 @@ mod tests {
         // Content fits with margin: its screen extent is within the viewport.
         let r = cam.world_rect_to_screen(vp, content);
         assert!(r.width() <= vp.width() + 1.0 && r.height() <= vp.height() + 1.0);
+    }
+
+    #[test]
+    fn zoom_to_fit_frames_oversized_content_below_gesture_floor() {
+        // A folder-derived tree / cluster tree can span far more world units than
+        // `viewport / MIN_SCALE`. Fitting it must zoom out past the gesture floor
+        // so everything lands inside the viewport (regression: it used to clamp to
+        // MIN_SCALE and overflow, so the preview looked un-fit).
+        let mut cam = Camera::default();
+        let vp = viewport(); // 800x600
+        let content = CanvasRect::new(0.0, 0.0, 60_000.0, 40_000.0);
+        cam.zoom_to_fit(vp, content, 0.1);
+        // The required fit scale is well below the gesture floor.
+        assert!(cam.scale() < 0.05, "fit zoomed out past MIN_SCALE, got {}", cam.scale());
+        // And the whole content actually fits inside the viewport.
+        let r = cam.world_rect_to_screen(vp, content);
+        assert!(
+            r.width() <= vp.width() + 1.0 && r.height() <= vp.height() + 1.0,
+            "oversized content framed within viewport: {:?}",
+            r
+        );
     }
 }

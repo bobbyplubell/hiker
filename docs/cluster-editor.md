@@ -2,42 +2,20 @@
 
 Interactive surface for viewing, manually editing, and configuring automation on a cluster tree (per `clustering.md`'s `ClusterTree`). A tree is a per-tree `.md` file whose body is an editable outline of clusters and note references; the graphical cluster editor and the markdown editor tab are two surfaces over that one document.
 
-The headline decisions:
-
-- **Lives in the left sidebar as a switchable mode, with an Expand button to flip into a full center pane for graphical work.** The sidebar gains a mode switcher (Files / Cluster trees / future Trails) just above the existing `+ New note` row; switching to Cluster trees mode swaps the sidebar body to the cluster editor, hiding the filetree-only chrome (+New, `…` actions, Trash bin). An Expand button on the cluster-trees header sends the editor to the center pane, replacing the editor with a graphical tree view tuned for drag-drop reshaping; click a leaf in expanded mode to open the note in the editor, the existing back-navigation returns to the expanded tree. Mirrors `chat-panel-expand-to-editor`. [cluster-editor-sidebar-mode, cluster-editor-pane-expand]
-- **Multiple trees can be open at once.** The sidebar's Cluster trees body shows a list of open trees — typically the saved triage tree (always present once saved) plus zero-or-more ephemeral trees from one-shot runs. Each tree expands inline to show its node hierarchy. Header on each tree row shows name + state pill (`draft` / `applied` / `saved as triage`). Switching between trees is just expanding a different one — no modal context-swap. [cluster-editor-multiple-trees-open]
-- **Manual reshaping at every level.** Move notes between clusters, merge siblings, merge children up into the parent, split a cluster (re-run the partitioner against just its members), rename a cluster, edit an LLM-generated summary, drop a cluster (members fall to outliers), promote outliers into a cluster, run scoped Summarize over selected / stale / all clusters. Drag-and-drop reparents in the row view (`cluster-editor-dnd-reparent`); multi-select uses Shift-click for range and Cmd/Ctrl-click for toggle; buttons on the multi-select toolbar drive verbs that aren't naturally drag-shaped (merge / split / Summarize selected / Stage move / Stage tag). Every edit is undoable until apply. [cluster-editor-node-operations]
-- **Automation policies attach at any level.** A policy (`Tag` / `Move` / `Freeze`) can be set on a leaf, a mid-tree cluster, or the root. `Tag` and `Move` each carry a `require_review` toggle; `Freeze` means "do nothing for matches in this subtree." Resolution at triage time walks up from the affected note to the nearest ancestor with an explicit policy; no policy anywhere up to the root means the note is left alone. A saved tree is a *policy program*, not a single classifier with a knob. [cluster-editor-policy-any-level, cluster-editor-policy-resolution-walk-up]
-- **Names and summaries are just the outline text.** Click-to-edit on any cluster's name or summary in the graphical surface, or type them in the markdown surface — both write the same body. Regeneration touches only clusters whose name is still a `Cluster N` placeholder, so any name the user (or a prior LLM pass) gave is left alone; re-naming an already-named cluster is an explicit per-cluster action. [cluster-editor-edit-name-summary, cluster-editor-user-edit-provenance]
-- **Auto-save in-progress edits to the tree's `.md` file.** Every edit — graphical or hand-typed — writes the tree's per-tree `.md` file (`vault/.hiker/trees/<tree-id>.md`, owned by `core::trees`) through the op-log granular user-save path; there's no parallel on-disk store. Closing and reopening the editor resumes where you left off; the draft survives app restarts. Discard-draft is an explicit button. [cluster-editor-draft-persistence]
-- **Building a tree (or reclustering a subtree) happens in a clustering review tab, not a modal.** "New tree" and "Recluster subtree…" both open a `cluster-review` app-page tab. The sidebar's Cluster trees mode exposes a single "New tree" button as the entry point — algorithm choice (including `From folders` as one of the algorithm options) happens inside the tab, not via per-algorithm buttons. The tab carries three stacked sections: a configuration panel (lifecycle / scope / algorithm / naming + an Advanced disclosure grouped by engine stage), a Run button that kicks off the structural clustering pass on a background task with live progress + incremental cluster reveal, and a review panel that renders the resulting tree as either an expandable hierarchical list or a graph (the user toggles). The user can adjust params and re-run as many times as wanted before committing. A single Confirm action persists the structural tree as a `draft` `.md` file with placeholder names and flips the tab to the cluster editor pane. Naming applies at Confirm via the review tab's 3-way Naming control — Deterministic (default, on-device) / LLM / None — and can also be (re)run later from the cluster editor pane. Nothing about the structural result is written to disk until Confirm. [cluster-review-tab]
-- **Apply and Save-as-triage are separate actions.** Apply walks the current tree state and emits one pending op per leaf whose resolved policy is `Tag` or `Move` (`surface = "cluster-editor"`, `metadata.tree_id`); the user then bulk-reviews via the tree-scoped batch-review pane (see below). Save-as-triage persists the tree with its policies as the active triage classifier (replaces any prior saved tree); does *not* enqueue staging rows itself — triage emits them as matches fire over time. A user can both apply and save-as-triage from the same tree if both make sense. [cluster-editor-apply-action, cluster-editor-save-as-triage]
-- **Batch review for one-shot Apply.** Apply opens a tree-scoped review pane that lists every staging row produced by this Apply pass — Accept-all, per-row Accept/Reject, inline edits to target folder / tag slug, all in one surface. The same rows are also visible from the activity-detail Pending filter; the in-pane view is the convenience surface for one-shot users who don't want to leave the cluster editor. The tree's `state` flips to `applied` once every row is resolved (accepted or rejected). [cluster-editor-batch-review-pane]
+Orientation: a tree lives in the left sidebar's Clusters panel and can Expand into a full center pane for graphical work; multiple trees stay open at once; the document is a visible per-tree `.md` whose outline body is the canonical structure (`core::trees`, op-log substrate). The user reshapes at every level (move/merge/split/rename/drop/promote), attaches `Tag`/`Move`/`Freeze` automation policies at any level, and either Applies one-shot or Saves-as-triage. Building a tree happens in a `cluster-review` tab, not a modal. The sections below own the detail.
 
 
-## Sidebar mode switcher
+## Sidebar placement
 
-> **Superseded (UI).** The dedicated three-button Files / Cluster-trees / Trails switcher row described in this section has been replaced by the egui-workbench activity-bar + multi-region sidebar (see `sidebar-mode-switcher` in `status.md`): each surface (Files / Clusters / Trails / Trash / Vault) is now an independent dockable panel reached from the activity bar, not a mode of one switcher row, and the arrangement persists via the workbench panel set rather than `vault.sidebar_mode`. The cluster-trees panel *body* described below still applies as the Clusters panel.
+Clusters is an independent activity-bar sidebar panel (alongside Files / Trails / Trash / Vault); the arrangement persists via the workbench panel set, not a `vault.sidebar_mode` switcher (`sidebar-mode-switcher` in `status.md`). The sidebar's collapse toggle (`sidebar-toggle-icon`) hides the whole sidebar. The panel body is described below.
 
-The left sidebar's top region grows a mode switcher row, sitting between the vault bar (Open vault / Home / Settings — at the top of the app, per `editor.md`) and the existing `+ New note` row. Three modes (initially):
+## Cluster trees panel (sidebar)
 
-- **Files** (default) — file tree with the new-note button in the panel header. (Trash is its own activity-bar panel now, per `feature-trash-panel` — not pinned here.)
-- **Cluster trees** — the cluster editor with its own header (tree-name selector, "New tree from current vault" action).
-- **Trails** — reserved slot, not implemented in v1. The switcher offers it as a greyed entry once trails land.
-
-The switcher lives in the sidebar's top row alongside the persistent `+` (new note) and `⋯` (mode-aware actions) buttons — see `editor.md` for the full row layout. Three icon-buttons on the left (file-tree glyph / cluster-tree glyph / trail glyph), pressed-state on the active mode. Switching modes is purely a sidebar-content swap — the editor pane on the right is unaffected, the active buffer stays loaded, the discovery panel keeps its state. Mode is persisted per-vault under `vault.sidebar_mode` via the existing `set_setting` plumbing. [sidebar-mode-switcher, sidebar-mode-persistence]
-
-A small detail: the sidebar's collapse toggle (`sidebar-toggle-icon`) keeps its existing behavior — it hides the whole sidebar regardless of mode. Modes don't have their own collapse states; they share the sidebar's one.
-
-## Cluster trees mode (sidebar)
-
-Sidebar body when the mode is Cluster trees. Header carries the mode-specific actions; body lists the open trees with their tree contents nested.
+Sidebar body when the mode is Cluster trees. Header carries the mode-specific actions; body lists the open trees with their tree contents nested. Multiple trees stay open at once — typically the saved triage tree (always present once saved) plus zero-or-more ephemeral one-shot trees, each expanding inline to its node hierarchy with a name + state pill (`draft` / `applied` / `saved as triage`); switching between trees is just expanding a different one, no modal context-swap. [cluster-editor-multiple-trees-open]
 
 ```
 ┌─ Sidebar ─────────────────────────────────┐
-│ [Files] [Trees]* [Trails (soon)]          │  ← mode switcher
-├───────────────────────────────────────────┤
-│ Cluster trees                       [...] │  ← mode-specific header
+│ Cluster trees                       [...] │  ← panel header
 │   [+ Suggest reorganization]              │  ← primary action
 │                                           │
 │ ▼ 2026-05-08 reorg          draft  [⤢]   │  ← tree row, Expand button
@@ -57,7 +35,8 @@ The `[⤢]` icon on each tree's row is the Expand button — flips that tree int
 
 Header actions:
 
-- **New tree** — the primary affordance. Opens a `cluster-review` app-page tab where the user configures scope/method/params, runs the structural clustering pass, reviews the result, and confirms (firing the LLM naming pass and persisting the tree as `draft`). This is the entry point for building a tree from the vault; the cluster editor is the review surface. Lifecycle (**Sapling** / **Evergreen**) is one of the form fields — a hint that sets the post-confirm default action, not a hard mode. Full detail in the "Clustering review tab" section below. [cluster-editor-new-tree-action, cluster-editor-sapling-evergreen-lifecycle]
+- **New tree** — the primary affordance, the Clusters accordion-header `+` split-button (the shared `split-add-button`). The primary `+` opens a `cluster-review` app-page tab with default params; the caret dropdown lists tree-creation presets that prefill the tab. There, the user configures scope/method/params, runs the structural clustering pass, reviews the result, and confirms (firing the LLM naming pass and persisting the tree as `draft`). The cluster editor is the review surface. Lifecycle (**Sapling** / **Evergreen**) is one of the form fields — a hint that sets the post-confirm default action, not a hard mode. Full detail in the "Clustering review tab" section below. [cluster-editor-new-tree-action, cluster-editor-sapling-evergreen-lifecycle]
+- **Tree-creation presets.** A preset is a reusable set of tree-creation params (algorithm, source-type filter, post-confirm LLM-naming toggle) — the review form's config minus the per-tree name. Built-in presets (e.g. Leiden / HDBSCAN / From folders) are virtual (in-code) and always appear. A user preset is an **ordinary vault note** carrying `hiker.kind: cluster-preset` frontmatter (the params in a `cluster_preset` block); the `+` dropdown finds them through the store's frontmatter query (`store-note-query`), so a note the user hand-typed or imported with that frontmatter is a preset exactly like one hiker saved — nothing lives under `.hiker/`, per `subsystem-notes-visible`. "Save preset" in the review tab writes such a note (default location `cluster-presets/<slug>.md`; the user can move it anywhere — discovery is by frontmatter, not path). The caret lists built-ins first, then user presets. [cluster-preset, cluster-preset-defaults, cluster-preset-save]
 - **`…` menu** — mode-specific overflow: "Open saved triage tree" (no-op when already open), "Import tree from file" (load a `cluster-tree.json` from elsewhere — useful for sharing trees), "Discard all drafts," "Tree settings" (per-node policy defaults, etc.). [cluster-editor-mode-menu]
 
 Each tree's body is a hierarchical list, one row per cluster or leaf note. Cluster rows are collapsible (chevron at left); leaf-note rows are clickable to open the note in the editor pane on the right. Multi-select works via Shift/Cmd-click on rows; selection survives expand/collapse so a bulk merge across collapsed sections is still possible.
@@ -81,7 +60,7 @@ Outliers render as a special virtual node at the bottom of every tree level — 
 
 ## Expanded mode (center pane)
 
-Clicking the Expand button on a tree row sends that tree to the center pane, replacing the editor. This is the surface tuned for heavy graphical reshaping — wider rows, larger drag targets, multi-pane "before/after" preview, more screen real estate for visualizing N-level trees.
+Clicking the Expand button on a tree row sends that tree to the center pane, replacing the editor (mirrors `chat-panel-expand-to-editor`). This is the surface tuned for heavy graphical reshaping — wider rows, larger drag targets, multi-pane "before/after" preview, more screen real estate for visualizing N-level trees. [cluster-editor-sidebar-mode, cluster-editor-pane-expand]
 
 The expanded mode is a new editor-pane sub-mode, joining the existing list (editor / vault-home-overview / vault-home-detail / settings / chat-expanded). The sidebar's cluster trees mode keeps showing the same tree (in its docked form) so the user can switch back by collapsing the expanded view. [cluster-editor-pane-mode]
 
@@ -114,15 +93,17 @@ Behavior:
 - **Full row UX parity with the sidebar.** The shared row primitive (`cluster-editor-row-primitive`) gives the pane the same chevron / click-to-edit name + summary / right-click context menu / policy chip popover / staleness badge / multi-select behavior as the sidebar. Right-click verbs are identical: cluster rows expose Move to… / Split / Subcluster… / Merge children up / Drop cluster; leaf rows expose Move to… / Promote out of outliers… (under the outlier bucket) / Send to outliers; the outlier bucket exposes Move to… / Drop cluster.
 - **Multi-select via Shift/Cmd-click** picks rows across levels (selecting a cluster includes its subtree implicitly for purposes of the bulk-action toolbar). The multi-select toolbar surfaces in the pane header alongside the existing Apply / Save-as-triage cluster when `selection.size > 0`, with verbs Merge siblings / Drop / Stage move to… / Stage tag with… / Clear. Pane-local selection state also survives queue-event refreshes.
 - **Markdown view toggle** in the toolbar flips the pane between the graphical tree and an editable markdown view over the same document — the outline body the tree carries on disk — mirroring the board view's `View as: Board / Markdown` (`board-view-toggle`). Editing the markdown edits the tree: structural edits parse back through the parse tiers, and switching to the graphical view re-renders from the now-current body. The same document also opens as a full editor tab for side-by-side work (`tree-edit-via-tabs`). [cluster-editor-markdown-view-toggle]
-- **Apply / Save as triage / Discard draft** are toolbar buttons. Apply emits staging rows for every leaf with a `Tag` or `Move` policy and opens the batch-review pane (see below); Save as triage persists the tree as the triage classifier; Discard draft confirms then deletes the tree's `.md` file.
+- **Apply / Save as triage / Discard draft** are toolbar buttons. Apply emits staging rows for every leaf with a `Tag` or `Move` policy and opens the batch-review pane (see below); Save as triage persists the tree (and its policies) as the active triage classifier, replacing any prior saved tree — it does *not* enqueue staging rows itself, triage emits them as matches fire over time; Discard draft confirms then deletes the tree's `.md` file. A user can both Apply and Save-as-triage from the same tree if both make sense. [cluster-editor-save-as-triage]
 - **Regenerate names** runs the cluster naming/summarization prompt for any cluster whose name is still a `Cluster N` placeholder. Each regeneration is one task in `core::tasks` (per `task-queue.md`); the user can watch progress in the queue widget. Regenerating an already-named cluster requires per-node explicit "Regenerate this node" from its row menu. Tasks are submitted **bottom-up**: nodes are grouped by depth, and each depth's `RaptorSummarize` batch is awaited before the next shallower batch — so a parent summarizes over its children's real names, not placeholders (each worker reads its children's current `name`/`summary` at execution time). [cluster-editor-regenerate-via-task-queue]
 
 
 ## Tree storage: per-tree `.md` files
 
-Cluster trees live as per-tree markdown documents at `vault/.hiker/trees/<tree-id>.md`, owned by `core::trees` (sibling to `core::store`'s `index.db` and `core::oplog`). Each tree is one `.md` file whose **body is the canonical structure** — a nested outline of clusters and note references a human reads, edits, and copy-pastes directly. Frontmatter holds only tree-level metadata (`hiker.kind: cluster-tree`, id, name, lifecycle, scope, method); it does not hold the node hierarchy. Trees ride the op-log substrate like any other markdown document (per `op-log.md`) — they sync, carry version history, and every edit is a CRDT op. [trees-md-store]
+Cluster trees live as per-tree markdown documents at a visible vault path — `{new_cluster_tree_dir}/<tree-id>.md` (the `[clustering] new_cluster_tree_dir` key, default `cluster-trees/`) — owned by `core::trees` (sibling to `core::store`'s `index.db` and `core::oplog`). Each tree is one `.md` file whose **body is the canonical structure** — a nested outline of clusters and note references a human reads, edits, and copy-pastes directly. Frontmatter holds only tree-level metadata (`hiker.kind: cluster-tree`, id, name, lifecycle, scope, method); it does not hold the node hierarchy. Trees ride the op-log substrate like any other markdown document (per `op-log.md`) — they sync, carry version history, and every edit is a CRDT op. [trees-md-store]
 
-The `.hiker/trees/` directory is carved out of the watcher's `.hiker/`-ignore rule (same shape as the `.hiker/trails/` and `.hiker/sessions/` carve-outs) so tree docs route to the indexer and the op-log like any other md file; `core::trees` owns watcher suppression around its own writes. Module discipline mirrors `core::trails`: pure Rust types out of the module, the on-disk markdown shape (the outline grammar plus metadata frontmatter) never leaks past the boundary. No schema-version file, no migration code — the document is self-describing, and unknown frontmatter keys are preserved on round-trip. [trees-module-discipline]
+A tree is user-created content, so by `subsystem-notes-visible` it lives at a real, browsable vault path and is discovered through its `hiker.kind: cluster-tree` frontmatter (`store-note-query`) — not under `.hiker/`, and not by any directory glob. A tree the user moved, renamed, hand-typed, or imported with that frontmatter is found exactly like one hiker authored; the filename is incidental (the tree id is carried in `hiker.id`, the path is decoupled from the id). The configured directory is only the *default placement* for newly-created trees. [cluster-tree-visible-note]
+
+Because the tree path is now a visible note, `core::trees` follows the same write discipline as trail-docs: each save suppresses the watcher around the op-log atomic write and enqueues an explicit indexer `Upsert`, so the tree is queryable immediately without a redundant external-edit reconcile. Module discipline mirrors `core::trails`: pure Rust types out of the module, the on-disk markdown shape (the outline grammar plus metadata frontmatter) never leaks past the boundary. No schema-version file — the document is self-describing, and unknown frontmatter keys are preserved on round-trip. A one-time migration relocates legacy `.hiker/trees/<id>.md` files to the visible default on first open (`cluster-tree-migration`). [trees-module-discipline]
 
 ### Document shape
 
@@ -195,6 +176,8 @@ Structure lives in the body, so a structural edit is a localized **body** edit �
 
 The build pass writes the initial outline when a new tree is created — there is no separate "build snapshot vs editable draft" distinction; every cluster and leaf is editable from the moment it lands. [cluster-editor-edit-history]
 
+Every edit — graphical or hand-typed — auto-saves to the tree's `.md` through this path; there is no parallel on-disk store. Closing and reopening the editor resumes where the user left off and the draft survives app restarts; Discard-draft is an explicit button. [cluster-editor-draft-persistence]
+
 **Undo / redo.** The cluster editor keeps an in-memory session undo stack; each undo applies the reverse edit through the working layer. Cross-session "revert to an earlier state" rides the tree doc's normal version history — the same snapshot machinery every note has — not a bespoke per-tree log. [cluster-editor-undo-redo]
 
 Discard-draft on a tree whose `source = 'one-shot'` deletes the tree's `.md` file through `core::ops::delete` (so it lands in trash and is restorable like any note). Discard on a saved-triage tree is "Unsave as triage" — flips `state` back to `draft` and (optionally) deletes; the user is asked which. [cluster-editor-discard-draft]
@@ -206,24 +189,24 @@ struct EditableNode {
     id: NodeId,                       // ephemeral parse-time handle; never persisted
     parent: Option<NodeId>,
     kind: NodeKind,                   // Cluster | Leaf | OutlierBucket
-    note_path: Option<VaultRel>,      // present on leaves; the wikilink target (resolved via the index)
-    name: String,                     // user-editable (clusters only)
-    summary: String,                  // user-editable (clusters only)
+    note_path: Option<VaultRel>,      // leaves only; the wikilink target, resolved via the index
+    name: String,                     // clusters only; user-editable
+    summary: String,                  // clusters only; user-editable
     policy: Option<NodePolicy>,       // parsed from the heading's inline attribute
     confidence: f32,                  // from build pass; preserved through edits
     summary_membership_churn: u32,    // per cluster-summary-staleness-counter
-    // centroid is loaded from index.db's cluster_centroids (keyed by cluster path)
-    // when the placement classifier needs it, not carried on the node.
 }
 
 enum NodePolicy {
-    Tag  { slug: String,      require_review: bool },
-    Move { folder: VaultRel,  require_review: bool },
-    Freeze,                                        // never propose changes for matches under this node
+    Tag  { slug: String,     require_review: bool },
+    Move { folder: VaultRel, require_review: bool },
+    Freeze,                           // never propose changes for matches under this node
 }
 
 enum NodeKind { Cluster, Leaf, OutlierBucket }
 ```
+
+Centroids are not carried on the node — they load from `index.db`'s `cluster_centroids` (keyed by cluster path) only when the placement classifier needs them.
 
 Names carry no hidden `user_edited` flag: the body is the truth, so a name is whatever the heading says. Regeneration (`cluster-editor-regenerate-via-task-queue`) targets only clusters whose name still matches the `Cluster N` placeholder pattern, leaving any human- or LLM-given name alone. [cluster-editor-tree-shape]
 
@@ -247,7 +230,7 @@ A note appears once per cluster by default — clustering produces a strict part
 
 ## Clustering review tab
 
-Building a new tree and reclustering a subtree both go through a `cluster-review` app-page tab. The tab is the configuration surface, the runner, and the structural-result reviewer; only once the user confirms does the LLM pass fire and the tree land on disk as a `.md` file. Entry points: the sidebar's `+ Suggest reorganization` / `+` button (`cluster-editor-new-tree-action`) opens a fresh tab; the row-menu's "Recluster subtree…" entry on a cluster row (`cluster-editor-recluster-subtree`) opens a tab pre-bound to that `(tree_id, node_id)`; the mode menu's "Rebuild" entry on an Evergreen tree opens a tab prefilled with the tree's saved scope/method/params. [cluster-review-tab-from-new-tree-action, cluster-review-tab-from-recluster-action, cluster-review-tab-rebuild-prefill]
+Building a new tree and reclustering a subtree both go through a `cluster-review` app-page tab, not a modal. The tab is the configuration surface, the runner, and the structural-result reviewer; nothing about the structural result is written to disk until a single Confirm action persists it as a `draft` `.md` with placeholder names and flips the tab to the cluster editor pane. [cluster-review-tab] Entry points: the Clusters accordion-header `+` split-button (`cluster-editor-new-tree-action`) opens a fresh tab — its primary click with default params, its caret-dropdown presets prefilling the form (`cluster-preset`); the row-menu's "Recluster subtree…" entry on a cluster row (`cluster-editor-recluster-subtree`) opens a tab pre-bound to that `(tree_id, node_id)`; the mode menu's "Rebuild" entry on an Evergreen tree opens a tab prefilled with the tree's saved scope/method/params. [cluster-review-tab-from-new-tree-action, cluster-review-tab-from-recluster-action, cluster-review-tab-rebuild-prefill]
 
 ### Tab kind
 
@@ -303,7 +286,7 @@ Always-visible at the top of the tab. Default-expanded; collapses to a one-line 
 
 ### Recursion mode
 
-The **Recursion** group (Advanced, when `Method == Cluster`) sets `ClusterParams.recursion` to one of three modes (`cluster-recursion-modes`): **Flat** (default — `build_cluster_tree` returns after the single top-level partition: a flat tree of leaf clusters plus the outlier bucket), **Manual** (same flat build; the user then deepens specific clusters with the row-menu Split verb), or **Auto** (the build recurses every branch until `max_depth` / `leaf_min_size` / `leaf_cohesion_threshold` trips). Flat is the default because a legible single level the user deepens deliberately beats an opaque pre-built hierarchy. The mode persists in the tree's `method` frontmatter, so it's recoverable from a saved tree. [cluster-review-tab-recursion-mode]
+The **Recursion** group (Advanced, when `Method == Cluster`) sets `ClusterParams.recursion` to one of three modes (`cluster-recursion-modes`): **Flat** (default — `build_cluster_tree` returns after the single top-level partition: leaf clusters plus the outlier bucket), **Manual** (same flat build; the user deepens specific clusters with the row-menu Split verb), or **Auto** (recurses every branch until `max_depth` / `leaf_min_size` / `leaf_cohesion_threshold` trips). Flat is default — a legible single level the user deepens deliberately beats an opaque pre-built hierarchy. The mode persists in the tree's `method` frontmatter. [cluster-review-tab-recursion-mode]
 
 ### Run clustering
 
@@ -364,7 +347,7 @@ Opening "Suggest reorganization" with a `cluster-review` tab already open for th
 
 ## Operations
 
-All operations are local edits to the tree's outline body, committed through the op-log granular user-save path (the semantic op name rides the op `metadata`). None of them mutate the vault — only Apply or a staging-row accept does that.
+All operations are local edits to the tree's outline body, committed through the op-log granular user-save path (the semantic op name rides the op `metadata`). None of them mutate the vault — only Apply or a staging-row accept does that. Every edit is undoable until apply. [cluster-editor-node-operations]
 
 - **Move note between clusters.** Drag a leaf onto a different cluster row (or use the row menu's "Move to…"). Updates the leaf's `parent`. Centroids of source and target clusters are recomputed. [cluster-editor-move-note-between-clusters]
 - **Merge sibling clusters.** Multi-select 2+ clusters at the same level → toolbar "Merge siblings" → creates one cluster whose members are the union, name and summary are auto-regenerated (queues a task in `core::tasks` for naming) unless the user names it explicitly first. [cluster-editor-merge-siblings]
@@ -438,7 +421,7 @@ Two consequences of reclustering a subtree are load-bearing enough to call out:
 
 ## Per-node automation policy
 
-Policies attach at any level — including the outlier bucket. A note's effective policy at triage time is determined by walking from the note's leaf up the tree, taking the first ancestor with an explicit policy. No policy anywhere = no automation, the note is left alone (matches the existing "low confidence" tier behavior). [cluster-editor-policy-resolution-walk-up]
+A policy can attach to a leaf, a mid-tree cluster, the root, or the outlier bucket — a saved tree is a *policy program*, not a single classifier with a knob. A note's effective policy at triage time is determined by walking from the note's leaf up the tree, taking the first ancestor with an explicit policy. No policy anywhere = no automation, the note is left alone (matches the existing "low confidence" tier behavior). [cluster-editor-policy-any-level, cluster-editor-policy-resolution-walk-up]
 
 The outlier bucket gets its own policy slot for the canonical "send unsorted notes to `inbox/unsorted/`" or "tag them `unsorted`" flow. Setting a `Move` or `Tag` policy on the outlier bucket applies that policy to every note the placement classifier labels as outlier — no walk-up needed because outliers don't have a parent in the cluster sense. `Freeze` on the outlier bucket is a valid choice for "leave outliers in inbox; I'll triage them by hand." [cluster-editor-outlier-policy]
 
@@ -466,7 +449,7 @@ When a tree is in `saved as triage` state and the user has any policy set on any
 
 All four pathways submit through `core::tasks`, which routes to whatever worker is configured. The user watches progress in the queue widget; a per-policy task naturally inherits the queue's cancel + audit machinery. [cluster-editor-triage-via-task-queue]
 
-Triage outputs flow through the op log rather than mutating the vault directly. Each match produces one row with `surface = "triage"`, `metadata.tree_id`, `metadata.matched_node_id`, `metadata.confidence`, and an `action` derived from the resolved policy: `auto-move` → `move_note`, `auto-tag` → `apply_tag`, `review` → the same `move_note` / `apply_tag` row marked for explicit user review. Whether the row auto-accepts or waits for the user is gated by `[triage].review_required` (default `true`) and the policy type: `auto-*` policies auto-accept only when the flag is off; a `review` policy always waits for explicit user accept. The accept path reuses `suggestions-apply-cmd` (the same `move_note(from, to)` and frontmatter-tag-write code that drives one-shot Apply): `apply_tag` rows write to the configured `[suggestions] tag_field` on the target note's frontmatter. [cluster-editor-triage-via-staging]
+Triage outputs flow through the op log rather than mutating the vault directly. Each match produces one row with `surface = "triage"`, `metadata.tree_id`, `metadata.matched_node_id`, `metadata.confidence`, and an `action` derived from the resolved policy: `auto-move` → `move_note`, `auto-tag` → `apply_tag`, `review` → the same row marked for explicit user review. Auto-accept-vs-pending follows the `require_review` × global-flag rule above. The accept path reuses `suggestions-apply-cmd` (the same `move_note(from, to)` and frontmatter-tag-write code that drives one-shot Apply): `apply_tag` rows write to the configured `[suggestions] tag_field` on the target note's frontmatter. [cluster-editor-triage-via-staging]
 
 ### `[triage]` config
 
@@ -474,18 +457,12 @@ Triage-level behavior. All keys are eligible for user and vault scope; vault win
 
 ```toml
 [triage]
-review_required = true       # every triage match stays pending until accepted; auto-apply is the per-tree opt-in once trusted
-scope = "inbox/"             # source-folder safety boundary (also drives the on-save trigger folder)
-scheduled_rerun = ""         # cron-shape; empty disables
+review_required = true       # bool; global "force review on every match" (see above); when false, auto-* matches auto-accept on insert, review-policy matches still wait
+scope = "inbox/"             # string; source-folder safety boundary — triage never moves a note whose source_path is outside it; also the on-save trigger folder
+scheduled_rerun = ""         # string; cron-shape, empty disables (cluster-editor-triage-scheduled-rerun)
 ```
 
-| Key | Type | Default | Scope | Behavior |
-| --- | ---- | ------- | ----- | -------- |
-| `review_required` | bool | `true` | user + vault | When `true` (default), every triage match stays pending in the op log until the user accepts — auto-apply is the per-tree opt-in once a classifier is trusted. When `false`, `auto-move` / `auto-tag` matches auto-accept on insert; `review`-policy matches always require user accept. Live-applied. [triage-review-required] |
-| `scope` | string | `"inbox/"` | user + vault | Source-folder safety boundary for triage moves (the guardrail above). Triage never produces a `move_note` row whose `source_path` is outside this folder. Also the on-save trigger folder. |
-| `scheduled_rerun` | string | `""` | user + vault | Cron-shape; empty disables. Per `cluster-editor-triage-scheduled-rerun`. |
-
-Strict-load schema coverage per `settings-strict-load`. The settings UI grows matching rows under a "Triage" subsection; live-applied (no restart).
+All keys are user + vault scope (vault wins), live-applied, strict-load schema coverage per `settings-strict-load`; the settings UI grows matching rows under a "Triage" subsection. [triage-review-required]
 
 
 ## Batch-review pane (one-shot Apply)
@@ -540,24 +517,7 @@ Already-named (non-placeholder) clusters are skipped by all three — regenerati
 
 ## Graph view for policy assignment
 
-Third view variant, alongside the sidebar mode and the row-shaped expanded mode. Renders the tree as a node-link graph using the project's committed graph renderer (the egui force-graph widget, per `design.md`'s graph-view bullet) — tuned for "see the whole tree at a glance, assign policies by clicking nodes, watch the colors light up." [cluster-editor-graph-view]
-
-```
-┌─ Cluster editor: 2026-05-08 reorg  [Graph view]  ──────────────────┐
-│ [Apply] [Save as triage] [Tree view] [Markdown view] [✕]            │
-│                                                                      │
-│         ●─── Research (24)                                           │
-│        ╱│╲                                                           │
-│       ● ● ●  Embeddings   Vector DBs   LLM agents                    │
-│       │   │ │                                                        │
-│       ● ● ●                                                          │
-│         ●─── Projects (15)                                           │
-│         │                                                            │
-│         ●  Dishwasher                                                │
-│                                                                      │
-│  Legend: ● Move   ● Tag   ● Freeze   ○ no policy   ⏸ require review │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Third view variant, alongside the sidebar mode and the row-shaped expanded mode. Renders the tree as a node-link graph using the project's committed graph renderer (the egui force-graph widget, per `design.md`'s graph-view bullet) — tuned for "see the whole tree at a glance, assign policies by clicking nodes, watch the colors light up." Legend: `●` Move / `●` Tag / `●` Freeze / `○` no policy / `⏸` require review. [cluster-editor-graph-view]
 
 When to use the graph view vs. the row-shaped expanded view: row view is the working surface for textual operations (read summaries, rename clusters, drag-drop into clusters, multi-select stage actions). Graph view is the working surface for *overview and policy assignment* — the spatial layout makes the tree structure legible at a glance, and color-by-policy turns "did I assign moves to everything that needs it" into a visual scan instead of a row-by-row walk.
 
@@ -581,7 +541,7 @@ Behavior: [cluster-editor-graph-view-behavior]
 
 ### View menu
 
-A single eye-icon button lives on the **pane's pinned toolbar**, always visible — same eye icon the editor's view-options menu uses (`editor.md` → `## View options menu`). Clicking it opens a unified "View options" popover that carries: (a) a **View as** radio (Tree / Graph / Markdown) that replaces the prior 3-button toggle strip in the toolbar; (b) in tree mode, **Expand all** / **Collapse all** verbs that mutate the pane-local `expanded: Set<NodeId>` (per `cluster-editor-row-primitive`) so the whole tree opens or closes in one click; (c) in graph mode, the graph-specific switches (leaves visibility / layout / show outliers / fit / reset / note-preview toggle). The menu refreshes in place when the view-mode radio changes; switching the View-as mode swaps just the pane body and leaves the toolbar intact. In the egui immediate-mode UI the menu is rebuilt each frame, so there's no mounted-popover lifecycle to manage — the eye button is a stable anchor and the menu's items always reflect the current view mode. Consolidating both into one menu keeps the pinned toolbar tidy and gives the cluster pane a single "view" affordance instead of two separate ones. Choices: [cluster-editor-graph-view-view-menu]
+A single eye-icon button lives on the **pane's pinned toolbar**, always visible — same eye icon the editor's view-options menu uses (`editor.md` → `## View options menu`). Clicking it opens a unified "View options" popover that carries: (a) a **View as** radio (Tree / Graph / Markdown — three peer rendering modes of the same tree, `cluster-editor-graph-view-toggle`) that replaces the prior 3-button toggle strip in the toolbar; (b) in tree mode, **Expand all** / **Collapse all** verbs that mutate the pane-local `expanded: Set<NodeId>` (per `cluster-editor-row-primitive`) so the whole tree opens or closes in one click; (c) in graph mode, the graph-specific switches (leaves visibility / layout / show outliers / fit / reset / note-preview toggle). The menu refreshes in place when the view-mode radio changes; switching the View-as mode swaps just the pane body, leaves the toolbar intact, and preserves the current selection (multi-selecting in row view then toggling to graph shows those nodes highlighted). In the egui immediate-mode UI the menu is rebuilt each frame, so there's no mounted-popover lifecycle to manage — the eye button is a stable anchor and the menu's items always reflect the current view mode. Choices: [cluster-editor-graph-view-view-menu]
 
 - **Leaf visibility.** Three modes: `Hide leaves` (only cluster nodes render), `Auto (LOD)` (leaves hidden when zoomed out below a threshold, fade in as the user zooms in — default), `Show all leaves` (every leaf node is always present in the canvas). [cluster-editor-graph-view-leaf-visibility]
 - **Layout.** Radio: `Radial (default)` / `Vertical tree` / `Horizontal tree` / `Force-directed`. Switching re-runs the chosen layout and animates nodes to their new positions. [cluster-editor-graph-view-layout]
@@ -592,15 +552,9 @@ View-menu choices are per-tree saved view state (persisted in the tree doc's fro
 
 ### Outlier rendering in the graph
 
-The outlier bucket renders as a **separate disconnected node**, floating off to the side of the main tree (default: lower-right corner of the canvas). It carries the same "Outliers (N)" label as the row view's virtual node. Its policy chip works identically to any other node's — clicking it opens the policy editor; setting a `Move` or `Tag` policy on it applies that policy to every member note classified as outlier by the placement classifier. [cluster-editor-graph-view-outlier-disconnected]
-
-Setting an outlier policy is the canonical pattern for "send unsorted notes to `inbox/unsorted/`" or "tag them `unsorted`" — instead of leaving outliers to rot in the inbox, the user makes the policy explicit. [cluster-editor-outlier-policy]
+The outlier bucket renders as a **separate disconnected node**, floating off to the side of the main tree (default: lower-right corner of the canvas). It carries the same "Outliers (N)" label as the row view's virtual node. Its policy chip works identically to any other node's (the canonical outlier-policy flow, per `cluster-editor-outlier-policy`). [cluster-editor-graph-view-outlier-disconnected]
 
 The build-time `include_outliers = false` option (per `cluster-review-tab-config-section`) suppresses the outlier bucket entirely — notes that would have been outliers get force-routed into their nearest cluster instead. The view-menu's `Show outliers` toggle only hides the rendered node, not the underlying data; both can be set independently.
-
-### View switching
-
-A toggle in the toolbar of the expanded pane flips between tree (row) view, graph view, and markdown view — three peer rendering modes of the same tree. The user's current selection survives the switch (so multi-selecting in row view and toggling to graph view shows those nodes highlighted in the graph). [cluster-editor-graph-view-toggle]
 
 ### Renderer integration
 
@@ -643,7 +597,7 @@ The cluster editor *does* reuse the **graph renderer** (the egui force-graph wid
 
 ## Forward refs
 
-- `core::trees` — owner of the per-tree `.md` files under `vault/.hiker/trees/`; (de)serializes the `hiker.nodes` frontmatter and commits edits through the op-log. Same module-discipline pattern as `core::trails` — plain Rust types out, the on-disk YAML shape never leaks.
+- `core::trees` — owner of the per-tree `.md` files at the visible `new_cluster_tree_dir` (default `cluster-trees/`); (de)serializes the `hiker.nodes` frontmatter and commits edits through the op-log. Same module-discipline pattern as `core::trails` — plain Rust types out, the on-disk YAML shape never leaks.
 - `core::cluster_editor` — the implementation home of the UI-facing editor operations; sibling to `core::cluster` / `core::suggest` / `core::trees`. Consumes `core::cluster::build_tree`, applies edits through `core::trees`, emits one-off pending ops via `core::ops` for the multi-select Stage move/tag verbs.
 - `core::tasks` — every LLM-driven action in this surface (initial naming, regeneration, merge/split renaming) submits there.
 - `editor.md` — sidebar mode switcher lives in the editor's domain; this spec defines the cluster-trees mode body, the editor.md mode-switcher entry is owned there.

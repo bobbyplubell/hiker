@@ -2,18 +2,23 @@
 //! user's decision. A fork must not be auto-merged (the reason
 //! `op-log-merge-conflict` exists), so this module owns the keep-mine /
 //! keep-theirs / keep-both branch table and the conflict-copy naming for both
-//! the keep-both path and the concurrent-rename-collision case.
+//! the keep-both path and the concurrent-rename-collision case. A
+//! concurrent-rename collision is likewise never auto-resolved: it BLOCKS for
+//! the same Keep mine / theirs / both verbs. [sync-concurrent-rename-not-merged]
 //!
 //! Pure `impl SyncNode` continuation; no items of its own. The lineage verbs
 //! it calls live in [`super::lineage`].
 
+use std::collections::HashSet;
+
 use libp2p::PeerId;
 
 use hiker_core::oplog::shapes::Author;
+use hiker_core::oplog::sync::SameRegion;
 
 use crate::enroll::Classification;
 use crate::identity::{LocalDocId, Resolution, SyncStatus};
-use crate::protocol::ManifestEntry;
+use crate::protocol::{ManifestEntry, Message};
 use crate::Error;
 
 use super::{SyncNode, SyncReport};
@@ -134,28 +139,19 @@ impl SyncNode {
             }
             Classification::Fork => {
                 // Concurrent-rename collision (`sync-concurrent-rename-not-merged`):
-                // a manifest entry classified Fork at a path where the peer's
-                // doc and our doc have completely different histories AND our
-                // local replica's accepted text is the empty string is the
-                // signature of "we got here by adopting the peer's renamed-to
-                // target while still holding another doc with its own content at
-                // the same path." When the peer's doc has a `prior_paths` and
-                // its current_hash does NOT match the empty hash, treat the
-                // local doc as the loser of an LWW-on-path collision and write
-                // it as a conflict-copy before adopting the peer's lineage at
-                // the original path. The path the peer is renaming TO wins;
-                // ours becomes `<stem>.conflict-<rand6>.<ext>`. The detection
-                // is the safe choice the brief calls out: only the resolver
-                // (this device) materializes a conflict-copy, so two peers each
-                // colliding on the same target only produce one loser.
+                // the peer's manifest entry has a `prior_paths` (it renamed a
+                // doc TO this path) and our local replica at the same path is a
+                // DIFFERENT doc with its own content. The two lineages are
+                // disjoint and both claim the path — this is a contended change,
+                // so per the spec it is NOT auto-resolved: BLOCK both for user
+                // resolution (Keep mine / Keep theirs / Keep both) rather than
+                // silently picking a winner. If the user already queued a
+                // decision on a prior round, `resolve_rename_collision` acts on
+                // it now instead of re-blocking. [sync-concurrent-rename-not-merged]
                 if self.detect_rename_collision(local, entry)? {
-                    self.write_conflict_copy(local, path)?;
-                    self.adopt_theirs_from_peer(peer_id, local, path).await?;
-                    self.mark_bound(path);
-                    self.clear_blocked(path);
-                    report.bound.push(path.to_string());
-                    report.converged.push(path.to_string());
-                    return Ok(());
+                    return self
+                        .resolve_rename_collision(peer_id, local, entry, report)
+                        .await;
                 }
                 // Otherwise: a content fork. If the user picked a resolution on
                 // a prior round, act on it now instead of re-blocking; otherwise
@@ -190,7 +186,7 @@ impl SyncNode {
                     .unwrap()
                     .insert(path.to_string(), SyncStatus::Blocked);
                 let peer = self.peer_fingerprint(&peer_id);
-                self.record_blocked(path, &peer);
+                self.record_blocked(path, "fork", &peer);
                 report.blocked.push((path.to_string(), "fork".to_string()));
             }
             Some(Resolution::KeepTheirs) => {
@@ -237,8 +233,556 @@ impl SyncNode {
                 report.bound.push(path.to_string());
                 report.converged.push(path.to_string());
             }
+            Some(Resolution::KeepDeleted) | Some(Resolution::KeepEdit) => {
+                // Delete-vs-edit verbs don't apply to a content fork; leave it
+                // blocked rather than guess a lineage outcome.
+                return Err(Error::Apply(format!(
+                    "delete-vs-edit resolution applied to a content fork at {path}"
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// Handle a detected concurrent-rename collision: two devices renamed
+    /// DIFFERENT documents onto the SAME path while disconnected. With no queued
+    /// decision (the default) this BLOCKS the doc (reason `"rename-collision"`)
+    /// and records it persistently for the UI — nothing is moved, copied, or
+    /// adopted until the user resolves. Once the user picks, each choice
+    /// converges BOTH devices in one round (the loser's doc lands at a
+    /// `conflict-`suffixed path; the winner keeps the contended path):
+    ///
+    /// - **Keep mine** — OUR doc keeps the path. We materialize the peer's doc
+    ///   as a `conflict-` sibling locally (so its content survives + streams to
+    ///   the peer as a fresh doc), then PUSH our base so the peer adopts our doc
+    ///   at the path (the peer's doc yields the path).
+    /// - **Keep theirs** — the PEER's doc wins the path. We move our doc aside
+    ///   to a `conflict-` sibling, then adopt the peer's lineage at the path.
+    ///   (This is the old silent auto-behavior, now user-chosen.)
+    /// - **Keep both** — both survive at distinct paths; the loser is picked
+    ///   DETERMINISTICALLY by device fingerprint (`min(fingerprint)` keeps the
+    ///   path) so both devices agree without negotiating. Dispatches to the
+    ///   keep-mine mechanic when we win the path, keep-theirs when the peer does.
+    ///
+    /// [sync-concurrent-rename-not-merged, sync-conflict-block-and-resolve]
+    // status: sync-concurrent-rename-not-merged
+    pub(super) async fn resolve_rename_collision(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        entry: &ManifestEntry,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        let path = entry.path.as_str();
+        let decision = self.resolutions.lock().unwrap().get(path).copied();
+        match decision {
+            None => {
+                // No decision. Before re-blocking, RE-EVALUATE: the collision may
+                // have CONVERGED out-of-band — resolved on the other device so the
+                // two formerly-disjoint lineages now share one at this path (our
+                // local replica adopted the peer's, or vice-versa). In real
+                // auto-sync BOTH devices are dialers and BOTH independently
+                // blocked the collision; once one side resolves and the lineages
+                // converge, this side's independent block is stale and must
+                // auto-clear rather than re-block forever. The collision is gone
+                // exactly when this path no longer classifies as a Fork against
+                // the peer (a shared content hash now exists) OR the structural
+                // collision predicate no longer holds. We clear ONLY when the
+                // contention is genuinely gone — a still-disjoint collision
+                // re-blocks. [sync-concurrent-rename-not-merged,
+                // sync-conflict-block-and-resolve]
+                let ours_current = self.current_hash(&local.0)?;
+                let ours_history = self.history_set(&local.0)?;
+                let theirs_history: HashSet<String> =
+                    entry.recent_history_hashes.iter().cloned().collect();
+                let class = crate::enroll::classify(
+                    &ours_current,
+                    &ours_history,
+                    &entry.current_hash,
+                    &theirs_history,
+                );
+                let still_colliding = matches!(class, Classification::Fork)
+                    && self.detect_rename_collision(local, entry)?;
+                if !still_colliding {
+                    // The collision resolved out-of-band: the lineages converged
+                    // at this path. Pull the (now clean) delta so our state vector
+                    // matches and drop the stale block.
+                    self.apply_delta_from_peer(peer_id, local, path).await?;
+                    self.clear_stale_block(path);
+                    report.bound.push(path.to_string());
+                    report.converged.push(path.to_string());
+                    return Ok(());
+                }
+                // Still a genuine collision and no decision: BLOCK the doc, stream
+                // nothing, hold everything in place (no move / copy / adopt), and
+                // record it persistently for the UI + attention badge.
+                // [sync-concurrent-rename-not-merged]
+                self.status
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_string(), SyncStatus::Blocked);
+                let peer = self.peer_fingerprint(&peer_id);
+                self.record_blocked(path, "rename-collision", &peer);
+                report
+                    .blocked
+                    .push((path.to_string(), "rename-collision".to_string()));
+                tracing::warn!(
+                    path = %path,
+                    "sync: rename collision — blocking for user resolution"
+                );
+            }
+            Some(Resolution::KeepMine) => {
+                self.rename_collision_keep_mine(peer_id, local, path, report)
+                    .await?;
+            }
+            Some(Resolution::KeepTheirs) => {
+                self.rename_collision_keep_theirs(peer_id, local, path, report)
+                    .await?;
+            }
+            Some(Resolution::KeepBoth) => {
+                // Deterministic winner so BOTH devices converge to the same
+                // assignment: the smaller fingerprint keeps the contended path,
+                // the larger takes the `conflict-` suffix. Routed to the same
+                // keep-mine / keep-theirs mechanics.
+                let peer_fp = self.peer_fingerprint(&peer_id).0;
+                let we_keep_path = self.fingerprint().0 < peer_fp;
+                if we_keep_path {
+                    self.rename_collision_keep_mine(peer_id, local, path, report)
+                        .await?;
+                } else {
+                    self.rename_collision_keep_theirs(peer_id, local, path, report)
+                        .await?;
+                }
+            }
+            Some(Resolution::KeepDeleted) | Some(Resolution::KeepEdit) => {
+                // Delete-vs-edit verbs don't apply to a rename collision; leave
+                // it blocked rather than guess an outcome.
+                return Err(Error::Apply(format!(
+                    "delete-vs-edit resolution applied to a rename collision at {path}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep-mine arm of a rename collision: OUR doc keeps the contended path.
+    /// The peer's doc yields, so we preserve its content as a `conflict-` sibling
+    /// (fetched over the open channel, written via the op-log create path so it
+    /// streams to the peer as a fresh doc) and PUSH our base so the peer adopts
+    /// our doc at the path. After this both sides share OUR lineage at the path
+    /// and the peer holds the `conflict-` copy. [sync-concurrent-rename-not-merged]
+    async fn rename_collision_keep_mine(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        path: &str,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        let (theirs, _) = self.fetch_peer_text(peer_id, path).await?;
+        self.write_conflict_copy_text(path, &theirs)?;
+        self.push_adopt_to_peer(peer_id, local, path).await?;
+        self.mark_bound(path);
+        self.clear_blocked(path);
+        report.bound.push(path.to_string());
+        report.converged.push(path.to_string());
+        Ok(())
+    }
+
+    /// Keep-theirs arm of a rename collision: the PEER's doc wins the contended
+    /// path. We move our doc aside to a `conflict-` sibling (its content survives
+    /// as a fresh local note) and adopt the peer's lineage in place at the path.
+    /// [sync-concurrent-rename-not-merged]
+    async fn rename_collision_keep_theirs(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        path: &str,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        self.write_conflict_copy(local, path)?;
+        self.adopt_theirs_from_peer(peer_id, local, path).await?;
+        self.mark_bound(path);
+        self.clear_blocked(path);
+        report.bound.push(path.to_string());
+        report.converged.push(path.to_string());
+        Ok(())
+    }
+
+    /// Steady-state delta apply for a BOUND doc, gated on a same-region
+    /// conflict check. Both sides share a lineage, so a Yrs merge of the peer's
+    /// delta would silently interleave concurrent edits — desired for DISJOINT
+    /// regions, garbling for the SAME region. Before applying, run the 3-way
+    /// span-overlap verdict; on an overlap, BLOCK (hold the delta, mark
+    /// `Blocked`/`same-region`) instead of folding it into `accepted`. Disjoint
+    /// edits and fast-forwards still auto-merge via the normal delta path.
+    ///
+    /// A doc already same-region-blocked from a prior round consults the user's
+    /// queued [`Resolution`] here and converges BOTH devices in one round:
+    /// - **KeepTheirs** — the peer's text wins the overlap;
+    /// - **KeepMine** — re-assert OUR text as a fresh op so it wins forward on
+    ///   the shared lineage and the peer converges to it;
+    /// - **KeepBoth** — the peer's text wins at the path, ours survives as a
+    ///   `conflict-` sibling note.
+    ///
+    /// Each first folds the peer's ops into our state vector (so the delta isn't
+    /// re-offered and re-blocked next round), then writes the decisive winner
+    /// text. [sync-conflict-detect-same-region, sync-conflict-block-and-resolve]
+    // status: sync-conflict-detect-same-region
+    pub(super) async fn sync_bound_doc(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        entry: &ManifestEntry,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        let path = entry.path.as_str();
+        // A queued resolution for an already-blocked doc acts now (converges +
+        // unblocks) instead of re-running the detection. Copy the decision out
+        // of the lock before any await so no MutexGuard is held across it.
+        let decision = self.resolutions.lock().unwrap().get(path).copied();
+        if let Some(decision) = decision {
+            return self
+                .resolve_same_region(peer_id, local, path, decision, report)
+                .await;
+        }
+
+        // Local accepted state up front: text + tombstone. A tombstone keeps the
+        // last-known text, so a delete-vs-edit can be hash-invisible — the cheap
+        // hash pre-check below would call it a fast-forward. So the gate also
+        // triggers on a tombstone on EITHER side.
+        let ours = self
+            .oplog
+            .materialize_accepted(&local.0)
+            .map_err(|e| Error::Apply(format!("materialize ours: {e}")))?;
+        let ours_current = blake3::hash(ours.text.as_bytes()).to_hex().to_string();
+        let ours_history = self.history_set(&local.0)?;
+        let theirs_history: HashSet<String> =
+            entry.recent_history_hashes.iter().cloned().collect();
+        let both_diverged = ours_current != entry.current_hash
+            && !theirs_history.contains(&ours_current)
+            && !ours_history.contains(&entry.current_hash);
+
+        // A delete-vs-edit conflict is a `Tombstone` concurrent with a `Replace`
+        // on the same doc; a tombstone is hash-invisible (it keeps the text), so
+        // the `both_diverged` hash test alone can't see it. We therefore fetch
+        // theirs (text + tombstone) whenever the doc could be a delete-vs-edit OR
+        // a same-region overlap, and run the delete-vs-edit verdict FIRST. The
+        // delete-vs-edit possibility is: we are tombstoned (we may have deleted
+        // while they edited), OR our state differs from theirs in any way (they
+        // may have tombstoned while we edited — including the case the cheap
+        // fast-forward path would otherwise silently auto-apply). A pure
+        // fast-forward delete (live side never edited past the shared base) is
+        // classified `NotApplicable` by the verdict and falls through to
+        // auto-apply → the Phase-3 trash move. [sync-conflict-delete-vs-edit]
+        let maybe_delete_vs_edit = ours.tombstone || ours_current != entry.current_hash;
+        if !both_diverged && !maybe_delete_vs_edit {
+            // Clean fast-forward / disjoint history, no tombstone in play →
+            // normal delta apply. If this doc was Blocked on a prior round and
+            // the conflict has since converged out-of-band (resolved on the
+            // other device), drop the now-stale block so it stops surfacing.
+            self.apply_delta_from_peer(peer_id, local, path).await?;
+            self.clear_stale_block(path);
+            report.bound.push(path.to_string());
+            report.converged.push(path.to_string());
+            return Ok(());
+        }
+
+        // Fetch theirs (text + tombstone) over the open authenticated channel —
+        // the same `DocContentRequest` the View-diff uses, paid only on this
+        // divergence path. [sync-fork-diff]
+        let (theirs, theirs_tombstone) = self.fetch_peer_text(peer_id, path).await?;
+
+        // Delete-vs-edit FIRST: a tombstone concurrent with an edit must block
+        // for Keep-deleted / Keep-edit, not be CRDT-folded (which would let the
+        // delete silently win or the edit silently resurrect).
+        // [sync-conflict-delete-vs-edit]
+        let dve = self
+            .oplog
+            .delete_vs_edit_verdict(&local.0, &theirs, theirs_tombstone, &theirs_history)
+            .map_err(|e| Error::Apply(format!("delete_vs_edit_verdict: {e}")))?;
+        if matches!(dve, hiker_core::oplog::sync::DeleteVsEdit::Conflict) {
+            self.status
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), SyncStatus::Blocked);
+            let peer = self.peer_fingerprint(&peer_id);
+            self.record_blocked(path, "delete-vs-edit", &peer);
+            report
+                .blocked
+                .push((path.to_string(), "delete-vs-edit".to_string()));
+            tracing::warn!(
+                path = %path,
+                "sync: delete-vs-edit conflict — blocking for user resolution"
+            );
+            return Ok(());
+        }
+
+        // Not a delete-vs-edit. If the hashes didn't both diverge it's a clean
+        // fast-forward (incl. a pure fast-forward delete) → normal delta apply.
+        if !both_diverged {
+            self.apply_delta_from_peer(peer_id, local, path).await?;
+            self.clear_stale_block(path);
+            report.bound.push(path.to_string());
+            report.converged.push(path.to_string());
+            return Ok(());
+        }
+
+        // Both sides moved off a shared base: run the same-region overlap
+        // verdict on the already-fetched peer text.
+        let verdict = self
+            .oplog
+            .same_region_verdict(&local.0, &theirs, &theirs_history)
+            .map_err(|e| Error::Apply(format!("same_region_verdict: {e}")))?;
+        match verdict {
+            SameRegion::CleanMerge | SameRegion::NoSharedBase => {
+                // Disjoint regions (or no reconstructable base) — let the Yrs
+                // merge apply the delta. NoSharedBase on a bound doc is rare
+                // (the lineage IS shared) but if it happens the safe move is the
+                // normal delta path, not a silent block. Clear any stale block:
+                // a same-region conflict resolved on the other device converges
+                // here as a clean merge, and this side's block must drop.
+                self.apply_delta_from_peer(peer_id, local, path).await?;
+                self.clear_stale_block(path);
+                report.bound.push(path.to_string());
+                report.converged.push(path.to_string());
+            }
+            SameRegion::Conflict => {
+                // Same-region overlap: do NOT fold the delta into `accepted`.
+                // Mark blocked + record persistently for the UI; stream nothing
+                // for this doc until the user resolves it. The rest of the round
+                // is unaffected (per-doc resilience). [sync-conflict-block-and-resolve]
+                self.status
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_string(), SyncStatus::Blocked);
+                let peer = self.peer_fingerprint(&peer_id);
+                self.record_blocked(path, "same-region", &peer);
+                report
+                    .blocked
+                    .push((path.to_string(), "same-region".to_string()));
+                tracing::warn!(
+                    path = %path,
+                    "sync: same-region conflict — blocking for user resolution"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Act on a queued resolution for a same-region-blocked BOUND doc, converging
+    /// both devices in one round. The peer's ops are first folded into our
+    /// `accepted` (so the delta isn't re-offered next round and we don't
+    /// re-block), then the decisive winner text is written as a fresh op on the
+    /// shared lineage — which streams to the peer on its next pull, so the peer
+    /// converges to the same outcome rather than re-conflicting.
+    /// [sync-conflict-block-and-resolve]
+    async fn resolve_same_region(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        path: &str,
+        decision: Resolution,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        // Capture OUR text BEFORE folding the peer delta — the keep-mine winner
+        // is the local content as it stands now, not the post-merge interleave.
+        // Likewise capture ours for the keep-both conflict copy.
+        let ours_before = self
+            .oplog
+            .materialize_accepted(&local.0)
+            .map_err(|e| Error::Apply(format!("resolve materialize ours: {e}")))?
+            .text;
+        match decision {
+            Resolution::KeepMine => {
+                // Our text wins forward. We make OUR version decisively canonical
+                // by re-asserting it locally and PUSHING our base to the peer so
+                // it adopts it (discarding its overlapping divergence) — exactly
+                // the fork keep-mine converge. Pushing (rather than relying on
+                // the peer to pull + re-detect) is what stops the peer from
+                // independently re-blocking on the same overlap: it adopts our
+                // base and clears its block in one shot. The peer's ops are NOT
+                // folded into ours first — ours stays exactly `ours_before`, and
+                // the push hands the peer our clean lineage.
+                self.oplog
+                    .apply_user_text(&local.0, &ours_before)
+                    .map_err(|e| Error::Apply(format!("keep-mine apply_user_text: {e}")))?;
+                self.push_adopt_to_peer(peer_id, local, path).await?;
+            }
+            Resolution::KeepTheirs => {
+                // Their changes win the overlap. Fold the peer's ops into our SV
+                // (so the delta isn't re-offered next round), then re-assert the
+                // peer's CURRENT text as the accepted content — the decisive
+                // winner. The peer is already at this text, so when it later
+                // pulls us the states match (a clean no-op), no re-block.
+                self.apply_delta_from_peer(peer_id, local, path).await?;
+                let (theirs, _) = self.fetch_peer_text(peer_id, path).await?;
+                self.oplog
+                    .apply_user_text(&local.0, &theirs)
+                    .map_err(|e| Error::Apply(format!("keep-theirs apply_user_text: {e}")))?;
+            }
+            Resolution::KeepBoth => {
+                // Theirs wins at the path; ours survives as a `conflict-` sibling
+                // note. Same shape as keep-theirs for the original path, plus the
+                // copy (written from the pre-fold text we captured).
+                self.write_conflict_copy_text(path, &ours_before)?;
+                self.apply_delta_from_peer(peer_id, local, path).await?;
+                let (theirs, _) = self.fetch_peer_text(peer_id, path).await?;
+                self.oplog
+                    .apply_user_text(&local.0, &theirs)
+                    .map_err(|e| Error::Apply(format!("keep-both apply_user_text: {e}")))?;
+            }
+            Resolution::KeepDeleted | Resolution::KeepEdit => {
+                // Delete-vs-edit choices are routed to `resolve_delete_vs_edit`,
+                // not here — a same-region block can't take a delete-vs-edit
+                // verb. Surfacing it keeps the doc blocked rather than guessing.
+                return Err(Error::Apply(format!(
+                    "delete-vs-edit resolution applied to a same-region block at {path}"
+                )));
+            }
+        }
+        self.mark_bound(path);
+        self.clear_blocked(path);
+        report.bound.push(path.to_string());
+        report.converged.push(path.to_string());
+        Ok(())
+    }
+
+    /// Drive a delete-vs-edit-blocked doc: re-block it (no decision) or act on
+    /// the user's queued Keep-deleted / Keep-edit choice, converging both
+    /// devices in one round via the same PUSH-the-winner approach keep-mine uses
+    /// (the peer adopts our decisive base wholesale and clears its own block, so
+    /// it can't independently re-detect the same conflict next round).
+    ///
+    /// - **Keep deleted** — tombstone our doc (trashing our `.md` if we were the
+    ///   live side), then push our tombstoned base; the peer adopts it and its
+    ///   `.md` is trashed by the adopt path's transition handling.
+    /// - **Keep edit** — resurrect/keep the live edited text: make our doc that
+    ///   text (clearing our tombstone if we were the deleter), then push it; the
+    ///   peer adopts the live edited doc.
+    ///
+    /// The decisive content is computed BEFORE any mutation: the live edited
+    /// text is whichever side isn't tombstoned (ours if the peer deleted, the
+    /// peer's if we deleted). [sync-conflict-delete-vs-edit]
+    // status: sync-conflict-delete-vs-edit
+    pub(super) async fn resolve_delete_vs_edit(
+        &mut self,
+        peer_id: PeerId,
+        local: &LocalDocId,
+        entry: &ManifestEntry,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
+        let path = entry.path.as_str();
+        let decision = self.resolutions.lock().unwrap().get(path).copied();
+        let Some(decision) = decision else {
+            // No decision yet. Before re-blocking, RE-EVALUATE: the conflict may
+            // have CONVERGED out-of-band — resolved on the other device so both
+            // sides now agree (both tombstoned, or both live at the same text).
+            // In real auto-sync BOTH devices are dialers, so BOTH independently
+            // blocked; once one resolves and the content converges, this side's
+            // independent block is stale and must auto-clear rather than re-block
+            // forever (the user shouldn't have to also click here, and a
+            // re-hydrated block after restart must not wedge). We only clear when
+            // the contention is GENUINELY gone — a still-live conflict re-blocks.
+            // [sync-conflict-delete-vs-edit, sync-conflict-block-and-resolve]
+            let (theirs, theirs_tombstone) = self.fetch_peer_text(peer_id, path).await?;
+            let theirs_history: HashSet<String> =
+                entry.recent_history_hashes.iter().cloned().collect();
+            let dve = self
+                .oplog
+                .delete_vs_edit_verdict(&local.0, &theirs, theirs_tombstone, &theirs_history)
+                .map_err(|e| Error::Apply(format!("re-eval delete_vs_edit_verdict: {e}")))?;
+            if matches!(dve, hiker_core::oplog::sync::DeleteVsEdit::NotApplicable) {
+                // The delete-vs-edit contention is gone. Fold any pending peer
+                // delta in (a no-op when already converged) and drop the now-stale
+                // block so it stops surfacing.
+                self.apply_delta_from_peer(peer_id, local, path).await?;
+                self.clear_stale_block(path);
+                report.bound.push(path.to_string());
+                report.converged.push(path.to_string());
+                return Ok(());
+            }
+            // Still a live conflict and no decision: keep it blocked + recorded
+            // for the UI. The record already exists from the detecting round;
+            // re-record so a restart that lost it re-surfaces. [sync-blocked-state]
+            self.status
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), SyncStatus::Blocked);
+            let peer = self.peer_fingerprint(&peer_id);
+            self.record_blocked(path, "delete-vs-edit", &peer);
+            report
+                .blocked
+                .push((path.to_string(), "delete-vs-edit".to_string()));
+            return Ok(());
+        };
+
+        // Our accepted state + the peer's, captured before any mutation.
+        let ours = self
+            .oplog
+            .materialize_accepted(&local.0)
+            .map_err(|e| Error::Apply(format!("resolve dve materialize ours: {e}")))?;
+        let (theirs, theirs_tombstone) = self.fetch_peer_text(peer_id, path).await?;
+
+        match decision {
+            Resolution::KeepDeleted => {
+                // The delete wins. Make our doc tombstoned + trash our `.md` (a
+                // no-op trash when we already were the deleter), then push the
+                // tombstoned base so the peer converges to deleted and its `.md`
+                // is trashed by the adopt path's transition handling.
+                if !ours.tombstone {
+                    self.oplog
+                        .tombstone_document_to_trash(&local.0, &Author::User)
+                        .map_err(|e| {
+                            Error::Apply(format!("keep-deleted tombstone_to_trash: {e}"))
+                        })?;
+                }
+                self.push_adopt_to_peer(peer_id, local, path).await?;
+            }
+            Resolution::KeepEdit => {
+                // Resurrect with the edit. The live edited text is whichever side
+                // isn't tombstoned: ours if the peer deleted, theirs if we did.
+                let edited = if ours.tombstone { theirs } else { ours.text.clone() };
+                // apply_user_text resurrects a tombstoned doc (clears the
+                // tombstone) and lands the edited text as the accepted content.
+                self.oplog
+                    .apply_user_text(&local.0, &edited)
+                    .map_err(|e| Error::Apply(format!("keep-edit apply_user_text: {e}")))?;
+                // If we were the deleter, our `.md` was trashed at delete time;
+                // resurrecting writes it back via the commit path's `.md` write.
+                self.push_adopt_to_peer(peer_id, local, path).await?;
+            }
+            Resolution::KeepMine | Resolution::KeepTheirs | Resolution::KeepBoth => {
+                // Lineage-direction verbs don't apply to a delete-vs-edit block;
+                // surface rather than guess, leaving the doc blocked.
+                let _ = theirs_tombstone;
+                return Err(Error::Apply(format!(
+                    "lineage resolution applied to a delete-vs-edit block at {path}"
+                )));
+            }
+        }
+        self.mark_bound(path);
+        self.clear_blocked(path);
+        report.bound.push(path.to_string());
+        report.converged.push(path.to_string());
+        Ok(())
+    }
+
+    /// Fetch the peer's CURRENT accepted text + tombstone flag for `path` over
+    /// the already-open authenticated channel — the same `DocContentRequest` the
+    /// View-diff probe uses, but issued mid-round on the connection the dialer
+    /// already holds (so no second dial / Hello). The tombstone flag is what the
+    /// delete-vs-edit detection needs (a deleted doc keeps its last-known text).
+    /// [sync-fork-diff, sync-conflict-delete-vs-edit]
+    async fn fetch_peer_text(&mut self, peer_id: PeerId, path: &str) -> Result<(String, bool), Error> {
+        let req = Message::DocContentRequest {
+            path: path.to_string(),
+        };
+        match self.request(peer_id, req).await? {
+            Message::DocContentResponse { text, tombstone } => Ok((text, tombstone)),
+            other => Err(Error::Transport(format!(
+                "expected DocContentResponse, got {other:?}"
+            ))),
+        }
     }
 
     /// Recognize a concurrent-rename collision: the peer's manifest entry has
@@ -254,9 +798,9 @@ impl SyncNode {
     /// renamed to where you see it now." If our local replica at the new path
     /// is some OTHER doc (its own current_hash is not in the peer's
     /// `prior_paths`-derived history either, and we have a non-empty current
-    /// state), we are the loser of the LWW race. Returning `true` here makes
-    /// `act_on_classification` write the local replica as a conflict-copy and
-    /// adopt the peer's lineage at the original path.
+    /// state), the two disjoint lineages both claim the path. Returning `true`
+    /// here makes `act_on_classification` route to `resolve_rename_collision`,
+    /// which BLOCKS for user resolution rather than auto-deciding a winner.
     fn detect_rename_collision(
         &self,
         local: &LocalDocId,
@@ -293,9 +837,19 @@ impl SyncNode {
             .materialize_accepted(&local.0)
             .map_err(|e| Error::Transport(format!("materialize for conflict copy: {e}")))?
             .text;
+        self.write_conflict_copy_text(path, &text)
+    }
+
+    /// Write `text` as a fresh `<stem>.conflict-<rand6>.<ext>` sibling note next
+    /// to `path` — the keep-both copy when the content to preserve is already in
+    /// hand (the same-region resolution captures OUR text before folding the
+    /// peer delta, so it can't re-materialize it from the local doc). Routed
+    /// through the op-log `create_document` path like any indexed note.
+    /// [sync-blocked-state, sync-conflict-block-and-resolve]
+    pub(super) fn write_conflict_copy_text(&self, path: &str, text: &str) -> Result<(), Error> {
         let copy_path = conflict_copy_path(path);
         self.oplog
-            .create_document(&copy_path, "note", &text, &Author::User)
+            .create_document(&copy_path, "note", text, &Author::User)
             .map_err(|e| Error::Transport(format!("create conflict copy: {e}")))?;
         Ok(())
     }

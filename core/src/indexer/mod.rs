@@ -264,6 +264,20 @@ impl IndexJobTx {
         }
         self.tx.send(job).await
     }
+
+    /// Non-blocking enqueue of an `Upsert` for `rel_path`, for synchronous
+    /// callers that can't `.await` (the `core::trees` write path). Tracks the
+    /// path in `pending` like [`send`]. A full or closed channel is reported
+    /// `Err` so the caller can fall back to the ambient watcher → indexer
+    /// route; it never blocks an async runtime worker.
+    pub fn try_upsert(
+        &self,
+        rel_path: String,
+        force: bool,
+    ) -> Result<(), mpsc::error::TrySendError<IndexJob>> {
+        self.pending.lock().unwrap().insert(rel_path.clone());
+        self.tx.try_send(IndexJob::Upsert { rel_path, force })
+    }
 }
 
 impl Handle {

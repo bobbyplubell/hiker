@@ -675,6 +675,7 @@ pub fn delete_note(
     watcher: Option<&Watcher>,
     trash: &Trash,
     rel: &str,
+    doc_id: Option<String>,
 ) -> Result<Entry, HikerError> {
     let abs = vault.resolve(rel)?;
     let meta = match fs::symlink_metadata(&abs) {
@@ -719,7 +720,11 @@ pub fn delete_note(
         if let Some(w) = watcher {
             w.suppress(rel);
         }
-        let entry = trash.move_file_in(vault.root(), rel)?;
+        let mut entry = trash.move_file_in(vault.root(), rel)?;
+        // Record the op-log doc_id (when the note was tracked) so a later
+        // restore can rebind `path → doc_id` and recover the doc's retained
+        // Yrs history rather than minting a fresh import. status: vault-trash-restore
+        entry.doc_id = doc_id;
         if let Some(w) = watcher {
             // Re-suppress so the TTL window starts close to when notify
             // surfaces its events post-rename.
@@ -1113,7 +1118,7 @@ use crate::store::Store;
         upsert_stub(&mut store, "a.md");
         let trash = crate::trash::Trash::open(vault.root());
 
-        let entry = delete_note(&vault, &mut store, None, &trash, "a.md").unwrap();
+        let entry = delete_note(&vault, &mut store, None, &trash, "a.md", None).unwrap();
 
         assert!(!dir.path().join("a.md").exists());
         assert!(dir.path().join(".hiker/trash").join(&entry.trashed_name).exists());
@@ -1133,7 +1138,7 @@ use crate::store::Store;
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
 
-        let entry = delete_note(&vault, &mut store, None, &trash, "note.txt").unwrap();
+        let entry = delete_note(&vault, &mut store, None, &trash, "note.txt", None).unwrap();
 
         assert!(!dir.path().join("note.txt").exists());
         assert!(dir.path().join(".hiker/trash").join(&entry.trashed_name).exists());
@@ -1145,7 +1150,7 @@ use crate::store::Store;
         let (dir, vault) = test_helpers::test_vault();
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
-        match delete_note(&vault, &mut store, None, &trash, "ghost.md") {
+        match delete_note(&vault, &mut store, None, &trash, "ghost.md", None) {
             Err(HikerError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -1167,7 +1172,7 @@ use crate::store::Store;
         upsert_stub(&mut store, "proj/sub/b.md");
         let trash = crate::trash::Trash::open(vault.root());
 
-        let entry = delete_note(&vault, &mut store, None, &trash, "proj").unwrap();
+        let entry = delete_note(&vault, &mut store, None, &trash, "proj", None).unwrap();
 
         assert!(!dir.path().join("proj").exists());
         let trash_root = dir.path().join(".hiker/trash").join(&entry.trashed_name);
@@ -1196,7 +1201,7 @@ use crate::store::Store;
         let vault = Vault::open(dir.path()).unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
-        let deleted = delete_note(&vault, &mut store, None, &trash, "a.md").unwrap();
+        let deleted = delete_note(&vault, &mut store, None, &trash, "a.md", None).unwrap();
 
         let restored = restore_note(&vault, None, &trash, &deleted.id).unwrap();
         assert_eq!(restored.original_path, "a.md");
@@ -1214,7 +1219,7 @@ use crate::store::Store;
         let vault = Vault::open(dir.path()).unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
-        let deleted = delete_note(&vault, &mut store, None, &trash, "a.md").unwrap();
+        let deleted = delete_note(&vault, &mut store, None, &trash, "a.md", None).unwrap();
         // User created a new file at the same path before restoring.
         fs::write(dir.path().join("a.md"), b"new").unwrap();
         match restore_note(&vault, None, &trash, &deleted.id) {
@@ -1233,7 +1238,7 @@ use crate::store::Store;
         let vault = Vault::open(dir.path()).unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         let trash = crate::trash::Trash::open(vault.root());
-        let deleted = delete_note(&vault, &mut store, None, &trash, "sub/a.md").unwrap();
+        let deleted = delete_note(&vault, &mut store, None, &trash, "sub/a.md", None).unwrap();
         // User removed the empty parent folder after deleting.
         fs::remove_dir(dir.path().join("sub")).unwrap();
         let restored = restore_note(&vault, None, &trash, &deleted.id).unwrap();
@@ -1253,7 +1258,7 @@ use crate::store::Store;
         upsert_stub(&mut store, "proj/a.md");
         upsert_stub(&mut store, "proj/sub/b.md");
         let trash = crate::trash::Trash::open(vault.root());
-        let deleted = delete_note(&vault, &mut store, None, &trash, "proj").unwrap();
+        let deleted = delete_note(&vault, &mut store, None, &trash, "proj", None).unwrap();
 
         let restored = restore_note(&vault, None, &trash, &deleted.id).unwrap();
         assert_eq!(restored.kind, crate::trash::Kind::Folder);

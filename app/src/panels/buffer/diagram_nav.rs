@@ -59,7 +59,7 @@ pub(crate) fn handle_clicks(
 ///   wikilink name creates the note and opens it.
 pub(crate) fn dispatch_link(app: &mut AppState, target: &LinkTarget, sticky: bool) {
     match target {
-        LinkTarget::External(url) => crate::extract::open_external_url(app, url),
+        LinkTarget::External(url) => crate::os_open::open_external_url(app, url),
         LinkTarget::Zim { archive, article } => open_zim(app, archive, article),
         LinkTarget::VaultPath(_) | LinkTarget::Wikilink(_) => open_note(app, target, sticky),
     }

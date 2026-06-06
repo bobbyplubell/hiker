@@ -30,14 +30,13 @@ hiker-core.workspace = true
 # build a GraniteLlmClient via core's config bridge. status: crawler-shared-llm
 hiker-llm.workspace = true
 hiker-sync = { path = "../hiker-sync" }
-# Extraction subsystem (decoupled leaf crate). The app wires the registry +
-# sidecar write; `core` never links it. See docs/extract.md.
-hiker-extract.workspace = true
 puffin = { version = "0.19", optional = true, features = ["serialization"] }
 puffin_http = { version = "0.16", optional = true }
 
 # UI
 hiker-theme.workspace = true
+# Generalized context-menu layer (status: ctxmenu-crate). Declared ready for the
+# menu-adoption phase; not yet used.
 egui.workspace = true
 egui_extras.workspace = true
 egui_workbench = { workspace = true, features = ["serde"] }
@@ -72,6 +71,10 @@ hiker-wavedrom = { path = "../hiker-render/hiker-render/wavedrom" }
 # SVG → RGBA rasterization (usvg parse + tiny-skia pixmap). Same version
 # `hiker-htmlview` already pulls in, so the dep set stays consistent.
 resvg = "0.47.0"
+# PNG encode/decode for the persisted diagram-cache layer
+# (panels/buffer/widgets/diagram_cache.rs). PNG-only; same version
+# tools/graph-snapshot uses. status: widget-render-disk-cache
+image = { version = "0.25", default-features = false, features = ["png"] }
 eframe.workspace = true
 petgraph.workspace = true
 rfd.workspace = true

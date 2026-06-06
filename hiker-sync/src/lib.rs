@@ -62,7 +62,18 @@ pub enum Error {
     #[error("protocol serialization error: {0}")]
     Protocol(#[from] serde_json::Error),
 
-    /// A transport / network operation failed (Wave 2+).
+    /// A transport / network operation failed (Wave 2+). Connection-level: a
+    /// round that hits this can't make progress on subsequent documents either,
+    /// so the dialer aborts the peer's round on a `Transport` error.
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// A DOC-LEVEL failure applying or adopting one document's state into the
+    /// local op-log (e.g. a rename collision onto an occupied path, or a base
+    /// the op-log refused). Unlike [`Transport`](Self::Transport) this is scoped
+    /// to the one document — the connection is still healthy — so the dialer
+    /// records it against that path and CONTINUES the round with the remaining
+    /// documents rather than aborting.
+    #[error("apply error: {0}")]
+    Apply(String),
 }

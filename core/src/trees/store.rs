@@ -1,16 +1,24 @@
 //! Per-tree `.md` store for `core::trees` (`trees-md-store`).
 //!
-//! Each cluster tree is one markdown document at
-//! `vault/.hiker/trees/<tree-id>.md`. The full structure lives in the
-//! `hiker` frontmatter (`trees-md-frontmatter`); the body is a fixed stub
-//! (the human render is produced on demand by the cluster editor, not
-//! persisted). Edits load the tree, mutate the in-memory [`TreeDoc`], and
-//! rewrite **only the frontmatter fence** through the op-log working layer —
-//! so each edit lands as a `SetFrontmatter` op (`trees-edit-setfrontmatter`)
-//! and the body bytes never move.
+//! Each cluster tree is one markdown document at a **visible** vault path —
+//! `{new_cluster_tree_dir}/<tree-id>.md` (default `cluster-trees/`) per
+//! `cluster-tree-visible-note` / `subsystem-notes-visible`. The full
+//! structure lives in the `hiker` frontmatter (`trees-md-frontmatter`); the
+//! body is a fixed stub (the human render is produced on demand by the
+//! cluster editor, not persisted). Edits load the tree, mutate the in-memory
+//! [`TreeDoc`], and rewrite **only the frontmatter fence** through the op-log
+//! working layer — so each edit lands as a `SetFrontmatter` op
+//! (`trees-edit-setfrontmatter`) and the body bytes never move.
 //!
-//! No rusqlite, no schema-version file, no migration code — the frontmatter
-//! is self-describing and non-`hiker` keys round-trip untouched.
+//! Discovery is by the `hiker.kind: cluster-tree` frontmatter query
+//! (`store-note-query`), not a directory glob — so a tree the user moved,
+//! hand-typed, or imported is found exactly like one hiker authored. A
+//! one-time migration (`migrate_legacy_trees`) relocates legacy
+//! `.hiker/trees/<id>.md` files to the visible default on first open,
+//! preserving each tree's op-log identity.
+//!
+//! No rusqlite, no schema-version file — the frontmatter is self-describing
+//! and non-`hiker` keys round-trip untouched.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -19,10 +27,46 @@ use serde::{Deserialize, Serialize};
 use serde_yml::Value as Yaml;
 
 use super::types::{
-    Db, EditableNode, Error, NodeInsert, NodeKind, NodePolicy, TreeInsert, TreeRow,
+    Db, EditableNode, Error, NodeInsert, NodeKind, NodePolicy, TreeContainingHit, TreeInsert, TreeRow,
 };
+use crate::indexer::IndexJobTx;
 use crate::oplog::OpLog;
+use crate::store::dto::{MetaFilter, NoteQuery};
 use crate::vault::Vault;
+use crate::watcher::Watcher;
+
+/// Frontmatter `hiker.kind` value that marks a note as a cluster tree. The
+/// discovery query (`list_trees`, `path_for_tree`) filters on it; a note the
+/// user typed or imported with this `kind` is a tree exactly like one hiker
+/// wrote. status: cluster-tree-visible-note
+const KIND: &str = "cluster-tree";
+
+/// Default visible directory for new tree `.md` files when the
+/// `new_cluster_tree_dir` config hasn't been wired (early open, tests).
+/// Mirrors `default_new_cluster_tree_dir` in `core::config`.
+const DEFAULT_TREE_DIR: &str = "cluster-trees/";
+
+/// The `query_notes` query that finds every cluster-tree note by frontmatter.
+fn cluster_tree_query() -> NoteQuery {
+    NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "hiker.kind".to_string(),
+            value: KIND.to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Read the `hiker.id` from a tree `.md`'s frontmatter, confirming it is a
+/// `cluster-tree`. `None` for a non-tree note or a tree missing its id.
+fn fm_tree_id(text: &str) -> Option<String> {
+    let fm = crate::frontmatter::split(text).frontmatter?;
+    let hiker = fm.get("hiker")?;
+    if hiker.get("kind").and_then(Yaml::as_str) != Some(KIND) {
+        return None;
+    }
+    hiker.get("id").and_then(Yaml::as_str).map(str::to_string)
+}
 
 // ── on-disk frontmatter shape ────────────────────────────────────────────
 
@@ -105,6 +149,11 @@ open this tree in the cluster editor to view and edit it. -->\n";
 pub(super) struct TreeDoc {
     pub meta: TreeRow,
     pub nodes: Vec<EditableNode>,
+    /// Vault-relative path the tree was loaded from (or written to on
+    /// insert). `save` rewrites this exact file — the path is decoupled from
+    /// the tree id so a tree the user moved keeps saving in place
+    /// (`cluster-tree-visible-note`).
+    path: String,
     /// Body bytes, preserved across edits.
     body: String,
     /// Non-`hiker` frontmatter keys, preserved on round-trip.
@@ -216,47 +265,207 @@ impl TreeDoc {
 // ── construction + load / save ─────────────────────────────────────────
 
 impl Db {
-    /// Create a trees handle backed by the op-log + vault. Ensures the
-    /// `.hiker/trees/` directory exists. No file is opened — trees are read
-    /// and written per-id as `.md` documents.
+    /// Create a trees handle backed by the op-log + vault. No directory is
+    /// created — the visible tree dir (`new_cluster_tree_dir`, default
+    /// `cluster-trees/`) is created lazily by `vault.write_file` on the first
+    /// tree. Runs the one-time legacy-location migration
+    /// (`migrate_legacy_trees`) so a vault carrying `.hiker/trees/<id>.md`
+    /// files surfaces them at the visible default. The watcher/indexer
+    /// handles and the configured dir are wired later via [`Db::wire`] (they
+    /// don't exist at construction time).
     pub fn new(oplog: Arc<OpLog>, vault: Arc<Vault>) -> Result<Self, Error> {
-        let dir = vault.root().join(".hiker").join("trees");
-        std::fs::create_dir_all(&dir)?;
         let store = crate::store::Store::open(vault.root()).map_err(|e| Error::Store(e.to_string()))?;
-        Ok(Self {
+        let db = Self {
             oplog,
             vault,
             centroids: Mutex::new(store),
             history: Mutex::new(HashMap::new()),
-        })
+            watcher: std::sync::OnceLock::new(),
+            index_jobs: std::sync::OnceLock::new(),
+            new_tree_dir: Mutex::new(DEFAULT_TREE_DIR.to_string()),
+            id_paths: Mutex::new(HashMap::new()),
+        };
+        db.migrate_legacy_trees()?;
+        Ok(db)
     }
 
-    /// Vault-relative path of a tree's `.md` file.
-    pub(super) fn rel(tree_id: &str) -> String {
-        format!(".hiker/trees/{tree_id}.md")
+    /// Wire the watcher + indexer handles and the configured default tree
+    /// directory after the indexer/watcher have started (they postdate
+    /// `Db::new` in bootstrap). Idempotent for the handles (`OnceLock::set`
+    /// ignores a second set); always refreshes the configured dir.
+    pub fn wire(&self, watcher: Arc<Watcher>, jobs: IndexJobTx, new_tree_dir: &str) {
+        let _ = self.watcher.set(watcher);
+        let _ = self.index_jobs.set(jobs);
+        if let Ok(mut dir) = self.new_tree_dir.lock() {
+            *dir = new_tree_dir.to_string();
+        }
     }
 
-    /// Load a tree from its `.md`. Returns `TreeNotFound` when the file is
-    /// missing or carries no `hiker` cluster-tree frontmatter.
+    /// One-time, idempotent relocation of legacy `.hiker/trees/<id>.md` trees
+    /// to the visible default (`cluster-trees/<id>.md`), run at `Db::new`.
+    /// Legacy trees were unindexed (everything under `.hiker/` is watcher-
+    /// ignored), so this is what makes them discoverable by the frontmatter
+    /// query. Guarded to no-op when `.hiker/trees/` is absent.
+    ///
+    /// Per-tree ordering — **the single biggest correctness risk**: the
+    /// op-log doc is repointed to the new path (`oplog::writes::rename`, which
+    /// preserves the doc_id + full history) **before** the file bytes move.
+    /// Doing the fs move first, or a `user_save` at the new path before the
+    /// repoint, would leave the op-log mapping at the old path and the next
+    /// write would mint a *fresh* doc — forking history. The repoint comes
+    /// first; only then do the bytes move. A legacy tree with no op-log
+    /// mapping (never saved while the op-log was running) just has its bytes
+    /// moved — the bootstrap / full-scan seeds a fresh doc at the new path.
+    ///
+    /// Indexing is deferred: the indexer's initial full-scan (which runs after
+    /// `Db::new` in bootstrap and walks the visible vault) picks the relocated
+    /// files up — no `Upsert` enqueue is needed here, and the watcher isn't
+    /// running yet so no suppression is needed either.
+    ///
+    /// status: cluster-tree-migration
+    fn migrate_legacy_trees(&self) -> Result<(), Error> {
+        let legacy_dir = self.vault.root().join(".hiker").join("trees");
+        if !legacy_dir.is_dir() {
+            return Ok(());
+        }
+        let target_dir = DEFAULT_TREE_DIR.trim_end_matches('/');
+        let entries = match std::fs::read_dir(&legacy_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".md") else {
+                continue;
+            };
+            let old_rel = format!(".hiker/trees/{name}");
+            let new_rel = if target_dir.is_empty() {
+                format!("{stem}.md")
+            } else {
+                format!("{target_dir}/{stem}.md")
+            };
+            // Idempotent: a tree already at the new path means a prior run (or
+            // a hand-moved file) already relocated it; leave the legacy copy
+            // for the unlink at loop end and skip.
+            if self.vault.abs_path(&new_rel).map(|p| p.exists()).unwrap_or(false) {
+                continue;
+            }
+            // 1. Repoint the op-log doc FIRST (preserves doc_id + history).
+            //    No-op when the legacy file was never op-log-seeded.
+            if matches!(self.oplog.doc_id_for_path(&old_rel), Ok(Some(_)))
+                && let Err(e) = crate::oplog::writes::rename(
+                    &self.oplog,
+                    &old_rel,
+                    &new_rel,
+                    &crate::oplog::shapes::Author::User,
+                )
+            {
+                tracing::warn!(error = %e, %old_rel, %new_rel, "tree migration: op-log repoint failed; skipping");
+                continue;
+            }
+            // 2. Move the bytes to the visible path (create parent on first).
+            let Ok(old_abs) = self.vault.abs_path(&old_rel) else {
+                continue;
+            };
+            let Ok(new_abs) = self.vault.abs_path(&new_rel) else {
+                continue;
+            };
+            if let Some(parent) = new_abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Err(e) = std::fs::rename(&old_abs, &new_abs) {
+                tracing::warn!(error = %e, %old_rel, %new_rel, "tree migration: file move failed");
+                continue;
+            }
+            // Cache the relocated path so a `load` before the full-scan indexes
+            // it still resolves (the id is the filename stem here).
+            self.cache_path(stem, &new_rel);
+        }
+        // 3. Best-effort cleanup of the now-empty legacy shell so a second
+        //    open takes the early-return path above.
+        let _ = std::fs::remove_dir(&legacy_dir);
+        Ok(())
+    }
+
+    /// Resolve a tree id to the vault-relative path of its `.md` via the
+    /// frontmatter query: every `hiker.kind: cluster-tree` note whose
+    /// `hiker.id` matches `tree_id`. `None` when no such note exists. The
+    /// path is decoupled from the id, so this is the single id→path seam the
+    /// load / delete / state-update paths share. status: cluster-tree-visible-note
+    pub(super) fn path_for_tree(&self, tree_id: &str) -> Option<String> {
+        // In-process cache first — a tree created / loaded this session is
+        // resolvable before the indexer has populated `note_meta`. Verify the
+        // cached file still carries the id (a user move/delete invalidates it).
+        if let Ok(cache) = self.id_paths.lock()
+            && let Some(rel) = cache.get(tree_id)
+            && self.vault.read_file(rel).ok().and_then(|t| fm_tree_id(&t)).as_deref() == Some(tree_id)
+        {
+            return Some(rel.clone());
+        }
+        // Fallback: the frontmatter query, for trees this process hasn't
+        // touched (discovered, sync-arrived, hand-typed).
+        let rows = {
+            let store = self.centroids.lock().ok()?;
+            store.query_notes(&cluster_tree_query()).ok()?
+        };
+        for row in rows {
+            let Ok(text) = self.vault.read_file(&row.path) else {
+                continue;
+            };
+            if fm_tree_id(&text).as_deref() == Some(tree_id) {
+                if let Ok(mut cache) = self.id_paths.lock() {
+                    cache.insert(tree_id.to_string(), row.path.clone());
+                }
+                return Some(row.path);
+            }
+        }
+        None
+    }
+
+    /// Record an id → path mapping in the in-process cache.
+    fn cache_path(&self, tree_id: &str, rel: &str) {
+        if let Ok(mut cache) = self.id_paths.lock() {
+            cache.insert(tree_id.to_string(), rel.to_string());
+        }
+    }
+
+    /// Load a tree by id. Resolves the id → path via the frontmatter query
+    /// (`path_for_tree`), then reads + parses that `.md`. Returns
+    /// `TreeNotFound` when no `cluster-tree` note carries the id, or the
+    /// resolved file is missing / lacks `hiker` cluster-tree frontmatter.
     pub(super) fn load(&self, tree_id: &str) -> Result<TreeDoc, Error> {
-        let rel = Self::rel(tree_id);
+        let rel = self
+            .path_for_tree(tree_id)
+            .ok_or_else(|| Error::TreeNotFound(tree_id.to_string()))?;
+        self.load_at(&rel, tree_id)
+    }
+
+    /// Load + parse the tree `.md` at a known vault-relative path. The
+    /// `expect_id` guards against a path whose frontmatter id drifted from
+    /// what the caller resolved.
+    fn load_at(&self, rel: &str, expect_id: &str) -> Result<TreeDoc, Error> {
         let text = self
             .vault
-            .read_file(&rel)
-            .map_err(|_| Error::TreeNotFound(tree_id.to_string()))?;
+            .read_file(rel)
+            .map_err(|_| Error::TreeNotFound(expect_id.to_string()))?;
         let split = crate::frontmatter::split(&text);
         let body = split.body.to_string();
         let Some(Yaml::Mapping(mut top)) = split.frontmatter else {
-            return Err(Error::TreeNotFound(tree_id.to_string()));
+            return Err(Error::TreeNotFound(expect_id.to_string()));
         };
         let hiker_key = Yaml::String("hiker".into());
         let hiker_val = top
             .remove(&hiker_key)
-            .ok_or_else(|| Error::TreeNotFound(tree_id.to_string()))?;
+            .ok_or_else(|| Error::TreeNotFound(expect_id.to_string()))?;
         let fm: TreeFm = serde_yml::from_value(hiker_val).map_err(|e| Error::Yaml(e.to_string()))?;
-        if fm.kind != "cluster-tree" {
-            return Err(Error::TreeNotFound(tree_id.to_string()));
+        if fm.kind != KIND {
+            return Err(Error::TreeNotFound(expect_id.to_string()));
         }
+        // Cache the resolved id → path so a subsequent load doesn't need the
+        // index (the create flow loads immediately after insert).
+        self.cache_path(&fm.id, rel);
 
         let mut note_ids = HashMap::new();
         let mut nodes: Vec<EditableNode> = fm
@@ -290,8 +499,9 @@ impl Db {
             .collect();
 
         // Fill centroids from the derived index cache (`trees-centroids-index`).
+        // Keyed by the tree's own id (`fm.id`), which is path-independent.
         if let Ok(store) = self.centroids.lock()
-            && let Ok(cents) = store.cluster_centroids_for_tree(tree_id)
+            && let Ok(cents) = store.cluster_centroids_for_tree(&fm.id)
         {
             for n in nodes.iter_mut() {
                 if let Some(c) = cents.get(&n.id) {
@@ -313,6 +523,7 @@ impl Db {
         Ok(TreeDoc {
             meta,
             nodes,
+            path: rel.to_string(),
             body,
             extra_fm: top,
             note_ids,
@@ -320,11 +531,19 @@ impl Db {
     }
 
     /// Serialize `doc` back to frontmatter (body preserved) and commit it
-    /// through the op-log as a user edit. Because only the frontmatter fence
-    /// changes, the op is labeled `SetFrontmatter`.
+    /// through the op-log as a user edit at `doc.path`. Because only the
+    /// frontmatter fence changes, the op is labeled `SetFrontmatter`.
+    ///
+    /// The tree now lives at a visible, indexed path
+    /// (`cluster-tree-visible-note`), so — like trail-docs and presets — the
+    /// write suppresses the watcher and enqueues an explicit `Upsert` so the
+    /// tree is queryable at once and the op-log atomic write isn't echoed
+    /// back as an external edit. When the handles aren't wired yet (early
+    /// open, tests) the write still lands; the ambient watcher → indexer
+    /// route picks it up.
     pub(super) fn save(&self, doc: &TreeDoc) -> Result<(), Error> {
         let fm = TreeFm {
-            kind: "cluster-tree".into(),
+            kind: KIND.into(),
             id: doc.meta.id.clone(),
             name: doc.meta.name.clone(),
             source: doc.meta.source.clone(),
@@ -359,8 +578,25 @@ impl Db {
         top.insert(Yaml::String("hiker".into()), hiker_val);
         let full = crate::frontmatter::assemble(&Yaml::Mapping(top), &doc.body)
             .map_err(|e| Error::Yaml(e.to_string()))?;
-        let rel = Self::rel(&doc.meta.id);
-        crate::ops::op_writes::user_save(&self.oplog, &self.vault, &rel, &full)?;
+        let rel = &doc.path;
+        // Record the id → path mapping so the next `load` resolves without the
+        // index (covers the insert_tree → insert_nodes create sequence).
+        self.cache_path(&doc.meta.id, rel);
+        // Suppress before the op-log atomic write so notify's echo for this
+        // self-write is dropped (`watcher-suppress-self-writes`).
+        if let Some(watcher) = self.watcher.get() {
+            watcher.suppress(rel.clone());
+        }
+        crate::ops::op_writes::user_save(&self.oplog, &self.vault, rel, &full)?;
+        // Re-suppress close to when notify surfaces the write, then index
+        // explicitly (the watcher events were suppressed) so the tree is
+        // discoverable by the frontmatter query immediately.
+        if let Some(watcher) = self.watcher.get() {
+            watcher.suppress(rel.clone());
+        }
+        if let Some(jobs) = self.index_jobs.get() {
+            let _ = jobs.try_upsert(rel.clone(), false);
+        }
         Ok(())
     }
 
@@ -379,9 +615,24 @@ impl Db {
 
     // ── Tree-level operations ────────────────────────────────────────
 
-    /// Create a new tree `.md`. Returns the tree id (generated when `None`).
+    /// Create a new tree `.md` at the configured visible directory
+    /// (`{new_cluster_tree_dir}/<tree-id>.md`, default `cluster-trees/`).
+    /// Returns the tree id (generated when `None`). The id is the basename so
+    /// uniqueness is free; discovery is by frontmatter, so the user can
+    /// rename / move the file afterward. status: cluster-tree-visible-note
     pub fn insert_tree(&self, t: TreeInsert) -> Result<super::types::TreeId, Error> {
         let id = t.id.unwrap_or_else(crate::store::dto::new_id);
+        let dir = self
+            .new_tree_dir
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_else(|_| DEFAULT_TREE_DIR.to_string());
+        let folder = dir.trim_end_matches('/');
+        let path = if folder.is_empty() {
+            format!("{id}.md")
+        } else {
+            format!("{folder}/{id}.md")
+        };
         let doc = TreeDoc {
             meta: TreeRow {
                 id: id.clone(),
@@ -394,6 +645,7 @@ impl Db {
                 vault_snapshot: t.vault_snapshot,
             },
             nodes: Vec::new(),
+            path,
             body: BODY_STUB.to_string(),
             extra_fm: serde_yml::Mapping::new(),
             note_ids: HashMap::new(),
@@ -411,28 +663,109 @@ impl Db {
         }
     }
 
-    /// List every tree, newest first.
+    /// List every tree, newest first. Discovery is primarily by the
+    /// `hiker.kind: cluster-tree` frontmatter query (`store-note-query`) — so
+    /// trees are found anywhere in the vault, including notes the user typed
+    /// or imported with that frontmatter. The in-process id→path cache is
+    /// unioned in so a tree created this session shows up *before* the indexer
+    /// has populated `note_meta` (the query alone would miss it until the
+    /// explicit `Upsert` is processed). status: cluster-tree-visible-note
     pub fn list_trees(&self) -> Result<Vec<TreeRow>, Error> {
-        let dir = self.vault.root().join(".hiker").join("trees");
-        let mut out = Vec::new();
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
+        let query_rows = {
+            let store = self.centroids.lock().map_err(|_| Error::Poisoned)?;
+            store
+                .query_notes(&cluster_tree_query())
+                .map_err(|e| Error::Store(e.to_string()))?
         };
-        for entry in rd {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(stem) = name.strip_suffix(".md") else {
+        // Union the indexed paths with the in-process cache, de-duped by path,
+        // so neither index latency nor a not-yet-cached discovery hides a tree.
+        let mut paths: Vec<String> = query_rows.into_iter().map(|r| r.path).collect();
+        if let Ok(cache) = self.id_paths.lock() {
+            for rel in cache.values() {
+                if !paths.contains(rel) {
+                    paths.push(rel.clone());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for rel in paths {
+            // We already hold the path; parse it straight through `load_at`,
+            // passing the path's own frontmatter id as the expected id so the
+            // guard can't reject a legitimately-discovered tree.
+            let Ok(text) = self.vault.read_file(&rel) else {
                 continue;
             };
-            match self.load(stem) {
+            let Some(id) = fm_tree_id(&text) else {
+                continue;
+            };
+            match self.load_at(&rel, &id) {
                 Ok(doc) => out.push(doc.meta),
                 Err(Error::TreeNotFound(_)) => continue,
                 Err(e) => return Err(e),
             }
         }
         out.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
+        Ok(out)
+    }
+
+    /// The tree id of the cluster-tree note at `rel`, or `None` when `rel` isn't
+    /// a cluster-tree note. Reads the note's frontmatter (`hiker.kind ==
+    /// cluster-tree` → its `hiker.id`). Lets the host route a cluster-tree to its
+    /// force-graph view instead of opening it as raw markdown.
+    /// status: cluster-tree-open-routing
+    #[must_use]
+    pub fn tree_id_at_path(&self, rel: &str) -> Option<String> {
+        let text = self.vault.read_file(rel).ok()?;
+        fm_tree_id(&text)
+    }
+
+    /// Cluster-trees with at least one leaf node referencing `note_path` — the
+    /// "appears in" reverse lookup. There's no node index (a tree *is* its `.md`
+    /// doc), so this mirrors [`Self::list_trees`]: walk the discovered tree docs,
+    /// parse each, and keep those whose nodes reference the note. The tree's
+    /// vault path comes for free from the walk, so the hit is directly openable.
+    /// status: canvas-appears-in
+    pub fn trees_containing_note(&self, note_path: &str) -> Result<Vec<TreeContainingHit>, Error> {
+        let query_rows = {
+            let store = self.centroids.lock().map_err(|_| Error::Poisoned)?;
+            store
+                .query_notes(&cluster_tree_query())
+                .map_err(|e| Error::Store(e.to_string()))?
+        };
+        let mut paths: Vec<String> = query_rows.into_iter().map(|r| r.path).collect();
+        if let Ok(cache) = self.id_paths.lock() {
+            for rel in cache.values() {
+                if !paths.contains(rel) {
+                    paths.push(rel.clone());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for rel in paths {
+            let Ok(text) = self.vault.read_file(&rel) else {
+                continue;
+            };
+            let Some(id) = fm_tree_id(&text) else {
+                continue;
+            };
+            let doc = match self.load_at(&rel, &id) {
+                Ok(doc) => doc,
+                Err(Error::TreeNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if doc
+                .nodes
+                .iter()
+                .any(|n| n.note_path.as_deref() == Some(note_path))
+            {
+                out.push(TreeContainingHit {
+                    tree_id: doc.meta.id.clone(),
+                    name: doc.meta.name.clone(),
+                    path: rel,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
@@ -452,17 +785,27 @@ impl Db {
     /// (Trash-on-discard semantics live in the app's discard-draft path per
     /// `cluster-editor-discard-draft`; this is the low-level removal.)
     pub fn delete_tree(&self, tree_id: &str) -> Result<(), Error> {
-        let rel = Self::rel(tree_id);
-        if let Ok(Some(doc_id)) = self.oplog.doc_id_for_path(&rel) {
-            let _ = self
-                .oplog
-                .tombstone_document(&doc_id, &crate::oplog::shapes::Author::User);
-        }
-        if let Ok(abs) = self.vault.abs_path(&rel) {
-            let _ = std::fs::remove_file(abs);
+        // Resolve the tree's current visible path via the frontmatter query.
+        // A tree whose file is already gone still tombstones any op-log doc
+        // and clears its centroids below. The hard `remove_file` is left
+        // *un*-suppressed: the file is now visible + indexed, so the watcher's
+        // Delete event drives the index-row removal (the same way an ordinary
+        // note delete does); suppressing it would orphan the `notes` row.
+        if let Some(rel) = self.path_for_tree(tree_id) {
+            if let Ok(Some(doc_id)) = self.oplog.doc_id_for_path(&rel) {
+                let _ = self
+                    .oplog
+                    .tombstone_document(&doc_id, &crate::oplog::shapes::Author::User);
+            }
+            if let Ok(abs) = self.vault.abs_path(&rel) {
+                let _ = std::fs::remove_file(abs);
+            }
         }
         if let Ok(mut store) = self.centroids.lock() {
             let _ = store.delete_cluster_centroids_for_tree(tree_id);
+        }
+        if let Ok(mut cache) = self.id_paths.lock() {
+            cache.remove(tree_id);
         }
         self.history
             .lock()

@@ -26,7 +26,6 @@ pub mod links_rename;
 pub mod llm;
 pub mod observability;
 pub mod oplog;
-pub mod plugins;
 pub mod prompts;
 pub mod ops;
 pub mod search;

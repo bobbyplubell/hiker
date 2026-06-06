@@ -289,11 +289,7 @@ impl AppState {
         }
     }
     let id = state.next_tab_id();
-    state.session.tabs.push(Tab {
-        id,
-        kind,
-        sticky: true,
-    });
+    state.session.tabs.push(Tab::new(id, kind, true));
     state.session.active_tab = Some(id);
     }
 }

@@ -2,16 +2,7 @@
 
 Hiker exposes its vault as an MCP server so external agents (Claude Code, Goose, Codex, custom MCP clients) can read, search, and write notes. Lands the v3 milestone from `design.md`.
 
-The headline decisions:
-
-- **In-process with hiker UI, decoupled by crate.** `core::mcp` is a sibling crate (`mcp-server/`); UI launches it on vault open, stops it on vault close. Single-process means MCP shares the indexer's writer and the read store — no two-writer coordination problem. UI imports zero MCP types; MCP imports zero UI types. [mcp-in-process, mcp-crate-decoupled]
-- **Streamable HTTP transport only for v3.** Single transport. stdio and old-style HTTP+SSE are deferred. Streamable HTTP is the modern MCP transport and is supported by every current ACP-side agent ecosystem; cutting stdio for v3 keeps the lifecycle constraint ("only when hiker is running") trivially honored, since the server is just a tokio task in hiker's process. [mcp-transport-streamable-http]
-- **rmcp as the implementation library.** Official Anthropic Rust SDK named in `design.md`'s target stack. Same wrap-it-in-our-own-trait discipline as graniet/`llm`: hiker's MCP-facing code defines its own tool surface; the rmcp Server wires it to the wire. [mcp-rmcp-backed]
-- **Read + write tools both.** Read: `search_notes`, `get_note`, `related_notes`. Write: `set_frontmatter`, `apply_tag`, `write_note` (full content), `edit_note` (span-anchored patches). `write_note` stamps `hiker.author: agent-authored` *only when the note is being created*; rewrites of existing notes and every `edit_note` / `set_frontmatter` / `apply_tag` skip the stamp. Every agent write produces ops in the document's op log tagged `author='agent:<client-id>'` per `op-log.md`. [mcp-tool-surface, mcp-author-stamp-on-create-only]
-- **Agent rollback via the op-log projection.** No separate snapshot directory. Agent writes append ops to the op log like any other write; the home page's agent-activity widget (per `editor.md`) and detail view query the projection layer in `core::activity` (per `op-log.md` "History materialization") to render the activity feed and drive rollback. [mcp-rollback-via-changes]
-- **Localhost-trust auth for v3.** No token. The HTTP server defaults to binding `127.0.0.1` only and any process on the local machine that can reach the port can connect. The bind address is configurable per `mcp-bind-host-configurable`; flipping it to a non-loopback interface keeps the same auth model — i.e. *anyone who can reach the port is trusted* — so the settings UI shows a warning when the user picks anything else. Token-based auth is deferred until there's a concrete multi-user-machine or shared-host need. The discovery file is local-readable but not network-reachable. [mcp-localhost-trust]
-- **Random ephemeral port written to a discovery file.** Port chosen by the OS at startup; written to `vault/.hiker/mcp.json` with the URL the agent should connect to. Most security gain over a fixed port; agents read the discovery file (already in the vault directory they have access to). Configurable to a fixed port if a user wants stability for static MCP config. [mcp-port-discovery]
-- **Dynamic capability advertising.** Tools that depend on unbuilt features (`list_trails`, `list_landmarks`, `list_collections`, vision OCR helpers) aren't advertised at `initialize` time. Agents see only what's actually backed by working code. [mcp-dynamic-capabilities]
+**In-process, decoupled by crate.** `core::mcp` is a sibling crate (`mcp-server/`); the UI launches it on vault open and stops it on vault close. Single-process means MCP shares the indexer's writer and the read store — no two-writer coordination — while UI imports zero MCP types and MCP imports zero UI types. [mcp-in-process, mcp-crate-decoupled] The implementation library is **rmcp** (the official Anthropic Rust SDK), wrapped in hiker's own tool-surface trait the same way graniet/`llm` is. [mcp-rmcp-backed]
 
 
 ## Architecture
@@ -44,7 +35,7 @@ Tokio task lifecycle: spawned at vault open, dropped at vault close. The HTTP li
 
 ## Tool surface
 
-v3 ships a deliberately small surface — three reads, three writes — covering the cases that have concrete value today and leaving room for the rest as backing features land.
+Read + write tools, covering the cases with concrete value today and leaving room for the rest as backing features land. Every agent write produces ops in the document's op log tagged `author='agent:<client-id>'` (per `op-log.md`); `write_note` stamps `hiker.author: agent-authored` *only when creating* a note, and every other write skips the stamp. [mcp-tool-surface, mcp-author-stamp-on-create-only] The canonical registered list is in Capability negotiation below.
 
 ### Read tools
 
@@ -54,46 +45,29 @@ v3 ships a deliberately small surface — three reads, three writes — covering
 
 ### UI context tools
 
-Three read tools that surface "what is the user looking at right now" to an attached agent. Cheap to call, no new permission beyond the existing vault-read posture (every value they return is derivable from state the agent could observe with an extra `get_note` round-trip; these tools cut the round-trip). All three honor per-tool toggles under `[mcp.tools]` (defaults true). All three return inert payloads when no buffer is focused so the agent gets a clean "nothing's active" answer rather than an error.
+Three read tools surfacing "what is the user looking at right now." No new permission beyond vault-read (every value is derivable with an extra `get_note` round-trip). All honor per-tool toggles and return inert payloads when no buffer is focused.
 
-- **`get_active_note()`** — returns the focused editor tab's vault-relative path plus the cursor's byte offset and (if non-empty) the current selection's `{ start_byte, end_byte }`. Buffer-only — when the active tab is an app page (settings / home / queue / etc., per `tab-kinds`), returns `{ path: null }`. The path is the value `chat-active-note-context-injection` already injects on every turn; exposing it as a tool lets a session-less rmcp client see the same context. [mcp-tool-get-active-note]
-- **`get_open_notes()`** — returns the ordered list of currently-open `buffer` tabs, each as `{ path, active: bool }`. Non-buffer tab kinds are omitted (an `agent` / `graph` / `home` tab doesn't have a note path). Order matches the tab strip's visible order. Useful for "summarize the set of notes I've been moving between." [mcp-tool-get-open-notes]
-- **`get_selection()`** — returns the active buffer's current selection as `{ path, start_byte, end_byte, text }` when non-empty, else `{ path: null }`. Same data the chat input's `@selection` token captures (per `chat-input-at-selection`); exposing it as an MCP tool means a non-chat agent (Claude Code, Codex over MCP) can read the user's highlight without the user having to copy-paste. [mcp-tool-get-selection]
+- **`get_active_note()`** — the focused editor tab's vault-relative path plus the cursor's byte offset and (if non-empty) the selection's `{ start_byte, end_byte }`. Buffer-only — an app-page tab (settings / home / queue / etc., per `tab-kinds`) returns `{ path: null }`. Same value `chat-active-note-context-injection` injects per turn. [mcp-tool-get-active-note]
+- **`get_open_notes()`** — the ordered list of open `buffer` tabs, each `{ path, active: bool }`, in tab-strip order. Non-buffer tab kinds (`agent` / `graph` / `home`) are omitted. [mcp-tool-get-open-notes]
+- **`get_selection()`** — the active buffer's selection as `{ path, start_byte, end_byte, text }` when non-empty, else `{ path: null }`. Same data the chat input's `@selection` token captures (per `chat-input-at-selection`). [mcp-tool-get-selection]
 
 All three are read-only and bypass the read-before-write set — calling them does **not** count as "the agent read this path" for `mcp-read-before-write` purposes; only `get_note` populates the read set. Otherwise an agent could `get_open_notes()` and then claim it had read the file.
 
-### Pending-op introspection tools
+### Pending-op introspection tools (not yet implemented)
 
-When `review_required` is on (per `agent-write-review-mode`), agent writes don't land on disk — they enter the document's pending queue per `op-log-pending-queue` / `op-log-status-states`. An agent that called `write_note("inbox/foo.md", ...)` and then `get_note("inbox/foo.md")` sees `1002 note_not_found` (against the accepted materialization) even though the write "succeeded" with `status: "pending"`. These tools let the agent confirm and inspect its own pending work. Both wrap `core::oplog::query` filtered to pending ops by surface + session.
+When `review_required` is on (per `agent-write-review-mode`), an agent's write enters the document's pending queue instead of landing on disk, so a follow-up `get_note` against that path returns `1002 note_not_found`. Three tools are specced to let an agent confirm, inspect, and revise its own pending work, all wrapping `core::oplog::query` filtered to pending ops by surface + session:
 
-- **`list_pending_proposals(filter?: { target_path?, surface?, session_id?, trail_id? })`** — list pending ops visible to MCP. Default filter scopes to `surface = "mcp-tool-call"` so the agent sees only ops it (or another MCP client) produced. Returns an array of `{ op_id, target_path, action, surface, session_id, created_at, content_hash }` — the same shape the activity detail page consumes (per `staging-review-filtering`). Body is *not* included; use `get_pending_proposal` for that. [mcp-tool-list-pending-proposals]
-- **`get_pending_proposal(op_id: string)`** — fetch a single pending op's metadata plus its proposed `content`. Returns `1002 note_not_found`-style error when the id is unknown (op was accepted, rejected, or never existed). Read-only — agents can't accept/reject from MCP; that's a human-in-the-loop action by design. For `edit_note`-shaped ops, the response additionally carries an `anchors` array — one entry per `Replace` op in the original batch — with shape `{ edit_index, anchor_status: "holds" | "drifted" | "ambiguous", old_str_preview }`. See `mcp-pending-proposal-anchor-status`. [mcp-tool-get-pending-proposal]
+- **`list_pending_proposals(filter?)`** — list pending ops visible to MCP (default scope `surface = "mcp-tool-call"`); returns `{ op_id, target_path, action, surface, session_id, created_at, content_hash }` per op, no body. [mcp-tool-list-pending-proposals]
+- **`get_pending_proposal(op_id)`** — one pending op's metadata + proposed `content`; read-only (accept/reject is human-only). For `edit_note`-shaped ops it adds an `anchors` array (one per `Replace` op in the batch, resolved by shared `batch_id`) recomputed against `materialize(accepted)`, each `{ edit_index, anchor_status, old_str_preview }` where `anchor_status` is `holds` (matches once) / `drifted` (zero matches) / `ambiguous` (>1 match, edit wasn't `replace_all`). Racy by construction. Whole-document ops omit `anchors` (treat absence as "n/a"). [mcp-tool-get-pending-proposal, mcp-pending-proposal-anchor-status]
+- **`amend_pending_proposal(op_id, new_content)`** — replace a pending op's payload in place (same `metadata.client_id` only; whole-document shapes only — `edit_note` batches re-issue after accept/reject). Recomputes `content_hash`, stamps `amended_at_ms`, increments `amend_count`, discards the prior payload (no version history), fires op-log change events. If the user has already accepted, the op has left the queue and the call returns `1002` — "amend works until the user takes action," so the human still gets exactly one gate per accepted change. [mcp-tool-amend-pending-proposal]
 
-**Anchor status on pending `edit_note` ops.** When the agent and the user are racing on the same note — user accepting earlier ops, typing into the buffer, or another MCP client writing in parallel — an `edit_note` op staged a few seconds ago may already be doomed. Without surfacing anchor liveness, the agent only learns this when the user clicks Accept and the apply fails on drift; by then the iteration loop is wasted. `get_pending_proposal` recomputes anchor match state on the fly:
-
-- **Target it's checked against.** Always `materialize(accepted)` for the document — the same state the accept verb would apply against. (Under op-log, the prior buffer-vs-disk distinction collapses: the user's typing has already applied accepted ops, so the accepted materialization already reflects everything the user has saved.) A `target: "accepted_materialization"` field records this for debugging.
-- **Per-`Replace`-op, not per-batch.** Because each `edit_note` call emits N `Replace` ops sharing a `batch_id` (per `op-log-op-shape`), the op being inspected is *one* `Replace`. The `anchors` array still reports the whole batch (resolved by looking up sibling ops with the same `batch_id`) so the agent sees joint liveness.
-- **Status values.** `holds` — `old_str` matches exactly once. `drifted` — zero matches; the anchor is gone. `ambiguous` — more than one match and the original edit wasn't `replace_all: true`.
-- **Racy by construction.** The answer is true at read time and may be stale a moment later — same caveat as any drift check. Agents that need a tighter guarantee re-call right before deciding to amend.
-- **Whole-document shapes.** `write_note` / `set_frontmatter` / `apply_tag` ops don't have anchors, so the `anchors` field is omitted for those (not `[]`). Consumers should treat absence as "n/a," not "all clear." [mcp-pending-proposal-anchor-status]
-
-These are read tools, so they aren't gated by `review_required` — they work regardless of mode (returning an empty list when nothing is pending). Both honor the standard per-tool toggle (`[mcp.tools].list_pending_proposals_enabled`, `get_pending_proposal_enabled`).
-
-**Amending a pending op.** A pending write is one-shot today — once the agent submits, it can introspect via the tools above but can't revise its own work; making a follow-up edit means rejecting and re-issuing, which the agent can't do (rejection is human-only). In practice, agents iterate because their *first* attempt was wrong (missed a section, mangled formatting, wrong tone) and want to replace it before the user has even looked. To support that without breaking the one-human-gate-per-change model:
-
-- **`amend_pending_proposal(op_id: string, new_content: string)`** — replace a pending op's payload in place. Same client (same `metadata.client_id`) only — agents can't amend another client's pending work. Applies to whole-document op shapes (`write_note`, `set_frontmatter`, `apply_tag`); `edit_note`-shaped batches are out of scope for v1 (the per-edit batch shape makes "amend" ambiguous — for those the agent re-issues `edit_note` after the user accepts/rejects). Replaces the op's stored payload and recomputes `content_hash`; stamps `metadata.amended_at_ms = <now>` and increments `metadata.amend_count`. **No version history** — the prior payload is discarded. Returns `{ op_id, content_hash }`. Errors: `1002`-style when the id is unknown / already accepted / already rejected; `invalid_params` when the op shape isn't whole-document; `forbidden` when the op belongs to a different client. Honors per-tool toggle (`[mcp.tools].amend_pending_proposal_enabled`). [mcp-tool-amend-pending-proposal]
-
-The amend tool fires op-log change events on success, so a user with the review surface already open re-renders against the new content. If the user has already clicked Accept and the apply-to-`accepted` is mid-flight when the amend lands, the accept wins — the op has already left the pending queue by the time `amend_pending_proposal`'s lookup runs, and the tool returns `1002`. No special race handling beyond that — the model is "amend works until the user takes action." The agent gets to iterate on its own pending work before human review, but the human still has exactly one gate per accepted change.
-
-Not a workflow primitive — the agent uses this when *its prior attempt was wrong*, not as a normal iterative-edit channel. A long sequence of amends suggests the agent should have done a `get_note` + reasoned more before the first write; the audit log surfaces high `amend_count` so this stays visible.
+None of the three is registered in the router today — they appear only inside two tool descriptions. Tracked as `bug-mcp-pending-proposal-tools-unimplemented`. Per-tool toggles for them (`*_enabled`) follow the standard pattern once built.
 
 ### Write tools
 
-All writes route through `core::ops`. Every agent write produces ops tagged `author='agent:<client-id>'`: applied to the document's `accepted` Doc when `review_required` is off, queued in `<doc-id>.pending` when it's on.
+All writes route through `core::ops`. Every agent write produces ops tagged `author='agent:<client-id>'`: applied to the document's `accepted` Doc when `review_required` is off, queued in `<doc-id>.pending` when it's on. Authorship stamping is creation-only (full statement under Authorship + audit trail, `mcp-author-stamp-on-create-only`).
 
-**Authorship stamping is creation-only** — only a `write_note` that *creates* a file stamps `hiker.author: agent-authored`; replacements and every `edit_note` / `set_frontmatter` / `apply_tag` skip it. Per-modification provenance lives on each op's `author` field. Full statement under Authorship + audit trail (`mcp-author-stamp-on-create-only`).
-
-**Pending-mode caveat — load-bearing for agent behavior.** When `[mcp.tools].review_required` is on (see `agent-write-review-mode`), every write tool below produces ops with `status = pending` *instead of* writing to disk. The tool returns `{ status: "staged", proposal_id: "<id>" }` (`write_note` / `set_frontmatter` / `apply_tag`) or `{ status: "staged", proposal_ids: ["<id>", ...] }` (`edit_note`, one per edit); in direct mode the response is `{ status: "written" }`. The file is **not** visible on disk or via `get_note` until the user accepts — `get_note` returns `1002 note_not_found` for a path that exists only as pending ops (per `mcp-staging-read-disk-only`). Tool descriptions surface this behavior in plain language so the agent doesn't mistake a pending write for a failed write; the agent can introspect via `mcp-tool-list-pending-proposals` / `mcp-tool-get-pending-proposal`. `edit_note` produces *one `Replace` op per edit* sharing a `batch_id` per `op-log-op-shape`; `write_note` / `set_frontmatter` / `apply_tag` produce one op per call. [mcp-write-tools-staging-aware]
+**Pending-mode caveat — load-bearing for agent behavior.** When `[mcp.tools].review_required` is on (see `agent-write-review-mode`), every write tool produces ops with `status = pending` *instead of* writing to disk, returning `{ status: "staged", proposal_id }` (or `proposal_ids` for `edit_note`, one per edit); direct mode returns `{ status: "written" }`. The file is **not** visible on disk or via `get_note` until the user accepts — `get_note` returns `1002 note_not_found` for a path that exists only as pending ops (per `mcp-staging-read-disk-only`). Tool descriptions surface this in plain language so the agent doesn't mistake a pending write for a failed one. `edit_note` produces *one `Replace` op per edit* sharing a `batch_id` per `op-log-op-shape`; the other write tools produce one op per call. [mcp-write-tools-staging-aware]
 
 - **`write_note(rel_path: string, content: string, expected_hash?: string)`** — create or replace a note's body. If `expected_hash` is provided, the write is drift-aware (checks against `materialize(accepted)`); without it, an unconditional write. Refuses paths under `.hiker/`. Stamps `hiker.author: agent-authored` on the resulting frontmatter *only when the target path did not previously exist* (per `mcp-author-stamp-on-create-only`). When the target path already exists, the call requires the agent to have read the note in the current session via `get_note` first (`1008 read_required`); see `mcp-read-before-write`. Creates are exempt. Returns the new content hash. [mcp-tool-write-note]
 - **`edit_note(rel_path: string, edits: [{ old_str: string, new_str: string, replace_all?: bool }])`** — apply one or more span-anchored patches to an existing note. Each `old_str` must match exactly once in the file unless `replace_all: true`. Refuses non-existent paths (use `write_note` to create). Validation happens at receive time as one transaction; on any failure the whole call rejects and nothing is queued. Returns `{ status: "staged", proposal_ids: [...] }` in review mode or `{ status: "written", content_hash }` in direct mode. [mcp-tool-edit-note]
@@ -145,7 +119,7 @@ Write:
 
 ### Task queue tools
 
-When `core::tasks` lands (per `task-queue.md`), the MCP server gains four more tools so external rmcp clients — Claude Code, Codex, the user's ACP-acting-as-MCP-client — can drain hiker's non-interactive LLM work. The same tools are in-process-dispatched to the basic chat agent's tool set when `[tasks] expose_to_chat_agent = true`, so the queue's checkout/submit surface is one tool registry shared across the chat agent and external clients.
+Per `task-queue.md`, the MCP server exposes the queue's checkout/submit surface so external rmcp clients can drain hiker's non-interactive LLM work. The same tools are in-process-dispatched to the basic chat agent's tool set when `[tasks] expose_to_chat_agent = true` — one tool registry shared across the chat agent and external clients.
 
 - **`task_checkout(types?, shapes?, min_priority?, lease_secs?)`** — return the next eligible task or null; stamps a lease against the calling rmcp client id. [tasks-mcp-tool-checkout]
 - **`task_submit(task_id, value)`** — write the result; validates against the task's `output_schema` if any. [tasks-mcp-tool-submit]
@@ -160,25 +134,10 @@ Cancellation is **not** an MCP tool. External agents learn cancellation via `sta
 
 Notably absent from v3:
 
-- `move_note`, `delete_note`, `create_folder` — heavier write operations. Agent enrichment use cases don't need them; deferred until a real motivating case appears.
-- `list_landmarks`, `list_collections`, `get_collection` — landmarks and collections are unbuilt; the corresponding tools are added when those features land. Until then they're not advertised at initialize. [mcp-tool-landmarks-deferred, mcp-tool-collections-deferred]
-- `expand_chunk`, `get_note_context` — sketched in `design.md` but not load-bearing for v3 use cases. The chunk-id format issue can be settled later. Deferred.
+- `move_note`, `delete_note`, `create_folder` — heavier writes; deferred until a real motivating case appears.
+- `list_landmarks`, `list_collections`, `get_collection` — landmarks/collections unbuilt; added (and advertised) when those features land. [mcp-tool-landmarks-deferred, mcp-tool-collections-deferred]
+- `expand_chunk`, `get_note_context` — sketched in `design.md` but not load-bearing for v3. Deferred.
 - Vision OCR helpers — depend on the extractor pipeline being real. Deferred to v4+.
-
-
-### Plugin authoring tools
-
-When the plugin-authoring loop lands (per `plugins.md`), the MCP server gains two tools so an attached coding agent can author and install a plugin end-to-end without hiker compiling anything. Both are write-class — gated by `writes_enabled` and their own per-tool toggles — and both honor the consent model: neither enables a plugin without the human permission-review dialog.
-
-- **`propose_plugin(id: string, manifest: json, files: map<string, string>)`** — scaffold a plugin into a vault-scoped scratch dir (`.hiker/plugins-scratch/<id>/`): writes the manifest plus source files (Lua source for the `lua` tier, or a build tree the agent will compile for the `wasm` tier). Idempotent per `id`; refuses paths escaping the scratch dir. Returns the scratch location. Nothing is loaded or trusted yet — this is a staging area the agent iterates in. [mcp-propose-plugin]
-- **`install_plugin(id: string)`** — hand the scaffolded plugin (Lua source, or a `.wasm` the agent built in its own environment and placed in the scratch dir) into the existing install path: hiker reads the scaffolded manifest's `runtime`, computes the blake3 pins, and routes the plugin into the permission-review flow (`plugin-install-flow`). The plugin enters **disabled, pending the human consent dialog** that presents its requested capabilities — never auto-enabled (`plugin-authoring-proposal-gate`). Returns `{ status: "pending_review", manifest_hash, source_hash }`. [mcp-install-plugin]
-
-Authoring a per-site **source plugin** (per `extract.md` / `plugins.md`'s *Agent authoring loop*) adds two read-class tools for the iterate loop:
-
-- **`fetch_raw(url: string)`** — fetch a sample page's raw HTML (+ detected data-blobs) over the static extraction path (`extract-web-static-fetch`), so the agent can see the structure it writes against. The target is a URL the user supplied or one-click-confirmed, not an agent-chosen one, capping the agent's fetch reach. [mcp-fetch-raw]
-- **`extract_preview(extractor: string, source: string)`** — run a candidate extractor (built-in or a draft plugin) against a URL/file and return `{ markdown, next_urls }` **without writing to the vault**. The candidate runs in the `wasmi` sandbox, so it can be invoked freely. [mcp-extract-preview]
-
-These run in a **host-enforced scoped sub-task** with reduced capabilities — `fetch_raw` + `extract_preview` + propose-code, no vault-write and no arbitrary-net — so untrusted page content reaching the agent can't be turned into a consequential action; the only persistent step is the human-gated `install_plugin`. The restriction is task wiring, not a togglable mode. The security model is specified in `plugins.md` (`plugin-authoring-security`); the broader session-partition generalization is parked in `ideas.md`. [mcp-authoring-scoped-subtask]
 
 
 ## Read-before-write
@@ -187,48 +146,16 @@ Both write tools that touch *existing* content require a prior `get_note` call a
 
 - **Scope.** `edit_note` always requires a prior read. `write_note` requires a prior read only when the target path *already exists* on disk; creating a new note is exempt (there is nothing to have read). `set_frontmatter` / `apply_tag` / `remove_tag` are merge-into-frontmatter operations and don't need to have seen the body — they're exempt.
 - **Read set is per-session.** Each MCP session (one rmcp connection) carries an in-memory `HashSet<rel_path>` populated by every successful `get_note` call. The set is dropped at session close. Re-issuing a write against the same path within the session doesn't require re-reading.
-- **Implementation.** A small `ReadSet` lives on the per-session handler state in `mcp-server/src/handler.rs`, populated in `get_note_inner` after a successful fetch and consulted in `write_note_inner` / `edit_note_inner` before validation. The check fires before the staging / direct-write branch.
-- **Why per-session not per-call.** Per-call read-before-every-edit would be safe but punishing on multi-edit workflows where the agent already has the file's content in its own context. The per-session shape matches Claude Code's Read-before-Edit rule (the user-facing precedent) and is enough to stop the hallucinated-path failure mode that motivates the rule.
+- **Implementation.** A small `ReadSet` lives on the per-session handler state in `mcp-server/src/handler.rs`, populated in `get_note_inner` after a successful fetch and consulted in `write_note_inner` / `edit_note_inner` before validation, ahead of the staging / direct-write branch. Per-session (not per-call) because the agent often already holds the content in its own context; it matches Claude Code's Read-before-Edit precedent.
 
 
 ## UI refresh on agent writes
 
-Agent writes route through `core::ops::agent_*`, which suppress the watcher
-around the fs write so notify can't surface a stale event for the path the
-indexer has already remapped. Watcher suppression is load-bearing for
-correctness on rename/delete (see `watcher.md`) and we want the same shape
-for body writes — but it means the UI's existing watcher file events
-listener never fires for an agent-authored save, leaving the tree stale
-until the user clicks refresh.
+Agent writes route through `core::ops::agent_*`, which suppress the watcher around the fs write (load-bearing for rename/delete correctness, see `watcher.md`). Suppression means the UI's watcher-file-events listener never fires for an agent-authored save, leaving the tree stale.
 
-Resolution: ride the existing op-log append events. Every agent
-write already appends a `Changes` row tagged `author = "agent:<client-id>"`
-(per the audit-trail section below); the existing tokio bridge in
-the host re-emits each row as op-log append events,
-which the home-page activity widget already consumes. The frontend's tree
-+ buffer-reload code subscribes to the same event and applies the same
-post-mutation refresh it would for a watcher event — gated on
-`author.startsWith("agent:")` so non-agent rows (user saves, rollbacks)
-keep flowing through the watcher path unchanged. [mcp-ui-refresh-on-agent-write]
+Resolution: ride the existing op-log append events. Every agent write appends a `Changes` row tagged `author = "agent:<client-id>"`; the host's tokio bridge re-emits each row as an op-log append event, which the home-page activity widget already consumes. The frontend's tree + buffer-reload code subscribes to the same event and applies its post-mutation refresh — gated on `author.startsWith("agent:")` so non-agent rows (user saves, rollbacks) keep flowing through the watcher path unchanged. [mcp-ui-refresh-on-agent-write]
 
-When an accepted `edit_note` lands on a path whose buffer is currently dirty,
-the plain "reload from disk" path is wrong — it would clobber the user's
-unsaved edits. The patch-review accept flow (see `patch-review.md`) applies
-the same span-anchored patch to both disk and the in-memory buffer in one
-transactional move and refuses with a clear error when the user's edits
-have clobbered the patch's anchor. Direct-mode agent writes (review off)
-land via this same machinery; the op-log append events listener delegates
-to the patch-aware buffer-update path when the row carries an `edit_note`
-patch in metadata, falling back to the disk reload otherwise.
-
-Why not just drop watcher suppression for body writes: it would work for
-`write_note` but the same pattern shouldn't fork between body-write and
-move/delete. One consistent rule is easier to reason about, and the
-event we're piggybacking on is *more* informative than a watcher event
-anyway — it's synchronous with the change, carries the change id (so the
-UI could highlight the agent row in the activity feed), and works
-identically for any future non-watcher write source (sync, import, CLI
-in-process).
+When an accepted `edit_note` lands on a path whose buffer is currently dirty, the plain disk-reload path would clobber the user's unsaved edits. The patch-review accept flow (see `patch-review.md`) instead applies the span-anchored patch to both disk and the in-memory buffer in one transactional move, refusing with a clear error when the user's edits have clobbered the anchor. Direct-mode agent writes use this same machinery: the append-events listener delegates to the patch-aware buffer-update path when the row carries an `edit_note` patch in metadata, falling back to disk reload otherwise.
 
 
 ## Authorship + audit trail
@@ -240,16 +167,16 @@ Every accepted MCP-driven write produces two artifacts, plus a frontmatter stamp
 
 **Frontmatter stamp on creation only.** When `write_note` brings a note into existence (the target path didn't exist), the resulting frontmatter carries `hiker.author: agent-authored` (and optionally `hiker.provenance: mcp-<client-id>`). Every other write tool — `write_note` against an existing path, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag` — skips the stamp. The frontmatter field expresses *origin*; per-modification provenance lives on each op's `author` field. [mcp-author-stamp-on-create-only]
 
-Why both op-log entries and JSONL entries: the op log is the content-change log (what files changed, what's the rollback target); JSONL is call-telemetry log (which tool ran, what was sent, did it succeed). Different consumers — the op log powers rollback UI, JSONL powers prompt-edit debugging and cost transparency per `llm.md`. They overlap in mention but not in shape.
+The two artifacts have different consumers: the op log is the content-change log (powers rollback UI), the JSONL is the call-telemetry log (powers prompt-edit debugging and cost transparency per `llm.md`).
 
 
 ## HTTP server + transport
 
-rmcp's Streamable HTTP transport: single endpoint accepting POST for client→server messages and GET (with SSE upgrade) for server→client streaming. JSON-RPC 2.0 over the wire.
+rmcp's Streamable HTTP transport (the only v3 transport; stdio and old HTTP+SSE are deferred): single endpoint accepting POST for client→server messages and GET (with SSE upgrade) for server→client streaming. JSON-RPC 2.0 over the wire. Cutting stdio keeps the "only when hiker is running" lifecycle trivially honored, since the server is just a tokio task in hiker's process. [mcp-transport-streamable-http]
 
-**Bind address.** Default `127.0.0.1` (localhost-only). Configurable in `[mcp] host` for users who need LAN access for an agent on another machine; the settings UI surfaces this as a string field with a warning that anything other than `127.0.0.1` exposes vault contents to whoever can reach the listening port (the auth model is still localhost-trust per `mcp-localhost-trust`, so a non-loopback bind effectively means *trust everyone on the LAN*). Default stays loopback so users have to opt into the broader exposure. `0.0.0.0` is allowed for the all-interfaces case; users running their own reverse proxy can bind there and gate the proxy. [mcp-bind-host-configurable]
+**Bind address.** Default `127.0.0.1` (localhost-only). The auth model is localhost-trust — no token; anyone who can reach the port is trusted, and the discovery file is local-readable but not network-reachable. [mcp-localhost-trust] Configurable in `[mcp] host` for LAN access; a non-loopback bind keeps the same trust model (effectively *trust everyone on the LAN*), so the settings UI warns when the value isn't `127.0.0.1`. `0.0.0.0` is allowed for users gating an all-interfaces bind behind their own reverse proxy. [mcp-bind-host-configurable]
 
-**Port.** Default ephemeral (port 0 → OS-assigned). Configurable in `[mcp]`:
+**Port.** Default ephemeral (port 0 → OS-assigned), written with the connect URL to the discovery file at startup; configurable to a fixed port for static MCP config. [mcp-port-discovery] Configurable in `[mcp]`:
 
 ```toml
 [mcp]
@@ -278,22 +205,19 @@ Written on bind, removed on graceful shutdown. Stale files are detected by attem
 
 ## Capability negotiation
 
-At rmcp `initialize` time, hiker advertises the tool list dynamically based on what features are present:
+At rmcp `initialize` time, hiker advertises its tool list dynamically based on what features are present. The currently-registered set (canonical — `mcp-server/src/handler/router.rs`):
 
-- Always advertised in v3: `search_notes`, `get_note`, `related_notes`, `get_active_note`, `get_open_notes`, `get_selection`, `list_pending_proposals`, `get_pending_proposal`, `write_note`, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag`.
-- Conditionally advertised: nothing in v3, but the mechanism is built for future tools that depend on backing features (trails, landmarks, collections, vision extractors). Each future tool defines a `is_available()` predicate; the server filters its tool list at initialize time. [mcp-dynamic-capabilities]
-- Plugin-provided tools (per `plugins.md`'s `plugin-mcp-tools`) ride this same mechanism: a loaded, enabled plugin's declared tools join the surface at `initialize` and drop off when it's disabled or removed.
+- **Notes (read):** `search_notes`, `get_note`, `related_notes`, `get_active_note`, `get_open_notes`, `get_selection`.
+- **Notes (write):** `write_note`, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag`.
+- **Boards:** `boards_list`, `board_get`, `board_create`, `board_add_card`, `board_add_text_card`, `board_move_card`, `board_set_card_text`, `board_remove_card`, `board_add_column`, `board_rename_column`, `board_reorder_column`, `board_delete_column`.
+- **Task queue:** `task_checkout`, `task_submit`, `task_fail`, `task_heartbeat`, `task_list`.
 
-This means agents see a coherent capability set rather than calling tools that error with "feature not implemented." Cleanest UX for the agent side; modest implementation cost for hiker.
+(The pending-op introspection tools above — `list_pending_proposals`, `get_pending_proposal`, `amend_pending_proposal` — are *not* registered; see `bug-mcp-pending-proposal-tools-unimplemented`.) Conditionally advertised: the mechanism is built for future tools that depend on backing features (trails, landmarks, collections, vision extractors) — each defines an `is_available()` predicate and the server filters at initialize time, so agents see a coherent capability set instead of calling tools that error with "feature not implemented." [mcp-dynamic-capabilities]
 
 
-## Lifecycle awareness
+## Lifecycle awareness (not yet implemented)
 
-By default, `search_notes`, `get_note`, and `related_notes` exclude notes with `hiker.archived` / `hiker.redacted` / `hiker.retired` set, per `design.md`'s lifecycle operations section. Agents can opt in via a `scope` parameter to include them when intentionally auditing or recovering history. **Redacted notes are returned as id + title only** — body and chunks unreachable via MCP regardless of scope. [mcp-lifecycle-aware]
-
-This is enforced in `core::search::query` and `core::store::get_note`, not at the MCP layer, so the same rules apply to the UI's search and any other consumer.
-
-In v3 these lifecycle fields aren't yet implemented in hiker (they're a deferred feature in `design.md`). The MCP server treats them as absent and returns everything; once lifecycle lands, the filter is automatic.
+The lifecycle fields are a deferred `design.md` feature; until they land the MCP server treats them as absent and returns everything. The intended behavior: `search_notes` / `get_note` / `related_notes` exclude notes with `hiker.archived` / `hiker.redacted` / `hiker.retired` by default, with a `scope` opt-in to include them; **redacted notes return id + title only** regardless of scope. Enforcement lives in `core::search::query` and `core::store::get_note` (not the MCP layer), so the same rules apply to UI search and any other consumer once built. [mcp-lifecycle-aware]
 
 
 ## Error model
@@ -326,57 +250,32 @@ discovery_file = ".hiker/mcp.json"   # vault-relative
 max_top_k = 50
 
 [mcp.tools]
-# Master gate kept for backwards-compat: when false, every write tool is
-# refused with `1004 disabled` regardless of the per-tool flags below.
+# Master write gate, kept for backwards-compat: when false, every write tool
+# is refused with `1004 disabled` regardless of the per-tool flags below.
 writes_enabled = true
 allow_redacted_lookup = false
 
-# Per-tool toggles. Default true. Independent of `writes_enabled` —
-# flipping this off hides the tool from `agent_tool_defs` and rejects
-# direct rmcp calls with `1004 disabled` even when `writes_enabled` is on.
-search_notes_enabled = true
-get_note_enabled = true
-related_notes_enabled = true
-get_active_note_enabled = true
-get_open_notes_enabled = true
-get_selection_enabled = true
-list_pending_proposals_enabled = true
-get_pending_proposal_enabled = true
-write_note_enabled = true
-edit_note_enabled = true
-set_frontmatter_enabled = true
-apply_tag_enabled = true
-remove_tag_enabled = true
-task_checkout_enabled = true
-task_submit_enabled = true
-task_fail_enabled = true
-task_heartbeat_enabled = true
-task_list_enabled = true
-propose_plugin_enabled = true
-install_plugin_enabled = true
+# Plus one `<tool>_enabled` toggle per registered tool (default true) —
+# every note read/write, every board tool, and every task_* tool (the full
+# list in core::config::sections::McpToolsConfig). Each is independent of
+# `writes_enabled`: flipping one off hides that tool from `agent_tool_defs`
+# and rejects direct rmcp calls with `1004 disabled` even when writes are on.
 
 [mcp.audit]
 log_full_input = false               # mirror of [llm.audit] log_full_prompt; default off
 ```
 
-Per-tool toggles apply live (a flip in the settings pane re-gates the next dispatch immediately, no vault restart). Bind-affecting changes — `enabled` / `host` / `port` / `discovery_file` / `max_top_k` / `audit.log_full_input` — trigger an in-place restart of the MCP server task: the existing handle drops (cancelling the axum task and removing the discovery file), then `hiker_mcp::start(...)` rebinds against the updated config. The restart is done from `set_setting` while keeping the vault session intact. [mcp-tool-toggles, mcp-server-restart-on-config-change, mcp-config-section]
+Per-tool toggles apply live (the next dispatch re-gates immediately, no restart). [mcp-tool-toggles] Bind-affecting changes — `enabled` / `host` / `port` / `discovery_file` / `max_top_k` / `audit.log_full_input` — trigger an in-place restart from `set_setting` (the handle drops, cancelling the axum task and removing the discovery file, then `hiker_mcp::start(...)` rebinds) while keeping the vault session intact. [mcp-server-restart-on-config-change, mcp-config-section]
 
 
 ## Settings UI section
 
-The settings pane (`settings-pane-section-list`) gets a dedicated `mcp` section with the schema above as interactive rows. [mcp-settings-ui-section]
+The settings pane (`settings-pane-section-list`) gets a dedicated `mcp` section rendering the schema above as interactive rows (Enabled, Port, Max top-k, Allow-redacted, Log-full-input, the per-tool toggles + `writes_enabled` gate, and a read-only Discovery-file path). [mcp-settings-ui-section] Two rows carry behavior beyond their bool:
 
-- **Enabled** — bool. Master gate; when off the server doesn't bind.
-- **Host** — string. Default `127.0.0.1`. The pane renders a warning row underneath when the value is anything other than `127.0.0.1` / `localhost` / `::1` so the user sees the LAN-exposure consequence right where they set it.
-- **Port** — positive integer (`0` = ephemeral). Restart-bound.
-- **Discovery file** — read-only display of the vault-relative path.
-- **Max top-k** — positive integer.
-- **Per-tool toggles** — one bool row per advertised tool (`write_note`, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag`, plus the read tools), plus the legacy `writes_enabled` master gate. Live-applied.
-- **Allow redacted lookup** — bool. Live-applied.
-- **Review required** — bool, default `true`. When on, every MCP tool-write produces ops with `status = pending` instead of writing directly. Live-applied. `[mcp.tools].review_required` per `agent-write-review-mode`; surfaced alongside the per-tool toggles so the user sees the gate right where they configure which write tools are on. Turning it off bypasses the inline patch-review UI — agent ops enter as `status = accepted` and reach disk on the next save-projection.
-- **Log full input** — bool, mirrors `llm.audit.log_full_prompt`. 
+- **Host** — the pane renders a warning row underneath when the value isn't `127.0.0.1` / `localhost` / `::1`, so the user sees the LAN-exposure consequence where they set it.
+- **Review required** — bool, default `true`, per `agent-write-review-mode`. When on, every MCP tool-write produces ops with `status = pending` instead of writing directly; off bypasses the inline patch-review UI (ops enter `accepted` and reach disk on the next save-projection). Surfaced alongside the per-tool toggles.
 
-Defaults to `vault` scope (matches the `[tasks]` section) — MCP config is per-vault by nature (the discovery file lives in the vault). User scope still works for users who want a global default; eligibility list mirrors the toml shape.
+Defaults to `vault` scope (the discovery file lives in the vault); user scope still works for a global default.
 
 Loader and validator land alongside the v3 milestone. Until then the section is unrecognized and `settings-strict-load` will refuse it. [mcp-config-section]
 
@@ -386,15 +285,14 @@ Loader and validator land alongside the v3 milestone. Until then the section is 
 - **stdio transport.** Standard for local MCP servers but conflicts with the "only when hiker is running" lifecycle constraint without ceremony. Deferred; if a concrete agent needs stdio, revisit.
 - **Old HTTP+SSE transport.** Being deprecated in MCP spec evolution. No reason to support both old and new HTTP shapes.
 - **Token-based auth.** Localhost-trust suffices for personal-machine-with-single-user. Token auth lands when a multi-user-machine or shared-host scenario is real. [mcp-token-auth-deferred]
-- **Long-running operation streaming.** None of the v3 tools are long-running — search, get_note, related_notes return synchronously; writes are fast. Reindex isn't an MCP-triggered operation. Streaming notifications are deferred until a tool genuinely needs them.
-- **Bulk write tools** (`move_note`, `delete_note`, `create_folder`). The agent enrichment cases v3 targets don't need them; the rollback story is simpler when writes are content-only.
+- **Long-running operation streaming.** No v3 tool is long-running (reads return synchronously, writes are fast); streaming notifications wait until a tool genuinely needs them.
 - **Cross-vault queries.** The MCP server is bound to one open vault. Multi-vault is `design.md`'s `search-multi-vault` deferred slug.
 
 
 ## Forward refs
 
 - `op-log.md` — the substrate. Agent writes are ops; rollback walks the log.
-- `core::activity` (`op-log.md` "History materialization") — thin projection over the op log; load-bearing for agent rollback UX. v3 ships them together.
+- `core::activity` (`op-log.md` "History materialization") — thin projection over the op log; load-bearing for agent rollback UX (no separate snapshot directory — agent writes are ops like any other, and the home-page agent-activity widget + detail view query this projection to render the feed and drive rollback). v3 ships them together. [mcp-rollback-via-changes]
 - `editor.md` vault home page — agent-activity widget + detail view consume the `core::changes` projection.
 - `llm.md` — interactive LLM features (chat over vault, vision OCR) flow through external ACP agents. Those agents are the typical MCP clients connecting to this server.
 - Future MCP tools (post-v3): trails-related (`list_trails` / `get_trail`), landmark-related (`list_landmarks`), collection-related (`list_collections` / `get_collection`), bulk write tools (`move_note` / `delete_note`), chunk-context (`expand_chunk` / `get_note_context`), streaming notifications. Each lands when its backing feature does, advertised dynamically.

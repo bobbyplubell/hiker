@@ -1,6 +1,6 @@
 # QA / evaluation
 
-How we validate retrieval quality and (later) auto-organization quality. Distinct from unit tests — those verify "the code does what we told it to do," this verifies "the results are useful." Build out only when there's actual content to evaluate against; premature eval infrastructure on a 0-note vault is wasted motion.
+How we validate retrieval quality and (later) auto-organization quality — eval verifies "the results are useful," distinct from unit tests (see "What this is *not*"). Build out only when there's actual content to evaluate against; premature eval infrastructure on a 0-note vault is wasted motion.
 
 
 ## Related-notes evaluation
@@ -22,7 +22,7 @@ Three layers, in build order:
     - research/sqlite-vec.md
 ```
 
-**The eval runner lives in the same external Python tool** (`tools/eval-synth/` or similar) that generates synthetic corpora — orchestrating gen + scoring + reporting in one place is cheaper than splitting them, and Python's plotting / reporting story is far ahead of Rust's. The Python tool calls into hiker for retrieval via a small CLI primitive (`hiker query <q>` initially) or via MCP once that's real (post-v3). Hiker doesn't grow a `hiker eval` subcommand. [eval-golden-set]
+**The eval runner lives in the same external Python tool** (`tools/eval-synth/`) that generates synthetic corpora — gen + scoring + reporting in one place. The tool calls into hiker for retrieval via a small CLI primitive (`hiker query <q>` initially) or via MCP once that's real (post-v3). Hiker doesn't grow a `hiker eval` subcommand. [eval-golden-set]
 
 The tool runs `related_notes(source)` for each entry and checks whether expected paths appear in top-k. Reports:
 
@@ -75,7 +75,7 @@ Cluster coherence as a secondary metric: per-cluster mean intra-distance vs near
 
 A personal vault starts empty, which means both the golden-set and the auto-org eval are starved for ground truth on day one. One way around this: generate synthetic notes across a spread of topics (e.g. ask an LLM for N notes across M domains, with intentional cross-links and near-duplicates) and use them as a seed corpus. [eval-synthetic-corpus]
 
-**Implementation: external Python script, not a hiker feature.** Synthetic-corpus generation is a one-off batch workload that doesn't fit hiker's LLM strategy (`llm.md`'s one-action-one-prompt rule for non-fan-out features) and doesn't earn its keep being implemented in Rust. The tool lives at `tools/eval-synth/` in this repo as a plain Python script with a `requirements.txt` next to it (no uv / poetry / packaging ceremony — `pip install -r tools/eval-synth/requirements.txt` once, then run the script). Uses litellm for multi-provider LLM access, writes notes into a vault directory, exits. Hiker indexes the resulting notes like any other content; nothing in `core/` knows about the generator. [eval-synth-tool]
+**Implementation: external Python script, not a hiker feature.** Synthetic-corpus generation is a one-off batch workload that doesn't fit hiker's LLM strategy (`llm.md`'s one-action-one-prompt rule for non-fan-out features) and doesn't earn its keep being implemented in Rust. The tool lives at `tools/eval-synth/` as a plain Python script with a `requirements.txt` next to it (no packaging ceremony). Uses litellm for multi-provider LLM access, writes notes into a vault directory, exits. Hiker indexes the resulting notes like any other content; nothing in `core/` knows about the generator. [eval-synth-tool]
 
 **v0 scope: corpus generation only.** The first slice of `tools/eval-synth/` is just `gen` — produce N notes across a topic taxonomy, write them as `.md` files into a target vault directory. Frontmatter stamps `hiker.provenance: synthetic-corpus` so generated notes are filterable as imported (per `design.md`'s authorship trichotomy). Runner / scoring / `recall@K` reporting wait on `cli-query` (the small hiker CLI primitive `eval-synth-tool` calls to run real queries against an indexed vault) — that's separate work in the hiker repo, deferred until the corpus generator is real and there's something concrete to score against. Thumbs feedback (`eval-thumbs-feedback`) is a different feature with its own UI surface and isn't part of this script's scope.
 
@@ -91,7 +91,6 @@ Caveats:
 
 - Synthetic notes don't capture the user's actual writing style, vocabulary quirks, or the long-tail "weird" notes that real vaults accumulate. Good-on-synthetic ≠ good-on-real.
 - Risk of over-fitting tuning choices to whatever the generator's distribution looks like. Treat synthetic scores as a *floor* (if it can't do this, it's broken) not a ceiling.
-- Keep the generator prompt and seed checked in so runs are reproducible.
 
 Build timing: opportunistic, but probably worth it *before* the golden-set on a real vault — it's the only way to get auto-org eval signal before the curated-tree feature has been used in anger.
 

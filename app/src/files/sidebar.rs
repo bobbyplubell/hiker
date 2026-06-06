@@ -5,7 +5,7 @@
 //! add-to-trail / set-active-trail / add-to-board / delete). Folder rows
 //! expand/collapse and accept drag-dropped paths to re-parent subtrees.
 //!
-//! Migrated onto the Files `Feature`'s `SidebarSurface`: rendering goes
+//! Migrated onto the Files `Activity`'s `View`: rendering goes
 //! through the narrow `feature::Ctx` instead of `&mut AppState`. The
 //! tree UI state lives in `AppState::file_tree_state` (reached via
 //! `ctx.state`); directory listings come from `ctx.vault`; the index /
@@ -20,7 +20,8 @@ use eframe::egui;
 
 use hiker_core::vault::{DirEntryDto, EntryKind};
 
-use crate::feature::Ctx;
+use crate::activity::Ctx;
+use crate::item_menu;
 use crate::state::{AppState, FileTreeState};
 use hiker_theme as theme;
 
@@ -29,11 +30,13 @@ use hiker_theme as theme;
 /// `&mut AppState` helpers don't fight the menu closure's `ui` borrow nor
 /// the narrow `Ctx` borrow.
 enum FileVerb {
-    Open,
+    /// A shared note-item base action (Open / Reveal-in-tree / Properties),
+    /// composed from [`item_menu::note_item_base`] so the universal verbs live
+    /// in one place (status: ctxmenu-item-base).
+    Base(item_menu::ItemAction),
     Rename,
     Duplicate,
     Reveal,
-    Properties,
     Reindex,
     AddToTrail { trail_name: String },
     SetActiveTrail,
@@ -54,9 +57,6 @@ enum FileVerb {
     /// Snapshot this trail-doc into a fresh `.canvas` and open it framed-to-fit.
     /// Only offered on `.hiker/trails/*.md` rows. status: canvas-export-trail-verb
     ExportTrailToCanvas,
-    /// Extract a non-md source into a `.md` sidecar and index it
-    /// (`extract-trigger-on-demand`).
-    MakeSearchable,
     /// Open a non-md source in the OS default handler
     /// (`extract-open-original-external`).
     OpenExternal,
@@ -318,8 +318,6 @@ impl FilesCtx<'_, '_> {
                 crate::panels::canvas::open(app, &rel);
             } else if is_board_doc(app, &rel) {
                 crate::panels::board::open(app, &rel);
-            } else if is_capture_doc(app, &rel) {
-                crate::panels::capture::open(app, &rel);
             } else {
                 crate::editor_pane::open_file(app, &rel, /* sticky */ false);
             }
@@ -371,13 +369,17 @@ impl FilesCtx<'_, '_> {
                 .as_ref()
                 .map(|(name, paths)| (name.clone(), paths.contains(rel)));
             let canvases = crate::panels::canvas::list_canvases(self.ctx.vault);
-            verb = file_menu_body(
+            if let Some(v) = egui_workbench::menu::show(
                 ui,
-                MenuArgs { rel, active_trail: &active_trail, board_doc },
-                &boards,
-                &membership,
-                &canvases,
-            );
+                build_file_menu(
+                    MenuArgs { rel, active_trail, board_doc },
+                    boards,
+                    membership,
+                    canvases,
+                ),
+            ) {
+                verb = Some(v);
+            }
         });
         verb
     }
@@ -433,19 +435,7 @@ fn refresh_deco(app: &mut AppState) {
         .map(|(p, _)| p.clone())
         .collect();
     let skipped = app.ui_cache.skipped_paths.clone();
-    let active_trail = app
-        .trails_state
-        .active_trail
-        .clone()
-        .filter(|id| app.trails_state.trails.iter().any(|t| &t.id == id))
-        .and_then(|tid| app.trails_state.trails.iter().find(|t| t.id == tid))
-        .map(|t| (t.name.clone(), collect_waypoint_paths(&t.waypoints)));
-    let trail_names = app
-        .trails_state
-        .trails
-        .iter()
-        .map(|t| t.name.to_lowercase())
-        .collect();
+    let (active_trail, trail_names) = trail_deco_snapshot(app);
     let deco = &mut app.file_tree_state.deco;
     deco.dirty = dirty;
     deco.skipped = skipped;
@@ -456,13 +446,12 @@ fn refresh_deco(app: &mut AppState) {
 /// Dispatch a context-menu verb against `AppState`.
 fn apply_file_verb(app: &mut AppState, verb: FileVerb, rel: &str) {
     match verb {
-        FileVerb::Open => crate::editor_pane::open_file(app, rel, true),
+        FileVerb::Base(action) => item_menu::apply_item_action(app, action, rel),
         // `Rename` is seeded inline in `run_file_verb` (egui memory); it
         // never reaches the deferred dispatch.
         FileVerb::Rename => {}
         FileVerb::Duplicate => duplicate_file(app, rel),
         FileVerb::Reveal => reveal_in_file_manager(app, rel),
-        FileVerb::Properties => open_properties(app, rel),
         FileVerb::Reindex => reindex_path(app, rel),
         FileVerb::AddToTrail { trail_name } => add_to_trail(app, rel, &trail_name),
         FileVerb::SetActiveTrail => set_active_trail(app, rel),
@@ -486,8 +475,7 @@ fn apply_file_verb(app: &mut AppState, verb: FileVerb, rel: &str) {
         }
         // status: canvas-export-trail-verb
         FileVerb::ExportTrailToCanvas => export_trail_to_canvas(app, rel),
-        FileVerb::MakeSearchable => crate::extract::make_searchable(app, rel),
-        FileVerb::OpenExternal => crate::extract::open_external(app, rel),
+        FileVerb::OpenExternal => crate::os_open::open_external(app, rel),
         FileVerb::Delete => {
             app.session.modal = Some(crate::state::Modal::ConfirmDelete {
                 path: rel.to_string(),
@@ -512,13 +500,52 @@ fn reindex_path(app: &mut AppState, rel: &str) {
     app.push_toast(format!("Reindexing {rel}"), crate::state::ToastLevel::Info);
 }
 
+/// Append `rel` as a waypoint of the active trail (parent `None` ⇒ append
+/// cursor) via the core verb on the frame's tokio runtime. No-op (with a
+/// toast) when no trail is active. status: trail-add-to-active-from-tree-verb
 fn add_to_trail(app: &mut AppState, rel: &str, trail_name: &str) {
-    crate::state::trail_append_waypoint(app, rel);
-    let _ = crate::bootstrap::save_trails(&app.vault_session.vault_root, &app.trails_state.trails);
-    app.push_toast(
-        format!("Added {rel} to '{trail_name}'"),
-        crate::state::ToastLevel::Info,
-    );
+    let Some(trail_rel) = app
+        .vault_session
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.vault.active_trail.clone())
+    else {
+        app.push_toast("No active trail", crate::state::ToastLevel::Info);
+        return;
+    };
+    let watcher = app.vault_session.services.watcher.clone();
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let log = app.vault_session.services.oplog.clone();
+    let vault = app.vault_session.vault.clone();
+    let (trail_rel_owned, rel_owned) = (trail_rel.clone(), rel.to_string());
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::trails::ops::append_waypoint(hiker_core::trails::ops::AppendWaypointArgs {
+                watcher: &watcher,
+                jobs: &jobs,
+                log: &log,
+                vault: &vault,
+                trail_doc_rel: &trail_rel_owned,
+                source_rel: &rel_owned,
+                parent_waypoint_path: None,
+                annotation: None,
+            })
+            .await
+            .map(|_| ())
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
+    };
+    match result {
+        Ok(()) => app.push_toast(
+            format!("Added {rel} to '{trail_name}'"),
+            crate::state::ToastLevel::Info,
+        ),
+        Err(e) => app.push_toast(
+            format!("Add to trail failed: {e}"),
+            crate::state::ToastLevel::Error,
+        ),
+    }
 }
 
 /// Snapshot the trail-doc at `rel` into a fresh `.canvas` (the core export
@@ -553,37 +580,38 @@ fn export_trail_to_canvas(app: &mut AppState, rel: &str) {
     }
 }
 
-/// Activate the trail whose name matches the doc basename (trail-doc paths
-/// live under `.hiker/trails/<name>.md`).
+/// Activate the trail-doc at `rel`: set `vault.active_trail` config and
+/// stamp the trail-doc's `hiker.last_activated_at`. The verb only appears
+/// on trail-doc rows, so `rel` is the trail-doc path itself.
+/// status: trail-set-as-active-context-verb
 fn set_active_trail(app: &mut AppState, rel: &str) {
-    let stem = rel
-        .rsplit('/')
-        .next()
-        .and_then(|n| n.strip_suffix(".md"))
-        .unwrap_or("");
-    let hit = app
-        .trails_state
-        .trails
-        .iter()
-        .find(|t| t.name.eq_ignore_ascii_case(stem))
-        .map(|t| (t.id.clone(), t.name.clone()));
-    match hit {
-        Some((tid, name)) => {
-            app.trails_state.active_trail = Some(tid);
-            crate::actions::ensure_panel_visible(app, crate::tab::PANEL_TRAILS);
-            app.push_toast(
-                format!("Activated trail {name}"),
-                crate::state::ToastLevel::Info,
-            );
+    let watcher = app.vault_session.services.watcher.clone();
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let vault = app.vault_session.vault.clone();
+    let rel_owned = rel.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let stamp = handle.block_on(async {
+            hiker_core::trails::ops::stamp_last_activated_at(&watcher, &jobs, &vault, &rel_owned)
+                .await
+        });
+        if let Err(e) = stamp {
+            tracing::warn!(error = %e, trail = %rel, "stamp last_activated_at failed");
         }
-        None => app.push_toast(
-            "No trail registered for this doc",
-            crate::state::ToastLevel::Info,
-        ),
     }
+    app.set_setting(
+        hiker_core::config::SettingsScope::Vault,
+        "vault.active_trail",
+        &serde_json::Value::String(rel.to_string()),
+        "Activate trail failed",
+    );
+    crate::actions::ensure_panel_visible(app, crate::tab::PANEL_TRAILS);
+    app.push_toast(
+        format!("Activated trail {}", trail_title(rel)),
+        crate::state::ToastLevel::Info,
+    );
 }
 
-fn open_properties(app: &mut AppState, rel: &str) {
+pub(crate) fn open_properties(app: &mut AppState, rel: &str) {
     use crate::tab::{Tab, TabKind};
     if let Some(existing) = app.session.tabs.iter().find(|t| match &t.kind {
         TabKind::Properties { path } => path == rel,
@@ -593,13 +621,11 @@ fn open_properties(app: &mut AppState, rel: &str) {
         return;
     }
     let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
+    app.session.tabs.push(Tab::new(
         id,
-        kind: TabKind::Properties {
-            path: rel.to_string(),
-        },
-        sticky: false,
-    });
+        TabKind::Properties { path: rel.to_string() },
+        false,
+    ));
     app.session.active_tab = Some(id);
     app.session.preview_tab = Some(id);
 }
@@ -816,113 +842,95 @@ fn repoint_open_buffer(app: &mut AppState, from: &str, to: &str) {
 // ----- free helpers (pure / UI) -----
 
 /// The precomputed per-row context the menu renders against (everything the
-/// pure-rendering `file_menu_body` can't reach through the narrow `Ctx`).
-#[derive(Clone, Copy)]
+/// pure-data `build_file_menu` can't reach through the narrow `Ctx`).
 struct MenuArgs<'a> {
     rel: &'a str,
-    active_trail: &'a Option<(String, bool)>,
+    active_trail: Option<(String, bool)>,
     board_doc: bool,
 }
 
-/// Build the body of the per-file context menu, returning the picked verb.
-/// Pure rendering — no `AppState` access; the `active_trail` / `boards` /
-/// `membership` / `canvases` reads are passed in precomputed.
-fn file_menu_body(
-    ui: &mut egui::Ui,
+/// Build the per-file context menu as a `egui_workbench::menu::Menu<FileVerb>`
+/// (status: ctxmenu-files). Pure data construction — no `AppState` access; the
+/// `active_trail` / `boards` / `membership` / `canvases` reads are gathered on
+/// menu-open and passed in (status: ctxmenu-build-on-open). The two pickers
+/// ("Add to board…", "Add to canvas…") render their own live nested
+/// `menu_button` widgets, so they ride `Custom` entries (status:
+/// ctxmenu-target-builder).
+fn build_file_menu(
     args: MenuArgs<'_>,
-    boards: &[crate::panels::board::PickerEntry],
-    membership: &std::collections::HashSet<String>,
-    canvases: &[(String, String)],
-) -> Option<FileVerb> {
+    boards: Vec<crate::panels::board::PickerEntry>,
+    membership: std::collections::HashSet<String>,
+    canvases: Vec<(String, String)>,
+) -> egui_workbench::menu::Menu<FileVerb> {
     let MenuArgs { rel, active_trail, board_doc } = args;
-    let mut verb = None;
-    for (label, made) in [
-        ("Open", FileVerb::Open),
-        ("Rename", FileVerb::Rename),
-        ("Duplicate", FileVerb::Duplicate),
-        ("Reveal in file manager", FileVerb::Reveal),
-        ("Properties", FileVerb::Properties),
-        ("Reindex this file", FileVerb::Reindex),
-    ] {
-        if ui.button(label).clicked() {
-            verb = Some(made);
-            ui.close();
-        }
-    }
-    // Non-markdown sources get the extraction affordances: "Make searchable"
-    // (extract a sidecar + index it) and "Open original externally" (hand the
-    // source to the OS handler — there is no in-app renderer). Indexable
-    // rows (`.md` / `.txt`) ride the ordinary ingest path and don't need
-    // them. See docs/extract.md.
+    // The universal Open / Copy-path / Properties verbs come from the shared
+    // base (status: ctxmenu-item-base); `reveal: false` because this list *is*
+    // the file tree, so "Reveal in file tree" would be redundant. The
+    // file-specific verbs follow in their own section. Note the base's Open and
+    // the file tree's own "Reveal in file manager" (the OS finder) are distinct.
+    let mut menu = item_menu::note_item_base(rel, item_menu::BaseOpts { reveal: false }, FileVerb::Base)
+        .section()
+        .action("Rename", FileVerb::Rename)
+        .action("Duplicate", FileVerb::Duplicate)
+        .action("Reveal in file manager", FileVerb::Reveal)
+        .action("Reindex this file", FileVerb::Reindex);
+    // Non-markdown sources the app has no in-app renderer for get the
+    // "Open original externally" affordance (hand the source to the OS
+    // handler). Indexable rows (`.md` / `.txt`) ride the ordinary ingest
+    // path and don't need it.
     if !hiker_core::indexer::is_indexable_path(rel) {
-        if ui.button("Make searchable").clicked() {
-            verb = Some(FileVerb::MakeSearchable);
-            ui.close();
-        }
-        if ui.button("Open original externally").clicked() {
-            verb = Some(FileVerb::OpenExternal);
-            ui.close();
-        }
+        menu = menu.action("Open original externally", FileVerb::OpenExternal);
     }
-    // Add-to-trail: only when a trail is active; disabled when `rel` is
-    // already a waypoint at any depth.
+    // Add-to-trail: only when a trail is active; disabled (with the
+    // "Already in '…'" label) when `rel` is already a waypoint at any depth.
     if let Some((trail_name, already)) = active_trail {
-        let label = if *already {
-            format!("Already in '{trail_name}'")
-        } else {
-            format!("Add to trail '{trail_name}'")
-        };
-        if ui
-            .add_enabled(!already, egui::Button::new(label))
-            .clicked()
-        {
-            verb = Some(FileVerb::AddToTrail {
+        let action = if already {
+            egui_workbench::menu::Action::new(format!("Already in '{trail_name}'"), FileVerb::AddToTrail {
                 trail_name: trail_name.clone(),
-            });
-            ui.close();
-        }
+            })
+            .enabled(egui_workbench::menu::Enabled::No("already a waypoint".into()))
+        } else {
+            egui_workbench::menu::Action::new(format!("Add to trail '{trail_name}'"), FileVerb::AddToTrail {
+                trail_name,
+            })
+        };
+        menu = menu.action_with(action);
     }
     // "Set as active trail" + "Export to canvas" — only on a `.hiker/trails/*.md`
     // row (the trail-doc detection). status: canvas-export-trail-verb
     if rel.starts_with(".hiker/trails/") && rel.ends_with(".md") {
-        if ui.button("Set as active trail").clicked() {
-            verb = Some(FileVerb::SetActiveTrail);
-            ui.close();
-        }
-        if ui.button("Export to canvas").clicked() {
-            verb = Some(FileVerb::ExportTrailToCanvas);
-            ui.close();
-        }
+        menu = menu
+            .action("Set as active trail", FileVerb::SetActiveTrail)
+            .action("Export to canvas", FileVerb::ExportTrailToCanvas);
     }
     // Board-docs get an explicit "Open as board" verb (the default click
     // already routes there).
-    if board_doc && ui.button("Open as board").clicked() {
-        verb = Some(FileVerb::OpenAsBoard);
-        ui.close();
+    if board_doc {
+        menu = menu.action("Open as board", FileVerb::OpenAsBoard);
     }
     // `.canvas` files: an explicit "Open as canvas" (the default click route)
     // and a "View as JSON" escape hatch that opens the raw text in the editor.
     // status: canvas-file-tree-glyph
     if is_canvas_doc(rel) {
-        if ui.button("Open as canvas").clicked() {
-            verb = Some(FileVerb::OpenAsCanvas);
-            ui.close();
-        }
-        if ui.button("View as JSON").clicked() {
-            verb = Some(FileVerb::ViewCanvasAsJson);
-            ui.close();
-        }
+        menu = menu
+            .action("Open as canvas", FileVerb::OpenAsCanvas)
+            .action("View as JSON", FileVerb::ViewCanvasAsJson);
     }
     // "Add to board…" on indexable note rows: a board → column nested
     // picker. Hidden on board-doc rows and non-`.md` rows; disabled
-    // per-board when the note is already a card.
+    // per-board when the note is already a card. The picker renders its own
+    // live nested widgets, so it rides a `Custom` entry.
     if !board_doc && rel.ends_with(".md") && !boards.is_empty() {
-        ui.menu_button("Add to board…", |ui| {
-            let mut pick: Option<(String, String)> = None;
-            crate::panels::board::column_picker(ui, boards, membership, &mut pick);
-            if let Some((board_rel, column)) = pick {
-                verb = Some(FileVerb::AddToBoard { board_rel, column });
-            }
+        menu = menu.custom(move |ui| {
+            let mut verb = None;
+            ui.menu_button("Add to board…", |ui| {
+                let mut pick: Option<(String, String)> = None;
+                crate::panels::board::column_picker(ui, &boards, &membership, &mut pick);
+                if let Some((board_rel, column)) = pick {
+                    verb = Some(FileVerb::AddToBoard { board_rel, column });
+                }
+            });
+            verb
         });
     }
     // "Add to canvas…" on non-`.canvas` rows: a nested picker listing every
@@ -931,34 +939,72 @@ fn file_menu_body(
     // hold the same note twice, so there's no already-present disabling.
     // status: canvas-add-to-canvas-verb
     if !is_canvas_doc(rel) && !canvases.is_empty() {
-        ui.menu_button("Add to canvas…", |ui| {
-            for (canvas_rel, title) in canvases {
-                if ui.button(title).clicked() {
-                    verb = Some(FileVerb::AddToCanvas { canvas_rel: canvas_rel.clone() });
-                    ui.close();
+        menu = menu.custom(move |ui| {
+            let mut verb = None;
+            ui.menu_button("Add to canvas…", |ui| {
+                for (canvas_rel, title) in &canvases {
+                    if ui.button(title).clicked() {
+                        verb = Some(FileVerb::AddToCanvas { canvas_rel: canvas_rel.clone() });
+                        ui.close();
+                    }
                 }
-            }
+            });
+            verb
         });
     }
-    if ui.button("Delete").clicked() {
-        verb = Some(FileVerb::Delete);
-        ui.close();
-    }
-    verb
+    menu.action("Delete", FileVerb::Delete)
 }
 
-/// Recursively collect every waypoint path in a forest into a flat set
-/// (used for the "already in trail" membership decoration).
-fn collect_waypoint_paths(waypoints: &[crate::state::Waypoint]) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    fn walk(ws: &[crate::state::Waypoint], out: &mut std::collections::HashSet<String>) {
-        for w in ws {
-            out.insert(w.path.clone());
-            walk(&w.children, out);
+/// Snapshot the trail decorations the file tree renders, read live from
+/// `core::trails`: the active trail's `(title, source-note-membership)`
+/// (from `vault.active_trail` config + `get_trail`) and every trail's
+/// lowercased title. Empty on a store-lock or config-lock failure.
+fn trail_deco_snapshot(
+    app: &AppState,
+) -> (Option<(String, std::collections::HashSet<String>)>, std::collections::HashSet<String>) {
+    let active_rel = app
+        .vault_session
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.vault.active_trail.clone());
+    let Ok(store) = app.vault_session.services.read_store.lock() else {
+        return (None, std::collections::HashSet::new());
+    };
+    let vault = &app.vault_session.vault;
+    let log = &app.vault_session.services.oplog;
+    let listing = hiker_core::trails::list(vault, &store, log).unwrap_or_default();
+    let trail_names = listing.iter().map(|t| t.title.to_lowercase()).collect();
+    let active_trail = active_rel
+        .filter(|rel| listing.iter().any(|t| &t.rel_path == rel))
+        .and_then(|rel| hiker_core::trails::get_trail(vault, &store, log, &rel).ok())
+        .map(|detail| {
+            let mut members = std::collections::HashSet::new();
+            collect_source_paths(&detail.waypoints, &mut members);
+            (trail_title(&detail.rel_path), members)
+        });
+    (active_trail, trail_names)
+}
+
+/// Trail-doc title (basename without `.md`).
+fn trail_title(rel: &str) -> String {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.strip_suffix(".md").unwrap_or(base).to_string()
+}
+
+/// Collect every resolved waypoint's source-note path (recursively) into
+/// `out` — the "already in active trail" membership set the file tree
+/// decorates source-note rows with.
+fn collect_source_paths(
+    waypoints: &[hiker_core::trails::ResolvedWaypoint],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for w in waypoints {
+        if !w.source_path.is_empty() {
+            out.insert(w.source_path.clone());
         }
+        collect_source_paths(&w.children, out);
     }
-    walk(waypoints, &mut out);
-    out
 }
 
 const fn sort_label(s: hiker_core::config::sections::TreeSortBy, compact: bool) -> &'static str {
@@ -1022,26 +1068,6 @@ fn canvas_glyph_marker(rel: &str) -> &'static str {
 /// status: canvas-file-tree-glyph
 fn is_canvas_doc(rel: &str) -> bool {
     rel.ends_with(".canvas")
-}
-
-/// True if the `.md` at `rel` is a capture-spec note (frontmatter
-/// `hiker.kind: capture` — a crawl job or RSS feed). Reads + parses the
-/// file — called on click / menu open, never per-frame. Routes the row to
-/// the capture form (`crawl-job-form`) rather than the raw markdown editor.
-fn is_capture_doc(app: &AppState, rel: &str) -> bool {
-    if !rel.ends_with(".md") {
-        return false;
-    }
-    app.vault_session
-        .vault
-        .read_file(rel)
-        .ok()
-        .and_then(|src| {
-            let split = hiker_core::frontmatter::split(&src);
-            let fm = split.frontmatter.as_ref()?;
-            Some(hiker_extract::capture::Spec::from_frontmatter(fm).is_ok())
-        })
-        .unwrap_or(false)
 }
 
 // ----- inline-rename draft storage in egui memory -----
@@ -1244,16 +1270,21 @@ mod sort_label_tests {
     }
 
     #[test]
-    fn waypoint_paths_collected_recursively() {
-        use crate::state::Waypoint;
-        let wp = |path: &str, children: Vec<Waypoint>| Waypoint {
-            path: path.to_string(),
-            at_ms: 0,
+    fn source_paths_collected_recursively() {
+        use hiker_core::trails::ops::ResolutionOutcome;
+        use hiker_core::trails::ResolvedWaypoint;
+        let wp = |source: &str, children: Vec<ResolvedWaypoint>| ResolvedWaypoint {
+            waypoint_rel: format!("trails/t/{source}--abc123.md"),
+            annotation_body: String::new(),
+            source_path: source.to_string(),
+            in_trail_path: "trails/t.md".to_string(),
+            resolution: ResolutionOutcome::Resolved { rel_path: source.to_string() },
             children,
-            annotation: String::new(),
+            tree_path: "1".to_string(),
         };
         let forest = vec![wp("a.md", vec![wp("b.md", vec![wp("c.md", vec![])])])];
-        let set = collect_waypoint_paths(&forest);
+        let mut set = std::collections::HashSet::new();
+        collect_source_paths(&forest, &mut set);
         assert!(set.contains("a.md") && set.contains("b.md") && set.contains("c.md"));
     }
 }

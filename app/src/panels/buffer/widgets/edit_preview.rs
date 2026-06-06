@@ -90,6 +90,12 @@ pub struct PreviewInputs<'a> {
     pub dpr: f32,
     /// `render_widgets && is_markdown` — the same gate the providers apply.
     pub gated: bool,
+    /// Persisted diagram-cache context (`<vault>/.hiker/diagram-cache`),
+    /// `None` when `[render] cache_diagrams` is off. The popup render reuses
+    /// the same disk cache as the in-place widget layer so a span that's been
+    /// rendered once on disk skips the resvg blit here too
+    /// (`widget-render-disk-cache`).
+    pub cache: Option<&'a super::disk_cache::DiagramCacheCtx>,
 }
 
 /// Paint the live edit-preview overlay if the main cursor reveals a math /
@@ -203,6 +209,7 @@ fn ensure_render(
         return true; // hit — no render, no raster, no upload
     }
 
+    let disk = inputs.cache;
     let rendered: Option<render::RenderedWidget> = match active.kind {
         PreviewKind::InlineMath | PreviewKind::DisplayMath => render::render_math(
             inner,
@@ -211,12 +218,13 @@ fn ensure_render(
             dpr,
             super::theme_fg(theme),
             "",
+            disk,
         ),
         PreviewKind::Mermaid => {
-            render::render_mermaid(inner, font_px, dpr, super::theme_mermaid_colors(theme))
+            render::render_mermaid(inner, font_px, dpr, super::theme_mermaid_colors(theme), disk)
         }
         PreviewKind::WaveDrom => {
-            render::render_wavedrom(inner, font_px, dpr, super::theme_wavedrom_colors(theme))
+            render::render_wavedrom(inner, font_px, dpr, super::theme_wavedrom_colors(theme), disk)
         }
     };
     let Some(rendered) = rendered else {
@@ -313,6 +321,7 @@ mod tests {
             font_px: 15.0,
             dpr: 1.0,
             gated: false,
+            cache: None,
         };
         let _ = ctx.run(Default::default(), |ctx| {
             show(&mut cache, ctx, &inputs);
@@ -376,6 +385,7 @@ mod tests {
             font_px: 15.0,
             dpr: 1.0,
             gated: true,
+            cache: None,
         };
         let _ = ctx.run(Default::default(), |ctx| show(&mut cache, ctx, &inputs));
         assert!(cache.texture.is_none(), "dismissed span builds no texture");
@@ -395,6 +405,7 @@ mod tests {
             font_px: 15.0,
             dpr: 1.0,
             gated: true,
+            cache: None,
         };
         let _ = ctx.run(Default::default(), |ctx| show(&mut cache, ctx, &inputs));
         assert!(cache.dismissed_anchor.is_none(), "leaving the span re-arms the popup");

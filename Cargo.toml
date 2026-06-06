@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "core",
     "hiker-sync",
-    "hiker-extract",
     "hiker-canvas/core",
     "hiker-canvas/view-core",
     "hiker-canvas/view",
@@ -16,6 +15,7 @@ members = [
     "hiker-features",
     "hiker-lite",
     "site",
+    "tools/diff-overlay-snapshot",
     "tools/graph-snapshot",
     "tools/minimap-render",
     "tools/profile-canvas",
@@ -23,16 +23,11 @@ members = [
     "tools/profile-scroll",
     "widgets/graph-widgets",
 ]
-# Example plugins compile to wasm32 (cdylib importing `hiker.host_call`), so
-# they're excluded from the host workspace build/test/clippy — they're built
-# separately with `cargo build --target wasm32-unknown-unknown`. Each carries
-# host-target unit tests for its pure logic (run from its own dir).
 # `hiker-crawler` is the JS-capable companion app (docs/hiker-crawler.md),
-# excluded for the same reason as the wasm `plugins`: its optional CEF engine
-# links a C++ Chromium FFI binding and bundles a multi-hundred-MB CEF
-# distribution, so it must build separately (`cd hiker-crawler && cargo run`)
-# and never block the workspace build / check.sh. Nothing in the workspace
-# depends on it (crawler-quarantine).
+# excluded because its optional CEF engine links a C++ Chromium FFI binding
+# and bundles a multi-hundred-MB CEF distribution, so it must build separately
+# (`cd hiker-crawler && cargo run`) and never block the workspace build /
+# check.sh. Nothing in the workspace depends on it (crawler-quarantine).
 # `editor`, `egui-workbench`, and `hiker-render` are git submodules with their
 # own workspace roots (standalone repos). They're consumed here as path
 # dependencies via `[workspace.dependencies]`, not as members — listing them
@@ -40,7 +35,7 @@ members = [
 # roots error). `hiker-render` supplies the egui-agnostic graph layout
 # (`hiker-graph`, wrapped by `widgets/graph-widgets`) and the from-scratch
 # HTML/CSS renderer (`hiker-htmlview`, used by the ZIM viewer).
-exclude = ["plugins", "hiker-crawler", "editor", "egui-workbench", "hiker-render"]
+exclude = ["hiker-crawler", "editor", "egui-workbench", "hiker-render"]
 
 [workspace.package]
 version = "0.0.0"
@@ -50,7 +45,6 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 hiker-core = { path = "core" }
-hiker-extract = { path = "hiker-extract" }
 hiker-canvas = { path = "hiker-canvas/core" }
 canvas-view-core = { path = "hiker-canvas/view-core" }
 # Shared LLM client extracted from core (status: crawler-shared-llm). Consumed
@@ -59,6 +53,9 @@ hiker-llm = { path = "hiker-llm" }
 # Shared egui theme extracted from the app (status: crawler-shared-theme) so the
 # app and hiker-crawler match colors/fonts/spacing exactly.
 hiker-theme = { path = "hiker-theme" }
+# Generalized context-menu layer (status: ctxmenu-crate). Pure-egui crate: a menu
+# is data (`Menu<A>`) rendered by one shared `show`. Consumed by `hiker-app` and
+# `canvas-view`.
 hiker-mcp-server = { path = "mcp-server" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -108,12 +105,6 @@ yrs = "0.26"
 # Vec<PendingOp> file (op-log-store-layout). 1.x keeps the serde-derive
 # path; 2.x's encode/decode-trait API would mean re-deriving every type.
 bincode = "1"
-# wasmi: pure-Rust WebAssembly interpreter for the plugin host
-# (`plugin-runtime-wasmi`). Chosen over wasmtime deliberately — no JIT /
-# Cranelift, a small auditable dependency tree that fits the clean-SBOM
-# posture in deny.toml. Confined behind the `WasmEngine` trait so the
-# engine is swappable later.
-wasmi = "1"
 
 # --- Editor widget (folded from egui_editor; standalone sub-crates) ---
 editor-core = { path = "editor/editor-core" }
@@ -200,3 +191,11 @@ opt-level = 3
 
 [workspace.lints.clippy]
 too_many_lines = "deny"
+
+[patch.crates-io]
+# Fork of winit 0.30.13 with upstream master's Wayland touchpad pinch cherry-picked
+# in (zwp_pointer_gestures_v1 -> WindowEvent::PinchGesture). Released winit 0.30.x
+# lacks it and master is 0.31-beta (incompatible with our egui 0.32/0.34 stack, which
+# pins winit ^0.30), so a 0.30-based fork is the only version-compatible path.
+# egui-winit maps PinchGesture -> zoom, giving canvas pinch-to-zoom for free.
+winit = { git = "ssh://git@github.com/bobbyplubell/winit.git", branch = "wayland-pinch-magnify" }

@@ -114,3 +114,34 @@ async fn no_referrers_is_a_noop() {
     assert_eq!(touched, 0, "no canvas references the moved note");
     assert_eq!(vault.read_file("board.canvas").unwrap(), CANVAS, "canvas byte-identical");
 }
+
+#[test]
+fn canvases_referencing_returns_only_canvases_with_a_matching_file_node() {
+    // status: canvas-appears-in
+    let td = TempDir::new().unwrap();
+    let vault = Vault::open(td.path()).unwrap();
+    // One canvas references old/path.md (+ other/keep.md); a second references
+    // only an unrelated note; a third is unparseable and must be skipped, not
+    // abort the scan.
+    write(&vault, "diagrams/board.canvas", CANVAS);
+    write(
+        &vault,
+        "diagrams/other.canvas",
+        r##"{"nodes":[{"id":"a","x":0,"y":0,"width":10,"height":10,"type":"file","file":"unrelated/note.md"}],"edges":[]}"##,
+    );
+    write(&vault, "diagrams/broken.canvas", "{ not valid json");
+
+    let hits = super::canvases_referencing(&vault, "old/path.md").unwrap();
+    assert_eq!(hits, vec!["diagrams/board.canvas".to_string()]);
+
+    // A second File node in the same canvas is matched independently.
+    let keep = super::canvases_referencing(&vault, "other/keep.md").unwrap();
+    assert_eq!(keep, vec!["diagrams/board.canvas".to_string()]);
+
+    // A note no canvas references yields nothing.
+    assert!(
+        super::canvases_referencing(&vault, "nobody/refs.md")
+            .unwrap()
+            .is_empty()
+    );
+}

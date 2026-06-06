@@ -387,6 +387,41 @@ pub(super) fn doc_recent_content_hashes(
     Ok(rows)
 }
 
+/// The `op_id` of the most-recent accepted op whose `content_hash` is one of
+/// `shared` — the op at which this doc's content last matched a content the
+/// peer also knows (its `recent_history_hashes`). That op's
+/// [`super::OpLog::materialize_at`] reconstruction is the common base for the
+/// same-region 3-way overlap test (`sync-conflict-detect-same-region`):
+/// "the most recent content whose hash appears in BOTH histories." `None` when
+/// no accepted op of this doc carries a shared hash (no common base — the fork
+/// path, left to enrollment classification). Newest-first by
+/// `timestamp_ms DESC, rowid DESC`, matching [`query_metadata`]'s order.
+///
+/// status: op-log-side-table
+pub(super) fn most_recent_shared_op_id(
+    conn: &Connection,
+    doc_id: &str,
+    shared: &std::collections::HashSet<String>,
+) -> Result<Option<String>, Error> {
+    if shared.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT op_id, content_hash FROM op_metadata \
+         WHERE doc_id = ?1 AND status = 'accepted' AND content_hash IS NOT NULL \
+         ORDER BY timestamp_ms DESC, rowid DESC",
+    )?;
+    let mut rows = stmt.query(params![doc_id])?;
+    while let Some(row) = rows.next()? {
+        let op_id: String = row.get(0)?;
+        let hash: String = row.get(1)?;
+        if shared.contains(&hash) {
+            return Ok(Some(op_id));
+        }
+    }
+    Ok(None)
+}
+
 /// GC: delete `op_metadata` rows of `status` older than `cutoff_ms`. Pending
 /// ops never auto-GC (they aren't in this table). Returns the deleted count.
 ///

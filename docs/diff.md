@@ -2,16 +2,13 @@
 
 A unified diff primitive plus the editor surfaces that consume it. Every diff in hiker — uncommitted-buffer diff, op-log history (via `core::changes`), pending agent ops, snapshot review — is the same `DiffLayer` rendered against an editor tab.
 
-The headline decisions:
-
-- **One primitive: `DiffLayer { base, current, owner }`.** Two text inputs in; hunks + intraline spans + decoration set out. The renderer is owner-agnostic. Hosted in the editor crate alongside the existing decoration primitives. [diff-layer]
-- **Diff is a mode of the editor tab, not a tab kind.** An editor tab carries an optional `diff: DiffSource`; when set, the tab renders the buffer's `current` text decorated by `DiffLayer(resolve(diff), current)`. Toggle is in the editor toolbar; no separate `BufferDiff` / `SnapshotPreview` / `StagingPreview` / `TrashPreview` tab kinds. [diff-as-mode]
-- **`DiffSource` enumerates where `base` comes from.** `Disk(path)`, `LiveBuffer(doc_id)`, `ChangeRow(op_id)`, `PendingOp(op_id)`, `Trash(trash_path)`, `Empty`. Each variant resolves to a `Rope` directly — no URI scheme indirection. [diff-source-enum]
-- **Owners drive UI affordances, not rendering.** The decoration set is identical across owners; what differs is per-hunk verbs (accept/reject for `Agent`, restore for `Snapshot`, none for `Index` or `Manual`). Verbs ride as overlay widgets on the hunk. [diff-layer-owner]
-- **Computation is pure; rendering is in the editor crate.** `core::diff::compute(before, after)` returns hunks with optional intraline spans. `editor-diff` turns hunks into a `DecorationSet` (line backgrounds, removed-line view zones, intraline marks). Side-by-side layout is a future view option on the same primitive, not a separate tab. [diff-core-module, diff-renderer, diff-viewer-split-view]
+- **Diff is a mode of the editor tab, not a tab kind.** A tab carries an optional `diff: DiffSource`; when set, it renders the buffer's `current` decorated by `DiffLayer(resolve(diff), current)`. Toggle is in the editor toolbar; no separate `BufferDiff` / `SnapshotPreview` / `StagingPreview` / `TrashPreview` tab kinds. [diff-as-mode]
+- **Computation is pure; rendering is in the editor crate.** `core::diff::compute(before, after)` returns hunks with optional intraline spans. `editor-diff` turns hunks into a `DecorationSet`. [diff-core-module, diff-renderer]
 
 
 ## DiffLayer
+
+The one primitive: two text inputs in, hunks + intraline spans + decoration set out, owner-agnostic. Hosted in the editor crate. [diff-layer]
 
 ```rust
 pub struct DiffLayer {
@@ -28,6 +25,8 @@ pub enum DiffOwner {
 }
 ```
 
+Owners drive UI affordances, not rendering — the decoration set is identical across owners; only the per-hunk verbs differ (above), riding as overlay widgets on the hunk. [diff-layer-owner]
+
 The layer recomputes hunks each frame from `(base, current)`. Cheap because the inputs are ropes and diff is line-based. No anchor bookkeeping across edits — the diff *is* the state.
 
 The decoration set the layer emits:
@@ -41,6 +40,8 @@ The decoration set the layer emits:
 
 ## DiffSource
 
+`DiffSource` enumerates where `base` comes from. Each variant resolves to a `Rope` directly — no URI scheme indirection — synchronously off existing services (`vault.read_file`, `app.buffers.get(doc_id)`, `changes.materialization_at(op_id)`, `oplog.pending_content(op_id)`, `vault.read_trash(path)`); no async, no caching layer; resolved each time the tab activates or its source is invalidated. [diff-source-enum]
+
 ```rust
 pub enum DiffSource {
     Disk(PathBuf),                  // on-disk text at read time
@@ -52,11 +53,9 @@ pub enum DiffSource {
 }
 ```
 
-Each variant resolves to a `Rope` synchronously off existing services (`vault.read_file`, `app.buffers.get(doc_id)`, `changes.materialization_at(op_id)`, `oplog.pending_content(op_id)`, `vault.read_trash(path)`). No async, no caching layer; resolved each time the tab activates or its source is invalidated.
+`LiveBuffer` is the "diff against another open buffer" affordance. The dirty-buffer diff is `base = Disk(path), current = live buffer`.
 
-`LiveBuffer` is the "diff against another open buffer" affordance — used by the dirty-buffer toggle (`base = LiveBuffer(self)` is wrong; the dirty-buffer diff is `base = Disk(path), current = live buffer`).
-
-`Empty` exists so trash entries — which have no current on-disk counterpart — can open in editor mode with `diff = Some(Empty)` greyed out, rather than special-casing the tab.
+`Empty` lets trash entries — which have no current on-disk counterpart — open in editor mode with `diff = Some(Empty)` greyed out, rather than special-casing the tab.
 
 
 ## Editor tab integration
@@ -69,12 +68,7 @@ A tab is `Editor { buffer, diff: Option<DiffSource> }` (the only buffer-backed k
 
 The buffer's `current` is whatever the buffer normally holds — its rope is unchanged by entering diff mode. Diff is a content lens, not a buffer swap. Cursor and selection survive toggling on and off.
 
-`owner_for(diff)` maps:
-- `Disk` / `LiveBuffer` → `Manual` (no per-hunk controls; user is just looking)
-- `ChangeRow` → `Snapshot` (per-hunk restore verb)
-- `PendingOp` → `Agent` (per-hunk accept/reject)
-- `Trash` → `Manual`
-- `Empty` → `Manual` (diff is empty anyway)
+`owner_for(diff)` maps: `Disk` / `LiveBuffer` / `Trash` / `Empty` → `Manual`; `ChangeRow` → `Snapshot`; `PendingOp` → `Agent`. (Verbs per the `DiffOwner` variants above.)
 
 `Agent` ownership is the inline patch-review path described in `patch-review.md`: the diff source isn't a single proposal — it's the buffer's `agent_base` (the disk text at the moment proposals were hydrated). That's not a `DiffSource` variant because it's a property of the buffer itself, not a chosen comparison target.
 

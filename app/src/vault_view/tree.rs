@@ -65,6 +65,81 @@ impl VaultNode {
     }
 }
 
+/// Derive a source-note path from a waypoint snapshot's `waypoint_path` alone.
+/// The snapshot is `<source-rel>--<rand6>.md` under `/waypoints/`, so the part
+/// after `/waypoints/` with the `--<rand6>.md` suffix stripped is the source.
+/// LOSSY: a snapshot stored without its source's directory (legacy `.md`
+/// waypoints were flattened to a bare basename) yields only the basename stem,
+/// with no directory and no original extension. [`resolve_waypoint_source`]
+/// re-resolves that against the note index to recover the real path.
+fn derive_snapshot_source(waypoint_path: &str) -> String {
+    let after = waypoint_path
+        .rsplit_once("/waypoints/")
+        .map_or(waypoint_path, |(_, rel)| rel);
+    let stem = after.strip_suffix(".md").unwrap_or(after);
+    match stem.rfind("--") {
+        Some(i) => stem[..i].to_string(),
+        None => stem.to_string(),
+    }
+}
+
+/// The real vault note a waypoint row points at, resolved against the indexed
+/// notes so the row opens / reveals / previews the live note instead of a dead
+/// path. Resolution order:
+///
+/// 1. The indexer-derived `source_path`, when it names an indexed note (the
+///    normal case: the waypoint-note's `hiker.references.path` was ingested).
+/// 2. The snapshot-filename derivation, when it itself names an indexed note
+///    (a snapshot that kept the source's directory + extension).
+/// 3. The note whose filename stem equals the derived basename — recovers the
+///    source when the snapshot flattened away its directory / extension. The
+///    `-<hash>` suffix the indexer stamps on note filenames keeps these unique.
+/// 4. Best effort: the non-empty `source_path`, else the raw derivation, so the
+///    row still labels even when nothing resolves (it just can't open/preview).
+///
+/// Without (2)/(3), waypoints in vaults whose `.hiker/trails/…` snapshots are
+/// gone (so `source_path` is empty) carried un-openable paths — a hover or
+/// click produced a "No such file" error. status: vault-view-trail-nesting
+fn resolve_waypoint_source(
+    wp: &WaypointRow,
+    by_path: &HashMap<&str, &NoteMetaRow>,
+    by_stem: &HashMap<String, &str>,
+) -> String {
+    if !wp.source_path.is_empty() && by_path.contains_key(wp.source_path.as_str()) {
+        return wp.source_path.clone();
+    }
+    let derived = derive_snapshot_source(&wp.waypoint_path);
+    if by_path.contains_key(derived.as_str()) {
+        return derived;
+    }
+    if let Some(path) = by_stem.get(&display_label(&derived)) {
+        return (*path).to_string();
+    }
+    if !wp.source_path.is_empty() {
+        return wp.source_path.clone();
+    }
+    derived
+}
+
+/// Index from a note's filename stem (basename minus the indexable extension,
+/// per [`display_label`]) to its vault path, keeping only stems that map to a
+/// single note. Powers step 3 of [`resolve_waypoint_source`]; ambiguous stems
+/// are dropped so a guess is never wrong.
+fn build_stem_index(notes: &[NoteMetaRow]) -> HashMap<String, &str> {
+    let mut by_stem: HashMap<String, &str> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for n in notes {
+        let stem = display_label(&n.path);
+        if by_stem.insert(stem.clone(), n.path.as_str()).is_some() {
+            ambiguous.insert(stem);
+        }
+    }
+    for s in &ambiguous {
+        by_stem.remove(s);
+    }
+    by_stem
+}
+
 /// Display label for a note path: filename with the indexable extension
 /// stripped. Sessions get a title+date label upstream (see `session_label`).
 fn display_label(path: &str) -> String {
@@ -141,6 +216,9 @@ pub fn build_composed(notes: &[NoteMetaRow], waypoints: &[WaypointRow]) -> Vec<V
         notes.iter().map(|n| (n.id.as_str(), n)).collect();
     let by_path: HashMap<&str, &NoteMetaRow> =
         notes.iter().map(|n| (n.path.as_str(), n)).collect();
+    // Filename-stem index so a trail waypoint whose snapshot path lost the
+    // source's directory can still resolve to the real note.
+    let by_stem = build_stem_index(notes);
 
     // Notes already placed under a parent/trail/source — excluded from the
     // top-level source-group pass so they appear exactly once.
@@ -148,7 +226,7 @@ pub fn build_composed(notes: &[NoteMetaRow], waypoints: &[WaypointRow]) -> Vec<V
 
     let mut roots: Vec<VaultNode> = Vec::new();
 
-    roots.extend(build_trail_nodes(waypoints, &by_id, &mut consumed));
+    roots.extend(build_trail_nodes(waypoints, &by_id, &by_path, &by_stem, &mut consumed));
     roots.extend(build_crawl_nodes(notes, &by_id, &mut consumed));
     roots.extend(build_sidecar_nodes(notes, &by_path, &mut consumed));
     roots.extend(build_source_groups(notes, &consumed));
@@ -161,6 +239,8 @@ pub fn build_composed(notes: &[NoteMetaRow], waypoints: &[WaypointRow]) -> Vec<V
 fn build_trail_nodes(
     waypoints: &[WaypointRow],
     by_id: &HashMap<&str, &NoteMetaRow>,
+    by_path: &HashMap<&str, &NoteMetaRow>,
+    by_stem: &HashMap<String, &str>,
     consumed: &mut HashSet<String>,
 ) -> Vec<VaultNode> {
     // Group waypoint rows by trail_id, preserving the store's
@@ -176,9 +256,13 @@ fn build_trail_nodes(
         // the source-group pass.
         let Some(trail_note) = by_id.get(trail_id) else { continue };
         consumed.insert(trail_note.path.clone());
-        let children = nest_waypoints(&rows);
+        let children = nest_waypoints(&rows, by_path, by_stem);
         for wp in &rows {
-            consumed.insert(wp.waypoint_path.clone());
+            // Consume the *source* note (the real vault note the waypoint
+            // captures), not the internal `.hiker/trails/…` snapshot pointer —
+            // so the note shows only under its trail, and its row opens/reveals
+            // the actual note rather than the un-openable snapshot file.
+            consumed.insert(resolve_waypoint_source(wp, by_path, by_stem));
         }
         out.push(VaultNode {
             label: display_label(&trail_note.path),
@@ -193,12 +277,20 @@ fn build_trail_nodes(
 /// Turn a flat, tree-path-ordered waypoint list into a nested forest by
 /// `parent_waypoint_id`. Rows arrive ordered by `tree_path`, so a parent
 /// always precedes its children and same-parent children keep reading order.
-fn nest_waypoints(rows: &[&WaypointRow]) -> Vec<VaultNode> {
+fn nest_waypoints(
+    rows: &[&WaypointRow],
+    by_path: &HashMap<&str, &NoteMetaRow>,
+    by_stem: &HashMap<String, &str>,
+) -> Vec<VaultNode> {
     // waypoint_id -> index into a flat node vec; build nodes, then splice
     // children into parents by id.
     let mut nodes: Vec<VaultNode> = rows
         .iter()
-        .map(|wp| VaultNode::leaf(&wp.waypoint_path, NodeKind::Waypoint))
+        // The node points at the source note (resolved via
+        // `resolve_waypoint_source`), so opening, revealing, copy-path, and
+        // Properties act on the real note — never the un-openable
+        // `.hiker/trails/…` snapshot pointer.
+        .map(|wp| VaultNode::leaf(&resolve_waypoint_source(wp, by_path, by_stem), NodeKind::Waypoint))
         .collect();
     let idx_of: HashMap<&str, usize> = rows
         .iter()
@@ -435,6 +527,55 @@ mod tests {
     }
 
     #[test]
+    fn derive_snapshot_source_strips_rand_suffix() {
+        // Snapshot that kept the source's dir + extension.
+        assert_eq!(
+            derive_snapshot_source(
+                ".hiker/trails/01ABC/waypoints/networking/tcp-deep-dive-abb4b0.txt--YHN2N2.md"
+            ),
+            "networking/tcp-deep-dive-abb4b0.txt"
+        );
+        // Flattened `.md` snapshot: only the basename stem survives (dir +
+        // original `.md` lost) — `resolve_waypoint_source` recovers the rest.
+        assert_eq!(
+            derive_snapshot_source(
+                ".hiker/trails/01ABC/waypoints/b-tree-index-anatomy-1a4b4e--DJAVGK.md"
+            ),
+            "b-tree-index-anatomy-1a4b4e"
+        );
+    }
+
+    #[test]
+    fn resolve_waypoint_source_recovers_real_note() {
+        let notes = vec![
+            note("A", "research/a.md"),
+            note("BT", "indexing/b-tree-index-anatomy-1a4b4e.md"),
+        ];
+        let by_path: HashMap<&str, &NoteMetaRow> =
+            notes.iter().map(|n| (n.path.as_str(), n)).collect();
+        let by_stem = build_stem_index(&notes);
+
+        // 1. source_path that names an indexed note → used verbatim.
+        let w = wp("T1", "w1", "research/a.md", None, "1");
+        assert_eq!(resolve_waypoint_source(&w, &by_path, &by_stem), "research/a.md");
+
+        // 2/3. Empty source_path + flattened snapshot filename → recovered by
+        // stem, restoring the lost `indexing/` directory + `.md` extension.
+        let mut w2 = wp("T1", "w2", "", None, "1");
+        w2.waypoint_path =
+            ".hiker/trails/01ABC/waypoints/b-tree-index-anatomy-1a4b4e--DJAVGK.md".into();
+        assert_eq!(
+            resolve_waypoint_source(&w2, &by_path, &by_stem),
+            "indexing/b-tree-index-anatomy-1a4b4e.md"
+        );
+
+        // 4. Nothing resolves → best-effort raw derivation (row still labels).
+        let mut w3 = wp("T1", "w3", "", None, "1");
+        w3.waypoint_path = ".hiker/trails/01ABC/waypoints/ghost-note-zzzzzz--QQQQQQ.md".into();
+        assert_eq!(resolve_waypoint_source(&w3, &by_path, &by_stem), "ghost-note-zzzzzz");
+    }
+
+    #[test]
     fn sidecar_source_detection() {
         assert_eq!(sidecar_source("docs/rm0090.pdf.md").as_deref(), Some("docs/rm0090.pdf"));
         assert_eq!(sidecar_source("clip.html.md").as_deref(), Some("clip.html"));
@@ -496,11 +637,13 @@ mod tests {
             .find(|n| n.kind == NodeKind::Trail)
             .expect("trail node");
         assert_eq!(t.children.len(), 2, "two root waypoints");
-        assert_eq!(t.children[0].path.as_deref(), Some("trails/t/w1.md"));
-        assert_eq!(t.children[1].path.as_deref(), Some("trails/t/w3.md"));
+        // Waypoint nodes carry the SOURCE note path, not the internal
+        // `.hiker/trails/…` snapshot pointer, so their rows open the real note.
+        assert_eq!(t.children[0].path.as_deref(), Some("research/a.md"));
+        assert_eq!(t.children[1].path.as_deref(), Some("research/c.md"));
         // w2 nests under w1 (the side trail), preserving order.
         assert_eq!(t.children[0].children.len(), 1);
-        assert_eq!(t.children[0].children[0].path.as_deref(), Some("trails/t/w2.md"));
+        assert_eq!(t.children[0].children[0].path.as_deref(), Some("research/b.md"));
     }
 
     #[test]

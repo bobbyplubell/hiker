@@ -2,13 +2,6 @@
 
 One shared autocomplete substrate behind every "type a few characters, pick a ranked candidate" surface in hiker: the editor's in-buffer `[[wikilink]]` completion, the chat composer's `@`-mention, and the standalone vault pickers (canvas **Insert from vault**, and board add-card as it adopts it). Today these are three separate implementations with duplicated ranking; this doc specs the package they converge on.
 
-The headline decisions:
-
-- **One ranking core, not three.** A single candidate-matching + scoring function (prefix / subsequence / word-boundary fuzzy over a label, basename-aware for vault paths) lives in one place and every surface calls it. It replaces the wikilink source's private `score_basename` and the chat composer's bespoke `@`-token scan. [autocomplete-shared-core]
-- **A candidate-source abstraction over the buffer-bound trait.** `editor-view`'s `CompletionSource` stays the in-buffer contract (it needs `EditorState` + a byte position), but its candidate-production half is factored onto a smaller `CandidateSource` (query string → ranked `CompletionItem`s) that the standalone picker and the in-buffer trait both build on. The matching/ranking is shared; only the *trigger + replace* differs between in-buffer and standalone. [autocomplete-candidate-source]
-- **A reusable popup-picker widget for standalone surfaces.** Surfaces that aren't inside a text buffer (the canvas insert picker; a future command-style picker) use one egui widget: a query field + a ranked, keyboard-navigable list (↑/↓, Enter, Esc), rendered as a popup/overlay, returning the chosen item. The in-buffer surfaces keep their inline anchored popup but share the same list rendering + key handling. [autocomplete-picker-widget]
-- **Vault notes + sources are one candidate source.** A `VaultSource` enumerates vault paths (notes and other indexed sources), ranked by the shared core, and feeds both the wikilink completion and the canvas/board pickers — so "what can I link / insert" is one definition, not re-derived per surface. [autocomplete-vault-source]
-
 
 ## Current state
 
@@ -42,6 +35,11 @@ Concrete sources:
 
 - **`VaultSource`** (`autocomplete-vault-source`) — vault notes + other indexed sources, enumerated from the vault/indexer and ranked by the shared core. The single definition of "linkable / insertable vault item," consumed by wikilink completion and the canvas/board pickers. A scope flag selects notes-only (wikilink) vs. notes + sources (canvas insert).
 - **`MentionSource`** (`autocomplete-mention`) — the chat `@`-mention candidates, migrated off the bespoke scan onto `VaultSource` + the shared core (the `@`-trigger token scan stays chat-specific; the ranking does not).
+
+
+## Picker widget
+
+`autocomplete-picker-widget` — surfaces not inside a text buffer (the canvas insert picker; a future command-style picker) use one egui widget: a query field + a ranked, keyboard-navigable list (↑/↓, Enter, Esc), rendered as a popup/overlay, returning the chosen item. The in-buffer surfaces keep their inline anchored popup but share the same list rendering + key handling.
 
 
 ## Consumers

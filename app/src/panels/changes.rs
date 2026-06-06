@@ -135,6 +135,21 @@ enum Action {
     Rollback { path: String },
 }
 
+/// Build the right-click menu for an activity-feed row (status: ctxmenu-changes).
+/// "View history" is always offered; "Roll back to previous version" only on
+/// change ops (pending rows have no committed version to revert).
+fn build_changes_row_menu(path: &str, is_change: bool) -> egui_workbench::menu::Menu<Action> {
+    let mut menu = egui_workbench::menu::Menu::new()
+        .action("View history for this note", Action::ViewHistory(path.to_string()));
+    if is_change {
+        menu = menu.action(
+            "Roll back to previous version",
+            Action::Rollback { path: path.to_string() },
+        );
+    }
+    menu
+}
+
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
     ui.heading("Changes");
     ui.add_space(2.0);
@@ -344,20 +359,12 @@ impl AppState {
             }
             let row_path = row.path.clone();
             let is_change = matches!(&row.payload, Payload::Change(_));
-            open_resp.context_menu(|ui| {
-                if ui.button("View history for this note").clicked() {
-                    action = Some(Action::ViewHistory(row_path.clone()));
-                    ui.close();
-                }
-                if is_change
-                    && ui.button("Roll back to previous version").clicked()
-                {
-                    action = Some(Action::Rollback {
-                        path: row_path.clone(),
-                    });
-                    ui.close();
-                }
-            });
+            let mut chosen = None;
+            open_resp
+                .context_menu(|ui| chosen = egui_workbench::menu::show(ui, build_changes_row_menu(&row_path, is_change)));
+            if let Some(picked) = chosen {
+                action = Some(picked);
+            }
         });
         action
     }
@@ -380,11 +387,11 @@ impl AppState {
                     self.session.active_tab = Some(existing.id);
                 } else {
                     let id = self.next_tab_id();
-                    self.session.tabs.push(Tab {
+                    self.session.tabs.push(Tab::new(
                         id,
-                        kind: TabKind::version_preview(path, op_id),
-                        sticky: true,
-                    });
+                        TabKind::version_preview(path, op_id),
+                        true,
+                    ));
                     self.session.active_tab = Some(id);
                 }
             }

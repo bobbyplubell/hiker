@@ -36,12 +36,14 @@ use editor_core::theme::Theme;
 use editor_md::diagrams::{mermaid_spans, wavedrom_spans};
 use editor_md::equations::{MathKind as SpanKind, math_spans};
 
+pub mod disk_cache;
 pub mod edit_preview;
-mod render;
+pub(crate) mod render;
 pub mod tables;
 
 use std::collections::HashMap;
 
+use disk_cache::DiagramCacheCtx;
 use editor_core::decoration::WidgetClickRegion;
 use render::{
     DiagramRegion, MathKind, MermaidColors, RenderedWidget, WaveDromColors, mermaid_regions,
@@ -274,6 +276,7 @@ pub fn math_widget_decorations(
     viewport: Option<&std::ops::Range<usize>>,
     font_px: f32,
     dpr: f32,
+    cache: Option<&DiagramCacheCtx>,
 ) -> DecorationSet {
     let fg = theme_fg(theme);
     let total_lines = state.doc.len_lines();
@@ -301,7 +304,7 @@ pub fn math_widget_decorations(
                     continue;
                 }
                 let src = &state.doc.to_string()[span.inner_range.clone()];
-                let Some(rendered) = render_math(src, MathKind::Inline, font_px, dpr, fg, "")
+                let Some(rendered) = render_math(src, MathKind::Inline, font_px, dpr, fg, "", cache)
                 else {
                     continue; // parse failure → fall back to the source mark
                 };
@@ -325,7 +328,7 @@ pub fn math_widget_decorations(
                     continue;
                 }
                 let src = &state.doc.to_string()[span.inner_range.clone()];
-                let Some(rendered) = render_math(src, MathKind::Display, font_px, dpr, fg, "")
+                let Some(rendered) = render_math(src, MathKind::Display, font_px, dpr, fg, "", cache)
                 else {
                     continue;
                 };
@@ -358,6 +361,7 @@ pub fn mermaid_widget_decorations(
     viewport: Option<&std::ops::Range<usize>>,
     font_px: f32,
     dpr: f32,
+    cache: Option<&DiagramCacheCtx>,
 ) -> DecorationSet {
     let colors = theme_mermaid_colors(theme);
     let total_lines = state.doc.len_lines();
@@ -383,7 +387,8 @@ pub fn mermaid_widget_decorations(
             continue;
         }
         let src = &state.doc.to_string()[span.inner_range.clone()];
-        let Some((rendered, regions)) = render_mermaid_with_regions(src, font_px, dpr, colors)
+        let Some((rendered, regions)) =
+            render_mermaid_with_regions(src, font_px, dpr, colors, cache)
         else {
             continue; // parse / unsupported-type failure → fall back to the mark
         };
@@ -415,6 +420,7 @@ pub fn wavedrom_widget_decorations(
     viewport: Option<&std::ops::Range<usize>>,
     font_px: f32,
     dpr: f32,
+    cache: Option<&DiagramCacheCtx>,
 ) -> DecorationSet {
     let colors = theme_wavedrom_colors(theme);
     let total_lines = state.doc.len_lines();
@@ -435,7 +441,7 @@ pub fn wavedrom_widget_decorations(
             continue;
         }
         let src = &state.doc.to_string()[span.inner_range.clone()];
-        let Some(rendered) = render_wavedrom(src, font_px, dpr, colors) else {
+        let Some(rendered) = render_wavedrom(src, font_px, dpr, colors, cache) else {
             continue; // parse / unsupported failure → fall back to the mark
         };
         emit_block_widget(
@@ -908,7 +914,7 @@ mod tests {
     const FONT: f32 = 15.0;
 
     fn deco_count(state: &EditorState) -> (usize, usize) {
-        let set = math_widget_decorations(state, None, None, FONT, DPR);
+        let set = math_widget_decorations(state, None, None, FONT, DPR, None);
         let mut inline = 0;
         let mut block = 0;
         for (_, d) in set.iter_all() {
@@ -926,7 +932,7 @@ mod tests {
     /// block here (the live preview is the floating overlay, not a `Below`
     /// block). status: widget-edit-popup-preview
     fn math_block_sides(state: &EditorState) -> (usize, usize) {
-        let set = math_widget_decorations(state, None, None, FONT, DPR);
+        let set = math_widget_decorations(state, None, None, FONT, DPR, None);
         block_sides(&set)
     }
 
@@ -997,7 +1003,7 @@ mod tests {
     fn display_widget_and_hide_emitted_when_cursor_elsewhere() {
         let src = "intro\n\n$$\n\\int_0^1 x\\,dx\n$$\n\nmore\n";
         let state = EditorState::new(src);
-        let set = math_widget_decorations(&state, None, None, FONT, DPR);
+        let set = math_widget_decorations(&state, None, None, FONT, DPR, None);
         let mut block = 0;
         let mut hides = 0;
         for (_, d) in set.iter_all() {
@@ -1022,7 +1028,7 @@ mod tests {
         let mut state = EditorState::new(src);
         let inside = src.find("\\int").unwrap();
         state.selection = Selection::single(inside);
-        let set = math_widget_decorations(&state, None, None, FONT, DPR);
+        let set = math_widget_decorations(&state, None, None, FONT, DPR, None);
         let mut hides = 0;
         for (_, d) in set.iter_all() {
             if let Decoration::Line(LineStyle { hide: true, .. }) = d {
@@ -1050,7 +1056,7 @@ mod tests {
     /// (block widgets, hide lines) for the mermaid provider, mirroring
     /// `deco_count`.
     fn mermaid_counts(state: &EditorState) -> (usize, usize) {
-        let set = mermaid_widget_decorations(state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(state, None, None, FONT, DPR, None);
         let mut block = 0;
         let mut hides = 0;
         for (_, d) in set.iter_all() {
@@ -1070,7 +1076,7 @@ mod tests {
         let (block, hides) = mermaid_counts(&state);
         assert_eq!(block, 1, "one mermaid block widget when cursor is away");
         assert!(hides >= 3, "all fence lines of the block are hidden");
-        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let (above, below) = block_sides(&set);
         assert_eq!((above, below), (1, 0), "in-place render is an Above block");
     }
@@ -1084,7 +1090,7 @@ mod tests {
         let mut state = EditorState::new(src);
         let inside = src.find("not a real").unwrap();
         state.selection = Selection::single(inside);
-        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let (above, below) = block_sides(&set);
         assert_eq!((above, below), (0, 0), "no in-place / below block when revealed");
     }
@@ -1098,7 +1104,7 @@ mod tests {
         let mut state = EditorState::new(src);
         let inside = src.find("graph TD").unwrap();
         state.selection = Selection::single(inside);
-        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let mut hides = 0;
         for (_, d) in set.iter_all() {
             if let Decoration::Line(LineStyle { hide: true, .. }) = d {
@@ -1148,7 +1154,7 @@ mod tests {
 
         // The decoration provider builds a MermaidWidget whose click_regions()
         // emits exactly that id for the linked node.
-        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let ids: Vec<u64> = set
             .iter_all()
             .filter_map(|(_, d)| match d {
@@ -1174,7 +1180,7 @@ mod tests {
         let state = EditorState::new(src);
 
         // The widget id the painter emits for a body click == the render hash.
-        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR);
+        let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let widget_id = set
             .iter_all()
             .find_map(|(_, d)| match d {
@@ -1213,7 +1219,7 @@ mod tests {
         // too, so its body click routes through the same map.
         let src = "intro\n\n$$\n\\int_0^1 x\\,dx\n$$\n\nmore\n";
         let state = EditorState::new(src);
-        let set = math_widget_decorations(&state, None, None, FONT, DPR);
+        let set = math_widget_decorations(&state, None, None, FONT, DPR, None);
         let widget_id = set
             .iter_all()
             .find_map(|(_, d)| match d {
@@ -1402,7 +1408,7 @@ mod tests {
     /// (block widgets, hide lines) for the wavedrom provider, mirroring
     /// `mermaid_counts`.
     fn wavedrom_counts(state: &EditorState) -> (usize, usize) {
-        let set = wavedrom_widget_decorations(state, None, None, FONT, DPR);
+        let set = wavedrom_widget_decorations(state, None, None, FONT, DPR, None);
         let mut block = 0;
         let mut hides = 0;
         for (_, d) in set.iter_all() {
@@ -1426,7 +1432,7 @@ mod tests {
         let (block, hides) = wavedrom_counts(&state);
         assert_eq!(block, 1, "one wavedrom block widget when cursor is away");
         assert!(hides >= 3, "all fence lines of the block are hidden");
-        let set = wavedrom_widget_decorations(&state, None, None, FONT, DPR);
+        let set = wavedrom_widget_decorations(&state, None, None, FONT, DPR, None);
         let (above, below) = block_sides(&set);
         assert_eq!((above, below), (1, 0), "in-place render is an Above block");
     }
@@ -1470,7 +1476,7 @@ mod tests {
         // wavedrom block resolves (via its content_hash) to an offset inside the
         // fence span, so the caret lands there and reveals the source.
         let state = EditorState::new(WAVEDROM_SRC);
-        let set = wavedrom_widget_decorations(&state, None, None, FONT, DPR);
+        let set = wavedrom_widget_decorations(&state, None, None, FONT, DPR, None);
         let widget_id = set
             .iter_all()
             .find_map(|(_, d)| match d {

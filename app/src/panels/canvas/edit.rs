@@ -294,6 +294,9 @@ fn render_text_widget(
         highlight_trailing_whitespace: false,
         diff: None,
         resolve_title: None,
+        // Canvas node editing renders through the in-memory caches only.
+        // status: widget-render-disk-cache
+        diagram_cache: None,
     };
     let mut rebuild = |state: &EditorState, view: &mut ViewState| {
         rebuild_editor_decorations(state, view, &mut deco_ctx);

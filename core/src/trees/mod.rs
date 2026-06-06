@@ -1,14 +1,17 @@
 //! Cluster-tree store. See `docs/cluster-editor.md` §"Tree storage:
 //! per-tree `.md` files" and `docs/clustering.md` for the full spec.
 //!
-//! `core::trees` owns the per-tree markdown documents under
-//! `vault/.hiker/trees/<tree-id>.md` (`trees-md-store`). The full structure
-//! lives in the `hiker` frontmatter; edits load the tree, mutate it in
-//! memory, and rewrite only the frontmatter fence through the op-log working
-//! layer — each edit lands as a `SetFrontmatter` op. Mirrors the
-//! module-discipline pattern of `core::trails`: all frontmatter
-//! (de)serialization stays behind this boundary, callers consume plain Rust
-//! types only. No SQLite, no schema-version file, no migration code.
+//! `core::trees` owns the per-tree markdown documents at a visible vault path
+//! (`{new_cluster_tree_dir}/<tree-id>.md`, default `cluster-trees/`,
+//! `trees-md-store` / `cluster-tree-visible-note`), discovered by the
+//! `hiker.kind: cluster-tree` frontmatter query. The full structure lives in
+//! the `hiker` frontmatter; edits load the tree, mutate it in memory, and
+//! rewrite only the frontmatter fence through the op-log working layer — each
+//! edit lands as a `SetFrontmatter` op. Mirrors the module-discipline pattern
+//! of `core::trails`: all frontmatter (de)serialization stays behind this
+//! boundary, callers consume plain Rust types only. No SQLite, no
+//! schema-version file. A one-time migration (`cluster-tree-migration`)
+//! relocates legacy `.hiker/trees/<id>.md` trees on first open.
 //!
 //! Submodule layout (per `trees-module-discipline`):
 //!

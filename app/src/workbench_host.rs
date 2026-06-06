@@ -1,7 +1,7 @@
 //! Hiker ↔ `egui_workbench` bridge.
 //!
 //! Owns the host-side `Workbench` integration: the per-frame `Host`
-//! adapter (activity modes are feature ids, sourced from the registry),
+//! adapter (activity modes are activity ids, sourced from the registry),
 //! and the sync helper that
 //! keeps `AppState::session.tabs` (the canonical list of open buffers
 //! and pages) in lock-step with the workbench's editor area.
@@ -26,7 +26,7 @@ use egui_workbench::theme::Palette;
 use crate::panels;
 use crate::clusters;
 use crate::state::AppState;
-use crate::tab::{PANEL_CHAT, TabId, TabKind};
+use crate::tab::{TabId, TabKind};
 
 /// View-model for an editor tab inside the workbench. Carries a
 /// `TabId` pointer back into `Session::tabs` plus enough cached state
@@ -79,7 +79,7 @@ pub fn sync_workbench_tabs(&mut self) {
     }
     let active_id = app.session.active_tab;
     let preview_id = app.session.preview_tab;
-    let want: Vec<Want> = app
+    let mut want: Vec<Want> = app
         .session
         .tabs
         .iter()
@@ -100,7 +100,14 @@ pub fn sync_workbench_tabs(&mut self) {
                 dirty,
                 state,
                 is_active: Some(t.id) == active_id,
-                edge_to_edge: matches!(t.kind, crate::tab::TabKind::Editor { .. }),
+                // Tabs that paint their own full-bleed surface (the markdown
+                // editor + status strip; the canvas with its header + board)
+                // skip the workbench pane inset so the host bg doesn't frame
+                // them with a contrasting border.
+                edge_to_edge: matches!(
+                    t.kind,
+                    crate::tab::TabKind::Editor { .. } | crate::tab::TabKind::Canvas { .. }
+                ),
             }
         })
         .collect();
@@ -110,6 +117,26 @@ pub fn sync_workbench_tabs(&mut self) {
         std::collections::HashMap::new();
     for (handle, tab) in app.workbench.iter_tabs() {
         existing.insert(tab.id, handle);
+    }
+
+    // Attention badge on the Sync tab: decorate its label with a warning glyph
+    // + count of items needing the user (blocked docs + held content-key change
+    // + a surfaced last-error). Quiet (no suffix) when healthy. Tab labels are
+    // plain text, so we mirror the toolbar's red-badge INTENT as a "(!) N" suffix
+    // rather than a per-glyph background. ASCII marker — egui's default font
+    // tofus U+26A0. status: sync-attention-badge
+    if let Some(service) = app.vault_session.services.sync.clone() {
+        let count = service.state_snapshot().attention_count();
+        if count > 0 {
+            for w in &mut want {
+                if matches!(
+                    app.tab_by_id(w.id).map(|t| &t.kind),
+                    Some(crate::tab::TabKind::Sync)
+                ) {
+                    w.label = format!("{} (!) {count}", w.label);
+                }
+            }
+        }
     }
 
     let want_ids: std::collections::HashSet<TabId> =
@@ -168,6 +195,27 @@ pub fn sync_workbench_tabs(&mut self) {
         app.workbench.set_active(handle);
     }
 }
+
+/// Hiker's `TabId` of the active tab inside the given editor `group`, if any.
+/// Resolves the workbench's active-tab *handle* in that group back to the
+/// `HikerWbTab` payload's `TabId` — the FOLLOW seam a linked viz tab reads
+/// each frame to learn "what note is active over there". status: tab-linking
+pub fn active_tab_in_group(
+    &self,
+    group: egui_workbench::workspace::GroupId,
+) -> Option<TabId> {
+    let handle = self.workbench.active_tab_in_group(group)?;
+    self.workbench.editor_area.get(handle).map(|t| t.id)
+}
+
+/// The editor group currently holding hiker tab `id`, if it is mirrored into
+/// the workbench. Resolves `id` to its workbench handle first, then asks the
+/// workbench which group that handle lives in — the basis for a
+/// tab-targeted DRIVE link. status: tab-linking
+pub fn group_of_tab(&self, id: TabId) -> Option<egui_workbench::workspace::GroupId> {
+    let handle = self.workbench.editor_area.handle_for(|t| t.id == id)?;
+    self.workbench.group_of(handle)
+}
 }
 
 /// Per-frame `Host` adapter. Lives only for the duration
@@ -221,15 +269,15 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     }
 
     fn activity_items(&self) -> Vec<Item<String>> {
-        // Activity bar = the registry's PRIMARY features, in registry
-        // order. `primary_activity()` excludes secondary-dock-only
-        // features (chat). Each item's mode is the feature id; its
-        // icon/label come straight from the feature.
+        // Activity bar = the registry's activity-bar activities, in
+        // registry order. `on_activity_bar()` excludes secondary-dock-only
+        // activities (chat). Each item's mode is the activity id; its
+        // icon/label come straight from the activity.
         // [feature-consumer-activity-bar]
         self.app
-            .features
+            .activities
             .iter()
-            .filter(|f| f.primary_activity())
+            .filter(|f| f.on_activity_bar())
             .map(|f| Item {
                 label: f.label().to_string(),
                 icon: Some(f.icon()),
@@ -240,53 +288,79 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     }
 
     fn side_bar_title(&self, mode: &String) -> egui::WidgetText {
-        self.app
-            .features
-            .by_id(mode)
-            .map_or_else(|| mode.clone().into(), |f| f.label().to_string().into())
+        // A top-level activity id resolves to its label directly. A multi-view
+        // container sub-view arrives as a slashed wire id (`"context/appears-in"`)
+        // that isn't itself an activity, so title-case the view key for the
+        // section header instead of showing the raw id. [feature-multi-region-sidebar]
+        if let Some(f) = self.app.activities.by_id(mode) {
+            return f.label().to_string().into();
+        }
+        let (_, view_key) = crate::activity::split_view_id(mode);
+        titleize(view_key).into()
     }
 
     fn side_bar_ui(&mut self, ui: &mut egui::Ui, mode: &String) {
         let _g = crate::profiling::FrameProf::guard("wb:side_bar");
-        let panel_id = mode.as_str();
-        // Every sidebar mode is now a registered Feature with a real
-        // `SidebarSurface`: render through the narrow `feature::Ctx`, then
+        // `mode` is a `ViewId`; resolve its activity, then its view.
+        // Every sidebar mode is now a registered Activity with at least
+        // one `View`: render through the narrow `activity::Ctx`, then
         // drain its deferred effects with full `&mut AppState`. The old
         // `panels_registry` fallback was retired once Files (the last
         // hardcoded panel) migrated. [feature-consumer-sidebar]
-        let feature = self.app.features.by_id(panel_id).cloned();
-        match feature.as_ref().and_then(|f| f.sidebar()) {
-            Some(sidebar) => {
-                let mut effects: Vec<crate::feature::Effect> = Vec::new();
-                crate::feature::with_ctx(self.app, panel_id, &mut effects, |ctx| {
-                    sidebar.render(ui, ctx);
+        let (activity_id, view_key) = crate::activity::split_view_id(mode);
+        let activity = self.app.activities.by_id(activity_id).cloned();
+        let view = activity
+            .as_ref()
+            .and_then(|a| a.views().into_iter().find(|v| v.id() == view_key));
+        match view {
+            Some(view) => {
+                let state_key = view.state_key();
+                let mut effects: Vec<crate::activity::Effect> = Vec::new();
+                crate::activity::with_ctx(self.app, state_key, &mut effects, |ctx| {
+                    view.render(ui, ctx);
                 });
                 for eff in effects {
                     eff(self.app);
                 }
             }
             None => {
-                ui.weak(format!("(panel '{panel_id}' has no sidebar surface)"));
+                ui.weak(format!("(panel '{mode}' has no view)"));
             }
         }
     }
 
 
+    fn container_views(&self, container: &String) -> Vec<String> {
+        // Resolve the container to its activity and return its ordered
+        // wire view-ids (slashed for multi-view containers). Unknown ids
+        // fall back to the bare container id. [feature-multi-region-sidebar]
+        self.app.activities.by_id(container).map_or_else(
+            || vec![container.clone()],
+            |a| {
+                let views: Vec<String> = a.views().iter().map(|v| a.view_id(*v)).collect();
+                if views.is_empty() { vec![container.clone()] } else { views }
+            },
+        )
+    }
+
+    fn container_location(&self, container: &String) -> egui_workbench::side_bar::Location {
+        self.app
+            .activities
+            .by_id(container)
+            .map_or(egui_workbench::side_bar::Location::LeftBar, |a| {
+                a.default_location()
+            })
+    }
+
     fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &String) {
+        if mode == "chat" {
+            self.chat_action_buttons(ui);
+            return;
+        }
         if mode == "files" {
-            // Left-click → new note; right-click → cross-type picker
-            // (note / board), per `sidebar-new-item-button`.
-            // status: board-create
-            let resp = ui
-                .add(
-                    egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus))
-                        .small(),
-                )
-                .on_hover_text("New note (right-click for more)");
-            if resp.clicked() {
-                self.app.new_note();
-            }
-            resp.context_menu(|ui| {
+            // `+` split-button: primary mints a note; the caret dropdown picks
+            // any document type. status: sidebar-new-item-button, split-add-button
+            let add = crate::widgets::split_button::split_add_button(ui, "New note", |ui| {
                 if ui.button("New note").clicked() {
                     self.app.new_note();
                     ui.close();
@@ -300,20 +374,72 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
                     self.app.new_canvas();
                     ui.close();
                 }
-                // Capture entry points (`crawl-job-form` /
-                // `rss-subscription-lifecycle`): each creates a capture-spec
-                // note and opens it in the form-over-frontmatter tab.
-                if ui.button("New crawl…").clicked() {
-                    self.app.new_crawl();
+            });
+            if add.primary_clicked {
+                self.app.new_note();
+            }
+        }
+        if mode == "clusters" {
+            // Clusters-mode `+` split-button: primary `+` opens the review tab
+            // for a new tree with default params; the caret dropdown lists
+            // tree-creation presets (built-in + user-saved) that prefill it.
+            // status: cluster-editor-new-tree-action, cluster-preset
+            use crate::clusters::panel::ReviewConfig;
+            // Presets are vault notes (`hiker.kind: cluster-preset`) found via
+            // the store's frontmatter query; cache the result so the header
+            // doesn't re-query every frame. status: cluster-preset
+            if self.app.clusters_state.preset_cache.is_none() {
+                let vault = self.app.vault_session.vault.clone();
+                let loaded = match self.app.vault_session.services.read_store.lock() {
+                    Ok(store) => crate::clusters::preset::load(&store, &vault),
+                    Err(_) => crate::clusters::preset::builtins(),
+                };
+                self.app.clusters_state.preset_cache = Some(loaded);
+            }
+            let presets = self.app.clusters_state.preset_cache.clone().unwrap_or_default();
+            let add = crate::widgets::split_button::split_add_button(ui, "New cluster tree", |ui| {
+                if ui.button("New tree").clicked() {
+                    ReviewConfig::default().open(self.app);
                     ui.close();
                 }
-                if ui.button("New feed…").clicked() {
-                    self.app.new_feed();
-                    ui.close();
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Presets").small().color(hiker_theme::muted()),
+                );
+                for preset in &presets {
+                    if ui.button(&preset.params.name).clicked() {
+                        preset.config().open(self.app);
+                        ui.close();
+                    }
                 }
             });
+            if add.primary_clicked {
+                ReviewConfig::default().open(self.app);
+            }
         }
-
+        if mode == "canvases" {
+            // Plain `+` button (no dropdown): mint a new canvas and open it.
+            // status: canvas-create, canvas-activity-new-button
+            let plus = ui
+                .add(
+                    egui::ImageButton::new(crate::icons::ICONS.image(crate::icons::Icon::Plus))
+                        .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+                )
+                .on_hover_text("New canvas");
+            if plus.clicked() {
+                self.app.new_canvas();
+            }
+        }
+        // Eye toggle for every sidebar view that shows hover previews — the three
+        // context sub-views, the Vault lens (cluster-tree thumbnails), and the
+        // canvases activity (canvas thumbnails). Appended after any mode-specific
+        // buttons (e.g. the canvases `+`). status: preview-toggle
+        if matches!(
+            mode.as_str(),
+            "context/backlinks" | "context/appears-in" | "context/related" | "vault" | "canvases"
+        ) {
+            self.hover_preview_eye(ui);
+        }
     }
 
     fn side_bar_actions_menu(&mut self, ui: &mut egui::Ui, mode: &String) {
@@ -387,76 +513,6 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
         }
     }
 
-    fn secondary_side_bar_action_buttons(&mut self, ui: &mut egui::Ui) {
-        let active_id = self.app.chat_state.registry.active.clone();
-        if active_id.is_some()
-            && ui
-                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Trash)).small())
-                .on_hover_text("Delete this session")
-                .clicked()
-            && let Some(id) = active_id.as_deref()
-        {
-            let vault_root = self.app.vault_session.vault_root.clone();
-            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
-            if let Err(err) = crate::chat::session::delete(
-                &mut self.app.chat_state.registry,
-                &vault_root,
-                &chats_dir,
-                id,
-            ) {
-                tracing::warn!(error = %err, "chat: delete failed");
-            }
-        }
-        if ui
-            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)).small())
-            .on_hover_text("New session")
-            .clicked()
-        {
-            let vault_root = self.app.vault_session.vault_root.clone();
-            let (model, provider) = self
-                .app
-                .vault_session
-                .config
-                .read()
-                .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
-                .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
-            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
-            if let Err(err) = crate::chat::session::create_new(
-                &mut self.app.chat_state.registry,
-                &vault_root,
-                &chats_dir,
-                &model,
-                &provider,
-            ) {
-                tracing::warn!(error = %err, "chat: create_new failed");
-            }
-        }
-    }
-
-    fn secondary_side_bar_title_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add(crate::icons::ICONS.image(crate::icons::Icon::Chat));
-        self.app.chat_session_picker(ui);
-    }
-
-    fn secondary_side_bar_ui(&mut self, ui: &mut egui::Ui) {
-        let _g = crate::profiling::FrameProf::guard("wb:secondary_side_bar");
-        // The docked chat region is a migrated `Feature`'s sidebar
-        // surface. It renders through the narrow `feature::Ctx` (chat state
-        // via `ctx.state`, broad mutations deferred), mirroring
-        // `side_bar_ui` — but on the secondary (right) side bar rather than
-        // a primary activity mode. [feature-consumer-sidebar]
-        let feature = self.app.features.by_id(PANEL_CHAT).cloned();
-        if let Some(sidebar) = feature.as_ref().and_then(|f| f.sidebar()) {
-            let mut effects: Vec<crate::feature::Effect> = Vec::new();
-            crate::feature::with_ctx(self.app, PANEL_CHAT, &mut effects, |ctx| {
-                sidebar.render(ui, ctx);
-            });
-            for eff in effects {
-                eff(self.app);
-            }
-        }
-    }
-
     fn status_bar_ui(&mut self, ui: &mut egui::Ui) {
         // Active-tab-driven status content: when a Buffer tab is
         // focused, render the per-buffer version dropdown + indexer
@@ -526,6 +582,87 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
 /// per-kind panel renderers. Lifted out of [`HikerWbBehavior::pane_ui`]
 /// so the match doesn't fight the behavior trait's borrow contract.
 impl<'a> HikerWbBehavior<'a> {
+    /// Eye menu shared by every sidebar view that shows hover previews
+    /// (`context/backlinks`, `context/appears-in`, `context/related`, `vault`,
+    /// `canvases`): one toggle for `[ui].hover_previews_enabled`, read live and
+    /// committed at `Scope::Vault`. status: preview-toggle
+    fn hover_preview_eye(&mut self, ui: &mut egui::Ui) {
+        let enabled = self
+            .app
+            .vault_session
+            .config
+            .read()
+            .map(|c| c.ui.hover_previews_enabled)
+            .unwrap_or(true);
+        let resp = ui
+            .add(
+                egui::ImageButton::new(crate::icons::ICONS.image(crate::icons::Icon::Eye))
+                    .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+            )
+            .on_hover_text("View options");
+        egui::Popup::menu(&resp).show(|ui| {
+            let mut show = enabled;
+            if ui.checkbox(&mut show, "Show hover previews").changed() {
+                self.app.set_setting(
+                    hiker_core::config::SettingsScope::Vault,
+                    "ui.hover_previews_enabled",
+                    &serde_json::json!(show),
+                    "Save hover preview toggle failed",
+                );
+            }
+        });
+    }
+
+    /// Chat section header buttons (new / delete session), re-homed from
+    /// the retired bespoke secondary side bar onto the generic per-mode
+    /// `side_bar_action_buttons("chat")` path. The session picker lives in
+    /// the chat body's top chrome row. [feature-consumer-sidebar]
+    fn chat_action_buttons(&mut self, ui: &mut egui::Ui) {
+        let active_id = self.app.chat_state.registry.active.clone();
+        if active_id.is_some()
+            && ui
+                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Trash)).small())
+                .on_hover_text("Delete this session")
+                .clicked()
+            && let Some(id) = active_id.as_deref()
+        {
+            let vault_root = self.app.vault_session.vault_root.clone();
+            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
+            if let Err(err) = crate::chat::session::delete(
+                &mut self.app.chat_state.registry,
+                &vault_root,
+                &chats_dir,
+                id,
+            ) {
+                tracing::warn!(error = %err, "chat: delete failed");
+            }
+        }
+        if ui
+            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)).small())
+            .on_hover_text("New session")
+            .clicked()
+        {
+            let vault_root = self.app.vault_session.vault_root.clone();
+            let (model, provider) = self
+                .app
+                .vault_session
+                .config
+                .read()
+                .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
+                .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
+            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
+            if let Err(err) = crate::chat::session::create_new(
+                &mut self.app.chat_state.registry,
+                &vault_root,
+                &chats_dir,
+                &model,
+                &provider,
+            ) {
+                tracing::warn!(error = %err, "chat: create_new failed");
+            }
+        }
+    }
+
     fn render_tab_body(&mut self, ui: &mut egui::Ui, tab_id: TabId, kind: &TabKind) {
         crate::profile_scope!("render_tab_body", tab_kind_name(kind));
         let _g = crate::profiling::FrameProf::guard(tab_kind_name(kind));
@@ -565,13 +702,12 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::QueueDetail { task_id } => panels::queue::show_detail(ui, app, task_id),
             TabKind::Settings => panels::settings::show(ui, app),
             TabKind::Properties { path } => panels::properties::show(ui, app, path),
-            TabKind::Graph => panels::graph::show(ui, app),
+            TabKind::Graph => panels::graph::show(ui, app, tab_id),
             TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
             TabKind::Canvas { path } => panels::canvas::show(ui, app, tab_id, path, rt),
             TabKind::BoardsIndex => panels::boards_index::show(ui, app),
             TabKind::Agent { session_id } => crate::chat::render::show_tab(ui, app, session_id),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
-            TabKind::Plugins => panels::plugins::show(ui, app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, app, rt),
             TabKind::Sync => panels::sync::show(ui, app, rt),
             TabKind::Changes => panels::changes::show(ui, app),
@@ -579,9 +715,6 @@ impl<'a> HikerWbBehavior<'a> {
                 clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
-            TabKind::Capture { note_path } => {
-                panels::capture::show(ui, app, tab_id, note_path, rt)
-            }
             TabKind::ZimView { zim_path, article } => {
                 panels::zim::show(ui, app, tab_id, zim_path, article)
             }
@@ -591,7 +724,7 @@ impl<'a> HikerWbBehavior<'a> {
 }
 
 /// Stable per-kind label for the frame profiler / puffin scopes.
-fn tab_kind_name(kind: &TabKind) -> &'static str {
+const fn tab_kind_name(kind: &TabKind) -> &'static str {
     match kind {
         TabKind::Editor { .. } => "tab:Editor",
         TabKind::Home => "tab:Home",
@@ -606,13 +739,27 @@ fn tab_kind_name(kind: &TabKind) -> &'static str {
         TabKind::BoardsIndex => "tab:BoardsIndex",
         TabKind::Agent { .. } => "tab:Agent",
         TabKind::PatchReview => "tab:PatchReview",
-        TabKind::Plugins => "tab:Plugins",
         TabKind::IndexerDetail => "tab:IndexerDetail",
         TabKind::Sync => "tab:Sync",
         TabKind::Changes => "tab:Changes",
         TabKind::ClusterReview { .. } => "tab:ClusterReview",
         TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
-        TabKind::Capture { .. } => "tab:Capture",
         TabKind::ZimView { .. } => "tab:ZimView",
     }
+}
+
+/// Title-case a kebab/snake view key for a side-bar section header:
+/// `"appears-in"` → `"Appears In"`, `"backlinks"` → `"Backlinks"`.
+/// [feature-multi-region-sidebar]
+fn titleize(key: &str) -> String {
+    key.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

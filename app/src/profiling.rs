@@ -43,9 +43,14 @@ pub struct Profiler;
 
 impl Profiler {
 /// Start the puffin_http server + the in-process frame mirror. Call
+/// once at boot. Idempotent. No-op without the `profiling` feature.
+#[cfg(not(feature = "profiling"))]
+pub const fn init_server(self) {}
+
+/// Start the puffin_http server + the in-process frame mirror. Call
 /// once at boot. Idempotent.
+#[cfg(feature = "profiling")]
 pub fn init_server(self) {
-    #[cfg(feature = "profiling")]
     {
         // FrameView mirror: every recorded frame is also pushed here so
         // `capture_to_file` can dump a snapshot without involving the
@@ -277,11 +282,13 @@ fn summarize_frames(view: &puffin::FrameView) -> String {
 impl Profiler {
 /// Mark the start of a new frame. Call once at the top of `update`.
 /// No-op without the `profiling` feature.
+#[cfg(not(feature = "profiling"))]
+pub const fn new_frame(self) {}
+
+/// Mark the start of a new frame. Call once at the top of `update`.
+#[cfg(feature = "profiling")]
 pub fn new_frame(self) {
-    #[cfg(feature = "profiling")]
-    {
-        puffin::GlobalProfiler::lock().new_frame();
-    }
+    puffin::GlobalProfiler::lock().new_frame();
 }
 }
 

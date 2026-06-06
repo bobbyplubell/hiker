@@ -150,14 +150,14 @@ fn disk_drift_dialog(
             } else {
                 let id = app.next_tab_id();
                 // Vault buffer with the on-disk diff already active.
-                app.session.tabs.push(Tab {
+                app.session.tabs.push(Tab::new(
                     id,
-                    kind: TabKind::Editor {
+                    TabKind::Editor {
                         buffer: BufferSource::Vault { path: p.clone() },
                         diff: Some(DiffSource::Disk { path: p }),
                     },
-                    sticky: true,
-                });
+                    true,
+                ));
                 app.session.active_tab = Some(id);
             }
         }
@@ -426,14 +426,22 @@ fn apply_restore(app: &mut AppState, entry: &hiker_core::autosave::RecoveredEntr
     // immediately marked dirty (current_hash != loaded_hash) and the user
     // sees an unsaved buffer they can Save or Revert.
     let on_disk_hash = entry.on_disk_hash.clone().unwrap_or_default();
-    // Plain disk-backed buffer (no config / vault completion sources).
+    // Build the buffer with the live config + vault handle so it gets the same
+    // editor config (word-wrap, …) AND the wikilink completion source every
+    // other open path attaches. This runs BEFORE `restore_tab_state`, whose
+    // `contains_key` guard then skips re-creating the buffer — so if recovery
+    // seeded a source-less buffer here, `[[` autocomplete would be dead for the
+    // whole session on exactly the notes that were open last time (the ones
+    // with recovered autosave content). status: wikilink-autocomplete
+    let cfg_guard = app.vault_session.config.read().ok();
     let buffer = crate::buffer::Buffer::with_config_and_vault(
         entry.path.clone(),
         &text,
         on_disk_hash,
-        None,
-        None,
+        cfg_guard.as_deref(),
+        Some(app.vault_session.vault.clone()),
     );
+    drop(cfg_guard);
     app.session.buffers.insert(entry.path.clone(), buffer);
     crate::editor_pane::open_file(app, &entry.path, /* sticky */ true);
     let autosave = app.vault_session.services.autosave.clone();

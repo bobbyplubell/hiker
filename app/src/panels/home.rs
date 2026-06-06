@@ -128,11 +128,7 @@ impl AppState {
             return;
         }
         let id = self.next_tab_id();
-        self.session.tabs.push(Tab {
-            id,
-            kind,
-            sticky: true,
-        });
+        self.session.tabs.push(Tab::new(id, kind, true));
         self.session.active_tab = Some(id);
     }
 }
@@ -309,11 +305,11 @@ impl AppState {
     fn open_version(&mut self, path: &str, op_id: &str) {
         use crate::tab::{Tab, TabKind};
         let id = self.next_tab_id();
-        self.session.tabs.push(Tab {
+        self.session.tabs.push(Tab::new(
             id,
-            kind: TabKind::version_preview(path.to_string(), op_id.to_string()),
-            sticky: true,
-        });
+            TabKind::version_preview(path.to_string(), op_id.to_string()),
+            true,
+        ));
         self.session.active_tab = Some(id);
     }
 }
@@ -369,11 +365,7 @@ pub(crate) fn open_home_detail(app: &mut AppState, which: HomeDetail) {
         return;
     }
     let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::HomeDetail { which },
-        sticky: true,
-    });
+    app.session.tabs.push(Tab::new(id, TabKind::HomeDetail { which }, true));
     app.session.active_tab = Some(id);
 }
 

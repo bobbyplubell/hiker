@@ -506,6 +506,9 @@ fn card_decoration_ctx<'a>(
         highlight_trailing_whitespace: false,
         diff: None,
         resolve_title: None,
+        // Canvas node previews don't carry a vault-scoped disk cache — they
+        // render through the in-memory caches only. status: widget-render-disk-cache
+        diagram_cache: None,
     }
 }
 
@@ -673,9 +676,9 @@ fn parent_dir(abs: &Path) -> PathBuf {
     abs.parent().map(Path::to_path_buf).unwrap_or_else(|| abs.to_path_buf())
 }
 
-/// The extract sidecar path for a source file: `<source-filename>.<ext>.md`
-/// beside it (`hiker-extract`'s `write_file_sidecar` naming). `None` if no
-/// filename. Existence is checked by the caller.
+/// The extracted-text sidecar path for a source file:
+/// `<source-filename>.<ext>.md` beside it. `None` if no filename. Existence
+/// is checked by the caller.
 fn sidecar_path(abs: &Path) -> Option<PathBuf> {
     let name = abs.file_name()?.to_string_lossy().into_owned();
     Some(abs.with_file_name(format!("{name}.md")))

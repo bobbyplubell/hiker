@@ -85,7 +85,7 @@ use hiker_core::oplog::OpLog;
 
 use crate::config::Settings;
 use crate::crypto::{self, ContentKey, DeviceKeypair, SharedContentKey};
-use crate::identity::{BlockedDoc, DeviceFingerprint, Resolution, SyncStatus};
+use crate::identity::{BlockStore, BlockedDoc, DeviceFingerprint, Resolution, SyncStatus};
 // Note: path is the cross-device identity; no `LogicalId` rides the wire here.
 // [sync-path-identity]
 use crate::protocol::Message;
@@ -259,6 +259,40 @@ pub struct SyncReport {
     pub converged: Vec<String>,
     /// `(path, reason)` for each document left unsynced — a fork is `"fork"`.
     pub blocked: Vec<(String, String)>,
+    /// `(path, reason)` for each document that hit a DOC-LEVEL error this round
+    /// (e.g. a decrypt failure or a per-doc apply failure) and was SKIPPED so
+    /// the round could continue with the remaining docs. A transport-level
+    /// failure (the connection itself broke) aborts the round instead and never
+    /// lands here. Empty on a clean round.
+    pub errored: Vec<(String, String)>,
+    /// Set to the peer's device fingerprint when this round's content-key
+    /// convergence was HELD because our key is established (deliberately set)
+    /// and the peer's differs — we did NOT silently switch. The app surfaces it
+    /// (and the Sync page later renders a confirm action; the manual import is
+    /// the accept-the-change path for now). `None` when the key matched or was
+    /// freshly auto-adopted. [sync-content-key-confirm-on-change]
+    pub pending_content_key_change: Option<String>,
+    /// Set to the peer's device fingerprint when a FRESH (non-established) key
+    /// auto-adopted the peer's key in-band this round — surfaced so the user
+    /// sees the adoption happened. `None` otherwise.
+    /// [sync-content-key-confirm-on-change]
+    pub adopted_content_key_from: Option<String>,
+}
+
+/// The result of one round's in-band content-key convergence (the dialer's
+/// [`SyncNode::converge_content_key`] step). Carried back onto the
+/// [`SyncReport`] so the app surfaces an adoption or a held key change.
+/// [sync-content-key-confirm-on-change]
+pub(super) enum ContentKeyOutcome {
+    /// Keys already matched, or we are the canonical owner — nothing changed.
+    Unchanged,
+    /// A fresh (non-established) key auto-adopted the peer's key in-band. Carries
+    /// the peer's device fingerprint for the surfaced line.
+    Adopted { peer_fp: String },
+    /// Our key is established and the peer's differs — we held our key (did NOT
+    /// switch) and surface the mismatch for confirmation. Carries the peer's
+    /// device fingerprint.
+    PendingChange { peer_fp: String },
 }
 
 /// A peer sync node: owns the vault's [`OpLog`], the content + device keys, the
@@ -301,9 +335,19 @@ pub struct SyncNode {
     /// Persistent record of every forked (blocked) document, keyed by vault
     /// path — the surface the UI lists and resolves. Distinct from the round
     /// report's `blocked` (which is the LAST round only): an entry persists
-    /// until the doc converges or the user resolves it.
-    /// [sync-blocked-state, sync-path-identity]
+    /// until the doc converges or the user resolves it. Hydrated from
+    /// [`block_store`](Self::block_store) on construct and written through it on
+    /// every record/clear, so a held conflict survives an app restart and
+    /// re-surfaces instead of silently clearing.
+    /// [sync-blocked-state, sync-path-identity, sync-conflict-block-persistence]
     pub(super) blocked: Mutex<HashMap<String, BlockedDoc>>,
+    /// Durable backing for [`blocked`](Self::blocked): the per-vault
+    /// `<vault>/.hiker/sync/blocked.json` store. `record_blocked` / `clear_blocked`
+    /// write the whole set through this after mutating the in-memory map, and
+    /// [`SyncNode::new`] hydrates the map from it — closing the
+    /// "block lives only in memory and clears on restart" gap.
+    /// [sync-conflict-block-persistence]
+    pub(super) block_store: BlockStore,
     /// User resolution decisions for blocked docs, keyed by vault path. The
     /// fork branch consults this on the NEXT round: an entry makes it act
     /// (keep-mine / keep-theirs / keep-both) instead of re-blocking. Empty by
@@ -348,6 +392,12 @@ pub struct SyncNode {
     /// [`take_newly_discovered`](Self::take_newly_discovered) to trigger an
     /// immediate sync round on first sight of a peer.
     pub(super) newly_discovered: Mutex<bool>,
+    /// Set true whenever a `run` window served a [`Message::SyncPoke`] from an
+    /// enrolled peer — that peer just committed a change and wants us to pull
+    /// promptly. The caller polls + clears it via [`take_poked`](Self::take_poked)
+    /// to trigger an immediate sync round, the same shape as `newly_discovered`.
+    /// [sync-poke-on-commit]
+    pub(super) poked: Mutex<bool>,
     /// The libp2p swarm, built lazily.
     pub(super) swarm: Option<Swarm<SyncBehaviour>>,
 }
@@ -368,6 +418,22 @@ impl SyncNode {
     ) -> Self {
         let fingerprint = keypair.fingerprint();
         let device_names = Mutex::new(config.device_names.clone());
+        // Hydrate the blocked-conflict set from its durable per-vault store, so a
+        // held conflict (fork / same-region / delete-vs-edit / rename-collision)
+        // recorded before the last shutdown re-surfaces on this construct rather
+        // than silently clearing. [sync-conflict-block-persistence]
+        // status: sync-conflict-block-persistence
+        let block_store = BlockStore::for_vault(oplog.vault_root());
+        let hydrated_blocks = block_store.load();
+        // Seed the per-doc status map so a re-hydrated block reports
+        // `SyncStatus::Blocked` from `status_of_path` immediately on restart —
+        // consistent with `blocked_docs()`, without waiting for the next round.
+        // [sync-conflict-block-persistence]
+        let status: HashMap<String, SyncStatus> = hydrated_blocks
+            .keys()
+            .map(|p| (p.clone(), SyncStatus::Blocked))
+            .collect();
+        let blocked = Mutex::new(hydrated_blocks);
         Self {
             oplog,
             content_key,
@@ -375,10 +441,11 @@ impl SyncNode {
             fingerprint,
             config,
             enrolled,
-            status: Mutex::new(HashMap::new()),
+            status: Mutex::new(status),
             device_names,
             peer_content_key_fps: Mutex::new(HashMap::new()),
-            blocked: Mutex::new(HashMap::new()),
+            blocked,
+            block_store,
             resolutions: Mutex::new(HashMap::new()),
             blobs: Mutex::new(MemBlobStore::new()),
             server_push_seq: Mutex::new(HashMap::new()),
@@ -387,6 +454,7 @@ impl SyncNode {
             seen_unenrolled_logged: Mutex::new(HashSet::new()),
             newly_seen_unenrolled: Mutex::new(Vec::new()),
             newly_discovered: Mutex::new(false),
+            poked: Mutex::new(false),
             swarm: None,
         }
     }
@@ -458,6 +526,22 @@ impl SyncNode {
             return;
         };
         self.record_discovered([(peer_id, addr)]);
+    }
+
+    /// Record a doc as blocked with the given `reason` and peer, the test seam
+    /// for the restart-with-stale-block path: it models a persisted block that
+    /// re-hydrates on construct (status forced `Blocked`) even though the
+    /// conflict has since converged out-of-band. Mirrors the production
+    /// [`record_blocked`](Self::record_blocked) the detecting round calls, plus
+    /// the status seed `SyncNode::new` does for a hydrated block, so the next
+    /// round routes to the doc's blocked re-eval branch exactly as after a real
+    /// restart.
+    pub fn record_blocked_for_test(&self, path: &str, reason: &str, peer: &DeviceFingerprint) {
+        self.record_blocked(path, reason, peer);
+        self.status
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), SyncStatus::Blocked);
     }
 
     /// Reset the per-blind-id server pull cursors so the next
@@ -587,22 +671,62 @@ impl SyncNode {
         self.resolutions.lock().unwrap().insert(path, resolution);
     }
 
-    /// Record a fork as persistently blocked. Idempotent on the path key.
-    pub(super) fn record_blocked(&self, path: &str, peer: &DeviceFingerprint) {
-        self.blocked.lock().unwrap().insert(
+    /// Record a doc as persistently blocked with the given `reason`
+    /// (`"fork"` for a disjoint-lineage fork, `"same-region"` for a bound-doc
+    /// overlapping concurrent edit, `"delete-vs-edit"` for a delete concurrent
+    /// with an edit, `"rename-collision"` for two devices renaming different
+    /// docs onto the same path). Idempotent on the path key. The block is
+    /// written through the durable [`block_store`](Self::block_store) so it
+    /// survives a restart and re-surfaces. [sync-blocked-state,
+    /// sync-conflict-block-and-resolve, sync-conflict-block-persistence]
+    pub(super) fn record_blocked(&self, path: &str, reason: &str, peer: &DeviceFingerprint) {
+        let mut blocked = self.blocked.lock().unwrap();
+        blocked.insert(
             path.to_string(),
             BlockedDoc {
                 path: path.to_string(),
-                reason: "fork".to_string(),
+                reason: reason.to_string(),
                 peer_fingerprint: peer.clone(),
             },
         );
+        self.persist_blocked(&blocked);
+    }
+
+    /// Write the current blocked set through the durable per-vault store. Called
+    /// after every `record_blocked` / `clear_blocked` mutation while the
+    /// `blocked` lock is held, so the on-disk file and the in-memory map never
+    /// diverge. A persist I/O failure is logged, not fatal — the block is still
+    /// held in memory this session and re-recorded next round if it persists.
+    /// [sync-conflict-block-persistence]
+    fn persist_blocked(&self, blocked: &HashMap<String, BlockedDoc>) {
+        if let Err(e) = self.block_store.save(blocked) {
+            tracing::warn!(error = %e, "sync: failed to persist blocked-conflict set");
+        }
+    }
+
+    /// The reason a doc at `path` is currently blocked (`"fork"` /
+    /// `"same-region"` / `"delete-vs-edit"` / `"rename-collision"`), if it is
+    /// blocked. Lets the dialer route a blocked doc to the right resolution
+    /// branch on a later round.
+    pub(super) fn blocked_reason(&self, path: &str) -> Option<String> {
+        self.blocked
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|b| b.reason.clone())
     }
 
     /// Clear a blocked record and its resolution decision — called when the doc
-    /// converges or its fork is resolved.
+    /// converges or its fork is resolved. Removes the durable entry too, so a
+    /// resolved/converged block does NOT resurrect on the next restart.
+    /// [sync-conflict-block-persistence]
     pub(super) fn clear_blocked(&self, path: &str) {
-        self.blocked.lock().unwrap().remove(path);
+        let mut blocked = self.blocked.lock().unwrap();
+        let removed = blocked.remove(path).is_some();
+        if removed {
+            self.persist_blocked(&blocked);
+        }
+        drop(blocked);
         self.resolutions.lock().unwrap().remove(path);
     }
 
@@ -642,6 +766,22 @@ impl SyncNode {
     /// for the next periodic tick.
     pub fn take_newly_discovered(&self) -> bool {
         std::mem::replace(&mut self.newly_discovered.lock().unwrap(), false)
+    }
+
+    /// Whether an enrolled peer poked us (committed a change and asked us to
+    /// pull) since the last call, clearing the flag. The sync driver polls this
+    /// after each responder window — alongside `take_newly_discovered` — to run
+    /// a prompt pull round rather than waiting for the next periodic tick.
+    /// [sync-poke-on-commit]
+    pub fn take_poked(&self) -> bool {
+        std::mem::replace(&mut self.poked.lock().unwrap(), false)
+    }
+
+    /// Record an inbound poke (set the `poked` flag). Called by the responder
+    /// dispatch when an enrolled peer sends [`Message::SyncPoke`].
+    /// [sync-poke-on-commit]
+    pub(super) fn record_poked(&self) {
+        *self.poked.lock().unwrap() = true;
     }
 
     /// Fold an mDNS `Discovered` event into the single discovery map — EVERY
@@ -788,6 +928,21 @@ impl SyncNode {
             .lock()
             .unwrap()
             .insert(path.to_string(), SyncStatus::Bound);
+    }
+
+    /// Drop a stale block when a doc auto-merges cleanly again — e.g. the
+    /// conflict was resolved on the OTHER device and the content has since
+    /// converged, so this side's block (which the user never cleared here) must
+    /// stop surfacing. Idempotent and cheap when the doc wasn't blocked:
+    /// `clear_blocked` only persists if it actually removed an entry.
+    /// status: sync-conflict-block-and-resolve
+    pub(super) fn clear_stale_block(&self, path: &str) {
+        let was_blocked = self.blocked.lock().unwrap().contains_key(path);
+        if was_blocked {
+            tracing::info!(path = %path, "sync: conflict converged out-of-band — clearing stale block");
+        }
+        self.mark_bound(path);
+        self.clear_blocked(path);
     }
 
     /// Run the manual, time-boxed mDNS discovery window: drive the swarm for
@@ -1173,6 +1328,74 @@ mod tests {
             "BUG: responder served content key to a peer that already has it \
              (Hello reported matching content_key_fp), got {response:?}"
         );
+    }
+
+    /// Build a node over an explicit (caller-owned) vault dir, so the dir can
+    /// be reused across a drop+reconstruct ("restart") in the persistence test.
+    fn mk_node_at(vault_root: &std::path::Path) -> SyncNode {
+        let oplog = Arc::new(OpLog::open(vault_root).unwrap());
+        SyncNode::new(
+            oplog,
+            SharedContentKey::new(ContentKey::generate()),
+            DeviceKeypair::generate(),
+            Settings::default(),
+            EnrolledPeers::new(),
+        )
+    }
+
+    /// The core durability guarantee for `sync-conflict-block-persistence`: a
+    /// recorded block (path + reason + peer fingerprint) survives an app restart
+    /// — modeled by DROPPING the `SyncNode` and reconstructing a fresh one over
+    /// the SAME vault dir — and re-surfaces via `blocked_docs()` /
+    /// `status_of_path()`. Resolving (clearing) a block removes its persisted
+    /// entry, so it does NOT resurrect on the next restart.
+    #[test]
+    fn blocked_conflict_survives_restart_and_clears_on_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        let peer = DeviceFingerprint("DEV-PEER".into());
+
+        // First session: record a same-region block.
+        {
+            let node = mk_node_at(vault);
+            assert!(node.blocked_docs().is_empty(), "fresh vault has no blocks");
+            node.record_blocked("notes/a.md", "same-region", &peer);
+            node.mark_bound("notes/a.md"); // a no-op for status here; just exercising
+            assert_eq!(node.blocked_docs().len(), 1);
+        } // node dropped — the only durable record is now on disk.
+
+        // Restart: a brand-new node over the same vault dir re-hydrates the block.
+        {
+            let node = mk_node_at(vault);
+            let blocks = node.blocked_docs();
+            assert_eq!(blocks.len(), 1, "block re-surfaced after restart");
+            assert_eq!(blocks[0].path, "notes/a.md");
+            assert_eq!(blocks[0].reason, "same-region", "reason persisted");
+            assert_eq!(blocks[0].peer_fingerprint, peer, "peer fingerprint persisted");
+            assert_eq!(
+                node.status_of_path("notes/a.md"),
+                Some(SyncStatus::Blocked),
+                "hydrated block reports Blocked status without a round"
+            );
+            assert_eq!(
+                node.blocked_reason("notes/a.md").as_deref(),
+                Some("same-region"),
+                "blocked_reason routes the restart-hydrated block"
+            );
+
+            // Resolve (converge / user-resolve) → clears the persisted entry.
+            node.clear_blocked("notes/a.md");
+            assert!(node.blocked_docs().is_empty(), "cleared in this session");
+        } // dropped again.
+
+        // Next restart: the cleared block must NOT resurrect.
+        {
+            let node = mk_node_at(vault);
+            assert!(
+                node.blocked_docs().is_empty(),
+                "resolved block does not resurrect on the next restart"
+            );
+        }
     }
 
     /// An mDNS `Expired` event drops the peer from the continuous set.

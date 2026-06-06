@@ -1,50 +1,33 @@
 # Observability
 
-Plan for instrumenting hiker with `tracing`. Goal: when something goes wrong (a note didn't index, the watcher fired 3000 events, an embedder call hung) we can answer *what happened and where* by reading a log file, without rerunning under a debugger.
+Plan for instrumenting hiker with `tracing`. Goal: when something goes wrong (a note didn't index, the watcher fired 3000 events, an embedder call hung) we can answer *what happened and where* from the log stream, without rerunning under a debugger.
 
-v1 is deliberately small: stand up `tracing`, write a rotating log file, replace `eprintln!` calls with structured events. Spans, in-app log viewer, frontend bridge, and `EnvFilter` tuning are deferred — they're the natural follow-ups but the file alone covers the immediate troubleshooting need.
-
-The headline decisions:
-
-- Use the `tracing` crate ecosystem — `tracing` for emission, `tracing-subscriber` for formatting, `tracing-appender` for file output. No `log`, no `env_logger`, no `println!` for diagnostics. [obs-tracing-baseline]
-- Production logs go to `vault/.hiker/logs/hiker.log` with daily rotation, 7-day retention; dev logs also go to stderr. [obs-log-files] [obs-log-rotation]
-- Errors carry context via structured fields, not stringified `format!` blobs. The fields are the contract; the human message is for grep. [obs-error-context]
-- Note **content** never enters the log stream. Paths and titles yes; body bytes no. [obs-no-content]
-- Secrets / API keys / auth tokens never enter the log stream. [obs-no-secrets]
+Use the `tracing` crate ecosystem — `tracing` for emission, `tracing-subscriber` for formatting. No `log`, no `env_logger`, no `println!` for diagnostics. [obs-tracing-baseline]
 
 
-## v1: subscriber setup
+## Subscriber setup
 
-Single `init_tracing(vault_root)` call from each binary's entry point (`app`, `cli`, `mcp-server`). Two-layer subscriber:
-
-1. **Format layer (stderr)** — pretty-printed compact format. What you see while running the app in dev.
-2. **File layer (rolling)** — `tracing-appender` daily rotation in `vault/.hiker/logs/`, retained for 7 days. Same compact format. The vault is the right home for these (per-vault state, follows the user, gitignored by default). [obs-log-files] [obs-log-rotation]
-
-Hardcoded default level: `info` for everything, `debug` for `hiker::*`. No `EnvFilter` parsing in v1 — if you need more verbosity, edit the default and recompile. The env-var path is a small addition when the friction is real (see Deferred).
+The live subscriber is an inline `tracing_subscriber::fmt()` in the app entry point (`app/src/main.rs`) writing to **stderr** with an `EnvFilter`:
 
 ```rust
-let file_appender = tracing_appender::rolling::daily(
-    vault.join(".hiker/logs"), "hiker.log"
-);
-let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-
-tracing_subscriber::registry()
-    .with(filter::Targets::new()
-        .with_default(LevelFilter::INFO)
-        .with_target("hiker", LevelFilter::DEBUG))
-    .with(fmt::layer().with_writer(io::stderr).compact())
-    .with(fmt::layer().with_writer(file_writer).compact())
+tracing_subscriber::fmt()
+    .with_env_filter(
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info")),
+    )
     .init();
 ```
 
-The `_guard` from `non_blocking` must outlive the program. Easiest: stash it in a `OnceLock` from `init_tracing`.
+`RUST_LOG` works — set it to override the bare-`info` default per-module (`RUST_LOG=info,hiker=debug`). There is no file appender and no per-vault log file today; output goes to the terminal that launched the app.
+
+The `cli` and `mcp-server` binaries install **no** subscriber, so their `tracing` events are dropped unless run in-process under the app. Wiring them (and file logging) is tracked under Deferred (`bug-observability-file-logging-unwired`).
 
 
-## v1: where to log
+## Where to log
 
-No `#[instrument]` decorations, no spans. Just events at the obvious sites, with structured fields. Convert every existing `eprintln!("[hiker::indexer] ...")` to a `tracing` event as part of this work — those are the lowest-hanging fruit and the wrong shape today.
+No `#[instrument]` decorations, no spans. Just events at the obvious sites, with structured fields; convert every existing `eprintln!("[hiker::indexer] ...")` to a `tracing` event.
 
-Concretely, v1 adds events at:
+Event sites:
 
 - **Watcher**: each debounced event (`debug!(path, kind)`); each suppression hit (`debug!(path)` with the suppression token).
 - **Indexer**: per-job decision points — file indexed (`info!(path, chunks)`), file skipped (`info!(path, reason)`), file errored (`error!(error = %e, path)`), full-scan summary (`info!(seen, queued, deleted)`).
@@ -52,7 +35,7 @@ Concretely, v1 adds events at:
 - **Store**: schema migrations and slow queries (`warn!(query, elapsed_ms)` if elapsed > 100ms — cheap to add inline).
 - **Host commands**: errors only — emit on the `Err(...)` branch with `error!(error = %e, command = "<name>")`.
 
-That's enough to reconstruct any v1 failure from a tail of `hiker.log`. Span-based grouping ("everything that happened during job 42") is the upgrade path when this stops being enough.
+That's enough to reconstruct any failure from the log stream. Span-based grouping ("everything that happened during job 42") is the upgrade path when this stops being enough.
 
 
 ## Error context [obs-error-context]
@@ -81,41 +64,40 @@ The `error = %e` field captures the chain; the message stays grep-stable. Combin
 
 ## Module placement
 
-- `core::observability` — exports `init_tracing(vault_root)`, the file appender guard type, and any default constants.
-- No other module calls `tracing_subscriber::*` directly. Emit events; let the binary configure the subscriber.
+- No module under `core::*` calls `tracing_subscriber::*` directly. Modules emit events; the binary configures the subscriber.
+- `core::observability` exists but its `init_tracing(vault_root)` (the deferred file-logging entry point) is **dead code** with zero callers — see Deferred.
 
 
 ## Deferred
 
-Everything below is real, considered, and explicitly *not v1*. Each lands when the v1 file-log surface stops answering questions, not before.
+Each lands when the live stderr surface stops answering questions, not before.
+
+### File logging (unwired) [obs-log-files] [obs-log-rotation]
+
+The designed-but-unwired model: `core::observability::init_tracing(vault_root)` called from each binary's entry point, standing up a two-layer subscriber — a compact stderr format layer plus a `tracing-appender` daily-rotating file layer at `vault/.hiker/logs/hiker.log` (7-day retention, gitignored, per-vault state that follows the user). The non-blocking writer's `_guard` must outlive the program (stash it in a `OnceLock`).
+
+This function exists in `core::observability` but has **no callers** — no file logging runs anywhere, and `cli`/`mcp-server` have no subscriber at all. Wiring it up (and replacing the inline app `fmt()` with it) is tracked as `bug-observability-file-logging-unwired`.
 
 ### Spans on pipeline stages [obs-spans-pipeline]
 
-Spans wrap pipeline stages — `indexer.process_job`, `embedder.embed_batch`, `cluster.reconcile` — not individual function calls. The point is a single timeline showing where time was spent and which stage failed, async-aware across `.await`. Adopt when log volume from flat events makes correlation painful.
-
-```rust
-#[instrument(skip_all, fields(path = %job.path.display(), job_id = job.id))]
-async fn process_job(job: IndexJob) -> Result<()> { ... }
-```
-
-Per-subsystem instrumentation slots already reserved:
+Spans wrap pipeline stages (`indexer.process_job`, `embedder.embed_batch`, `cluster.reconcile`) — not individual function calls — via `#[instrument]`, giving a single timeline showing where time was spent and which stage failed, async-aware across `.await`. Adopt when flat-event volume makes correlation painful. Per-subsystem slots reserved:
 
 - **Watcher** — one span per debounced event after coalescing; pre-debounce raw events stay at `trace!`. [obs-instrument-watcher]
 - **Indexer** — top-level span per job; child spans for `chunk` / `embed` / `store`, each recording elapsed and outcome on close. [obs-instrument-indexer]
-- **Embedder** — span on `embed_batch` with `batch_size` and elapsed; embedding is the dominant cost so its latency signal is worth pulling out. [obs-instrument-embed]
+- **Embedder** — span on `embed_batch` with `batch_size` and elapsed. [obs-instrument-embed]
 - **Store** — slow-query log only (no span per SQL call); migrations at `info!`. [obs-instrument-store]
 - **Cluster / summarize** — top-level span on `hiker reconcile`; per-level child spans with `level`, `member_count`, `algorithm` fields. [obs-instrument-cluster]
-- **Host command boundary** — `#[instrument]` on every host command so each user action is one trace with everything done in service of it nested underneath. [obs-command-spans]
+- **Host command boundary** — `#[instrument]` on every host command so each user action is one nested trace. [obs-command-spans]
 
-### Env-var-driven filter [obs-env-filter]
+### Named env var + richer default [obs-env-filter]
 
-`HIKER_LOG` env var → `EnvFilter`, defaulting to `info,hiker=debug`. Lets a user crank verbosity on a single module (`HIKER_LOG=trace,hiker::core::embed=debug hiker reindex`) without recompiling. Cheap addition; pulled into v1 the first time someone wants module-level tuning.
+The live subscriber already honors `RUST_LOG` via `EnvFilter`. The follow-up is a hiker-namespaced `HIKER_LOG` var and a richer default than bare `info` (e.g. `info,hiker=debug`) so module-level verbosity needs no env var at all.
 
 ### UI logging [obs-frontend-bridge]
 
-The UI is native egui (Rust), so panel code emits `tracing` events directly — there's no separate frontend process and no log bridge to cross. `vault/.hiker/logs/hiker.log` is already the unified log for the whole app; UI call sites use the standard `tracing` macros with a `ui::`-prefixed target naming the panel.
+The UI is native egui (Rust), so panel code emits `tracing` events directly — there's no separate frontend process and no log bridge to cross. UI call sites use the standard `tracing` macros with a `ui::`-prefixed target naming the panel; the events ride the same subscriber as the rest of the app.
 
-**Targets.** Use the `ui::` prefix with the panel name as the second segment: `ui::files`, `ui::search`, `ui::chat`, `ui::settings`, `ui::app`. Keeps the namespace clean for `HIKER_LOG` filtering.
+**Targets.** Use the `ui::` prefix with the panel name as the second segment: `ui::files`, `ui::search`, `ui::chat`, `ui::settings`, `ui::app`. Keeps the namespace clean for env-filter filtering.
 
 **No content.** The same `obs-no-content` and `obs-no-secrets` rules apply: panels MUST NOT log note body text, embeddings, or auth tokens. Discipline-only — reviewers should reject any UI log call that includes buffer text.
 
@@ -134,9 +116,7 @@ Three-piece feature for browsing logs without leaving the app:
 
 - **Broadcast layer** — custom `tracing-subscriber` layer fans every formatted event into a `tokio::sync::broadcast` channel; the host subscribes and emits each as log events. [obs-log-channel]
 - **Ring buffer** — same layer keeps the most recent N events (default 2000) in a server-side `VecDeque` so the viewer has history when it opens mid-session; `get_log_buffer(filter) -> Vec<LogEvent>` command returns the snapshot. [obs-log-ring-buffer]
-- **Viewer panel** — collapsible UI panel showing the live event stream. Per-row: timestamp, level, module, message, expandable fields. Top bar: level filter, free-text filter, pause/resume, "open log file" button. Filter is client-side only. [obs-log-viewer-panel]
-
-The vault `.hiker/logs/` directory is fine to read with `less` / `rg` for now; the viewer is a convenience, not a necessity.
+- **Viewer panel** — collapsible UI panel showing the live event stream. Per-row: timestamp, level, module, message, expandable fields. Top bar: level filter, free-text filter, pause/resume. Filter is client-side only. [obs-log-viewer-panel]
 
 ### Test subscriber [obs-test-subscriber]
 
@@ -155,5 +135,4 @@ Not now, not without an explicit consent flow. Local logs only.
 
 - Replacing the existing error type strategy (`anyhow` for binary, `thiserror` for library boundaries — covered separately).
 - Crash reporting (sentry-style). Different problem; revisit when there's a reason.
-- Span tree visualization in the eventual log viewer. The flat event list is enough; if span trees later prove useful, the data is in the file output for offline tooling.
-- Search across rotated log files inside the eventual viewer. Older logs are read with `less` / `rg`.
+- Span tree visualization in the eventual log viewer. The flat event list is enough.

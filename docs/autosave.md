@@ -1,17 +1,8 @@
 # Autosave
 
-Crash-recovery snapshots of dirty editor buffers, plus a tab-state restore on vault re-open. Written periodically from the frontend, owned by the backend, auto-restored as dirty sticky tabs on next launch when an autosaved buffer has unsaved deltas (no modal — the dirty-marker is the affordance). Modeled on Notepad++: one snapshot per dirty buffer, overwritten in place each tick, separate from the actual file the user is editing.
+Crash-recovery snapshots of dirty editor buffers, plus a tab-state restore on vault re-open. Written periodically from the frontend, owned by the backend, auto-restored as dirty sticky tabs on next launch when an autosaved buffer has unsaved deltas (no modal — the dirty-marker is the affordance). One snapshot per dirty buffer, overwritten in place each tick, separate from the actual file the user is editing.
 
-Distinct from saving. Saving writes the *user's file* — autosave writes a *sidecar shadow copy* the user never sees unless we crash. Distinct from the op log (`op-log.md`) — that records committed writes (accepted ops) for agent rollback / future sync; autosave records *uncommitted* in-flight content for force-kill recovery. Different lifecycle, different consumers, different invariants; the two stores never share state.
-
-The headline decisions:
-
-- **One sidecar file per dirty buffer, overwritten in place each tick.** No append-only history, no per-tick versioning. NPP shape: re-saves to the same file, the freshest tick is the only thing on disk per buffer. [autosave-one-per-buffer]
-- **Backend owns storage, GC, and recovery; frontend ticks and pushes.** All filesystem touches are in `core::autosave`. The frontend's role collapses to "fire a 5s timer, push every dirty buffer's current text, prompt on recover hits." Live buffer text only exists in the editor's in-memory state, so the push direction is unavoidable; everything else stays in core. [autosave-backend-module]
-- **Storage lives at `vault/.hiker/autosave/`.** Per-vault. One `<id>.md` per dirty buffer plus an `index.json` carrying the path↔id map, per-entry content hash, and an authoritative tab-state snapshot. [autosave-store-layout]
-- **Recovery surfaces only buffers that genuinely have unsaved deltas.** On vault open, `autosave_recover()` returns entries whose autosaved `content_hash` differs from the live on-disk hash for the same path. Matches drop silently — they're stale snapshots from the last clean session. [autosave-recover-cmd]
-- **Both tab state and buffer recovery restore silently.** Reopening tabs is the quality-of-life baseline; recovered buffers ride the same shape — each one auto-opens as a sticky tab carrying the autosaved content, dirty against disk, so the user sees the unsaved work and decides whether to save or revert via the normal save / discard surfaces. No prompt at vault open. [autosave-tab-state-silent-restore, autosave-recovery-auto-restore]
-- **Not in the op log.** The two stores have different lifecycles (autosave: ephemeral, GC'd on save; op log: durable, retention-bounded), different consumers, and conflating them would inflate the op log by orders of magnitude. Autosave is in-flight per-keystroke buffer state; the op log is committed edit history.
+Autosave is distinct from saving and from the op log. Saving writes the *user's file*; autosave writes a *sidecar shadow copy* the user never sees unless we crash. The op log (`op-log.md`) records *committed* writes (accepted ops) for agent rollback / future sync, is durable and retention-bounded; autosave records *uncommitted* in-flight per-keystroke content for force-kill recovery, is ephemeral and GC'd on save. Different lifecycle, different consumers, different invariants; the two stores never share state, and conflating them would inflate the op log by orders of magnitude. [autosave-one-per-buffer, autosave-backend-module, autosave-store-layout, autosave-recover-cmd, autosave-tab-state-silent-restore, autosave-recovery-auto-restore]
 
 
 ## Storage layout
@@ -26,7 +17,7 @@ The headline decisions:
   ...
 ```
 
-`<id>` is a ulid; the trailing slug is debuggable but not load-bearing (the `index.json` map is canonical). One file per dirty buffer; overwritten on each tick. The on-disk content is exactly what the buffer would write if Save were pressed *right now* — no diff-encoding, no compression. Markdown at personal-vault scale doesn't justify the ceremony, and recovery wants the cheapest possible read path.
+`<id>` is a ulid; the trailing slug is debuggable but not load-bearing (the `index.json` map is canonical). One file per dirty buffer, overwritten each tick. The on-disk content is exactly what the buffer would write if Save were pressed *right now* — no diff-encoding, no compression.
 
 `index.json`:
 
@@ -62,41 +53,11 @@ The autosave directory is in the `watcher-ignore-hardcoded` list (everything und
 
 ## Backend module
 
-`core::autosave::Autosave` exposes:
+`core::autosave::Autosave` exposes (all `-> Result<_, AutosaveError>`): `open(vault_root)`, `write(path, contents, buffer_hash)`, `clear(path)`, `save_tab_state(state)` / `load_tab_state() -> Option<TabState>`, `recover() -> Vec<RecoveredEntry>`, `discard(path)`, and `vault_swap_reset()`.
 
-```rust
-impl Autosave {
-    pub fn open(vault_root: &Path) -> Result<Self, AutosaveError>;
+`RecoveredEntry`: `path`, `autosave_id`, `autosaved_content: Vec<u8>`, `autosaved_hash`, `on_disk_hash: Option<String>` (None when the file no longer exists on disk), `saved_at_ms`.
 
-    pub fn write(&self, path: &str, contents: &[u8], buffer_hash: &str)
-        -> Result<(), AutosaveError>;
-
-    pub fn clear(&self, path: &str) -> Result<(), AutosaveError>;
-
-    pub fn save_tab_state(&self, state: TabState) -> Result<(), AutosaveError>;
-    pub fn load_tab_state(&self) -> Result<Option<TabState>, AutosaveError>;
-
-    pub fn recover(&self) -> Result<Vec<RecoveredEntry>, AutosaveError>;
-    pub fn discard(&self, path: &str) -> Result<(), AutosaveError>;
-
-    pub fn vault_swap_reset(&self) -> Result<(), AutosaveError>;
-}
-```
-
-`RecoveredEntry`:
-
-```rust
-pub struct RecoveredEntry {
-    pub path: String,
-    pub autosave_id: String,
-    pub autosaved_content: Vec<u8>,
-    pub autosaved_hash: String,
-    pub on_disk_hash: Option<String>,    // None when the file no longer exists on disk
-    pub saved_at_ms: i64,
-}
-```
-
-`recover()` walks the index, computes the live on-disk hash for each entry's path (or `None` when missing), and returns only entries whose `autosaved_hash != on_disk_hash` (or whose on-disk file is gone). Matches are dropped silently as part of the same call so the index file shrinks naturally. [autosave-recover-cmd]
+`recover()` walks the index, computes each entry's live on-disk hash (or `None` when missing), and returns only entries whose `autosaved_hash != on_disk_hash` (or whose file is gone). Matches drop silently in the same call so the index file shrinks. [autosave-recover-cmd]
 
 Module discipline mirrors `core::store` and `core::changes` — `core::autosave` is the only module that touches `.hiker/autosave/`, returns plain Rust types (`RecoveredEntry`, `TabState`) not internal storage types, and exposes a narrow API the host wraps in 5–15 lines per command. [autosave-backend-module]
 
@@ -107,7 +68,7 @@ The host command surface matches the Rust API one-to-one: `autosave_write` / `au
 
 Every ~5 seconds while any tab is dirty, the frontend pushes each dirty buffer's current `(path, contents, hash)` to `autosave_write`. Buffers that became clean since the last tick fire `autosave_clear(path)`. [autosave-write-tick]
 
-- **Tick interval: 5s.** NPP defaults around 7s; we go slightly tighter since vaults are mostly markdown (cheap to write) and the cost of losing 5s of typing is annoying enough to justify the extra disk traffic.
+- **Tick interval: 5s.** Vaults are mostly markdown (cheap to write) and losing 5s of typing is annoying enough to justify the disk traffic.
 - **Tick is suspended when no buffers are dirty.** No-op timers are wasteful; reactivate on first dirty transition.
 - **Flush on window blur.** The OS gives us a focus-loss event before most graceful exits; the frontend fires an extra immediate tick on blur to shorten the worst-case loss window. [autosave-write-tick]
 - **Read-only preview buffers (trash / snapshot) never autosave.** They're never dirty by construction — the autosave path filters them out at the source. [autosave-readonly-skipped]
@@ -146,6 +107,8 @@ Worth pinning: the multi-tab restore order matches `tab_state.open_paths` (the s
 
 On vault open, after the auto-restore loop finishes opening recovered buffers (or immediately if there were none), the frontend silently calls `autosave_load_tab_state()` and reopens each path in `open_paths` as a sticky tab in order, then activates `active_path`. If `preview_path` is non-null and that path was *not* in `open_paths`, it opens as the preview slot. [autosave-tab-state-silent-restore]
 
+`open_paths`, `active_path`, and `preview_path` all use a tab's `persist_key` — the prefixed form for per-doc tabs (`canvas:<path>`, `board:<path>`) and a synthetic key for singleton page tabs (`:home`, `:graph`, …) — so the active tab restores for every persistable tab kind, not only plain vault-note tabs. A non-persistable active tab (trash/snapshot preview) leaves `active_path` empty and restore falls back to the first reopened tab.
+
 Failures — a path no longer on disk, or a tab whose buffer was a trash preview — drop silently from the restore list; the remaining tabs reopen normally and missing paths log to the obs stream per `obs-error-context`.
 
 Open buffers persist across vault re-opens via this tab-state snapshot (`multi-buffer-in-memory-only` in `editor.md`).
@@ -158,22 +121,17 @@ Closing a vault flushes the in-memory autosave state — clearing each handled p
 
 ## Backup classification
 
-Per `design.md`'s three-class backup framing:
-
-- The autosave directory's `<id>.md` files are **regenerable from running memory** — if the app is up and a tab is dirty, the next tick re-creates them. Lost only if the app exits cleanly with all buffers saved (in which case there's nothing to recover) or after the auto-restored buffer is in memory and the sidecar is dropped. Treat as **regenerable** for backup purposes; not worth syncing.
-- The `index.json` is **durable** — it carries the tab-state snapshot, which isn't reconstructible after a clean shutdown. Worth keeping if a backup tool is already including the rest of `.hiker/`. The cost is trivial (one small JSON file per vault).
-
-In practice, the simplest "back up the whole `.hiker/` directory" rule already covers both correctly. [autosave-backup-class]
+Per `design.md`'s three-class backup framing: the `<id>.md` sidecars are **regenerable** (the next tick re-creates any dirty buffer), not worth syncing; the `index.json` is **durable** (carries the tab-state snapshot, not reconstructible after a clean shutdown) but trivially small. The simplest "back up the whole `.hiker/` directory" rule covers both correctly. [autosave-backup-class]
 
 
 ## Settings
 
-Autosave is on by default with a fixed 5s tick. No `[autosave]` config section in v1 — the tick interval is hard-coded, on/off is implicit, and there's no nob a normal user needs. If a real workflow asks for them, an `[autosave]` section can land later (`tick_secs`, `enabled`); the strict-load posture and write-back machinery in `settings.md` already cover the shape. The deferred row stays in `settings.md`'s `## Deferred`.
+Autosave is on by default with a fixed 5s tick. No `[autosave]` config section in v1 — interval hard-coded, on/off implicit. An `[autosave]` section (`tick_secs`, `enabled`) can land later; `settings.md`'s strict-load + write-back machinery already covers the shape, and the deferred row lives in its `## Deferred`.
 
 
 ## Out of scope
 
-- **Per-buffer history.** NPP shape is one snapshot per buffer overwritten in place. Multiple snapshots per buffer would re-invent the op log for in-flight content; if a future workflow wants per-keystroke timeline replay, it'd build on the op log (which already records every accepted op) rather than autosave.
+- **Per-buffer history.** One snapshot per buffer, overwritten in place. Multiple snapshots would re-invent the op log for in-flight content; per-keystroke timeline replay, if ever wanted, builds on the op log, not autosave.
 - **Compression.** Autosave files are markdown at personal-vault scale, written briefly, read once. zstd would save bytes but adds an encode step in the hot tick path for no measured win.
 - **Cross-device autosave sync.** Autosave is per-machine crash recovery, not a device-handoff feature. The future sync layer in `design.md` syncs *committed* writes (saved files); in-flight uncommitted content stays local. This deliberately matches every other editor's posture.
 - **Per-keystroke continuous flush.** 5s tick + on-blur flush is the right ergonomic floor; flushing every keystroke would bury the disk for negligible recovery improvement.

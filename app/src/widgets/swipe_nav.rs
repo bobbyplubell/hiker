@@ -30,6 +30,18 @@ use crate::state::AppState;
 impl AppState {
     pub fn handle_swipe_nav(&mut self, ctx: &egui::Context) {
     let state = self;
+    // Opt-out: `[ui].swipe_nav_enabled` (default true). When off, two-finger
+    // horizontal scroll never navigates. [navigation-swipe-disable]
+    if !state
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.ui.swipe_nav_enabled)
+        .unwrap_or(true)
+    {
+        state.session.nav.swipe_accum_x = 0.0;
+        return;
+    }
     let now = std::time::Instant::now();
     // egui delivers scroll inputs from the platform; on macOS/Windows
     // touchpads a two-finger horizontal swipe lands here as x-axis delta.
@@ -85,34 +97,19 @@ impl AppState {
     }
 
     const THRESHOLD: f32 = 120.0;
-    const RELEASE_IDLE_MS: u128 = 140;
 
-    // No-input frame: this is what "fingers lifted" looks like. If the
-    // gesture was armed past threshold, commit the nav now; otherwise
-    // decay the indicator smoothly toward 0.
+    // No-input frame (fingers lifted / momentum done): just decay the indicator
+    // smoothly toward 0. We do NOT commit here — committing on the threshold
+    // crossing below means we never wait on the touchpad's momentum-scroll tail,
+    // which is what made the old release-time commit feel laggy / hung.
     let no_input = dx.abs() < 0.01 && dy.abs() < 0.01;
     if no_input {
-        if let Some(last) = state.session.nav.swipe_last_activity {
-            let idle_ms = now.duration_since(last).as_millis();
-            if idle_ms > RELEASE_IDLE_MS {
-                if let Some(dir) = state.session.nav.swipe_armed_dir.take() {
-                    // Release-time commit.
-                    editor_pane::nav_go(state, dir as i32);
-                    state.session.nav.swipe_last_commit_dir = Some(dir);
-                    state.session.nav.swipe_accum_x = (dir as f32) * -THRESHOLD;
-                    state.session.nav.swipe_cooldown_until =
-                        Some(now + std::time::Duration::from_millis(350));
-                    ctx.request_repaint();
-                    return;
-                }
-                if state.session.nav.swipe_accum_x.abs() > 0.5 {
-                    state.session.nav.swipe_accum_x *= 0.85;
-                    ctx.request_repaint();
-                } else if state.session.nav.swipe_accum_x.abs() <= 0.5 {
-                    state.session.nav.swipe_accum_x = 0.0;
-                    state.session.nav.swipe_last_activity = None;
-                }
-            }
+        if state.session.nav.swipe_accum_x.abs() > 0.5 {
+            state.session.nav.swipe_accum_x *= 0.8;
+            ctx.request_repaint();
+        } else {
+            state.session.nav.swipe_accum_x = 0.0;
+            state.session.nav.swipe_last_activity = None;
         }
         return;
     }
@@ -120,9 +117,8 @@ impl AppState {
     // Horizontal-dominant only.
     if dx.abs() <= dy.abs() * 1.5 {
         if dy.abs() > dx.abs() {
-            // Vertical-dominant scroll cancels any armed swipe.
+            // Vertical-dominant scroll cancels a partial swipe.
             state.session.nav.swipe_accum_x = 0.0;
-            state.session.nav.swipe_armed_dir = None;
         }
         return;
     }
@@ -130,22 +126,20 @@ impl AppState {
     state.session.nav.swipe_accum_x += dx;
     state.session.nav.swipe_last_activity = Some(now);
 
-    // Arm when we cross the threshold; do NOT fire here. If the user
-    // keeps pushing past, hold the indicator at full so it's visually
-    // saturated. If they reverse back below threshold, disarm — they're
-    // backing out of the gesture.
-    if state.session.nav.swipe_accum_x >= THRESHOLD {
-        // Positive dx (swipe right) → back.
-        state.session.nav.swipe_armed_dir = Some(-1);
-        state.session.nav.swipe_accum_x = THRESHOLD;
-    } else if state.session.nav.swipe_accum_x <= -THRESHOLD {
-        state.session.nav.swipe_armed_dir = Some(1);
-        state.session.nav.swipe_accum_x = -THRESHOLD;
-    } else if state.session.nav.swipe_armed_dir.is_some()
-        && state.session.nav.swipe_accum_x.abs() < THRESHOLD * 0.8
-    {
-        // Below 80% of threshold → user is canceling.
-        state.session.nav.swipe_armed_dir = None;
+    // Commit the instant the accumulator crosses the threshold — responsive,
+    // with no wait for the gesture to be "released". A short cooldown then keeps
+    // a single continuous swipe (incl. its momentum tail) from firing again.
+    let accum = state.session.nav.swipe_accum_x;
+    if accum.abs() >= THRESHOLD {
+        // Positive dx (swipe right) → back; negative → forward.
+        let dir: i8 = if accum > 0.0 { -1 } else { 1 };
+        editor_pane::nav_go(state, dir as i32);
+        state.session.nav.swipe_last_commit_dir = Some(dir);
+        // Hold the accumulator at full (sign preserved) so the indicator flashes
+        // saturated during the cooldown.
+        state.session.nav.swipe_accum_x = (dir as f32) * -THRESHOLD;
+        state.session.nav.swipe_cooldown_until =
+            Some(now + std::time::Duration::from_millis(350));
     }
     ctx.request_repaint();
     }

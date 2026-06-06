@@ -31,6 +31,24 @@ pub enum Tool {
     Hand,
 }
 
+/// How a plain (no-modifier) scroll over empty canvas behaves. View state only,
+/// driven by the host from `[ui].canvas_scroll_mode` each frame; never
+/// serialized. Ctrl/Cmd+scroll and pinch always zoom regardless of this.
+/// status: canvas-scroll-mode
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMode {
+    /// Detect the source device per scroll event: a mouse wheel zooms to the
+    /// cursor, a touchpad two-finger scroll pans (the default). The widget reads
+    /// the scroll's `MouseWheelUnit` — line deltas are a wheel, pixel deltas a
+    /// touchpad.
+    #[default]
+    Auto,
+    /// Always pan the camera.
+    Pan,
+    /// Always zoom to the cursor.
+    Zoom,
+}
+
 /// What a left-press should begin, decided purely from the active [`Tool`], the
 /// universal pan modifiers (Space held / middle mouse button), and whether the
 /// press landed on a node or on empty canvas. Pulled out of the egui event

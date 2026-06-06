@@ -339,7 +339,7 @@ impl From<AmbiguousResolution> for crate::wikilink::AmbiguityPolicy {
 /// `docs/clustering.md` and `docs/trails.md` §"Draft sources".
 ///
 /// status: trail-draft-from-clustering
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusteringConfig {
     /// When `true`, the clustering pipeline emits a DRAFT trail proposal
@@ -352,6 +352,28 @@ pub struct ClusteringConfig {
     /// status: trail-draft-from-clustering
     #[serde(default = "no")]
     pub propose_trails: bool,
+    /// Default directory for newly-created cluster-tree `.md` files.
+    /// Vault-relative; empty string places trees at vault root. Auto-created
+    /// on first tree by `vault.write_file`. Discovery is by `hiker.kind:
+    /// cluster-tree` frontmatter, so the user can move a tree anywhere after
+    /// creation. Vault-scope eligible per `settings-write-back`.
+    ///
+    /// status: cluster-tree-visible-note
+    #[serde(default = "default_new_cluster_tree_dir")]
+    pub new_cluster_tree_dir: String,
+}
+
+impl Default for ClusteringConfig {
+    fn default() -> Self {
+        Self {
+            propose_trails: no(),
+            new_cluster_tree_dir: default_new_cluster_tree_dir(),
+        }
+    }
+}
+
+fn default_new_cluster_tree_dir() -> String {
+    "cluster-trees/".to_string()
 }
 
 /// `[boards]` section. Mirrors `[trails]`: default placement for newly
@@ -1405,5 +1427,56 @@ impl TreeSortBy {
             TreeSortBy::MtimeDesc => "mtime_desc",
             TreeSortBy::MtimeAsc => "mtime_asc",
         }
+    }
+}
+
+/// `[chat]` section. Loaded so the strict-load `Config` accepts a `[chat]`
+/// table. Owns the location of the visible chat-session note folder; the
+/// chat *runtime* lives in the app layer and reads this field to build
+/// session paths. See `docs/settings.md` §`[chat]`.
+///
+/// status: settings-section-chat
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    /// Visible folder holding native + imported chat-session notes
+    /// (`chat-session-markdown-store`); imports land in its `imported/`
+    /// subfolder. Default `"chats/"`. Sessions are ordinary indexed notes,
+    /// not hidden under `.hiker/` (`subsystem-notes-visible`).
+    #[serde(default = "default_chats_dir")]
+    pub chats_dir: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self { chats_dir: default_chats_dir() }
+    }
+}
+
+fn default_chats_dir() -> String {
+    "chats/".to_string()
+}
+
+/// `[render]` section. Vault-wide policy for the editor's rendered-widget
+/// layer (LaTeX math, Mermaid / WaveDrom diagrams, tables). See
+/// `docs/editor-widgets.md` §"Caching and invalidation" and
+/// `docs/settings.md` §`[render]`.
+///
+/// status: render-cache-diagrams-toggle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderConfig {
+    /// When `true` (default), rasterized diagram widgets are persisted to
+    /// `<vault>/.hiker/diagram-cache/` keyed by the render's `content_hash`,
+    /// so reopening a note skips the resvg blit on a cache hit. The in-memory
+    /// `CachedDeco` / texture caches are unaffected; off skips only the disk
+    /// layer. Live-applied. status: widget-render-disk-cache
+    #[serde(default = "yes")]
+    pub cache_diagrams: bool,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self { cache_diagrams: true }
     }
 }

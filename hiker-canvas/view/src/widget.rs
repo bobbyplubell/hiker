@@ -28,10 +28,11 @@ use canvas_view_core::camera::Camera;
 use canvas_view_core::edges::anchor_pos;
 use canvas_view_core::handles::Handle;
 use canvas_view_core::interaction::{self, Target};
-use canvas_view_core::state::{CreateKind, Interaction, LabelEdit, Selection, Tool, UndoStack};
+use canvas_view_core::state::{CreateKind, Interaction, LabelEdit, ScrollMode, Selection, Tool, UndoStack};
 use hiker_canvas::model::Side;
 
 use crate::content::{CardView, NodeContentRenderer};
+use crate::menu::{self, CanvasMenuRenderer};
 use crate::paint;
 
 /// Spacing of the optional background grid, in canvas units.
@@ -51,6 +52,13 @@ pub struct CanvasResponse {
     /// view itself stays content-display-only; activation is the host's job.
     /// status: canvas-link-node-card
     pub activated: Option<String>,
+    /// A node the user asked to EDIT this frame WITHOUT a double-click: either a
+    /// plain click on a node that was already the sole selection (click-again, a
+    /// la Finder rename), or the host's Enter/F2-on-selected. The host enters
+    /// inline-edit for an editable node (no activate fallback — a click-again on a
+    /// non-editable node does nothing). Distinct from `activated` (double-click)
+    /// so the host can treat them differently. status: canvas-inline-edit
+    pub edit_requested: Option<String>,
     /// The host should open the inline "+ Link" URL prompt — a canvas
     /// context-menu action that needs host-side UI. status: canvas-node-create
     pub request_link_prompt: bool,
@@ -123,6 +131,17 @@ pub struct CanvasView {
     /// Reverts to normal Select behavior once the group is created.
     /// status: canvas-group-draw
     pending_group_draw: bool,
+    /// How a plain (no-modifier) scroll over empty canvas behaves (pan / zoom /
+    /// auto-detect by device). Ctrl/Cmd+scroll and pinch always zoom regardless.
+    /// Set by the host from `[ui].canvas_scroll_mode` each frame. View state only.
+    /// status: canvas-scroll-mode
+    scroll_mode: ScrollMode,
+    /// In `Auto` mode, the device behind the most recent scroll (`true` = mouse
+    /// wheel / line delta, `false` = touchpad / pixel delta). egui emits a tail of
+    /// smoothed `smooth_scroll_delta` frames after the raw `MouseWheel` events
+    /// stop, so we remember the last source to keep pan-vs-zoom stable across that
+    /// tail rather than flipping mid-gesture. status: canvas-scroll-mode
+    last_scroll_was_line: bool,
 }
 
 impl CanvasView {
@@ -130,6 +149,12 @@ impl CanvasView {
     #[must_use]
     pub fn new() -> Self {
         Self { show_grid: true, ..Self::default() }
+    }
+
+    /// Set how a plain scroll behaves (pan / zoom / auto-detect). The host drives
+    /// this from `[ui].canvas_scroll_mode`. status: canvas-scroll-mode
+    pub const fn set_scroll_mode(&mut self, mode: ScrollMode) {
+        self.scroll_mode = mode;
     }
 
     /// The current camera (read-only view state).
@@ -244,6 +269,25 @@ impl CanvasView {
         }
     }
 
+    /// Single-select the node `id` and center the camera on it (keeping the
+    /// current zoom), if it exists. The FOLLOW seam a host uses to highlight
+    /// and bring into view the node matching the active note of a linked tab
+    /// group. Returns `true` when the node was found and focused; `false`
+    /// (no-op) otherwise. status: tab-linking
+    pub fn focus_node(&mut self, viewport: Rect, canvas: &Canvas, id: &str) -> bool {
+        let Some(node) = canvas.nodes.iter().find(|n| n.id == id) else {
+            return false;
+        };
+        self.selection.clear();
+        self.selection.nodes.insert(id.to_string());
+        let center = Point::new(
+            node.x as f64 + node.width as f64 / 2.0,
+            node.y as f64 + node.height as f64 / 2.0,
+        );
+        self.camera.center_on_point(viewport, center);
+        true
+    }
+
     /// Mint a fresh, canvas-unique node/edge id.
     fn mint_id(&mut self, canvas: &Canvas) -> String {
         loop {
@@ -307,7 +351,13 @@ impl CanvasView {
     /// connect (egui gives the topmost widget pointer priority). Overlays
     /// (selection, handles, rubber bands) and the inline label editor paint
     /// last, on top of the surface. Node content is therefore display-only.
-    pub fn show(&mut self, ui: &mut egui::Ui, canvas: &mut Canvas, content: &mut dyn NodeContentRenderer) -> CanvasResponse {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas: &mut Canvas,
+        content: &mut dyn NodeContentRenderer,
+        menu: &mut dyn CanvasMenuRenderer,
+    ) -> CanvasResponse {
         let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         let mut out = CanvasResponse::default();
 
@@ -339,10 +389,28 @@ impl CanvasView {
 
         self.paint_overlays(ui, viewport, canvas, &hover);
         self.draw_label_editor(ui, viewport, canvas, &mut out);
-        self.show_context_menu(&response, viewport, canvas, &mut out);
+        self.show_context_menu(&response, viewport, canvas, menu, &mut out);
 
         out.interacted = response.clicked() || response.dragged() || response.hovered();
         out
+    }
+
+    /// Paint the canvas SCENE only — grid, group backgrounds, edges, and node
+    /// cards / LOD placeholders at the current camera — with NO interaction:
+    /// no interaction surface is allocated, no input is read (zoom / keys /
+    /// pointer), no overlays / handles / context menu, and nothing is committed.
+    /// A display-only render for previews and thumbnails, safe to call inside a
+    /// non-interactable `egui::Area` (it registers no interactive widget, so it
+    /// can't steal pointer hover from the row beneath it).
+    ///
+    /// Shares the exact scene-paint path with [`CanvasView::show`] via
+    /// [`CanvasView::paint_scene`]; the only difference is everything around it
+    /// is skipped. Hand it [`crate::content::NoContentRenderer`] when only frames / LOD
+    /// are wanted — at fit/thumbnail zoom every node is a LOD placeholder and the
+    /// content renderer is never invoked. status: canvas-static-paint
+    pub fn show_static(&mut self, ui: &mut egui::Ui, canvas: &Canvas, content: &mut dyn NodeContentRenderer) {
+        let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        self.paint_scene(ui, viewport, canvas, content, None);
     }
 
     /// Wheel / pinch input. A pinch always zooms the camera. A wheel over a
@@ -352,15 +420,60 @@ impl CanvasView {
     /// toward the cursor.
     /// status: canvas-card-scroll, canvas-card-zoom, canvas-pan-zoom, canvas-lod-placeholder
     fn handle_zoom(&mut self, ui: &egui::Ui, viewport: Rect, canvas: &Canvas) {
-        let (scroll, zoom, pointer, ctrl) = ui.input(|i| {
-            (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos(), i.modifiers.command)
+        // Keyboard zoom: plain `+`/`=` in, `-` out, `0` fit-to-content. No
+        // modifier, so it never fights egui's built-in Cmd/Ctrl+/- whole-UI zoom
+        // — and it's the ergonomic way to zoom in scroll-to-pan mode where a
+        // plain scroll pans. Gated on no focused editor (inline-edit / edge
+        // label) so it can't fire while typing. Zooms around the cursor when it's
+        // over the canvas, else the viewport center. status: canvas-scroll-mode
+        if self.label_edit.is_none() && ui.ctx().memory(egui::Memory::focused).is_none() {
+            let (zin, zout, fit) = ui.input(|i| {
+                (
+                    i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals),
+                    i.key_pressed(Key::Minus),
+                    i.key_pressed(Key::Num0),
+                )
+            });
+            if zin || zout || fit {
+                let anchor = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .filter(|p| viewport.contains(*p))
+                    .unwrap_or_else(|| viewport.center());
+                if fit {
+                    self.fit(viewport, canvas);
+                } else {
+                    let factor = if zin { 1.2 } else { 1.0 / 1.2 };
+                    self.camera.zoom_to_cursor(viewport, anchor, factor);
+                }
+            }
+        }
+        // Read the source device of this frame's scroll, if any: egui tags each
+        // `MouseWheel` event with a unit — `Line` (mouse-wheel notches) vs `Point`
+        // (touchpad pixel deltas). winit's Wayland backend keys this off
+        // `has_discrete_scroll`, so it's the libinput mouse-vs-touchpad split. We
+        // take the latest event's unit and remember it, because egui's scroll
+        // smoothing keeps feeding `smooth_scroll_delta` for a few frames after the
+        // raw events stop (no `MouseWheel` event on those tail frames).
+        // status: canvas-scroll-mode
+        let (scroll_xy, scroll, zoom, pointer, ctrl, wheel_unit) = ui.input(|i| {
+            let unit = i.events.iter().rev().find_map(|e| match e {
+                egui::Event::MouseWheel { unit, .. } => Some(*unit),
+                _ => None,
+            });
+            (i.smooth_scroll_delta, i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos(), i.modifiers.command, unit)
         });
+        if let Some(unit) = wheel_unit {
+            // `Point` is a touchpad; `Line`/`Page` are a wheel.
+            self.last_scroll_was_line = !matches!(unit, egui::MouseWheelUnit::Point);
+        }
         let Some(cursor) = pointer.filter(|p| viewport.contains(*p)) else { return };
+        // Pinch and Ctrl/Cmd+scroll always zoom to the cursor (egui folds
+        // ctrl+scroll into `zoom_delta`). status: canvas-scroll-mode
         if (zoom - 1.0).abs() > f32::EPSILON {
             self.camera.zoom_to_cursor(viewport, cursor, zoom);
             return;
         }
-        if scroll.abs() <= 0.5 {
+        if scroll_xy.length() <= 0.5 {
             return;
         }
         let world = self.camera.screen_to_world(viewport, cursor);
@@ -382,8 +495,23 @@ impl CanvasView {
                 return;
             }
         }
-        let factor = (scroll * 0.0015).exp();
-        self.camera.zoom_to_cursor(viewport, cursor, factor);
+        // Over empty canvas / a group / a LOD placeholder (nothing with its own
+        // scrollable content): pan or zoom per the host's mode. In `Auto`, the
+        // remembered source decides — a wheel zooms, a touchpad pans.
+        // status: canvas-scroll-mode
+        let zooms = match self.scroll_mode {
+            ScrollMode::Zoom => true,
+            ScrollMode::Pan => false,
+            ScrollMode::Auto => self.last_scroll_was_line,
+        };
+        if zooms {
+            let factor = (scroll * 0.0015).exp();
+            self.camera.zoom_to_cursor(viewport, cursor, factor);
+        } else {
+            // Natural two-finger pan — move the camera with the scroll (both
+            // axes). `smooth_scroll_delta` already honors the OS scroll direction.
+            self.camera.pan_by_screen(scroll_xy);
+        }
     }
 
     /// Keyboard: delete, undo/redo, escape.
@@ -703,103 +831,108 @@ impl CanvasView {
     /// the click landed on: a node card (zoom + delete), an edge (edit label +
     /// delete), or empty canvas (the toolbar's create / insert / fit verbs, so
     /// the toolbar is reachable without leaving the canvas). status: canvas-context-menu
-    fn show_context_menu(&mut self, response: &egui::Response, viewport: Rect, canvas: &mut Canvas, out: &mut CanvasResponse) {
+    fn show_context_menu(
+        &mut self,
+        response: &egui::Response,
+        viewport: Rect,
+        canvas: &mut Canvas,
+        menu: &mut dyn CanvasMenuRenderer,
+        out: &mut CanvasResponse,
+    ) {
         let anchor = self.menu_anchor;
         response.context_menu(|ui| {
             let target = anchor.map(|p| interaction::resolve_target(canvas, &self.camera, viewport, &self.selection, p));
             match target {
                 Some(Target::Node(id) | Target::SideHandle { node: id, .. }) => {
-                    self.node_context_menu(ui, &id, canvas, out);
+                    if let Some(action) = menu.node_menu(ui) {
+                        self.apply_node_menu(action, &id, canvas, out);
+                    }
                 }
                 Some(Target::ResizeHandle(_)) => {
                     if let Some(id) = self.selection.nodes.iter().next().cloned() {
-                        self.node_context_menu(ui, &id, canvas, out);
+                        if let Some(action) = menu.node_menu(ui) {
+                            self.apply_node_menu(action, &id, canvas, out);
+                        }
                     }
                 }
-                Some(Target::Edge(id)) => self.edge_context_menu(ui, &id, canvas, out),
-                _ => self.empty_context_menu(ui, viewport, canvas, out),
+                Some(Target::Edge(id)) => {
+                    if let Some(action) = menu.edge_menu(ui) {
+                        self.apply_edge_menu(action, &id, canvas, out);
+                    }
+                }
+                _ => {
+                    if let Some(action) = menu.empty_menu(ui) {
+                        self.apply_empty_menu(action, viewport, canvas, out);
+                    }
+                }
             }
         });
     }
 
-    /// The node context menu: per-card content zoom + delete. status: canvas-card-zoom, canvas-delete
-    fn node_context_menu(&mut self, ui: &mut egui::Ui, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
-        {
-            let entry = self.card_views.entry(id.to_owned()).or_default();
-            if ui.button("Zoom in").clicked() {
-                entry.zoom = (entry.zoom * 1.25).clamp(0.3, 4.0);
-                ui.close();
+    /// Apply a chosen node-menu verb through the widget's existing pipeline:
+    /// zoom verbs mutate the card's view state; `Delete` runs the same selection
+    /// delete + undo recording as the toolbar. status: ctxmenu-canvas
+    fn apply_node_menu(&mut self, action: menu::NodeMenuAction, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
+        use crate::menu::NodeMenuAction::{Delete, ResetZoom, ZoomIn, ZoomOut};
+        match action {
+            ZoomIn | ZoomOut | ResetZoom => {
+                let entry = self.card_views.entry(id.to_owned()).or_default();
+                entry.zoom = match action {
+                    ZoomIn => (entry.zoom * 1.25).clamp(0.3, 4.0),
+                    ZoomOut => (entry.zoom / 1.25).clamp(0.3, 4.0),
+                    _ => 1.0,
+                };
             }
-            if ui.button("Zoom out").clicked() {
-                entry.zoom = (entry.zoom / 1.25).clamp(0.3, 4.0);
-                ui.close();
-            }
-            if ui.button("Reset zoom").clicked() {
-                entry.zoom = 1.0;
-                ui.close();
-            }
-        }
-        ui.separator();
-        if ui.button("Delete").clicked() {
-            let mut sel = Selection::default();
-            sel.nodes.insert(id.to_owned());
-            let pre = canvas.clone();
-            let ops = interaction::delete_selection(canvas, &sel);
-            self.commit_each(&pre, ops, out);
-            self.selection.nodes.remove(id);
-            ui.close();
-        }
-    }
-
-    /// The edge context menu: edit the label, or delete the edge.
-    /// status: canvas-edge-label, canvas-delete
-    fn edge_context_menu(&mut self, ui: &mut egui::Ui, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
-        if ui.button("Edit label…").clicked() {
-            let draft = canvas.edges.iter().find(|e| e.id == id).and_then(|e| e.label.clone()).unwrap_or_default();
-            self.label_edit = Some(LabelEdit { edge_id: id.to_owned(), draft });
-            ui.close();
-        }
-        if ui.button("Delete").clicked() {
-            if canvas.edges.iter().any(|e| e.id == id) {
+            Delete => {
+                let mut sel = Selection::default();
+                sel.nodes.insert(id.to_owned());
                 let pre = canvas.clone();
-                let op = EditOp::RemoveEdge { id: id.to_owned() };
-                op.apply(canvas);
-                self.commit_one(op, &pre, out);
-                self.selection.edges.remove(id);
+                let ops = interaction::delete_selection(canvas, &sel);
+                self.commit_each(&pre, ops, out);
+                self.selection.nodes.remove(id);
             }
-            ui.close();
         }
     }
 
-    /// The empty-space context menu: the toolbar's create / insert / fit verbs.
+    /// Apply a chosen edge-menu verb: open the inline label editor, or delete the
+    /// edge through the `EditOp` + undo pipeline.
+    /// status: canvas-edge-label, canvas-delete, ctxmenu-canvas
+    fn apply_edge_menu(&mut self, action: menu::EdgeMenuAction, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
+        match action {
+            menu::EdgeMenuAction::EditLabel => {
+                let draft = canvas.edges.iter().find(|e| e.id == id).and_then(|e| e.label.clone()).unwrap_or_default();
+                self.label_edit = Some(LabelEdit { edge_id: id.to_owned(), draft });
+            }
+            menu::EdgeMenuAction::Delete => self.delete_edge(id, canvas, out),
+        }
+    }
+
+    /// Remove an edge (if it still exists) through the `EditOp` + undo pipeline.
+    /// status: canvas-delete
+    fn delete_edge(&mut self, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
+        if !canvas.edges.iter().any(|e| e.id == id) {
+            return;
+        }
+        let pre = canvas.clone();
+        let op = EditOp::RemoveEdge { id: id.to_owned() };
+        op.apply(canvas);
+        self.commit_one(op, &pre, out);
+        self.selection.edges.remove(id);
+    }
+
+    /// Apply a chosen empty-space verb: the toolbar's create / insert / fit verbs.
     /// Text and group create immediately (queued for the next `show`); link /
     /// vault-insert need host-side UI, so they're reported as requests in
-    /// [`CanvasResponse`]. status: canvas-node-create, canvas-context-menu
-    fn empty_context_menu(&mut self, ui: &mut egui::Ui, viewport: Rect, canvas: &Canvas, out: &mut CanvasResponse) {
-        if ui.button("Add text").clicked() {
-            self.create_centered(CreateKind::Text);
-            ui.close();
-        }
-        if ui.button("New note").clicked() {
-            out.request_new_note = true;
-            ui.close();
-        }
-        if ui.button("Add link…").clicked() {
-            out.request_link_prompt = true;
-            ui.close();
-        }
-        if ui.button("Insert from vault…").clicked() {
-            out.request_insert_picker = true;
-            ui.close();
-        }
-        if ui.button("Add group").clicked() {
-            self.arm_group_draw();
-            ui.close();
-        }
-        ui.separator();
-        if ui.button("Fit to content").clicked() {
-            self.fit(viewport, canvas);
-            ui.close();
+    /// [`CanvasResponse`]. status: canvas-node-create, canvas-context-menu, ctxmenu-canvas
+    fn apply_empty_menu(&mut self, action: menu::EmptyMenuAction, viewport: Rect, canvas: &Canvas, out: &mut CanvasResponse) {
+        use crate::menu::EmptyMenuAction::{AddGroup, AddLink, AddText, FitToContent, InsertFromVault, NewNote};
+        match action {
+            AddText => self.create_centered(CreateKind::Text),
+            NewNote => out.request_new_note = true,
+            AddLink => out.request_link_prompt = true,
+            InsertFromVault => out.request_insert_picker = true,
+            AddGroup => self.arm_group_draw(),
+            FitToContent => self.fit(viewport, canvas),
         }
     }
 }
@@ -902,5 +1035,74 @@ mod tests {
         view.consume_pending(&mut canvas, viewport(), &mut out);
         assert!(out.committed.is_empty());
         assert!(canvas.nodes.is_empty());
+    }
+
+    fn sample_canvas() -> Canvas {
+        let mut canvas = Canvas::default();
+        canvas.nodes.push(Node {
+            id: "a".into(),
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 120,
+            color: None,
+            kind: NodeKind::Text { text: "hello".into() },
+            extra: BTreeMap::new(),
+        });
+        canvas.nodes.push(Node {
+            id: "b".into(),
+            x: 400,
+            y: 240,
+            width: 200,
+            height: 120,
+            color: None,
+            kind: NodeKind::File { file: "notes/x.md".into(), subpath: None },
+            extra: BTreeMap::new(),
+        });
+        canvas
+    }
+
+    /// `show_static` drives one display-only paint through a real `Ui` without
+    /// panicking and — crucially — registers NO interactive widget, so it can
+    /// live inside a non-interactable `Area` without stealing pointer hover.
+    /// status: canvas-static-paint
+    #[test]
+    fn show_static_paints_without_registering_interaction() {
+        use crate::content::NoContentRenderer;
+        let canvas = sample_canvas();
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let mut view = CanvasView::new();
+            view.fit(ui.available_rect_before_wrap(), &canvas);
+            view.show_static(ui, &canvas, &mut NoContentRenderer);
+        });
+        harness.run();
+        // A non-interactable scene: no widget claimed pointer interest, so the
+        // ctx reports nothing wants pointer / keyboard input.
+        assert!(!harness.ctx.wants_pointer_input(), "static paint must not sense the pointer");
+        assert!(!harness.ctx.wants_keyboard_input(), "static paint must not grab keyboard focus");
+    }
+
+    /// A `NoContentRenderer` renderer paints nothing and echoes the card's scroll back
+    /// unchanged. status: canvas-static-paint
+    #[test]
+    fn no_content_echoes_scroll() {
+        use crate::content::{CardView, NoContentRenderer};
+        use crate::content::NodeContentRenderer;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let node = Node {
+                id: "a".into(),
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 60,
+                color: None,
+                kind: NodeKind::Text { text: String::new() },
+                extra: BTreeMap::new(),
+            };
+            let view = CardView { zoom: 1.0, scroll_y: 17.0 };
+            let echoed = NoContentRenderer.render(ui, &node, ui.max_rect(), view);
+            assert_eq!(echoed, 17.0);
+        });
+        harness.run();
     }
 }

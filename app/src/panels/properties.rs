@@ -181,16 +181,27 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     }
 
     // Trail membership: list every trail that contains this note as a
-    // waypoint. Per `properties` spec — surfaces the note's role in
-    // user-curated structure.
-    let trail_hits: Vec<(String, usize)> = app
-        .trails_state.trails
-        .iter()
-        .filter_map(|t| {
-            let idx = t.waypoints.iter().position(|w| w.path == path)?;
-            Some((t.name.clone(), idx))
-        })
-        .collect();
+    // waypoint, via the derived `trail_waypoints` reverse lookup. Per
+    // `properties` spec — surfaces the note's role in user-curated
+    // structure.
+    let trail_hits: Vec<String> = {
+        match app.vault_session.services.read_store.lock() {
+            Ok(store) => hiker_core::trails::containing_note_with_paths(
+                &app.vault_session.vault,
+                &store,
+                &app.vault_session.services.oplog,
+                path,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| {
+                let base = h.trail_doc_rel.rsplit('/').next().unwrap_or(&h.trail_doc_rel);
+                base.strip_suffix(".md").unwrap_or(base).to_string()
+            })
+            .collect(),
+            Err(_) => Vec::new(),
+        }
+    };
     if !trail_hits.is_empty() {
         ui.add_space(12.0);
         ui.label(egui::RichText::new("Trails").strong());
@@ -198,9 +209,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
             .num_columns(2)
             .spacing(egui::vec2(20.0, 4.0))
             .show(ui, |ui| {
-                for (name, idx) in &trail_hits {
+                for name in &trail_hits {
                     ui.label(egui::RichText::new(name).monospace());
-                    ui.label(format!("waypoint #{}", idx + 1));
+                    ui.label("waypoint");
                     ui.end_row();
                 }
             });

@@ -28,6 +28,7 @@ use editor_view::viewport::ViewState;
 use hiker_canvas::model::{Node, NodeKind};
 
 use canvas_view::content::{CardView, NodeContentRenderer};
+use canvas_view::menu::{CanvasMenuRenderer, EdgeMenuAction, EmptyMenuAction, NodeMenuAction};
 
 /// A hosted read-only editor for one node's markdown / text body, plus the
 /// fingerprint of the content it was built for.
@@ -212,4 +213,23 @@ fn hash(text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     h.finish()
+}
+
+/// A no-op [`CanvasMenuRenderer`] for the profiler: the timed sweeps never open a
+/// context menu, so the menu seam just needs a trivial implementation to satisfy
+/// `CanvasView::show`. Returns `None` for every target.
+pub struct NoMenus;
+
+impl CanvasMenuRenderer for NoMenus {
+    fn node_menu(&mut self, _ui: &mut egui::Ui) -> Option<NodeMenuAction> {
+        None
+    }
+
+    fn edge_menu(&mut self, _ui: &mut egui::Ui) -> Option<EdgeMenuAction> {
+        None
+    }
+
+    fn empty_menu(&mut self, _ui: &mut egui::Ui) -> Option<EmptyMenuAction> {
+        None
+    }
 }

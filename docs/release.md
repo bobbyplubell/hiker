@@ -2,19 +2,12 @@
 
 How versions are numbered, how branches flow into releases, and what a "release" actually means for hiker.
 
-The headline decisions:
-
-- SemVer, with a `0.x.y` prefix until v1. Minor bumps may break; patch bumps may not.
-- Trunk-based: `main` is always shippable. Work happens on short-lived feature branches that squash-merge back.
-- Releases are git tags (`v0.3.1`) on a commit on `main`. The tag is the source of truth; CHANGELOG and the embedded version must match it.
-- A `dev` branch is not used in v1. Add one only when there's a concrete reason (stabilization window, multi-contributor staging) — not preemptively.
-
 
 ## Versioning
 
 Pre-stable SemVer (`0.MAJOR.MINOR`-style use of the slots), interpreted as:
 
-- **`0.x.0` (minor bump while pre-1.0)** — may break: vault format, `vault/.hiker/` layout, DB schema, config schema, CLI flags, host command signatures consumed by the UI. The `store-version-fail-loud` rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
+- **`0.x.0` (minor bump while pre-1.0)** — may break any persisted format or public surface (see the breaking-change table below). The `store-version-fail-loud` rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
 - **`0.x.y` (patch bump)** — bug fixes, internal refactors, additive features that don't change persisted formats or public surfaces. Safe to upgrade in place.
 - **`1.0.0`** — when the persisted formats and public surfaces are stable enough to defend across a year. Not on the near-term roadmap.
 
@@ -64,7 +57,7 @@ Rules:
 - **Squash-merge into `main`.** The squashed commit is the unit of history; its message describes the *change*, not the path that got there.
 - **Branch naming:** `feat/<slug>`, `fix/<slug>`, `chore/<slug>`. Where possible the `<slug>` is a status.md slug so the branch name itself is greppable.
 
-No `dev` branch, no long-running release branches. If a release needs stabilization, cut a `release/0.x` branch *at tag time* from `main`, fix-forward there, and cherry-pick fixes back to `main`. This is a tool we reach for when a release needs it — not a permanent branch.
+No long-running release branches. If a release needs stabilization, cut a `release/0.x` branch *at tag time* from `main`, fix-forward there, and cherry-pick fixes back to `main` — a tool we reach for when a release needs it, not a permanent branch. (`dev` branch: see Out of scope.)
 
 
 ## Squash-merge message convention

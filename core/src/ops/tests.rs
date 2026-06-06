@@ -674,6 +674,632 @@ fn external_edit_is_noop_on_self_write_echo() {
     );
 }
 
+// ── startup disk reconcile (op-log-startup-disk-reconcile) ─────────────────
+// Acceptance cases 1, 3, 4, 10 from op-log.md §External-edit sync. Offline
+// delete/rename (cases 2, 5–9, 11, 12) are later phases and out of scope here.
+
+#[test]
+fn reconcile_disk_folds_offline_edit_as_external() {
+    // Acceptance case 1: an offline edit to a tracked file is folded in by the
+    // startup pass → materialize(accepted) matches disk, content_hash advances,
+    // the op is authored `external`.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "first line\nsecond line\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
+    let hash_before = crate::hash_string(&log.materialize_accepted(&id).unwrap().text);
+
+    // Mutate the .md on disk directly, as an external editor (or sync) would
+    // while hiker was closed.
+    std::fs::write(td.path().join("a.md"), "first line\nOFFLINE edit\n").unwrap();
+
+    let reconciled = bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap();
+    assert_eq!(reconciled, 1, "exactly one doc drifted and was reconciled");
+
+    // accepted now matches disk verbatim.
+    assert_eq!(
+        log.materialize_accepted(&id).unwrap().text,
+        "first line\nOFFLINE edit\n"
+    );
+
+    // content_hash advanced: the disk text's hash is now in the doc's history.
+    let hashes = log.doc_history_hashes(&id).unwrap();
+    let hash_after = crate::hash_string("first line\nOFFLINE edit\n");
+    assert!(
+        hashes.contains(&hash_after),
+        "the reconciled content hash is recorded"
+    );
+    assert_ne!(hash_before, hash_after, "content_hash advanced");
+
+    // The reconcile op is authored `external`.
+    let rows = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| r.author.as_wire() == "external"),
+        "an author=external op metadata row exists"
+    );
+}
+
+#[test]
+fn reconcile_disk_is_noop_when_nothing_changed() {
+    // Acceptance case 3: no offline change → reconcile mints nothing (no new
+    // op / version) and reports a zero count.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "untouched\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
+
+    let rows_before = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+
+    let reconciled = bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap();
+    assert_eq!(reconciled, 0, "a clean reopen reconciles nothing");
+
+    let rows_after = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+    assert_eq!(rows_before, rows_after, "no new accepted op was minted");
+    assert_eq!(log.materialize_accepted(&id).unwrap().text, "untouched\n");
+}
+
+#[test]
+fn reconcile_disk_hash_gate_ignores_mtime_touch() {
+    // Acceptance case 4: touch the file (rewrite identical bytes, bumping
+    // mtime) but keep the content byte-identical → no op minted. The gate is
+    // the byte hash, not mtime.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "identical bytes\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
+
+    let rows_before = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+
+    // Rewrite the exact same bytes — a "touch" that moves mtime forward while
+    // leaving content identical (mirrors what a sync round or `touch` does).
+    std::fs::write(td.path().join("a.md"), "identical bytes\n").unwrap();
+
+    let reconciled = bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap();
+    assert_eq!(reconciled, 0, "byte-identical file mints no op (hash gate)");
+
+    let rows_after = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+    assert_eq!(rows_before, rows_after, "no spurious op from an mtime touch");
+}
+
+#[test]
+fn reconcile_disk_skips_several_unchanged_docs() {
+    // Acceptance case 10: several unchanged docs → reconcile mints nothing for
+    // them (and only folds the one that actually drifted).
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "alpha\n").unwrap();
+    std::fs::write(td.path().join("b.md"), "bravo\n").unwrap();
+    std::fs::create_dir_all(td.path().join("sub")).unwrap();
+    std::fs::write(td.path().join("sub/c.md"), "charlie\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+
+    // First pass: nothing changed since bootstrap seeded from disk.
+    assert_eq!(
+        bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap(),
+        0,
+        "all docs unchanged → nothing reconciled"
+    );
+
+    // Drift exactly one of the three.
+    std::fs::write(td.path().join("b.md"), "BRAVO changed\n").unwrap();
+    assert_eq!(
+        bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap(),
+        1,
+        "only the one drifted doc is reconciled"
+    );
+
+    let b_id = log.doc_id_for_path("b.md").unwrap().unwrap();
+    assert_eq!(
+        log.materialize_accepted(&b_id).unwrap().text,
+        "BRAVO changed\n"
+    );
+
+    // A second pass after reconcile is again a no-op (idempotent).
+    assert_eq!(bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap(), 0);
+}
+
+#[test]
+fn reconcile_disk_offline_delete_trashes_and_retains_history() {
+    // Acceptance case 12: remove a tracked .md from disk → reconcile routes it
+    // to trash (history retained, keyed by doc_id) and tombstones the doc as
+    // `author=external`; restore then recovers content AND history under the
+    // same doc_id with the tombstone cleared.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "line one\nline two\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
+    // Advance history so "history preserved" is a meaningful claim.
+    std::fs::write(td.path().join("a.md"), "line one\nline two\nline three\n").unwrap();
+    assert_eq!(
+        bridge::reconcile_disk(&vault, &log, &Trash::open(td.path())).unwrap(),
+        1,
+        "the edit folds as one external op"
+    );
+    let history_len_before_delete = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+    assert!(history_len_before_delete >= 2, "doc has multi-op history");
+
+    // Offline delete: the file vanishes while hiker is closed.
+    std::fs::remove_file(td.path().join("a.md")).unwrap();
+    let trash = Trash::open(td.path());
+    let reconciled = bridge::reconcile_disk(&vault, &log, &trash).unwrap();
+    assert_eq!(reconciled, 1, "the gone file is reconciled as a delete");
+
+    // The doc is tombstoned, authored external.
+    assert!(
+        log.materialize_accepted(&id).unwrap().tombstone,
+        "doc is tombstoned"
+    );
+    let rows = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.op_kind == "tombstone" && r.author.as_wire() == "external"),
+        "an external Tombstone op was recorded"
+    );
+
+    // The op-log history is RETAINED keyed by doc_id (not purged): the
+    // pre-delete versions plus the tombstone are all still queryable.
+    assert!(
+        rows.len() > history_len_before_delete,
+        "history retained (pre-delete ops + tombstone), not purged"
+    );
+
+    // The content is recoverable from trash: a manifest entry references the
+    // doc_id and the artifact carries the last known content.
+    let listed = trash.list().unwrap();
+    assert_eq!(listed.len(), 1, "one trash entry created");
+    let entry = &listed[0];
+    assert_eq!(entry.original_path, "a.md");
+    assert_eq!(entry.doc_id.as_deref(), Some(id.as_str()), "entry references the doc_id");
+    let artifact = std::fs::read_to_string(trash.entry_path(entry)).unwrap();
+    assert_eq!(
+        artifact, "line one\nline two\nline three\n",
+        "trash artifact holds the last known content"
+    );
+
+    // Restore: fs-move the artifact back, then rebind the doc — exactly what
+    // the indexer's handle_restore_from_trash does (fs restore + oplog
+    // writes::restore). Content AND history recover under the same doc_id.
+    crate::vault::restore_note(&vault, None, &trash, &entry.id).unwrap();
+    crate::oplog::writes::restore(
+        &log,
+        entry.doc_id.as_deref().unwrap(),
+        &entry.original_path,
+        &crate::oplog::shapes::Author::User,
+    )
+    .unwrap();
+
+    // Same doc_id resolves at the restored path.
+    assert_eq!(
+        log.doc_id_for_path("a.md").unwrap().as_deref(),
+        Some(id.as_str()),
+        "path rebinds to the same retained doc_id"
+    );
+    // Tombstone cleared, content recovered.
+    let restored = log.materialize_accepted(&id).unwrap();
+    assert!(!restored.tombstone, "tombstone cleared on restore");
+    assert_eq!(restored.text, "line one\nline two\nline three\n");
+    // The file is back on disk.
+    assert!(td.path().join("a.md").exists());
+    // History survives the round trip (pre-delete ops are still there).
+    let after_restore = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap();
+    assert!(
+        after_restore.len() > rows.len(),
+        "restore appends a resurrection op on top of the retained history"
+    );
+}
+
+#[test]
+fn reconcile_disk_offline_rename_rebinds_and_preserves_history() {
+    // Offline rename: rename the .md on disk (old gone, new present, identical
+    // bytes) → reconcile rebinds path → doc_id to the new path, records a
+    // Rename { from } op, preserves history, and creates NO trash entry.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("old.md"), "stable content\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("old.md").unwrap().unwrap();
+
+    // Offline rename while hiker is closed: same bytes at a new path.
+    std::fs::rename(td.path().join("old.md"), td.path().join("new.md")).unwrap();
+
+    let trash = Trash::open(td.path());
+    let reconciled = bridge::reconcile_disk(&vault, &log, &trash).unwrap();
+    assert_eq!(reconciled, 1, "the rename is recognized as one reconcile");
+
+    // The mapping moved to the new path; the same doc_id, not a fresh one.
+    assert_eq!(
+        log.path_for_doc(&id).unwrap().as_deref(),
+        Some("new.md"),
+        "path_for_doc now resolves to the new path"
+    );
+    assert_eq!(
+        log.doc_id_for_path("new.md").unwrap().as_deref(),
+        Some(id.as_str()),
+    );
+    assert!(
+        log.doc_id_for_path("old.md").unwrap().is_none(),
+        "the old path no longer maps to the doc"
+    );
+
+    // A Rename { from: old.md } op authored external was recorded.
+    let rows = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| {
+            r.op_kind == "rename"
+                && r.rename_from.as_deref() == Some("old.md")
+                && r.author.as_wire() == "external"
+        }),
+        "an external Rename {{ from: old.md }} op exists"
+    );
+
+    // Content (history) preserved, not tombstoned.
+    let mat = log.materialize_accepted(&id).unwrap();
+    assert!(!mat.tombstone, "a rename does not tombstone");
+    assert_eq!(mat.text, "stable content\n");
+
+    // No spurious delete/trash entry was created.
+    assert!(
+        trash.list().unwrap().is_empty(),
+        "an offline rename produces no trash entry"
+    );
+}
+
+#[test]
+fn reconcile_disk_does_not_trash_a_present_but_unreadable_file() {
+    // Adversarial: a tracked file that becomes non-UTF-8 (corruption, a binary
+    // write) is PRESENT but unreadable — it must NOT be mistaken for an offline
+    // delete and trashed. And one unreadable doc must not abort the pass: a
+    // sibling with a clean offline edit still reconciles (best-effort per doc).
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("bad.md"), "valid utf8\n").unwrap();
+    std::fs::write(td.path().join("good.md"), "good v1\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let bad = log.doc_id_for_path("bad.md").unwrap().unwrap();
+    let good = log.doc_id_for_path("good.md").unwrap().unwrap();
+
+    // bad.md becomes invalid UTF-8 while still present; good.md gets a clean edit.
+    std::fs::write(td.path().join("bad.md"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
+    std::fs::write(td.path().join("good.md"), "good v2\n").unwrap();
+
+    let trash = Trash::open(td.path());
+    let reconciled = bridge::reconcile_disk(&vault, &log, &trash).unwrap();
+
+    // Only good.md reconciled; the unreadable file was skipped, not deleted —
+    // and skipping it did NOT abort the pass.
+    assert_eq!(reconciled, 1, "the unreadable file did not abort the pass");
+    assert_eq!(log.materialize_accepted(&good).unwrap().text, "good v2\n");
+    assert!(
+        !log.materialize_accepted(&bad).unwrap().tombstone,
+        "a present-but-unreadable file must not be tombstoned"
+    );
+    assert_eq!(
+        log.materialize_accepted(&bad).unwrap().text,
+        "valid utf8\n",
+        "the unreadable file's accepted content is left untouched"
+    );
+    assert!(trash.list().unwrap().is_empty(), "nothing was trashed");
+}
+
+#[test]
+fn reconcile_disk_resurrects_tombstoned_doc_when_file_reappears() {
+    // Adversarial: an offline delete tombstones a doc + trashes its content. If
+    // the file later REAPPEARS on disk (a restore from backup, a sync
+    // re-create), the next reconcile must un-delete it — clear the tombstone and
+    // fold the current bytes — not leave a tombstoned ghost the tree won't show.
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("a.md"), "v1\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
+    let trash = Trash::open(td.path());
+
+    // Offline delete: file gone → reconcile tombstones + trashes.
+    std::fs::remove_file(td.path().join("a.md")).unwrap();
+    assert_eq!(bridge::reconcile_disk(&vault, &log, &trash).unwrap(), 1);
+    assert!(
+        log.materialize_accepted(&id).unwrap().tombstone,
+        "doc is tombstoned after the offline delete"
+    );
+
+    // The file reappears with NEW content → next reconcile resurrects + folds.
+    std::fs::write(td.path().join("a.md"), "v2 resurrected\n").unwrap();
+    assert_eq!(bridge::reconcile_disk(&vault, &log, &trash).unwrap(), 1);
+    let m = log.materialize_accepted(&id).unwrap();
+    assert!(!m.tombstone, "the reappeared file un-tombstones the doc");
+    assert_eq!(m.text, "v2 resurrected\n", "the reappeared content is folded in");
+    // Same doc_id (history preserved), not a fresh lineage.
+    assert_eq!(
+        log.doc_id_for_path("a.md").unwrap().as_deref(),
+        Some(id.as_str()),
+        "the resurrected doc keeps its doc_id"
+    );
+}
+
+#[test]
+fn reconcile_before_bootstrap_keeps_offline_rename_one_lineage() {
+    // Ordering invariant (op-log.md §External-edit sync): at vault open the
+    // order is reconcile → bootstrap-seed → first sync round, and reconcile
+    // MUST run before bootstrap. This test models the REAL startup order for an
+    // offline rename: seed `old.md`, simulate close, rename old→new on disk,
+    // then run `reconcile_disk` FOLLOWED BY `bootstrap` (the real open order).
+    //
+    // Correct order ⇒ reconcile claims `new.md` for the existing lineage while
+    // it is still untracked (rebind + Rename{from}), so the subsequent bootstrap
+    // sees `new.md` already mapped and seeds nothing fresh: ONE doc, ONE
+    // lineage, NO trash. A regression to bootstrap-first would seed `new.md` as
+    // a fresh doc, leaving two lineages and orphaned history — this guards it.
+    use crate::ops::op_writes as bridge;
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("old.md"), "stable content\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("old.md").unwrap().unwrap();
+
+    // Simulate close + offline rename (old gone, new present, same bytes).
+    std::fs::rename(td.path().join("old.md"), td.path().join("new.md")).unwrap();
+
+    // The REAL open order: reconcile FIRST, then bootstrap.
+    let trash = Trash::open(td.path());
+    let reconciled = bridge::reconcile_disk(&vault, &log, &trash).unwrap();
+    assert_eq!(reconciled, 1, "reconcile recognizes the rename");
+    let seeded = bridge::bootstrap(&vault, &log).unwrap();
+    assert_eq!(
+        seeded, 0,
+        "bootstrap seeds nothing fresh for new.md — reconcile already claimed it"
+    );
+
+    // Exactly ONE doc exists for the lineage (no second fresh doc was seeded).
+    assert_eq!(
+        log.list_doc_ids().unwrap().len(),
+        1,
+        "only one document (the original lineage) exists after the real open order"
+    );
+
+    // It is the SAME doc_id, now mapped to new.md; old.md no longer maps.
+    assert_eq!(
+        log.path_for_doc(&id).unwrap().as_deref(),
+        Some("new.md"),
+        "the original lineage moved to new.md"
+    );
+    assert_eq!(
+        log.doc_id_for_path("new.md").unwrap().as_deref(),
+        Some(id.as_str()),
+        "new.md maps to the original doc_id, not a fresh one"
+    );
+    assert!(
+        log.doc_id_for_path("old.md").unwrap().is_none(),
+        "old.md no longer maps to any doc"
+    );
+
+    // A Rename { from: old.md } op authored external was recorded — history
+    // is preserved on the same lineage, not orphaned to a new one.
+    let rows = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| {
+            r.op_kind == "rename"
+                && r.rename_from.as_deref() == Some("old.md")
+                && r.author.as_wire() == "external"
+        }),
+        "an external Rename {{ from: old.md }} op exists on the lineage"
+    );
+    let mat = log.materialize_accepted(&id).unwrap();
+    assert!(!mat.tombstone, "the lineage is not tombstoned");
+    assert_eq!(mat.text, "stable content\n", "content/history preserved");
+
+    // And NO trash entry was produced (a rename is not a delete).
+    assert!(
+        trash.list().unwrap().is_empty(),
+        "the real open order produces no trash entry for a rename"
+    );
+}
+
+#[test]
+fn open_time_external_edit_folds_watcher_missed_change() {
+    // Open-time reconcile (op-log-open-time-disk-reconcile): a change made
+    // directly to a tracked .md on disk that the in-session watcher dropped
+    // (suppressed-write window / notify overflow) is folded when the doc is
+    // reconciled at buffer open via `external_edit`, and the text the buffer
+    // would load (materialize(accepted), == disk after the fold) reflects it.
+    use crate::ops::op_writes as bridge;
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    std::fs::write(td.path().join("note.md"), "original body\n").unwrap();
+    let log = OpLog::open(td.path()).unwrap();
+    bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("note.md").unwrap().unwrap();
+
+    // A watcher-missed change: disk now diverges from accepted.
+    std::fs::write(td.path().join("note.md"), "edited out of band\n").unwrap();
+
+    // Opening the buffer reconciles this one doc before its text loads.
+    let applied = bridge::external_edit(&log, &vault, "note.md").unwrap();
+    assert!(applied, "the watcher-missed change folds at open");
+
+    // The buffer loads from the reconciled accepted, which now equals disk.
+    assert_eq!(
+        log.materialize_accepted(&id).unwrap().text,
+        "edited out of band\n",
+        "the loaded text reflects the out-of-band edit"
+    );
+
+    // A second open with no further change is a hash-gated no-op.
+    let again = bridge::external_edit(&log, &vault, "note.md").unwrap();
+    assert!(!again, "a clean reopen reconciles nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_app_delete_then_restore_preserves_doc_id_and_history() {
+    // Regression: the in-app delete (IndexJob::DeleteNote) + restore
+    // (IndexJob::RestoreFromTrash) round trip preserves the doc_id and
+    // history — restore rebinds rather than minting a fresh import.
+    use crate::ops::file::{delete, restore};
+    use crate::oplog::meta::{Filter, OpStatus};
+
+    let td = TempDir::new().unwrap();
+    let vault = open_vault(&td);
+    let watcher = Watcher::start(td.path()).unwrap();
+    let store = Store::open(td.path()).unwrap();
+    std::fs::write(td.path().join("keep.md"), "body before delete\n").unwrap();
+
+    // Stand up an op-log and seed it, then attach it to the indexer so the
+    // delete / restore jobs record tombstone + rebind through it.
+    let log = Arc::new(OpLog::open(td.path()).unwrap());
+    crate::ops::op_writes::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("keep.md").unwrap().unwrap();
+
+    let idx = start_indexer(vault.clone(), store);
+    idx.attach_oplog(log.clone());
+
+    let trash = Trash::open(td.path());
+
+    // Delete → trash; the entry should carry the doc_id and the op-log should
+    // tombstone the doc.
+    let entry = delete(&watcher, &idx.job_sender(), &vault, "keep.md")
+        .await
+        .unwrap();
+    assert_eq!(entry.doc_id.as_deref(), Some(id.as_str()), "trash entry carries doc_id");
+    assert!(log.materialize_accepted(&id).unwrap().tombstone, "doc tombstoned");
+    let history_after_delete = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+
+    // Restore → rebind; same doc_id, tombstone cleared, history preserved.
+    let restored = restore(&watcher, &idx.job_sender(), &trash, &entry.id)
+        .await
+        .unwrap();
+    assert_eq!(restored.original_path, "keep.md");
+    assert_eq!(
+        log.doc_id_for_path("keep.md").unwrap().as_deref(),
+        Some(id.as_str()),
+        "restore rebinds the same doc_id (no fresh ULID)"
+    );
+    let restored_doc = log.materialize_accepted(&id).unwrap();
+    assert!(!restored_doc.tombstone, "tombstone cleared");
+    assert_eq!(restored_doc.text, "body before delete\n");
+    let history_after_restore = log
+        .query_metadata(&Filter {
+            doc_id: Some(id.clone()),
+            status: Some(OpStatus::Accepted),
+            ..Filter::default()
+        })
+        .unwrap()
+        .len();
+    assert!(
+        history_after_restore > history_after_delete,
+        "history preserved + a resurrection op appended"
+    );
+    // The trash entry is gone after a successful restore.
+    assert!(trash.find(&entry.id).unwrap().is_none());
+}
+
 #[test]
 fn hunk_reject_leaves_accepted_untouched() {
     use crate::ops::op_writes::{self as bridge, AgentEdit};

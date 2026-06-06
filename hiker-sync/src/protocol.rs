@@ -112,11 +112,14 @@ pub enum Message {
     /// mutates either side. [sync-fork-diff]
     DocContentRequest { path: String },
 
-    /// The peer's current accepted text for a [`Message::DocContentRequest`]'s
-    /// path — `materialize(accepted).text`. Read-only preview content; the
-    /// requester diffs it against its own version and never adopts it.
-    /// [sync-fork-diff]
-    DocContentResponse { text: String },
+    /// The peer's current accepted state for a [`Message::DocContentRequest`]'s
+    /// path — `materialize(accepted)`'s `text` plus its `tombstone` flag.
+    /// Read-only preview content; the requester diffs it against its own version
+    /// and never adopts it. The `tombstone` flag lets the delete-vs-edit
+    /// detection tell a deleted peer doc from a live one (a tombstone keeps the
+    /// last-known text, so text alone can't), per `sync-conflict-delete-vs-edit`.
+    /// [sync-fork-diff, sync-conflict-delete-vs-edit]
+    DocContentResponse { text: String, tombstone: bool },
 
     /// The sender's full document manifest.
     Manifest(Manifest),
@@ -202,6 +205,19 @@ pub enum Message {
     /// (or had nothing at that id), echoing the `blind_id` for correlation.
     /// [sync-rename-blob-rotation]
     DeleteBlobAck { blind_id: String },
+
+    /// A content-free "wake up and pull" nudge to an enrolled peer: the sender
+    /// just committed a local change and wants the peer to run its existing pull
+    /// path promptly rather than waiting for its own ~15s poll tick. Carries no
+    /// payload — it only sets the peer's `poked` flag so the peer's sync driver
+    /// fires an `auto_sync_round`, which is where the actual manifest/delta
+    /// exchange happens. The connection is already enrollment-gated. The reply is
+    /// a [`Message::SyncPokeAck`]. [sync-poke-on-commit]
+    SyncPoke,
+
+    /// Acknowledge a [`Message::SyncPoke`]: the peer recorded the nudge and will
+    /// pull on its next driver turn. [sync-poke-on-commit]
+    SyncPokeAck,
 }
 
 #[cfg(test)]
@@ -232,6 +248,7 @@ mod tests {
             },
             Message::DocContentResponse {
                 text: "hello\nworld\n".into(),
+                tombstone: false,
             },
             Message::Manifest(Manifest {
                 entries: vec![ManifestEntry {
@@ -282,6 +299,8 @@ mod tests {
             Message::DeleteBlobAck {
                 blind_id: "bf00".into(),
             },
+            Message::SyncPoke,
+            Message::SyncPokeAck,
         ];
         for m in msgs {
             let json = serde_json::to_string(&m).unwrap();

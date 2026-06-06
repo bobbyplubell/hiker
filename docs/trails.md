@@ -2,21 +2,10 @@
 
 Curated walks through a vault — a memex-style first-class concept where each waypoint is its own note carrying the user's annotation and a path-based link back to the source the waypoint is about. Trails ride the existing markdown / indexer / watcher / changes / trash machinery so they're searchable, editable, syncable, and backup-able like any other note.
 
-The headline decisions:
-
-- **A trail-doc is a regular markdown note in the vault.** Frontmatter holds the trail's metadata (activation timestamp, waypoint tree); body is freeform README-shape prose the user authors. The body is *not* auto-generated from waypoints — the sidebar renders the walk; the body is for the trail's framing. The trail's internal identifier is its op-log `doc_id` (per `op-log-document-identity`); it is not written into frontmatter. [trail-doc-shape]
-- **Each waypoint is its own markdown note** in the trail-doc's visible companion folder (`<dir>/<trail>/<source-basename>--<rand6>.md`, per `note-companion-folder`), not hidden under `.hiker/`. Body is empty by design — a clean canvas the user fills with their commentary about the source. Frontmatter holds the source-note path and the trail-doc path. Order and tree position live in the trail-doc's frontmatter, not in filenames. The `<rand6>` is a 6-char random alphanumeric disambiguator so two waypoints in the same trail can point at the same source. [waypoint-note-shape, trail-storage-layout, trail-empty-waypoint-body]
-- **References are vault-relative paths.** The trail-doc lists each waypoint by its vault path; each waypoint-note lists its source and its trail by vault path. Renames rewrite paths through the shared rename-rewrite pass (`wikilink-rename-rewrite`). [trail-path-references]
-- **Trails branch.** A waypoint can have child waypoints forming a side trail; the trail-doc's waypoint list is a tree, not a flat list. Side trails render nested under their parent in the sidebar. The reader walks the main line, drops down a side trail to follow a digression, and walks back up — the Bush memex shape. [trail-side-trail-shape, trails-mode-side-trail-render]
-- **Trails are user-curated, not strictly user-authored.** The user owns every accepted trail. The clustering pipeline and MCP agents may *propose* draft trails which land in a review queue; the user accepts (with optional edits) or discards. Accepted drafts become normal trails. The proposal mechanic is the same propose-into-a-review-queue shape used for automation-authored changes elsewhere, scoped to trails. [trail-draft-review-surface, trail-draft-from-agent, trail-draft-from-clustering]
-- **Build-as-you-read verbs.** Two surfaces append the current note as a waypoint on the active trail without going through capture: a tree right-click "Add to active trail" verb on note rows, and an editor-pane affordance when a regular note is open and a trail is active. The reading-loop gesture has a native handle, not just the external-source ingest path. [trail-add-to-active-from-tree-verb, trail-add-to-active-from-editor-verb]
-- **MCP exposes trails for read and write.** Agents read trails to consume curated context and write trails to transcribe their own investigations as draft trails (gated by the standard `agent-write-review-mode` setting). [mcp-tool-trails-list, mcp-tool-trail-create, mcp-tool-trail-append-waypoint]
-- **The Trails sidebar mode shows the active trail vertically, top-to-bottom, read-only.** The dropdown at the top selects which trail is active; the trail-head icon next to it jumps to the trail-doc. The editor stays untouched — clicking a waypoint opens the source note in the editor pane on the right. [trails-mode-body, trails-mode-active-trail-dropdown]
-
 Use cases:
 
 - Ordered context for an agent (a curated walk with per-waypoint "why this matters here" annotations).
-- Opt-in agent activity logging — notes an agent reads/writes/cites become a draft trail.
+- Opt-in agent activity logging — notes an agent reads/writes/cites become a trail. Agent/clustering-proposed trails ride the normal op-log pending/patch-review path like any other agent write.
 - Narrative *between* immutable multimodal sources (PDFs, web archives, audio transcripts) you can't annotate inline.
 - Re-traversable record of an investigation where the path itself — order, side trips — is the point.
 
@@ -38,7 +27,7 @@ A trail is a *trail-doc* plus a **companion folder** of *waypoint-notes* beside 
 
 The trail-doc lives at a user-chosen vault location (default `trails/`, configurable), and its waypoints live in the sibling `<trail>/` companion folder (`note-companion-folder` in `files.md`) — visible, indexed notes, not hidden under `.hiker/`. The waypoint-note basename is `<source-basename>--<rand6>.md` where `<rand6>` is a 6-char random alphanumeric disambiguator so two waypoints can point at the same source. Renaming or moving the trail-doc moves its companion folder in the same `move_note` transaction and rewrites the trail↔waypoint paths through the shared `wikilink-rename-rewrite` pass; the trail's identity is still its op-log `doc_id` (per `op-log-document-identity`, read from `doc-index.db`, never stamped into frontmatter), so a rename never re-mints the trail. [trail-storage-layout]
 
-The companion folder is **flat regardless of tree depth** — side trails don't get nested directories. The trail-doc's `hiker.waypoints` frontmatter is the only source of truth for both *order* and *tree shape*. Filenames are stable identifiers, not position encoders: reordering, re-parenting, or moving waypoints between depths never renames a file. The tradeoff is that `ls`-ing the folder gives you no reading order — the sidebar (and the trail-doc itself) is the right surface for that. Vault mode nests the waypoints under the trail-doc by the `hiker.waypoints` tree (`vault-view.md`), preserving order and side-trail shape. [trail-storage-layout]
+The companion folder is **flat regardless of tree depth** — side trails don't get nested directories. The trail-doc's `hiker.waypoints` frontmatter is the only source of truth for both *order* and *tree shape*; filenames are stable identifiers, not position encoders, so reordering, re-parenting, or moving waypoints between depths never renames a file. Vault mode nests the waypoints under the trail-doc by the `hiker.waypoints` tree (`vault-view.md`), preserving order and side-trail shape.
 
 
 ## Trail-doc shape
@@ -58,11 +47,11 @@ hiker:
 ---
 ```
 
-(The trail's identity is its `doc_id`, read from `doc-index.db`, not stamped into frontmatter. Waypoint paths point into the trail-doc's companion folder and are rewritten on rename like any other reference.)
+(The trail's identity is its `doc_id` — not in frontmatter, per Storage layout. Waypoint paths point into the companion folder and are rewritten on rename like any other reference.)
 
 `hiker.waypoints` is a tree: each entry is a vault-relative path to a waypoint-note and may carry its own `waypoints:` array of child entries forming a side trail. Children are themselves trees — side trails nest arbitrarily deep. A waypoint with no `waypoints:` key (or an empty array) is a leaf; the common case for v1 is a flat tree where most or all waypoints sit at the root and side trails appear only where the user has explicitly digressed. [trail-side-trail-shape]
 
-Body is freeform markdown — a hand-authored README for the trail. The user writes whatever framing they want here: why the trail exists, what it covers, where it ends, who they're sharing it with. The body is *not* auto-generated and never overwritten by hiker; the sidebar already renders the waypoint walk, the body is for the trail's prose framing, separate from the per-waypoint annotations (which live in each waypoint-note's body). [trail-doc-shape]
+Body is freeform markdown — a hand-authored README for the trail (why it exists, what it covers, who it's shared with). It is *not* auto-generated and never overwritten by hiker; the sidebar renders the waypoint walk, the body is the trail's prose framing, separate from the per-waypoint annotations (which live in each waypoint-note's body). [trail-doc-shape]
 
 The trail-doc must have a `.md` extension to be recognized as a trail. A note carrying `hiker.kind: trail` in frontmatter but a non-`.md` extension is treated as a regular note — the discriminator alone isn't enough.
 
@@ -84,7 +73,7 @@ hiker:
 
 Body is the user's annotation — empty when the waypoint is created (clean canvas), filled in by the user as they author commentary. Standard markdown; renders in the editor like any other note when opened directly. [waypoint-note-shape, trail-empty-waypoint-body]
 
-The two-hop structure (trail-doc → waypoint-note → source-note) means each waypoint is searchable, editable, addressable for cross-references, and visible in the autosave / changes / trash pipelines like any other note in the vault.
+The two-hop structure (trail-doc → waypoint-note → source-note) makes each waypoint searchable, editable, cross-reference-addressable, and visible in the autosave / changes / trash pipelines like any other note.
 
 
 ## Reference shape
@@ -114,7 +103,7 @@ A vault has at most one active trail at a time. When set, the active trail is th
 
 ## Sidebar Trails mode
 
-The Trails mode body is the third sidebar mode (per `sidebar-mode-switcher`). Its content is mostly the **active trail rendered vertically, top-to-bottom**, with header chrome for switching trails and reaching the trail-doc. The editor pane on the right is unaffected — clicking a waypoint opens its source note in the editor; the sidebar stays.
+The Trails mode body is the third sidebar mode (per `sidebar-mode-switcher`). Its content is mostly the **active trail rendered vertically, top-to-bottom, read-only**, with header chrome for switching trails and reaching the trail-doc. The editor pane on the right is unaffected — clicking a waypoint opens its source note in the editor; the sidebar stays. [trails-mode-body]
 
 ### Header
 
@@ -145,7 +134,7 @@ Click affordances inside a card:
 
 Side-trail waypoints (waypoints that are children of another waypoint per `trail-side-trail-shape`) render **indented under their parent**. Each level of nesting adds one indent step plus a thin left rule running the height of the side-trail block, so the user can visually trace the digression and see where it returns to the main line. Children of the same parent render in their frontmatter order; depth-first traversal matches reading order. [trails-mode-side-trail-render]
 
-A parent waypoint with children gets a second chevron (separate from the body-expand chevron) that **collapses or expands the side trail** without touching the parent's own annotation. Default state for v1: every side trail expanded, so the full tree is visible on first render. The collapse-side-trail chevron is for noise control on long branchy trails, not a reading-position concept — there's no "you are here" pointer in v1. The dedicated affordance for "follow this digression and hide the rest" is deferred polish.
+A parent waypoint with children gets a second chevron (separate from the body-expand chevron) that **collapses or expands the side trail** without touching the parent's own annotation — noise control on long branchy trails. Default state for v1: every side trail expanded, so the full tree is visible on first render. (No reading-position "you are here" pointer in v1 beyond the append-cursor glyph; "follow this digression and hide the rest" is deferred, per Out of scope.)
 
 ### Empty states
 
@@ -158,20 +147,20 @@ A parent waypoint with children gets a second chevron (separate from the body-ex
 
 ### Sidebar invariants
 
-The Trails mode sidebar body is **read-only** for editing operations: no drag-to-reorder, no click-to-rename, no in-place annotation editing. Changes to the trail's structure happen by editing the trail-doc's frontmatter directly, by editing waypoint-notes in the editor, or via the one editing verb below. The read-only invariant keeps the sidebar a navigation surface and avoids tangling the linking-metadata between waypoint-notes when waypoints are reordered. [trails-mode-sidebar-read-only]
+The Trails mode sidebar body is **read-only** for editing operations: no drag-to-reorder, no click-to-rename, no in-place annotation editing. Structure changes happen by editing the trail-doc's frontmatter directly, editing waypoint-notes in the editor, or the one editing verb below. The read-only invariant keeps the sidebar a navigation surface and avoids tangling the linking-metadata between waypoint-notes when waypoints are reordered. [trails-mode-sidebar-read-only]
 
-The single editing verb is **Remove waypoint** in a row's right-click context menu: deletes the waypoint-note from the trail-doc's companion folder, removes the entry from the trail-doc's `hiker.waypoints` tree, confirms before deleting (the annotation is in the waypoint-note body and removal moves it to trash, not gone forever). Goes through `core::ops::delete` so the waypoint-note lands in `.hiker/trash/` like any other note and is restorable. Reorder and re-parenting are intentionally not exposed in v1 — users who want to restructure edit the trail-doc frontmatter directly. [trails-mode-remove-waypoint-verb]
+The single editing verb is **Remove waypoint** in a row's right-click context menu: deletes the waypoint-note from the companion folder, removes the entry from the trail-doc's `hiker.waypoints` tree, and confirms first (removal moves the annotation to trash, not gone forever). Goes through `core::ops::delete` so the waypoint-note lands in `.hiker/trash/` and is restorable. [trails-mode-remove-waypoint-verb]
 
-**Removing a parent with children cascades.** If the waypoint being removed has child waypoints (a side trail), the confirm dialog names the child count ("Remove this waypoint and N side-trail waypoints?") and the remove operation deletes the parent and every descendant in a single pass — each descendant waypoint-note moves to `.hiker/trash/` like the parent. The trail-doc frontmatter drops the entire subtree. Cascade beats orphan-promotion (children floating up to grandparent) because the user's mental model is "this digression goes away," not "the parent goes away but its tail-end stays." Trash makes the cascade reversible if the user changes their mind.
+**Removing a parent with children cascades.** If the waypoint being removed has child waypoints (a side trail), the confirm dialog names the child count ("Remove this waypoint and N side-trail waypoints?") and the remove deletes the parent and every descendant in a single pass — each descendant waypoint-note moves to `.hiker/trash/` like the parent, and the trail-doc frontmatter drops the entire subtree. Children are not promoted to the grandparent; trash keeps the cascade reversible.
 
 **Trails mode is independent of Cluster trees mode.** The Trails and Cluster trees sidebar bodies are sibling modes; switching modes swaps which body renders. Bodies don't share state, don't stack, and one mode's UI must never bleed into another's — only the active mode's body renders. [trails-mode-isolation-from-clusters]
 
 
 ## Trail graph viewer (deferred)
 
-A future trail visualization that opens a trail (or a set of trails) as a graph in its own editor-pane tab — separate from the Cluster trees graph view. Nodes are waypoints; edges are sequence + side-trail branching. The renderer reuses the shared egui force-graph widget built for the vault graph view and cluster editor (`app/src/widgets/force_graph.rs`) so the two viewers share rendering primitives, camera/zoom, and selection conventions. The tab kind is `graph` (already reserved in `TabKind` in `app/src/tab.rs`); the trail viewer is one consumer, a future cross-vault overview is another.
+A future trail visualization that opens a trail (or set of trails) as a graph in its own editor-pane tab, separate from the Cluster trees graph view. Nodes are waypoints; edges are sequence + side-trail branching. The renderer reuses the shared egui force-graph widget (`app/src/widgets/force_graph.rs`) so the viewers share rendering primitives, camera/zoom, and selection conventions. Tab kind is `graph` (already reserved in `TabKind`); the trail viewer is one consumer, a future cross-vault overview another.
 
-Scope is intentionally light for v1: open the active trail as a graph, render waypoints with their basenames, edges colored by sequence vs side-trail. Multi-trail overlays, time-axis layouts, and filtering by activation recency are deferred polish — they're things the user might ask for, not things v1 needs. [trails-graph-viewer-tab]
+Scope is light for v1: open the active trail as a graph, waypoints with basenames, edges colored by sequence vs side-trail. Multi-trail overlays, time-axis layouts, and filtering by activation recency are deferred. [trails-graph-viewer-tab]
 
 
 ## Filetree integration
@@ -182,20 +171,18 @@ Trail-docs render in the file tree at their natural FS location with a distincti
 
 **Per-trail dropdown chevron.** Each trail-doc row in the tree gets an expand chevron when its trail has at least one waypoint. Clicking the chevron expands the row inline (same machinery as folder expansion) to show the trail's waypoint-notes nested underneath, in trail order. Chevron is hidden for trails with zero waypoints. Expand state is per-trail and resets on vault open (no persistent expansion memory — keeps the tree tidy after a session). [trail-row-dropdown-chevron]
 
-The Trails-mode expand-in-tree affordance renders the trail's waypoints in the sidebar regardless of how the Files tree shows them.
-
-**Waypoints in the Files tree.** A trail-doc's waypoints live in its visible companion folder (`trail-storage-layout`), so in Files mode the trail-doc and its `<trail>/` folder appear like any note + folder, collapsed by default. No special hide/show toggle — the folder is ordinary tree content the user collapses or ignores; Vault mode nests the waypoints under the trail-doc by the `hiker.waypoints` tree for the clean reading view.
+**Waypoints in the Files tree.** A trail-doc's waypoints live in its visible companion folder (`trail-storage-layout`), so in Files mode the trail-doc and its `<trail>/` folder appear like any note + folder, collapsed by default. No special hide/show toggle — the folder is ordinary tree content the user collapses or ignores. (Vault mode's clean reading nest is per Storage layout.)
 
 **"Set as active trail" right-click verb.** Right-clicking a trail-doc row in the tree opens a context menu with a "Set as active trail" entry; selecting it activates the trail (sets `vault.active_trail`, stamps `hiker.last_activated_at`). Lets the user activate a trail without switching sidebar modes. The verb is hidden on non-trail rows. [trail-set-as-active-context-verb]
 
 **"Export to canvas" right-click verb.** Right-clicking a trail-doc row offers **Export to canvas**, which snapshots the trail's waypoint tree into a new `.canvas` document (each waypoint a file-node pointing at its waypoint-note, parent→child links as edges). Snapshot, not synced — defined in `canvas-export.md`. [canvas-export-trail-verb]
 
-**"Add to active trail" right-click verb.** Right-clicking an indexable note row (`.md` / `.txt`) in the tree shows an "Add to active trail" entry that appends the note as a new waypoint of the currently active trail. Routes through the existing `captureToActiveTrail(sourceRel)` helper, which wraps `Ipc.trailAppendWaypoint(activeTrailDocRel, sourceRel, null)` — same code path the future capture entry points (browser-ext, drag-URL, MCP scrape, share sheet) use. On success, toast `"Added to <trail-basename>"`. The verb is **hidden** on trail-doc rows (already a trail), waypoint-note rows (those inside a trail-doc's companion folder), folders, and unsupported file types. The verb is **disabled with a tooltip** ("No active trail — pick one in Trails mode") when no active trail is set; surfacing it disabled rather than hiding it teaches the affordance — once the user activates any trail the verb lights up. This is the v1 stopgap until real capture entry points land; it doesn't substitute for them (capture flow still routes external sources to an active trail without hopping through the tree). [trail-add-to-active-from-tree-verb]
+**"Add to active trail" right-click verb.** On indexable note rows (`.md` / `.txt`); appends the note as a waypoint of the active trail. Full behavior under "Building a trail while reading" below. On success, toast `"Added to <trail-basename>"`. [trail-add-to-active-from-tree-verb]
 
 
 ## Creating a trail
 
-A new trail comes from one of three entry points, all going through the same `core::trails::create_trail(name)` op:
+A new trail comes from one of three entry points, all going through the same `create_trail` op:
 
 - **Sidebar `+` button while in Trails mode** — left-click creates a new trail with a default name (`new-trail-N.md`, suffix-counted to avoid collision per the same `create_with_suffix` shape `sidebar-new-item-button` already uses); the new trail-doc opens in the editor with inline-rename mode active so the user can name it before submitting. The trail is auto-set as active.
 - **Sidebar `+` right-click cross-type picker** — picking "New trail" from the picker (per `sidebar-new-item-button`) creates a trail regardless of current sidebar mode.
@@ -221,23 +208,23 @@ When **no active trail** is set, captures land in `inbox/` (or the source type's
 
 ## Building a trail while reading
 
-Capture is the right shape when an external source enters the vault. For notes already in the vault — your own writing, prior captures, anything you're re-encountering — there are two surfaces that append the current note as a waypoint on the active trail without going through capture. Both call into the same `core::trails::append_waypoint` op as the capture flow (root-level append; re-parenting via frontmatter edit).
+For notes already in the vault — your own writing, prior captures, anything you're re-encountering — two surfaces append the current note as a waypoint on the active trail without going through capture. Both call the same `append_waypoint` op as the capture flow.
 
-- **Tree right-click → "Add to active trail"** — context-menu verb on `.md` / `.txt` rows in the file tree. Hidden on trail-docs, waypoint-notes, folders, and unsupported extensions. Disabled with a tooltip ("No active trail — pick one in the Trails sidebar") when no trail is active. The note doesn't have to be open in the editor; this is the "I'm browsing the tree and want to mark that one" shape. [trail-add-to-active-from-tree-verb]
-- **Editor-pane "Add to trail" affordance** — when a regular note is open in the editor and a trail is active, a small pill in the editor toolbar's right-side cluster (just left of Save) reads "Add to trail: <trail-name>" and clicks-through to the same op. Hidden when no trail is active, or when the open buffer is itself a trail-doc / waypoint-note / read-only preview. The trail name in the pill doubles as the always-visible "which trail is active" indicator the spec otherwise lacks outside Trails mode. [trail-add-to-active-from-editor-verb]
+- **Tree right-click → "Add to active trail"** — context-menu verb on `.md` / `.txt` rows. Hidden on trail-docs, waypoint-notes, folders, and unsupported extensions. Disabled with a tooltip ("No active trail — pick one in the Trails sidebar") when no trail is active. The note doesn't have to be open in the editor; this is the "I'm browsing the tree and want to mark that one" shape. [trail-add-to-active-from-tree-verb]
+- **Editor-pane "Add to trail" affordance** — when a regular note is open in the editor and a trail is active, a pill in the editor toolbar's right-side cluster (just left of Save) reads "Add to trail: <trail-name>" and clicks-through to the same op. Hidden when no trail is active, or when the open buffer is itself a trail-doc / waypoint-note / read-only preview. The pill's trail name doubles as the always-visible "which trail is active" indicator outside Trails mode. [trail-add-to-active-from-editor-verb]
 
-Both verbs append under the trail's **append cursor** (see below) — the trail's "you are here" position. By default the cursor sits at the root tail (so consecutive adds extend the main line, today's behavior); the user moves the cursor to a specific waypoint to branch into a side trail. Idempotency: if the note is already a waypoint at any depth in the trail, the verb is disabled with a tooltip ("Already in this trail") rather than creating a duplicate. The check is per-trail, not per-vault — the same note can be a waypoint of multiple trails simultaneously (per `trails_containing_note`).
+Both verbs append under the trail's **append cursor** (see below) — the trail's "you are here" position. The cursor defaults to the root tail (consecutive adds extend the main line); the user moves it to a waypoint to branch into a side trail. Idempotency: if the note is already a waypoint at any depth in the trail, the verb is disabled with a tooltip ("Already in this trail") rather than duplicating. The check is per-trail, not per-vault — the same note can be a waypoint of multiple trails simultaneously (per `trails_containing_note`).
 
 
 ## Append cursor — branching the trail
 
 [trail-append-cursor]
 
-The trail-doc carries a **position cursor** in frontmatter — `hiker.append_under: <waypoint-id> | null` — that names where the next append lands. `null` (or absent) means "append at the root tail," matching the original flat-trail behavior with zero migration. When the cursor names a waypoint, `core::trails::append_waypoint` places the new entry as the last child of that waypoint (creating or extending a side trail).
+The trail-doc carries a **position cursor** in frontmatter — `hiker.append_under: <waypoint-id> | null` — that names where the next append lands. `null` (or absent) means "append at the root tail" (zero migration for flat trails). When the cursor names a waypoint, `append_waypoint` places the new entry as the last child of that waypoint (creating or extending a side trail).
 
-**Cursor stays put across appends.** The cursor only moves when the user explicitly moves it (right-click "Append from here") or resets it (header action). Successive appends under the same cursor become *siblings* — `X.1`, `X.2`, `X.3` — a flat side trail under `X`, mirroring how flat the main line stays when the cursor is `null`. To dig deeper into a sub-side-trail off `X.2`, the user right-clicks `X.2` to move the cursor; subsequent appends become `X.2.1`, `X.2.2`. Auto-advance was rejected because it produces unintended deepening (every append would nest one level further than the last), turning a flat capture session into an accidental ladder.
+**Cursor stays put across appends.** The cursor only moves when the user explicitly moves it (right-click "Append from here") or resets it (header action) — appends never advance it, so a flat capture session never becomes an accidental ladder. Successive appends under the same cursor become *siblings* — `X.1`, `X.2`, `X.3` — a flat side trail under `X`. To dig into a sub-side-trail off `X.2`, the user right-clicks `X.2` to move the cursor; subsequent appends become `X.2.1`, `X.2.2`.
 
-**Explicit `parent_waypoint_id` overrides.** When `core::trails::append_waypoint` is called with `parent_waypoint_id: Some(id)` (the existing arg, used by MCP and any future explicit-parent caller), the explicit parent wins over the cursor. When `parent_waypoint_id: None` (the build-as-you-read verbs), the cursor is consulted and used as the parent. This keeps the typed surface honest — explicit > cursor — while letting the verbs ride the cursor without plumbing a separate arg through. Neither path moves the cursor; the cursor is exclusively user-controlled.
+**Explicit `parent_waypoint_id` overrides the cursor.** `append_waypoint` with `parent_waypoint_id: Some(id)` (used by MCP and any explicit-parent caller) places under that parent; with `None` (the build-as-you-read verbs) it consults the cursor. Explicit > cursor; neither path moves the cursor.
 
 **Cascade-delete safety.** When `remove_waypoint` cascades through the cursor's waypoint (or the cursor's waypoint itself is the target), the cursor resets to `null` in the same trail-doc rewrite. Reading a stale `append_under` that doesn't resolve to any waypoint in the tree (concurrent edit, hand-edited frontmatter pointing at a deleted id) is treated as `null` on read with a `tracing::warn!` — same posture as orphan waypoint refs.
 
@@ -245,7 +232,7 @@ The trail-doc carries a **position cursor** in frontmatter — `hiker.append_und
 
 [trail-append-cursor-indicator]
 
-The cursor's waypoint card in the Trails sidebar gets a **little-person glyph** (the existing `Icons.user()` head-and-shoulders SVG, already used in the recent-activity author-pill) rendered in the card head, just before the source-note basename. The glyph is an accent color (matching the existing `--accent` token used elsewhere) so the cursor's position is scannable at a glance without reading every card. Cards that aren't the cursor render unchanged. The same glyph as the activity pill keeps the visual vocabulary consistent — "where the user is" reads the same across surfaces.
+The cursor's waypoint card in the Trails sidebar gets a **little-person glyph** (the existing `Icons.user()` head-and-shoulders SVG, also used in the recent-activity author-pill) in the card head, just before the source-note basename, in the `--accent` color so the cursor's position is scannable at a glance. Non-cursor cards render unchanged.
 
 When the cursor is `null` (root-tail append), no card carries the glyph. The Trails-mode header surfaces a subtle hint instead: a small text row reading `"Appending to main line"` (cursor null) or `"Appending under <basename>"` with a `"Reset to main line"` action button (cursor set). The header hint is the global "what's the next append going to do" signal; the per-card glyph is the locator.
 
@@ -258,10 +245,6 @@ Filetree integration is intentionally not extended to show the cursor — the fi
 
 The two verbs are the only cursor-mutation surfaces in v1. The cursor field is also editable directly in the trail-doc frontmatter (it's a regular markdown note); a hand-edit triggers the same indexer / sidebar refresh path as any other trail-doc change.
 
-### Why this shape
-
-The earlier deferred design (`"Branch from this waypoint" sidebar verb`) required a parent-picker gesture every time the user wanted to branch — a heavier interaction the v1 spec punted on. The cursor design replaces that with a *persistent positional* concept: the user marks where the next appends should land, and they keep landing there until moved. Reading a trail and adding a digression becomes one gesture (right-click "Append from here") that covers any number of follow-up appends; growing that digression into a sub-digression takes another single gesture on the new parent. The cursor is exclusively user-controlled — appends never move it — so the user never has to undo unintended nesting. It also subsumes the `"Follow side trail" reading-position mode` deferred under "Out of scope (v1)": the cursor is the position, no separate reading-mode state needed.
-
 
 ## Indexer integration
 
@@ -272,7 +255,7 @@ A derived `trail_waypoints` table inside `index.db` supports fast lookups: which
 - `tree_path` is a materialized path encoding depth-first position — `"1"`, `"1.2"`, `"1.2.1"`, etc. — so lexical ordering on `tree_path` gives reading order without a recursive query. Re-derived from the trail-doc's `hiker.waypoints` tree on every upsert; not load-bearing for correctness (the frontmatter is truth) but cheap for sidebar paint.
 - Indexes on `trail_doc_path`, `source_path`, `parent_waypoint_path`.
 
-Built and maintained by `core::indexer` like every other derived index — re-derived on schema bump, fail-loud per `store-version-fail-loud`. Schema version increments to match. The same index feeds the shared rename-rewriter (`wikilink-rename-rewrite`) for the trail/waypoint side. [trail-waypoints-derived-table]
+Built and maintained by `core::indexer` like every other derived index — re-derived on schema bump, fail-loud per `store-version-fail-loud`. The same index feeds the shared rename-rewriter (`wikilink-rename-rewrite`) for the trail/waypoint side. [trail-waypoints-derived-table]
 
 
 ## Watcher integration
@@ -298,7 +281,7 @@ The search panel's per-source-type filter (`search-source-type-filter`) grows tw
 
 ## MCP integration
 
-Trails are a first-class MCP surface — both read and write — so attached agents can consume curated trails as context and transcribe their own investigations as draft trails. All MCP-routed writes go through `core::ops::agent_*` helpers, append `core::changes` rows tagged `author='agent:<client-id>'`, stamp `hiker.author: agent-authored` on affected files, and pass through staging if `agent-write-review-mode` is enabled — uniform with the existing MCP write tools. The `mcp-tool-toggles` machinery lets the user disable any individual trail tool independently.
+Trails are a first-class MCP surface (read and write) so attached agents can consume curated trails as context and transcribe their investigations. All MCP writes go through `core::ops::agent_*` helpers, append `core::changes` rows tagged `author='agent:<client-id>'`, stamp `hiker.author: agent-authored`, and ride the normal op-log pending/patch-review path like any other agent write — uniform with the existing MCP write tools. `mcp-tool-toggles` lets the user disable any individual trail tool.
 
 ### Read tools
 
@@ -308,55 +291,11 @@ Trails are a first-class MCP surface — both read and write — so attached age
 
 ### Write tools
 
-- **`trail_create(name, draft?)`** — create a new trail (empty waypoint list, default placement per `[trails] new_trail_dir`). When `draft=true`, the trail-doc is created with `hiker.draft: true` in its frontmatter and lands at the draft path per the draft-trail surface below; the user reviews and accepts to promote. Returns the new trail-doc's id and rel-path. [mcp-tool-trail-create]
+- **`trail_create(name)`** — create a new trail (empty waypoint list, default placement per `[trails] new_trail_dir`). Returns the new trail-doc's id and rel-path. Agent-authored trails ride the normal op-log pending/patch-review path like any other agent write. [mcp-tool-trail-create]
 - **`trail_append_waypoint(trail_id, source_rel, parent_waypoint_id?, annotation?)`** — append a new waypoint to a trail. Creates the waypoint-note in the trail-doc's companion folder, links to the source, and seeds the annotation with the optional `annotation` argument (omitted → empty body, the v1 capture-flow shape). When `parent_waypoint_id` is provided, the new waypoint is appended as the last child of that parent (a side-trail append); omitted → root-level append. [mcp-tool-trail-append-waypoint]
 - **`trail_remove_waypoint(trail_id, waypoint_id)`** — remove a waypoint from a trail. Symmetric to the sidebar's "Remove waypoint" verb; cascades to descendants if the target has children, per the sidebar verb's cascade rule. [mcp-tool-trail-remove-waypoint]
 
 Agent-authored trails are auditable two ways: the `hiker.author: agent-authored` stamp on the trail-doc and every waypoint-note, plus the `mcp-audit-log-mcp-calls` record of every trail tool call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` — surface `mcp-tool-call`, feature `trails_list` / `trail_get` / `trail_create` / etc., redacted-by-default body content per `[mcp.audit] log_full_input`.
-
-
-## Draft trails
-
-The clustering pipeline and MCP agents may *propose* trails the user hasn't authored. Drafts are first-class trails (same shape, same storage, same indexer treatment) flagged with `hiker.draft: true` in the trail-doc frontmatter and parked at a separate path so they don't pollute the user's trail dropdown until accepted. The user accepts (with optional edits to either the body, the waypoints, or both), edits-and-re-saves to keep iterating, or discards.
-
-### Draft sources
-
-- **MCP agents** — any agent calling `trail_create(draft=true)` or appending waypoints to a draft trail produces a draft. The default for agent-initiated trail creation depends on the `agent-write-review-mode` flag: when review mode is on, `draft=true` is the implicit default (matching the existing staging-as-default-for-agent-writes shape); when review mode is off, agents can still opt into drafts explicitly. The MCP `trail_create` wrapper resolves the effective draft flag as `explicit_arg.unwrap_or(default_draft_for_review_mode(review_mode_on))` (the helper lives in `core::trails::ops`), so an explicit `draft=false` always overrides the review-mode default. [trail-draft-from-agent]
-- **Clustering pipeline** — when `core::cluster` produces a tree containing a notable thread (a chain of related notes that look like an implicit reading order), it can emit a draft trail proposal alongside the existing reorganization output. Off by default — opt-in via `[clustering] propose_trails = false`. The chain test is `core::cluster::detect_reading_order_chain`: a pure, conservative gate over each cluster member's `(note_id, order_key)` (the producer resolves `order_key` from ctime / a frontmatter sequence / a `part-N` naming pattern). It fires only when the cluster has 3..25 members with *distinct* ordering keys (a duplicate key = ambiguous ordering, so it declines rather than guess) and returns the members in reading order; the producer then runs `create_trail(draft=true)` + ordered `append_waypoint`s. Conservative-by-design: a missed chain costs the user a manual trail, a false chain costs review-queue noise. [trail-draft-from-clustering]
-- **Auto-generated from LLM tool-use trace** — folds into this same draft pipeline. When an agent answers a query, the set of `get_note` / `read_note` / search tool calls during that turn becomes a candidate draft trail. Specced under `trail-auto-from-llm-trace`; the draft-review surface here is its consumer.
-
-### Storage
-
-A draft is a not-yet-accepted agent proposal, so it lives as **pending-review machinery** under `.hiker/`, not as a visible note: the draft trail-doc at `<vault>/.hiker/trails/drafts/<trail-id>.md` with its waypoints in a sibling companion folder `<vault>/.hiker/trails/drafts/<trail-id>/`. The basename is the trail-doc's `doc_id`, not a user-facing name, so drafts never collide and never need the `-N` suffix loop accepted trails use. Drafts are storage-shape-identical to accepted trails (trail-doc + companion folder) except for the location and the `hiker.draft: true` flag, and — being pre-acceptance — they are *not indexed/searchable* until accepted; the review surface reads them directly via `core::trails::list`. The flag is a plain `hiker.draft` boolean that parses/writes through the same frontmatter round-trip as every other `hiker.*` field; absent or `false` both read as not-a-draft, and accepting strips the key entirely (no stale `draft: false`). Drafts are excluded from the Trails sidebar dropdown, the filetree's trail rows, and `trails_list` MCP results unless the caller passes `include_drafts=true` — implemented as the `include_drafts` parameter on `core::trails::list`, which surfaces each row's `draft` flag when drafts are included. [trail-draft-review-surface]
-
-### Review surface
-
-Draft trails are reviewed inline from two surfaces: the trails panel itself, and the activity detail page (per `settings.md`'s pending change review section). [trail-draft-review-surface]
-
-**Trails panel.** When the active trail is a draft, a muted banner row appears below the header (same visual weight as the append-cursor hint):
-
-```
-ⓘ Draft — proposed by agent
-[Accept trail]  [Reject]
-```
-
-When the active trail has pending waypoint additions proposed by an agent, minimal collapsed rows appear at the end of the waypoint list:
-
-```
-── Proposed ─────────────────────────────
-+  research/raptor.md   [Accept] [Reject]
-+  notes/whisper.md     [Accept] [Reject]
-```
-
-Each row is the source basename plus two muted action links. No full waypoint card — the source path is enough context.
-
-**Activity detail page.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill that lists all pending proposals, including draft trails and waypoint additions. Each row carries [Accept] [Reject]; [Accept all (N)] batch-approves.
-
-**Accept** (`core::trails::ops::accept_draft`) — strips `hiker.draft: true`, then moves the draft trail-doc *and its companion folder* from `.hiker/trails/drafts/` to the configured `[trails] new_trail_dir` (default `trails/`) via `core::ops::file::move_note` (the doc + companion-folder move is one transaction, the same pairing a trail-doc rename uses). The trail's `doc_id` is unchanged, the waypoint paths rewrite to the new companion-folder location through `wikilink-rename-rewrite`, and the now-visible trail + waypoints get indexed. The trail joins the dropdown as a normal trail. Refuses to act on a non-draft trail-doc (so a double-accept can't relocate a real trail). The `core::changes` row tagged `metadata.reviewed = true` + `metadata.review_source = "trail-draft"` is deferred until the in-app review surface lands.
-
-**Reject** (`core::trails::ops::reject_draft`) — hard-deletes the draft trail-doc and its `.hiker/trails/drafts/<trail-id>/` companion folder (waypoint-notes included). No trash, no `core::changes` row — drafts are pre-acceptance and unindexed, so rejection is a plain disk delete. Refuses to act on a non-draft trail-doc.
-
-Drafts also appear in the Trails sidebar dropdown when the user explicitly toggles "Show drafts" — useful for working on a draft over multiple sessions before deciding to accept. Toggle state is per-vault, off by default.
 
 
 ## Out of scope (v1)
@@ -373,7 +312,7 @@ Drafts also appear in the Trails sidebar dropdown when the user explicitly toggl
 
 ## Deferred
 
-- **Auto-generated trails from LLM tool-use trace.** Audit-shaped: when an agent answers a query, the set of `get_note` / `read_note` / search tool calls during that turn becomes a candidate trail showing the agent's reasoning path. The candidate trail rides the draft-trail surface (`trail-draft-review-surface`) — user accepts, edits, or discards through the same review flow. Pairs naturally with `chat-tool-call-opens-touched-note` since both surface the agent's note-touching trail. Lands once basic trails are solid in real use. [trail-auto-from-llm-trace]
+- **Auto-generated trails from LLM tool-use trace.** Audit-shaped: when an agent answers a query, the set of `get_note` / `read_note` / search tool calls during that turn becomes a candidate trail showing the agent's reasoning path. The candidate trail rides the normal op-log pending/patch-review path like any other agent write — user accepts, edits, or discards through the same review flow. Pairs naturally with `chat-tool-call-opens-touched-note` since both surface the agent's note-touching trail. Lands once basic trails are solid in real use. [trail-auto-from-llm-trace]
 - **Filename color toggle for active-trail waypoints.** Optional toggle (default off) that colorizes the filename of any note that's a waypoint of the *currently active* trail in the file tree, so trail membership is scannable from the tree without opening the Trails sidebar mode. Lives under the View menu when it lands. [trail-active-waypoint-filename-color]
 - **CLI surface.** `hiker trail list / show / activate / new` for shell-script-driven workflows; rides the broader `cli-*` family in `status.md`. [cli-trail-list, cli-trail-show, cli-trail-activate, cli-trail-new]
 - **Active-trail indicator outside Trails mode.** A small chip in the editor toolbar or status bar showing which trail is active when sidebar is in Files / Cluster trees mode. Useful if capture-into-wrong-trail becomes a real footgun in v1 use; revisit then.

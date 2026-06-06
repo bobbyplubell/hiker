@@ -1,7 +1,7 @@
-//! Search feature — sidebar surface owning the query input, the per-mode
+//! Search activity — sidebar surface owning the query input, the per-mode
 //! options menus, the typeahead debounce machinery, and the result list.
-//! Migrated off `panels::search` + `panels_registry` to a real `Feature`
-//! rendering through the narrow `feature::Ctx`: UI state lives on
+//! Migrated off `panels::search` + `panels_registry` to a real `Activity`
+//! rendering through the narrow `activity::Ctx`: UI state lives on
 //! `AppState::search_state` (reached via `ctx.state`), the index queries
 //! run against `ctx.services`/`ctx.vault`, and every broad mutation
 //! (open a note, reveal in the file tree, persist a setting, stash the
@@ -26,7 +26,7 @@ use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 
 use crate::editor_pane;
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Activity, Ctx, View};
 use crate::panels::zim;
 use crate::search::state::{OrderBy, State};
 use crate::state::AppState;
@@ -36,12 +36,12 @@ pub mod state;
 
 const SEARCH_DEBOUNCE_MS: u64 = 250;
 
-/// Zero-sized `Feature` descriptor for search. State lives in
+/// Zero-sized `Activity` descriptor for search. State lives in
 /// `AppState::search_state`; the surface reaches it via
 /// `Ctx::state.downcast_mut::<State>()`.
 pub struct Search;
 
-impl Feature for Search {
+impl Activity for Search {
     fn id(&self) -> &'static str {
         "search"
     }
@@ -51,14 +51,17 @@ impl Feature for Search {
     fn icon(&self) -> egui::Image<'static> {
         crate::icons::ICONS.image(crate::icons::Icon::Search)
     }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&SearchSidebar)
+    fn views(&self) -> Vec<&dyn View> {
+        vec![&SearchSidebar]
     }
 }
 
 struct SearchSidebar;
 
-impl SidebarSurface for SearchSidebar {
+impl View for SearchSidebar {
+    fn id(&self) -> &'static str {
+        "search"
+    }
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         // Apply any background-query results that landed since last frame
         // (`search-query-embed-spawn-blocking`) before drawing, so the freshest hits show.
@@ -597,8 +600,8 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     let results = st.results.clone();
     let selected = st.selected_row;
     let mut to_open: Option<(String, bool, u32)> = None;
-    let mut copy: Option<String> = None;
     let mut reveal: Option<String> = None;
+    let mut props: Option<String> = None;
     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
     if enter_pressed
         && let Some(idx) = selected
@@ -606,15 +609,15 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     {
         to_open = Some((hit.path.clone(), true, hit.chunk_index));
     }
-    render_groups(ui, &results, selected, &mut to_open, &mut copy, &mut reveal);
+    render_groups(ui, &results, selected, &mut to_open, &mut reveal, &mut props);
     if let Some((rel, sticky, chunk_index)) = to_open {
         ctx.defer(move |app| open_at_chunk(app, &rel, sticky, chunk_index));
     }
-    if let Some(path) = copy {
-        ui.ctx().copy_text(path);
-    }
     if let Some(rel) = reveal {
         ctx.defer(move |app| reveal_in_files(app, &rel));
+    }
+    if let Some(rel) = props {
+        ctx.defer(move |app| crate::files::sidebar::open_properties(app, &rel));
     }
     let zim_empty = render_zim_results(ui, ctx);
     if results.is_empty() && zim_empty {
@@ -695,8 +698,8 @@ fn render_groups(
     results: &[DiscoveryHit],
     selected: Option<usize>,
     to_open: &mut Option<(String, bool, u32)>,
-    copy: &mut Option<String>,
     reveal: &mut Option<String>,
+    props: &mut Option<String>,
 ) {
     let mut group_order: Vec<String> = Vec::new();
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
@@ -731,8 +734,18 @@ fn render_groups(
             CardAction::Open { sticky } => {
                 *to_open = Some((hit.path.clone(), sticky, hit.chunk_index));
             }
-            CardAction::CopyPath => *copy = Some(hit.path.clone()),
-            CardAction::Reveal => *reveal = Some(hit.path.clone()),
+            // The shared base maps onto the same out-params the card has always
+            // dispatched through; Copy-path is the base's own `Custom` entry, so
+            // it never surfaces as a `CardAction` (status: ctxmenu-item-base).
+            CardAction::Base(crate::item_menu::ItemAction::Open) => {
+                *to_open = Some((hit.path.clone(), false, hit.chunk_index));
+            }
+            CardAction::Base(crate::item_menu::ItemAction::RevealInFiles) => {
+                *reveal = Some(hit.path.clone());
+            }
+            CardAction::Base(crate::item_menu::ItemAction::Properties) => {
+                *props = Some(hit.path.clone());
+            }
         }
         // Indented additional matches.
         if idxs.len() > 1 {
@@ -746,6 +759,23 @@ fn render_groups(
                         format!("> chunk {}", h.chunk_index)
                     };
                     let resp = ui.add(egui::Button::selectable(highlighted, label));
+                    if let Some(action) = crate::item_menu::note_item_menu_response(
+                        &resp,
+                        &h.path,
+                        crate::item_menu::BaseOpts { reveal: true },
+                    ) {
+                        match action {
+                            crate::item_menu::ItemAction::Open => {
+                                *to_open = Some((h.path.clone(), false, h.chunk_index));
+                            }
+                            crate::item_menu::ItemAction::RevealInFiles => {
+                                *reveal = Some(h.path.clone());
+                            }
+                            crate::item_menu::ItemAction::Properties => {
+                                *props = Some(h.path.clone());
+                            }
+                        }
+                    }
                     if resp.clicked() {
                         let sticky = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
                         *to_open = Some((h.path.clone(), sticky, h.chunk_index));
@@ -778,7 +808,7 @@ fn open_at_chunk(app: &mut AppState, rel: &str, sticky: bool, chunk_index: u32) 
 /// row's container is visible, make the files panel visible, then arm a
 /// one-shot scroll target the files panel honors on its next render
 /// (`reveal-in-sidebar-scroll`).
-fn reveal_in_files(app: &mut AppState, rel: &str) {
+pub(crate) fn reveal_in_files(app: &mut AppState, rel: &str) {
     let mut prefix_parts: Vec<&str> = rel.split('/').collect();
     prefix_parts.pop();
     let mut acc = String::new();
@@ -1000,8 +1030,10 @@ fn filename_search(vault: &hiker_core::vault::Vault, query: &str) -> Vec<Discove
 pub enum CardAction {
     None,
     Open { sticky: bool },
-    CopyPath,
-    Reveal,
+    /// A shared note-item base action (Open / Reveal-in-tree / Copy-path /
+    /// Properties), composed from [`crate::item_menu::note_item_base`] so the
+    /// universal verbs live in one place (status: ctxmenu-item-base).
+    Base(crate::item_menu::ItemAction),
 }
 
 /// Render a single result-card row (per `discovery-result-card`). Layout:
@@ -1048,26 +1080,24 @@ pub fn result_card(ui: &mut egui::Ui, hit: &DiscoveryHit, allow_context: bool) -
     }
     if allow_context {
         resp.context_menu(|ui| {
-            if ui.button("Open").clicked() {
-                action = CardAction::Open { sticky: false };
-                ui.close();
-            }
-            if ui.button("Open (sticky)").clicked() {
-                action = CardAction::Open { sticky: true };
-                ui.close();
-            }
-            if ui.button("Copy path").clicked() {
-                action = CardAction::CopyPath;
-                ui.close();
-            }
-            if ui.button("Reveal in sidebar").clicked() {
-                action = CardAction::Reveal;
-                ui.close();
+            if let Some(chosen) = egui_workbench::menu::show(ui, build_search_hit_menu(&hit.path)) {
+                action = chosen;
             }
         });
     }
     ui.add_space(4.0);
     action
+}
+
+/// Build the right-click menu for a search result card (status: ctxmenu-search).
+/// The universal Open / Reveal-in-tree / Copy-path / Properties verbs come from
+/// the shared base (status: ctxmenu-item-base); the card-specific "Open
+/// (sticky)" follows in its own section. Gated by `allow_context` at the call
+/// site.
+fn build_search_hit_menu(path: &str) -> egui_workbench::menu::Menu<CardAction> {
+    crate::item_menu::note_item_base(path, crate::item_menu::BaseOpts { reveal: true }, CardAction::Base)
+        .section()
+        .action("Open (sticky)", CardAction::Open { sticky: true })
 }
 
 /// The card's top line: title (truncated, fills the row) with the score +

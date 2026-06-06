@@ -30,6 +30,7 @@
 //! status: canvas-crate-split
 
 pub mod content;
+pub mod menu;
 pub mod paint;
 pub mod palette;
 pub mod widget;

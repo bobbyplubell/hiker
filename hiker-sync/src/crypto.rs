@@ -37,6 +37,12 @@ const NONCE_LEN: usize = 12;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The write-through persist hook for [`SharedContentKey`]: called with the new
+/// key bytes and its established flag on every mutation, so the app keeps the
+/// on-disk key (and its established marker) in step with the in-memory one.
+/// [sync-content-key-confirm-on-change]
+pub type ContentKeyPersist = Arc<dyn Fn(&ContentKey, bool) + Send + Sync>;
+
 /// The per-vault 256-bit content key. Encrypts every update blob with
 /// AES-256-GCM and derives blind ids. Opaque newtype over the raw key bytes;
 /// the `aes_gcm` cipher never escapes this module.
@@ -153,7 +159,8 @@ impl std::fmt::Debug for ContentKey {
     }
 }
 
-/// A shared, persist-through handle to the vault content key.
+/// A shared, persist-through handle to the vault content key plus its
+/// "established" flag.
 ///
 /// Wraps `Arc<Mutex<ContentKey>>` plus an optional persist hook, so the node and
 /// the app's sync service hold a clone of the SAME key (mirroring the
@@ -162,33 +169,62 @@ impl std::fmt::Debug for ContentKey {
 /// (`sync-vault-key-inband`) and the manual import both write through to
 /// at-rest storage consistently. The node uses this for encrypt / decrypt /
 /// blind-id, so swapping the key takes effect for the whole session at once.
+///
+/// The **established** flag (`sync-content-key-confirm-on-change`) records
+/// whether the current key was deliberately set — a manual import or a
+/// completed in-band convergence — as opposed to the fresh key a brand-new
+/// device auto-generated. A fresh (non-established) key auto-adopts a peer's
+/// key in-band; an established key does NOT silently switch (the convergence is
+/// held and surfaced for the user to confirm via a manual import). The flag is
+/// persisted through the same hook seam as the key bytes.
+// status: sync-content-key-confirm-on-change
 #[derive(Clone)]
 pub struct SharedContentKey {
     inner: Arc<Mutex<ContentKey>>,
-    /// Called with the new key on every [`set`](Self::set). The app wires this
-    /// to write through its user-scope `KeyStore`; tests can leave it unset.
-    persist: Option<Arc<dyn Fn(&ContentKey) + Send + Sync>>,
+    /// Whether the current key was deliberately set / has converged. See the
+    /// type doc. Persisted alongside the key via [`persist`](Self::persist).
+    established: Arc<Mutex<bool>>,
+    /// Called with the new key + established flag on every mutation. The app
+    /// wires this to write through its user-scope `KeyStore`; tests can leave it
+    /// unset.
+    persist: Option<ContentKeyPersist>,
 }
 
 impl SharedContentKey {
     /// A handle with no persist hook — the key lives only in memory (tests, or
-    /// a node whose caller persists separately).
+    /// a node whose caller persists separately). The key starts NON-established
+    /// (a freshly minted key); use [`new_established`](Self::new_established) to
+    /// start from a key the caller already knows is deliberate.
     pub fn new(key: ContentKey) -> Self {
+        Self::new_with_established(key, false)
+    }
+
+    /// A handle for a key the caller already knows is deliberate (e.g. one that
+    /// has previously converged or been imported). In-memory only.
+    pub fn new_established(key: ContentKey) -> Self {
+        Self::new_with_established(key, true)
+    }
+
+    fn new_with_established(key: ContentKey, established: bool) -> Self {
         Self {
             inner: Arc::new(Mutex::new(key)),
+            established: Arc::new(Mutex::new(established)),
             persist: None,
         }
     }
 
-    /// A handle whose [`set`](Self::set) also calls `persist` with the new key —
-    /// the write-through used by the app's sync service to keep the on-disk
-    /// content key in step with the in-memory one.
+    /// A handle whose mutations also call `persist` with the new key + the new
+    /// established flag — the write-through used by the app's sync service to
+    /// keep the on-disk content key (and its established marker) in step with
+    /// the in-memory one. `established` is the flag loaded from at-rest storage.
     pub fn with_persist(
         key: ContentKey,
-        persist: Arc<dyn Fn(&ContentKey) + Send + Sync>,
+        established: bool,
+        persist: ContentKeyPersist,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(key)),
+            established: Arc::new(Mutex::new(established)),
             persist: Some(persist),
         }
     }
@@ -199,13 +235,34 @@ impl SharedContentKey {
         self.inner.lock().unwrap().clone()
     }
 
-    /// Replace the key in place AND persist it (if a hook is set). The seam both
-    /// the in-band auto-transfer and the manual import route through.
+    /// Whether the current key is established (deliberately set / converged).
+    /// The convergence decision gates on this: a fresh key auto-adopts a peer's,
+    /// an established key holds and surfaces. [sync-content-key-confirm-on-change]
+    pub fn is_established(&self) -> bool {
+        *self.established.lock().unwrap()
+    }
+
+    /// Replace the key in place AND persist it (if a hook is set), WITHOUT
+    /// changing the established flag. Used where the key changes but the
+    /// "deliberate" status is unchanged (e.g. a node-side test seam).
     pub fn set(&self, key: ContentKey) {
+        let established = *self.established.lock().unwrap();
         if let Some(persist) = &self.persist {
-            persist(&key);
+            persist(&key, established);
         }
         *self.inner.lock().unwrap() = key;
+    }
+
+    /// Replace the key AND mark it established, persisting both atomically. The
+    /// seam both the completed in-band auto-transfer (a fresh key adopting a
+    /// peer's) and the manual import route through — after either, the key is a
+    /// deliberate one. [sync-content-key-confirm-on-change]
+    pub fn adopt(&self, key: ContentKey) {
+        if let Some(persist) = &self.persist {
+            persist(&key, true);
+        }
+        *self.inner.lock().unwrap() = key;
+        *self.established.lock().unwrap() = true;
     }
 
     /// The non-secret fingerprint of the current key — the handshake comparison
@@ -497,29 +554,64 @@ mod tests {
     #[test]
     fn shared_content_key_set_updates_and_persists() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // A persist hook that records the last-persisted fingerprint + call count.
+        // A persist hook that records the last-persisted fingerprint + established
+        // flag + call count.
         let calls = Arc::new(AtomicUsize::new(0));
-        let last = Arc::new(Mutex::new(String::new()));
+        let last = Arc::new(Mutex::new((String::new(), false)));
         let calls_c = calls.clone();
         let last_c = last.clone();
         let shared = SharedContentKey::with_persist(
             key_a(),
-            Arc::new(move |k: &ContentKey| {
+            false,
+            Arc::new(move |k: &ContentKey, est: bool| {
                 calls_c.fetch_add(1, Ordering::SeqCst);
-                *last_c.lock().unwrap() = k.fingerprint();
+                *last_c.lock().unwrap() = (k.fingerprint(), est);
             }),
         );
 
-        // Initial state: no persist on construct, fingerprint matches key_a.
+        // Initial state: no persist on construct, fingerprint matches key_a, not
+        // established.
         assert_eq!(calls.load(Ordering::SeqCst), 0, "construct doesn't persist");
         assert_eq!(shared.fingerprint(), key_a().fingerprint());
+        assert!(!shared.is_established(), "fresh handle is not established");
 
-        // set() swaps the key in place AND fires the persist hook with the new key.
+        // set() swaps the key in place AND fires the persist hook, leaving the
+        // established flag unchanged (still false here).
         shared.set(key_b());
         assert_eq!(calls.load(Ordering::SeqCst), 1, "set persists once");
         assert_eq!(shared.fingerprint(), key_b().fingerprint(), "key swapped in place");
-        assert_eq!(*last.lock().unwrap(), key_b().fingerprint(), "persisted the new key");
+        assert_eq!(*last.lock().unwrap(), (key_b().fingerprint(), false), "persisted key, not established");
         assert_eq!(shared.get().as_bytes(), key_b().as_bytes(), "get reflects the swap");
+        assert!(!shared.is_established(), "set leaves established unchanged");
+    }
+
+    #[test]
+    fn shared_content_key_adopt_marks_established_and_persists() {
+        // adopt() swaps the key AND marks it established, persisting both.
+        let last = Arc::new(Mutex::new((String::new(), false)));
+        let last_c = last.clone();
+        let shared = SharedContentKey::with_persist(
+            key_a(),
+            false,
+            Arc::new(move |k: &ContentKey, est: bool| {
+                *last_c.lock().unwrap() = (k.fingerprint(), est);
+            }),
+        );
+        assert!(!shared.is_established());
+        shared.adopt(key_b());
+        assert!(shared.is_established(), "adopt marks established");
+        assert_eq!(shared.fingerprint(), key_b().fingerprint(), "adopt swaps the key");
+        assert_eq!(
+            *last.lock().unwrap(),
+            (key_b().fingerprint(), true),
+            "adopt persists the new key + established=true"
+        );
+    }
+
+    #[test]
+    fn new_established_starts_established() {
+        let shared = SharedContentKey::new_established(key_a());
+        assert!(shared.is_established(), "new_established starts established");
     }
 
     #[test]
@@ -527,6 +619,9 @@ mod tests {
         let shared = SharedContentKey::new(key_a());
         shared.set(key_b());
         assert_eq!(shared.get().as_bytes(), key_b().as_bytes(), "set works with no hook");
+        shared.adopt(key_a());
+        assert_eq!(shared.get().as_bytes(), key_a().as_bytes(), "adopt works with no hook");
+        assert!(shared.is_established(), "adopt marks established even with no hook");
     }
 
     #[test]

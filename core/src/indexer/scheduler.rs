@@ -11,11 +11,11 @@ use tokio::sync::{broadcast, mpsc, watch, OnceCell};
 use crate::embed::{Embedder, Error};
 use crate::store::Store;
 
-use super::jobs::{handle_simple_job, JobCtx, ReloadCtx};
-use super::{
-    run_full_scan, submit_embedder_load_task, update_status, update_total_notes,
-    EmbedderLoadTaskPlumbing, IndexJob, IndexJobTx, IndexStatus, ProgressEvent,
-};
+// Only the most heavily-used parent items are imported; the rest are reached
+// via explicit `super::` paths at their use sites so this file doesn't lean on
+// a wide slice of its parent's namespace (per `check-splits` super-reach).
+use super::jobs::handle_simple_job;
+use super::{update_status, IndexJob, ProgressEvent};
 
 /// Long-lived state for the indexer task loop. Bundled into a struct so the
 /// driver entry point is a `self`-method (exempt from `single_call_fn`)
@@ -30,15 +30,15 @@ where
     pub embedder_loader: F,
     pub rx: mpsc::Receiver<IndexJob>,
     pub progress: broadcast::Sender<ProgressEvent>,
-    pub status: watch::Sender<IndexStatus>,
+    pub status: watch::Sender<super::IndexStatus>,
     pub pending: Arc<Mutex<HashSet<String>>>,
     pub embedder_cell: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
-    pub self_tx: IndexJobTx,
+    pub self_tx: super::IndexJobTx,
     pub watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     pub oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
     /// status: inbox-rules
     pub inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>>,
-    pub tasks: Option<EmbedderLoadTaskPlumbing>,
+    pub tasks: Option<super::EmbedderLoadTaskPlumbing>,
 }
 
 impl<F> IndexerLoop<F>
@@ -100,7 +100,7 @@ pub(super) async fn run(self) {
             update_status(state.status, |s| s.queued = len);
         }
         state.handle_one_job(&mut store, &mut embedder, job).await;
-        update_total_notes(state.status, &store);
+        super::update_total_notes(state.status, &store);
         // Job done — published queue depth now reflects only the still-queued
         // jobs (no in-flight bump until the next recv).
         {
@@ -120,10 +120,10 @@ struct LoopState<'a> {
     vault: &'a crate::vault::Vault,
     vault_root: &'a PathBuf,
     progress: &'a broadcast::Sender<ProgressEvent>,
-    status: &'a watch::Sender<IndexStatus>,
+    status: &'a watch::Sender<super::IndexStatus>,
     pending: &'a Arc<Mutex<HashSet<String>>>,
     embedder_cell: &'a Arc<RwLock<Option<Arc<dyn Embedder>>>>,
-    self_tx: &'a IndexJobTx,
+    self_tx: &'a super::IndexJobTx,
     watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
     /// status: inbox-rules
@@ -138,13 +138,13 @@ impl<'a> LoopState<'a> {
     async fn load_and_resolve<F>(
         &self,
         embedder_loader: F,
-        tasks: Option<&EmbedderLoadTaskPlumbing>,
+        tasks: Option<&super::EmbedderLoadTaskPlumbing>,
     ) -> Option<Arc<dyn Embedder>>
     where
         F: FnOnce() -> Result<Arc<dyn Embedder>, Error> + Send + 'static,
     {
         let load_task_id = if let Some(p) = tasks {
-            Some(submit_embedder_load_task(&p.queue, &p.initial_model_id).await)
+            Some(super::submit_embedder_load_task(&p.queue, &p.initial_model_id).await)
         } else {
             None
         };
@@ -282,7 +282,7 @@ impl<'a> LoopState<'a> {
             // model can be assigned to the loop-local `embedder`
             // binding; subsequent jobs see the swap immediately.
             IndexJob::ReloadEmbedder { model_id, reply } => {
-                let ctx = ReloadCtx {
+                let ctx = super::jobs::ReloadCtx {
                     embedder,
                     embedder_cell: self.embedder_cell,
                     store,
@@ -294,7 +294,7 @@ impl<'a> LoopState<'a> {
                 ctx.run(model_id, reply).await;
             }
             other => {
-                let ctx = JobCtx {
+                let ctx = super::jobs::JobCtx {
                     vault: self.vault,
                     vault_root: self.vault_root,
                     embedder,
@@ -317,7 +317,7 @@ impl<'a> LoopState<'a> {
         embedder: &Arc<dyn Embedder>,
         force: bool,
     ) {
-        let jobs = match run_full_scan(self.vault_root, store, force) {
+        let jobs = match super::run_full_scan(self.vault_root, store, force) {
             Ok(jobs) => jobs,
             Err(e) => {
                 let msg = format!("{e}");
@@ -359,7 +359,7 @@ impl<'a> LoopState<'a> {
             if let IndexJob::Upsert { rel_path, .. } = &j {
                 self.pending.lock().unwrap().insert(rel_path.clone());
             }
-            let ctx = JobCtx {
+            let ctx = super::jobs::JobCtx {
                 vault: self.vault,
                 vault_root: self.vault_root,
                 embedder,
@@ -372,7 +372,7 @@ impl<'a> LoopState<'a> {
                 inbox_cell: self.inbox_cell,
             };
             handle_simple_job(&ctx, store, j).await;
-            update_total_notes(self.status, store);
+            super::update_total_notes(self.status, store);
         }
     }
 }

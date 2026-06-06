@@ -4,17 +4,17 @@ In-app viewer for offline `.zim` archives (Wikipedia exports, wikis, doc sites):
 
 The headline decisions:
 
-- **Articles render through the no-JS `hiker-htmlview` renderer**, host-driven (the tab owns scroll / clip / input; the renderer lays out, paints, and hit-tests links). In-archive CSS / images are served offline by a ZIM-backed `ResourceProvider`. No browser engine, no JS — the same stance as `extract.md`'s `extract-web-no-js-stance`. [zim-view]
-- **An archive opens as a preview tab**, exactly like opening a note: it reuses the shared preview slot and is promotable to pinned by double-clicking the tab. [zim-view-preview-tab]
-- **In-archive links follow note preview semantics** — a preview tab navigates in place (the link replaces it); a pinned tab opens the target as a new preview tab. [zim-link-preview-open]
-- **In-archive navigation rides the global Back/Forward stack** as `NavTarget::ZimArticle`, so the top-bar buttons walk article history browser-style, interleaved with note / snapshot history. [zim-nav-stack]
-- **The "Jump to" title picker and the vault-search ZIM results run off the UI thread**, so typing stays smooth on a multi-million-title archive. [title-picker-async] [zim-federated-search]
+- **Articles render through the no-JS `hiker-htmlview` renderer**, host-driven (the tab owns scroll / clip / input; the renderer lays out, paints, and hit-tests links). In-archive CSS / images are served offline by a ZIM-backed `ResourceProvider`. No browser engine, no JS.
+- **An archive opens as a preview tab**, exactly like opening a note: it reuses the shared preview slot and is promotable to pinned by double-clicking the tab.
+- **In-archive links follow note preview semantics** — a preview tab navigates in place (the link replaces it); a pinned tab opens the target as a new preview tab.
+- **In-archive navigation rides the global Back/Forward stack** as `NavTarget::ZimArticle`, so the top-bar buttons walk article history browser-style, interleaved with note / snapshot history.
+- **The "Jump to" title picker and the vault-search ZIM results run off the UI thread**, so typing stays smooth on a multi-million-title archive.
 
 ## Rendering [zim-view]
 
 `TabKind::ZimView { zim_path, article }` — one tab per opened archive; `article = None` is the archive's main page. The tab body lays out and paints the article HTML through `hiker-htmlview` (the renderer behind `htmlview-render`) into the tab's painter; the host owns the `ScrollArea`, the clip rect, and pointer hit-testing (`link_at`).
 
-Subresources (CSS, images an article references) are served offline by a ZIM-backed `ResourceProvider` resolved against the archive's `zim://` base. Relative refs arrive un-normalized from the renderer (plain concatenation), so the provider collapses `.` / `..` segments before splitting off the ZIM namespace — without it MediaWiki articles render unstyled (tables fall back to their `width="100%"` attribute). Lookups try the parsed namespace, then the common content / image / style namespaces (`C` / `I` / `-` / `A` / `M`), so legacy and modern archive layouts both resolve.
+Subresources (CSS, images an article references) are served offline by a ZIM-backed `ResourceProvider` resolved against the archive's `zim://` base. Relative refs arrive un-normalized from the renderer, so the provider collapses `.` / `..` segments before splitting off the ZIM namespace (without it MediaWiki articles render unstyled). Lookups try the parsed namespace, then the common content / image / style namespaces (`C` / `I` / `-` / `A` / `M`), so legacy and modern archive layouts both resolve.
 
 Panes are `!Send` (they hold the renderer's stylo-styled document plus egui textures), so they live in a UI-thread-local store keyed by tab id and are dropped on tab close.
 
@@ -27,7 +27,7 @@ Panes are `!Send` (they hold the renderer's stylo-styled document plus egui text
 - **preview tab** → navigates in place (the link replaces the current article);
 - **pinned tab** → opens the target as a new preview tab, leaving the pinned article undisturbed.
 
-**Back / Forward** [zim-nav-stack]. Each article visit records a `NavTarget::ZimArticle { zim_path, article }` on the one global nav stack shared with notes and snapshots, so the top-bar Back/Forward buttons (and swipe-nav) walk article history. A back/forward landing navigates an existing tab for the archive in place, preferring the active tab. Per-tab isolated history was rejected: the global stack reuses the existing buttons and matches how every other surface navigates, at the cost of interleaving ZIM steps with note steps.
+**Back / Forward** [zim-nav-stack]. Each article visit records a `NavTarget::ZimArticle { zim_path, article }` on the one global nav stack shared with notes and snapshots, so the top-bar Back/Forward buttons (and swipe-nav) walk article history. A back/forward landing navigates an existing tab for the archive in place, preferring the active tab. Per-tab isolated history was rejected in favor of the shared global stack, at the cost of interleaving ZIM steps with note steps.
 
 ## Title picker [title-picker-async]
 

@@ -58,50 +58,65 @@ pub struct AppState {
     pub session: Session,
     /// File-tree UI state (expanded dirs, dir listing cache, selection,
     /// inline-rename draft, reveal scroll target). Relocated off
-    /// `Session::file_tree` so the `files` feature surface can reach it
+    /// `Session::file_tree` so the `files` activity surface can reach it
     /// through the registry `Ctx::state` slot, matching the other
-    /// migrated features. [feature-filetree-migration]
+    /// migrated activities. [feature-filetree-migration]
     pub file_tree_state: FileTreeState,
     pub ui_cache: UiCache,
     pub panels: PanelStates,
-    /// Per-feature UI state for the migrated `clusters` feature.
+    /// Per-activity UI state for the migrated `clusters` activity.
     /// Top-level (sibling to `panels`) per `feature-state-ownership`:
-    /// each migrated feature owns its state on `AppState` directly so
+    /// each migrated activity owns its state on `AppState` directly so
     /// `PanelStates` shrinks rather than growing into a god struct.
     pub clusters_state: crate::clusters::state::State,
-    /// Per-feature UI state for the migrated `trails` feature
+    /// Per-activity UI state for the migrated `trails` activity
     /// (`feature-trails-migration`).
     pub trails_state: crate::trails::state::State,
-    /// Per-feature UI state for the migrated `backlinks` feature
+    /// Per-activity UI state for the migrated `backlinks` activity
     /// (`feature-backlinks-migration`).
     pub backlinks_state: crate::backlinks::State,
-    /// Per-feature UI state for the migrated `related` feature
+    /// Per-activity UI state for the `appears-in` view — cached reverse
+    /// references (canvases / boards / trails / trees). status: canvas-appears-in
+    pub appears_in_state: crate::appears_in::State,
+    /// Per-activity UI state for the migrated `related` activity
     /// (`feature-related-migration`).
     pub related_state: crate::related::State,
-    /// Per-feature UI state for the migrated `search` feature
+    /// Per-activity UI state for the migrated `search` activity
     /// (`feature-search-migration`).
     pub search_state: crate::search::state::State,
-    /// Per-feature UI state for the migrated `vault` lens feature
+    /// Per-activity UI state for the migrated `vault` lens activity
     /// (chosen lens + collapsed groups; read-only, nothing persisted on
     /// notes). status: vault-view-mode
     pub vault_state: crate::vault_view::State,
-    /// Per-feature UI state for the migrated `trash` feature. The panel
+    /// Per-activity UI state for the migrated `trash` activity. The panel
     /// is effectively stateless (listing read fresh from disk), but the
-    /// registry hands every feature a state slice, so this is a
+    /// registry hands every activity a state slice, so this is a
     /// zero-field marker. status: feature-trash-panel
     pub trash_state: crate::trash::State,
-    /// Per-feature state for the migrated docked `chat` sidebar: the
+    /// Per-activity UI state for the `canvases` activity (lists the
+    /// vault's `.canvas` files). Effectively stateless — the listing is
+    /// read fresh from disk — so a zero-field marker keeps the registry
+    /// `with_ctx` seam uniform. status: feature-state-ownership
+    pub canvases_activity_state: crate::canvas_activity::State,
+    /// Per-activity state for the migrated docked `chat` sidebar: the
     /// in-memory session registry + the lazy-discover gate. Relocated
     /// off `Session::chat` / `Session::chat_discovered`.
     pub chat_state: crate::chat::state::State,
-    /// Per-session feature descriptor registry. Built in
-    /// `bootstrap::open_vault` from `feature::builtin_features()` plus
-    /// (in Phase 3) plugin-derived features. Sidebar/activity/hamburger
-    /// consumers iterate this rather than hardcoding feature lists.
+    /// Per-session activity descriptor registry. Built in
+    /// `bootstrap::open_vault` from `activity::builtin_activities()` plus
+    /// (in Phase 3) plugin-derived activities. Sidebar/activity/hamburger
+    /// consumers iterate this rather than hardcoding activity lists.
     /// `feature-registry`.
-    pub features: std::sync::Arc<crate::feature::Registry>,
+    pub activities: std::sync::Arc<crate::activity::ActivityRegistry>,
     pub ui: UiState,
     pub toasts: Vec<Toast>,
+    /// What the sync engine last surfaced as needing the user — the blocked-doc
+    /// paths, whether a content-key change is held, and whether a last-error is
+    /// present. The update loop diffs the live snapshot against this each frame
+    /// and fires a toast ONLY on a new item appearing (a transition), so a
+    /// silent no-op round never spams. Reset on vault swap (fresh `AppState`).
+    /// status: sync-attention-badge
+    pub sync_attention_seen: SyncAttentionSeen,
     pub vault_switch: VaultSwitchState,
     /// IDE-style layout host. Wraps the editor tabs + side bars +
     /// activity bar + status bar. Kept on the top-level state so its
@@ -157,11 +172,6 @@ pub struct VaultSession {
     pub config: Arc<RwLock<Config>>,
     pub services: Services,
     pub events: VaultEvents,
-    /// The WASM plugin host for this vault: loaded plugins + their live
-    /// instances. UI-thread-owned (the engine instances aren't `Sync`), so it
-    /// lives here rather than in the `Arc`-handle `Services` bag. Drives plugin
-    /// panels through `&mut` in the frame loop.
-    pub plugins: hiker_core::plugins::PluginHost,
     /// Cancellation token shared with every background task spawned for
     /// this vault (watcher relay, indexer progress forwarder, direct
     /// LLM worker). On vault swap the update loop calls
@@ -370,22 +380,15 @@ pub struct PanelStates {
     /// Per-board-tab UI state (View-as toggle, inline-rename drafts,
     /// pending column-delete confirm). Keyed by tab id.
     pub boards: HashMap<TabId, crate::panels::board::Pane>,
-    /// Per-capture-tab UI + run state (form drafts, in-flight engine run,
-    /// captured-page index). Keyed by tab id. status: crawl-job-form
-    pub captures: HashMap<TabId, crate::panels::capture::Pane>,
     /// Per-canvas-tab UI state (parsed `Canvas`, the `CanvasView` widget,
     /// View-as toggle, dirty / reload tracking). Keyed by tab id.
     /// status: canvas-tab
     pub canvases: HashMap<TabId, crate::panels::canvas::Pane>,
-    pub graph: Option<crate::panels::graph::State>,
-    pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterGraph>,
+    pub graph: Option<crate::panels::graph::VaultPanel>,
+    pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterView>,
     pub home: crate::panels::home::State,
     /// Sync page local UI state — the per-fork "view diff" cache. [sync-fork-diff]
     pub sync: crate::panels::sync::State,
-    /// Wikilink hover-preview lifecycle (timer + cached body + scroll).
-    /// One instance is enough — at most one preview card is up at a time
-    /// across all buffer panes. [wikilink-hover-preview]
-    pub wikilink_hover: crate::panels::buffer::wikilink_nav::HoverState,
     /// Floating live edit-preview overlay render cache. One slot suffices —
     /// at most one popup is up at a time (the span under the main caret).
     /// status: widget-edit-popup-preview
@@ -413,44 +416,11 @@ pub enum MutationEvent {
 
 pub const INDEXER_EVENTS_MAX: usize = 200;
 pub const SYNC_EVENTS_MAX: usize = 200;
-pub const TRAILS_MAX: usize = 50;
 pub const NAV_MAX: usize = 200;
 
-// ===========================================================================
-// Trails (data + free fns kept at `crate::state::` for compat with imports)
-// ===========================================================================
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Trail {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub waypoints: Vec<Waypoint>,
-    #[serde(default)]
-    pub created_at_ms: i64,
-    #[serde(default)]
-    pub last_activated_at_ms: i64,
-    #[serde(default)]
-    pub append_under: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Waypoint {
-    pub path: String,
-    #[serde(default)]
-    pub at_ms: i64,
-    #[serde(default)]
-    pub children: Vec<Waypoint>,
-    #[serde(default)]
-    pub annotation: String,
-}
-
-pub fn now_ms_i64() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+// Trails are markdown trail-docs on disk (`core::trails`), read live each
+// frame by the trails sidebar — there is no in-`AppState` trail model. The
+// active trail is `vault.active_trail` config.
 
 impl NavState {
     /// Record `target` as the new current entry: drop any forward tail (a new
@@ -545,220 +515,6 @@ pub fn nav_can_forward(state: &AppState) -> bool {
     state.session.nav.can_forward()
 }
 
-/// Manually append `path` as a waypoint of the currently active trail.
-/// No-op when no trail is active. When `append_under` is set, the new
-/// waypoint nests under that cursor; otherwise it lands at the root tail.
-pub fn trail_append_waypoint(state: &mut AppState, path: &str) {
-    let Some(trail_id) = state.trails_state.active_trail.clone() else {
-        return;
-    };
-    let Some(trail) = state.trails_state.trails.iter_mut().find(|t| t.id == trail_id) else {
-        return;
-    };
-    let wp = Waypoint {
-        path: path.to_string(),
-        at_ms: now_ms_i64(),
-        children: Vec::new(),
-        annotation: String::new(),
-    };
-
-    if let Some(under) = trail.append_under.clone() {
-        if let Some(parent) = find_waypoint_mut(&mut trail.waypoints, &under) {
-            if parent.children.last().map(|w| w.path == path).unwrap_or(false) {
-                return;
-            }
-            parent.children.push(wp);
-            return;
-        }
-        tracing::warn!(
-            append_under = %under,
-            trail_id = %trail.id,
-            "stale trail append_under cursor; resetting to root"
-        );
-        trail.append_under = None;
-    }
-
-    if trail.waypoints.last().map(|w| w.path == path).unwrap_or(false) {
-        return;
-    }
-    trail.waypoints.push(wp);
-    if trail.waypoints.len() > TRAILS_MAX {
-        let drop = trail.waypoints.len() - TRAILS_MAX;
-        trail.waypoints.drain(0..drop);
-    }
-}
-
-pub fn find_waypoint_mut<'a>(
-    waypoints: &'a mut [Waypoint],
-    path: &str,
-) -> Option<&'a mut Waypoint> {
-    for w in waypoints.iter_mut() {
-        if w.path == path {
-            return Some(w);
-        }
-        if let Some(found) = find_waypoint_mut(&mut w.children, path) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Waypoint drag-and-drop placement target.
-#[derive(Debug, Clone)]
-pub enum MoveOp {
-    /// Insert as a sibling immediately before `target`.
-    Before(String),
-    /// Insert as a sibling immediately after `target`.
-    After(String),
-    /// Append as a child of `target`.
-    Child(String),
-    /// Place at the root-level head of the trail.
-    Head,
-    /// Place at the root-level tail of the trail.
-    Tail,
-}
-
-fn take_waypoint(waypoints: &mut Vec<Waypoint>, path: &str) -> Option<Waypoint> {
-    if let Some(pos) = waypoints.iter().position(|w| w.path == path) {
-        return Some(waypoints.remove(pos));
-    }
-    for w in waypoints.iter_mut() {
-        if let Some(taken) = take_waypoint(&mut w.children, path) {
-            return Some(taken);
-        }
-    }
-    None
-}
-
-impl Trail {
-/// Locate `target` within this trail's waypoint forest, returning
-/// `(parent_path, index)` — `parent_path` is `None` for a root-level
-/// hit. `&self` method so the single caller (`move_waypoint`) doesn't
-/// trip `single_call_fn`.
-fn locate_waypoint(&self, target: &str) -> Option<(Option<String>, usize)> {
-    let waypoints = &self.waypoints;
-    for (i, w) in waypoints.iter().enumerate() {
-        if w.path == target {
-            return Some((None, i));
-        }
-    }
-    fn descend(w: &Waypoint, target: &str) -> Option<(Option<String>, usize)> {
-        for (i, c) in w.children.iter().enumerate() {
-            if c.path == target {
-                return Some((Some(w.path.clone()), i));
-            }
-            if let Some(found) = descend(c, target) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    for w in waypoints {
-        if let Some(found) = descend(w, target) {
-            return Some(found);
-        }
-    }
-    None
-}
-}
-
-/// True when `path` is `ancestor` itself or appears anywhere within
-/// `ancestor`'s subtree. Used to reject moves that would cycle.
-fn is_in_subtree(waypoints: &[Waypoint], ancestor: &str, path: &str) -> bool {
-    fn walk(w: &Waypoint, path: &str) -> bool {
-        w.path == path || w.children.iter().any(|c| walk(c, path))
-    }
-    for w in waypoints {
-        if w.path == ancestor {
-            return walk(w, path);
-        }
-        if is_in_subtree(&w.children, ancestor, path) {
-            return true;
-        }
-    }
-    false
-}
-
-impl Trail {
-/// Move waypoint `src` to a new position per `op`. Returns true on
-/// success. No-op (returns false) when the source isn't present or the
-/// move would create a cycle (dropping a node into its own subtree).
-pub fn move_waypoint(&mut self, src: &str, op: MoveOp) -> bool {
-    match &op {
-        MoveOp::Before(t) | MoveOp::After(t) | MoveOp::Child(t) => {
-            if src == t.as_str() || is_in_subtree(&self.waypoints, src, t) {
-                return false;
-            }
-        }
-        MoveOp::Head | MoveOp::Tail => {}
-    }
-    let Some(item) = take_waypoint(&mut self.waypoints, src) else {
-        return false;
-    };
-    match op {
-        MoveOp::Tail => {
-            self.waypoints.push(item);
-            true
-        }
-        MoveOp::Head => {
-            self.waypoints.insert(0, item);
-            true
-        }
-        MoveOp::Child(target) => {
-            if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &target) {
-                parent.children.push(item);
-                true
-            } else {
-                self.waypoints.push(item);
-                false
-            }
-        }
-        MoveOp::Before(target) => match self.locate_waypoint(&target) {
-            Some((None, idx)) => {
-                self.waypoints.insert(idx, item);
-                true
-            }
-            Some((Some(parent_path), idx)) => {
-                if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &parent_path) {
-                    parent.children.insert(idx, item);
-                    true
-                } else {
-                    self.waypoints.push(item);
-                    false
-                }
-            }
-            None => {
-                self.waypoints.push(item);
-                false
-            }
-        },
-        MoveOp::After(target) => match self.locate_waypoint(&target) {
-            Some((None, idx)) => {
-                self.waypoints.insert(idx + 1, item);
-                true
-            }
-            Some((Some(parent_path), idx)) => {
-                if let Some(parent) = find_waypoint_mut(&mut self.waypoints, &parent_path) {
-                    parent.children.insert(idx + 1, item);
-                    true
-                } else {
-                    self.waypoints.push(item);
-                    false
-                }
-            }
-            None => {
-                self.waypoints.push(item);
-                false
-            }
-        },
-    }
-}
-}
-
-#[cfg(test)]
-#[path = "state_move_tests.rs"]
-mod move_tests;
-
 // ===========================================================================
 // UiState — window-level UI
 // ===========================================================================
@@ -794,42 +550,23 @@ pub struct UiState {
     /// in settings takes effect immediately without a restart. Stored as the
     /// concatenation `"system\0editor\0code"` for a cheap equality compare.
     pub last_fonts_fp: Option<String>,
-    /// Latched "we hid the workbench chrome for reader view" state. The
-    /// main update loop reads this to decide whether to drive the hide
-    /// or restore edge, so the user's independent collapse / expand
-    /// choices outside reader view aren't trampled every frame.
-    pub reader_view_chrome_hidden: bool,
-    pub reader_view_prev_primary_visible: bool,
-    pub reader_view_prev_secondary_visible: bool,
-    pub reader_view_prev_status_visible: bool,
-    pub reader_view_prev_activity_visible: bool,
+    /// When true, reader / focus mode also hides the global top bar (the
+    /// custom titlebar or native top toolbar). Loaded from
+    /// `ui.reader_hide_top_bar` at startup and mirrored by the View menu /
+    /// settings checkbox. [view-reader-hide-top-bar]
+    pub reader_hide_top_bar: bool,
+    /// When true, reader / focus mode also hides the tab strip. Loaded from
+    /// `ui.reader_hide_tabs`, mirrored by the View menu / reader-icon context
+    /// menu. [view-reader-hide-tabs]
+    pub reader_hide_tabs: bool,
+    /// When true, reader / focus mode also hides each view's in-tab toolbar.
+    /// Loaded from `ui.reader_hide_toolbar`, mirrored by the View menu /
+    /// reader-icon context menu. [view-reader-hide-toolbar]
+    pub reader_hide_toolbar: bool,
     /// Per-session MRU of command-palette action ids — most-recently
     /// invoked first. Floats recent picks above their fuzzy-match rank
     /// per `command-palette`'s recency rule. In-memory only.
     pub palette_mru: Vec<String>,
-}
-
-/// True when the active tab is an editor with `reader_view = true`. Used
-/// by the main update loop to flip the host-level chrome. Non-buffer
-/// tab kinds always report `false` so reader view is meaningless there
-/// (per `editor-reader-view`'s scope rule).
-pub fn active_buffer_reader_view(state: &AppState) -> bool {
-    let Some(id) = state.session.active_tab else {
-        return false;
-    };
-    let Some(tab) = state.tab_by_id(id) else {
-        return false;
-    };
-    let crate::tab::TabKind::Editor { buffer, .. } = &tab.kind else {
-        return false;
-    };
-    let key = crate::buffer::buffer_key_for_source(buffer);
-    state
-        .session
-        .buffers
-        .get(&key)
-        .map(|b| b.reader_view)
-        .unwrap_or(false)
 }
 
 // ===========================================================================
@@ -876,6 +613,8 @@ impl Default for Toolbars {
                     "vault.label",
                     "sep",
                     "spacer",
+                    "view.reader_mode",
+                    "view.menu",
                     "view.toggle_left_sidebar",
                     "view.toggle_right_sidebar",
                 ]
@@ -942,6 +681,19 @@ pub struct Toast {
     pub undo: Option<UndoSpec>,
 }
 
+/// The last sync-attention state the update loop notified on, so a toast fires
+/// only when a NEW item appears (a transition), never on every silent round.
+/// status: sync-attention-badge
+#[derive(Default)]
+pub struct SyncAttentionSeen {
+    /// Blocked-doc paths we've already toasted about.
+    pub blocked_paths: HashSet<String>,
+    /// `(label, reason)` of per-doc/per-peer errors we've already toasted.
+    pub errored: HashSet<(String, String)>,
+    /// The peer fingerprint of a held content-key change we've already toasted.
+    pub pending_key_peer: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 pub enum ToastLevel {
     Info,
@@ -1003,8 +755,9 @@ pub enum Modal {
 ///
 /// - Toolbar / vault picker: `SwitchVault { path }` — queues a vault
 ///   swap via `state.pending_vault_switch`.
-/// - Trails sidebar: `DeleteTrailWaypoint { trail_id, path }` — removes
-///   one waypoint (and any side-trail descendants) from a trail.
+/// - Trails sidebar: `DeleteTrailWaypoint { trail_doc_rel, waypoint_path }`
+///   — removes one waypoint (and any side-trail descendants) from a trail
+///   via `core::trails::ops::remove_waypoint` (notes move to trash).
 /// - Trash sidebar: `EmptyTrash` — purges every trashed item.
 /// - Settings: `ResetScope { scope_path }` — writes `""` to the named
 ///   scope file and reloads config from disk.
@@ -1016,8 +769,8 @@ pub enum ConfirmIntent {
         path: PathBuf,
     },
     DeleteTrailWaypoint {
-        trail_id: String,
-        path: String,
+        trail_doc_rel: String,
+        waypoint_path: String,
     },
     EmptyTrash,
     ResetScope {
@@ -1051,7 +804,7 @@ impl AppState {
             return id;
         }
         let id = self.next_tab_id();
-        self.session.tabs.push(Tab { id, kind: build(), sticky: true });
+        self.session.tabs.push(Tab::new(id, build(), true));
         self.session.active_tab = Some(id);
         id
     }
@@ -1141,6 +894,15 @@ pub fn set_setting_quiet(
 // ===========================================================================
 
 impl AppState {
+    /// Whether a view's in-tab toolbar (canvas create toolbar, editor toolbar,
+    /// board/graph action rows, …) should be hidden this frame: reader mode is
+    /// active AND the user opted into hiding toolbars in it. Reader mode shows
+    /// them by default. [view-reader-hide-toolbar]
+    #[must_use]
+    pub const fn reader_hides_view_toolbar(&self) -> bool {
+        self.workbench.reader_mode() && self.ui.reader_hide_toolbar
+    }
+
     pub fn apply_confirm(&mut self, intent: ConfirmIntent) {
     let state = self;
     match intent {
@@ -1152,53 +914,48 @@ impl AppState {
                 ToastLevel::Info,
             );
         }
-        ConfirmIntent::DeleteTrailWaypoint { trail_id, path } => {
-            // Lift the trail-rm helpers — defined locally to keep this
-            // module self-contained instead of leaking back into trails.rs.
-            fn subtree_size(ws: &[Waypoint]) -> usize {
-                ws.iter().map(|w| 1 + subtree_size(&w.children)).sum()
-            }
-            fn remove_waypoint_recursive(ws: &mut Vec<Waypoint>, target: &str) {
-                if let Some(pos) = ws.iter().position(|w| w.path == target) {
-                    ws.remove(pos);
-                    return;
-                }
-                for w in ws.iter_mut() {
-                    remove_waypoint_recursive(&mut w.children, target);
-                }
-            }
-            let removed = if let Some(trail) = state
-                .trails_state
-                .trails
-                .iter_mut()
-                .find(|t| t.id == trail_id)
-            {
-                let before = subtree_size(&trail.waypoints);
-                remove_waypoint_recursive(&mut trail.waypoints, &path);
-                if trail.append_under.as_deref() == Some(path.as_str()) {
-                    trail.append_under = None;
-                }
-                before.saturating_sub(subtree_size(&trail.waypoints))
-            } else {
-                0
+        ConfirmIntent::DeleteTrailWaypoint { trail_doc_rel, waypoint_path } => {
+            // Remove the waypoint (and any side-trail descendants) via the
+            // async core verb: the waypoint-notes move to trash and the
+            // trail-doc frontmatter drops the subtree. Run synchronously on
+            // the frame's tokio runtime; the sidebar re-reads next paint.
+            let watcher = state.vault_session.services.watcher.clone();
+            let jobs = state.vault_session.services.indexer.job_sender();
+            let vault = state.vault_session.vault.clone();
+            let trash = hiker_core::trash::Trash::open(&state.vault_session.vault_root);
+            let result = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle.block_on(async {
+                    hiker_core::trails::ops::remove_waypoint(
+                        &watcher,
+                        &jobs,
+                        &vault,
+                        &trash,
+                        &trail_doc_rel,
+                        &waypoint_path,
+                    )
+                    .await
+                }),
+                Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
             };
-            let _ = crate::bootstrap::save_trails(
-                &state.vault_session.vault_root,
-                &state.trails_state.trails,
-            );
-            let msg = if removed > 1 {
-                let sides = removed - 1;
-                format!(
-                    "Waypoint and {} side-trail waypoint{} removed",
-                    sides,
-                    if sides == 1 { "" } else { "s" },
-                )
-            } else if removed == 1 {
-                "Waypoint removed".to_string()
-            } else {
-                "Waypoint not found".to_string()
-            };
-            state.push_toast(msg, ToastLevel::Info);
+            match result {
+                Ok(outcome) => {
+                    let removed = outcome.removed_count;
+                    let msg = if removed > 1 {
+                        let sides = removed - 1;
+                        format!(
+                            "Waypoint and {} side-trail waypoint{} removed",
+                            sides,
+                            if sides == 1 { "" } else { "s" },
+                        )
+                    } else {
+                        "Waypoint removed".to_string()
+                    };
+                    state.push_toast(msg, ToastLevel::Info);
+                }
+                Err(err) => {
+                    state.push_toast(format!("Remove waypoint failed: {err}"), ToastLevel::Error);
+                }
+            }
         }
         ConfirmIntent::EmptyTrash => {
             let trash = hiker_core::trash::Trash::open(&state.vault_session.vault_root);

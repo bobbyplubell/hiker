@@ -19,3 +19,8 @@ canvas-view-core = { workspace = true }
 # hiker-htmlview): node content is painted by a host-supplied trait so it stays
 # engine-free.
 hiker-canvas = { workspace = true }
+
+[dev-dependencies]
+# Headless egui harness to drive `show_static` through a real `Ui` and confirm
+# the display-only paint registers no interactive widget. status: canvas-static-paint
+egui_kittest = { workspace = true }

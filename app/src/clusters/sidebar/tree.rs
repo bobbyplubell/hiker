@@ -24,8 +24,9 @@ use eframe::egui;
 use hiker_core::trees::types::{Db, EditableNode, Error, NodeInsert, NodeKind, NodePolicy};
 
 use super::{push_toast, regenerate_names, summarize_subset, ClusterCtx};
+use crate::clusters::sidebar::node_menu;
 use crate::clusters::state::State;
-use crate::feature::Ctx;
+use crate::activity::Ctx;
 use crate::state::{Toast, ToastLevel};
 use hiker_theme as theme;
 
@@ -175,12 +176,22 @@ fn paint_row(
         }
     }
 
-    // Right-click context menu.
+    // Right-click context menu (status: ctxmenu-clusters). The candidate
+    // lists for the dynamic submenus are gathered LAZILY inside the closure —
+    // egui only runs it when the menu is actually open, not every frame for
+    // every visible row. The chosen verb is captured out (egui's
+    // `context_menu` closure must return `()`) and applied afterward through
+    // the same paths the old imperative menu used.
     let node_owned = node.clone();
     let tree_id_owned = tree_id.to_string();
+    let mut chosen = None;
     row_response.context_menu(|ui| {
-        self.node_context_menu(ui, &tree_id_owned, &node_owned);
+        let menu = node_menu::build_cluster_node_menu(self.menu_args(&node_owned));
+        chosen = egui_workbench::menu::show(ui, menu);
     });
+    if let Some(verb) = chosen {
+        self.apply_node_verb(&tree_id_owned, &node_owned, verb);
+    }
 }
 
 fn row_contents(
@@ -334,143 +345,170 @@ fn open_leaf(&mut self, node: &EditableNode) {
 }
 
 // ── Per-row right-click context menu ──────────────────────────────────
-// Surfaces rename, edit summary, the policy submenu, split/recluster,
-// summarize, merge children up, drop cluster, promote-out-of-outliers,
-// send-to-outliers, and the Move-to… picker. Multi-select stage-moves /
-// stage-tags live in the toolbar above; here we operate on a single node.
+// The menu itself is a `egui_workbench::menu::Menu<NodeVerb>` built in `node_menu.rs`
+// (status: ctxmenu-clusters). Here we gather the per-node context the builder
+// needs on menu-open (`menu_args`) and apply the chosen verb (`apply_node_verb`)
+// through the same code paths the old imperative menu used. Multi-select
+// stage-moves / stage-tags live in the toolbar above; here we operate on a
+// single node.
 
-pub(super) fn node_context_menu(
-    &mut self,
-    ui: &mut egui::Ui,
-    tree_id: &str,
-    node: &EditableNode,
-) {
-    let is_cluster = node.kind == NodeKind::Cluster;
-    let is_leaf = node.kind == NodeKind::Leaf;
-
-    if !is_leaf && ui.button("Rename").clicked() {
-        self.st().renaming = Some((node.id.clone(), node.name.clone()));
-        ui.close();
-    }
-    if !is_leaf && ui.button("Edit summary…").clicked() {
-        self.st().editing_summary = Some((node.id.clone(), node.summary.clone()));
-        ui.close();
-    }
-    if is_cluster {
-        ui.menu_button("Policy", |ui| {
-            self.policy_submenu(ui, tree_id, node);
-        });
-        ui.separator();
-        if ui
-            .button("Split / Recluster")
-            .on_hover_text("Re-run clustering on this subtree using stored note embeddings")
-            .clicked()
-        {
-            self.recluster_subtree(tree_id, Some(&node.id));
-            ui.close();
-        }
-        if ui
-            .button("Summarize (LLM)")
-            .on_hover_text("Generate a new summary for this cluster via the LLM")
-            .clicked()
-        {
-            let ids = vec![node.id.clone()];
-            summarize_subset(self, tree_id, &ids);
-            ui.close();
-        }
-        if ui.button("Merge children up").on_hover_text(
-            "Flatten one level: each child cluster's children move up to this node.",
-        ).clicked() {
-            self.merge_children_up(tree_id, node);
-            ui.close();
-        }
-        if ui.button("Drop cluster").clicked() {
-            self.drop_cluster(tree_id, node);
-            ui.close();
-        }
-    }
-    if is_leaf {
-        let parent_is_outlier_bucket = node
+/// Gather the per-node context the menu builder renders against: the node, the
+/// leaf-in-outlier-bucket flag, and the live "Move to…" / "Merge with sibling…"
+/// candidate lists. Computed on menu-open (status: ctxmenu-build-on-open) using
+/// the same enumeration logic the old `show_move_targets` / `show_merge_siblings`
+/// used, so the offered targets are identical.
+fn menu_args(&self, node: &EditableNode) -> node_menu::MenuArgs {
+    let descendants = self.collect_descendants(&node.id);
+    let nodes = &self.st_ref().nodes;
+    let move_targets: Vec<node_menu::MoveTarget> = nodes
+        .iter()
+        .filter(|n| {
+            matches!(n.kind, NodeKind::Cluster | NodeKind::OutlierBucket)
+                && n.id != node.id
+                && !descendants.contains(&n.id)
+        })
+        .map(|n| node_menu::MoveTarget {
+            id: n.id.clone(),
+            name: n.name.clone(),
+            is_outlier_bucket: n.kind == NodeKind::OutlierBucket,
+        })
+        .collect();
+    let siblings: Vec<node_menu::SiblingTarget> = nodes
+        .iter()
+        .filter(|n| {
+            n.id != node.id
+                && n.parent == node.parent
+                && matches!(n.kind, NodeKind::Cluster)
+        })
+        .map(|n| node_menu::SiblingTarget {
+            id: n.id.clone(),
+            name: n.name.clone(),
+        })
+        .collect();
+    let leaf_in_outlier_bucket = node.kind == NodeKind::Leaf
+        && node
             .parent
             .as_ref()
-            .and_then(|pid| self.st_ref().nodes.iter().find(|n| &n.id == pid))
+            .and_then(|pid| nodes.iter().find(|n| &n.id == pid))
             .is_some_and(|p| p.kind == NodeKind::OutlierBucket);
-        if parent_is_outlier_bucket && ui.button("Promote out of outliers…").clicked() {
-            // v0: route through the Move to… picker.
-            self.show_move_targets(ui, tree_id, node);
-            ui.close();
-        }
-        if !parent_is_outlier_bucket && ui.button("Send to outliers").clicked() {
-            self.promote_to_outlier_bucket(tree_id, node);
-            ui.close();
-        }
-    }
-    ui.menu_button("Move to…", |ui| {
-        self.show_move_targets(ui, tree_id, node);
-    });
-    if !is_leaf {
-        ui.menu_button("Merge with sibling…", |ui| {
-            self.show_merge_siblings(ui, tree_id, node);
-        });
-    }
-    if ui.button("Collapse all").clicked() {
-        self.st().expanded.clear();
-        ui.close();
+    node_menu::MenuArgs {
+        node: node.clone(),
+        leaf_in_outlier_bucket,
+        move_targets,
+        siblings,
     }
 }
 
-fn policy_submenu(
+/// Apply a chosen cluster-menu verb. Each arm routes through the exact path
+/// the old imperative menu used: inline `renaming` / `editing_summary` /
+/// `editing_*_policy` seeding, `apply_policy`, `recluster_subtree`,
+/// `summarize_subset`, `merge_children_up`, `drop_cluster`,
+/// `promote_to_outlier_bucket`, and `trees.move_node` / `promote_outlier` /
+/// `merge_siblings`.
+fn apply_node_verb(
     &mut self,
-    ui: &mut egui::Ui,
     tree_id: &str,
     node: &EditableNode,
+    verb: node_menu::NodeVerb,
 ) {
+    use node_menu::NodeVerb;
+    match verb {
+        // The universal Open / Reveal-in-tree / Properties verbs come from the
+        // shared base; applied against the leaf's backing note path through
+        // `ctx.defer` (status: ctxmenu-item-base). Only leaves carry a path, and
+        // the base is only built for those, so a missing path is a no-op.
+        NodeVerb::Base(action) => {
+            if let Some(rel) = node.note_path.clone() {
+                self.ctx
+                    .defer(move |app| crate::item_menu::apply_item_action(app, action, &rel));
+            }
+        }
+        NodeVerb::Rename => {
+            self.st().renaming = Some((node.id.clone(), node.name.clone()));
+        }
+        NodeVerb::EditSummary => {
+            self.st().editing_summary = Some((node.id.clone(), node.summary.clone()));
+        }
+        NodeVerb::SetPolicy(choice) => self.apply_policy_choice(tree_id, node, choice),
+        NodeVerb::Split => self.recluster_subtree(tree_id, Some(&node.id)),
+        NodeVerb::Summarize => {
+            let ids = vec![node.id.clone()];
+            summarize_subset(self, tree_id, &ids);
+        }
+        NodeVerb::MergeUp => self.merge_children_up(tree_id, node),
+        NodeVerb::Drop => self.drop_cluster(tree_id, node),
+        NodeVerb::SendToOutliers => self.promote_to_outlier_bucket(tree_id, node),
+        NodeVerb::MoveTo { target_id } => self.apply_move_to(tree_id, node, &target_id),
+        NodeVerb::MergeWithSibling { sibling_id } => {
+            self.apply_merge_sibling(tree_id, node, &sibling_id);
+        }
+        NodeVerb::CollapseAll => self.st().expanded.clear(),
+    }
+}
+
+/// Apply a Policy-submenu choice. `Default` / `Freeze` write through
+/// `apply_policy`; `SetTag` / `SetMove` open the inline policy editor seeded
+/// with the existing values — the same behavior as the old `policy_submenu`.
+fn apply_policy_choice(
+    &mut self,
+    tree_id: &str,
+    node: &EditableNode,
+    choice: node_menu::PolicyChoice,
+) {
+    use node_menu::PolicyChoice;
     let trees = self.trees.clone();
     let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
     let toasts = &mut *self.ctx.toasts;
-    let current = node.policy.clone();
-    let is_freeze = matches!(current, Some(NodePolicy::Freeze));
-    let is_tag = matches!(current, Some(NodePolicy::Tag { .. }));
-    let is_move = matches!(current, Some(NodePolicy::Move { .. }));
-    if ui
-        .selectable_label(current.is_none(), "Default (no policy)")
-        .on_hover_text("Clear any policy from this cluster")
-        .clicked()
-    {
-        apply_policy(state, toasts, &trees, tree_id, &node.id, None);
-        ui.close();
+    match choice {
+        PolicyChoice::Default => {
+            apply_policy(state, toasts, &trees, tree_id, &node.id, None);
+        }
+        PolicyChoice::Freeze => {
+            apply_policy(state, toasts, &trees, tree_id, &node.id, Some(&NodePolicy::Freeze));
+        }
+        PolicyChoice::SetTag { slug, require_review } => {
+            state.editing_tag_policy = Some((node.id.clone(), slug, require_review));
+        }
+        PolicyChoice::SetMove { folder, require_review } => {
+            state.editing_move_policy = Some((node.id.clone(), folder, require_review));
+        }
     }
-    if ui
-        .selectable_label(is_freeze, "Freeze")
-        .on_hover_text("Reclustering won't touch this subtree")
-        .clicked()
-    {
-        apply_policy(state, toasts, &trees, tree_id, &node.id, Some(&NodePolicy::Freeze));
-        ui.close();
-    }
-    let (existing_tag_slug, existing_tag_req) = match &node.policy {
-        Some(NodePolicy::Tag { slug, require_review }) => (slug.clone(), *require_review),
-        _ => (String::new(), false),
+}
+
+/// Apply a "Move to…" / outlier-promote pick: a leaf promotes (`promote_outlier`)
+/// under the target, a non-leaf reparents (`move_node`) — exactly as the old
+/// `show_move_targets` did.
+fn apply_move_to(
+    &mut self,
+    tree_id: &str,
+    node: &EditableNode,
+    target_id: &str,
+) {
+    let trees = self.trees.clone();
+    let result = if node.kind == NodeKind::Leaf {
+        trees.promote_outlier(tree_id, &node.id, Some(target_id))
+    } else {
+        trees.move_node(tree_id, &node.id, Some(target_id))
     };
-    if ui
-        .selectable_label(is_tag, "Set Tag policy…")
-        .clicked()
-    {
-        state.editing_tag_policy =
-            Some((node.id.clone(), existing_tag_slug, existing_tag_req));
-        ui.close();
+    match result {
+        Ok(()) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Move failed: {}", err), ToastLevel::Error),
     }
-    let (existing_move_folder, existing_move_req) = match &node.policy {
-        Some(NodePolicy::Move { folder, require_review }) => (folder.clone(), *require_review),
-        _ => (String::new(), false),
-    };
-    if ui
-        .selectable_label(is_move, "Set Move policy…")
-        .clicked()
-    {
-        state.editing_move_policy =
-            Some((node.id.clone(), existing_move_folder, existing_move_req));
-        ui.close();
+}
+
+/// Merge this cluster with the chosen sibling, exactly as the old
+/// `show_merge_siblings` did.
+fn apply_merge_sibling(
+    &mut self,
+    tree_id: &str,
+    node: &EditableNode,
+    sibling_id: &str,
+) {
+    let trees = self.trees.clone();
+    let ids = vec![node.id.clone(), sibling_id.to_string()];
+    match trees.merge_siblings(tree_id, &ids) {
+        Ok(_) => self.st().mark_dirty(),
+        Err(err) => self.toast(format!("Merge siblings failed: {}", err), ToastLevel::Error),
     }
 }
 
@@ -483,47 +521,6 @@ fn merge_children_up(
     match trees.merge_children_up(tree_id, &node.id) {
         Ok(()) => self.st().mark_dirty(),
         Err(err) => self.toast(format!("Merge failed: {}", err), ToastLevel::Error),
-    }
-}
-
-fn show_merge_siblings(
-    &mut self,
-    ui: &mut egui::Ui,
-    tree_id: &str,
-    node: &EditableNode,
-) {
-    let trees = self.trees.clone();
-    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
-    let toasts = &mut *self.ctx.toasts;
-    let parent = node.parent.clone();
-    let siblings: Vec<EditableNode> = state
-        .nodes
-        .iter()
-        .filter(|n| {
-            n.id != node.id
-                && n.parent == parent
-                && matches!(n.kind, NodeKind::Cluster)
-        })
-        .cloned()
-        .collect();
-    if siblings.is_empty() {
-        ui.label("(no sibling clusters)");
-        return;
-    }
-    for sib in siblings {
-        let label = format!("* {}", sib.name);
-        if ui.button(label).clicked() {
-            let ids = vec![node.id.clone(), sib.id.clone()];
-            match trees.merge_siblings(tree_id, &ids) {
-                Ok(_) => state.mark_dirty(),
-                Err(err) => push_toast(
-                    toasts,
-                    format!("Merge siblings failed: {}", err),
-                    ToastLevel::Error,
-                ),
-            }
-            ui.close();
-        }
     }
 }
 
@@ -568,52 +565,6 @@ fn promote_to_outlier_bucket(
     match trees.promote_outlier(tree_id, &node.id, Some(&bucket.id)) {
         Ok(()) => self.st().mark_dirty(),
         Err(err) => self.toast(format!("Move failed: {}", err), ToastLevel::Error),
-    }
-}
-
-fn show_move_targets(
-    &mut self,
-    ui: &mut egui::Ui,
-    tree_id: &str,
-    node: &EditableNode,
-) {
-    let descendants = self.collect_descendants(&node.id);
-    let trees = self.trees.clone();
-    let state = self.ctx.state.downcast_mut::<State>().expect("clusters state");
-    let toasts = &mut *self.ctx.toasts;
-    let candidates: Vec<EditableNode> = state
-        .nodes
-        .iter()
-        .filter(|n| {
-            matches!(n.kind, NodeKind::Cluster | NodeKind::OutlierBucket)
-                && n.id != node.id
-                && !descendants.contains(&n.id)
-        })
-        .cloned()
-        .collect();
-    if candidates.is_empty() {
-        ui.label("(no valid targets)");
-        return;
-    }
-    for c in candidates {
-        let glyph = if c.kind == NodeKind::OutlierBucket { "?" } else { "*" };
-        let label = format!("{} {}", glyph, c.name);
-        if ui.button(label).clicked() {
-            let result = if node.kind == NodeKind::Leaf {
-                trees.promote_outlier(tree_id, &node.id, Some(&c.id))
-            } else {
-                trees.move_node(tree_id, &node.id, Some(&c.id))
-            };
-            match result {
-                Ok(()) => state.mark_dirty(),
-                Err(err) => push_toast(
-                    toasts,
-                    format!("Move failed: {}", err),
-                    ToastLevel::Error,
-                ),
-            }
-            ui.close();
-        }
     }
 }
 

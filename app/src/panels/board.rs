@@ -95,11 +95,7 @@ pub fn open(app: &mut AppState, path: &str) -> TabId {
         return id;
     }
     let id = app.next_tab_id();
-    app.session.tabs.push(Tab {
-        id,
-        kind: TabKind::Board { path: path.to_string() },
-        sticky: true,
-    });
+    app.session.tabs.push(Tab::new(id, TabKind::Board { path: path.to_string() }, true));
     app.session.active_tab = Some(id);
     id
 }
@@ -135,8 +131,15 @@ enum BoardAction {
     AddCardFromFile { column: String, source_rel: String },
     AddColumn,
     RenameColumn { old: String, new: String },
+    /// Seed the inline column-rename text field for `name` (the `…`-menu
+    /// "Rename column" entry; needs the live `app`/`tab_id`, so it routes
+    /// through `apply_action` rather than a core op).
+    StartRenameColumn(String),
     ReorderColumn { name: String, to: usize },
     DeleteColumn(String),
+    /// Arm the inline delete-with-cards confirm row for `name` (used when the
+    /// column still has cards; an empty column deletes immediately).
+    RequestDeleteColumn(String),
     RenameBoard { new_title: String },
     /// Set the WIP limit on a column (`None` clears it).
     /// status: board-wip-limits
@@ -506,41 +509,11 @@ fn render_column_header(
                 .on_hover_text("This column exceeds its WIP limit");
             }
             ui.menu_button("…", |ui| {
-                render_wip_limit_menu(ui, col, action);
-                if ui.button("Rename column").clicked() {
-                    app.panels
-                        .boards
-                        .entry(tab_id)
-                        .or_default()
-                        .renaming_column = Some((col.name.clone(), col.name.clone()));
-                    ui.close();
-                }
-                if col_index > 0 && ui.button("Move left").clicked() {
-                    *action = Some(BoardAction::ReorderColumn {
-                        name: col.name.clone(),
-                        to: col_index - 1,
-                    });
-                    ui.close();
-                }
-                if col_index + 1 < column_names.len() && ui.button("Move right").clicked() {
-                    *action = Some(BoardAction::ReorderColumn {
-                        name: col.name.clone(),
-                        to: col_index + 1,
-                    });
-                    ui.close();
-                }
-                if ui.button("Delete column").clicked() {
-                    if col.cards.is_empty() {
-                        *action = Some(BoardAction::DeleteColumn(col.name.clone()));
-                    } else {
-                        // Delete-with-cards prompts first.
-                        app.panels
-                            .boards
-                            .entry(tab_id)
-                            .or_default()
-                            .confirm_delete_column = Some(col.name.clone());
-                    }
-                    ui.close();
+                if let Some(chosen) = egui_workbench::menu::show(
+                    ui,
+                    build_board_column_menu(col, col_index, column_names.len()),
+                ) {
+                    *action = Some(chosen);
                 }
             });
         }
@@ -571,35 +544,57 @@ fn render_column_header(
     }
 }
 
-/// Column-menu submenu to set or clear the WIP limit. Presets 1..6 cover the
-/// common cases; "No limit" clears it. Overflow is flagged (soft) rather than
-/// blocking the move. status: board-wip-limits
-fn render_wip_limit_menu(
-    ui: &mut egui::Ui,
+/// Build the `…` column-options menu as a `egui_workbench::menu::Menu<BoardAction>`
+/// (status: ctxmenu-board): WIP-limit submenu, Rename column, Move left / right
+/// (each gated by position), and Delete column. Delete routes through
+/// `RequestDeleteColumn` when the column still has cards (the inline confirm
+/// flow stays as-is) and `DeleteColumn` when it's empty.
+fn build_board_column_menu(
     col: &ResolvedColumn,
-    action: &mut Option<BoardAction>,
-) {
-    ui.menu_button("WIP limit", |ui| {
-        let none_label = if col.wip_limit.is_none() { "* No limit" } else { "No limit" };
-        if ui.button(none_label).clicked() {
-            *action = Some(BoardAction::SetWipLimit { name: col.name.clone(), limit: None });
-            ui.close();
-        }
-        for n in 1..=6usize {
-            let label = if col.wip_limit == Some(n) {
-                format!("* {n}")
-            } else {
-                n.to_string()
-            };
-            if ui.button(label).clicked() {
-                *action = Some(BoardAction::SetWipLimit {
-                    name: col.name.clone(),
-                    limit: Some(n),
-                });
-                ui.close();
-            }
-        }
-    });
+    col_index: usize,
+    column_count: usize,
+) -> egui_workbench::menu::Menu<BoardAction> {
+    let mut menu = egui_workbench::menu::Menu::new()
+        .submenu("WIP limit", build_wip_limit_menu(col))
+        .action("Rename column", BoardAction::StartRenameColumn(col.name.clone()));
+    if col_index > 0 {
+        menu = menu.action(
+            "Move left",
+            BoardAction::ReorderColumn { name: col.name.clone(), to: col_index - 1 },
+        );
+    }
+    if col_index + 1 < column_count {
+        menu = menu.action(
+            "Move right",
+            BoardAction::ReorderColumn { name: col.name.clone(), to: col_index + 1 },
+        );
+    }
+    let delete = if col.cards.is_empty() {
+        BoardAction::DeleteColumn(col.name.clone())
+    } else {
+        // Delete-with-cards prompts first via the inline confirm row.
+        BoardAction::RequestDeleteColumn(col.name.clone())
+    };
+    menu.action("Delete column", delete)
+}
+
+/// The WIP-limit submenu: "No limit" plus presets 1..6, rendered as toggles so
+/// the current limit shows a checkmark. Presets cover the common cases; overflow
+/// is flagged (soft) rather than blocking the move. status: board-wip-limits
+fn build_wip_limit_menu(col: &ResolvedColumn) -> egui_workbench::menu::Menu<BoardAction> {
+    let mut menu = egui_workbench::menu::Menu::new().toggle(
+        "No limit",
+        col.wip_limit.is_none(),
+        BoardAction::SetWipLimit { name: col.name.clone(), limit: None },
+    );
+    for n in 1..=6usize {
+        menu = menu.toggle(
+            n.to_string(),
+            col.wip_limit == Some(n),
+            BoardAction::SetWipLimit { name: col.name.clone(), limit: Some(n) },
+        );
+    }
+    menu
 }
 
 fn render_card(
@@ -862,6 +857,15 @@ fn apply_action(app: &mut AppState, tab_id: TabId, board_rel: &str, action: Boar
             add_text_card(app, tab_id, &rel, &column);
             return;
         }
+        BoardAction::StartRenameColumn(name) => {
+            app.panels.boards.entry(tab_id).or_default().renaming_column =
+                Some((name.clone(), name));
+            return;
+        }
+        BoardAction::RequestDeleteColumn(name) => {
+            app.panels.boards.entry(tab_id).or_default().confirm_delete_column = Some(name);
+            return;
+        }
         BoardAction::SetCardText { card_id, text } => (
             "Edit card",
             run(async move { bops::set_card_text(&log, &jobs, &vault, &rel, &card_id, &text).await }),
@@ -1009,7 +1013,7 @@ pub type PickerEntry = (String, String, Vec<String>);
 ///
 /// status: board-add-card
 pub fn picker_context_ctx(
-    ctx: &crate::feature::Ctx<'_>,
+    ctx: &crate::activity::Ctx<'_>,
     note_rel: &str,
 ) -> (Vec<PickerEntry>, std::collections::HashSet<String>, bool) {
     picker_context_parts(

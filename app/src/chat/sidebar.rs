@@ -1,7 +1,7 @@
 //! Docked chat sidebar surface (the `feature::Ctx` path).
 //!
 //! The docked chat region is migrated onto the `Chat` feature's
-//! `SidebarSurface`. It renders through the narrow `feature::Ctx`
+//! `View`. It renders through the narrow `feature::Ctx`
 //! (`render_sidebar`) rather than `&mut AppState`: chat state comes from
 //! `ctx.state` (the feature's `State`), services/vault/config/toasts from
 //! the shared ctx, and broad mutations that need full `&mut AppState`
@@ -20,7 +20,7 @@ use crate::chat::render::{
 };
 use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole, State};
-use crate::feature::Ctx;
+use crate::activity::Ctx;
 use crate::state::AppState;
 use hiker_theme as theme;
 
@@ -53,6 +53,13 @@ impl SideBar<'_, '_> {
         }
         self.st().registry.pump_events();
 
+        // Session picker chrome row — re-homed from the retired bespoke
+        // secondary side bar title row. The new/delete buttons live in the
+        // section header (`side_bar_action_buttons("chat")`); the picker is
+        // here in the body so it has room for the combo. [feature-consumer-sidebar]
+        self.session_picker(ui);
+        ui.separator();
+
         // Reserve the composer at the bottom; transcript fills the rest.
         let composer_height = 90.0_f32;
         let avail = ui.available_height();
@@ -67,6 +74,48 @@ impl SideBar<'_, '_> {
         }
         ui.separator();
         self.composer(ui);
+    }
+
+    /// The active-session combobox, rendered against the narrow `Ctx`
+    /// (chat registry via `ctx.state`). Mirrors `AppState::chat_session_picker`
+    /// but without needing full `&mut AppState`.
+    fn session_picker(&mut self, ui: &mut egui::Ui) {
+        let active_id = self.st().registry.active.clone();
+        let active_label = active_label_for(&self.st().registry, active_id.as_deref());
+        let mut switch_to: Option<String> = None;
+        let picker_width = ui.available_width().min(280.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add(crate::icons::ICONS.image(crate::icons::Icon::Chat));
+            egui::ComboBox::from_id_salt("chat_picker_sidebar_body")
+                .selected_text(active_label)
+                .width(picker_width)
+                .show_ui(ui, |ui| {
+                    let mut rows: Vec<(String, String, i64)> = self
+                        .st()
+                        .registry
+                        .sessions
+                        .values()
+                        .map(|s| (s.id.clone(), s.preview.clone(), s.mtime_unix))
+                        .collect();
+                    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+                    if rows.is_empty() {
+                        ui.label(
+                            egui::RichText::new("(no sessions yet)")
+                                .color(theme::muted())
+                                .small(),
+                        );
+                    }
+                    for (id, preview, _mtime) in rows {
+                        let selected = active_id.as_deref() == Some(id.as_str());
+                        if ui.selectable_label(selected, &preview).clicked() {
+                            switch_to = Some(id);
+                        }
+                    }
+                });
+        });
+        if let Some(id) = switch_to {
+            session::set_active(&mut self.st().registry, &id);
+        }
     }
 
     fn transcript(&mut self, ui: &mut egui::Ui) {
@@ -311,6 +360,14 @@ impl SideBar<'_, '_> {
                     }
                 }
             });
+    }
+}
+
+/// Label for the active session in the picker combo's closed state.
+fn active_label_for(reg: &ChatRegistry, id: Option<&str>) -> String {
+    match id.and_then(|i| reg.sessions.get(i)) {
+        Some(s) => s.preview.clone(),
+        None => "(no active session)".to_string(),
     }
 }
 

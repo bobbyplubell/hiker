@@ -46,3 +46,16 @@ pub fn rename(log: &OpLog, from: &str, to: &str, author: &Author) -> Result<(), 
     };
     log.rename_document(&doc_id, to, author).map_err(map_err)
 }
+
+/// Restore a previously-tombstoned document, recovering its history. Rebinds
+/// `path → doc_id` to the retained `doc_id` and clears the tombstone (per
+/// `op-log.md`'s "Offline delete and rename"). The filesystem move out of
+/// trash stays the caller's concern; this records the logical resurrection so
+/// the note comes back with its full change history rather than as a fresh
+/// import. The caller supplies the `doc_id` from the trash manifest entry,
+/// since the path mapping may have been repointed away while the doc was gone.
+///
+/// status: vault-trash-restore
+pub fn restore(log: &OpLog, doc_id: &str, path: &str, author: &Author) -> Result<(), HikerError> {
+    log.restore_document(doc_id, path, author).map_err(map_err)
+}

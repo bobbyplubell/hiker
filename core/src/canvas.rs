@@ -16,7 +16,7 @@
 //
 // status: canvas-file-ref-rewrite
 
-use hiker_canvas::model::Canvas;
+use hiker_canvas::model::{Canvas, NodeKind};
 
 pub mod export;
 
@@ -63,6 +63,32 @@ pub async fn on_note_moved(
         }
     }
     touched
+}
+
+/// Vault-relative paths of every `.canvas` document that has at least one File
+/// node pointing at `note`. A best-effort on-demand scan — there's no canvas
+/// reference index yet (`canvas-search-index` is deferred), so this walks the
+/// `.canvas` files, parses each, and keeps those referencing the note.
+/// Unreadable / unparseable canvases are skipped rather than failing the whole
+/// scan, the same tolerant posture as the rename sweep. status: canvas-appears-in
+pub fn canvases_referencing(vault: &Vault, note: &str) -> Result<Vec<String>, HikerError> {
+    let mut out = Vec::new();
+    for rel in walk_canvas_files(vault)? {
+        let Ok(text) = vault.read_file(&rel) else {
+            continue;
+        };
+        let Ok(canvas) = Canvas::from_json(&text) else {
+            continue;
+        };
+        let refers = canvas
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.kind, NodeKind::File { file, .. } if file == note));
+        if refers {
+            out.push(rel);
+        }
+    }
+    Ok(out)
 }
 
 /// Walk the vault for `.canvas` files, returning their vault-relative paths.

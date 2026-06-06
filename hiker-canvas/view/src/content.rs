@@ -91,6 +91,22 @@ fn paint_preview_body(painter: &egui::Painter, inner: Rect, text: &str, size: f3
     painter.galley(body_top, galley, color);
 }
 
+/// A zero-cost [`NodeContentRenderer`] that paints nothing and echoes the
+/// scroll unchanged. The renderer to hand [`crate::widget::CanvasView::show_static`]
+/// when only the frames / edges / LOD placeholders are wanted (previews,
+/// thumbnails): at fit/thumbnail zoom every node is a LOD placeholder so the
+/// content renderer is never invoked anyway, and this no-op avoids needing the
+/// `!Send` per-node content engine for a display-only paint.
+/// status: canvas-static-paint
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoContentRenderer;
+
+impl NodeContentRenderer for NoContentRenderer {
+    fn render(&mut self, _ui: &mut egui::Ui, _node: &Node, _inner: Rect, view: CardView) -> f32 {
+        view.scroll_y
+    }
+}
+
 /// A human-readable tag for a node kind, for the debug renderer.
 const fn kind_label(kind: &NodeKind) -> &'static str {
     match kind {

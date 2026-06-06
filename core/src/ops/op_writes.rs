@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::errors::HikerError;
 use crate::oplog::{shapes::Author, error::Error as SubstrateError, EditSpec, OpLog, ProducerCtx, StageOutcome};
+use crate::trash::Trash;
 use crate::vault::Vault;
 
 /// Translate a substrate error into the vault-wide [`HikerError`] so
@@ -91,15 +92,13 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
     for rel in walk_hidden_md_subtree(vault, &crate::trails::dir())? {
         seeded += seed_one(vault, log, &rel)? as usize;
     }
-    // TODO: `.hiker/trees/` cluster-tree docs (per `cluster-editor.md` and
-    // `op-log.md`'s sync section) deserve the same second-pass coverage
-    // here. Currently per-tree `.md` files are managed by `core::trees`
-    // and lazily seeded on first save via `op_writes::user_save` →
-    // `doc_id_or_seed`; a vault arriving with pre-existing tree files
-    // (sync, manual import) would not have op-log mappings until something
-    // touches them. Add a `walk_hidden_md_subtree(vault, ".hiker/trees")`
-    // pass once the tree-doc location stabilizes (or a watcher carve-out
-    // is added for `.hiker/trees/` matching the trails carve-out).
+    // Cluster-tree docs now live at a *visible* vault path
+    // (`cluster-tree-visible-note`, default `cluster-trees/`), so the main
+    // `walk_indexable_files` pass above already seeds them like any other
+    // note — no `.hiker/trees/` second pass is needed. Legacy
+    // `.hiker/trees/<id>.md` files are relocated to the visible default by
+    // `core::trees::Db`'s one-time migration at vault open, before the
+    // indexer's full-scan runs.
     Ok(seeded)
 }
 
@@ -786,6 +785,244 @@ pub fn external_edit(log: &OpLog, vault: &Vault, rel: &str) -> Result<bool, Hike
     };
     log.apply_external_edit(&doc_id, &disk_text).map_err(map_err)
 }
+
+/// Reconcile every tracked document's disk bytes against its
+/// `materialize(accepted)`, folding any drift in as one `author=external` op
+/// per doc — the **startup reconcile** trigger of `op-log.md`'s
+/// External-edit sync (after bootstrap seeding, before the first sync round).
+/// It closes the gap the live watcher can't: edits made to the `.md` while
+/// hiker was closed (a Syncthing receive, a manual edit in another tool) are
+/// never replayed by the watcher, so this walks the tracked docs and reconciles
+/// them once at open.
+///
+/// **Hash-gated, not mtime-gated.** For each tracked doc that still has a file
+/// on disk, the byte hash of the disk text is compared against the hash of
+/// `materialize(accepted)`. A match produces no op and no disk rewrite, so a
+/// clean reopen reconciles nothing — even if the file's mtime changed
+/// (`op-log-disk-canonical`). On mismatch the disk text is folded in by
+/// reusing the same [`external_edit`] / [`OpLog::apply_external_edit`] path the
+/// live watcher uses, authored `external`.
+///
+/// **Offline delete and rename** (per `op-log.md`'s "Offline delete and
+/// rename") are reconciled too. A tracked path *gone* from disk is first
+/// probed as an offline rename: if a new untracked path on disk carries
+/// content whose hash matches the gone doc's current or recent history hashes,
+/// it is recognized as the same lineage — `path → doc_id` is rebound and an
+/// `OpKind::Rename { from }` is recorded (`author=external`), preserving
+/// history. No match → the gone path is an offline delete: tombstone the doc
+/// (`author=external`) and capture `materialize(accepted)` — the last known
+/// content, since the disk bytes are gone — as a recoverable trash entry that
+/// references the `doc_id`. The Yrs state + history (`<doc-id>.yrs`/`.yrslog`/
+/// `.ops` + metadata) are RETAINED keyed by `doc_id`, not purged, so a later
+/// restore rebinds and recovers full history. The new path of a rename, and
+/// any other untracked file, is seeded by `bootstrap` separately.
+///
+/// Returns the count of docs that were actually reconciled (a delta applied, a
+/// rename rebound, or a delete tombstoned) — not the number walked.
+///
+/// status: op-log-startup-disk-reconcile
+pub fn reconcile_disk(
+    vault: &Vault,
+    log: &OpLog,
+    trash: &Trash,
+) -> Result<usize, HikerError> {
+    let mut reconciled = 0usize;
+    // TODO(op-log-startup-disk-reconcile): mtime/size pre-filter. The op-log
+    // stores no per-doc mtime to compare against, so adding one would mean new
+    // persisted state; at personal-vault scale hashing every tracked doc is
+    // fine. The byte hash below remains the commit decision regardless.
+
+    // Untracked disk paths (present on disk, no doc-index row) are the only
+    // candidates for an offline-rename target. Resolve them once, lazily
+    // hashing each only when a gone doc actually needs a rename probe — an
+    // all-content-drift vault never reads a single one.
+    let untracked = UntrackedDiskPaths::scan(vault, log)?;
+
+    // Best-effort per doc: a single doc that can't be reconciled (a file that
+    // exists but won't read — a permission error, a transient lock, non-UTF-8)
+    // must not abort the pass for every other doc. Log and carry on, mirroring
+    // `bootstrap`'s `seed_one` posture.
+    for doc_id in log.list_doc_ids().map_err(map_err)? {
+        match reconcile_one_doc(vault, log, trash, &untracked, &doc_id) {
+            Ok(true) => reconciled += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                doc_id = %doc_id, error = %e,
+                "startup-disk-reconcile: skipping doc (non-fatal)",
+            ),
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Reconcile one tracked doc against its on-disk file. `Ok(true)` when a change
+/// was applied (edit fold, rename rebind, delete-to-trash, or a resurrect),
+/// `Ok(false)` on a clean no-op, `Err` when the doc couldn't be reconciled
+/// (the caller logs and skips it — never fatal to the whole pass).
+///
+/// Presence is decided by whether the file EXISTS, not by whether it READS. A
+/// path with no file is an offline delete/rename; a file that exists but fails
+/// to read (non-UTF-8, a permission error, a transient lock) is NOT a delete —
+/// the read error is surfaced so the doc and its file are left untouched rather
+/// than tombstoned and trashed.
+fn reconcile_one_doc(
+    vault: &Vault,
+    log: &OpLog,
+    trash: &Trash,
+    untracked: &UntrackedDiskPaths,
+    doc_id: &str,
+) -> Result<bool, HikerError> {
+    let Some(rel) = log.path_for_doc(doc_id).map_err(map_err)? else {
+        // No path mapping (e.g. an already-tombstoned lineage whose file is
+        // gone) — nothing on disk to reconcile against.
+        return Ok(false);
+    };
+    let present = vault.abs_path(&rel).map(|p| p.exists()).unwrap_or(false);
+
+    if !present {
+        // The file is genuinely gone. Probe for an offline rename before
+        // treating it as a delete.
+        let accepted = log.materialize_accepted(doc_id).map_err(map_err)?;
+        if accepted.tombstone {
+            // Already tombstoned (e.g. a prior reconcile) — the absent file is
+            // the expected state; nothing to re-delete.
+            return Ok(false);
+        }
+        if let Some(new_path) = find_rename_target(vault, log, doc_id, untracked)? {
+            // Same lineage at a new path: rebind + record the rename, authored
+            // external. The new path is consumed so no other gone doc claims it.
+            log.rename_document(doc_id, &new_path, &Author::External)
+                .map_err(map_err)?;
+            untracked.consume(&new_path);
+            tracing::debug!(from = %rel, to = %new_path, "startup-disk-reconcile: folded offline rename");
+            return Ok(true);
+        }
+        // No rename match → offline delete. Tombstone (external) and route the
+        // last known content through the trash so it stays recoverable; the
+        // op-log files stay put keyed by doc_id.
+        log.tombstone_document(doc_id, &Author::External)
+            .map_err(map_err)?;
+        let entry = trash.capture_content_in(&rel, &accepted.text, Some(doc_id.to_string()))?;
+        trash.append(&entry)?;
+        tracing::debug!(path = %rel, "startup-disk-reconcile: offline delete → trash, history retained");
+        return Ok(true);
+    }
+
+    // The file exists. A read failure now is present-but-unreadable (non-UTF-8,
+    // a permission error) — surfaced via `?` so the caller logs and skips,
+    // never mistaking it for a delete.
+    let disk_text = vault.read_file(&rel)?;
+    let accepted = log.materialize_accepted(doc_id).map_err(map_err)?;
+
+    let mut changed = false;
+    if accepted.tombstone {
+        // The file is back on disk under a tombstoned doc — an un-delete (a
+        // restore from a backup, a sync re-create). Clear the tombstone (the
+        // rebind to the unchanged path is a no-op) before folding any content
+        // drift, so a resurrected file isn't left a ghost the tree won't show.
+        log.restore_document(doc_id, &rel, &Author::External)
+            .map_err(map_err)?;
+        tracing::debug!(path = %rel, "startup-disk-reconcile: resurrected tombstoned doc whose file reappeared");
+        changed = true;
+    }
+
+    // Hash gate: a byte-identical file mints no op and rewrites nothing
+    // (`op-log-disk-canonical`), even if its mtime moved.
+    if crate::hash_string(&disk_text) != crate::hash_string(&accepted.text)
+        && log.apply_external_edit(doc_id, &disk_text).map_err(map_err)?
+    {
+        tracing::debug!(path = %rel, "startup-disk-reconcile: folded offline edit");
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Untracked disk paths — present in the vault but with no `doc-index.db`
+/// mapping — and their lazily-computed content hashes. These are the only
+/// candidates an offline rename's source can match against. Hashes are read
+/// on first probe and cached, and a matched path is `consume`d so two gone
+/// docs can't both claim the same new file.
+struct UntrackedDiskPaths {
+    /// Vault-relative path → its content hash, computed on demand.
+    hashes: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl UntrackedDiskPaths {
+    fn scan(vault: &Vault, log: &OpLog) -> Result<Self, HikerError> {
+        let mut hashes = std::collections::HashMap::new();
+        for rel in vault.walk_indexable_files("")? {
+            if log.doc_id_for_path(&rel).map_err(map_err)?.is_none() {
+                hashes.insert(rel, None);
+            }
+        }
+        Ok(Self {
+            hashes: std::cell::RefCell::new(hashes),
+        })
+    }
+
+    /// Hash of an untracked path's current disk bytes, computed once and
+    /// cached. `None` when the path isn't an untracked candidate or is
+    /// unreadable.
+    fn hash_of(&self, vault: &Vault, rel: &str) -> Option<String> {
+        let mut map = self.hashes.borrow_mut();
+        let slot = map.get_mut(rel)?;
+        if slot.is_none() {
+            *slot = vault.read_file(rel).ok().map(|t| crate::hash_string(&t));
+        }
+        slot.clone()
+    }
+
+    fn candidates(&self) -> Vec<String> {
+        self.hashes.borrow().keys().cloned().collect()
+    }
+
+    /// Drop a path from the candidate set once it's been claimed by a rename.
+    fn consume(&self, rel: &str) {
+        self.hashes.borrow_mut().remove(rel);
+    }
+}
+
+/// Probe the untracked disk paths for an offline-rename target of the gone
+/// doc `doc_id`: an untracked path whose current content hash matches the
+/// doc's *current* `materialize(accepted)` hash or one of its recent accepted
+/// history hashes (a rename plus a stale-but-recent body still recognizes the
+/// lineage). Returns the matched vault-relative path, or `None`. A lightweight
+/// reimplementation of `hiker-sync`'s `find_rename_source` content-hash probe,
+/// scoped to local disk.
+fn find_rename_target(
+    vault: &Vault,
+    log: &OpLog,
+    doc_id: &str,
+    untracked: &UntrackedDiskPaths,
+) -> Result<Option<String>, HikerError> {
+    let candidates = untracked.candidates();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // The doc's known content hashes: current + a bounded recent-history window.
+    let mut known: std::collections::HashSet<String> = log
+        .recent_doc_history_hashes(doc_id, RENAME_HISTORY_PROBE_DEPTH)
+        .map_err(map_err)?
+        .into_iter()
+        .collect();
+    known.insert(crate::hash_string(
+        &log.materialize_accepted(doc_id).map_err(map_err)?.text,
+    ));
+
+    for cand in candidates {
+        if let Some(h) = untracked.hash_of(vault, &cand)
+            && known.contains(&h)
+        {
+            return Ok(Some(cand));
+        }
+    }
+    Ok(None)
+}
+
+/// How many recent accepted-history content hashes to consider when probing a
+/// gone doc for an offline rename — enough to recognize a rename of a file
+/// whose body lagged a few edits behind, without scanning unbounded history.
+const RENAME_HISTORY_PROBE_DEPTH: usize = 16;
 
 /// Auto-reject any drifted pending ops on the document at `rel` when the
 /// `[op-log] auto_reject_on_drift` flag is set. A no-op when the flag is

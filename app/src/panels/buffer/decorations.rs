@@ -65,6 +65,12 @@ pub(crate) struct DecoRebuildCtx<'a> {
     /// live-title rendering; `None` falls back to plain (non-clickable) link
     /// pills (read-only previews). status: wikilink-render-live-title
     pub(crate) resolve_title: Option<&'a editor_md::links::TitleResolver<'a>>,
+    /// Persisted diagram-cache context (`<vault>/.hiker/diagram-cache`), or
+    /// `None` when `[render] cache_diagrams` is off. Owned (it's just a
+    /// `PathBuf`) so the rebuild closure doesn't have to borrow `app`; passed
+    /// by reference into the math/mermaid/wavedrom widget providers, which read
+    /// it below the in-memory `cached!` layer. status: widget-render-disk-cache
+    pub(crate) diagram_cache: Option<widgets::disk_cache::DiagramCacheCtx>,
 }
 
 /// Rebuild every decoration layer for the editor against the *current* doc
@@ -95,9 +101,11 @@ pub(crate) fn rebuild_editor_decorations(
         highlight_trailing_whitespace,
         diff,
         resolve_title,
+        diagram_cache,
     } = ctx;
     let theme = *theme;
     let resolve_title = *resolve_title;
+    let diagram_cache = diagram_cache.as_ref();
     // Compute the visible byte range up-front so we can scope paint-only
     // providers to the viewport.
     let visible = view.visible_lines();
@@ -280,19 +288,19 @@ pub(crate) fn rebuild_editor_decorations(
         let dpr = *dpr;
         let font_px = *font_px;
         cached!(math_widget, render_fp,
-            || widgets::math_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr),
+            || widgets::math_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
             heights);
         // Rendered Mermaid diagram widgets (`widget-mermaid-render`). Same gate,
         // same render fingerprint as the math-widget layer; emits `hide` lines +
         // a `BlockWidget` per fence so it goes through `push_with_heights`.
         cached!(mermaid_widget, render_fp,
-            || widgets::mermaid_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr),
+            || widgets::mermaid_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
             heights);
         // Rendered WaveDrom diagram widgets (`widget-wavedrom-render`). Same
         // gate + render fingerprint as math / mermaid; emits `hide` lines + a
         // `BlockWidget` per fence, so it goes through `push_with_heights`.
         cached!(wavedrom_widget, render_fp,
-            || widgets::wavedrom_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr),
+            || widgets::wavedrom_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
             heights);
         // Natively-painted pipe-table widgets (`widget-table-render`). Same gate
         // + render fingerprint as math / mermaid; emits `hide` lines + a

@@ -1147,6 +1147,556 @@ async fn fork_keep_both_preserves_local_copy() {
     );
 }
 
+// --- 4e. Same-region conflict on a BOUND doc: detection, block, resolution -
+
+/// Establish a shared (bound) lineage for `path`/`seed`: A creates it, B adopts
+/// A's base in one round. Returns the two nodes, their oplogs, B's doc id, and
+/// the dirs (kept alive). After this both materialize `seed` and B is Bound.
+async fn bound_pair(
+    key: &ContentKey,
+    path: &str,
+    seed: &str,
+) -> (
+    SyncNode,
+    Arc<OpLog>,
+    String,
+    SyncNode,
+    Arc<OpLog>,
+    String,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let (mut a, oplog_a, da) = mk_node(key);
+    let (mut b, oplog_b, db) = mk_node(key);
+    enroll_each_other(&a, &b);
+    // Both devices independently hold the seed (each records a seed content_hash
+    // in its own `.ops` history) — the real steady-state shape. First contact
+    // with identical content adopts the canonical lineage and binds both sides.
+    let doc_a = oplog_a.create_document(path, "note", seed, &Author::User).unwrap();
+    let doc_b = oplog_b.create_document(path, "note", seed, &Author::User).unwrap();
+
+    // Drive bidirectional rounds until BOTH sides are Bound on the shared
+    // lineage. Identical content binds via the canonical/non-canonical adoption
+    // dance (`min(fingerprint)` owns the lineage), which can take a couple of
+    // passes either direction depending on which device is canonical — so loop
+    // rather than assume one round settles it regardless of the random
+    // fingerprints.
+    for _ in 0..4 {
+        let addr0 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server0 = spawn_responder(a, Duration::from_secs(3));
+        b.sync_once(&addr0).await.unwrap();
+        a = server0.await.unwrap();
+
+        let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_b = spawn_responder(b, Duration::from_secs(3));
+        a.sync_once(&addr_b).await.unwrap();
+        b = server_b.await.unwrap();
+
+        if a.status_of_path(path) == Some(SyncStatus::Bound)
+            && b.status_of_path(path) == Some(SyncStatus::Bound)
+        {
+            break;
+        }
+    }
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, seed);
+    assert_eq!(a.status_of_path(path), Some(SyncStatus::Bound), "A bound on shared lineage");
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Bound), "B bound on shared lineage");
+    (a, oplog_a, doc_a, b, oplog_b, doc_b, da, db)
+}
+
+/// REGRESSION guard for the desired CRDT behavior: two BOUND devices edit
+/// DISJOINT regions concurrently — the same-region gate must NOT block; the
+/// steady-state Yrs merge lands both edits. (Companion to the
+/// `same_region_concurrent_edits_block` test: the boundary between auto-merge
+/// and block.) [sync-conflict-detect-same-region]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_disjoint_edits_still_auto_merge() {
+    let key = ContentKey::generate();
+    let path = "notes/disjoint.md";
+    let seed = "HEAD base\nmiddle\nTAIL base\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+
+    // Disjoint edits: A edits HEAD, B edits TAIL.
+    oplog_a
+        .apply_user_text(&doc_a, "HEAD ALPHA\nmiddle\nTAIL base\n")
+        .unwrap();
+    oplog_b
+        .apply_user_text(&doc_b, "HEAD base\nmiddle\nTAIL OMEGA\n")
+        .unwrap();
+
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server1 = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr_a).await.unwrap();
+    assert!(rb.blocked.is_empty(), "disjoint edits must NOT block: {rb:?}");
+    let mut a = server1.await.unwrap();
+
+    let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr_b).await.unwrap();
+    assert!(ra.blocked.is_empty(), "disjoint edits must NOT block: {ra:?}");
+    let _b = server2.await.unwrap();
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, text_b, "both converge");
+    assert!(text_a.contains("ALPHA") && text_a.contains("OMEGA"), "both edits survive: {text_a:?}");
+}
+
+/// Two BOUND devices edit the SAME region concurrently — the gate must BLOCK
+/// (reason `same-region`) instead of silently CRDT-interleaving. The peer delta
+/// is held, NOT folded into accepted (B stays at its own text), and the block
+/// is recorded persistently for the UI. [sync-conflict-detect-same-region,
+/// sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_concurrent_edits_block() {
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+
+    // Both rewrite the SAME line ("body line") — overlapping ranges.
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    let _a = server.await.unwrap();
+
+    assert!(
+        rb.blocked.iter().any(|(p, reason)| p == path && reason == "same-region"),
+        "same-region edit blocks: {rb:?}"
+    );
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Blocked), "B blocked");
+    let blocked = b.blocked_docs();
+    assert_eq!(blocked.len(), 1, "one persistent blocked entry: {blocked:?}");
+    assert_eq!(blocked[0].reason, "same-region");
+    // The delta was HELD, not folded: B stays at its own text.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        b_text,
+        "the peer delta was held — B's content unchanged (no silent interleave)"
+    );
+}
+
+/// Same-region block → keep-theirs: BOTH devices converge to A's (theirs)
+/// content, and the block clears without re-conflicting on later rounds.
+/// [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_keep_theirs_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    let fork_path = b.blocked_docs()[0].path.clone();
+
+    // Resolve keep-theirs; round 2 (B pulls + resolves).
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepTheirs);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-theirs no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B adopted A's text");
+
+    // Round 3: A pulls B's decisive op so it converges too.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not block on convergence: {ra:?}");
+    let b = server3.await.unwrap();
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text, "A converged to theirs");
+
+    // Extra round must NOT re-block either side.
+    let addr4 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server4 = spawn_responder(a, Duration::from_secs(2));
+    let mut b = b;
+    let r4 = b.sync_once(&addr4).await.unwrap();
+    assert!(r4.blocked.is_empty(), "no re-block on a later round: {r4:?}");
+    let _a = server4.await.unwrap();
+}
+
+/// The REALISTIC bidirectional flow the single-direction tests miss: in real
+/// auto-sync BOTH devices are dialers, so BOTH independently detect a same-region
+/// overlap and BOTH block. Resolving on ONE side must converge AND auto-clear the
+/// OTHER side's independent block once the content converges — not leave it
+/// blocked until the user also clicks there. Regression for
+/// `clear_stale_block`. [sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_both_sides_block_then_one_resolves_clears_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // BOTH devices run a round (each is a dialer in turn) and BOTH block.
+    // B dials A:
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    assert!(!b.blocked_docs().is_empty(), "B blocked on its round");
+    // A dials B:
+    let addrb = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb = spawn_responder(b, Duration::from_secs(3));
+    a.sync_once(&addrb).await.unwrap();
+    let mut b = serverb.await.unwrap();
+    assert!(
+        !a.blocked_docs().is_empty(),
+        "A independently blocks too — the realistic both-dialers case"
+    );
+
+    // User resolves keep-theirs on B ONLY (A gets no decision).
+    let fork_path = b.blocked_docs()[0].path.clone();
+    b.set_fork_resolution(fork_path, Resolution::KeepTheirs);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(b.blocked_docs().is_empty(), "B resolved + unblocked");
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_text,
+        "B adopted A's text"
+    );
+
+    // A is STILL blocked with no decision. Its NEXT round must AUTO-CLEAR the
+    // now-stale block because the content has converged (this is the bug:
+    // before `clear_stale_block`, A stayed blocked forever even on force-sync).
+    let addrb2 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb2 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addrb2).await.unwrap();
+    let _b = serverb2.await.unwrap();
+    assert!(ra.blocked.is_empty(), "A's round does not re-block: {ra:?}");
+    assert!(
+        a.blocked_docs().is_empty(),
+        "A's stale block auto-cleared once the conflict converged out-of-band"
+    );
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        a_text,
+        "A converged to the resolved text"
+    );
+}
+
+/// Same-region block → keep-mine: BOTH devices converge to B's (ours) content;
+/// our text wins forward on the shared lineage. No re-block. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_keep_mine_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    let fork_path = b.blocked_docs()[0].path.clone();
+
+    // Resolve keep-mine; round 2 (B re-asserts ours forward).
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepMine);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-mine no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, b_text, "B keeps ours");
+
+    // Round 3: A pulls B's decisive op → converges to ours.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not block: {ra:?}");
+    let mut b = server3.await.unwrap();
+    let a_final = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    assert_eq!(a_final, b_text, "A converged to B's (keep-mine) content: {a_final:?}");
+    assert_eq!(a_final.matches("EDITED BY B").count(), 1, "B's text once on A");
+    assert_eq!(a_final.matches("EDITED BY A").count(), 0, "A's divergence discarded");
+
+    // Extra round, no re-block.
+    let addr4 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server4 = spawn_responder(a, Duration::from_secs(2));
+    let r4 = b.sync_once(&addr4).await.unwrap();
+    assert!(r4.blocked.is_empty(), "no re-block on a later round: {r4:?}");
+    let _a = server4.await.unwrap();
+}
+
+/// Same-region block → keep-both: A's text wins at the path, B's text survives
+/// as a `conflict-` sibling note; both devices converge. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_keep_both_preserves_local_copy() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    let fork_path = b.blocked_docs()[0].path.clone();
+
+    // Resolve keep-both; round 2.
+    b.set_fork_resolution(fork_path.clone(), Resolution::KeepBoth);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let _a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-both no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+
+    // Original path holds A's content; B's survives as a conflict sibling.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_text,
+        "original path adopted A's content"
+    );
+    let copy = oplog_b
+        .list_doc_ids()
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            oplog_b
+                .path_for_doc(id)
+                .unwrap()
+                .map(|p| p.contains("conflict"))
+                .unwrap_or(false)
+        })
+        .expect("a conflict-copy note exists");
+    assert_eq!(
+        oplog_b.materialize_accepted(&copy).unwrap().text,
+        b_text,
+        "the conflict copy preserves B's local version"
+    );
+}
+
+// --- 4c-bis. Delete-vs-edit: block + Keep-deleted / Keep-edit ---------------
+
+/// Two BOUND devices: A edits the doc while B deletes it (concurrent). The gate
+/// must BLOCK (reason `delete-vs-edit`) on the puller rather than silently let
+/// the delete win or the edit resurrect. Covers BOTH directions by pulling each
+/// way. [sync-conflict-delete-vs-edit]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_blocks_both_directions() {
+    let key = ContentKey::generate();
+    let path = "notes/dve.md";
+    let seed = "title\nbody line\n";
+
+    // Direction 1: A (peer/server) deleted, B (puller) edited → B blocks.
+    {
+        let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+            bound_pair(&key, path, seed).await;
+        oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+        oplog_b.apply_user_text(&doc_b, "title\nbody EDITED BY B\n").unwrap();
+        let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server = spawn_responder(a, Duration::from_secs(3));
+        let rb = b.sync_once(&addr).await.unwrap();
+        let _a = server.await.unwrap();
+        assert!(
+            rb.blocked.iter().any(|(p, r)| p == path && r == "delete-vs-edit"),
+            "peer-deleted + we-edited must block delete-vs-edit: {rb:?}"
+        );
+        assert_eq!(b.status_of_path(path), Some(SyncStatus::Blocked), "B blocked");
+        // The delete was HELD, not folded: B stays live at its own edit.
+        let mb = oplog_b.materialize_accepted(&doc_b).unwrap();
+        assert!(!mb.tombstone, "B's edit not silently deleted");
+        assert_eq!(mb.text, "title\nbody EDITED BY B\n");
+    }
+
+    // Direction 2: A (peer/server) edited, B (puller) deleted → B blocks.
+    {
+        let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+            bound_pair(&key, path, seed).await;
+        oplog_a.apply_user_text(&doc_a, "title\nbody EDITED BY A\n").unwrap();
+        oplog_b.tombstone_document(&doc_b, &Author::User).unwrap();
+        let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server = spawn_responder(a, Duration::from_secs(3));
+        let rb = b.sync_once(&addr).await.unwrap();
+        let _a = server.await.unwrap();
+        assert!(
+            rb.blocked.iter().any(|(p, r)| p == path && r == "delete-vs-edit"),
+            "we-deleted + peer-edited must block delete-vs-edit: {rb:?}"
+        );
+        // The peer edit was HELD, not folded: B stays tombstoned at its own delete.
+        assert!(
+            oplog_b.materialize_accepted(&doc_b).unwrap().tombstone,
+            "B's delete not silently resurrected by the peer edit"
+        );
+    }
+}
+
+/// REGRESSION guard: a fast-forward delete (the peer deleted a version we
+/// already hold, and we did NOT concurrently edit) must STILL auto-apply (→
+/// trash) and NOT block. [sync-conflict-delete-vs-edit]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_forward_delete_auto_applies_no_block() {
+    let key = ContentKey::generate();
+    let path = "notes/ffdel.md";
+    let seed = "title\nbody line\n";
+    let (mut a, oplog_a, doc_a, mut b, _oplog_b, doc_b, _da, db) =
+        bound_pair(&key, path, seed).await;
+
+    // Only A deletes; B stays at the shared base (no concurrent edit).
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    let md_path = db.path().join(path);
+    assert!(md_path.exists(), "B's .md exists before the delete syncs");
+
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    let _a = server.await.unwrap();
+
+    assert!(rb.blocked.is_empty(), "a fast-forward delete must NOT block: {rb:?}");
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Bound), "B stays bound");
+    assert!(
+        _oplog_b.materialize_accepted(&doc_b).unwrap().tombstone,
+        "the delete auto-applied (B tombstoned)"
+    );
+    assert!(!md_path.exists(), "the ghost .md was trashed (Phase-3 trash path)");
+}
+
+/// Delete-vs-edit block → Keep deleted: BOTH devices converge to deleted, the
+/// block clears, and a later round does not re-block. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_keep_deleted_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/dve.md";
+    let seed = "title\nbody line\n";
+    // A deletes, B edits — B is the puller/resolver. Keep-deleted makes B
+    // tombstone + trash its own edited file (the live-side trash path), then
+    // pushes the tombstone so A converges to deleted too.
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, db) =
+        bound_pair(&key, path, seed).await;
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    oplog_b.apply_user_text(&doc_b, "title\nbody EDITED BY B\n").unwrap();
+    assert!(db.path().join(path).exists(), "B's edited .md exists before resolve");
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    assert_eq!(b.blocked_docs()[0].reason, "delete-vs-edit");
+
+    // Resolve keep-deleted; round 2 (B resolves + pushes the tombstone to A).
+    b.set_fork_resolution(path.to_string(), Resolution::KeepDeleted);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-deleted no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+    assert!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().tombstone,
+        "B stays deleted"
+    );
+    // A adopted the tombstone via PushAdopt → A is deleted too, ghost trashed.
+    assert!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().tombstone,
+        "A converged to deleted"
+    );
+    assert!(
+        !db.path().join(path).exists(),
+        "B's .md trashed on keep-deleted"
+    );
+
+    // Extra round: no re-block on either side.
+    let addr3 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(a, Duration::from_secs(2));
+    let r3 = b.sync_once(&addr3).await.unwrap();
+    assert!(r3.blocked.is_empty(), "no re-block after keep-deleted: {r3:?}");
+    let _a = server3.await.unwrap();
+}
+
+/// Delete-vs-edit block → Keep edit (resurrect): BOTH devices converge to the
+/// live edited document, the block clears, and a later round does not re-block.
+/// [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_keep_edit_resurrects_and_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/dve.md";
+    let seed = "title\nbody line\n";
+    // B deletes, A edits — B is the puller/resolver. Keep-edit must resurrect B
+    // to the edited (A's) content.
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, db) =
+        bound_pair(&key, path, seed).await;
+    let edited = "title\nbody EDITED BY A\n";
+    oplog_a.apply_user_text(&doc_a, edited).unwrap();
+    oplog_b.tombstone_document(&doc_b, &Author::User).unwrap();
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    assert_eq!(b.blocked_docs()[0].reason, "delete-vs-edit");
+
+    // Resolve keep-edit; round 2.
+    b.set_fork_resolution(path.to_string(), Resolution::KeepEdit);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-edit no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+    let mb = oplog_b.materialize_accepted(&doc_b).unwrap();
+    assert!(!mb.tombstone, "B resurrected (not tombstoned)");
+    assert_eq!(mb.text, edited, "B holds the edited content");
+    // A adopted B's resurrected lineage via PushAdopt → A is live + edited.
+    let ma = oplog_a.materialize_accepted(&doc_a).unwrap();
+    assert!(!ma.tombstone, "A converged to live");
+    assert_eq!(ma.text, edited, "A holds the edited content");
+    assert!(db.path().join(path).exists(), "B's .md is back on disk");
+
+    // Extra round: no re-block.
+    let addr3 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(a, Duration::from_secs(2));
+    let r3 = b.sync_once(&addr3).await.unwrap();
+    assert!(r3.blocked.is_empty(), "no re-block after keep-edit: {r3:?}");
+    let _a = server3.await.unwrap();
+}
+
 // --- 4d. Generic no-corruption guard: extra rounds after any resolution ----
 
 /// The explicit regression net for the whole deferred-cross-lineage-interleave
@@ -1310,47 +1860,40 @@ async fn rename_does_not_fork_identity() {
     assert_eq!(all_docs.len(), 1, "exactly one logical doc on B: {all_docs:?}");
 }
 
-// --- 5b. Concurrent rename collision: LWW-on-path, loser → conflict-copy ----
+// --- 5b. Concurrent rename collision: BLOCK + user resolution ---------------
 
-/// `sync-concurrent-rename-not-merged`: two devices independently rename
-/// DIFFERENT documents to the SAME target path while disconnected. The
-/// later-arriving rename's local replica collides with the existing
-/// `target.md` (now owned by the winning device's lineage) → the loser lands
-/// at `target.conflict-<rand6>.md`, the winner is at `target.md`, both devices
-/// converge with no data loss.
-///
-/// Test shape: A holds `foo.md`, B holds `bar.md` (different docs, different
-/// content, never synced together). A renames `foo.md → target.md`. B renames
-/// `bar.md → target.md`. Then sync. The receiver (B as dialer) sees A's
-/// manifest entry for `target.md` with `prior_paths = [foo.md]` and its own
-/// local replica at `target.md` (formerly bar). The two lineages are disjoint
-/// → classify Fork → the rename-collision detection in
-/// `act_on_classification` writes B's local content as a conflict-copy and
-/// adopts A's lineage at the original path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_rename_to_same_target_loser_becomes_conflict_copy() {
-    let key = ContentKey::generate();
-    let (mut a, oplog_a, _da) = mk_node(&key);
-    let (mut b, oplog_b, _db) = mk_node(&key);
+/// Seed the headline concurrent-rename-collision scenario: A holds `foo.md`
+/// (a_content) and B holds `bar.md` (b_content) — different docs, different
+/// content, never synced together. Each independently renames its doc to
+/// `target.md` while disconnected. Returns the two nodes + oplogs + doc ids +
+/// temp dirs (kept alive). After this, B dialing A sees A's manifest entry for
+/// `target.md` with `prior_paths = [foo.md]` colliding with B's own local
+/// replica at `target.md` (formerly bar) — the LWW-on-path collision.
+async fn rename_collision_setup(
+    key: &ContentKey,
+    a_content: &str,
+    b_content: &str,
+) -> (
+    SyncNode,
+    Arc<OpLog>,
+    String,
+    SyncNode,
+    Arc<OpLog>,
+    String,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let (a, oplog_a, da) = mk_node(key);
+    let (b, oplog_b, db) = mk_node(key);
     enroll_each_other(&a, &b);
 
-    let foo_path = "notes/foo.md";
-    let bar_path = "notes/bar.md";
     let target_path = "notes/target.md";
-    let a_content = "this is foo's content from A\n";
-    let b_content = "this is bar's content from B\n";
-
-    // Independently seeded: A has foo.md with its own content; B has bar.md
-    // with different content. No prior sync, so the lineages are disjoint.
     let doc_a = oplog_a
-        .create_document(foo_path, "note", a_content, &Author::User)
+        .create_document("notes/foo.md", "note", a_content, &Author::User)
         .unwrap();
     let doc_b = oplog_b
-        .create_document(bar_path, "note", b_content, &Author::User)
+        .create_document("notes/bar.md", "note", b_content, &Author::User)
         .unwrap();
-
-    // Concurrent rename to the same target path (each device offline from the
-    // other).
     oplog_a
         .rename_document(&doc_a, target_path, &Author::User)
         .unwrap();
@@ -1358,57 +1901,327 @@ async fn concurrent_rename_to_same_target_loser_becomes_conflict_copy() {
         .rename_document(&doc_b, target_path, &Author::User)
         .unwrap();
 
-    // B dials A, so B is the receiver of A's manifest entry for target.md →
-    // B's local replica at target.md (formerly bar) collides → B becomes the
-    // loser of the LWW-on-path race.
+    (a, oplog_a, doc_a, b, oplog_b, doc_b, da, db)
+}
+
+/// Find the single `notes/target.conflict-<rand6>.md` sibling doc in `oplog`
+/// and return its materialized text. Panics if absent.
+fn conflict_copy_text(oplog: &OpLog) -> String {
+    let all_paths: Vec<String> = oplog
+        .list_doc_ids()
+        .unwrap()
+        .into_iter()
+        .filter_map(|id| oplog.path_for_doc(&id).ok().flatten())
+        .collect();
+    let copy = all_paths
+        .iter()
+        .find(|p| {
+            p.contains(".conflict-") && p.ends_with(".md") && p.starts_with("notes/target.")
+        })
+        .unwrap_or_else(|| panic!("expected a target.conflict-<rand6>.md sibling: {all_paths:?}"));
+    let copy_id = oplog.doc_id_for_path(copy).unwrap().unwrap();
+    oplog.materialize_accepted(&copy_id).unwrap().text
+}
+
+/// `sync-concurrent-rename-not-merged`: two devices independently rename
+/// DIFFERENT documents to the SAME target path while disconnected. The two
+/// disjoint lineages both claim the path — a contended change. Per the spec
+/// this is NOT auto-resolved: it BLOCKS (reason `rename-collision`) for the
+/// user to pick Keep mine / Keep theirs / Keep both. Nothing is moved, copied,
+/// or adopted while blocked.
+///
+/// INVERSION NOTE: this test previously asserted `report.blocked.is_empty()`
+/// and that the loser silently became a `target.conflict-<rand6>.md` copy with
+/// A's lineage auto-adopted at the path. The spec now blocks instead of
+/// auto-deciding, so the assertions are inverted: the round MUST block, B's doc
+/// MUST stay at its own bar content (no adopt), and NO conflict-copy is written
+/// until the user resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_rename_to_same_target_blocks_for_resolution() {
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+
+    // B dials A → sees A's `target.md` (prior_paths=[foo.md]) colliding with
+    // B's own `target.md` (formerly bar). Disjoint lineages → BLOCK.
     let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server = spawn_responder(a, Duration::from_secs(3));
     let report = b.sync_once(&addr).await.unwrap();
     let _a = server.await.unwrap();
 
     assert!(
-        report.blocked.is_empty(),
-        "rename collision must NOT block — the loser becomes a conflict-copy: {report:?}"
+        report
+            .blocked
+            .iter()
+            .any(|(p, reason)| p == "notes/target.md" && reason == "rename-collision"),
+        "concurrent rename collision must BLOCK for user resolution: {report:?}"
     );
+    assert_eq!(
+        b.status_of_path("notes/target.md"),
+        Some(SyncStatus::Blocked),
+        "B's target.md is blocked"
+    );
+    let blocked = b.blocked_docs();
+    assert_eq!(blocked.len(), 1, "one persistent blocked entry: {blocked:?}");
+    assert_eq!(blocked[0].reason, "rename-collision");
 
-    // Target path now holds A's content (B adopted A's lineage there).
+    // HELD: nothing moved/copied/adopted. B's doc stays at its own bar content;
+    // no conflict-copy sibling exists yet.
     assert_eq!(
         oplog_b.materialize_accepted(&doc_b).unwrap().text,
-        a_content,
-        "B's doc at target.md adopted A's content"
+        b_content,
+        "B's doc unchanged while blocked (no silent adopt)"
     );
-    assert_eq!(
-        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
-        Some(target_path),
-        "B's original doc is at target.md (lineage adopted in place)"
-    );
-
-    // B's original bar content lives on as a conflict-copy sibling at
-    // `<stem>.conflict-<rand6>.<ext>`, indexed like any note (created via the
-    // op-log create path).
-    let all_paths: Vec<String> = oplog_b
+    let copy_count = oplog_b
         .list_doc_ids()
         .unwrap()
         .into_iter()
         .filter_map(|id| oplog_b.path_for_doc(&id).ok().flatten())
-        .collect();
-    let copy = all_paths
-        .iter()
-        .find(|p| p.contains(".conflict-") && p.ends_with(".md") && p.starts_with("notes/target."))
-        .unwrap_or_else(|| panic!("expected a target.conflict-<rand6>.md sibling: {all_paths:?}"));
-    let copy_id = oplog_b.doc_id_for_path(copy).unwrap().unwrap();
-    assert_eq!(
-        oplog_b.materialize_accepted(&copy_id).unwrap().text,
-        b_content,
-        "the conflict-copy preserves B's original bar content"
-    );
+        .filter(|p| p.contains(".conflict-"))
+        .count();
+    assert_eq!(copy_count, 0, "no conflict-copy written while blocked");
 
-    // No data lost: A still has its own content under target.md, B has A's at
-    // target.md, and B has its original content at the conflict-copy sibling.
+    // A is untouched too.
     assert_eq!(
         oplog_a.materialize_accepted(&doc_a).unwrap().text,
         a_content,
-        "A's content at target.md unchanged on A"
+        "A's content at target.md unchanged"
+    );
+}
+
+/// Rename collision → Keep theirs: the PEER's (A's) doc wins `target.md`; OUR
+/// (B's) doc moves aside to a `conflict-` sibling. Both devices converge with no
+/// data loss and no re-block. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_keep_theirs_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+
+    // Resolve keep-theirs; round 2 (B adopts A at the path, moves its own aside).
+    b.set_fork_resolution("notes/target.md".to_string(), Resolution::KeepTheirs);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-theirs no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+
+    // target.md holds A's content on B; B's bar survives as a conflict sibling.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_content,
+        "B's target.md adopted A's content (theirs won the path)"
+    );
+    assert_eq!(conflict_copy_text(&oplog_b), b_content, "B's bar preserved as conflict copy");
+
+    // Round 3: A pulls B's conflict-copy doc so it converges too.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not block on convergence: {ra:?}");
+    let b = server3.await.unwrap();
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        a_content,
+        "A keeps its content at target.md"
+    );
+    assert_eq!(conflict_copy_text(&oplog_a), b_content, "A pulled B's bar conflict copy");
+
+    // Extra round must NOT re-block.
+    let addr4 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server4 = spawn_responder(a, Duration::from_secs(2));
+    let mut b = b;
+    let r4 = b.sync_once(&addr4).await.unwrap();
+    assert!(r4.blocked.is_empty(), "no re-block on a later round: {r4:?}");
+    let _a = server4.await.unwrap();
+}
+
+/// Rename collision → Keep mine: OUR (B's) doc keeps `target.md`; the PEER's
+/// (A's) doc yields to a `conflict-` sibling. We push our base so A adopts ours
+/// at the path, and preserve A's content as a conflict copy that A pulls back.
+/// Both converge, no re-block. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_keep_mine_converges() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+
+    // Resolve keep-mine; round 2 (B keeps target.md, pushes ours to A, copies theirs).
+    b.set_fork_resolution("notes/target.md".to_string(), Resolution::KeepMine);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-mine no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+
+    // B keeps its bar at target.md; A's foo preserved as a conflict sibling on B.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        b_content,
+        "B keeps its content at target.md (mine won the path)"
+    );
+    assert_eq!(conflict_copy_text(&oplog_b), a_content, "A's foo preserved as conflict copy on B");
+    // A adopted B's bar at target.md via the push.
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        b_content,
+        "A adopted B's bar at target.md (push)"
+    );
+
+    // Round 3: A pulls B's conflict-copy of A's own foo content.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not block on convergence: {ra:?}");
+    let b = server3.await.unwrap();
+    assert_eq!(conflict_copy_text(&oplog_a), a_content, "A pulled its foo back as a conflict copy");
+
+    // Extra round must NOT re-block.
+    let addr4 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server4 = spawn_responder(a, Duration::from_secs(2));
+    let mut b = b;
+    let r4 = b.sync_once(&addr4).await.unwrap();
+    assert!(r4.blocked.is_empty(), "no re-block on a later round: {r4:?}");
+    let _a = server4.await.unwrap();
+}
+
+/// Rename collision → Keep both: both docs survive at distinct paths. The
+/// winner of the contended path is DETERMINISTIC by fingerprint (`min` keeps
+/// the path), so both devices converge to the same assignment regardless of who
+/// resolves. No re-block. [sync-conflict-resolve-actions]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_keep_both_converges_deterministically() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+
+    // The resolver is B; the deterministic winner of the path is the smaller
+    // fingerprint. Compute which content should end up at target.md vs the copy.
+    let b_keeps_path = b.fingerprint().0 < a.fingerprint().0;
+    let (path_text, copy_text) = if b_keeps_path {
+        (b_content, a_content)
+    } else {
+        (a_content, b_content)
+    };
+
+    // Round 1: block.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+
+    // Resolve keep-both; round 2.
+    b.set_fork_resolution("notes/target.md".to_string(), Resolution::KeepBoth);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let mut a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "keep-both no longer blocks: {r2:?}");
+    assert!(b.blocked_docs().is_empty(), "block cleared");
+
+    // The deterministic winner is at target.md on B; the loser is the copy.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        path_text,
+        "deterministic winner at target.md on B"
+    );
+    assert_eq!(conflict_copy_text(&oplog_b), copy_text, "loser preserved as conflict copy on B");
+
+    // Round 3: A converges to the same assignment.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not block on convergence: {ra:?}");
+    let b = server3.await.unwrap();
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        path_text,
+        "A converges to the same winner at target.md"
+    );
+    assert_eq!(conflict_copy_text(&oplog_a), copy_text, "A has the same loser as a conflict copy");
+
+    // Extra round must NOT re-block.
+    let addr4 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server4 = spawn_responder(a, Duration::from_secs(2));
+    let mut b = b;
+    let r4 = b.sync_once(&addr4).await.unwrap();
+    assert!(r4.blocked.is_empty(), "no re-block on a later round: {r4:?}");
+    let _a = server4.await.unwrap();
+}
+
+/// Regression guard: an ORDINARY rename (the peer renames a doc to a path
+/// NOTHING else claims) must still auto-apply — only a genuine collision with a
+/// different local doc at the target blocks. A holds `foo.md`, binds with B,
+/// then renames it to `renamed.md` (a path B has no other doc at). B's pull
+/// applies the rename on the shared lineage with no block.
+/// [sync-concurrent-rename-not-merged]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_colliding_rename_does_not_block() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let old_path = "notes/foo.md";
+    let new_path = "notes/renamed.md";
+    let seed = "ordinary rename\nbody\n";
+    let doc_a = oplog_a
+        .create_document(old_path, "note", seed, &Author::User)
+        .unwrap();
+
+    // Round 0: bind A↔B on foo.md.
+    let addr0 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server0 = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr0).await.unwrap();
+    let mut a = server0.await.unwrap();
+    let doc_b = oplog_b.doc_id_for_path(old_path).unwrap().unwrap();
+
+    // A renames to a path B has no other doc at — an ordinary rename.
+    oplog_a.rename_document(&doc_a, new_path, &Author::User).unwrap();
+
+    let addr1 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server1 = spawn_responder(a, Duration::from_secs(3));
+    let report = b.sync_once(&addr1).await.unwrap();
+    let _a = server1.await.unwrap();
+
+    assert!(
+        report.blocked.is_empty(),
+        "an ordinary rename must NOT block: {report:?}"
+    );
+    assert_eq!(
+        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
+        Some(new_path),
+        "B's doc moved to the new path (rename auto-applied on the shared lineage)"
+    );
+    assert_eq!(
+        oplog_b.list_doc_ids().unwrap().len(),
+        1,
+        "no conflict-copy minted for an ordinary rename"
     );
 }
 
@@ -1737,6 +2550,118 @@ async fn content_key_auto_transfers_on_first_contact() {
     );
 }
 
+/// Like [`mk_node_with_handle`] but with an EXPLICIT device keypair and an
+/// EXPLICIT established flag, so a test can pin which device is canonical
+/// (`min(fingerprint)`) and whether its key is deliberately set vs fresh —
+/// the two axes the convergence decision turns on.
+/// [sync-content-key-confirm-on-change]
+fn mk_node_established(
+    content_key: ContentKey,
+    established: bool,
+    keypair: DeviceKeypair,
+) -> (SyncNode, Arc<OpLog>, tempfile::TempDir, SharedContentKey) {
+    let (dir, oplog) = open_vault();
+    let handle = if established {
+        SharedContentKey::new_established(content_key)
+    } else {
+        SharedContentKey::new(content_key)
+    };
+    let node = SyncNode::new(
+        Arc::clone(&oplog),
+        handle.clone(),
+        keypair,
+        Settings::default(),
+        EnrolledPeers::new(),
+    );
+    (node, oplog, dir, handle)
+}
+
+/// A FRESH (non-established) key on the non-canonical side adopts the peer's key
+/// in-band, marks itself established, and the round surfaces the adoption.
+/// [sync-content-key-confirm-on-change]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_key_adopts_peer_and_marks_established() {
+    // Pin canonical = B (its fingerprint sorts BEFORE A's), so A is the
+    // non-canonical adopter when A dials B.
+    let kp_a = DeviceKeypair::generate();
+    let kp_b = loop {
+        let kp = DeviceKeypair::generate();
+        if kp.fingerprint().0 < kp_a.fingerprint().0 {
+            break kp;
+        }
+    };
+    let b_fp = kp_b.fingerprint().0.clone();
+
+    let key_a = ContentKey::from_bytes([1u8; 32]);
+    let key_b = ContentKey::from_bytes([2u8; 32]);
+    let (mut a, oplog_a, _da, handle_a) = mk_node_established(key_a, false, kp_a);
+    let (mut b, _ob, _db, handle_b) = mk_node_established(key_b, false, kp_b);
+    enroll_each_other(&a, &b);
+    assert!(!handle_a.is_established(), "A starts fresh");
+
+    oplog_a.create_document("notes/x.md", "note", "x\n", &Author::User).unwrap();
+
+    let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_b = spawn_responder(b, Duration::from_secs(3));
+    let report = a.sync_once(&addr_b).await.expect("round ok");
+    let _b = server_b.await.unwrap();
+
+    // A adopted B's (canonical) key, is now established, and the round surfaced it.
+    assert_eq!(handle_a.fingerprint(), handle_b.fingerprint(), "A adopted B's key");
+    assert!(handle_a.is_established(), "adoption marks A established");
+    assert_eq!(
+        report.adopted_content_key_from.as_deref(),
+        Some(b_fp.as_str()),
+        "round surfaces the adoption with the peer fingerprint: {report:?}"
+    );
+    assert!(report.pending_content_key_change.is_none(), "no pending change");
+}
+
+/// An ESTABLISHED key on the non-canonical side is NOT silently switched: the
+/// key is unchanged, no `ContentKeyRequest` is made, and the round surfaces a
+/// pending-key-change for the user to confirm.
+/// [sync-content-key-confirm-on-change]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn established_key_holds_and_surfaces_pending_change() {
+    // Pin canonical = B again, so A would be the adopter — except A's key is
+    // established, so it must hold instead.
+    let kp_a = DeviceKeypair::generate();
+    let kp_b = loop {
+        let kp = DeviceKeypair::generate();
+        if kp.fingerprint().0 < kp_a.fingerprint().0 {
+            break kp;
+        }
+    };
+    let b_fp = kp_b.fingerprint().0.clone();
+
+    let key_a = ContentKey::from_bytes([1u8; 32]);
+    let key_b = ContentKey::from_bytes([2u8; 32]);
+    let fp_a_before = key_a.fingerprint();
+    let (mut a, oplog_a, _da, handle_a) = mk_node_established(key_a, true, kp_a);
+    let (mut b, _ob, _db, handle_b) = mk_node_established(key_b, false, kp_b);
+    enroll_each_other(&a, &b);
+    assert!(handle_a.is_established(), "A's key is established");
+
+    oplog_a.create_document("notes/y.md", "note", "y\n", &Author::User).unwrap();
+
+    let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_b = spawn_responder(b, Duration::from_secs(3));
+    let report = a.sync_once(&addr_b).await.expect("round ok (held, not aborted)");
+    let _b = server_b.await.unwrap();
+
+    // A's established key is UNCHANGED — not silently switched to B's.
+    assert_eq!(handle_a.fingerprint(), fp_a_before, "A's key unchanged");
+    assert_ne!(handle_a.fingerprint(), handle_b.fingerprint(), "keys still differ");
+    assert!(handle_a.is_established(), "A stays established");
+    // The held change is surfaced with B's fingerprint for the page to confirm.
+    assert_eq!(
+        report.pending_content_key_change.as_deref(),
+        Some(b_fp.as_str()),
+        "round surfaces the held key change: {report:?}"
+    );
+    assert!(report.adopted_content_key_from.is_none(), "nothing adopted");
+}
+
 /// Two nodes that ALREADY share one content key see matching content-key
 /// fingerprints in the Hello exchange, so the in-band transfer is a no-op: the
 /// key never changes on either side. [sync-vault-key-inband]
@@ -1765,6 +2690,123 @@ async fn matching_content_keys_no_transfer() {
     // requested or swapped.
     assert_eq!(handle_a.fingerprint(), fp_before, "A's key unchanged");
     assert_eq!(handle_b.fingerprint(), fp_before, "B's key unchanged");
+}
+
+/// A single document that hits a DOC-LEVEL error mid-round must NOT abort the
+/// rest of the round: the other documents still sync, the bad one is recorded
+/// in `report.errored`, and `sync_once` returns `Ok` (not `Err`).
+/// Regression for `bug-sync-round-aborts-on-one-doc`.
+///
+/// The honest single-doc failure used here is a content-key mismatch on the
+/// DELTA path: doc1 is brought onto a shared lineage with a matching key, then
+/// B's content key is rotated to a DIFFERENT key while B is the CANONICAL side
+/// (so the in-band key convergence is a no-op — the canonical device never
+/// requests the peer's key). On the next round A's content-encrypted delta for
+/// doc1 fails to decrypt under B's now-different key (`Error::Decrypt`, a
+/// doc-level error). doc2 is fresh on A, so it adopts via the UNencrypted
+/// lineage base and converges regardless of the key mismatch. No test-only
+/// failure hook is added to production code — the mismatch rides the real key
+/// state machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_doc_error_does_not_abort_round() {
+    // Generate two keypairs and pick B's so it sorts BEFORE A's — B is then the
+    // canonical content-key owner and never re-adopts A's key in-band, so a
+    // deliberate later key rotation on B sticks for the delta round.
+    let kp_a = DeviceKeypair::generate();
+    let kp_b = loop {
+        let kp = DeviceKeypair::generate();
+        if kp.fingerprint().0 < kp_a.fingerprint().0 {
+            break kp;
+        }
+    };
+
+    let shared = ContentKey::from_bytes([9u8; 32]);
+    let (dir_a, oplog_a) = open_vault();
+    let (dir_b, oplog_b) = open_vault();
+    let _da = dir_a;
+    let _db = dir_b;
+
+    let handle_b = SharedContentKey::new(ContentKey::from_bytes(*shared.as_bytes()));
+    let mut a = SyncNode::new(
+        Arc::clone(&oplog_a),
+        SharedContentKey::new(ContentKey::from_bytes(*shared.as_bytes())),
+        kp_a,
+        Settings::default(),
+        EnrolledPeers::new(),
+    );
+    let mut b = SyncNode::new(
+        Arc::clone(&oplog_b),
+        handle_b.clone(),
+        kp_b,
+        Settings::default(),
+        EnrolledPeers::new(),
+    );
+    enroll_each_other(&a, &b);
+
+    // doc1 exists on both with identical content → round 1 puts it on a SHARED
+    // lineage (the non-canonical side, A, adopts B-or-vice-versa; either way the
+    // steady-state delta path becomes live).
+    let doc1 = "notes/keyed-doc.md";
+    let text1 = "alpha\nbeta\n";
+    let doc1_a = oplog_a.create_document(doc1, "note", text1, &Author::User).unwrap();
+    oplog_b.create_document(doc1, "note", text1, &Author::User).unwrap();
+
+    // Drive a couple of bidirectional rounds to settle doc1 onto a shared
+    // lineage (keys still match here, so this converges cleanly).
+    for _ in 0..2 {
+        let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_a = spawn_responder(a, Duration::from_secs(3));
+        b.sync_once(&addr_a).await.unwrap();
+        a = server_a.await.unwrap();
+
+        let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_b = spawn_responder(b, Duration::from_secs(3));
+        a.sync_once(&addr_b).await.unwrap();
+        b = server_b.await.unwrap();
+    }
+
+    // Now diverge: A edits doc1 (its delta will be encrypted under A's key) and
+    // creates a brand-new doc2 that B has never seen.
+    oplog_a.apply_user_text(&doc1_a, "alpha\nbeta\ngamma\n").unwrap();
+    let doc2 = "notes/fresh-doc.md";
+    let text2 = "fresh body\n";
+    oplog_a.create_document(doc2, "note", text2, &Author::User).unwrap();
+
+    // Rotate B's content key to something A doesn't hold. B is canonical, so the
+    // handshake's in-band convergence won't pull A's key back — the keys stay
+    // different for the doc phase.
+    handle_b.set(ContentKey::from_bytes([3u8; 32]));
+
+    // The round: doc1 takes the delta path and FAILS to decrypt (doc-level);
+    // doc2 adopts the unencrypted base and converges. The round must NOT abort.
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    let report = b
+        .sync_once(&addr_a)
+        .await
+        .expect("round must NOT abort on one doc's doc-level error");
+    let _a = server_a.await.unwrap();
+
+    // The good doc still synced.
+    assert!(
+        report.converged.contains(&doc2.to_string()),
+        "the good doc converged despite the bad one failing: {report:?}"
+    );
+    let doc2_b = oplog_b
+        .doc_id_for_path(doc2)
+        .unwrap()
+        .expect("B adopted the fresh doc");
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc2_b).unwrap().text,
+        text2,
+        "the good doc's content landed on B"
+    );
+
+    // The bad doc was recorded, not silently dropped.
+    assert!(
+        report.errored.iter().any(|(p, _)| p == doc1),
+        "the failing doc is recorded in report.errored: {report:?}"
+    );
 }
 
 // === Wave 6 — adversarial data-corruption / data-loss probes ===============
@@ -2097,49 +3139,61 @@ async fn shared_lineage_disjoint_edits_survive_once_stable() {
     }
 }
 
-// --- W4b. Concurrent SAME-region edits on a shared lineage -----------------
+// --- W4b. Concurrent SAME-region edits on a shared lineage now BLOCK --------
 
-/// After A & B share a lineage, SAME-region edits on each converge
-/// deterministically with no content loss and no duplication. Because the
-/// lineage is shared this is a CRDT merge (NOT a fork) — Yrs orders the two
-/// concurrent inserts by client id, so the result contains BOTH inserted
-/// markers exactly once and both sides agree. Extra rounds keep it byte-stable.
-/// [sync-content-encryption-aes256]
+/// After A & B share a lineage, SAME-region concurrent edits no longer silently
+/// CRDT-interleave: the bound-doc gate detects the byte-range overlap and BLOCKS
+/// the doc for user resolution (the behavior change of
+/// `sync-conflict-detect-same-region`). A resolution then converges both sides.
+/// (This test previously asserted the OLD silent-interleave contract; the slug
+/// exists precisely to replace it.) The disjoint-region sibling that must STILL
+/// auto-merge is `bound_disjoint_edits_still_auto_merge`.
+/// [sync-conflict-detect-same-region, sync-conflict-block-and-resolve]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_lineage_same_region_edits_converge() {
+async fn shared_lineage_same_region_edits_block_then_resolve() {
+    use hiker_sync::identity::Resolution;
     let key = ContentKey::generate();
-    let (mut a, oplog_a, _da) = mk_node(&key);
-    let (mut b, oplog_b, _db) = mk_node(&key);
-    enroll_each_other(&a, &b);
-
     let path = "notes/same-region.md";
     let seed = "alpha\nINSERT-HERE\nomega\n";
-    let doc_a = oplog_a.create_document(path, "note", seed, &Author::User).unwrap();
-
-    let addr0 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
-    let server0 = spawn_responder(a, Duration::from_secs(3));
-    b.sync_once(&addr0).await.unwrap();
-    let a = server0.await.unwrap();
-    let doc_b = oplog_b.doc_id_for_path(path).unwrap().unwrap();
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
 
     // Both edit the SAME line region with distinct markers.
-    oplog_a.apply_user_text(&doc_a, "alpha\nINSERT-HERE AAA-side\nomega\n").unwrap();
-    oplog_b.apply_user_text(&doc_b, "alpha\nINSERT-HERE BBB-side\nomega\n").unwrap();
+    let a_text = "alpha\nINSERT-HERE AAA-side\nomega\n";
+    let b_text = "alpha\nINSERT-HERE BBB-side\nomega\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
 
-    let (a, b) = drive_bidirectional(a, b, 4).await;
-    let _a = a;
-    let _b = b;
+    // Round 1: B pulls A — the same-region overlap BLOCKS instead of merging.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    assert!(
+        rb.blocked.iter().any(|(p, r)| p == path && r == "same-region"),
+        "same-region edits block, not silently interleave: {rb:?}"
+    );
+    // Held, not folded: B keeps its own text.
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, b_text);
 
-    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
-    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
-    // Converged: both sides identical (shared lineage = CRDT merge, no fork).
-    assert_eq!(text_a, text_b, "same-region edits converge: a={text_a:?} b={text_b:?}");
-    // No content loss: both concurrent inserts survive exactly once.
-    assert_eq!(text_a.matches("AAA-side").count(), 1, "A's insert once: {text_a:?}");
-    assert_eq!(text_a.matches("BBB-side").count(), 1, "B's insert once: {text_a:?}");
-    // The shared prefix/suffix are not doubled.
-    assert_eq!(text_a.matches("alpha").count(), 1, "prefix once: {text_a:?}");
-    assert_eq!(text_a.matches("omega").count(), 1, "suffix once: {text_a:?}");
+    // Resolve keep-theirs → both converge to A's content, no re-block.
+    let fork_path = b.blocked_docs()[0].path.clone();
+    b.set_fork_resolution(fork_path, Resolution::KeepTheirs);
+    let addr2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr2).await.unwrap();
+    let a = server2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "resolution clears the block: {r2:?}");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B adopted A's text");
+
+    // A pulls B's decisive op → converges, no re-block.
+    let addr3 = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server3 = spawn_responder(b, Duration::from_secs(3));
+    let mut a = a;
+    let ra = a.sync_once(&addr3).await.unwrap();
+    assert!(ra.blocked.is_empty(), "A does not re-block on convergence: {ra:?}");
+    let _b = server3.await.unwrap();
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text, "A converged to theirs");
 }
 
 // --- W6. Edit-while-forked, then resolve uses current content --------------
@@ -2374,3 +3428,2311 @@ async fn byte_exact_tricky_content_round_trips() {
         let _ = b;
     }
 }
+
+// === poke-on-commit transport round-trip ===================================
+
+/// The transport-level half of `sync-poke-on-commit`: with two mutually
+/// enrolled nodes, A's `poke(addr_b)` sets B's `poked` flag over the wire
+/// (Hello → HelloAck, then SyncPoke → SyncPokeAck), and B's `take_poked()`
+/// returns `true` exactly once then `false`. The poke carries no content — it
+/// only wakes B's existing pull path (here, the flag the bootstrap driver
+/// drains to fire an `auto_sync_round`). [sync-poke-on-commit]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poke_sets_peer_poked_flag_once() {
+    let key = ContentKey::generate();
+    let (mut a, _oplog_a, _da) = mk_node(&key);
+    let (mut b, _oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    // No poke yet: B's flag starts clear.
+    assert!(!b.take_poked(), "poked flag starts clear");
+
+    let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_b = spawn_responder(b, Duration::from_secs(3));
+
+    // A pokes B — lightweight nudge, no manifest / delta.
+    a.poke(&addr_b).await.unwrap();
+
+    let b = server_b.await.unwrap();
+    // B saw the poke exactly once: true, then cleared.
+    assert!(b.take_poked(), "poke set B's poked flag");
+    assert!(!b.take_poked(), "poked flag cleared after one read");
+}
+
+// === Wave 7 — both-devices-as-dialers convergence + stale-block clearing =====
+//
+// Real auto-sync makes BOTH peers dialers, so on a genuine conflict BOTH
+// independently detect it and BOTH block. Resolving on ONE side must (a) converge
+// the content on both AND (b) auto-clear the OTHER side's independent block once
+// the contention is gone out-of-band — the user should not have to also click on
+// the second device. The single-direction conflict tests above never exercise
+// this: only one device ever blocks there.
+//
+// These scenarios model both-devices-as-dialers via `sync_until_settled`, which
+// alternates A→B then B→A rounds to a fixed point, and assert on BOTH sides:
+// materialized content equal AND `blocked_docs()` empty at quiescence — the two
+// checks the older tests omitted.
+
+/// Drive realistic auto-sync to QUIESCENCE: alternate A-dials-B then B-dials-A
+/// rounds (both devices are dialers, the real shape) until a fixed point —
+/// neither side's round reports a new block AND both materialized texts are
+/// equal AND neither side still lists a `blocked_docs()` entry — or the
+/// `max_rounds` cap is hit (asserts it settled within the cap). Each side is
+/// passed as a `(oplog, doc_id)` pair so the fixed-point check can materialize
+/// and compare both sides' content. Returns the two nodes so the caller keeps
+/// driving / asserting.
+///
+/// This is the core both-dialers methodology piece: a single resolution on ONE
+/// device must propagate through these alternating rounds to converge the content
+/// AND clear the OTHER device's independent stale block.
+async fn sync_until_settled<'a>(
+    mut a: SyncNode,
+    mut b: SyncNode,
+    side_a: (&'a Arc<OpLog>, &'a str),
+    side_b: (&'a Arc<OpLog>, &'a str),
+    max_rounds: usize,
+) -> (SyncNode, SyncNode) {
+    let (oplog_a, doc_a) = side_a;
+    let (oplog_b, doc_b) = side_b;
+    let mut settled = false;
+    for round in 0..max_rounds {
+        // A dials B.
+        let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_b = spawn_responder(b, Duration::from_secs(3));
+        let ra = a.sync_once(&addr_b).await.unwrap();
+        b = server_b.await.unwrap();
+
+        // B dials A.
+        let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_a = spawn_responder(a, Duration::from_secs(3));
+        let rb = b.sync_once(&addr_a).await.unwrap();
+        a = server_a.await.unwrap();
+
+        // Fixed point: this full pair reported no NEW blocks, neither side still
+        // holds a persistent block, and both materialize the same text.
+        let text_a = oplog_a.materialize_accepted(doc_a).unwrap().text;
+        let text_b = oplog_b.materialize_accepted(doc_b).unwrap().text;
+        let no_new_blocks = ra.blocked.is_empty() && rb.blocked.is_empty();
+        let no_persistent_blocks = a.blocked_docs().is_empty() && b.blocked_docs().is_empty();
+        if no_new_blocks && no_persistent_blocks && text_a == text_b {
+            tracing::info!(round, "sync_until_settled: reached quiescence");
+            settled = true;
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "sync did not reach quiescence within {max_rounds} rounds: \
+         a_blocked={:?} b_blocked={:?} text_a={:?} text_b={:?}",
+        a.blocked_docs(),
+        b.blocked_docs(),
+        oplog_a.materialize_accepted(doc_a).unwrap().text,
+        oplog_b.materialize_accepted(doc_b).unwrap().text,
+    );
+    (a, b)
+}
+
+/// Make BOTH bound devices independently detect + block a same-region conflict
+/// (each is a dialer in turn), then return the nodes still blocked. Shared setup
+/// for the same-region both-sides scenarios. After this both `blocked_docs()` are
+/// non-empty for `path`.
+async fn both_block_same_region(
+    a: SyncNode,
+    b: SyncNode,
+) -> (SyncNode, SyncNode) {
+    // B dials A → B blocks.
+    let mut b = b;
+    let mut a = a;
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr).await.unwrap();
+    a = server.await.unwrap();
+    assert!(!b.blocked_docs().is_empty(), "B blocked on its round");
+    // A dials B → A independently blocks too.
+    let addrb = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb = spawn_responder(b, Duration::from_secs(3));
+    a.sync_once(&addrb).await.unwrap();
+    b = serverb.await.unwrap();
+    assert!(
+        !a.blocked_docs().is_empty(),
+        "A independently blocks too — the realistic both-dialers case"
+    );
+    (a, b)
+}
+
+/// SAME-REGION, both-sides, driven through the quiescence helper: BOTH block,
+/// the user resolves keep-theirs on ONE side, and the alternating rounds converge
+/// BOTH sides AND clear BOTH blocks. (The hand-rolled variant
+/// `same_region_both_sides_block_then_one_resolves_clears_both` already covers
+/// this; this drives it through `sync_until_settled` as the methodology baseline.)
+/// [sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_both_block_resolve_one_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/contended.md";
+    let seed = "title\nbody line\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    let (a, b) = both_block_same_region(a, b).await;
+
+    // User resolves keep-theirs on B ONLY (A gets no decision).
+    b.set_fork_resolution(path.to_string(), Resolution::KeepTheirs);
+
+    // Drive to quiescence: B's resolution converges content to A's, and A's
+    // independent stale block auto-clears once its content converges.
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    // BOTH sides: content equal to the resolved (theirs = A's) text AND no block.
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text, "A == resolved text");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B == resolved text");
+    assert!(a.blocked_docs().is_empty(), "A's stale block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+}
+
+// --- delete-vs-edit, both-sides ----------------------------------------------
+
+/// Make BOTH bound devices independently detect + block a delete-vs-edit
+/// conflict. A deletes, B edits (or symmetric, per the seeded oplogs). Each dials
+/// in turn so BOTH record a `delete-vs-edit` block. Returns the nodes still
+/// blocked.
+async fn both_block_delete_vs_edit(a: SyncNode, b: SyncNode) -> (SyncNode, SyncNode) {
+    let mut b = b;
+    let mut a = a;
+    // B dials A → B blocks delete-vs-edit.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    a = server.await.unwrap();
+    assert!(
+        rb.blocked.iter().any(|(_, r)| r == "delete-vs-edit"),
+        "B blocks delete-vs-edit on its round: {rb:?}"
+    );
+    // A dials B → A independently blocks delete-vs-edit too.
+    let addrb = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addrb).await.unwrap();
+    b = serverb.await.unwrap();
+    assert!(
+        ra.blocked.iter().any(|(_, r)| r == "delete-vs-edit"),
+        "A independently blocks delete-vs-edit too (both-dialers): {ra:?}"
+    );
+    (a, b)
+}
+
+/// DELETE-VS-EDIT, both-sides, Keep-edit: A deletes while B edits; BOTH dial and
+/// BOTH block delete-vs-edit. The user resolves Keep-edit on ONE side (B). Driving
+/// to quiescence must converge BOTH to the live edited doc AND clear BOTH blocks —
+/// including A's independent block, which has NO queued decision and must
+/// auto-clear once the content converges out-of-band (the stale-block fix for the
+/// delete-vs-edit re-eval path). [sync-conflict-delete-vs-edit,
+/// sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_both_block_keep_edit_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/dve-both.md";
+    let seed = "title\nbody line\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, db) = bound_pair(&key, path, seed).await;
+    // A deletes, B edits — a genuine concurrent delete-vs-edit.
+    let edited = "title\nbody EDITED BY B\n";
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    oplog_b.apply_user_text(&doc_b, edited).unwrap();
+
+    let (a, b) = both_block_delete_vs_edit(a, b).await;
+
+    // User resolves Keep-edit on B ONLY. A stays blocked with no decision.
+    b.set_fork_resolution(path.to_string(), Resolution::KeepEdit);
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 10).await;
+
+    // BOTH converge to the LIVE edited doc (not tombstoned), with the edit text.
+    let ma = oplog_a.materialize_accepted(&doc_a).unwrap();
+    let mb = oplog_b.materialize_accepted(&doc_b).unwrap();
+    assert!(!ma.tombstone, "A resurrected to live");
+    assert!(!mb.tombstone, "B stays live");
+    assert_eq!(ma.text, edited, "A holds the edited content");
+    assert_eq!(mb.text, edited, "B holds the edited content");
+    // BOTH blocks cleared — A's stale block auto-cleared (no decision queued there).
+    assert!(a.blocked_docs().is_empty(), "A's stale delete-vs-edit block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+    assert!(db.path().join(path).exists(), "B's .md is back on disk (resurrected)");
+}
+
+/// DELETE-VS-EDIT, both-sides, Keep-deleted: A deletes while B edits; BOTH dial
+/// and BOTH block. The user resolves Keep-deleted on ONE side (B). Driving to
+/// quiescence converges BOTH to deleted AND clears BOTH blocks — A's independent
+/// block (no decision) auto-clears once the tombstone converges. [sync-conflict-delete-vs-edit]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_both_block_keep_deleted_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/dve-both-del.md";
+    let seed = "title\nbody line\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, db) = bound_pair(&key, path, seed).await;
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    oplog_b.apply_user_text(&doc_b, "title\nbody EDITED BY B\n").unwrap();
+    assert!(db.path().join(path).exists(), "B's edited .md exists before resolve");
+
+    let (a, b) = both_block_delete_vs_edit(a, b).await;
+
+    // Keep-deleted on B ONLY; A stays blocked with no decision.
+    b.set_fork_resolution(path.to_string(), Resolution::KeepDeleted);
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 10).await;
+
+    // BOTH converge to deleted (tombstoned), BOTH blocks cleared.
+    assert!(oplog_a.materialize_accepted(&doc_a).unwrap().tombstone, "A deleted");
+    assert!(oplog_b.materialize_accepted(&doc_b).unwrap().tombstone, "B deleted");
+    assert!(a.blocked_docs().is_empty(), "A's stale block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+    assert!(!db.path().join(path).exists(), "B's .md trashed on keep-deleted");
+}
+
+// --- rename-collision, both-sides --------------------------------------------
+
+/// Make BOTH devices independently detect + block a concurrent-rename collision.
+/// Each renamed a DIFFERENT doc onto `target.md`; each dials in turn so BOTH
+/// record a `rename-collision` block. Returns the nodes still blocked.
+async fn both_block_rename_collision(a: SyncNode, b: SyncNode) -> (SyncNode, SyncNode) {
+    let mut b = b;
+    let mut a = a;
+    let target = "notes/target.md";
+    // B dials A → B blocks rename-collision.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    a = server.await.unwrap();
+    assert!(
+        rb.blocked.iter().any(|(p, r)| p == target && r == "rename-collision"),
+        "B blocks rename-collision on its round: {rb:?}"
+    );
+    // A dials B → A independently blocks rename-collision too.
+    let addrb = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addrb).await.unwrap();
+    b = serverb.await.unwrap();
+    assert!(
+        ra.blocked.iter().any(|(p, r)| p == target && r == "rename-collision"),
+        "A independently blocks rename-collision too (both-dialers): {ra:?}"
+    );
+    (a, b)
+}
+
+/// RENAME-COLLISION, both-sides, Keep-theirs: both rename different docs onto
+/// `target.md`; BOTH dial and BOTH block. The user resolves Keep-theirs on ONE
+/// side (B): the PEER's (A's) doc wins the path, B's own moves to a conflict
+/// sibling. Driving to quiescence converges BOTH on the path assignment AND
+/// clears BOTH blocks — A's independent block (no decision) auto-clears once the
+/// collision is gone out-of-band (the stale-block fix for the rename-collision
+/// re-eval path). [sync-concurrent-rename-not-merged, sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_both_block_keep_theirs_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+    let target = "notes/target.md";
+
+    let (a, b) = both_block_rename_collision(a, b).await;
+
+    // Keep-theirs on B ONLY: A's doc wins target.md, B moves its bar aside. A has
+    // no decision — its independent block must auto-clear once the collision is gone.
+    b.set_fork_resolution(target.to_string(), Resolution::KeepTheirs);
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 12).await;
+
+    // BOTH converge on the path assignment: A's content at target.md on both.
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        a_content,
+        "A keeps its content at target.md"
+    );
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_content,
+        "B's target.md adopted A's content (theirs won the path)"
+    );
+    // B's bar survives as a conflict copy.
+    assert_eq!(conflict_copy_text(&oplog_b), b_content, "B's bar preserved as conflict copy");
+    // BOTH blocks cleared (A's auto-cleared with no decision).
+    assert!(a.blocked_docs().is_empty(), "A's stale rename-collision block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+}
+
+/// RENAME-COLLISION, both-sides, Keep-both: both rename different docs onto
+/// `target.md`; BOTH block. The user resolves Keep-both on ONE side; the
+/// deterministic (`min(fingerprint)`) winner keeps the path, the loser becomes a
+/// conflict sibling — so both devices agree on the assignment. Driving to
+/// quiescence converges BOTH on the assignment AND clears BOTH blocks.
+/// [sync-concurrent-rename-not-merged]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_both_block_keep_both_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+    let target = "notes/target.md";
+
+    // Deterministic winner of the path: smaller fingerprint.
+    let b_keeps_path = b.fingerprint().0 < a.fingerprint().0;
+    let (path_text, copy_text) = if b_keeps_path {
+        (b_content, a_content)
+    } else {
+        (a_content, b_content)
+    };
+
+    let (a, b) = both_block_rename_collision(a, b).await;
+
+    b.set_fork_resolution(target.to_string(), Resolution::KeepBoth);
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 12).await;
+
+    // BOTH converge to the same deterministic assignment.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        path_text,
+        "deterministic winner at target.md on B"
+    );
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        path_text,
+        "A converges to the same winner at target.md"
+    );
+    assert_eq!(conflict_copy_text(&oplog_b), copy_text, "loser preserved as conflict copy on B");
+    assert_eq!(conflict_copy_text(&oplog_a), copy_text, "A has the same loser as a conflict copy");
+    assert!(a.blocked_docs().is_empty(), "A's stale block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+}
+
+// --- fork, both-sides --------------------------------------------------------
+
+/// FORK (disjoint lineages over a shared seed), both-sides: both independently
+/// fork and BOTH block. The user resolves keep-theirs on ONE side (B). Driving to
+/// quiescence converges BOTH to A's content AND clears BOTH blocks — A's
+/// independent fork block auto-clears once it re-classifies as a fast-forward
+/// against B's now-adopted (A's) lineage. [sync-blocked-state]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_both_block_keep_theirs_settles_both() {
+    use hiker_sync::identity::Resolution;
+    let seed = "title\nbody line\n";
+    let a_text = "title\nbody edited by A\n";
+    let b_text = "title\nbody edited by B\n";
+
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/forked-both.md";
+    let doc_a = oplog_a.create_document(path, "note", seed, &Author::User).unwrap();
+    let doc_b = oplog_b.create_document(path, "note", seed, &Author::User).unwrap();
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // BOTH fork: B dials A, then A dials B.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    let mut a = server.await.unwrap();
+    assert!(rb.blocked.iter().any(|(p, r)| p == path && r == "fork"), "B forks: {rb:?}");
+    let addrb = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let serverb = spawn_responder(b, Duration::from_secs(3));
+    let ra = a.sync_once(&addrb).await.unwrap();
+    let b = serverb.await.unwrap();
+    assert!(ra.blocked.iter().any(|(p, r)| p == path && r == "fork"), "A independently forks: {ra:?}");
+
+    // Keep-theirs on B ONLY. A has no decision.
+    let b = b;
+    b.set_fork_resolution(path.to_string(), Resolution::KeepTheirs);
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 10).await;
+
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text, "A keeps its content");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B adopted A's content");
+    assert!(a.blocked_docs().is_empty(), "A's stale fork block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's fork block cleared: {:?}", b.blocked_docs());
+}
+
+// --- deeper multi-step sequences through the helper --------------------------
+
+/// DEEPER: conflict → resolve → both edit again in DISJOINT regions → drive →
+/// converge with NO spurious block. A same-region conflict is resolved keep-theirs
+/// (both-sides), then BOTH devices make fresh edits to DISJOINT regions of the now
+/// shared-lineage doc. Driving to quiescence must merge both disjoint edits with
+/// no re-block on either side — proving the post-resolution lineage is genuinely
+/// shared and steady-state CRDT merge works. [sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflict_resolve_then_disjoint_edits_converge_no_block() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/seq-disjoint.md";
+    let seed = "HEAD base\nMID line\nTAIL base\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    // Same-region conflict on the MID line.
+    oplog_a.apply_user_text(&doc_a, "HEAD base\nMID edited by A\nTAIL base\n").unwrap();
+    oplog_b.apply_user_text(&doc_b, "HEAD base\nMID edited by B\nTAIL base\n").unwrap();
+
+    let (a, b) = both_block_same_region(a, b).await;
+    b.set_fork_resolution(path.to_string(), Resolution::KeepTheirs);
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+    let resolved = "HEAD base\nMID edited by A\nTAIL base\n";
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, resolved, "A resolved");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, resolved, "B resolved");
+
+    // Now BOTH edit DISJOINT regions (A the HEAD, B the TAIL) on the shared lineage.
+    oplog_a.apply_user_text(&doc_a, "HEAD ALPHA-mark\nMID edited by A\nTAIL base\n").unwrap();
+    oplog_b.apply_user_text(&doc_b, "HEAD base\nMID edited by A\nTAIL OMEGA-mark\n").unwrap();
+
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, text_b, "both converge to one merged text: a={text_a:?} b={text_b:?}");
+    for t in [&text_a, &text_b] {
+        assert_eq!(t.matches("ALPHA-mark").count(), 1, "A's disjoint edit once: {t:?}");
+        assert_eq!(t.matches("OMEGA-mark").count(), 1, "B's disjoint edit once: {t:?}");
+    }
+    assert!(a.blocked_docs().is_empty(), "no spurious block on A: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "no spurious block on B: {:?}", b.blocked_docs());
+}
+
+/// DEEPER: same-region conflict resolved Keep-both (both-sides) → the
+/// `conflict-` sibling note ALSO syncs to the other device. After both-sides
+/// resolution the original path holds A's content on both, B's losing text
+/// survives as a `conflict-` sibling on B, and driving to quiescence propagates
+/// that sibling note to A as well (it's a normal indexed note). Both converge on
+/// the original path AND on the sibling, no block. [sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_region_keep_both_sibling_syncs_to_peer() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/seq-keepboth.md";
+    let seed = "title\nbody line\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    let a_text = "title\nbody EDITED BY A\n";
+    let b_text = "title\nbody EDITED BY B\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    let (a, b) = both_block_same_region(a, b).await;
+    // Keep-both on B: A's text wins the path, B's survives as a conflict sibling.
+    b.set_fork_resolution(path.to_string(), Resolution::KeepBoth);
+
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 10).await;
+
+    // Original path: A's content on BOTH.
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, a_text, "A at the path");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B adopted A at the path");
+    // The conflict sibling preserves B's losing text on B...
+    let sibling_text = |oplog: &OpLog| -> Option<String> {
+        oplog
+            .list_doc_ids()
+            .unwrap()
+            .into_iter()
+            .find(|id| {
+                oplog
+                    .path_for_doc(id)
+                    .unwrap()
+                    .map(|p| p.contains(".conflict-"))
+                    .unwrap_or(false)
+            })
+            .map(|id| oplog.materialize_accepted(&id).unwrap().text)
+    };
+    assert_eq!(sibling_text(&oplog_b).as_deref(), Some(b_text), "B holds its losing text as a sibling");
+    // ...and that sibling note syncs to A as a normal indexed note.
+    assert_eq!(
+        sibling_text(&oplog_a).as_deref(),
+        Some(b_text),
+        "the conflict sibling propagated to A"
+    );
+    assert!(a.blocked_docs().is_empty(), "no block on A: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "no block on B: {:?}", b.blocked_docs());
+}
+
+// --- restart re-hydration: stale block must auto-clear on re-eval ------------
+
+/// Build a fresh [`SyncNode`] over an EXISTING vault (the same `Arc<OpLog>`),
+/// modelling an app RESTART: the durable `blocked.json` is re-hydrated, so the
+/// node comes up with the doc's status forced `Blocked` again (see
+/// `SyncNode::new`). Shares `content_key` and a fresh keypair pinned so the node
+/// is non-canonical/canonical as the caller needs is not required here. Used to
+/// exercise the blocked re-eval paths (`resolve_delete_vs_edit` /
+/// `resolve_rename_collision`) when the conflict has ALREADY converged
+/// out-of-band — the persisted block is now stale and must auto-clear.
+fn rebuild_node(content_key: &ContentKey, oplog: &Arc<OpLog>, keypair: DeviceKeypair) -> SyncNode {
+    SyncNode::new(
+        Arc::clone(oplog),
+        SharedContentKey::new(ContentKey::from_bytes(*content_key.as_bytes())),
+        keypair,
+        Settings::default(),
+        EnrolledPeers::new(),
+    )
+}
+
+/// REGRESSION (`bug-sync-delete-vs-edit-stale-block-on-peer`): a delete-vs-edit
+/// block that has CONVERGED out-of-band (resolved on the other device) must
+/// auto-clear when the blocked side re-evaluates — not re-block forever. We model
+/// the realistic restart: B blocks delete-vs-edit and persists it, the conflict
+/// is then resolved+converged on the shared lineage, and B is REBUILT (its block
+/// re-hydrates with status forced `Blocked`). On B's next round — routed to
+/// `resolve_delete_vs_edit` with NO queued decision because the status is
+/// Blocked — the re-eval sees the verdict is no longer a conflict (both sides
+/// agree) and AUTO-CLEARS the stale block instead of re-blocking.
+/// [sync-conflict-delete-vs-edit, sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_vs_edit_stale_block_auto_clears_on_reeval() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let path = "notes/dve-stale.md";
+    let seed = "title\nbody line\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) = bound_pair(&key, path, seed).await;
+    let kp_b = b.fingerprint();
+    let _ = kp_b;
+    // A deletes, B edits → both detect delete-vs-edit.
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    oplog_b.apply_user_text(&doc_b, "title\nbody EDITED BY B\n").unwrap();
+    let (a, b) = both_block_delete_vs_edit(a, b).await;
+    assert!(!b.blocked_docs().is_empty(), "B blocked before resolution");
+
+    // Resolve keep-deleted on B; converge so BOTH reach the tombstone state.
+    b.set_fork_resolution(path.to_string(), Resolution::KeepDeleted);
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+    assert!(oplog_a.materialize_accepted(&doc_a).unwrap().tombstone, "A converged to deleted");
+    assert!(oplog_b.materialize_accepted(&doc_b).unwrap().tombstone, "B converged to deleted");
+    drop((a, b));
+
+    // RESTART B: a fresh node over the SAME vault re-hydrates the (now stale)
+    // block from disk — status comes up forced Blocked even though the content
+    // already converged to deleted out-of-band. Manually re-record the block to
+    // model a persisted block that survived (the converge above cleared it; we
+    // simulate the restart-with-stale-block by recording it again, no decision).
+    let mut b2 = rebuild_node(&key, &oplog_b, DeviceKeypair::generate());
+    let mut a2 = rebuild_node(&key, &oplog_a, DeviceKeypair::generate());
+    enroll_each_other(&a2, &b2);
+    b2.record_blocked_for_test(path, "delete-vs-edit", &a2.fingerprint());
+    assert_eq!(
+        b2.status_of_path(path),
+        Some(SyncStatus::Blocked),
+        "rebuilt B comes up Blocked (re-hydrated stale block)"
+    );
+
+    // B2 dials A2 → routed to resolve_delete_vs_edit with NO decision. The
+    // conflict is gone (both deleted), so the re-eval must AUTO-CLEAR, not re-block.
+    let addr = a2.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a2, Duration::from_secs(3));
+    let rb = b2.sync_once(&addr).await.unwrap();
+    let _a2 = server.await.unwrap();
+    assert!(rb.blocked.is_empty(), "stale delete-vs-edit block does not re-block: {rb:?}");
+    assert!(
+        b2.blocked_docs().is_empty(),
+        "stale delete-vs-edit block auto-cleared on re-eval: {:?}",
+        b2.blocked_docs()
+    );
+}
+
+/// REGRESSION (`bug-sync-rename-collision-stale-block-on-peer`): a
+/// rename-collision block that no longer collides (resolved + converged
+/// out-of-band) must auto-clear on re-eval rather than re-block forever. Modelled
+/// via a restart: B blocks the collision, it is resolved so the lineages converge
+/// at the path, then B is rebuilt with the (now stale) block re-hydrated and
+/// dials A — routed to `resolve_rename_collision` with NO decision. The re-eval
+/// sees the collision is gone (our doc no longer disjoint from the peer's at the
+/// path) and AUTO-CLEARS. [sync-concurrent-rename-not-merged, sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_collision_stale_block_auto_clears_on_reeval() {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let a_content = "this is foo's content from A\n";
+    let b_content = "this is bar's content from B\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        rename_collision_setup(&key, a_content, b_content).await;
+    let target = "notes/target.md";
+    let (a, b) = both_block_rename_collision(a, b).await;
+
+    // Resolve keep-theirs on B; converge so both share A's lineage at target.md.
+    b.set_fork_resolution(target.to_string(), Resolution::KeepTheirs);
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 12).await;
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_content, "B adopted A at target");
+    drop((a, b));
+
+    // RESTART B with a re-hydrated (now stale) rename-collision block.
+    let mut b2 = rebuild_node(&key, &oplog_b, DeviceKeypair::generate());
+    let mut a2 = rebuild_node(&key, &oplog_a, DeviceKeypair::generate());
+    enroll_each_other(&a2, &b2);
+    b2.record_blocked_for_test(target, "rename-collision", &a2.fingerprint());
+    assert_eq!(b2.status_of_path(target), Some(SyncStatus::Blocked), "rebuilt B Blocked");
+
+    // B2 dials A2 → routed to resolve_rename_collision, no decision. The lineages
+    // already converged at the path, so the collision is gone → auto-clear.
+    let addr = a2.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a2, Duration::from_secs(3));
+    let rb = b2.sync_once(&addr).await.unwrap();
+    let _a2 = server.await.unwrap();
+    assert!(rb.blocked.is_empty(), "stale rename-collision block does not re-block: {rb:?}");
+    assert!(
+        b2.blocked_docs().is_empty(),
+        "stale rename-collision block auto-cleared on re-eval: {:?}",
+        b2.blocked_docs()
+    );
+}
+
+// ===========================================================================
+// Wave 7 — structured (NON-NOTE) document types over the op-log sync path.
+//
+// Canvas (`.canvas` JSON), cluster-trees (markdown + `hiker.*` frontmatter),
+// trails (markdown + `hiker.waypoints` YAML), and kanban boards all sync as
+// their serialized bytes EXACTLY like a note: at the sync layer a doc is just
+// bytes at a vault path, and the same-region conflict gate runs a char-level
+// Myers diff over that text (see `core::oplog::doc::spans_overlap`). These
+// scenarios exercise the REAL serialized shapes (not toy strings) so we have
+// coverage that the byte-level merge + same-region detection behaves sensibly
+// on JSON / YAML content, where edits are nested inside arrays/maps rather than
+// on prose lines.
+//
+// Each structured type contributes four scenarios, all driven through the same
+// both-devices-are-dialers helpers (`bound_pair`, `sync_until_settled`):
+//   1. round-trip      — edit on one device converges byte-equal to the other
+//   2. disjoint merge  — non-overlapping structural edits auto-merge, NO block
+//   3. same-region     — both edit the SAME element → BLOCK, resolve, converge
+//   4. delete          — tombstone one structured doc → propagates to the peer
+//
+// The seeds below are realistic serializations per:
+//   canvas  — hiker-canvas/core/src/model.rs (JSON Canvas 1.0)
+//   tree    — core/src/trees/store.rs (`hiker.kind: cluster-tree`)
+//   trail   — core/src/trails/mod.rs (`hiker.kind: trail`, recursive waypoints)
+//   kanban  — docs/kanban.md (`hiker.kind: board`, columns/cards)
+// They are kept here as plain `&str` (the sync layer needs only the bytes), so
+// hiker-sync gains no dependency on those crates.
+
+/// A structured doc fixture: the path it lives at, a realistic serialized seed,
+/// two DISJOINT edits (touch non-overlapping byte regions — must auto-merge),
+/// and two SAME-element edits (touch one overlapping region — must block).
+struct StructuredDoc {
+    path: &'static str,
+    seed: &'static str,
+    /// Disjoint: device-A edit and device-B edit hit different byte ranges.
+    disjoint_a: &'static str,
+    disjoint_b: &'static str,
+    /// A unique marker present in each disjoint edit, to assert it survived once.
+    disjoint_marker_a: &'static str,
+    disjoint_marker_b: &'static str,
+    /// Same element: both edits rewrite the SAME byte region (a real conflict).
+    same_a: &'static str,
+    same_b: &'static str,
+}
+
+// --- canvas: JSON Canvas 1.0, pretty-printed (multi-line, tab-indented) -----
+//
+// Two text nodes and one edge. Disjoint edit A repositions node `n1` (its `x`);
+// disjoint edit B adds a brand-new EDGE to the `edges` array — non-overlapping
+// regions of the JSON. Same-region edit moves the SAME node `n1`'s coords two
+// different ways.
+const CANVAS: StructuredDoc = StructuredDoc {
+    path: "diagrams/architecture.canvas",
+    seed: "{\n\
+\t\"nodes\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"n1\",\n\
+\t\t\t\"x\": 0,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Ingest pipeline\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"n2\",\n\
+\t\t\t\"x\": 400,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Vector store\"\n\
+\t\t}\n\
+\t],\n\
+\t\"edges\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"e1\",\n\
+\t\t\t\"fromNode\": \"n1\",\n\
+\t\t\t\"toNode\": \"n2\"\n\
+\t\t}\n\
+\t]\n\
+}\n",
+    // A moves n1: x 0 -> 64. (Edits only the n1 `x` value region.)
+    disjoint_a: "{\n\
+\t\"nodes\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"n1\",\n\
+\t\t\t\"x\": 64,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Ingest pipeline\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"n2\",\n\
+\t\t\t\"x\": 400,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Vector store\"\n\
+\t\t}\n\
+\t],\n\
+\t\"edges\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"e1\",\n\
+\t\t\t\"fromNode\": \"n1\",\n\
+\t\t\t\"toNode\": \"n2\"\n\
+\t\t}\n\
+\t]\n\
+}\n",
+    // B adds a second edge e2 (a new element in the `edges` array region).
+    disjoint_b: "{\n\
+\t\"nodes\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"n1\",\n\
+\t\t\t\"x\": 0,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Ingest pipeline\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"n2\",\n\
+\t\t\t\"x\": 400,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Vector store\"\n\
+\t\t}\n\
+\t],\n\
+\t\"edges\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"e1\",\n\
+\t\t\t\"fromNode\": \"n1\",\n\
+\t\t\t\"toNode\": \"n2\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"e2\",\n\
+\t\t\t\"fromNode\": \"n2\",\n\
+\t\t\t\"toNode\": \"n1\"\n\
+\t\t}\n\
+\t]\n\
+}\n",
+    disjoint_marker_a: "\"x\": 64",
+    disjoint_marker_b: "\"id\": \"e2\"",
+    // Both move the SAME node n1's x to DIFFERENT values (same byte region).
+    same_a: "{\n\
+\t\"nodes\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"n1\",\n\
+\t\t\t\"x\": 100,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Ingest pipeline\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"n2\",\n\
+\t\t\t\"x\": 400,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Vector store\"\n\
+\t\t}\n\
+\t],\n\
+\t\"edges\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"e1\",\n\
+\t\t\t\"fromNode\": \"n1\",\n\
+\t\t\t\"toNode\": \"n2\"\n\
+\t\t}\n\
+\t]\n\
+}\n",
+    same_b: "{\n\
+\t\"nodes\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"n1\",\n\
+\t\t\t\"x\": 200,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Ingest pipeline\"\n\
+\t\t},\n\
+\t\t{\n\
+\t\t\t\"id\": \"n2\",\n\
+\t\t\t\"x\": 400,\n\
+\t\t\t\"y\": 0,\n\
+\t\t\t\"width\": 240,\n\
+\t\t\t\"height\": 120,\n\
+\t\t\t\"type\": \"text\",\n\
+\t\t\t\"text\": \"Vector store\"\n\
+\t\t}\n\
+\t],\n\
+\t\"edges\": [\n\
+\t\t{\n\
+\t\t\t\"id\": \"e1\",\n\
+\t\t\t\"fromNode\": \"n1\",\n\
+\t\t\t\"toNode\": \"n2\"\n\
+\t\t}\n\
+\t]\n\
+}\n",
+};
+
+// --- cluster-tree: markdown + `hiker.kind: cluster-tree` frontmatter --------
+//
+// A flat node list under `hiker.nodes` (children implied by `parent`). Disjoint
+// edit A renames leaf `n1`; disjoint edit B renames leaf `n2` (different list
+// entries, distinct byte regions). Same-region edits rename the SAME leaf `n1`.
+const TREE: StructuredDoc = StructuredDoc {
+    path: "cluster-trees/semantic.md",
+    seed: "---\n\
+hiker:\n\
+  kind: cluster-tree\n\
+  id: '01KSG5MBTAEEW98M6BY06TYSFX'\n\
+  name: Semantic\n\
+  source: review:confirm\n\
+  state: draft\n\
+  created_at_ms: 1779732983626\n\
+  nodes:\n\
+  - id: root\n\
+    kind: cluster\n\
+    name: 'Vault: notes'\n\
+    confidence: 1.0\n\
+  - id: n1\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-1\n\
+      path: notes/alpha.md\n\
+    name: Alpha cluster\n\
+    confidence: 0.9\n\
+  - id: n2\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-2\n\
+      path: notes/beta.md\n\
+    name: Beta cluster\n\
+    confidence: 0.8\n\
+---\n\
+<!-- Cluster tree. The structure lives in the `hiker:` frontmatter above. -->\n",
+    disjoint_a: "---\n\
+hiker:\n\
+  kind: cluster-tree\n\
+  id: '01KSG5MBTAEEW98M6BY06TYSFX'\n\
+  name: Semantic\n\
+  source: review:confirm\n\
+  state: draft\n\
+  created_at_ms: 1779732983626\n\
+  nodes:\n\
+  - id: root\n\
+    kind: cluster\n\
+    name: 'Vault: notes'\n\
+    confidence: 1.0\n\
+  - id: n1\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-1\n\
+      path: notes/alpha.md\n\
+    name: Alpha RENAMED-A\n\
+    confidence: 0.9\n\
+  - id: n2\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-2\n\
+      path: notes/beta.md\n\
+    name: Beta cluster\n\
+    confidence: 0.8\n\
+---\n\
+<!-- Cluster tree. The structure lives in the `hiker:` frontmatter above. -->\n",
+    disjoint_b: "---\n\
+hiker:\n\
+  kind: cluster-tree\n\
+  id: '01KSG5MBTAEEW98M6BY06TYSFX'\n\
+  name: Semantic\n\
+  source: review:confirm\n\
+  state: draft\n\
+  created_at_ms: 1779732983626\n\
+  nodes:\n\
+  - id: root\n\
+    kind: cluster\n\
+    name: 'Vault: notes'\n\
+    confidence: 1.0\n\
+  - id: n1\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-1\n\
+      path: notes/alpha.md\n\
+    name: Alpha cluster\n\
+    confidence: 0.9\n\
+  - id: n2\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-2\n\
+      path: notes/beta.md\n\
+    name: Beta RENAMED-B\n\
+    confidence: 0.8\n\
+---\n\
+<!-- Cluster tree. The structure lives in the `hiker:` frontmatter above. -->\n",
+    disjoint_marker_a: "Alpha RENAMED-A",
+    disjoint_marker_b: "Beta RENAMED-B",
+    // Both rename the SAME leaf n1 differently.
+    same_a: "---\n\
+hiker:\n\
+  kind: cluster-tree\n\
+  id: '01KSG5MBTAEEW98M6BY06TYSFX'\n\
+  name: Semantic\n\
+  source: review:confirm\n\
+  state: draft\n\
+  created_at_ms: 1779732983626\n\
+  nodes:\n\
+  - id: root\n\
+    kind: cluster\n\
+    name: 'Vault: notes'\n\
+    confidence: 1.0\n\
+  - id: n1\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-1\n\
+      path: notes/alpha.md\n\
+    name: Alpha PICKED-BY-A\n\
+    confidence: 0.9\n\
+  - id: n2\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-2\n\
+      path: notes/beta.md\n\
+    name: Beta cluster\n\
+    confidence: 0.8\n\
+---\n\
+<!-- Cluster tree. The structure lives in the `hiker:` frontmatter above. -->\n",
+    same_b: "---\n\
+hiker:\n\
+  kind: cluster-tree\n\
+  id: '01KSG5MBTAEEW98M6BY06TYSFX'\n\
+  name: Semantic\n\
+  source: review:confirm\n\
+  state: draft\n\
+  created_at_ms: 1779732983626\n\
+  nodes:\n\
+  - id: root\n\
+    kind: cluster\n\
+    name: 'Vault: notes'\n\
+    confidence: 1.0\n\
+  - id: n1\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-1\n\
+      path: notes/alpha.md\n\
+    name: Alpha PICKED-BY-B\n\
+    confidence: 0.9\n\
+  - id: n2\n\
+    parent: root\n\
+    kind: leaf\n\
+    note:\n\
+      id: note-2\n\
+      path: notes/beta.md\n\
+    name: Beta cluster\n\
+    confidence: 0.8\n\
+---\n\
+<!-- Cluster tree. The structure lives in the `hiker:` frontmatter above. -->\n",
+};
+
+// --- trail: markdown + recursive `hiker.waypoints` YAML ---------------------
+//
+// A trail-doc with two root waypoints, the first carrying a nested child
+// subtree. Disjoint edit A appends a child to the FIRST root's subtree; disjoint
+// edit B appends a NEW second-root sibling — different subtrees, distinct byte
+// regions. Same-region edits both repoint the SAME waypoint's `path`.
+const TRAIL: StructuredDoc = StructuredDoc {
+    path: "trails/research.md",
+    seed: "---\n\
+hiker:\n\
+  kind: trail\n\
+  waypoints:\n\
+  - path: trails/research/r1--AAAAAA.md\n\
+    waypoints:\n\
+    - path: trails/research/c1--BBBBBB.md\n\
+  - path: trails/research/r2--DDDDDD.md\n\
+---\n\
+trail prose body\n",
+    // A adds a child under the FIRST root's subtree.
+    disjoint_a: "---\n\
+hiker:\n\
+  kind: trail\n\
+  waypoints:\n\
+  - path: trails/research/r1--AAAAAA.md\n\
+    waypoints:\n\
+    - path: trails/research/c1--BBBBBB.md\n\
+    - path: trails/research/c2--ADDEDA.md\n\
+  - path: trails/research/r2--DDDDDD.md\n\
+---\n\
+trail prose body\n",
+    // B adds a new root-level sibling waypoint at the END.
+    disjoint_b: "---\n\
+hiker:\n\
+  kind: trail\n\
+  waypoints:\n\
+  - path: trails/research/r1--AAAAAA.md\n\
+    waypoints:\n\
+    - path: trails/research/c1--BBBBBB.md\n\
+  - path: trails/research/r2--DDDDDD.md\n\
+  - path: trails/research/r3--ADDEDB.md\n\
+---\n\
+trail prose body\n",
+    disjoint_marker_a: "c2--ADDEDA",
+    disjoint_marker_b: "r3--ADDEDB",
+    // Both repoint the SAME first child waypoint's path differently.
+    same_a: "---\n\
+hiker:\n\
+  kind: trail\n\
+  waypoints:\n\
+  - path: trails/research/r1--AAAAAA.md\n\
+    waypoints:\n\
+    - path: trails/research/c1--PICKEDA.md\n\
+  - path: trails/research/r2--DDDDDD.md\n\
+---\n\
+trail prose body\n",
+    same_b: "---\n\
+hiker:\n\
+  kind: trail\n\
+  waypoints:\n\
+  - path: trails/research/r1--AAAAAA.md\n\
+    waypoints:\n\
+    - path: trails/research/c1--PICKEDB.md\n\
+  - path: trails/research/r2--DDDDDD.md\n\
+---\n\
+trail prose body\n",
+};
+
+// --- kanban board: markdown + `hiker.kind: board` columns/cards YAML --------
+//
+// Three columns (Todo / Doing / Done). Disjoint edit A adds a card to `Todo`;
+// disjoint edit B adds a card to `Done` — different columns, distinct byte
+// regions. Same-region edits both rewrite the SAME existing card's path.
+const KANBAN: StructuredDoc = StructuredDoc {
+    path: "boards/roadmap.md",
+    seed: "---\n\
+hiker:\n\
+  kind: board\n\
+  columns:\n\
+  - name: Todo\n\
+    cards:\n\
+    - { path: research/raptor-paper.md }\n\
+  - name: Doing\n\
+    cards:\n\
+    - { path: work/migration.md }\n\
+  - name: Done\n\
+    cards: []\n\
+---\n\
+# Q3 Roadmap\n\
+\n\
+Board prose framing.\n",
+    // A appends a card to the Todo column.
+    disjoint_a: "---\n\
+hiker:\n\
+  kind: board\n\
+  columns:\n\
+  - name: Todo\n\
+    cards:\n\
+    - { path: research/raptor-paper.md }\n\
+    - { path: inbox/CARD-ADDED-A.md }\n\
+  - name: Doing\n\
+    cards:\n\
+    - { path: work/migration.md }\n\
+  - name: Done\n\
+    cards: []\n\
+---\n\
+# Q3 Roadmap\n\
+\n\
+Board prose framing.\n",
+    // B appends a card to the (empty) Done column.
+    disjoint_b: "---\n\
+hiker:\n\
+  kind: board\n\
+  columns:\n\
+  - name: Todo\n\
+    cards:\n\
+    - { path: research/raptor-paper.md }\n\
+  - name: Doing\n\
+    cards:\n\
+    - { path: work/migration.md }\n\
+  - name: Done\n\
+    cards:\n\
+    - { path: archive/CARD-ADDED-B.md }\n\
+---\n\
+# Q3 Roadmap\n\
+\n\
+Board prose framing.\n",
+    disjoint_marker_a: "CARD-ADDED-A",
+    disjoint_marker_b: "CARD-ADDED-B",
+    // Both repoint the SAME Doing card's path differently.
+    same_a: "---\n\
+hiker:\n\
+  kind: board\n\
+  columns:\n\
+  - name: Todo\n\
+    cards:\n\
+    - { path: research/raptor-paper.md }\n\
+  - name: Doing\n\
+    cards:\n\
+    - { path: work/migration-PICKEDA.md }\n\
+  - name: Done\n\
+    cards: []\n\
+---\n\
+# Q3 Roadmap\n\
+\n\
+Board prose framing.\n",
+    same_b: "---\n\
+hiker:\n\
+  kind: board\n\
+  columns:\n\
+  - name: Todo\n\
+    cards:\n\
+    - { path: research/raptor-paper.md }\n\
+  - name: Doing\n\
+    cards:\n\
+    - { path: work/migration-PICKEDB.md }\n\
+  - name: Done\n\
+    cards: []\n\
+---\n\
+# Q3 Roadmap\n\
+\n\
+Board prose framing.\n",
+};
+
+// --- scenario 1: round-trip per type ----------------------------------------
+
+/// Generic round-trip: A creates the structured doc, B adopts it (shared
+/// lineage via `bound_pair`), then A edits it and the edit converges to B
+/// byte-equal, no block. Asserts on BOTH sides. The `kind` tag rides in `meta`
+/// but the sync path treats the body as plain bytes — this proves a non-note
+/// serialized body survives the adopt + delta path intact.
+async fn roundtrip_structured(doc: &StructuredDoc) {
+    let key = ContentKey::generate();
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, doc.path, doc.seed).await;
+
+    // Both materialize the exact seed bytes after binding.
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, doc.seed);
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, doc.seed);
+
+    // A edits; drive to quiescence so B picks it up.
+    oplog_a.apply_user_text(&doc_a, doc.disjoint_a).unwrap();
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+    drop((a, b));
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, doc.disjoint_a, "A holds its edited structured body");
+    assert_eq!(text_b, text_a, "B converged byte-equal to A's structured body");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_round_trip_converges() {
+    roundtrip_structured(&CANVAS).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_round_trip_converges() {
+    roundtrip_structured(&TREE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_round_trip_converges() {
+    roundtrip_structured(&TRAIL).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kanban_round_trip_converges() {
+    roundtrip_structured(&KANBAN).await;
+}
+
+// --- scenario 2: disjoint structural edits auto-merge (NO block) ------------
+
+/// Generic disjoint-merge: A and B (bound on a shared lineage) make DISJOINT
+/// structural edits (different byte regions of the JSON/YAML). Driving to
+/// quiescence must auto-merge BOTH edits with NO block on either side — the
+/// desired CRDT behavior for disjoint edits. Asserts both markers survive
+/// exactly once on BOTH sides and `blocked_docs()` is empty.
+async fn disjoint_structured_auto_merges(doc: &StructuredDoc) {
+    let key = ContentKey::generate();
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, doc.path, doc.seed).await;
+
+    oplog_a.apply_user_text(&doc_a, doc.disjoint_a).unwrap();
+    oplog_b.apply_user_text(&doc_b, doc.disjoint_b).unwrap();
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    // No block on either side — disjoint edits must merge, not conflict.
+    assert!(a.blocked_docs().is_empty(), "A not blocked on disjoint edit: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B not blocked on disjoint edit: {:?}", b.blocked_docs());
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, text_b, "both converge to one merged structured body");
+    for text in [&text_a, &text_b] {
+        assert_eq!(
+            text.matches(doc.disjoint_marker_a).count(),
+            1,
+            "A's structural edit ({}) present exactly once: {text:?}",
+            doc.disjoint_marker_a
+        );
+        assert_eq!(
+            text.matches(doc.disjoint_marker_b).count(),
+            1,
+            "B's structural edit ({}) present exactly once: {text:?}",
+            doc.disjoint_marker_b
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_disjoint_edits_auto_merge() {
+    disjoint_structured_auto_merges(&CANVAS).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_disjoint_edits_auto_merge() {
+    disjoint_structured_auto_merges(&TREE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_disjoint_edits_auto_merge() {
+    disjoint_structured_auto_merges(&TRAIL).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kanban_disjoint_edits_auto_merge() {
+    disjoint_structured_auto_merges(&KANBAN).await;
+}
+
+// --- scenario 3: same-region structural conflict blocks, then resolves ------
+
+/// Generic same-region conflict: A and B (bound) both edit the SAME structural
+/// element (same node coords / same waypoint path / same card path) DIFFERENTLY.
+/// Each device, dialing in turn, must independently BLOCK with reason
+/// `same-region` (proving the char-level overlap detection fires on JSON/YAML
+/// content the same way it does on prose). Then the user resolves keep-theirs on
+/// ONE side and driving to quiescence converges BOTH sides to the peer's content
+/// AND clears BOTH blocks. Asserts on BOTH sides throughout.
+async fn same_region_structured_blocks_then_resolves(doc: &StructuredDoc) {
+    use hiker_sync::identity::Resolution;
+    let key = ContentKey::generate();
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, doc.path, doc.seed).await;
+
+    oplog_a.apply_user_text(&doc_a, doc.same_a).unwrap();
+    oplog_b.apply_user_text(&doc_b, doc.same_b).unwrap();
+
+    // BOTH devices independently detect the same-region overlap and BLOCK.
+    let (a, b) = both_block_same_region(a, b).await;
+    assert!(
+        a.blocked_docs().iter().any(|d| d.path == doc.path && d.reason == "same-region"),
+        "A blocked same-region on structured content: {:?}",
+        a.blocked_docs()
+    );
+    assert!(
+        b.blocked_docs().iter().any(|d| d.path == doc.path && d.reason == "same-region"),
+        "B blocked same-region on structured content: {:?}",
+        b.blocked_docs()
+    );
+    // The peer delta was HELD, not folded — each side stays at its own edit.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        doc.same_b,
+        "B held its own structured edit (no silent interleave)"
+    );
+
+    // Resolve keep-theirs on B ONLY; drive to quiescence. Both converge to A's
+    // (theirs, from B's view) content and BOTH blocks clear.
+    b.set_fork_resolution(doc.path.to_string(), Resolution::KeepTheirs);
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 12).await;
+
+    assert!(a.blocked_docs().is_empty(), "A's block cleared: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B's block cleared: {:?}", b.blocked_docs());
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, doc.same_a, "A keeps its (theirs = A's) resolved content");
+    assert_eq!(text_b, doc.same_a, "B adopted A's content on keep-theirs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_same_node_edit_blocks_then_resolves() {
+    same_region_structured_blocks_then_resolves(&CANVAS).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_same_node_edit_blocks_then_resolves() {
+    same_region_structured_blocks_then_resolves(&TREE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_same_waypoint_edit_blocks_then_resolves() {
+    same_region_structured_blocks_then_resolves(&TRAIL).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kanban_same_card_edit_blocks_then_resolves() {
+    same_region_structured_blocks_then_resolves(&KANBAN).await;
+}
+
+// --- scenario 4: delete a structured doc propagates as a tombstone ----------
+
+/// Generic delete-propagation: A and B share a lineage on the structured doc,
+/// then A tombstones it. Driving to quiescence the tombstone propagates to B
+/// (B's `materialize_accepted` reports `tombstone`), with NO block, and the
+/// tombstone is stable across extra rounds (no resurrection). Asserts on BOTH
+/// sides. Mirrors `tombstone_propagates_over_shared_lineage` for non-note bytes.
+async fn delete_structured_propagates(doc: &StructuredDoc) {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, doc.path, doc.seed).await;
+    assert!(!oplog_b.materialize_accepted(&doc_b).unwrap().tombstone, "B alive at first");
+
+    // A tombstones the structured doc.
+    oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
+    assert!(oplog_a.materialize_accepted(&doc_a).unwrap().tombstone, "A tombstoned");
+
+    // Round 1: B pulls the tombstone delta.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let r1 = b.sync_once(&addr).await.unwrap();
+    assert!(r1.blocked.is_empty(), "tombstone delta not blocked: {r1:?}");
+    let a = server.await.unwrap();
+    assert!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().tombstone,
+        "B sees the tombstone after the synced delete of a structured doc"
+    );
+
+    // Extra rounds: tombstone is stable on BOTH sides (no resurrection).
+    let (_a, _b) = drive_bidirectional(a, b, 3).await;
+    assert!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().tombstone,
+        "A stays tombstoned across extra rounds"
+    );
+    assert!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().tombstone,
+        "B stays tombstoned across extra rounds"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_delete_propagates() {
+    delete_structured_propagates(&CANVAS).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_delete_propagates() {
+    delete_structured_propagates(&TREE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_delete_propagates() {
+    delete_structured_propagates(&TRAIL).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kanban_delete_propagates() {
+    delete_structured_propagates(&KANBAN).await;
+}
+
+// --- scenario 2 (probe): COMPACT single-line JSON still merges disjoint edits
+//
+// The same-region gate runs a CHAR-LEVEL Myers diff (`core::oplog::doc::
+// spans_overlap`), NOT a line-level one. A natural worry for `.canvas` is that a
+// tool serializing the whole canvas on ONE line would make every edit "the same
+// line" and thus spuriously conflict. This probe proves it does NOT: with a
+// COMPACT single-line canvas, A bumps node n1's `x` and B bumps node n2's `x`
+// (two distinct byte spans on the same physical line). They must auto-merge with
+// NO block — confirming the detection is byte-range fine-grained, so structured
+// docs do not need a coarser/finer special case for compact serializations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_compact_single_line_disjoint_edits_auto_merge() {
+    let key = ContentKey::generate();
+    let path = "diagrams/compact.canvas";
+    let seed = "{\"nodes\":[{\"id\":\"n1\",\"x\":0,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"A\"},{\"id\":\"n2\",\"x\":400,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"B\"}],\"edges\":[]}\n";
+    // A bumps n1.x (0 -> 64); B bumps n2.x (400 -> 480). Distinct byte spans on
+    // the same single line.
+    let edit_a = "{\"nodes\":[{\"id\":\"n1\",\"x\":64,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"A\"},{\"id\":\"n2\",\"x\":400,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"B\"}],\"edges\":[]}\n";
+    let edit_b = "{\"nodes\":[{\"id\":\"n1\",\"x\":0,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"A\"},{\"id\":\"n2\",\"x\":480,\"y\":0,\"width\":240,\"height\":120,\"type\":\"text\",\"text\":\"B\"}],\"edges\":[]}\n";
+
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+    oplog_a.apply_user_text(&doc_a, edit_a).unwrap();
+    oplog_b.apply_user_text(&doc_b, edit_b).unwrap();
+
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    assert!(a.blocked_docs().is_empty(), "A not blocked (char-level detection): {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B not blocked (char-level detection): {:?}", b.blocked_docs());
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(text_a, text_b, "both converge to one merged compact JSON");
+    // Both distinct value edits survived on a single line.
+    assert!(text_a.contains("\"n1\",\"x\":64"), "n1 moved by A survives: {text_a:?}");
+    assert!(text_a.contains("\"n2\",\"x\":480"), "n2 moved by B survives: {text_a:?}");
+}
+
+// === bug-sync-new-note-first-content-not-synced — repro scenarios ===========
+//
+// User-reported real-app bug: create a NEW note on A → type content → save. The
+// note IS created on peer B, but EMPTY — the first content commit does not
+// propagate. A second save (re-dirty + save) DOES propagate. So the FIRST
+// content-after-create fails to reach B; the SECOND succeeds.
+//
+// These scenarios isolate the mechanism at the sync layer. Three plausible
+// shapes (a)/(b)/(c) per the bug brief; the FAILING one localizes the cause.
+
+/// (a) FIRST-CONTACT THEN CONTENT, no prior sync. A creates the doc empty, then
+/// (the first save) applies the content — all BEFORE B has ever synced. B then
+/// pulls for the first time. Because the content is already in A's `accepted`
+/// before the round, the `LineageBase` A serves (`export_state`) carries the
+/// content, so a single settle must land it on B. This is the create-then-save-
+/// then-first-sync ordering; it is expected to PASS (content present at base).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_note_first_content_first_contact_after_save() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/fresh-create.md";
+    // Create empty (the new-note create), then the FIRST save lands content —
+    // both before B ever syncs.
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+    let content = "first typed content\nsecond line\n";
+    oplog_a.apply_user_text(&doc_a, content).unwrap();
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, content);
+
+    // B's very first pull: no local replica → create_local_for + adopt_from_peer
+    // → StateRequest/LineageBase → adopt_lineage. The base carries the content.
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr_a).await.unwrap();
+    let _a = server_a.await.unwrap();
+
+    assert!(rb.blocked.is_empty(), "first contact must not block: {rb:?}");
+    let doc_b = oplog_b
+        .doc_id_for_path(path)
+        .unwrap()
+        .expect("B has the doc after first contact");
+    let got = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(got, content, "B materializes A's content on first contact: {got:?}");
+}
+
+/// (b) CREATE-TIME EMPTY SYNC, THEN CONTENT. A creates empty; B syncs and adopts
+/// the EMPTY base (B now Bound at empty). THEN A applies the first content. B
+/// pulls again over the now-shared lineage (the bound-doc delta path:
+/// `export_since(B's SV)`). The content delta MUST reach B in this single round.
+///
+/// THIS is the real-app ordering: a fresh note often round-trips to the peer
+/// (debounced poke / poll) while still empty — the create is visible — and only
+/// then does the user's first typed content commit. If the SV watermark after
+/// adopting an empty base does not let `export_since` deliver the subsequent
+/// content delta, the FIRST content save is silently dropped on B. This is the
+/// scenario the brief flags as the likely culprit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_note_empty_synced_then_first_content() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/empty-then-content.md";
+    // A creates the note EMPTY (the new-note create, before any typing).
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+
+    // Round 1: B adopts A's EMPTY base and binds. Both sides now share the
+    // lineage at empty content.
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    let r1 = b.sync_once(&addr_a).await.unwrap();
+    let mut a = server_a.await.unwrap();
+    assert!(r1.blocked.is_empty(), "empty first contact must not block: {r1:?}");
+
+    let doc_b = oplog_b
+        .doc_id_for_path(path)
+        .unwrap()
+        .expect("B has the (empty) doc after round 1");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, "", "B at empty base");
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Bound), "B bound at empty");
+
+    // The FIRST content save on A (this is what the user types after the note
+    // exists on both devices).
+    let content = "the first typed content\nthat must sync\n";
+    oplog_a.apply_user_text(&doc_a, content).unwrap();
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, content);
+
+    // Round 2: B pulls the content delta over the shared lineage (bound path).
+    let addr_a2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a2 = spawn_responder(a, Duration::from_secs(3));
+    let r2 = b.sync_once(&addr_a2).await.unwrap();
+    let _a = server_a2.await.unwrap();
+    assert!(r2.blocked.is_empty(), "content delta must not block: {r2:?}");
+
+    // THE ASSERTION: B has the content after the FIRST content save — no second
+    // commit needed. If the bug reproduces here, B is still empty.
+    let got = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(
+        got, content,
+        "B must materialize A's FIRST content over the shared lineage (not empty): {got:?}"
+    );
+}
+
+/// (c) DRIVE-TO-QUIESCENCE variant of (b): create empty, settle, type content,
+/// settle again — does ONE settle after the first content commit converge B, or
+/// does it need a SECOND commit? `sync_until_settled` runs alternating rounds;
+/// it asserts quiescence (equal text both sides) within the cap. If the first
+/// content needs a second commit to propagate, this fails to settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_note_empty_then_content_settles_in_one() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/quiesce-create.md";
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+
+    // Settle the empty create across both devices.
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr_a).await.unwrap();
+    let a = server_a.await.unwrap();
+    let doc_b = oplog_b.doc_id_for_path(path).unwrap().expect("B has empty doc");
+
+    // First content save, then drive to quiescence — must converge to `content`.
+    let content = "quiescence content line\n";
+    oplog_a.apply_user_text(&doc_a, content).unwrap();
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+
+    let got = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(got, content, "B converged to A's first content within one settle: {got:?}");
+}
+
+/// (b') VARIANT: both A and B independently hold the path at EMPTY (e.g. an
+/// empty `.md` reached B out-of-band), neither bound. A then types its first
+/// content. On B's first-contact pull, B has a LOCAL empty replica, so the
+/// dialer takes the `Some(local)` + `None` status → `classify` path rather than
+/// `create_local_for`/adopt. A is ahead of empty (empty is in A's history), so
+/// it must be a clean FastForwardAdoptPeer — B adopts A's content, never a fork,
+/// never stuck empty. This models the new-note-first-content with a pre-existing
+/// empty local replica on the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_note_first_content_peer_holds_empty_replica() {
+    let key = ContentKey::generate();
+    let (a, oplog_a, _da) = mk_node(&key);
+    let (b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/both-empty.md";
+    // Both independently create the path EMPTY (distinct lineages, identical
+    // empty bytes). Neither has synced.
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+    let doc_b = oplog_b.create_document(path, "note", "", &Author::User).unwrap();
+
+    // A types its FIRST content (the first save), before any sync.
+    let content = "first content over a pre-existing empty peer replica\n";
+    oplog_a.apply_user_text(&doc_a, content).unwrap();
+
+    // Drive to quiescence: B must adopt A's content (A is strictly ahead of the
+    // shared empty seed). One settle, no second commit, no fork.
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+    assert!(a.blocked_docs().is_empty(), "A not blocked: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B not blocked: {:?}", b.blocked_docs());
+
+    let got = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(got, content, "B converged to A's first content (not empty): {got:?}");
+}
+
+/// REGRESSION for `bug-canvas-dirty-save-and-delete-sync`: a `.canvas` document
+/// whose committed JSON DELETES a node syncs to the peer in ONE settle — no
+/// "second change" required.
+///
+/// Before the fix the canvas wrote each edit straight to `accepted` per-edit
+/// (and a stuck dirty buffer meant the delete often needed a follow-up change to
+/// propagate). The canvas now rides the SAME op-log working/commit model as a
+/// note: a node-delete is an ordinary committed text edit (the canonical JSON
+/// minus that node), so it travels over the existing op-log sync exactly like a
+/// note edit. This pins that: a canvas's delete-committed JSON converges in one
+/// `sync_until_settled`. The canvas JSON is treated as opaque document text by
+/// the transport (kind is irrelevant to the Y.Text merge), so a node-removal is
+/// just a localized text delete over the canonical serialization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_node_delete_syncs_in_one_settle() {
+    let key = ContentKey::generate();
+    let path = "boards/plan.canvas";
+    // Two-node canvas in canonical (tab-indented, stable-key) JSON shape — the
+    // committed starting document on both bound devices.
+    let two_nodes = "{\n\t\"nodes\": [\n\t\t{\n\t\t\t\"id\": \"n1\",\n\t\t\t\"type\": \"file\",\n\t\t\t\"file\": \"a.md\",\n\t\t\t\"x\": 0,\n\t\t\t\"y\": 0,\n\t\t\t\"width\": 300,\n\t\t\t\"height\": 200\n\t\t},\n\t\t{\n\t\t\t\"id\": \"n2\",\n\t\t\t\"type\": \"file\",\n\t\t\t\"file\": \"b.md\",\n\t\t\t\"x\": 400,\n\t\t\t\"y\": 0,\n\t\t\t\"width\": 300,\n\t\t\t\"height\": 200\n\t\t}\n\t],\n\t\"edges\": []\n}";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, two_nodes).await;
+
+    // A deletes node n2 (the canvas commits the canonical JSON minus n2) — the
+    // shape `commit_working` folds to `accepted` after a delete edit.
+    let one_node = "{\n\t\"nodes\": [\n\t\t{\n\t\t\t\"id\": \"n1\",\n\t\t\t\"type\": \"file\",\n\t\t\t\"file\": \"a.md\",\n\t\t\t\"x\": 0,\n\t\t\t\"y\": 0,\n\t\t\t\"width\": 300,\n\t\t\t\"height\": 200\n\t\t}\n\t],\n\t\"edges\": []\n}";
+    oplog_a.apply_user_text(&doc_a, one_node).unwrap();
+
+    // One settle: B must converge to the deleted-node JSON, no second change.
+    let (a, b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+    assert!(a.blocked_docs().is_empty(), "A not blocked: {:?}", a.blocked_docs());
+    assert!(b.blocked_docs().is_empty(), "B not blocked: {:?}", b.blocked_docs());
+
+    let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(got_b, one_node, "B converged to the delete-committed canvas JSON: {got_b:?}");
+    assert!(!got_b.contains("n2"), "the deleted node is gone on the peer");
+    assert!(got_b.contains("n1"), "the surviving node remains on the peer");
+}
+
+// --- Save = commit working + sync (op-log-working-layer) -------------------
+
+/// The default sync-on-save flow: an UNSAVED (`working`-only) edit does NOT reach
+/// the peer — only `accepted` syncs — and once an explicit save (`commit_working`)
+/// folds it, it propagates. Over the REAL transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn working_only_edit_propagates_only_after_save() {
+    let key = ContentKey::generate();
+    let path = "notes/onsave.md";
+    let seed = "shared baseline\n";
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+
+    // An unsaved edit in `working` only — `accepted` is untouched, so it does not
+    // cross the wire.
+    oplog_a
+        .apply_working_edit(&doc_a, seed.len(), 0, "uncommitted edit\n")
+        .unwrap();
+    assert_eq!(
+        oplog_a.materialize_accepted(&doc_a).unwrap().text,
+        seed,
+        "accepted unchanged while the edit is working-only"
+    );
+
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        seed,
+        "the working-only edit does NOT reach the peer before a save"
+    );
+
+    // An explicit save folds `working` into `accepted`; it then propagates.
+    assert!(oplog_a.commit_working(&doc_a).unwrap(), "the working edit commits on save");
+    let want = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    assert_eq!(want, "shared baseline\nuncommitted edit\n");
+    let (_a, _b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        want,
+        "after the explicit save, the edit reaches the peer"
+    );
+}
+
+// === Canvas sync corruption repro =========================================
+//
+// A `.canvas` file rides the SAME whole-file-as-one-`Y.Text` substrate as a
+// note (`docs/canvas.md` [canvas-doc-kind]) — the JSON text IS the document; a
+// canvas edit re-serializes the model and commits the new full text, diffed
+// into localized spans exactly like a note save (`apply_user_text`). So these
+// tests drive the canvas binding faithfully by committing canonical-JSON text.
+//
+// The reported corruption is digit-level: numeric coordinates gain spliced /
+// duplicated digits (`5828` -> `582828`, `8116` -> `811116`) and garbage gets
+// prepended to byte 0 (`1113872{`). That is the fingerprint of two DISJOINT Yrs
+// lineages interleaving near-identical numeric-dense bytes. Every coordinate in
+// these fixtures is <= 4 digits, so a digit run longer than 4 is unambiguous
+// corruption — the invariant the checker enforces.
+
+#[derive(Clone)]
+struct CNode {
+    id: String,
+    file: String,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+/// Serialize canvas nodes to canonical-shaped JSON (tab-indented, stable key
+/// order), mirroring `Canvas::to_canonical_json`'s output shape so the localized
+/// diff sees realistic JSON token boundaries. Edges are empty.
+fn canvas_json(nodes: &[CNode]) -> String {
+    let mut s = String::from("{\n\t\"nodes\": [\n");
+    for (i, n) in nodes.iter().enumerate() {
+        s.push_str("\t\t{\n");
+        s.push_str(&format!("\t\t\t\"id\": \"{}\",\n", n.id));
+        s.push_str(&format!("\t\t\t\"x\": {},\n", n.x));
+        s.push_str(&format!("\t\t\t\"y\": {},\n", n.y));
+        s.push_str(&format!("\t\t\t\"width\": {},\n", n.w));
+        s.push_str(&format!("\t\t\t\"height\": {},\n", n.h));
+        s.push_str(&format!("\t\t\t\"file\": \"{}\",\n", n.file));
+        s.push_str("\t\t\t\"type\": \"file\"\n");
+        s.push_str(if i + 1 < nodes.len() { "\t\t},\n" } else { "\t\t}\n" });
+    }
+    s.push_str("\t],\n\t\"edges\": []\n}\n");
+    s
+}
+
+/// A grid of `n` file nodes; every coordinate is <= 4 digits (x,y) and width /
+/// height are 3 digits, so any 5+ digit run in the synced output is corruption.
+fn grid_canvas(n: usize) -> Vec<CNode> {
+    (0..n)
+        .map(|i| CNode {
+            id: format!("n{i}"),
+            file: format!("notes/node-{i}.md"),
+            x: 100 + (i % 5) as i64 * 300,
+            y: 100 + (i / 5) as i64 * 200,
+            w: 260,
+            h: 140,
+        })
+        .collect()
+}
+
+/// Longest run of consecutive ASCII digits in `s`. With <=4-digit fixtures, a
+/// result > 4 means digits were spliced/duplicated into a number (the reported
+/// `5828` -> `582828` corruption).
+fn max_digit_run(s: &str) -> usize {
+    let mut max = 0usize;
+    let mut cur = 0usize;
+    for b in s.bytes() {
+        if b.is_ascii_digit() {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    max
+}
+
+/// Assert `text` is an uncorrupted canvas: parses as JSON, holds exactly
+/// `expect_nodes` nodes, and has no spliced/duplicated digits.
+fn assert_canvas_intact(text: &str, expect_nodes: usize, who: &str) {
+    let run = max_digit_run(text);
+    assert!(
+        run <= 4,
+        "{who}: digit-splice corruption — {run}-digit run in synced canvas (all fixture \
+         coords are <=4 digits). Text:\n{text}"
+    );
+    let v: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("{who}: synced canvas is not valid JSON ({e}):\n{text}"));
+    let got = v["nodes"].as_array().map_or(0, Vec::len);
+    assert_eq!(got, expect_nodes, "{who}: node count changed (corruption):\n{text}");
+}
+
+/// Baseline: two vaults INDEPENDENTLY seed the SAME canvas (disjoint lineages),
+/// then sync to convergence. Mirrors `independent_lineages_identical_content_do_not_duplicate`
+/// but for a numeric-dense `.canvas`. Both sides must converge to the single
+/// canvas with no digit-splice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_independent_identical_lineages_do_not_corrupt() {
+    let key = ContentKey::generate();
+    let (a, oplog_a, _da) = mk_node(&key);
+    let (b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "boards/graph.canvas";
+    let nodes = grid_canvas(20);
+    let json = canvas_json(&nodes);
+    let doc_a = oplog_a.create_document(path, "canvas", &json, &Author::User).unwrap();
+    let doc_b = oplog_b.create_document(path, "canvas", &json, &Author::User).unwrap();
+
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_canvas_intact(&text_a, 20, "A");
+    assert_canvas_intact(&text_b, 20, "B");
+    assert_eq!(text_a, text_b, "both converge to one canvas");
+}
+
+/// Two bound (shared-lineage) devices move DIFFERENT nodes concurrently, then
+/// sync. Disjoint-region edits must auto-merge with no digit-splice. This
+/// exercises the char-level `multi_span_delta` localization on numeric-dense
+/// JSON, where a naive char diff can align digits ACROSS distinct number tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_concurrent_disjoint_node_moves_do_not_corrupt() {
+    let key = ContentKey::generate();
+    let (a, oplog_a, _da) = mk_node(&key);
+    let (b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "boards/graph.canvas";
+    let nodes = grid_canvas(20);
+    let doc_a = oplog_a
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+    let doc_b = oplog_b
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+
+    // Establish a shared lineage first.
+    let (a, b) = sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+
+    // Concurrent disjoint moves: A moves node 2, B moves node 17.
+    let mut na = nodes.clone();
+    na[2].x = 9001;
+    na[2].y = 8002;
+    oplog_a.apply_user_text(&doc_a, &canvas_json(&na)).unwrap();
+
+    let mut nb = nodes.clone();
+    nb[17].x = 7003;
+    nb[17].y = 6004;
+    oplog_b.apply_user_text(&doc_b, &canvas_json(&nb)).unwrap();
+
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_canvas_intact(&text_a, 20, "A");
+    assert_canvas_intact(&text_b, 20, "B");
+    assert_eq!(text_a, text_b, "both converge after disjoint concurrent moves");
+    // Both edits survived.
+    assert!(text_a.contains("9001") && text_a.contains("7003"), "both moves present: {text_a}");
+}
+
+/// Independent identical canvases, then concurrent edits land DURING the
+/// multi-round adoption handshake (one direction synced, then BOTH edit before
+/// the handshake completes). The dangerous window: a side bound while lineages
+/// are still disjoint would take a whole-doc cross-lineage delta. Whatever the
+/// outcome (converge or clean block), neither side may end digit-spliced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_edits_during_adoption_handshake_do_not_corrupt() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "boards/graph.canvas";
+    let nodes = grid_canvas(20);
+    let doc_a = oplog_a
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+    let doc_b = oplog_b
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+
+    // ONE direction only: B dials A (B adopts A on the Identical handshake; A is
+    // canonical and not yet bound — the half-open window).
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr_a).await.unwrap();
+    a = server_a.await.unwrap();
+
+    // Now BOTH edit concurrently, mid-handshake.
+    let mut na = nodes.clone();
+    na[1].x = 9001;
+    oplog_a.apply_user_text(&doc_a, &canvas_json(&na)).unwrap();
+    let mut nb = nodes.clone();
+    nb[18].x = 7003;
+    oplog_b.apply_user_text(&doc_b, &canvas_json(&nb)).unwrap();
+
+    // Drive several full rounds; either converges or blocks, but must not corrupt.
+    for _ in 0..8 {
+        let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_b = spawn_responder(b, Duration::from_secs(3));
+        a.sync_once(&addr_b).await.unwrap();
+        b = server_b.await.unwrap();
+
+        let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_a = spawn_responder(a, Duration::from_secs(3));
+        b.sync_once(&addr_a).await.unwrap();
+        a = server_a.await.unwrap();
+    }
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_canvas_intact(&text_a, 20, "A");
+    assert_canvas_intact(&text_b, 20, "B");
+}
+
+/// Two vaults INDEPENDENTLY author DIFFERENT canvases at the same path (disjoint
+/// lineages, no shared history) — the "both ran a layout command" case. This is
+/// a genuine fork: it must BLOCK for resolution, never silently CRDT-interleave
+/// the two numeric-dense JSONs into spliced digits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_independent_divergent_lineages_block_not_corrupt() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "boards/graph.canvas";
+    // Same node set but different layouts → different content, disjoint lineages.
+    let mut nodes_a = grid_canvas(20);
+    nodes_a[3].x = 9001;
+    let mut nodes_b = grid_canvas(20);
+    nodes_b[3].x = 7003;
+    let doc_a = oplog_a
+        .create_document(path, "canvas", &canvas_json(&nodes_a), &Author::User)
+        .unwrap();
+    let doc_b = oplog_b
+        .create_document(path, "canvas", &canvas_json(&nodes_b), &Author::User)
+        .unwrap();
+
+    // A few rounds; a genuine fork blocks rather than merges.
+    let mut blocked_somewhere = false;
+    for _ in 0..4 {
+        let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_a = spawn_responder(a, Duration::from_secs(3));
+        let rb = b.sync_once(&addr_a).await.unwrap();
+        a = server_a.await.unwrap();
+        blocked_somewhere |= !rb.blocked.is_empty();
+
+        let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server_b = spawn_responder(b, Duration::from_secs(3));
+        let ra = a.sync_once(&addr_b).await.unwrap();
+        b = server_b.await.unwrap();
+        blocked_somewhere |= !ra.blocked.is_empty();
+    }
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    // The invariant that matters: no silent digit-splice on either side.
+    assert_canvas_intact(&text_a, 20, "A");
+    assert_canvas_intact(&text_b, 20, "B");
+    assert!(
+        blocked_somewhere || !a.blocked_docs().is_empty() || !b.blocked_docs().is_empty(),
+        "a genuine canvas fork must block for resolution, not silently merge"
+    );
+}
+
+/// REPRO for the reported canvas corruption: one client edits + saves REPEATEDLY
+/// (each save commits + pokes) while the peer is idle, and the commits land while
+/// the lineage-adoption handshake is still settling. If a side gets bound while
+/// the lineages are still disjoint, the editing side's next push is a whole-doc
+/// cross-lineage delta that interleaves the near-identical numeric JSON
+/// (digit-duplication, e.g. `5828` -> `582828`). Models BOTH directions of the
+/// dial since canonicality is by fingerprint and we don't control which side
+/// wins. Must converge clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_edits_during_unsettled_handshake_do_not_corrupt() {
+    let key = ContentKey::generate();
+    // Independent identical seeds = disjoint lineages, the realistic "same board
+    // already on both devices".
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "boards/graph.canvas";
+    let nodes = grid_canvas(20);
+    let doc_a = oplog_a
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+    let doc_b = oplog_b
+        .create_document(path, "canvas", &canvas_json(&nodes), &Author::User)
+        .unwrap();
+
+    // A "drag": nudge a node each step, save (commit), then run ONE sync round
+    // in alternating directions — edits keep landing BEFORE the multi-round
+    // handshake reaches quiescence.
+    let mut cur = nodes.clone();
+    for i in 0..8 {
+        cur[1].x = 200 + i as i64;
+        cur[7].y = 300 + i as i64;
+        oplog_a.apply_user_text(&doc_a, &canvas_json(&cur)).unwrap();
+
+        if i % 2 == 0 {
+            // B pulls A.
+            let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+            let server_a = spawn_responder(a, Duration::from_secs(3));
+            b.sync_once(&addr_a).await.unwrap();
+            a = server_a.await.unwrap();
+        } else {
+            // A pushes to B (A dials B).
+            let addr_b = b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+            let server_b = spawn_responder(b, Duration::from_secs(3));
+            a.sync_once(&addr_b).await.unwrap();
+            b = server_b.await.unwrap();
+        }
+
+        // Corruption is visible the instant it lands — check every step.
+        let ta = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+        let tb = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+        assert_canvas_intact(&ta, 20, &format!("A@step{i}"));
+        assert_canvas_intact(&tb, 20, &format!("B@step{i}"));
+    }
+
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 12).await;
+    let ta = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let tb = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_canvas_intact(&ta, 20, "A-final");
+    assert_canvas_intact(&tb, 20, "B-final");
+    assert_eq!(ta, tb, "both converge to the same canvas");
+}
+
+/// The canvas forward-binding save path end-to-end: a canvas edit mirrors into
+/// `working` via `replace_working` (what `persist_canvas`/`mirror_json_to_working`
+/// run), an explicit Save folds it via `commit_working`, and it syncs to the peer.
+/// Guards that canvas edits reach `accepted` + the wire on save (the on-save flow,
+/// no autocommit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_forward_binding_save_syncs_to_peer() {
+    let key = ContentKey::generate();
+    let seed = canvas_json(&grid_canvas(6));
+    let (a, oplog_a, doc_a, b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, "boards/save.canvas", &seed).await;
+
+    // A edits the canvas via the forward binding (the `working` overlay), then
+    // SAVES (commit_working) — exactly `persist_canvas` + `save_canvas_document`.
+    let mut nodes = grid_canvas(6);
+    nodes[2].x = 9001;
+    let edited = canvas_json(&nodes);
+    oplog_a.replace_working(&doc_a, &edited).unwrap();
+    assert_eq!(
+        oplog_a.materialize_working(&doc_a).unwrap().text,
+        edited,
+        "the forward binding put the canvas edit in `working`"
+    );
+    assert!(
+        oplog_a.commit_working(&doc_a).unwrap(),
+        "Save commits the canvas working edit into accepted"
+    );
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, edited);
+
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 6).await;
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        edited,
+        "B received the saved canvas edit"
+    );
+}
+
+/// One full directional sync `from` dials `to` (responder window short).
+async fn dial(from: SyncNode, to: SyncNode) -> (SyncNode, SyncNode) {
+    let mut from = from;
+    let mut to = to;
+    let addr = to.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(to, Duration::from_secs(3));
+    from.sync_once(&addr).await.unwrap();
+    let to = server.await.unwrap();
+    (from, to)
+}
+
+/// THREE devices, each INDEPENDENTLY seeding the SAME canvas (three disjoint Yrs
+/// lineages) — the realistic "I already have this board on laptop, phone, and
+/// desktop" case. Mesh-sync them in an order that makes a peer adopt one lineage
+/// that a later pairwise round abandons, then make concurrent edits and mesh
+/// again. The transitive-adoption bug surfaces as a device bound to a stale
+/// lineage taking a whole-doc cross-lineage delta → digit-splice. All three must
+/// converge with no corruption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canvas_three_device_independent_lineages_converge_clean() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    let (mut c, oplog_c, _dc) = mk_node(&key);
+    // Enroll all three pairs.
+    a.enroll_peer(b.fingerprint()).unwrap();
+    a.enroll_peer(c.fingerprint()).unwrap();
+    b.enroll_peer(a.fingerprint()).unwrap();
+    b.enroll_peer(c.fingerprint()).unwrap();
+    c.enroll_peer(a.fingerprint()).unwrap();
+    c.enroll_peer(b.fingerprint()).unwrap();
+
+    let path = "boards/graph.canvas";
+    let nodes = grid_canvas(20);
+    let json = canvas_json(&nodes);
+    let doc_a = oplog_a.create_document(path, "canvas", &json, &Author::User).unwrap();
+    let doc_b = oplog_b.create_document(path, "canvas", &json, &Author::User).unwrap();
+    let doc_c = oplog_c.create_document(path, "canvas", &json, &Author::User).unwrap();
+
+    // Sync B<->C FIRST (they pick a canonical between themselves), then bring A
+    // in — so whichever of B/C adopted the other may now have to re-adopt A's
+    // lineage, leaving the third device transitively on a lineage that moved.
+    let run_mesh = |a: SyncNode, b: SyncNode, c: SyncNode| async move {
+        let (b, c) = dial(b, c).await;
+        let (c, b) = dial(c, b).await;
+        let (a, b) = dial(a, b).await;
+        let (b, a) = dial(b, a).await;
+        let (a, c) = dial(a, c).await;
+        let (c, a) = dial(c, a).await;
+        (a, b, c)
+    };
+    for _ in 0..4 {
+        let (na, nb, nc) = run_mesh(a, b, c).await;
+        a = na;
+        b = nb;
+        c = nc;
+    }
+
+    // Concurrent edits on all three (disjoint nodes), then mesh again.
+    let mut na = nodes.clone();
+    na[1].x = 9001;
+    oplog_a.apply_user_text(&doc_a, &canvas_json(&na)).unwrap();
+    let mut nb = nodes.clone();
+    nb[9].x = 7003;
+    oplog_b.apply_user_text(&doc_b, &canvas_json(&nb)).unwrap();
+    let mut nc = nodes.clone();
+    nc[18].x = 5005;
+    oplog_c.apply_user_text(&doc_c, &canvas_json(&nc)).unwrap();
+
+    for _ in 0..6 {
+        let (na, nb, nc) = run_mesh(a, b, c).await;
+        a = na;
+        b = nb;
+        c = nc;
+    }
+
+    let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    let text_c = oplog_c.materialize_accepted(&doc_c).unwrap().text;
+    assert_canvas_intact(&text_a, 20, "A");
+    assert_canvas_intact(&text_b, 20, "B");
+    assert_canvas_intact(&text_c, 20, "C");
+    drop((a, b, c));
+}
+
+// --- new-note first-content sync (op-log-working-layer) --------------------
+//
+//   typing = oplog.apply_working_edit(doc, ..)   (the editor forward binding)
+//   save   = oplog.commit_working(doc)           (folds working → accepted)
+// Regression guards that a freshly-created note's first SAVED content reaches the
+// peer and is not clobbered by the peer's still-empty replica.
+
+/// A creates a note EMPTY; the empty create settles to B (both bound at empty,
+/// each with `working = None`). A then types its first content and SAVES it
+/// (`commit_working`). Driving to quiescence, B must converge to A's content —
+/// the peer's still-empty replica must not clobber it back over the shared
+/// lineage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_note_first_saved_content_reaches_peer() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/fresh-create.md";
+    // A creates the note EMPTY (the new-note create seeds accepted = "").
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+
+    // Settle the empty create to B (both bound at empty, working = None).
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr_a).await.unwrap();
+    let a = server_a.await.unwrap();
+    let doc_b = oplog_b.doc_id_for_path(path).unwrap().expect("B has empty doc");
+    assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, "");
+
+    // A types its first content into `working`, then SAVES it.
+    let content = "first content line\nthat must reach the peer\n";
+    oplog_a.apply_working_edit(&doc_a, 0, 0, content).unwrap();
+    assert!(oplog_a.commit_working(&doc_a).unwrap(), "save folded the content");
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, content);
+
+    // Drive to quiescence — B must converge to A's content, NOT empty.
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+
+    let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    let got_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    assert_eq!(got_a, content, "A must still hold its content (not clobbered empty): {got_a:?}");
+    assert_eq!(got_b, content, "B must converge to A's first content (not empty): {got_b:?}");
+}
+
+/// A peer pull lands on A while A has UNSAVED typed content in `working` (the
+/// editor forward-binding mirrored typing into the overlay). The working-mirror
+/// in `apply_remote_update` must reconcile WITHOUT losing the typed content, and
+/// A's later save must then fold the typed content into `accepted` — not the
+/// empty remote state. This is the working-mirror survival the dirty-buffer
+/// corruption fixes (text-level reconcile) guarantee, on the save flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn working_overlay_survives_remote_empty_pull_then_saves() {
+    let key = ContentKey::generate();
+    let (mut a, oplog_a, _da) = mk_node(&key);
+    let (mut b, oplog_b, _db) = mk_node(&key);
+    enroll_each_other(&a, &b);
+
+    let path = "notes/pull-race.md";
+    let doc_a = oplog_a.create_document(path, "note", "", &Author::User).unwrap();
+
+    // Settle empty to B.
+    let addr_a = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr_a).await.unwrap();
+    let mut a = server_a.await.unwrap();
+    let doc_b = oplog_b.doc_id_for_path(path).unwrap().expect("B has empty doc");
+
+    // A types content into `working` but has NOT saved yet (the buffer is dirty;
+    // accepted is still empty).
+    let content = "typed-but-not-yet-saved\n";
+    oplog_a.apply_working_edit(&doc_a, 0, 0, content).unwrap();
+    assert_eq!(oplog_a.materialize_working(&doc_a).unwrap().text, content);
+    assert_eq!(oplog_a.materialize_accepted(&doc_a).unwrap().text, "");
+
+    // B (still empty) dials A: B's empty state syncs into A while A's accepted is
+    // empty and A's working holds the typed content — a remote pull landing on A
+    // while the user is mid-edit.
+    let addr_a2 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server_a2 = spawn_responder(a, Duration::from_secs(3));
+    b.sync_once(&addr_a2).await.unwrap();
+    a = server_a2.await.unwrap();
+
+    // The working overlay must STILL hold the typed content after the remote pull.
+    assert_eq!(
+        oplog_a.materialize_working(&doc_a).unwrap().text,
+        content,
+        "A's working overlay must survive the remote empty pull"
+    );
+
+    // Now A saves. It must fold the typed content into accepted, not commit empty.
+    let committed = oplog_a.commit_working(&doc_a).unwrap();
+    let got_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
+    assert!(committed, "save must fold the typed content");
+    assert_eq!(got_a, content, "A's accepted must be the typed content, not empty: {got_a:?}");
+
+    // And it must then sync to B.
+    let (_a, _b) =
+        sync_until_settled(a, b, (&oplog_a, &doc_a), (&oplog_b, &doc_b), 8).await;
+    let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
+    assert_eq!(got_b, content, "B must converge to the content (not empty): {got_b:?}");
+}
+
+// Note: the three-way-merge doubling regression (a peer save racing
+// `commit_working`'s two-lock window) needs the crate-private
+// `commit_working_test_hook`, so it lives as a core oplog test:
+// `core/src/oplog/tests/sync.rs::commit_working_no_double_when_peer_races_identical_content`.

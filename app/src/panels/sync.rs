@@ -79,7 +79,7 @@ pub fn show(
         ui.heading("Sync");
         if !blocked.is_empty() {
             ui.label(
-                egui::RichText::new(format!("\u{26A0} {} conflicts", blocked.len()))
+                egui::RichText::new(format!("(!) {} conflicts", blocked.len()))
                     .color(egui::Color32::from_rgb(210, 150, 40))
                     .strong(),
             );
@@ -234,26 +234,7 @@ fn sync_body(
     blocked: &[hiker_sync::identity::BlockedDoc],
     rt: &Arc<tokio::runtime::Runtime>,
 ) {
-    // Config sanity: surface a prominent amber warning when the running config
-    // can never converge, so a misconfigured vault doesn't fail silently.
-    if let Some(warn) = config_warning(snap) {
-        ui.label(
-            egui::RichText::new(warn)
-                .color(egui::Color32::from_rgb(210, 150, 40))
-                .strong(),
-        );
-        ui.add_space(4.0);
-    }
-
-    // Surfaced last error (notably a content-key mismatch). Red, actionable.
-    if let Some(err) = &snap.last_error {
-        ui.label(
-            egui::RichText::new(format!("Last error: {err}"))
-                .color(egui::Color32::from_rgb(200, 60, 60))
-                .strong(),
-        );
-        ui.add_space(4.0);
-    }
+    status_banners_section(ui, snap);
 
     // Conflicts (forked docs): only shown when there are any. Each row offers
     // the keep-mine / keep-theirs / keep-both verbs. [sync-blocked-state]
@@ -296,8 +277,132 @@ fn sync_body(
 
     ui.add_space(8.0);
 
-    // Enroll a peer by its swapped fingerprint. The draft lives in egui memory
-    // so it survives across renders without leaking into AppState.
+    enroll_device_section(ui, app, service, rt);
+
+    ui.add_space(8.0);
+
+    // Manual on-demand actions (auto-sync already runs every ~15s).
+    ui.horizontal(|ui| {
+        if ui.button("Sync now").clicked() {
+            service.force_sync(rt);
+            app.push_toast("Sync requested", ToastLevel::Info);
+        }
+        if ui.button("Discover (30s)").clicked() {
+            service.discover(DISCOVERY_WINDOW, rt);
+            app.push_toast("Discovery started", ToastLevel::Info);
+        }
+    });
+
+    ui.add_space(8.0);
+
+    // Discovered-peer visibility: what mDNS is currently surfacing, split into
+    // enrolled (reachable, will sync) and seen-but-unenrolled (needs enrolling).
+    // A seen peer whose fingerprint can be derived gets a one-click Enroll.
+    discovered_peers_section(ui, app, service, snap, rt);
+
+    ui.add_space(8.0);
+
+    connect_to_peer_section(ui, app, service, rt);
+
+    ui.add_space(12.0);
+    ui.separator();
+
+    recent_synced_section(ui, app);
+
+    ui.add_space(8.0);
+    ui.separator();
+
+    progress_log_section(ui, app);
+}
+
+/// The pre-grid alert banners on the Sync page: an amber config-sanity warning
+/// (a config that can never converge), the surfaced last round-aborting error,
+/// the per-doc/per-peer errors the last round skipped past, and a held
+/// content-key change awaiting the user. Each is conditional on its slice of the
+/// snapshot, so on a healthy vault this renders nothing.
+fn status_banners_section(ui: &mut egui::Ui, snap: &crate::sync_service::SyncSnapshot) {
+    // Config sanity: surface a prominent amber warning when the running config
+    // can never converge, so a misconfigured vault doesn't fail silently.
+    if let Some(warn) = config_warning(snap) {
+        ui.label(
+            egui::RichText::new(warn)
+                .color(egui::Color32::from_rgb(210, 150, 40))
+                .strong(),
+        );
+        ui.add_space(4.0);
+    }
+
+    // Surfaced last error (notably a content-key mismatch). Red, actionable.
+    if let Some(err) = &snap.last_error {
+        ui.label(
+            egui::RichText::new(format!("Last error: {err}"))
+                .color(egui::Color32::from_rgb(200, 60, 60))
+                .strong(),
+        );
+        ui.add_space(4.0);
+    }
+
+    // Per-doc / per-peer failures from the last round that did NOT abort it
+    // (a decrypt failure on one doc, a single peer's dial failing on a
+    // multi-peer round). Distinct from `last_error` (a round-aborting failure)
+    // and from the Conflicts section (forks the user resolves): these are
+    // skipped items the round continued past, surfaced so a partial failure
+    // isn't silent. status: sync-attention-badge
+    let errored = snap
+        .last_report
+        .as_ref()
+        .map(|r| r.errored.as_slice())
+        .unwrap_or_default();
+    if !errored.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("(!) Sync errors ({})", errored.len()))
+                .color(egui::Color32::from_rgb(200, 60, 60))
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "These items were skipped on the last round so the rest could \
+                 sync. They retry automatically next round.",
+            )
+            .color(theme::muted())
+            .small(),
+        );
+        for (label, reason) in errored {
+            ui.label(
+                egui::RichText::new(format!("{label} \u{2014} {reason}"))
+                    .color(egui::Color32::from_rgb(200, 60, 60))
+                    .small(),
+            );
+        }
+        ui.add_space(4.0);
+    }
+
+    // Held content-key change: this device's deliberately-set key differs from a
+    // peer's and we declined to silently switch. Surface it and point at the
+    // accept path — Copy/Import the matching key. A richer one-click confirm
+    // action is a later phase. [sync-content-key-confirm-on-change]
+    if let Some(peer) = &snap.pending_content_key_change {
+        ui.label(
+            egui::RichText::new(format!(
+                "Peer {peer} uses a different content key. Your key was NOT changed. \
+                 To sync with it, Copy/Import the matching key below."
+            ))
+            .color(egui::Color32::from_rgb(210, 150, 40))
+            .strong(),
+        );
+        ui.add_space(4.0);
+    }
+}
+
+/// The "Enroll device" field: paste a peer's fingerprint and enroll it. The
+/// draft lives in egui memory so it survives across renders without leaking into
+/// AppState; a successful enroll clears it. [sync-mdns-discovery]
+fn enroll_device_section(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    service: &Arc<crate::sync_service::SyncService>,
+    rt: &Arc<tokio::runtime::Runtime>,
+) {
     ui.label(egui::RichText::new("Enroll device").color(theme::muted()));
     let enroll_id = egui::Id::new("sync-enroll-draft");
     let mut draft: String = ui
@@ -329,32 +434,17 @@ fn sync_body(
         }
     }
     ui.ctx().data_mut(|d| d.insert_temp(enroll_id, draft));
+}
 
-    ui.add_space(8.0);
-
-    // Manual on-demand actions (auto-sync already runs every ~15s).
-    ui.horizontal(|ui| {
-        if ui.button("Sync now").clicked() {
-            service.force_sync(rt);
-            app.push_toast("Sync requested", ToastLevel::Info);
-        }
-        if ui.button("Discover (30s)").clicked() {
-            service.discover(DISCOVERY_WINDOW, rt);
-            app.push_toast("Discovery started", ToastLevel::Info);
-        }
-    });
-
-    ui.add_space(8.0);
-
-    // Discovered-peer visibility: what mDNS is currently surfacing, split into
-    // enrolled (reachable, will sync) and seen-but-unenrolled (needs enrolling).
-    // A seen peer whose fingerprint can be derived gets a one-click Enroll.
-    discovered_peers_section(ui, app, service, snap, rt);
-
-    ui.add_space(8.0);
-
-    // Manual peer fallback: dial an explicit multiaddr when mDNS finds nothing.
-    // Still gated on the peer being enrolled (the transport auth gate enforces).
+/// The "Connect to peer address" field: dial an explicit multiaddr when mDNS
+/// finds nothing. Still gated on the peer being enrolled (the transport auth
+/// gate enforces that). The draft lives in egui memory across renders.
+fn connect_to_peer_section(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    service: &Arc<crate::sync_service::SyncService>,
+    rt: &Arc<tokio::runtime::Runtime>,
+) {
     ui.label(egui::RichText::new("Connect to peer address").color(theme::muted()));
     let peer_id = egui::Id::new("sync-peer-addr-draft");
     let mut peer_draft: String = ui
@@ -383,11 +473,12 @@ fn sync_body(
         }
     }
     ui.ctx().data_mut(|d| d.insert_temp(peer_id, peer_draft));
+}
 
-    ui.add_space(12.0);
-    ui.separator();
-
-    // Recent synced items: query the op log for `author LIKE 'sync:%'`.
+/// The "Recent synced items" list: queries the activity log for changes whose
+/// author matches `sync:%` (writes a peer pushed to us) and renders up to 50,
+/// inline within the page scroll. [sync-attention-badge]
+fn recent_synced_section(ui: &mut egui::Ui, app: &AppState) {
     ui.label(egui::RichText::new("Recent synced items").color(theme::muted()));
     let activity = app.vault_session.services.activity.clone();
     let synced = activity.list(&Filter {
@@ -419,9 +510,12 @@ fn sync_body(
             );
         }
     }
+}
 
-    ui.add_space(8.0);
-    ui.separator();
+/// The "Progress" log: filter pills over the live sync-event ring plus the
+/// filtered lines themselves (last 200 scanned, up to 50 shown), rendered inline
+/// within the page scroll. Mirrors `indexer_detail`'s filter-pilled event log.
+fn progress_log_section(ui: &mut egui::Ui, app: &AppState) {
     ui.label(egui::RichText::new("Progress").color(theme::muted()));
 
     // Filter pills over the progress log, mirroring indexer_detail.
@@ -608,7 +702,7 @@ fn conflicts_section(
     rt: &Arc<tokio::runtime::Runtime>,
 ) {
     ui.label(
-        egui::RichText::new(format!("\u{26A0} Conflicts ({})", blocked.len()))
+        egui::RichText::new(format!("(!) Conflicts ({})", blocked.len()))
             .color(egui::Color32::from_rgb(210, 150, 40))
             .strong(),
     );
@@ -639,23 +733,43 @@ fn conflicts_section(
             .on_hover_text(fp);
 
             ui.horizontal(|ui| {
-                if ui.button("Keep mine").clicked() {
-                    service.resolve_fork(&doc.path, Resolution::KeepMine, rt);
-                    app.push_toast(
-                        "Keeping your version — pushing it so the other device adopts it too",
-                        ToastLevel::Info,
-                    );
-                }
-                if ui.button("Keep theirs").clicked() {
-                    service.resolve_fork(&doc.path, Resolution::KeepTheirs, rt);
-                    app.push_toast("Adopting the peer's version", ToastLevel::Info);
-                }
-                if ui.button("Keep both").clicked() {
-                    service.resolve_fork(&doc.path, Resolution::KeepBoth, rt);
-                    app.push_toast(
-                        "Saving your version as a conflict copy, then adopting theirs",
-                        ToastLevel::Info,
-                    );
+                // A delete-vs-edit block offers only Keep deleted / Keep edit
+                // (resurrect), not the lineage keep-mine/theirs/both verbs.
+                // [sync-conflict-delete-vs-edit]
+                if doc.reason == "delete-vs-edit" {
+                    if ui.button("Keep deleted").clicked() {
+                        service.resolve_fork(&doc.path, Resolution::KeepDeleted, rt);
+                        app.push_toast(
+                            "Keeping the delete — removing it on both devices",
+                            ToastLevel::Info,
+                        );
+                    }
+                    if ui.button("Keep edit").clicked() {
+                        service.resolve_fork(&doc.path, Resolution::KeepEdit, rt);
+                        app.push_toast(
+                            "Resurrecting the edited document on both devices",
+                            ToastLevel::Info,
+                        );
+                    }
+                } else {
+                    if ui.button("Keep mine").clicked() {
+                        service.resolve_fork(&doc.path, Resolution::KeepMine, rt);
+                        app.push_toast(
+                            "Keeping your version — pushing it so the other device adopts it too",
+                            ToastLevel::Info,
+                        );
+                    }
+                    if ui.button("Keep theirs").clicked() {
+                        service.resolve_fork(&doc.path, Resolution::KeepTheirs, rt);
+                        app.push_toast("Adopting the peer's version", ToastLevel::Info);
+                    }
+                    if ui.button("Keep both").clicked() {
+                        service.resolve_fork(&doc.path, Resolution::KeepBoth, rt);
+                        app.push_toast(
+                            "Saving your version as a conflict copy, then adopting theirs",
+                            ToastLevel::Info,
+                        );
+                    }
                 }
 
                 // "View diff": fetch the peer's CURRENT text on demand and show

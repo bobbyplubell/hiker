@@ -6,9 +6,8 @@ The headline decisions:
 
 - `.txt` files are indexed alongside `.md` (one more extension the indexer accepts; nothing else changes about the pipeline). [txt-extension-recognized]
 - The editor renders `.txt` with markdown formatting by default, with a per-vault disable toggle. A lot of "txt" content is markdown with the wrong extension; rendering it nicely is a free win and the user can turn it off when it isn't. [txt-render-as-markdown-default]
-- No auto-detection of "this `.txt` is really markdown." Extension is the user's responsibility; we never silently re-classify or rename.
 - No source rewriting, ever. The file on disk stays exactly as the user typed or pasted it.
-- The chunker uses cheap deterministic heuristics — paragraph splits, structure detection, sentence packing. No LLMs in the ingest path. More expensive techniques (TextTiling, embedder-driven boundaries, LLM rewrite) are deferred future options listed at the bottom.
+- The chunker uses cheap deterministic heuristics — paragraph splits, structure detection, sentence packing. No LLMs in the ingest path. More expensive techniques are deferred (see "Deferred future options").
 
 
 ## Editor rendering
@@ -53,7 +52,7 @@ Recognized patterns:
 
 - **ALL-CAPS line** (3–60 characters, more than one distinct character so we don't match `============`, fewer than ~10 words) → virtual H2 heading. Starts a new chunk; carries forward as `heading_path` like the markdown chunker.
 - **Underline-style headings** — a line of all `=` underneath text → virtual H1. All `-` → virtual H2. Standard reST/setext convention; common in dumped txt.
-- **Numbered list / bullet list / blockquote** — these flow as ordinary prose under the preceding heading section. We don't promote them to virtual structure; the only special handling lists need is in Layer 3, where the sentence segmenter must not mistake a numbered-list prefix (`^\s*\d+\.`) for a sentence terminator. (Without that carve-out, `1. Buy milk. 2. Bake bread.` would split mid-item because period+space+capital fires.) Bullet (`-`/`*`) and blockquote (`>`) prefixes don't end with a period, so they're already safe under the period-space-capital rule.
+- **Numbered list / bullet list / blockquote** — these flow as ordinary prose under the preceding heading section. We don't promote them to virtual structure; the only special handling lists need is in Layer 3, where the sentence segmenter must not mistake a numbered-list prefix (`^\s*\d+\.`) for a sentence terminator. Bullet (`-`/`*`) and blockquote (`>`) prefixes don't end with a period, so they're already safe under the period-space-capital rule.
 - **Indented blocks** (4+ leading spaces or a tab on consecutive lines) → treated as a code-shaped region. Excluded from heading-promotion checks (so `if (x):` on a Python paste isn't mistaken for a label) and kept whole rather than re-flowed by Layer 3.
 
 ### Layer 3: Sentence pack within sections
@@ -70,10 +69,10 @@ Sentence segmentation rules (deterministic, no library):
 
 ## Heuristic guardrails
 
-The cheap heuristics in Layer 2 are *very* eager by default — left unchecked they produce false-positive headings on any file that happens to contain capitalized lines or `:`-suffixed paragraphs. Three guardrails: [txt-chunker-guardrails]
+Layer 2's heuristics are eager by default — left unchecked they produce false-positive headings on any file with capitalized lines or `:`-suffixed paragraphs. Three guardrails: [txt-chunker-guardrails]
 
 - **Max-promotions-per-window.** No more than one ALL-CAPS-heading promotion per rolling 5-line window. A file where every line is short and capitalized (a scream-cased poem, a list of acronyms) gets at most a few virtual headings, not one per line.
-- **Period-plus-space sentence rule** (already noted in Layer 3 above). Prevents `obj.method` from being seen as a sentence break.
+- **Period-plus-space sentence rule** — the Layer 3 segmentation rule, which also prevents `obj.method` from being seen as a sentence break.
 - **Code-region exclusion.** Any region detected as code-shaped is excluded from heading promotion. Detection is either (a) 4+ leading spaces or a tab on 3+ consecutive lines, or (b) ≥3 of `;`, `{`, `}`, `(`, `)`, `=` on 3+ consecutive non-blank lines. Catches the "I pasted Python in this txt" case without needing a parser. Numbers are ballpark v1 defaults — tune if real content shows them too eager or too lax.
 
 These guardrails are tunable per-vault but ship with sensible defaults. Slugs are reserved for the tunables in case they need to surface in `settings.md` later, but for v1 the defaults are baked in.
@@ -81,21 +80,9 @@ These guardrails are tunable per-vault but ship with sensible defaults. Slugs ar
 
 ## Module placement
 
-Chunking logic for `.txt` lives in `core::chunker::txt`, sibling to `core::chunker::markdown`. Both implement a `Chunker` trait with `fn chunk(&self, source: &str) -> Vec<Chunk>`. The ingest pipeline picks the chunker by extension:
+Chunking logic for `.txt` lives in `core::chunker::txt`, sibling to `core::chunker::markdown`. Both implement a `Chunker` trait — minimum shape `fn chunk(&self, source: &str) -> Vec<Chunk>`, widened only if a real caller demands it. The ingest pipeline picks the chunker by extension at a single dispatch point; no other code knows about extensions, and future formats slot into the same match.
 
-```rust
-let chunker: &dyn Chunker = match ext {
-    "md" | "markdown" => &MARKDOWN_CHUNKER,
-    "txt"             => &TXT_CHUNKER,
-    _                 => return,   // not indexed in v1
-};
-```
-
-Single dispatch point; no other code needs to know about extensions. Future formats slot into the same match.
-
-Today `core/src/chunker.rs` is a single module with the markdown logic inlined. Landing `.txt` is a precondition refactor: extract the existing logic into `core::chunker::markdown`, define the `Chunker` trait, and add `core::chunker::txt` as a sibling. The trait should be the *minimum* shape both chunkers need — start with `fn chunk(&self, source: &str) -> Vec<Chunk>` and widen only if a real caller demands it.
-
-The other touch point is the walker / discovery filter that decides which paths get enqueued for ingest. It currently admits `.md` only; adding `.txt` is a one-line addition to the extension allowlist (see `core/src/indexer.rs`, the startup-scan and watcher-driven enqueue paths). Both the chunker dispatch and the walker filter must agree, or files will be discovered but unchunkable (or vice versa).
+The other touch point is the walker / discovery filter that decides which paths get enqueued for ingest: adding `.txt` to its extension allowlist. Both the chunker dispatch and the walker filter must agree, or files will be discovered but unchunkable (or vice versa).
 
 
 ## Edge cases
@@ -123,6 +110,6 @@ These are not on the v1 roadmap. Reach for one only when the cheap layers prove 
 
 - Other unstructured formats (`.org`, `.rst`, `.adoc`, `.pdf`, etc.) — separate docs when they land. The `txt-ingest` strategy may generalize but we won't pretend it does until we've worked through the format-specific concerns.
 - Per-note render-mode override (the per-vault default suffices for v1).
-- Auto-detection of "this `.txt` is really markdown" — explicitly rejected per the headline decisions.
+- Auto-detection of "this `.txt` is really markdown" — explicitly rejected (see "No autodetection" above).
 - Encoding negotiation beyond UTF-8 in v1.
 - A `hiker convert` command to upgrade `.txt` → `.md`. Possibly worth building later as an explicit user action; out of scope for the ingest spec itself.

@@ -126,7 +126,11 @@ pub fn show_embedded_buffer(
     embed: &mut EmbeddedView,
     opts: &EmbedOpts,
 ) -> EmbedResponse {
-    if !crate::editor_pane::ensure_vault_buffer_loaded(app, path) {
+    // Embedded views render every frame and are best-effort: a missing or
+    // unresolvable note draws nothing rather than spamming an error toast on
+    // every frame (e.g. a hover preview over a trail waypoint whose source note
+    // can't be resolved). Tab opens use the toasting `ensure_vault_buffer_loaded`.
+    if crate::editor_pane::try_ensure_vault_buffer_loaded(app, path).is_err() {
         return EmbedResponse::default();
     }
 
@@ -141,6 +145,10 @@ pub fn show_embedded_buffer(
         );
     let theme_owned = editor_core::theme::light_default();
     let dpr = ui.ctx().pixels_per_point();
+
+    // Persisted diagram cache for this vault buffer (`widget-render-disk-cache`),
+    // built before the `buffer` borrow so it can ride the rebuild closure owned.
+    let diagram_cache = crate::panels::buffer::diagram_cache_ctx(app);
 
     let Some(buffer) = app.session.buffers.get_mut(path) else {
         return EmbedResponse::default();
@@ -167,6 +175,7 @@ pub fn show_embedded_buffer(
         markdown: opts.markdown,
         dpr,
         txns: (!opts.read_only).then_some(&mut txns),
+        diagram_cache,
     });
     let editor_rect = response.rect;
     // Focus-on-create: a host entering an edit (canvas inline-edit) wants the
@@ -212,6 +221,7 @@ fn show_embed_edit_preview(
     dpr: f32,
 ) {
     use crate::panels::buffer::widgets::edit_preview::{self, PreviewInputs};
+    let cache = crate::panels::buffer::diagram_cache_ctx(app);
     let Some(buffer) = app.session.buffers.get(path) else {
         return;
     };
@@ -223,6 +233,7 @@ fn show_embed_edit_preview(
         font_px: embed.view.font_size,
         dpr,
         gated: true,
+        cache: cache.as_ref(),
     };
     edit_preview::show(&mut app.panels.edit_preview, ctx, &inputs);
 }
@@ -240,6 +251,9 @@ struct RenderCtx<'a> {
     markdown: bool,
     dpr: f32,
     txns: Option<&'a mut Vec<editor_core::transaction::Transaction>>,
+    /// Persisted diagram-cache context, or `None` when `[render]
+    /// cache_diagrams` is off. status: widget-render-disk-cache
+    diagram_cache: Option<crate::panels::buffer::widgets::disk_cache::DiagramCacheCtx>,
 }
 
 /// Run the editor widget for one embed frame: wire the decoration rebuild (the
@@ -257,6 +271,7 @@ fn render_widget(ui: &mut egui::Ui, ctx: RenderCtx<'_>) -> egui::Response {
         markdown,
         dpr,
         txns,
+        diagram_cache,
     } = ctx;
     let font_px = view.font_size;
     let mut deco_ctx = DecoRebuildCtx {
@@ -274,6 +289,7 @@ fn render_widget(ui: &mut egui::Ui, ctx: RenderCtx<'_>) -> egui::Response {
         highlight_trailing_whitespace: false,
         diff: None,
         resolve_title: Some(resolve_title),
+        diagram_cache,
     };
     let mut rebuild = |editor: &editor_core::state::Editor, view: &mut ViewState| {
         rebuild_editor_decorations(editor, view, &mut deco_ctx);

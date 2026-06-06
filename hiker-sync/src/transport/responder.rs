@@ -151,15 +151,21 @@ impl SyncNode {
             // there). [sync-fork-diff]
             Message::DocContentRequest { path } => {
                 let _ = peer; // enrollment already gated the connection.
-                let text = match self.local_doc_for_path(&path)? {
-                    Some(local) => self
-                        .oplog
-                        .materialize_accepted(&local.0)
-                        .map_err(|e| Error::Transport(format!("materialize {path}: {e}")))?
-                        .text,
-                    None => String::new(),
+                // Carry the tombstone flag alongside the text: a deleted doc
+                // keeps its last-known text, so the requester's delete-vs-edit
+                // detection needs the flag to tell a deleted peer doc from a
+                // live one. [sync-conflict-delete-vs-edit]
+                let (text, tombstone) = match self.local_doc_for_path(&path)? {
+                    Some(local) => {
+                        let m = self
+                            .oplog
+                            .materialize_accepted(&local.0)
+                            .map_err(|e| Error::Transport(format!("materialize {path}: {e}")))?;
+                        (m.text, m.tombstone)
+                    }
+                    None => (String::new(), false),
                 };
-                Ok(Message::DocContentResponse { text })
+                Ok(Message::DocContentResponse { text, tombstone })
             }
             Message::StateRequest { path } => {
                 // The peer wants our canonical base for the doc at `path`.
@@ -241,6 +247,17 @@ impl SyncNode {
                 self.blobs.lock().unwrap().delete(&blind_id);
                 Ok(Message::DeleteBlobAck { blind_id })
             }
+            // An enrolled peer committed a change and is nudging us to pull
+            // promptly. Set the `poked` flag so the sync driver runs an
+            // `auto_sync_round` on its next turn (the actual manifest/delta
+            // exchange happens there); the poke itself carries no content. The
+            // connection is already enrollment-gated. [sync-poke-on-commit]
+            // status: sync-poke-on-commit
+            Message::SyncPoke => {
+                let _ = peer; // enrollment already gated the connection.
+                self.record_poked();
+                Ok(Message::SyncPokeAck)
+            }
             other => Err(Error::Transport(format!(
                 "unexpected request on responder: {other:?}"
             ))),
@@ -276,8 +293,21 @@ impl SyncNode {
                 return Ok(Some(local));
             }
         }
-        // Fallback: content-hash overlap probe for older peers that don't send
-        // `prior_paths` (backward-compat).
+        // Fallback: content-hash overlap probe to pick WHICH local doc the
+        // reported rename moved, when none of our docs still sits at a listed
+        // prior path (a sequential / lossy-index rename). Gated on the peer
+        // actually REPORTING a rename for this entry (`prior_paths` non-empty):
+        // an entry with no prior paths is a freshly-created doc (e.g. a
+        // conflict-copy sibling), never a rename — inferring one from a stale
+        // content-hash overlap with an established local doc's HISTORY would
+        // misfire (it would treat the new doc as a rename of an unrelated doc
+        // that once held the same bytes, interleaving two disjoint lineages).
+        // Every shipping node emits a `Rename { from }` op per rename, so a real
+        // rename always carries prior paths. [sync-path-identity,
+        // sync-concurrent-rename-not-merged]
+        if entry.prior_paths.is_empty() {
+            return Ok(None);
+        }
         let theirs_history: HashSet<&str> = entry
             .recent_history_hashes
             .iter()

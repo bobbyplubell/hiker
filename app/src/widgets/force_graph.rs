@@ -1,18 +1,13 @@
-//! Shared pan/zoom + input plumbing for force-directed graph panels.
+//! Pan/zoom + input primitive for the graph panels: drag-to-pan,
+//! scroll-to-zoom-anchored-on-cursor, world→screen mapping, and
+//! fit-to-content framing.
 //!
-//! The vault link-graph (`panels/graph.rs`) and cluster-tree graph
-//! (`panels/cluster_graph.rs`) both render a Fruchterman–Reingold layout
-//! on a hand-rolled `Painter` canvas, with identical pan-by-drag,
-//! scroll-to-zoom-anchored-on-cursor, and world→screen mapping. This
-//! widget hosts that shared input + transform layer.
-//!
-//! Why not unify the FR step too? The two panels store node positions
-//! in materially different shapes: the vault graph uses
-//! `petgraph::DiGraph<NodeData, ()>` with `pos` embedded in each node,
-//! while the cluster panel keeps an external `HashMap<String, Vec2>`.
-//! Sharing the math would force one panel to copy positions in/out
-//! every frame — not worth the loss in clarity. Node drawing also
-//! stays per-panel (different colouring, sizing, hover semantics).
+//! The full rendering engine that builds on this — layout, node/edge/label
+//! drawing, the view-options menu, hover preview — lives in
+//! `widgets::graph_view`, which both the vault link-graph
+//! (`panels/graph.rs`) and the cluster-tree graph (`panels/cluster_graph.rs`)
+//! drive through a `graph_view::Source` adapter. This module stays the
+//! lowest layer: the pan/zoom transform a `graph_view::State` embeds.
 
 use eframe::egui;
 

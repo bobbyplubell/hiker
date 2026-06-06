@@ -2,15 +2,6 @@
 
 Hiker's file tree — the vault's notes browser — is the content of an `egui_workbench` primary-side-bar **Files** activity. The side-bar / accordion mechanics (sections, headers, collapse, resize, drag-to-add, persistence) belong to `egui_workbench` (`egui-workbench/SPEC.md`); this doc owns hiker's tree content: what the rows are, how they're created / moved / renamed / deleted, the trash, the per-row index-state markers, source visibility, and note multi-select.
 
-Headline decisions:
-
-- **`core::vault` owns the verbs.** `create_note` / `move_note` / `delete_note` (+ restore) are the single source of truth for note lifecycle — the tree's UI actions and the CLI (`hiker new` / `mv` / `rm` / `trash …`) call the same core commands.
-- **Delete is soft.** Deleting a note moves it into a per-vault trash directory; restorable until the trash is emptied.
-- **Explicit mutation, not inferred.** Tree moves/creates/deletes register a watcher suppression around their own writes so they aren't re-enqueued as redundant index jobs.
-- **Drag-and-drop moves; double-click renames; right-click is the verb menu.**
-- **Persistent multi-note selection** drives bulk verbs and feeds clustering / cluster-tree authoring.
-
-
 ## File tree
 
 In Files mode the side bar hosts the file tree, including drag-and-drop note moves — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command. [drag-and-drop-move]
@@ -19,7 +10,8 @@ In Files mode the side bar hosts the file tree, including drag-and-drop note mov
 
 The Files panel header carries the `+` (new item) and `⋯` (actions menu) affordances. No labels — icon-only.
 
-- **`+` is the new-item button.** Left-click creates the active surface's primary item: a note in the Files panel. Right-click opens a popover that lets the user pick any item type regardless of current surface (New note / New cluster tree / New trail), so creating a trail while browsing files doesn't require switching surfaces. [sidebar-new-item-button]
+- **`+` is the new-item split-button (`split-add-button`).** A primary `+` butted against a caret. Clicking `+` creates the active surface's primary item — a note in the Files panel. Clicking the caret opens a dropdown to pick any document type regardless of current surface (New note / New board / New canvas), so creating a board or canvas while browsing files doesn't require switching surfaces. [sidebar-new-item-button]
+- **`split-add-button` is one reusable widget** — primary action button + caret-dropdown; also drives the canvas create toolbar (`canvas-node-create`) and the Clusters new-tree control (`cluster-editor-new-tree-action`). The dropdown, not a right-click popover, is the visible affordance for the secondary options. [split-add-button]
 - **`⋯` menu's contents are filetree actions in the Files panel**: Refresh tree / Reindex all / Reindex this file / Sort by. [sidebar-toolbar-actions-menu]
 
 - **New note** (Files-mode `+` left-click): creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [sidebar-new-item-button]
@@ -35,10 +27,10 @@ The Files panel header carries the `+` (new item) and `⋯` (actions menu) affor
 
 Both `create_note` and `move_note` live in `core::vault` and are the single source of truth for creating and relocating notes — UI tree actions and CLI commands (`hiker new`, `hiker mv`) call them unchanged.
 
-- `create_note(rel: &str) -> Result<String>` — creates an empty file at `rel`, returns the actual path used (since auto-suffix may have changed it from the requested name). The button always passes a `new-note-N.md` candidate; the CLI passes the user's requested name verbatim and errors on collision rather than auto-suffixing (CLI behavior is explicit; UI behavior is forgiving). [create-note-core-cmd]
-- `move_note(from: &str, to: &str) -> Result<()>` — atomic fs rename + index update. Order: suppress watcher events for both paths (see below), fs rename, update `notes.path` + `path_ids` in a single transaction, release suppression. If the index update fails the fs rename is rolled back (rename `to` → `from`) before returning the error. [move-note-core-cmd]
+- `create_note(rel) -> Result<String>` — creates an empty file at `rel`, returns the actual path used (auto-suffix may have changed it). The button passes a `new-note-N.md` candidate; the CLI passes the requested name verbatim and errors on collision rather than auto-suffixing (CLI explicit, UI forgiving). [create-note-core-cmd]
+- `move_note(from, to) -> Result<()>` — atomic fs rename + index update. Order: suppress watcher events for both paths (see below), fs rename, update `notes.path` + `path_ids` in one transaction, release suppression. If the index update fails the fs rename is rolled back (`to` → `from`) before returning the error. [move-note-core-cmd]
 - **Target collision** — `move_note` errors and leaves the source untouched. No overwrite, no auto-suffix; the caller decides what to do (the tree DnD shows a toast, the CLI prints an error).
-- **Source is the currently-open buffer** — `move_note` operates on disk only and doesn't touch the buffer. The buffer's `currentPath` keeps pointing at the old path; the next save will fail the drift check (file missing) and prompt the user. Acceptable for v1 — buffer-follows-rename can come later if it proves annoying.
+- **Source is the currently-open buffer** — `move_note` operates on disk only; the buffer's `currentPath` keeps pointing at the old path, so the next save fails the drift check (file missing) and prompts the user. Buffer-follows-rename can come later.
 - **Source missing** — error.
 - **Target parent directory missing** — error rather than auto-create. Only reachable via CLI typo (`hiker mv a.md sub/dir/that/doesnt/exist/a.md`); UI drops are always onto an existing tree node.
 - **Folder drag** — moving a folder moves all contained notes recursively. Implementation: walk the folder, call `move_note` per file in a single transaction so the whole move succeeds or fails atomically. Empty subfolders move with the rename.
@@ -71,9 +63,9 @@ Beyond drag-and-drop and the toolbar buttons, the file tree supports two more in
 
 ### Delete semantics
 
-Delete is a soft delete — the file is moved into a per-vault trash directory, not removed from disk. Restorable until the trash is emptied. This trades a small amount of disk overhead for a real safety net against the worst tree-action mistake (deleting the wrong note).
+Delete is a soft delete — the file is moved into a per-vault trash directory, not removed from disk. Restorable until the trash is emptied.
 
-`delete_note(rel: &str) -> Result<()>` lives in `core::vault` next to `create_note` and `move_note`. Order: suppress watcher events for the source path, fs rename into trash (collision-suffixed; see below), update store (`store::delete_note` cascades chunks + vec rows + path_ids per `index.md`) so the note stops appearing in search/related, append a metadata entry to the trash manifest so restore knows the original path, release suppression. [delete-note-core-cmd]
+`delete_note(rel) -> Result<()>` lives in `core::vault` next to `create_note` and `move_note`. Order: suppress watcher events for the source path, fs rename into trash (collision-suffixed; see below), update store (`store::delete_note` cascades chunks + vec rows + path_ids per `index.md`) so the note stops appearing in search/related, append a trash-manifest entry recording the original path, release suppression. [delete-note-core-cmd]
 
 **Trash location:** `vault/.hiker/trash/`. Per-vault rather than per-user so the safety net travels with the vault under Syncthing/git/etc., and so two vaults' deletions don't collide.
 
@@ -81,9 +73,9 @@ Delete is a soft delete — the file is moved into a per-vault trash directory, 
 
 **Restore (`hiker trash restore <id|path>`)** — moves the file back to its original path via `move_note` (so the index re-picks it up cleanly). If the original path is now occupied, restore fails and the user picks a new target. [vault-trash-restore]
 
-**Empty (`hiker trash empty`)** — permanent deletion of all entries in the trash. Confirm prompt; this *is* the irrecoverable operation. No automatic emptying in v1 (no TTL, no size cap) — disk is cheap, surprise is expensive. Auto-empty policies can come later as a setting (`trash.retention_days`, `trash.max_size_mb`) when there's a real ask. [vault-trash-empty]
+**Empty (`hiker trash empty`)** — permanent deletion of all trash entries. Confirm prompt; this *is* the irrecoverable operation. No automatic emptying in v1 (no TTL, no size cap); auto-empty policies (`trash.retention_days`, `trash.max_size_mb`) can land later as a setting. [vault-trash-empty]
 
-Watcher must include `vault/.hiker/trash/` in its hard-coded ignore list (it's already covered by the existing `.hiker/` ignore in `watcher.md`, but worth noting explicitly because trash entries *are* `.md` files and a less-careful ignore would re-index them).
+The watcher ignores `vault/.hiker/trash/` via the existing `.hiker/` ignore (`watcher.md`) — noted explicitly since trash entries *are* `.md` files a less-careful ignore would re-index.
 
 Edge cases:
 
@@ -100,7 +92,7 @@ Trash is its own activity-bar panel (`feature-trash-panel`), not pinned inside t
 
 Planned richer interactions (the bullets below describe the intended surface; the current panel implements the disk listing + Restore / Purge / Empty):
 
-- **Disk is the source of truth for what's in the bin.** The panel is built by walking `<vault>/.hiker/trash/` directly — every file there shows up. The manifest is consulted for *original path* and *deletion time* only, and only on a per-entry basis. Files dropped into `.hiker/trash/` by hand, or entries whose manifest row got corrupted, still appear and can still be emptied. The manifest is a hint, not a gate. [tree-trash-disk-listing]
+- **Disk is the source of truth for what's in the bin.** The panel walks `<vault>/.hiker/trash/` directly — every file shows up. The manifest is consulted per-entry for *original path* and *deletion time* only. Hand-dropped files or entries with a corrupted manifest row still appear and can still be emptied — the manifest is a hint, not a gate. [tree-trash-disk-listing]
 - **Flat list, sorted by deletion time descending.** No reconstruction of the original folder structure inside the bin. Trash is a recovery surface ("the thing I deleted ten minutes ago"), not a working tree. Each row shows the basename, a relative-time hint (`5m ago`, `yesterday`, `Mar 12`), and the original path as muted secondary text. Folder entries get a `▸` glyph and a `(N notes)` count derived from the manifest's `members` (or `?` if the entry is orphaned and we can't tell). [tree-trash-flat-by-deleted]
 - **Click → read-only preview.** Single click on a trash row opens the file in the editor in a non-editable mode (read-only editor mode via `ViewState.read_only` plus a banner across the top: "Trash preview · Restore to edit"). The buffer's `path` is set to the on-disk trash location, `loadedHash` is set, but `isDirty` is forced false and the save button hides. Switching away from a trash preview discards nothing — there's nothing to discard. [tree-trash-preview]
 - **Right-click → Restore / Delete permanently.** Per-row context menu has two entries. Restore calls `vault-trash-restore` and re-ingests the note (see below). Delete permanently removes that single entry from disk + manifest, with a confirm modal that says "Permanently delete `<original_path>`? This cannot be undone." Same `confirmDanger` modal pattern the soft-delete uses. [tree-trash-restore-action]
@@ -108,7 +100,9 @@ Planned richer interactions (the bullets below describe the intended surface; th
 
 #### Restore semantics
 
-Restore is a `move_note` from the trash entry's on-disk location to its `original_path` (looked up from the manifest), followed by a re-ingest so search/related see it again. Because `move_note` already routes through the indexer's owned store connection and emits the correct watcher suppression, restore inherits that path for free — no separate code, no second writer. The store-side effect of restore is identical to a fresh import: a new ulid, fresh chunks, fresh embeddings. We do *not* try to preserve the pre-delete note id; chunk ids and the note id were freed by the original `delete_note` cascade and the v1 stable-id story doesn't extend across the trash boundary. Worth revisiting if/when MCP agents start pinning to chunk ids and a delete+restore round trip needs to look like a no-op.
+Restore is a `move_note` from the trash entry's on-disk location to its `original_path` (from the manifest), followed by a re-ingest so search/related see it again. `move_note` already routes through the indexer's owned store connection and emits the correct watcher suppression, so restore inherits that path — no separate code, no second writer.
+
+The op-log `doc_id` and its history survive the round trip: delete tombstones the doc and retains its Yrs state + history keyed by `doc_id` (per `op-log-external-edit-sync` in `op-log.md`); restore rebinds `path → doc_id` and clears the tombstone, so the document comes back with full change history. The store re-ingests fresh chunks + embeddings under that same `doc_id`, and since `notes.id` *is* the `doc_id` (`store-id-from-oplog`), search rebinds to the restored identity automatically.
 
 Edge cases:
 
@@ -121,8 +115,8 @@ Edge cases:
 
 - **No drag in or out of the trash row.** Restore is an explicit verb, not a DnD gesture. Dragging a regular tree note onto the trash header could plausibly be a delete shortcut, but the existing right-click → Delete plus the confirm modal already covers that path; adding a second route doubles the surface for accidents.
 - **Default state: collapsed.** First open of a vault shows the trash row collapsed regardless of count. Persistence of the expanded/collapsed state across launches is deferred to `settings.md`.
-- **Refresh.** The manual refresh button (`tree-refresh-manual`) re-walks the trash dir alongside the vault. The watcher's `.hiker/` ignore stays in place, so trash entries do not auto-refresh on filesystem events; this is intentional — trash is changed only by Hiker actions, and after each one the panel re-reads itself. If a user manually edits the trash dir, refresh picks it up.
-- **Index isolation.** Trash entries are never indexed, never appear in search/related, never count toward `Indexed (N notes)` in the status bar. Already covered by the watcher's `.hiker/` ignore and the walker's startup-scan path skipping `.hiker/`; restated here so future indexer changes don't accidentally include trash content.
+- **Refresh.** The manual refresh button (`tree-refresh-manual`) re-walks the trash dir alongside the vault. Trash entries don't auto-refresh on filesystem events (the watcher's `.hiker/` ignore); the panel re-reads itself after each Hiker action, and manual edits to the trash dir surface on refresh.
+- **Index isolation.** Trash entries are never indexed, never appear in search/related, never count toward `Indexed (N notes)` — covered by the watcher's and walker's `.hiker/` skip; called out here so future indexer changes don't accidentally include trash content.
 
 #### Out of scope (deferred)
 
@@ -152,7 +146,7 @@ Search and related-notes are independent of any such toggle — a category hidde
 
 ## Companion folders
 
-A note can own a sibling folder of child notes: a note at `<dir>/<name>.md` pairs with a folder `<dir>/<name>/` holding notes that logically belong to it. Used by extraction's crawl/feed captures (`crawl-job-note` in `extract.md`) and trail waypoints (`trail-storage-layout` in `trails.md`); a general primitive, not specific to either. [note-companion-folder]
+A note can own a sibling folder of child notes: a note at `<dir>/<name>.md` pairs with a folder `<dir>/<name>/` holding notes that logically belong to it. Used by trail waypoints (`trail-storage-layout` in `trails.md`); a general primitive, not specific to trails. [note-companion-folder]
 
 - **Pairing rule.** A folder whose name exactly matches a sibling `.md` basename is that note's companion folder. The Files tree renders it as an ordinary folder (real bytes, real path); Vault mode collapses its contents *as children of the note* (`vault-view.md`).
 - **`hiker.parent` is the nesting authority, not folder membership.** Child notes stamp `hiker.parent` (or, for trails, ride the `hiker.waypoints` tree). A file dropped into the folder *without* a parent stamp is a plain file, not a logical child — so the physical folder is a convenience/discoverability home, and the metadata is the truth. This keeps the two decoupled: stray files never become false children.
@@ -166,15 +160,15 @@ A persistent multi-note selection model in the file tree: a `selected: HashSet<v
 
 **Gesture split.** Mirrors the cluster editor's already-shipped row gestures (`cluster-editor-multi-select-shift-range` in `cluster-editor.md`) so the file-manager convention is identical in both surfaces:
 
-- **Plain click.** Clears any existing multi-selection and re-anchors on the clicked row. The row's primary affordance (open the note) still fires — clicking a row is a "use this row" gesture, not a bare "select this row" gesture.
-- **Cmd-click / Ctrl-click.** Toggles the clicked row in the selection set and re-anchors on it, so subsequent shift-clicks pivot off the just-toggled row.
-- **Shift-click.** Replaces the selection with the range from the current anchor through the clicked row in current display order (top-to-bottom walk of currently-rendered rows respecting expand/collapse), inclusive. Range membership is computed on the rendered tree at click time; expanding a folder after a shift-click range was set doesn't grow the existing selection. With no anchor (first interaction), a shift-click is treated as a single-row range and sets the anchor.
+- **Plain click.** Clears any multi-selection and re-anchors on the clicked row. The row's primary affordance (open the note) still fires — a click is "use this row," not bare "select this row."
+- **Cmd-click / Ctrl-click.** Toggles the clicked row in the selection set and re-anchors on it, so subsequent shift-clicks pivot off it.
+- **Shift-click.** Replaces the selection with the range from the current anchor through the clicked row in current display order (top-to-bottom walk of rendered rows, respecting expand/collapse), inclusive. Range membership is computed on the rendered tree at click time — expanding a folder afterward doesn't grow the selection. With no anchor (first interaction), it's a single-row range that sets the anchor.
 
-The anchor lives on the file-tree UI state and is cleared when the vault swaps. Selection survives folder expand/collapse — collapsing a folder whose children are selected keeps them in the set; they re-render as selected on re-expand.
+The anchor lives on the file-tree UI state and clears on vault swap. Selection survives folder expand/collapse — collapsed children stay in the set and re-render selected on re-expand.
 
 **What it powers:**
 
-- **Bulk file-tree verbs.** The selection set is the target for multi-note actions — move (one `move_note` per selected path under a single transaction, same shape as folder drag), delete (one `delete_note` per path into trash), add-to-board, add-to-canvas (`canvas-add-to-canvas-verb` in `canvas.md` — inserts each selected path as a pointer node on a chosen canvas), and add-to-tree-cluster. The right-click context menu (`tree-context-menu`) shows the bulk forms of its verbs when more than one row is selected ("Move N notes to trash?" reuses the folder-delete confirm copy shape). [note-multi-select-bulk-verbs]
-- **Drag-into-canvas (pending).** A file row (or a multi-selection) dragged onto an open canvas should drop pointer nodes at the drop point — the canvas side of this is the deferred `canvas-dnd-add` (in `canvas.md`); it rides the uniform vault-path drag payload (`design.md` `trails-dnd-ingestion`) alongside drag-into-cluster. Until it lands, the **Add to canvas** verb and the canvas **Insert from vault** picker cover insertion. [note-multi-select-bulk-verbs]
-- **Selected-notes clustering build scope.** When notes are multi-selected, the clustering build-scope picker (`cluster-editor-build-scope-picker` in `cluster-editor.md`) defaults to `BuildScope::Notes` (per `cluster-build-scope` in `clustering.md`) — the scope already exists; the selection feeds it the set of note ids.
-- **Drag-into-cluster authoring.** A multi-selected set can be dragged into a cluster in the cluster editor's graphical surface to author membership by example (`tree-author-blank` in `cluster-editor.md`).
+- **Bulk file-tree verbs.** The selection set is the target for multi-note actions — move (one `move_note` per path under a single transaction, same shape as folder drag), delete (one `delete_note` per path into trash), add-to-board, add-to-canvas (`canvas-add-to-canvas-verb` in `canvas.md` — each path inserted as a pointer node), and add-to-tree-cluster. The right-click menu (`tree-context-menu`) shows bulk forms when more than one row is selected ("Move N notes to trash?" reuses the folder-delete confirm copy). [note-multi-select-bulk-verbs]
+- **Drag-into-canvas (pending).** A file row or multi-selection dragged onto an open canvas should drop pointer nodes at the drop point — the deferred `canvas-dnd-add` (`canvas.md`), riding the uniform vault-path drag payload (`design.md` `trails-dnd-ingestion`). Until it lands, the **Add to canvas** verb and the canvas **Insert from vault** picker cover insertion. [note-multi-select-bulk-verbs]
+- **Selected-notes clustering build scope.** Multi-selection defaults the clustering build-scope picker (`cluster-editor-build-scope-picker` in `cluster-editor.md`) to `BuildScope::Notes` (per `cluster-build-scope` in `clustering.md`), feeding it the set of note ids.
+- **Drag-into-cluster authoring.** A multi-selected set can be dragged into a cluster in the cluster editor to author membership by example (`tree-author-blank` in `cluster-editor.md`).

@@ -1,11 +1,11 @@
 # Settings
 
-Configuration surface for Hiker. v1 ships a TOML loader and the section content needed to unblock the deferred toggles in `editor.md`, `txt-ingest.md`, and `index.md`. No settings UI in v1 — the file is the surface, and a relaunch picks up changes.
+Configuration surface for Hiker. v1 ships a TOML loader and the section content needed to unblock the deferred toggles in `editor.md`, `txt-ingest.md`, and `index.md`.
 
-- **Two TOML files.** Per-user `config.toml` at the platform config dir, per-vault `vault/.hiker/config.toml`. Vault overrides user key-by-key. [settings-user-config-toml, settings-vault-config-toml]
+- **Two TOML files.** Per-user `config.toml` at the platform config dir, per-vault `vault/.hiker/config.toml`. Vault overrides user key-by-key. [settings-user-config-toml] [settings-vault-config-toml]
 - **Read once at startup.** No watcher, no hot-reload, no per-access reread. Restart to apply. Struct built once and handed around frozen. [settings-load-once-at-startup]
 - **Strict load.** Unknown key or type mismatch aborts startup with a `file:line` error. Same fail-loud discipline as `store-version-fail-loud` in `index.md` — silently dropping a user-set value is worse than refusing to start. [settings-strict-load]
-- **Defaults live in Rust, files auto-create on first load.** Every field is `serde(default)`; the loader treats a missing file as empty *and* writes a defaults-populated TOML so users have a self-documenting file to edit. [settings-defaults-in-code, settings-auto-create-defaults]
+- **Defaults live in Rust, files auto-create on first load.** Every field is `serde(default)`; the loader treats a missing file as empty *and* writes a defaults-populated TOML so users have a self-documenting file to edit. [settings-defaults-in-code] [settings-auto-create-defaults]
 - **In-app toggles write back.** Existing UI toggles (View menu, tree sort, sidebar/related panel state, trash expansion) persist their flips to the vault TOML so they survive restart. No generalized settings panel in v1 — the TOML is still canonical for everything else. [settings-write-back]
 
 
@@ -27,7 +27,7 @@ Either file may be absent; both absent is the same as both empty.
 Deep merge: user is the wide default ("my preferences for any vault"), vault is the local override ("for *this* vault, also do X"), vault wins on key overlap.
 
 - Maps merge recursively. `[editor]` in both files produces a single table where vault keys win on overlap.
-- Arrays replace, not concatenate. User `indexing.ignored_paths = ["foo/"]` plus vault `["bar/"]` = `["bar/"]`. Concatenation reads as merging but is surprising (a user can't *remove* an inherited entry). Replace is honest.
+- Arrays replace, not concatenate. User `indexing.ignored_paths = ["foo/"]` plus vault `["bar/"]` = `["bar/"]`. Concatenation would prevent a user from *removing* an inherited entry.
 - `schema_version` comes from whichever file declares it; if both disagree, vault wins (same overlap rule). Mismatch with the binary's expected version is the strict-load case below.
 - No per-key user-only/vault-only tagging. Any key may appear in either file. The section tables name which keys make sense where, but the loader doesn't enforce it — putting `vault.recent` in a vault TOML works, it's just useless.
 
@@ -77,15 +77,15 @@ Per-vault toggles for the editor pane and View menu. All optional; each has an i
 | `editor_font` | string | platform proportional default | Font for the editor canvas's prose body. Per `editor-three-fonts` |
 | `code_font` | string | platform monospace default | Font for fenced code blocks AND frontmatter blocks (per `editor-frontmatter-rendering-fix`) AND inline code AND the diff layer's code-shaped hunks. Per `editor-three-fonts` |
 
-Font family rides the three font slots above per `editor-three-fonts`; per-slot **size** is intentionally excluded from v1 (theme tokens own size) and is listed in "Deferred" below. Theme is also deferred. Crash-recovery autosave (`autosave.md`) is on with a fixed 5s tick and has no config surface in v1; an `[autosave]` section can land later if a workflow asks.
+Font family rides the three font slots per `editor-three-fonts`; per-slot **size** and theme are deferred (theme tokens own size). Crash-recovery autosave (`autosave.md`) is on with a fixed 5s tick and no config surface in v1.
 
 ### [indexing] [settings-section-indexing]
 
-Indexer tunables. Vault-level only is the natural scope (different vaults have different content shapes), but a user-level default is fine for the common case.
+Indexer tunables. Vault-level is the natural scope, but a user-level default is fine.
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
-| `model` | string | `"bge-small-en-v1.5"` | Embedder model id. One of `bge-small-en-v1.5` (default, 384-dim, English), `bge-m3` (1024-dim, multilingual, 8k context), `embedding-gemma-300m` (768-dim). Strict-load rejects anything else. Bumping forces full re-embed via `embedder-version-tag`; a dim change additionally rebuilds the vec0 table via `store-rebuild-chunk-vecs-on-dim-change`. UI surface: interactive dropdown gated by `settings-embedder-model-change-warning` |
+| `model` | string | `"bge-small-en-v1.5"` | Embedder model id: `bge-small-en-v1.5` (default, 384-dim, English), `bge-m3` (1024-dim, multilingual, 8k ctx), `embedding-gemma-300m` (768-dim); strict-load rejects others. Bumping forces full re-embed (`embedder-version-tag`); a dim change rebuilds the vec0 table (`store-rebuild-chunk-vecs-on-dim-change`). UI: interactive dropdown gated by `settings-embedder-model-change-warning` |
 | `batch_size` | u16 | `64` | Embed batch size; backs the partial `embedder-batch-64` |
 | `ignored_paths` | array of strings | `[]` | Additional ignore patterns on top of the hard-coded list in `watcher-ignore-hardcoded`. gitignore-style globs, evaluated against vault-relative paths. Replaces, doesn't concatenate, per the array-merge rule above |
 
@@ -112,12 +112,7 @@ Switching `[indexing].model` is the single most expensive setting flip in the ap
 └───────────────────────────────────────────────────┘
 ```
 
-Cancel is default-focused; the action button carries the standard accent treatment used for other consequential confirms (`confirm3-real-modal`). The "Dim change" bullet is only rendered when the new model's dim differs from the current one — same-dim swaps (e.g. a hypothetical future 384-dim model) omit it.
-
-Body wording rules:
-- Names the *current* model and the *new* model verbatim, so the user can verify they're switching the thing they think they're switching.
-- States the re-embed consequence in plain language; no jargon about `embedder_version` or vec0.
-- The time estimate is a qualitative range, not a computed estimate — vault size and CPU vary too widely for a number to be honest.
+Cancel is default-focused; the action button carries the standard accent treatment used for other consequential confirms (`confirm3-real-modal`). The body names the current and new model verbatim. The "Dim change" bullet is only rendered when the new model's dim differs from the current one — same-dim swaps omit it. The time estimate is a qualitative range, not a computed number.
 
 Behavior on Confirm:
 1. `set_setting("indexing.model", new_id)` writes through `toml_edit` per `settings-write-back`.
@@ -127,32 +122,21 @@ Behavior on Confirm:
 
 Behavior on Cancel: the dropdown reverts to the previous value; no write occurs.
 
-The warning is only on the **settings UI** path. Hand-edits to the vault TOML don't surface a warning — strict-load picks up the new value on the *next launch*, the embedder loads at the new model id, and the re-embed runs. (Hot-reload is a UI-driven path only; the TOML hand-edit case is rare enough that "restart to apply" is acceptable, same posture as the rest of `settings-load-once-at-startup`.) Documented in the inline "Notes" comment of the auto-created TOML.
-
-### [extract] [settings-section-extract]
-
-Loaded: `ExtractConfig` is a field on the strict-load `Config` struct
-(`core/src/config/content_dirs.rs::ExtractConfig`, wired in
-`core/src/config/mod.rs`), so a well-formed `[extract]` table in a vault TOML
-is accepted. The extraction *work* lives in the decoupled `hiker-extract`
-crate (`extract-crate-decoupled`); `core` only loads this config so the
-strict-load `Config` recognizes the section.
-
-Extraction tunables (`extract.md`). Vault-level is the natural scope (which folders hold extractable sources is per-vault), with a user-level default fine for the common case.
-
-| Key | Type | Default | Notes |
-| --- | ---- | ------- | ----- |
-| `auto_globs` | array of strings | `[]` | Folders/globs whose non-md sources auto-extract on appear/change (`extract-trigger-auto-glob`). gitignore-style globs over vault-relative paths; replaces, doesn't concatenate, per the array-merge rule. Default empty = no auto-extraction; non-md elsewhere extracts only on the explicit "Make searchable" action (`extract-trigger-on-demand`) |
-| `clip_folder` | string | `"clips/"` | Destination folder for one-off URL captures (`scrape-cmd`); `hiker scrape --into` overrides per call |
-| `artifact_retention` | string | `"latest"` | Vault default for the binary-artifact retention cascade (`extract-artifact-retention`): `latest` / `keep:N` / `forever`; per-crawl/per-feed/per-source frontmatter overrides it |
-| `feed_default_poll` | string | `"6h"` | Default `poll_interval` for a new RSS/feed capture note when none is set (`rss-poll-schedule`); a feed may set its own |
-| `feed_item_retention` | string | `"keep:200"` | Vault default child-count bound for feeds (`rss-item-retention`): `keep:N` / `forever`; per-feed frontmatter overrides |
+The warning is only on the **settings UI** path. A vault-TOML hand-edit surfaces no warning — strict-load picks up the new value on the *next launch*, the embedder loads at the new id, and the re-embed runs (hot-reload is UI-only, "restart to apply" otherwise, per `settings-load-once-at-startup`). Documented in the inline "Notes" comment of the auto-created TOML.
 
 ### [chat] [settings-section-chat]
 
 | Key | Type | Default | Notes |
 | --- | ---- | ------- | ----- |
 | `chats_dir` | string | `"chats/"` | Visible folder holding native + imported chat-session notes (`chat-session-markdown-store`); imports land in its `imported/` subfolder |
+
+### [render] [settings-section-render]
+
+Vault-wide policy for the editor's rendered-widget layer (LaTeX math, Mermaid / WaveDrom diagrams, tables). Per-vault only — the cache it governs lives in the vault's `.hiker/`. Live-applied (no restart).
+
+| Key | Type | Default | Notes |
+| --- | ---- | ------- | ----- |
+| `cache_diagrams` | bool | `true` | Persist rasterized math / Mermaid / WaveDrom widgets to `<vault>/.hiker/diagram-cache/`, keyed by `content_hash`, so reopening a note skips the `resvg` blit. Sits below the in-memory `CachedDeco` / texture caches (`widget-render-disk-cache`); off = in-memory only. Best-effort 64 MB LRU sweep bounds the dir; tables paint natively (unaffected). Surfaced as the "Cache rendered diagrams to disk" toggle (`render-cache-diagrams-toggle`) |
 
 ### [inbox] [settings-section-inbox]
 
@@ -207,36 +191,35 @@ Stub. The full schema lives in `index.md`'s embedder section (`embedder-config-s
 
 Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables routing the chat panel through an external ACP agent instead of the basic agent loop. Shape: `agent` (registry id, "bundled" alias for the basic loop, or "none" for disable mode). Loader lands with `core::acp` itself.
 
+### [sync]
+
+The full schema lives in `sync.md` (`sync-config-section`); summarized here so the section list is complete. Per-vault: `enabled` / `mode` / `server_url` / `discovery` / `device_name`; `devices` + the learned `device_names` map are enrollment state. Secrets (content key, device private key) are user-scope and never appear. Exposed as standard settings rows (vault scope); `devices` is read-only there. [settings-section-sync]
+
 
 ## Pending change review
 
-Some writes shouldn't land directly on disk: the user didn't author the bytes (agent writes), or the user can't watch them all happen at once (batch mutations). These writes land as `status=pending` ops in the op log (per `op-log.md`) until the user accepts. Accept/reject lives inline on every surface that cares — the chat card where the proposal originated, the trails panel for draft-trail proposals, the file tree for per-file proposals, the editor toolbar when the open file has a pending op, and the activity detail page as the central review surface. No dedicated staging editor sub-mode — accept/reject lives alongside the content it affects.
+Some writes shouldn't land directly on disk: the user didn't author the bytes (agent writes), or can't watch them all at once (batch mutations). These land as `status=pending` ops in the op log (per `op-log.md`) until accepted. Accept/reject lives inline on every surface that cares (enumerated below) — no dedicated staging editor sub-mode.
 
 Two flows produce pending ops:
 
 - **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on makes the produced ops enter the log as `status=pending` instead of `status=accepted`. [agent-write-review-mode]
 - **Batch mutations (always pending)** — multi-note mutation actions (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks per `task-queue.md`; the user can't watch N buffers, so each result lands as pending unconditionally. Single-note user-initiated mutations stay in-buffer per `editor.md`'s Note-mutations menu.
 
-The headline decisions:
+The substrate — per-document pending queue (`<doc-id>.pending`), op shapes (`edit_note` → N `Replace` ops sharing a `batch_id`; `write_note`/`set_frontmatter`/`apply_tag` → one op; `move_note`/`rename` → `Rename`), drift detection, status states, and restart survival — is owned by `op-log.md` (`op-log-pending-queue`, `op-log-op-shape`, `op-log-status-states`, `op-log-pending-survives-restart`). What this doc owns is the settings-facing review surface behavior:
 
-- **Pending ops live in a per-document queue, not a separate staging database.** Agent ops are serialized Yrs updates in `<doc-id>.pending` (per `op-log-pending-queue`); accept applies them to the document's `accepted` CRDT state, reject discards them. Closing the app and reopening reconstitutes pending ops naturally — the queue is on disk. [op-log-pending-survives-restart]
-- **Agent-write review is off by default; opt-in per write surface.** Existing behavior — agent ops enter as `status=accepted` and reach disk immediately — stays the default. Users who want a checkpoint in the loop flip the per-surface `review_required` flag. [agent-write-review-mode]
-- **`edit_note` calls emit multiple `Replace` ops sharing a `batch_id`** so consumers can group them visually but accept/reject each independently. `write_note`, `set_frontmatter`, and `apply_tag` emit one op per call (whole-document `Replace`, `SetFrontmatter`, and `SetFrontmatter`-on-tags respectively). Op shapes specced in `op-log-op-shape`.
-- **`move_note` and `rename` flow through dedicated op kinds** per `op-log-op-shape` (`Rename` for path moves; the indexer logic that calls `core::vault::move_note` is unchanged from the prior design). Triage and the cluster editor's one-off Stage move verb emit `Rename` ops with `author = "auto:triage"` / `"auto:cluster-editor"` respectively.
-- **Drifted ops** (an anchor's `old_str` no longer resolves uniquely against the accepted materialization) surface with Accept disabled, Reject active. See `patch-review.md` for the inline drift surface. [op-log-status-states]
-- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders its own accept/reject inline: chat tool-call cards, the trails panel, the file tree context menu, the unified `Changes` tab. Hunk-shaped pending ops render directly in the live editable buffer as inline decorations + per-file pill (see `patch-review.md`). Whole-file pending ops open via the existing read-only-buffer-with-diff-toggle pattern, framed as "Review rewrite" / "Review new note" in the mode-controls label (per `write-note-review-surface`).
-- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the existing author-class pills) that shows all pending ops across all sources. Each row carries [Accept] [Reject]. An [Accept all (N)] button at the top batch-approves. [staging-review-activity-detail-filter]
-- **Pending ops are queryable by surface-specific filters.** `core::oplog::query()` accepts a filter (`by_path`, `by_trail_id`, `by_surface`, `by_session_id`, `status`) so each surface pulls only its relevant ops.
-- **MCP write responses are honest about pending.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "pending"` plus the op id so the agent can describe the outcome accurately. [staging-review-pending-response]
-- **Accept navigates to the target note as a preview tab.** After a successful individual accept (not batch), the UI opens the affected note at its target path in an editor tab with `preview: true`. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
+- **Agent-write review is off by default; opt-in per write surface.** Agent ops enter as `status=accepted` and reach disk immediately by default; users flip the per-surface `review_required` flag for a checkpoint. [agent-write-review-mode]
+- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders accept/reject inline (chat cards, trails panel, file tree context menu, unified `Changes` tab). Hunk-shaped pending ops render in the live editable buffer as inline decorations + per-file pill; whole-file pending ops open via the read-only-buffer-with-diff-toggle pattern, framed "Review rewrite" / "Review new note" (both per `patch-review.md`, `write-note-review-surface`). Drifted ops surface with Accept disabled, Reject active.
+- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the author-class pills) showing all pending ops across all sources; each row carries [Accept] [Reject], with [Accept all (N)] at the top. [staging-review-activity-detail-filter]
+- **MCP write responses are honest about pending.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "pending"` plus the op id. [staging-review-pending-response]
+- **Accept navigates to the target note as a preview tab.** After an individual accept (not batch), the UI opens the affected note at its target path with `preview: true`. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
 
 ### Review surfaces
 
-Five surfaces plus the central activity-detail page. One proposal may appear on multiple surfaces (e.g., an agent write appears on the chat card that produced it AND on the activity detail page AND on the file tree row for the affected file). Accept from any surface removes it from all.
+Five surfaces plus the central activity-detail page. One proposal may appear on several (an agent write shows on its chat card AND the activity detail page AND the file tree row); accept from any surface removes it from all.
 
 #### Surface 1: Chat panel tool-call cards
 
-When an agent proposes a write in review mode, the tool-call card appends two small text links inline:
+The tool-call card appends two text links inline:
 
 ```
 ▸ write_note(research/paper.md) ✓ Proposed  [Accept] [Reject]
@@ -246,9 +229,9 @@ Accept → drift-checked write → navigates to the target note as a preview tab
 
 #### Surface 2: Trails panel
 
-Two cases:
+Two cases.
 
-**Whole trail is a draft** (agent or clustering proposed a new trail). Below the trails panel header, a muted banner row (same visual weight as the existing append-cursor hint):
+**Whole trail is a draft** (agent or clustering proposed a new trail). Below the panel header, a muted banner row (append-cursor-hint weight):
 
 ```
 ┌─ Trails ──────────────────────────────────┐
@@ -257,9 +240,9 @@ Two cases:
 │ [Accept trail]  [Reject]                   │
 ```
 
-The waypoint cards render normally below so the user can inspect before deciding. Accept → moves trail-doc to `[trails] new_trail_dir`, strips `hiker.draft` flag, appends `core::changes` row. Reject → confirm then hard-deletes trail-doc + waypoint dir (no trash — this was never user data). [staging-accept-reject-from-trails]
+Waypoint cards render normally below for inspection. Accept → moves trail-doc to `[trails] new_trail_dir`, strips `hiker.draft`, appends `core::changes` row. Reject → confirm then hard-deletes trail-doc + waypoint dir (no trash — never user data). [staging-accept-reject-from-trails]
 
-**Active trail has pending waypoint additions.** Minimal collapsed rows at the end of the waypoint list:
+**Active trail has pending waypoint additions.** Collapsed rows at the end of the waypoint list:
 
 ```
 ┌─ Trails ──────────────────────────────────┐
@@ -269,16 +252,16 @@ The waypoint cards render normally below so the user can inspect before deciding
 │ +  notes/whisper.md     [Accept] [Reject] │
 ```
 
-Each row is the source basename plus two muted action links. No full waypoint card — the source path is enough context for "do I want this in my trail?" The proposal also appears on the activity detail page with the same Accept/Reject. [staging-accept-reject-from-trails]
+Each row is the source basename plus two muted action links — no full waypoint card. Also appears on the activity detail page with the same Accept/Reject. [staging-accept-reject-from-trails]
 
 #### Surface 3: File tree
 
 Pending proposals are **merged into the file tree at their target path**, not isolated in a separate panel:
 
-- **New files** (the target path does not yet exist on disk) appear in the tree as synthetic file rows at their destination folder, rendered with a **greyed name** so the user can see where the proposal will land if accepted.
-- **Changes to existing files** show the **same dirty indicator** (the suffix dot) already used for dirty buffers. The dot is the universal "this file has something unresolved" signal — dirty buffer, pending proposal, same visual.
-- **Synthetic directories** are created when a proposal targets a path inside a folder that doesn't exist yet (e.g. `newfolder/file.md`). The folder row appears greyed and can be expanded to reveal the staged children.
-- The tree refreshes automatically on staging-snapshot updates so proposals appear and disappear as they are accepted or rejected from any surface.
+- **New files** (target path doesn't yet exist) appear as synthetic file rows at their destination folder with a **greyed name**.
+- **Changes to existing files** show the **same dirty indicator** (suffix dot) used for dirty buffers — the universal "something unresolved" signal.
+- **Synthetic directories** are created when a proposal targets a path inside a folder that doesn't exist yet; the folder row appears greyed and expands to reveal staged children.
+- The tree refreshes automatically on staging-snapshot updates so proposals appear/disappear as they're resolved from any surface.
 
 Right-click context menu on the row grows staging actions:
 
@@ -293,21 +276,21 @@ Right-click context menu on the row grows staging actions:
   Reject change
 ```
 
-"Review pending change" opens the file as a read-only buffer with the diff toggle (reuses `snapshot-preview-mode`'s existing diff pattern). Accept and Reject work from the menu without opening the file. [staging-accept-reject-from-tree]
+"Review pending change" opens the file as a read-only buffer with the diff toggle (reuses `snapshot-preview-mode`). Accept and Reject work from the menu without opening the file. [staging-accept-reject-from-tree]
 
 #### Surface 4: Editor toolbar
 
-When the open buffer has a pending proposal, a small pill appears in the editor toolbar's right-side cluster, just left of Save (same placement and visual weight as the existing "Add to trail" pill):
+When the open buffer has a pending proposal, a pill appears in the toolbar's right cluster, just left of Save (same placement/weight as the "Add to trail" pill):
 
 ```
 Proposed change — [Accept] [Reject]
 ```
 
-Hidden when there's no proposal for the active file. Accept drift-checked-writes and removes the proposal from all surfaces. If the active buffer is the target file, the buffer reloads from disk; otherwise navigates to the target as a preview tab. Reject discards. The pill does not open a separate preview — the user is already looking at the file on disk. [staging-accept-reject-from-editor]
+Hidden when there's no proposal for the active file. Accept drift-checked-writes and removes the proposal from all surfaces; if the active buffer is the target file it reloads from disk, otherwise navigates to the target as a preview tab. Reject discards. No separate preview — the user is already looking at the file. [staging-accept-reject-from-editor]
 
 #### Surface 5: Activity detail page (central review surface)
 
-The existing `vault-home-recent-activity-detail` page (`vault-home-recent-activity-detail`) gains a "Pending" filter pill alongside the existing author-class pills (user/robot icons). When active:
+The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill alongside the author-class pills (user/robot icons). When active:
 
 ```
 ┌─ Activity ───────────────────────────────┐
@@ -333,72 +316,47 @@ Click a pending row → opens the editor tab in diff mode with `DiffSource = Sta
 
 #### Surface 6: Queue button (combined badge)
 
-The existing queue button in the top strip shows a combined badge: tasks + pending reviews. Click opens the queue detail page (unchanged). The review count is folded into the badge — users who want the full list go to the activity detail page. [staging-review-top-bar-badge]
+The existing top-strip queue button shows a combined badge: tasks + pending reviews. Click opens the queue detail page (unchanged); the full review list lives on the activity detail page. [staging-review-top-bar-badge]
 
 ### Button styling
 
-No green/red. All Accept/Reject use the existing muted token system and the same text-link weight as the `[Restore this version]` link in the activity detail:
+No green/red. All Accept/Reject use the muted token system and the text-link weight of the `[Restore this version]` link in the activity detail:
 
-- **Accept** — `var(--accent)` muted outline, same color family as active states elsewhere. Low-opacity fill on hover.
-- **Reject** — `var(--danger-text)` muted outline. Keeps the danger semantic but doesn't scream.
-- **Accept all** — same accent outline with "all" label.
+- **Accept** / **Accept all** — `var(--accent)` muted outline, low-opacity fill on hover.
+- **Reject** — `var(--danger-text)` muted outline; keeps the danger semantic without screaming.
 
-### Storage
+### Storage, lifecycle, and queries
 
-Accepted state lives in `.hiker/oplog/<doc-id>.yrs` (the document's Yrs CRDT state); pending ops queue separately in `<doc-id>.pending` as serialized Yrs updates paired with side-table metadata. Storage layout, op shapes, drift detection, and the layered model are all specced in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-layered-model`, `op-log-status-states`). The `[staging]` config section is replaced by `[op-log]` per `op-log-config-section`.
+The substrate is owned by `op-log.md` and `patch-review.md`, not respecified here. Pending-op storage layout, the produce → `stage_pending` → surface-refresh → accept/reject (`flip_op_status`) lifecycle, drift derivation, query filters (`core::oplog::query` by `path` / `trail_id` / `surface` / `session_id` / `status`), op-log change events, and retention/auto-reject behavior all live in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-status-states`, `op-log-config-section`). There is no separate staging database; the `[staging]` config section is replaced by `[op-log]`. The substrate API is `core::oplog`; producer helpers and `flip_op_status` live in `core::ops`.
 
-There is no separate staging database, no `staging.db` schema, no proposal table. Pending ops are queryable via `core::oplog::query({ status: Pending, ... })` — the same query surface every other consumer reads.
+### Config keys for review
 
-### Lifecycle of a pending op
+Per-surface gates live in their owning sections; log-level behavior (`auto_reject_on_drift`, `metadata_retention_days`, `rejected_retention_days`) lives in `[op-log]` per `op-log-config-section`.
 
-1. **Producer emits an op via `core::ops`.**
-    - **Agent path** — `mcp-tool-write-note` / `mcp-tool-edit-note` / a background feature emits ops via `core::ops::agent_*`. When `review_required` is on for the producer, the ops queue in `<doc-id>.pending` instead of applying to `accepted`. `edit_note` queues N `Replace` ops sharing a `batch_id`; `write_note` queues a single whole-document `Replace`; `set_frontmatter` and `apply_tag` queue `SetFrontmatter` ops (per `op-log-op-shape`). Validation (anchor uniqueness, no textual overlap, anchors resolve against pre-application content) happens once at the producer per `mcp-edit-note-validation`.
-    - **Batch mutation path** — each fanned-out task in `core::tasks` queues its result op on completion.
-2. **`OpLog::stage_pending` writes the op to `<doc-id>.pending`** and broadcasts op-log change events. The pending op is now durable across restarts.
-3. **All active surfaces refresh on the next frame.** Chat cards, trails panel, tree row indicators, in-buffer hunks, write-note pending banner, Changes tab. They read pending ops via `core::oplog::query` filtered to their relevant scope.
-4. **Drift detection.** Every op that advances `accepted` re-derives drift for the outstanding pending ops: hiker tries to apply each queued Yrs update to a clone of current `accepted`. A `Replace` whose `AnchorHint` no longer resolves uniquely (per `op-log-op-shape`) is drifted, surfaced as `(M drifted)` in the file pill (per `patch-review.md`). Drift is a derived signal, not a status — recomputed from the queue on demand.
-5. **User accepts from any surface** → `core::ops::flip_op_status(op_ids, Accepted)` applies the queued Yrs updates to `accepted`, writes their `op_metadata` rows, and re-runs save-to-disk per `op-log-atomic-write`. Reject → `flip_op_status(op_ids, Rejected)` drops them from the queue and writes a rejected audit row. Accepted ops join the synced CRDT state; rejected ops never reach `accepted`.
-6. **Auto-reject on drift.** When `[op-log] auto_reject_on_drift = true`, an op that becomes drifted is rejected automatically with `metadata.auto_rejected_reason` set. Per `op-log-config-section`.
-7. **Retention.** Accepted-op metadata GCs per `[op-log] metadata_retention_days`; rejected audit rows GC per `[op-log] rejected_retention_days`. Pending ops are never auto-GC'd — they sit in the queue until the user resolves them.
+- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every MCP tool-write enters the log as `status=Pending` instead of `Accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section.
+- **`[llm.background].review_required`** (bool, default `false`) — lands with the `[llm]` section. When true, debounced background features emit pending ops instead of mutating frontmatter directly.
 
-### `core::oplog` module
-
-The substrate API lives in `core::oplog` per `op-log.md`'s "Module placement." Producer-facing helpers (`agent_write_note`, `agent_edit_note`, `agent_set_frontmatter`, `agent_apply_tag`, `flip_op_status`) live in `core::ops`. UI surfaces call `core::oplog::query(filter)` with their relevant filter, not the producer helpers.
-
-Event: op-log change events broadcasts on every append / status-flip so all surfaces stay in sync.
-
-### Where the config keys live
-
-Two kinds of keys: per-surface gates (in their owning sections), and log-level behavior (in the `[op-log]` section specced in `op-log.md`).
-
-- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every MCP tool-write enters the log as `status=Pending` instead of `Accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section alongside the per-tool toggles.
-- **`[llm.background].review_required`** (bool, default `false`) — lands with the v3.5 `[llm]` section. When true, debounced background features emit pending ops instead of mutating frontmatter directly.
-
-Batch mutations don't have a `review_required` flag — they always emit pending ops.
-
-Log-level behavior (`auto_reject_on_drift`, `metadata_retention_days`, `rejected_retention_days`) lives in `[op-log]` per `op-log-config-section`.
+Batch mutations have no `review_required` flag — they always emit pending ops.
 
 ### Forward refs
 
-- `op-log.md` — the substrate; storage, op shape, status states, materialization, drift, config section.
-- `diff.md` — the diff primitive used for whole-file and per-hunk review.
-- `patch-review.md` — owns the inline per-hunk accept/reject surface for `Replace`-shaped pending ops plus the write-note review surface for whole-file pending ops.
-- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` is the producer of per-edit `Replace` ops.
+- `op-log.md` — the substrate; storage, op shape, status states, materialization, drift, config section, unified activity feed (`metadata.agent_op_id` carries the originating op for traceability).
+- `patch-review.md` — inline per-hunk accept/reject for `Replace` ops plus the write-note review surface for whole-file ops; `diff.md` is the underlying diff primitive.
+- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` produces per-edit `Replace` ops.
 - `llm.md` `[llm.background]` config gets `review_required`.
 - `task-queue.md` — batch mutation fan-out producers append pending ops on completion.
 - `trails.md` — draft trail review hooks into the surfaces described here.
-- `op-log.md` — accepted ops surface via the unified activity feed; `metadata.agent_op_id` carries the originating op for traceability.
 
 
 ## Settings UI shell
 
 A vault-bar gear button toggles a settings surface that replaces the editor (same shape as the vault home page — a sub-mode of the editor pane state). The TOML files stay canonical; the panel is a UI on top of the existing `set_setting` / `Config::load` infrastructure, not a parallel storage path. [settings-pane-mode]
 
-- **Pane mode, not modal.** The settings surface is a sub-mode of the editor pane, alongside the vault home overview and home detail. Clicking the gear swaps `#editor-pane` to a settings layout; clicking any tree row / recents row / search result returns to the editor on that note. Same shape `setVaultHomeVisible` already uses today, with the same dirty-buffer protection (a dirty editor buffer gets the existing `file-switch-guard-dirty` modal before the swap). [settings-pane-mode]
-- **Gear icon in the vault bar between Home and Open-vault.** `vault-bar` order becomes Home / Settings / Open-vault, then the vault path display, then back/forward at the trailing edge. Same icon-only treatment as the existing vault-bar buttons (gear / cog glyph in the established line-weight family). Pressed/unpressed state reflects whether the settings pane is currently visible. Tooltip "Settings." [vault-bar-settings-icon]
-- **A long scrollable page, sections stacked.** The body mirrors `vault-home-overview`: a header with the vault name + scope toggle, then a stack of section cards — one per `[section]` in the loaded config. Each card is a list of rows; each row is one config key with its current value, an inline control, a "reset to default" affordance, and a one-line description. No left-rail tabs in v1 — a single scrollable page is honest about the v1 surface size and matches the home page's vertical stack. [settings-pane-section-list]
-- **Eligible keys are interactive; everything else is read-only with a "edit TOML" affordance.** The write-back-eligible key set (the closed list in `core::config`) drives which rows get a live control vs. a read-only display. Read-only rows show the current value in a muted code style with an "Open `config.toml`" link that opens the TOML in the system file manager via the existing `reveal_in_file_manager` command. Same fail-loud / restart-to-apply model as today — non-eligible keys can't be written through `set_setting` for safety, the TOML is the source. [settings-pane-eligible-key-controls, settings-pane-readonly-display]
-- **Per-section scope toggle.** A small `[User] [Vault]` segmented control on each section card flips which file the displayed values come from, since either file may carry any key per "Merge & precedence." Default scope per section: vault for `[editor]` / `[vault]`-UI keys, user for `[vault].recent` / `[vault].default`. The user can flip; the choice is per-section and per-session, not persisted. [settings-pane-scope-toggle]
+- **Pane mode, not modal.** A sub-mode of the editor pane (alongside vault home overview / detail). Clicking the gear swaps `#editor-pane` to a settings layout; clicking any tree row / recents row / search result returns to the editor. Same shape `setVaultHomeVisible` uses, with the same dirty-buffer protection (`file-switch-guard-dirty` modal before the swap). [settings-pane-mode]
+- **Gear icon in the vault bar between Home and Open-vault.** `vault-bar` order becomes Home / Settings / Open-vault, then the vault path, then back/forward. Icon-only treatment matching the existing vault-bar buttons; pressed state reflects whether the pane is visible. Tooltip "Settings." [vault-bar-settings-icon]
+- **A long scrollable page, sections stacked.** Mirrors `vault-home-overview`: a header with vault name + scope toggle, then one section card per `[section]` in the loaded config. Each card lists rows; each row is one config key with its current value, an inline control, a reset affordance, and a one-line description. No left-rail tabs in v1. [settings-pane-section-list]
+- **Eligible keys are interactive; everything else is read-only with an "edit TOML" affordance.** The write-back-eligible key set (closed list in `core::config`, enumerated under "Write-back") drives which rows get a live control vs. read-only display. Read-only rows show the value in muted code style with an "Open `config.toml`" link firing `reveal_in_file_manager`. Non-eligible keys can't be written through `set_setting` — same fail-loud / restart-to-apply model as today. [settings-pane-eligible-key-controls] [settings-pane-readonly-display]
+- **Per-section scope toggle.** A `[User] [Vault]` segmented control per card flips which file the displayed values come from, since either may carry any key per "Merge & precedence." Default scope: vault for `[editor]` / `[vault]`-UI keys, user for `[vault].recent` / `[vault].default`. Per-section, per-session, not persisted. [settings-pane-scope-toggle]
 
 
 ### Layout
@@ -459,11 +417,11 @@ Read-only rows (`settings-pane-readonly-display`) show a muted info glyph; click
 
 ### Lifecycle
 
-- **Entering settings.** The gear button calls `setSettingsPaneVisible(true)` (same shape as `setVaultHomeVisible`), which swaps `#editor-pane` to the settings layout and renders the cards from the current `Config`. If the editor buffer is dirty, the existing `file-switch-guard-dirty` modal fires first.
-- **Live updates.** Every interactive flip calls the existing `set_setting` command. The command already updates the in-memory `Arc<Config>` and writes through `toml_edit`; the UI re-renders the affected row from the new value. No separate "save" button.
-- **External edits.** If the user hand-edits a TOML while the settings pane is open, the displayed values are stale until the next `set_setting` (which reloads the merged Config as a side effect, per existing `settings-write-back` semantics) or until the user closes and reopens the pane. A small "Refresh" affordance in the header forces a reload without making a write — calls a new `reload_config` command that re-runs `Config::load` and re-renders. Cheap to add; lands when a user actually hits the staleness case in real use. [settings-pane-manual-refresh]
-- **Exiting settings.** Clicking any tree row, recents row, search result, or the Home button exits settings the same way it exits home — no save protection needed (nothing is dirty in the settings pane; every flip is committed).
-- **Navigation history.** Entering settings is a content-surface change; pushes onto `navigation-history-stack` like home does. Back returns the user to wherever they were.
+- **Entering settings.** The gear calls `setSettingsPaneVisible(true)`, swapping `#editor-pane` to the settings layout and rendering cards from the current `Config`. A dirty editor buffer fires the `file-switch-guard-dirty` modal first.
+- **Live updates.** Every interactive flip calls `set_setting`, which updates the in-memory `Arc<Config>` and writes through `toml_edit`; the UI re-renders the affected row. No separate "save" button.
+- **External edits.** Hand-edits to a TOML while the pane is open leave displayed values stale until the next `set_setting` (which reloads the merged Config as a side effect) or a pane reopen. A header "Refresh" affordance forces a reload without writing — a new `reload_config` command re-runs `Config::load`. Lands when a user hits the staleness case. [settings-pane-manual-refresh]
+- **Exiting settings.** Any tree row / recents row / search result / Home button exits, same as home — no save protection (every flip is already committed).
+- **Navigation history.** Entering settings pushes onto `navigation-history-stack` like home; Back returns the user where they were.
 
 ### Keybind
 
@@ -472,14 +430,14 @@ Reserves `settings.open` in `keybind-registry`. Chord: `Cmd-,` on macOS (matches
 
 ### Out of scope (this surface)
 
-- **Theme / font / color-scheme.** Visual customization needs a theme system first; settings UI doesn't ship its own. Lands when theming is real.
-- **Live keybind editor.** The `[keymap]` section is a stub — the loader doesn't yet read keybind overrides per `settings-section-keymap`. Settings UI shows the section header with "no overrides yet" and a one-line pointer to `keybind-registry`. The full editor lands with the loader.
-- **LLM provider / model picker.** Lives behind the deferred `[llm]` section; the settings UI shows the section as deferred. Lands with `llm-providers-config`.
-- **Cloud / Ollama embedder provider picker.** The `[embedder]` *provider* section stays deferred until `embedder-llm-crate-backed` lands. Within-fastembed model selection (bge-small / bge-m3 / embedding-gemma-300m) is live in `[indexing].model` per `embedder-model-selectable`.
+- **Theme / font / color-scheme.** Needs a theme system first; lands when theming is real.
+- **Live keybind editor.** The `[keymap]` section is a stub (loader doesn't read overrides per `settings-section-keymap`). UI shows the section header with "no overrides yet" and a pointer to `keybind-registry`; the editor lands with the loader.
+- **LLM provider / model picker.** Behind the deferred `[llm]` section; shown as deferred. Lands with `llm-providers-config`.
+- **Cloud / Ollama embedder provider picker.** The `[embedder]` *provider* section stays deferred until `embedder-llm-crate-backed`. Within-fastembed model selection (bge-small / bge-m3 / embedding-gemma-300m) is live in `[indexing].model` per `embedder-model-selectable`.
 - **ACP agent picker.** Deferred with `core::acp`.
-- **Schema migration UI.** Schema bumps are still hard-fail per `settings-schema-version`; "delete to regenerate" is the workaround. A migration UI is deferred until post-real-use migration is a real concern.
-- **Search across settings.** A search input that filters rows by key/description. Useful at scale; v1 has ~12 interactive keys total — search would be more chrome than benefit.
-- **Per-key changelog.** Showing "this key was last changed on <date> by <action>" is interesting but not load-bearing; defer.
+- **Schema migration UI.** Bumps are hard-fail per `settings-schema-version`; "delete to regenerate" is the workaround until post-real-use migration is a concern.
+- **Search across settings.** v1 has ~12 interactive keys — search would be more chrome than benefit.
+- **Per-key changelog.** "Last changed on <date> by <action>" — not load-bearing; defer.
 
 
 ## Loading lifecycle
@@ -521,9 +479,7 @@ Single command `set_setting(scope: SettingsScope, key: String, value: serde_json
 
 **Watcher coordination.** Writes go to paths under `.hiker/` (vault TOML) or under the platform config dir (user TOML). The vault TOML path is already covered by `watcher-ignore-hardcoded`'s `.hiker/` rule, so write-back never re-enters as a watcher event. The user TOML is outside the vault entirely. No new suppression infrastructure needed.
 
-**External edits while running.** If the user hand-edits a TOML file while the app is open, the in-memory `Config` keeps the old values until the next `set_setting` call (no proactive hot-reload, per `settings-load-once-at-startup`). A subsequent `set_setting` writes through `toml_edit` so the user's manual edits are preserved; only the changed key is overwritten. The "external edit + in-app flip happen on different keys" case works correctly. Last-writer-wins on the same key is acceptable for v1 — concurrent vim + UI edits to the same setting is not a workflow worth designing for.
-
-`set_setting` reloads the full merged Config after writing, so unrelated hand-edits to other keys land in memory at that point as a side effect. This is intentional — it keeps the in-memory and on-disk views from diverging on keys neither the spec nor the user expected to interact — but is *not* a hot-reload guarantee. A user who only hand-edits and never flips an in-app toggle does not see their changes applied until restart.
+**External edits while running.** A hand-edit to a TOML while the app is open keeps the old in-memory values until the next `set_setting` (no proactive hot-reload, per `settings-load-once-at-startup`). That `set_setting` writes through `toml_edit` overwriting only the changed key, so manual edits on other keys are preserved; last-writer-wins on the same key. After writing, `set_setting` reloads the full merged Config, so unrelated hand-edits land in memory at that point as a side effect — but this is *not* a hot-reload guarantee: a user who only hand-edits and never flips a toggle sees no change until restart.
 
 [settings-write-back]
 
@@ -532,7 +488,7 @@ Single command `set_setting(scope: SettingsScope, key: String, value: serde_json
 
 On app startup, if `vault.default` in the user TOML is set and non-empty, the app opens that path directly without showing the vault picker. Empty or absent → show the picker as today. [settings-default-vault-autoopen]
 
-**The picker stays in the app layer, not core.** A CLI invocation should never risk spawning a folder dialog, so the native folder picker lives in the egui app and is invoked only when a folder is actually needed — never in `core`. Backend exposes `open_vault_at(path)` for the actual open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push. Same shared helper the CLI / MCP entry points call; no dialog dependency in core or the host layer.
+**The picker stays in the app layer, not core.** The native folder picker lives in the egui app (a CLI invocation must never spawn a dialog) and fires only when a folder is needed. Backend exposes `open_vault_at(path)` for the open work — `Vault::open` + `init_tracing` + `Config::load` + indexer/watcher spin-up + `vault.recent` push — the same helper the CLI / MCP entry points call; no dialog dependency in core or host.
 
 **App bootstrap.** On window init:
 
@@ -556,21 +512,15 @@ On app startup, if `vault.default` in the user TOML is set and non-empty, the ap
 
 Real, considered, explicitly not v1.
 
-- **Hot-reload.** Watch the two TOML files and re-apply on change. Not needed in v1 — `set_setting` keeps in-memory and on-disk state in sync for in-app flips, and external hand-edits while running are rare enough that "restart to apply" is acceptable.
-- **Expanding the write-back-eligible key set.** v1 hard-codes which keys are user-mutable from inside the app. New eligible keys are added one-at-a-time as new UI controls appear (e.g. theme picker, model picker). Generalized "any key, anywhere" write-back isn't planned — it would require either UI for every key or a generic settings panel.
-- **Per-key user-vs-vault scope enforcement on read.** Today the loader accepts any key in either file. If real misuse appears (users putting `vault.recent` in vault TOML and confusing themselves), add a per-field scope tag and reject misplaced keys at parse time. Write-back already routes per scope, so the read side is the only gap.
-- **Auto-rewrite of existing TOML files when keys are added.** When a future binary adds a key, existing TOMLs won't have it (`serde(default)` fills in transparently). Auto-rewriting to inject the new key with a comment would keep files self-documenting at the cost of touching user files on every launch — defer until users actually ask for it; "delete the file to regenerate" is the workaround.
-- **Theme / font.** Need a UI to be discoverable; not worth a TOML-only surface. Land alongside the settings UI shell.
-- **`[autosave]` config section.** Crash-recovery autosave (`autosave.md`) ships with a hard-coded 5s tick and no on/off knob. If a workflow asks for `tick_secs` / `enabled` / on-blur-only mode, the section lands then; the strict-load posture and write-back machinery already cover the shape.
-- **Sync of settings across machines.** Per-vault settings travel with the vault under Syncthing. The per-user TOML doesn't sync and shouldn't (recent vaults, default vault, machine-specific paths).
+- **Hot-reload.** Watch the two TOML files and re-apply on change. `set_setting` already keeps in-memory and on-disk state in sync for in-app flips; external hand-edits while running are rare enough that "restart to apply" is acceptable.
+- **Expanding the write-back-eligible key set.** New eligible keys are added one-at-a-time as new UI controls appear (theme picker, model picker). Generalized "any key, anywhere" write-back isn't planned.
+- **Per-key user-vs-vault scope enforcement on read.** The loader accepts any key in either file. If real misuse appears, add a per-field scope tag and reject misplaced keys at parse time. Write-back already routes per scope.
+- **Auto-rewrite of existing TOML files when keys are added.** `serde(default)` fills new keys transparently; auto-injecting them with comments would touch user files on every launch. "Delete the file to regenerate" is the workaround.
+- **Theme / font.** Need a UI to be discoverable. Land alongside the settings UI shell.
+- **`[autosave]` config section.** Crash-recovery autosave (`autosave.md`) ships with a hard-coded 5s tick and no knob; the section lands if a workflow asks for `tick_secs` / `enabled` / on-blur-only. Strict-load and write-back already cover the shape.
+- **Sync of settings across machines.** Per-vault settings travel with the vault under Syncthing; the per-user TOML doesn't sync and shouldn't (recent vaults, default vault, machine-specific paths).
 - **Backward-compatibility shims for old TOML shapes.** Pre-real-use we delete and re-create; post-real-use we ship per-version migrations. No "load old shape into new struct" code in between.
-- **`hiker config get/set` CLI.** Convenient but not required — `vim ~/.config/hiker/config.toml` plus the in-app write-back covers the v1 need.
-- **"Did you mean X?" hints on unknown keys.** The strict-load posture above mentions this; v1 doesn't implement it. The hard error already names the bad key plus the file, which is enough for the user to grep the spec. A near-match suggester (Levenshtein or similar over the known field names) is a polish-grade addition that can land when someone hits the case in real use.
+- **`hiker config get/set` CLI.** `vim ~/.config/hiker/config.toml` plus in-app write-back covers the v1 need.
+- **"Did you mean X?" hints on unknown keys.** The hard error already names the bad key plus file. A near-match suggester is polish-grade.
 
-
-## Out of scope
-
-- A web-based settings UI or remote config (Hiker is local-first by design).
-- Per-note settings beyond what frontmatter already supports.
-- Settings inheritance across multiple vaults (each vault's settings are independent of any other vault's settings).
-- Encrypted settings (no secrets live in `config.toml` today; if cloud embedder API keys land later, they get their own keychain-backed storage, not a TOML field).
+**Out of scope (not deferred — never):** a web-based settings UI or remote config (Hiker is local-first); per-note settings beyond frontmatter; settings inheritance across vaults (each vault is independent); encrypted settings (no secrets in `config.toml` — cloud embedder API keys, if they land, get keychain-backed storage, not a TOML field).

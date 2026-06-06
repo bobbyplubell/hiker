@@ -2,9 +2,15 @@
 //! `ui/src/style/tokens.css` — light palette to match the editor's
 //! `light_default` theme used for markdown decorations.
 //!
-//! Shared egui theme/style (status: crawler-shared-theme), extracted from
+//! Shared egui theme/style (status: style-theme-install), extracted from
 //! `app/src/theme.rs`. Depends ONLY on egui; consumed by both `hiker-app` and
 //! `hiker-crawler` so the two match colors/fonts/spacing.
+
+/// Shared corner radius for buttons and button-like controls (status:
+/// style-button-radius). `egui::Button` reads it from `widgets.*.corner_radius`;
+/// `egui::ImageButton` (whose rounding comes from the image, not the widget
+/// visuals) must opt in with `.corner_radius(BUTTON_CORNER_RADIUS)`.
+pub const BUTTON_CORNER_RADIUS: u8 = 5;
 
 /// Zero-sized handle for installing the app theme. A struct (rather than
 /// a free `install` fn) so it's an inherent method, exempt from
@@ -28,6 +34,25 @@ impl Theme {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1f, 0x24, 0x2c));
         style.visuals.widgets.inactive.fg_stroke =
             egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4a, 0x52, 0x5e));
+
+        // Ghost buttons (status: style-ghost-button): no background or border at
+        // rest, a subtle fill + 1px border on hover, a deeper fill + accent
+        // border when pressed. Applied through the interact widget visuals so
+        // every button — text, icon, and the split-add control — inherits it.
+        // `corner_radius` (status: style-button-radius) rounds the hover/press
+        // fills to the shared token.
+        let radius = egui::CornerRadius::same(BUTTON_CORNER_RADIUS);
+        let w = &mut style.visuals.widgets;
+        w.inactive.corner_radius = radius;
+        w.hovered.corner_radius = radius;
+        w.active.corner_radius = radius;
+        w.open.corner_radius = radius;
+        w.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        w.inactive.bg_stroke = egui::Stroke::NONE;
+        w.hovered.weak_bg_fill = hover_bg();
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, divider());
+        w.active.weak_bg_fill = active_bg();
+        w.active.bg_stroke = egui::Stroke::new(1.0, accent());
 
         let accent = egui::Color32::from_rgb(0x2f, 0x6f, 0xed);
         // Selection highlight: accent blue at ~44 % opacity (unmultiplied).

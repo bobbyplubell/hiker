@@ -1,7 +1,7 @@
-//! Trash — a sidebar `Feature` listing the vault's trashed items, each
+//! Trash — a sidebar `Activity` listing the vault's trashed items, each
 //! with Restore / Purge actions, plus a clickable read-only preview.
-//! Migrated off `panels_registry`'s `P_TRASH` to a real `Feature` whose
-//! `SidebarSurface` renders through the narrow `feature::Ctx`: the
+//! Migrated off `panels_registry`'s `P_TRASH` to a real `Activity` whose
+//! `View` renders through the narrow `activity::Ctx`: the
 //! listing is read from disk via `ctx.vault.root()` and every mutation
 //! (restore / purge / open-preview) is deferred with full `&mut
 //! AppState` via `ctx.defer`. The batch "Empty trash" verb stays in the
@@ -12,13 +12,13 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Activity, Ctx, View};
 use crate::icons;
 use hiker_theme as theme;
 
-/// Per-feature UI state for the Trash sidebar. The panel is effectively
+/// Per-activity UI state for the Trash sidebar. The panel is effectively
 /// stateless — the listing is read fresh from disk each frame — but the
-/// registry's `with_ctx` hands every feature a `&mut dyn Any` state
+/// registry's `with_ctx` hands every activity a `&mut dyn Any` state
 /// slice, so a zero-field marker keeps the seam uniform. Owned by
 /// `AppState::trash_state` (top-level, per `feature-state-ownership`).
 #[derive(Default)]
@@ -34,7 +34,7 @@ enum Action {
     Preview { trash_path: String, original_path: String },
 }
 
-/// Render the trash listing through the narrow feature `Ctx`. The
+/// Render the trash listing through the narrow activity `Ctx`. The
 /// listing comes from `hiker_core::trash::Trash` opened on the vault
 /// root; restore/purge/preview are deferred to `&mut AppState`.
 fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
@@ -166,14 +166,14 @@ fn format_ts(unix_secs: i64) -> String {
     t.format(fmt).unwrap_or_default()
 }
 
-// ---- Feature impl ----------------------------------------------------
+// ---- Activity impl ----------------------------------------------------
 
-/// Zero-sized `Feature` descriptor for the Trash panel. State lives in
+/// Zero-sized `Activity` descriptor for the Trash panel. State lives in
 /// `AppState::trash_state`; the surface reads the listing fresh from
 /// disk and defers every mutation.
 pub struct Trash;
 
-impl Feature for Trash {
+impl Activity for Trash {
     fn id(&self) -> &'static str {
         "trash"
     }
@@ -183,14 +183,17 @@ impl Feature for Trash {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Trash)
     }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&TrashSidebar)
+    fn views(&self) -> Vec<&dyn View> {
+        vec![&TrashSidebar]
     }
 }
 
 struct TrashSidebar;
 
-impl SidebarSurface for TrashSidebar {
+impl View for TrashSidebar {
+    fn id(&self) -> &'static str {
+        "trash"
+    }
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         egui::ScrollArea::vertical()
             .id_salt("panel-trash-body")

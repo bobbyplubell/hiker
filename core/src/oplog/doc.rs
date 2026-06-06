@@ -390,12 +390,24 @@ pub(super) fn three_way_merge(base: &str, ours: &str, theirs: &str) -> String {
     // later span's coordinates (the `apply_replaces` discipline).
     for (start, removed_len, inserted) in our_spans.iter().rev() {
         let our_end = start + removed_len;
+        // An EXACT twin on the peer side (same anchor, same removed length, same
+        // inserted text) means this edit already converged in `theirs` — the peer
+        // applied the identical change (e.g. our own content echoed back via
+        // sync, or both sides typed the same first content). Re-applying it would
+        // DUPLICATE it: two zero-width inserts of the same text at the same offset
+        // are NOT caught by the range-overlap test below (`start < ts+tl` is
+        // `0 < 0` for an insertion), so without this skip the span lands a second
+        // copy on top of `theirs` (the dirty-buffer-autocommit doubling bug).
+        // Mirrors `spans_overlap`'s identical-twin rule. status: op-log-yrs-backed
+        if their_spans
+            .iter()
+            .any(|(ts, tl, tins)| ts == start && tl == removed_len && tins == inserted)
+        {
+            continue;
+        }
         // Drop a span overlapping any region the peer also edited — the peer's
         // content is canonical there (no silent interleave of a real conflict).
-        let overlaps_peer = their_spans
-            .iter()
-            .any(|(ts, tl, _)| *start < ts + tl && *ts < our_end);
-        if overlaps_peer {
+        if span_overlaps_any(*start, our_end, &their_spans) {
             continue;
         }
         // Shift by the peer's net byte change strictly *before* this span, so
@@ -413,6 +425,66 @@ pub(super) fn three_way_merge(base: &str, ours: &str, theirs: &str) -> String {
         merged.replace_range(m_start..m_end, inserted);
     }
     merged
+}
+
+/// Whether the half-open byte range `[start, end)` overlaps any span in
+/// `spans` (each `(span_start, span_len, _)` in the same coordinate space).
+/// The exact predicate [`three_way_merge`] uses to decide a span is a genuine
+/// conflict (the peer also edited there) versus a disjoint edit it can shift
+/// and keep.
+fn span_overlaps_any(start: usize, end: usize, spans: &[(usize, usize, String)]) -> bool {
+    spans.iter().any(|(ts, tl, _)| start < ts + tl && *ts < end)
+}
+
+/// Same-region overlap DETECTION for the sync conflict gate
+/// (`sync-conflict-detect-same-region`): given the common `base`, our divergent
+/// text `ours`, and the peer's divergent text `theirs`, return `true` iff any of
+/// OUR divergent byte ranges overlaps THEIRS — i.e. both sides edited the same
+/// region and a Yrs merge would interleave a genuine conflict rather than merge
+/// two disjoint edits. This is the predicate side of [`three_way_merge`]'s
+/// span-drop rule, factored out so the dialer can BLOCK on overlap before
+/// applying the peer delta without changing the merge callers' behavior. A pure
+/// fast-forward (`ours == base` or `theirs == base`) yields no spans on one side
+/// and so never overlaps — disjoint-region edits return `false` (auto-merge).
+///
+/// status: sync-conflict-detect-same-region
+pub(super) fn spans_overlap(base: &str, ours: &str, theirs: &str) -> bool {
+    let our_spans = multi_span_delta(base, ours);
+    let their_spans = multi_span_delta(base, theirs);
+    // A span that is byte-identical on both sides is the SAME edit converging,
+    // not a conflict — e.g. one side already merged the other's change, so its
+    // diff-against-base reproduces that change verbatim. Such a span never
+    // contends with its identical twin. We only flag a span that genuinely
+    // DIFFERS from the other side's edit in the same region.
+    our_spans.iter().any(|(start, removed_len, inserted)| {
+        let end = start + removed_len;
+        // An exact twin on the other side (same anchor, same removed length,
+        // same inserted text) means both replicas already hold this edit — skip
+        // it, it can't conflict with itself.
+        let has_identical_twin = their_spans
+            .iter()
+            .any(|(ts, tl, tins)| ts == start && tl == removed_len && tins == inserted);
+        if has_identical_twin {
+            return false;
+        }
+        // Range intersection with a DIFFERING span (the `three_way_merge`
+        // predicate) is a genuine same-region overlap.
+        if their_spans.iter().any(|(ts, tl, tins)| {
+            *start < ts + tl && *ts < end && (ts != start || tl != removed_len || tins != inserted)
+        }) {
+            return true;
+        }
+        // Coincident anchor: two CONCURRENT INSERTIONS at the exact same byte
+        // offset (both zero-width, same `start`) with DIFFERENT inserted text
+        // are a genuine same-region conflict — a Yrs merge interleaves them —
+        // yet the strict half-open-range test misses them (a zero-width range
+        // overlaps nothing). Detection-only: `three_way_merge` keeps its strict
+        // rule, so its existing callers are unchanged.
+        *removed_len == 0
+            && their_spans
+                .iter()
+                .any(|(ts, tl, tins)| *tl == 0 && *ts == *start && tins != inserted)
+    })
 }
 
 /// Apply a set of `(byte_start, removed_len, inserted)` spans — the shape

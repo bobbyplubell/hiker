@@ -5,7 +5,6 @@
 
 pub mod breadcrumb;
 pub mod clipboard_menu;
-pub mod conflict;
 pub mod decorations;
 // Interactive mermaid diagram links: click dispatch + hover tooltips.
 // status: widget-mermaid-links
@@ -24,6 +23,7 @@ pub mod patch_review;
 pub mod patch_review_pill;
 pub mod scrollbar;
 pub mod show_changes;
+mod toolbar;
 pub mod toolbar_menus;
 pub mod wikilink_nav;
 
@@ -72,28 +72,23 @@ impl<'a> BufCtx<'a> {
     /// Top-level buffer-panel body: toolbar, optional pending-rewrite
     /// banner, inline diff overlay, then the editor itself.
     fn show(&mut self) {
-        // Reader / focus view (`editor-reader-view`): hide the buffer
-        // panel's own toolbar + status bar + pending-rewrite banner. The
-        // editor canvas is the only thing visible. Window-level chrome
-        // (top toolbar, side bars, status bar) is hidden by the workbench
-        // host — see `main::update`.
-        let reader = self
-            .app
-            .session
-            .buffers
-            .get(self.path)
-            .map(|b| b.reader_view)
-            .unwrap_or(false);
+        // Reader / focus mode (`view-reader-mode`): hide the buffer panel's
+        // status bar + pending-rewrite banner so the editor canvas dominates.
+        // The toolbar shows by default and hides only when the user opts into
+        // `view-reader-hide-toolbar` (see `reader_hides_view_toolbar`). Window-
+        // level chrome (top toolbar, side bars, status bar) is hidden by the
+        // workbench — see `main::update`. Reader mode is the single workbench/
+        // session-level flag, not per-buffer.
+        let reader = self.app.workbench.reader_mode();
 
-        // Esc exits reader view on the active buffer. Consume so it
-        // doesn't reach the editor (would otherwise clear selection).
+        // Esc exits reader mode. Consume so it doesn't reach the editor
+        // (would otherwise clear selection).
         if reader
             && self.ui.input_mut(|i| {
                 i.consume_key(eframe::egui::Modifiers::NONE, eframe::egui::Key::Escape)
             })
-            && let Some(buf) = self.app.session.buffers.get_mut(self.path)
         {
-            buf.reader_view = false;
+            self.app.workbench.set_reader_mode(false);
             return;
         }
 
@@ -139,8 +134,8 @@ impl<'a> BufCtx<'a> {
         find::render_bar(self.ui, self.app, self.path);
         find::tick_rebuild(self.app, self.path);
 
-        // Toolbar across the top of the buffer tab body.
-        if !reader {
+        // Toolbar across the top of the buffer tab body. [view-reader-hide-toolbar]
+        if !self.app.reader_hides_view_toolbar() {
             self.toolbar();
         }
 
@@ -273,6 +268,16 @@ impl<'a> BufCtx<'a> {
             .unwrap_or((1.0, None))
     };
 
+    // Reader / focus mode is the workbench-level flag (the single source of
+    // truth). Captured before the mutable buffer borrow below so the
+    // in-editor chrome (minimap + gutter) can follow it. [view-reader-mode]
+    let reader = app.workbench.reader_mode();
+
+    // Persisted diagram-cache context (`widget-render-disk-cache`), built
+    // before the mutable buffer borrow so the rebuild closure can carry it
+    // owned without borrowing `app`. Honors `[render] cache_diagrams`.
+    let diagram_cache = diagram_cache_ctx(app);
+
     let Some(buffer) = app.session.buffers.get_mut(path) else {
         ui.label(format!("buffer {} not loaded", path));
         return;
@@ -315,7 +320,6 @@ impl<'a> BufCtx<'a> {
     // Resolve minimap options from the live config snapshot. Cheap each
     // frame — a few field copies + 9 hex parses. Hex parses default back
     // to the built-in palette if the user typed something invalid.
-    let reader = buffer.reader_view;
     let mini_opts: Option<MinimapOptions> = if buffer.show_minimap && !reader {
         app.vault_session.config
             .read()
@@ -374,6 +378,7 @@ impl<'a> BufCtx<'a> {
             highlight_trailing_whitespace: buffer.highlight_trailing_whitespace,
             diff,
             resolve_title: Some(&resolve_title),
+            diagram_cache,
         };
         let mut rebuild =
             |editor: &editor_core::state::Editor,
@@ -507,10 +512,11 @@ impl<'a> BufCtx<'a> {
     // Wikilink click dispatch: resolve each clicked pill's target and open it.
     wikilink_nav::handle_clicks(app, ui.ctx(), path, &wikilink_clicks, mod_click);
 
-    // Wikilink hover-preview lifecycle: timer + cached body + scrollable
-    // overlay card. Reads the painter's per-frame zones snapshotted
-    // above. [wikilink-hover-preview]
-    wikilink_nav::track_hover(app, ui.ctx(), path, editor_rect, &wikilink_zones);
+    // Wikilink hover-preview: when the pointer rests on a resolved pill,
+    // register a hover on the shared note-preview mechanism (the same one
+    // the file-tree / canvas sidebars use). Reads the painter's per-frame
+    // zones snapshotted above. [wikilink-hover-preview]
+    wikilink_nav::track_hover(app, ui, path, editor_rect, &wikilink_zones);
 
     // Floating live edit-preview overlay: when the main caret reveals a math /
     // mermaid source span, float a non-interactive rendered preview near it.
@@ -644,6 +650,9 @@ fn show_edit_preview(
     dpr: f32,
     is_markdown: bool,
 ) {
+    // Owned disk-cache context built before the `buffer` borrow so the popup
+    // render reuses the persisted diagram cache (`widget-render-disk-cache`).
+    let cache = diagram_cache_ctx(app);
     let Some(buffer) = app.session.buffers.get(path) else {
         return;
     };
@@ -655,8 +664,23 @@ fn show_edit_preview(
         font_px: buffer.view.font_size,
         dpr,
         gated: buffer.render_widgets && buffer.live_edit_preview && is_markdown,
+        cache: cache.as_ref(),
     };
     widgets::edit_preview::show(&mut app.panels.edit_preview, ctx, &inputs);
+}
+
+/// Build the persisted-diagram-cache context for the current vault, honoring
+/// the `[render] cache_diagrams` toggle (default on). `None` when the toggle is
+/// off — the render path then uses only the in-memory caches
+/// (`widget-render-disk-cache`, `render-cache-diagrams-toggle`).
+pub(crate) fn diagram_cache_ctx(app: &AppState) -> Option<widgets::disk_cache::DiagramCacheCtx> {
+    let enabled = app
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.render.cache_diagrams)
+        .unwrap_or(true);
+    widgets::disk_cache::DiagramCacheCtx::new(&app.vault_session.vault_root, enabled)
 }
 
 /// Route this frame's block-widget body clicks (`widget-block-click-to-edit`):
@@ -746,320 +770,6 @@ impl AppState {
     }
 }
 
-/// Surface a thin banner whenever there's a pending write-shaped
-/// proposal targeting the open buffer. Spec mandates a single-line strip
-/// just under the toolbar (`patch-review.md:138-148`) with Accept,
-/// Reject, and View-diff actions — *not* the larger half-page banner the
-/// old TS UI used.
-impl<'a> BufCtx<'a> {
-fn pending_rewrite_banner(&mut self) {
-    let ui = &mut *self.ui;
-    let app = &mut *self.app;
-    let path: &str = self.path;
-    // Reads the per-frame op-log cache populated in
-    // `main::refresh_whole_file_proposals`. The most recent whole-file op for
-    // the path is the one surfaced (`note-open-routes-to-pending-review`); the
-    // list is already sorted newest-first.
-    let Some(prop) = app
-        .ui_cache.whole_file_proposals
-        .iter()
-        .find(|p| p.target_path == path)
-        .cloned()
-    else {
-        return;
-    };
-    let mut accept = false;
-    let mut reject = false;
-    let mut view = false;
-    egui::Frame::default()
-        .fill(egui::Color32::from_rgb(0xff, 0xf3, 0xc4))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xd9, 0xb8, 0x4e)))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(crate::icons::ICONS.image(crate::icons::Icon::Robot));
-                ui.label(
-                    egui::RichText::new(if prop.action == "create" {
-                        "Agent proposed a new note"
-                    } else {
-                        "Agent proposed a full-note rewrite"
-                    })
-                    .small()
-                    .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(format!("({})", &prop.op_id[..prop.op_id.len().min(8)]))
-                        .color(theme::muted())
-                        .monospace()
-                        .small(),
-                );
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        // Drifted whole-file ops: Accept disabled, reason in
-                        // tooltip; Reject + View stay active per
-                        // `write-note-review-conflicted-display`.
-                        let accept_resp = ui.add_enabled(
-                            !prop.drifted,
-                            egui::Button::new("Accept").small(),
-                        );
-                        if accept_resp
-                            .on_hover_text(if prop.drifted {
-                                "Proposal drifted from the current note — reject or re-run"
-                            } else {
-                                "Apply this rewrite to the note"
-                            })
-                            .clicked()
-                        {
-                            accept = true;
-                        }
-                        if ui.small_button("Reject").clicked() {
-                            reject = true;
-                        }
-                        if ui.small_button("View diff").clicked() {
-                            view = true;
-                        }
-                    },
-                );
-            });
-        });
-    if accept {
-        app.accept_staging_proposal(&prop.op_id, &prop.target_path);
-    }
-    if reject {
-        app.reject_staging_proposal(&prop.op_id, &prop.target_path);
-    }
-    if view {
-        use crate::tab::TabKind;
-        let pid = prop.op_id.clone();
-        let target = prop.target_path.clone();
-        let pid_for_build = pid.clone();
-        app.find_or_open_tab(
-            |k| matches!(
-                k,
-                TabKind::Editor {
-                    buffer: crate::tab::BufferSource::PendingProposal { proposal_id, .. },
-                    ..
-                } if *proposal_id == pid
-            ),
-            || TabKind::pending_preview(pid_for_build, target),
-        );
-    }
-}
-
-fn toolbar(&mut self) {
-    let ui = &mut *self.ui;
-    let app = &mut *self.app;
-    let path: &str = self.path;
-    let source = app.session.buffers.get(path).map(|b| b.source.clone());
-    let is_vault = matches!(&source, Some(crate::tab::BufferSource::Vault { .. }));
-    egui::Frame::default()
-        .inner_margin(egui::Margin::symmetric(4, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if !is_vault {
-                    // Reconstruct a `BufCtx` inside this closure — the
-                    // outer `&mut self` is split into `ui`/`app`/`path`
-                    // locals so we can call the read-only sibling as a
-                    // method via a fresh borrow.
-                    BufCtx { ui, app, path }.render_readonly_source_toolbar(source.as_ref());
-                    return;
-                }
-                if ui
-                    .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Check)))
-                    .on_hover_text("Save (Mod-S)")
-                    .clicked()
-                {
-                    if let Err(err) = editor_pane::save_buffer(app, path) {
-                        app.push_toast(format!("Save failed: {}", err), ToastLevel::Error);
-                    }
-                }
-                let dirty = app.session.buffers.get(path).map(super::super::buffer::Buffer::is_dirty).unwrap_or(false);
-                if dirty {
-                    ui.add(icons::ICONS.current_dot());
-                }
-                ui.separator();
-                let diff_resp = ui
-                    .add(egui::Button::image(icons::ICONS.image(crate::icons::Icon::Diff)))
-                    .on_hover_text("Diff vs disk — right-click to show changes\u{2026}");
-                if diff_resp.clicked() {
-                    open_diff_vs_disk(app, path);
-                }
-                diff_resp.context_menu(|ui| {
-                    app.show_diff_source_menu(ui, path);
-                });
-                // Agent-diff toggle: jump to the whole-file review-preview
-                // tab when a write-shaped proposal is in flight against this
-                // note. Reads the op-log-backed whole-file-proposal cache
-                // (anchored `edit_note` hunks already review inline via
-                // `agent_proposal`; this button is the whole-file surface).
-                // Mutually-exclusive with the user-diff button above per
-                // `patch-review.md:17-27` — both toggle the same buffer
-                // tab strip into a single diff mode at a time.
-                let has_agent_proposal = app
-                    .ui_cache
-                    .whole_file_proposals
-                    .iter()
-                    .any(|p| p.target_path == path);
-                ui.add_enabled_ui(has_agent_proposal, |ui| {
-                    if ui
-                        .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Robot)))
-                        .on_hover_text(if has_agent_proposal {
-                            "Agent diff (pending proposal)"
-                        } else {
-                            "No pending agent proposal for this note"
-                        })
-                        .clicked()
-                    {
-                        // Open the whole-file preview for the first (most
-                        // recent) matching proposal. Done via singleton tab
-                        // semantics so repeated clicks just focus the tab.
-                        if let Some(p) = app
-                            .ui_cache
-                            .whole_file_proposals
-                            .iter()
-                            .find(|p| p.target_path == path)
-                        {
-                            use crate::tab::TabKind;
-                            let pid = p.op_id.clone();
-                            let tpath = p.target_path.clone();
-                            let pid_for_build = pid.clone();
-                            app.find_or_open_tab(
-                                |k| matches!(
-                                    k,
-                                    TabKind::Editor {
-                                        buffer: crate::tab::BufferSource::PendingProposal { proposal_id, .. },
-                                        ..
-                                    } if *proposal_id == pid
-                                ),
-                                || TabKind::pending_preview(pid_for_build, tpath),
-                            );
-                        }
-                    }
-                });
-                toolbar_menus::Menus { ui, app, path }.view_options_menu();
-                toolbar_menus::Menus { ui, app, path }.mutations_menu();
-
-                // Markdown formatting button group (bold / italic / … / color).
-                format::FormatBar { ui: &mut *ui, app: &mut *app, path }.render();
-
-                // "Add to trail" pill — legacy `addToTrailPill.ts`,
-                // `trail-add-to-active-from-editor-verb`. Hidden when
-                // no active trail or when the buffer path isn't a
-                // regular indexable extension. Disabled (with tooltip)
-                // when the path is already a waypoint at any depth.
-                BufCtx { ui: &mut *ui, app: &mut *app, path }.add_to_trail_pill();
-
-                // Centered mode-controls slot — empty in plain editing mode.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
-                    // (right side reserved for future view-mode badges)
-                });
-            });
-        });
-}
-
-/// Toolbar for the read-only source kinds — snapshot blob, staging
-/// proposal, trash entry. Each renders a source-specific verb pair
-/// (Restore / Accept-Reject / nothing) plus the diff toggle when a
-/// `DiffSource` is in play. No Save, no Mutations, no dirty marker —
-/// these buffers are read-only.
-fn render_readonly_source_toolbar(&mut self, source: Option<&crate::tab::BufferSource>) {
-    let ui = &mut *self.ui;
-    let app = &mut *self.app;
-    let key: &str = self.path;
-    use crate::tab::BufferSource;
-    let active_id = app.session.active_tab;
-    let diff_active = active_id
-        .and_then(|id| app.tab_by_id(id))
-        .and_then(|t| t.kind.diff_source())
-        .is_some();
-    match source {
-        Some(BufferSource::HistoryVersion { path, op_id }) => {
-            let path = path.clone();
-            let cid = op_id.clone();
-            if ui
-                .add(
-                    egui::Button::image_and_text(
-                        icons::ICONS.primary_restore(),
-                        egui::RichText::new("Restore").color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::from_rgb(0x2f, 0x6f, 0xed)),
-                )
-                .on_hover_text("Write this snapshot back to disk")
-                .clicked()
-            {
-                app.restore_snapshot_to_disk(&path, &cid);
-            }
-            BufCtx { ui: &mut *ui, app: &mut *app, path: key }.render_diff_toggle_button(key, diff_active);
-        }
-        Some(BufferSource::PendingProposal { proposal_id, target_path }) => {
-            let pid = proposal_id.clone();
-            let target = target_path.clone();
-            // Drift: Accept disabled with reason in tooltip, Reject active —
-            // per `write-note-review-conflicted-display`. Read off the
-            // op-log cache so the gate matches the listing.
-            let drifted = app
-                .ui_cache
-                .whole_file_proposals
-                .iter()
-                .find(|p| p.op_id == pid)
-                .is_some_and(|p| p.drifted);
-            let accept_resp = ui.add_enabled(
-                !drifted,
-                egui::Button::new(
-                    egui::RichText::new("Accept").color(egui::Color32::WHITE),
-                )
-                .fill(egui::Color32::from_rgb(0x2f, 0x8f, 0x4d)),
-            );
-            if accept_resp
-                .on_hover_text(if drifted {
-                    "Proposal drifted from the current note — reject or re-run"
-                } else {
-                    "Write this proposal to disk"
-                })
-                .clicked()
-            {
-                app.accept_staging_proposal(&pid, &target);
-            }
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("Reject").color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::from_rgb(0xb9, 0x3a, 0x3a)),
-                )
-                .on_hover_text("Discard this proposal")
-                .clicked()
-            {
-                app.reject_staging_proposal(&pid, &target);
-            }
-            BufCtx { ui: &mut *ui, app: &mut *app, path: key }.render_diff_toggle_button(key, diff_active);
-        }
-        Some(BufferSource::Trash { .. }) => {
-            ui.label(egui::RichText::new("In trash · read-only").color(theme::muted()));
-        }
-        _ => {}
-    }
-}
-
-fn render_diff_toggle_button(&mut self, _key: &str, diff_active: bool) {
-    let ui = &mut *self.ui;
-    let app = &mut *self.app;
-    let label = if diff_active { "Hide diff" } else { "Show diff" };
-    if ui.button(label).clicked() {
-        // Flip the active tab's diff field between None and Disk(path).
-        let Some(active_id) = app.session.active_tab else { return };
-        let Some(tab) = app.tab_by_id_mut(active_id) else { return };
-        if let crate::tab::TabKind::Editor { buffer, diff } = &mut tab.kind {
-            *diff = match diff {
-                Some(_) => None,
-                None => Some(crate::tab::DiffSource::Disk { path: buffer.path().to_string() }),
-            };
-        }
-    }
-    }
-}
-
 /// Snapshot / staging-proposal verbs, surfaced from the read-only
 /// source-toolbar. Methods on `AppState` so they're exempt from
 /// `clippy::single_call_fn`.
@@ -1145,20 +855,15 @@ impl<'a> BufCtx<'a> {
     if !lower.ends_with(".md") && !lower.ends_with(".txt") {
         return;
     }
-    // Pill only surfaces when there's an explicitly-active trail.
-    let Some(trail_id) = app
-        .trails_state.active_trail
-        .clone()
-        .filter(|id| app.trails_state.trails.iter().any(|t| &t.id == id))
-    else {
+    // Pill only surfaces when there's an explicitly-active trail-doc
+    // (`vault.active_trail` config).
+    let Some(trail_rel) = active_trail_rel(app) else {
         return;
     };
-    let trail = match app.trails_state.trails.iter().find(|t| t.id == trail_id) {
-        Some(t) => t,
-        None => return,
-    };
-    let trail_name = trail.name.clone();
-    let already = trail_contains_path(&trail.waypoints, path);
+    let trail_name = trail_title(&trail_rel);
+    // Idempotency: a note already a waypoint of THIS trail disables the
+    // pill (per `trail-add-to-active-from-editor-verb`).
+    let already = trail_contains_path(app, &trail_rel, path);
 
     ui.separator();
     let label = format!("+ {}", trail_name);
@@ -1173,26 +878,82 @@ impl<'a> BufCtx<'a> {
     );
     let resp = resp.on_hover_text(tooltip);
     if resp.clicked() {
-        crate::state::trail_append_waypoint(app, path);
-        let _ = crate::bootstrap::save_trails(&app.vault_session.vault_root, &app.trails_state.trails);
-        app.push_toast(
-            format!("Added to '{}'", trail_name),
-            ToastLevel::Info,
-        );
+        match append_waypoint_to_active(app, &trail_rel, path) {
+            Ok(()) => app.push_toast(format!("Added to '{}'", trail_name), ToastLevel::Info),
+            Err(e) => app.push_toast(format!("Add to trail failed: {e}"), ToastLevel::Error),
+        }
     }
     }
 }
 
-fn trail_contains_path(waypoints: &[crate::state::Waypoint], path: &str) -> bool {
-    for w in waypoints {
-        if w.path == path {
-            return true;
-        }
-        if trail_contains_path(&w.children, path) {
-            return true;
-        }
+/// Vault-relative path of the active trail-doc, from `vault.active_trail`
+/// config, filtered to a trail that still exists in the vault listing.
+fn active_trail_rel(app: &AppState) -> Option<String> {
+    let rel = app.vault_session.config.read().ok()?.vault.active_trail.clone()?;
+    let store = app.vault_session.services.read_store.lock().ok()?;
+    let exists = hiker_core::trails::list(
+        &app.vault_session.vault,
+        &store,
+        &app.vault_session.services.oplog,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .any(|t| t.rel_path == rel);
+    exists.then_some(rel)
+}
+
+/// Trail-doc title (basename without `.md`).
+fn trail_title(rel: &str) -> String {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.strip_suffix(".md").unwrap_or(base).to_string()
+}
+
+/// Whether `note_rel` is already a waypoint of the trail at `trail_rel`,
+/// via the derived `trail_waypoints` reverse lookup.
+fn trail_contains_path(app: &AppState, trail_rel: &str, note_rel: &str) -> bool {
+    let Ok(store) = app.vault_session.services.read_store.lock() else {
+        return false;
+    };
+    hiker_core::trails::containing_note_with_paths(
+        &app.vault_session.vault,
+        &store,
+        &app.vault_session.services.oplog,
+        note_rel,
+    )
+    .unwrap_or_default()
+    .iter()
+    .any(|h| h.trail_doc_rel == trail_rel)
+}
+
+/// Append `note_rel` as a waypoint of `trail_rel` (parent `None` ⇒ append
+/// cursor) via the core verb on the frame's tokio runtime.
+fn append_waypoint_to_active(
+    app: &AppState,
+    trail_rel: &str,
+    note_rel: &str,
+) -> Result<(), hiker_core::errors::HikerError> {
+    let watcher = app.vault_session.services.watcher.clone();
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let log = app.vault_session.services.oplog.clone();
+    let vault = app.vault_session.vault.clone();
+    let (trail_rel, note_rel) = (trail_rel.to_string(), note_rel.to_string());
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
+            hiker_core::trails::ops::append_waypoint(hiker_core::trails::ops::AppendWaypointArgs {
+                watcher: &watcher,
+                jobs: &jobs,
+                log: &log,
+                vault: &vault,
+                trail_doc_rel: &trail_rel,
+                source_rel: &note_rel,
+                parent_waypoint_path: None,
+                annotation: None,
+            })
+            .await
+            .map(|_| ())
+        }),
+        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
     }
-    false
 }
 
 

@@ -102,6 +102,9 @@ impl EligibleKey {
             (ValueType::SyncMode, J::String(s)) => {
                 matches!(s.as_str(), "peer" | "server" | "both")
             }
+            (ValueType::CanvasScrollMode, J::String(s)) => {
+                matches!(s.as_str(), "auto" | "pan" | "zoom")
+            }
             _ => false,
         }
     }
@@ -195,6 +198,8 @@ pub(super) enum ValueType {
     TreeSortBy,
     /// `glyphs | bars` for `[editor.minimap] style`.
     MinimapStyle,
+    /// `auto | pan | zoom` for `[ui] canvas_scroll_mode`.
+    CanvasScrollMode,
     /// Floating-point fraction in `[0.0, 1.0]`.
     UnitFraction,
     /// Positive integer (fits in u32). Used for the LLM/agent knobs
@@ -279,6 +284,12 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "editor.double_click_pattern",   ty: ValueType::String },
     EligibleKey { path: "editor.triple_click_pattern",   ty: ValueType::String },
     EligibleKey { path: "ui.custom_titlebar",            ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_top_bar",        ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_tabs",           ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_toolbar",        ty: ValueType::Bool },
+    EligibleKey { path: "ui.canvas_scroll_mode",         ty: ValueType::CanvasScrollMode },
+    EligibleKey { path: "ui.swipe_nav_enabled",          ty: ValueType::Bool },
+    EligibleKey { path: "ui.hover_previews_enabled",     ty: ValueType::Bool },
     EligibleKey { path: "vault.sidebar_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.related_open",            ty: ValueType::Bool },
     EligibleKey { path: "vault.trash_expanded",          ty: ValueType::Bool },
@@ -295,6 +306,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "boards.new_board_dir",          ty: ValueType::String },
     // status: trail-draft-from-clustering
     EligibleKey { path: "clustering.propose_trails",     ty: ValueType::Bool },
+    // status: cluster-tree-visible-note
+    EligibleKey { path: "clustering.new_cluster_tree_dir", ty: ValueType::String },
     // status: embedder-model-selectable
     // status: settings-embedder-model-change-warning
     // Gated in the UI by a confirm modal (`settings-embedder-model-change-warning`)
@@ -412,6 +425,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // status: cluster-editor-triage-modified-rerun
     EligibleKey { path: "suggestions.triage.modified_rerun",  ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.modified_rerun_cosine_guard", ty: ValueType::UnitFraction },
+    // status: render-cache-diagrams-toggle
+    EligibleKey { path: "render.cache_diagrams",            ty: ValueType::Bool },
 ];
 
 pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
@@ -419,6 +434,12 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "vault.default", ty: ValueType::String },
     // [ui] chrome toggle — global app preference, eligible at user scope.
     EligibleKey { path: "ui.custom_titlebar",               ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_top_bar",           ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_tabs",              ty: ValueType::Bool },
+    EligibleKey { path: "ui.reader_hide_toolbar",           ty: ValueType::Bool },
+    EligibleKey { path: "ui.canvas_scroll_mode",            ty: ValueType::CanvasScrollMode },
+    EligibleKey { path: "ui.swipe_nav_enabled",             ty: ValueType::Bool },
+    EligibleKey { path: "ui.hover_previews_enabled",        ty: ValueType::Bool },
     // status: embedder-model-selectable
     // Also eligible at user scope as a global default; per-vault override
     // wins per the standard merge rule.
@@ -533,6 +554,37 @@ mod patch_tests {
                 .iter()
                 .find(|k| k.path == "ui.custom_titlebar")
                 .expect("ui.custom_titlebar is eligible");
+            assert!(matches!(key.ty(), ValueType::Bool));
+            assert!(key.validate(&json!(false)));
+            assert!(!key.validate(&json!("nope")));
+        }
+    }
+
+    /// `render.cache_diagrams` is an eligible vault-scope bool key, so the
+    /// persisted-diagram-cache toggle is user-settable and round-trips through
+    /// strict-load. [render-cache-diagrams-toggle]
+    #[test]
+    fn render_cache_diagrams_is_eligible_vault_bool() {
+        let key = ELIGIBLE_VAULT
+            .iter()
+            .find(|k| k.path == "render.cache_diagrams")
+            .expect("render.cache_diagrams is eligible at vault scope");
+        assert!(matches!(key.ty(), ValueType::Bool));
+        assert!(key.validate(&json!(true)));
+        assert!(key.validate(&json!(false)));
+        assert!(!key.validate(&json!("nope")));
+    }
+
+    /// `ui.reader_hide_top_bar` is an eligible bool key at both scopes,
+    /// mirroring `ui.custom_titlebar`, so the reader-mode top-bar toggle is
+    /// user-settable and round-trips through strict-load. [view-reader-hide-top-bar]
+    #[test]
+    fn ui_reader_hide_top_bar_is_eligible_bool_both_scopes() {
+        for table in [ELIGIBLE_VAULT, ELIGIBLE_USER] {
+            let key = table
+                .iter()
+                .find(|k| k.path == "ui.reader_hide_top_bar")
+                .expect("ui.reader_hide_top_bar is eligible");
             assert!(matches!(key.ty(), ValueType::Bool));
             assert!(key.validate(&json!(false)));
             assert!(!key.validate(&json!("nope")));

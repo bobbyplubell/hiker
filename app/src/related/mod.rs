@@ -1,10 +1,14 @@
-//! Related-notes feature — sidebar surface listing vector-similar notes
+//! Related-notes view — sidebar surface listing vector-similar notes
 //! for the active note. Migrated off `panels::related` + `panels_registry`
-//! to a real `Feature` rendering through the narrow `feature::Ctx` (reads
-//! via ctx; open-note deferred via `ctx.defer`). [feature-related-migration]
+//! to a real `View` rendering through the narrow `activity::Ctx` (reads
+//! via ctx; open-note deferred via `ctx.defer`). Surfaced by the
+//! `context` container activity (`crate::context`) alongside backlinks.
+//! [feature-related-migration]
 //!
 //! For the active note, calls `Store::related_notes` (vector-similarity
-//! query) and renders the hits as result cards. The query result is cached
+//! query) and renders the hits as plain icon+title rows with a markdown
+//! hover-preview (uniform with backlinks / appears-in), in place of the
+//! older rich snippet cards. The query result is cached
 //! on `State` and recomputed only when the active-note path changes —
 //! firing it every frame holds the shared `read_store` mutex through a
 //! non-trivial SQL pass and causes visible scroll lag across every other
@@ -13,8 +17,9 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::feature::{Ctx, Feature, SidebarSurface};
-use crate::search::{CardAction, DiscoveryHit, result_card};
+use crate::activity::{Ctx, View};
+use crate::icons;
+use crate::search::DiscoveryHit;
 use crate::state::Services;
 use hiker_theme as theme;
 
@@ -51,29 +56,16 @@ impl State {
     }
 }
 
-/// Zero-sized `Feature` descriptor for related notes. State lives in
+/// Zero-sized `View` descriptor for related notes. State lives in
 /// `AppState::related_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`.
-pub struct Related;
+/// `Ctx::state.downcast_mut::<State>()`. Exposed so the `context`
+/// container activity can list it among its `views()`.
+pub struct RelatedSidebar;
 
-impl Feature for Related {
+impl View for RelatedSidebar {
     fn id(&self) -> &'static str {
         "related"
     }
-    fn label(&self) -> &'static str {
-        "Related"
-    }
-    fn icon(&self) -> egui::Image<'static> {
-        crate::icons::ICONS.image(crate::icons::Icon::Graph)
-    }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&RelatedSidebar)
-    }
-}
-
-struct RelatedSidebar;
-
-impl SidebarSurface for RelatedSidebar {
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         // The workbench accordion owns the section header + collapse;
         // the body is just the content. [feature-panel-single-accordion]
@@ -136,11 +128,40 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     // `&state` borrow while we may queue an open-file effect.
     let hits = st.cached_hits.clone();
     for hit in &hits {
-        if let CardAction::Open { .. } = result_card(ui, hit, /*allow_context=*/ false) {
+        // Uniform with backlinks / appears-in: a plain icon+title row with a
+        // markdown hover-preview, in place of the old rich snippet card. The
+        // preview is the affordance for "what's in this note" now, so the row
+        // stays terse. [feature-related-migration]
+        let resp = ui
+            .add(egui::Button::image_and_text(
+                icons::ICONS.image(icons::Icon::File),
+                related_label(hit),
+            ))
+            .on_hover_text(&hit.path);
+        if resp.hovered() {
+            crate::widgets::preview::register_note_hover(ui, resp.rect, &hit.path);
+        }
+        crate::item_menu::attach_note_item_menu(
+            &resp,
+            ctx,
+            &hit.path,
+            crate::item_menu::BaseOpts { reveal: true },
+        );
+        if resp.clicked() {
             let path = hit.path.clone();
             ctx.defer(move |app| editor_pane::open_file(app, &path, /* sticky */ false));
         }
     }
+}
+
+/// The row label for a related hit: the note's indexed title when present, else
+/// the basename without its `.md` extension. [feature-related-migration]
+fn related_label(hit: &DiscoveryHit) -> String {
+    if !hit.title.trim().is_empty() {
+        return hit.title.clone();
+    }
+    let base = hit.path.rsplit('/').next().unwrap_or(hit.path.as_str());
+    base.strip_suffix(".md").unwrap_or(base).to_string()
 }
 
 /// Run the similarity query against the read store and return a fresh

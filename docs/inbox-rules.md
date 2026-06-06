@@ -5,10 +5,10 @@ Deterministic, user-authored rules that auto-place and auto-tag newly-created no
 The headline decisions:
 
 - **Rules live in vault config.** `[inbox].rules` in `vault/.hiker/config.toml` per `settings-section-inbox`. The rule list travels with the vault. No separate rules database. [inbox-rules]
-- **First match wins.** Rules are evaluated top-down on a single create event; the first match's action applies and evaluation stops. No multi-rule composition, no chained rewrites — predictable failure when two rules overlap.
+- **First match wins.** Rules are evaluated top-down on a single create event; the first match's action applies and evaluation stops. No multi-rule composition, no chained rewrites.
 - **Match by basename regex, body regex, or both.** When both are present they AND-combine. Body matching reads at most the first 4KB of the new file so the rule pass stays cheap on large dumps.
 - **Actions are `move_to` and `add_tag`** (one or both per rule). `move_to` is a vault-relative folder path; the note is renamed into that folder via the existing `move-note-core-cmd`. `add_tag` is a frontmatter tag merged via the existing `core::frontmatter::merge` path (creates the frontmatter block if absent). No "run this command" action — rules stay declarative and inspectable.
-- **No-match disposition is "leave alone."** A note that matches no rule stays at its original create path. There is no implicit "send everything else to inbox/" — that would surprise users who add rules incrementally.
+- **No-match disposition is "leave alone."** A note that matches no rule stays at its original create path. There is no implicit "send everything else to inbox/".
 - **Triggers on the watcher's create event only.** Rules don't re-fire on edit, on rename, or on indexer reingest. A note's path/tags are set at creation; later edits stay the user's domain.
 
 
@@ -35,16 +35,7 @@ Strict-load rules (per `settings-strict-load`):
 
 ## Execution
 
-The rule engine lives in `core::inbox`, called from the watcher pipeline on the `Created` event for `.md` / `.txt` files (`watcher-event-normalized`). Pseudocode:
-
-```
-on watcher Created(rel) for indexable extension:
-    body = read up to 4 KB of vault/rel
-    for rule in [inbox].rules:
-        if rule.matches(basename_of(rel), body):
-            apply rule.action(rel)   # move_to first, then add_tag against the new path
-            break
-```
+The rule engine lives in `core::inbox`, called from the watcher pipeline on the `Created` event for `.md` / `.txt` files (`watcher-event-normalized`). For a created path it reads up to 4 KB of body, walks the rules top-down, and applies the first match's action (`move_to` first, then `add_tag` against the new path):
 
 - `move_to` routes through `core::vault::move_note` so watcher suppression + index update are correct and the buffer-follows-rename rule holds.
 - `add_tag` routes through the existing frontmatter-merge primitive (same one `mcp-tool-apply-tag` calls) so the change is recorded as a regular user save (`author = "user"`).
@@ -55,7 +46,7 @@ A toast confirms the action with an Undo button — same pattern as `vault-trash
 
 ## Interaction with other systems
 
-- **Sibling to trees, not a replacement.** Trees (`docs/trees.md`, `cluster-editor.md`) is the AI-driven placement surface; inbox rules is the deterministic-placement surface. A note created in a vault with both systems active is offered to inbox rules first (cheap, sync); only if no rule matches does the trees system get a shot. The trees path produces a *proposal* the user reviews, while inbox rules apply directly — different trust levels, different UX.
+- **Ordering with trees.** A note created in a vault with both systems active is offered to inbox rules first (cheap, sync); only if no rule matches does the trees system get a shot. The trees path produces a *proposal* the user reviews, while inbox rules apply directly — different trust levels, different UX.
 - **Settings pane.** A small editor for the rule list lands when the settings UI's array-of-tables row control grows up; until then the TOML is the surface (consistent with the rest of v1 settings posture). The settings pane shows the rule count in the `[inbox]` section header.
 - **Disable AI master switch (`llm-features-disable-entirely`)** does not affect inbox rules — they're deterministic, not AI-driven. Users who turn AI off still get rule-based auto-org.
 

@@ -228,3 +228,99 @@ mod tests {
         assert_eq!(b.item.insert.as_str(), "b/index");
     }
 }
+
+/// End-to-end typing tests for the `[[` → autocomplete flow, driven through the
+/// real editor input pipeline (`command::handle`) on a `Buffer` built exactly
+/// as the app builds one — with the `WikilinkSource` attached. Guards both the
+/// auto-pair nesting (`[[` must produce `[[]]`, not `[[]`) and that the popup
+/// actually opens on a buffer carrying content (the restored-note case).
+#[cfg(test)]
+mod typing_tests {
+    use std::sync::Arc;
+
+    use editor_view::command::{self, Action};
+    use editor_view::events::InputEvent;
+    use hiker_core::vault::Vault;
+    use tempfile::TempDir;
+
+    use crate::buffer::Buffer;
+
+    /// A vault with a couple of notes plus a `target.md` the wikilink can
+    /// resolve, and a `Buffer` for `host` built the way every open path builds
+    /// one (vault handle supplied → `WikilinkSource` registered).
+    fn buffer_in_vault(host: &str, host_contents: &str) -> (TempDir, Buffer) {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("target.md"), "# Target\n").unwrap();
+        std::fs::write(td.path().join("other.md"), "# Other\n").unwrap();
+        std::fs::write(td.path().join(host), host_contents).unwrap();
+        let vault = Arc::new(Vault::open(td.path()).unwrap());
+        let buf = Buffer::with_config_and_vault(
+            host.to_string(),
+            host_contents,
+            hiker_core::hash_string(host_contents),
+            None,
+            Some(vault),
+        );
+        (td, buf)
+    }
+
+    /// Feed one `InputEvent::Text` through the real command pipeline and fold
+    /// the resulting state back into the buffer, exactly as the widget does.
+    fn type_text(buf: &mut Buffer, s: &str) {
+        let action = command::handle(&buf.editor, &mut buf.view, &InputEvent::Text(s.into()));
+        if let Action::Replace { state, .. } = action {
+            buf.editor = state;
+        }
+    }
+
+    fn type_open_brackets(buf: &mut Buffer) {
+        // Two separate `[` text events — the real per-keystroke sequence.
+        type_text(buf, "[");
+        type_text(buf, "[");
+    }
+
+    #[test]
+    fn typing_double_bracket_pairs_to_four_and_opens_completion() {
+        let (_td, mut buf) = buffer_in_vault("note.md", "");
+        type_open_brackets(&mut buf);
+        assert_eq!(buf.editor.doc.to_string(), "[[]]", "`[[` must auto-pair to `[[]]`");
+        assert_eq!(
+            buf.editor.selection.main().head.offset(),
+            2,
+            "caret sits between the inner brackets",
+        );
+        assert!(buf.view.completion.active, "completion popup should open on `[[`");
+        assert!(!buf.view.completion.items.is_empty(), "popup offers vault notes");
+    }
+
+    #[test]
+    fn double_bracket_opens_completion_on_a_note_with_existing_content() {
+        // The restored-note case: a buffer carrying prior content (frontmatter +
+        // body). Typing `[[` at the end of the body must still open the popup.
+        let body = "---\ntitle: Old Note\n---\n\nSome existing prose here.\n";
+        let (_td, mut buf) = buffer_in_vault("old.md", body);
+        // Move the caret to end of document (where the user types).
+        let end = buf.editor.doc.len_bytes();
+        buf.editor.selection = editor_core::selection::Selection::single(end);
+        type_open_brackets(&mut buf);
+        assert!(
+            buf.editor.doc.to_string().ends_with("[[]]"),
+            "`[[` nests to `[[]]` mid-document, got {:?}",
+            buf.editor.doc.to_string(),
+        );
+        assert!(
+            buf.view.completion.active,
+            "completion must open on a content-bearing (restored) note too",
+        );
+    }
+
+    #[test]
+    fn wikilink_source_is_registered_when_vault_supplied() {
+        let (_td, buf) = buffer_in_vault("note.md", "");
+        assert_eq!(
+            buf.view.completion_sources.len(),
+            1,
+            "a vault-backed buffer must carry the wikilink completion source",
+        );
+    }
+}

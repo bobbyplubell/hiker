@@ -1,7 +1,7 @@
-//! Clusters feature module — feature-registry-first home for the
+//! Clusters activity module — activity-registry-first home for the
 //! cluster-trees workflow (sidebar tree picker + node browser, the
-//! cluster-review tab body, and the per-feature UI state). Migrated out
-//! of `panels::cluster_review` + `sidebar::clusters` as part of Feature
+//! cluster-review tab body, and the per-activity UI state). Migrated out
+//! of `panels::cluster_review` + `sidebar::clusters` as part of activity
 //! registry Phase 1 (`feature-cluster-migration`).
 //!
 //! Layout:
@@ -13,28 +13,29 @@
 //! - `panel/` — cluster-review center-pane tab body.
 //!
 //! The `Clusters` zero-sized type at the bottom implements
-//! `crate::feature::Feature` so the registry can dispatch sidebar / icon /
+//! `crate::activity::Activity` so the registry can dispatch sidebar / icon /
 //! label generically. Center-pane dispatch still routes through the
 //! legacy `TabKind::ClusterReview` path until Phase 2/3 migrates that
 //! consumer.
 
 pub mod panel;
+pub mod preset;
 pub mod sidebar;
 pub mod state;
 
 use eframe::egui;
 
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Activity, Ctx, View};
 use crate::icons;
 
-/// Zero-sized `Feature` impl for the Clusters feature. Pure descriptor:
+/// Zero-sized `Activity` impl for the Clusters activity. Pure descriptor:
 /// holds no state. The real state lives in
 /// `AppState::clusters_state`; the sidebar surface reaches it via
 /// `Ctx::state.downcast_mut::<State>()` and routes broad effects
 /// (open a tab / open a note) through `Ctx::defer`.
 pub struct Clusters;
 
-impl Feature for Clusters {
+impl Activity for Clusters {
     fn id(&self) -> &'static str {
         "clusters"
     }
@@ -44,8 +45,8 @@ impl Feature for Clusters {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::ClusterTree)
     }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&ClustersSidebar)
+    fn views(&self) -> Vec<&dyn View> {
+        vec![&ClustersSidebar]
     }
 }
 
@@ -83,7 +84,10 @@ pub(crate) fn export_tree_to_canvas(
 
 struct ClustersSidebar;
 
-impl SidebarSurface for ClustersSidebar {
+impl View for ClustersSidebar {
+    fn id(&self) -> &'static str {
+        "clusters"
+    }
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         egui::ScrollArea::vertical()
             .id_salt("panel-clusters-body")

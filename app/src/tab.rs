@@ -20,18 +20,21 @@ pub struct TabId(pub u64);
 /// so layout files survive panel-registry shuffles.
 pub type PanelId = &'static str;
 
-// Stable panel-id vocabulary. These equal the corresponding feature ids
+// Stable panel-id vocabulary. These equal the corresponding activity ids
 // and are referenced by the activity-bar toggle actions
-// (`actions::toggle_panel`) and a few features' reveal calls. The values
-// match `Feature::id()`; `vault`/`trash` have no remaining const callers
-// (their toggles route through the feature id directly), so they aren't
+// (`actions::toggle_panel`) and a few activities' reveal calls. The values
+// match `Activity::id()`; `vault`/`trash` have no remaining const callers
+// (their toggles route through the activity id directly), so they aren't
 // listed here.
 pub const PANEL_FILES: PanelId = "files";
 pub const PANEL_CLUSTERS: PanelId = "clusters";
 pub const PANEL_TRAILS: PanelId = "trails";
 pub const PANEL_SEARCH: PanelId = "search";
-pub const PANEL_RELATED: PanelId = "related";
-pub const PANEL_BACKLINKS: PanelId = "backlinks";
+/// The `context` container (backlinks + related) activity-bar mode. The
+/// per-note discovery panels toggle the whole container; `backlinks` and
+/// `related` are now `View`s inside it (`"context/backlinks"` /
+/// `"context/related"`), not standalone activity ids.
+pub const PANEL_CONTEXT: PanelId = "context";
 pub const PANEL_CHAT: PanelId = "chat";
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,54 @@ pub struct Tab {
     /// Sticky = user signalled intent to keep this tab open. Preview tabs
     /// are non-sticky and live in `AppState::preview_tab`.
     pub sticky: bool,
+    /// Cross-tab wiring for viz tabs (graph / canvas). A `target` makes a
+    /// node-click open the note into another tab group (DRIVE); a `source`
+    /// makes the tab follow whatever note is active in another group
+    /// (FOLLOW). Empty (the default) means the tab is self-contained.
+    /// status: tab-linking
+    pub link: TabLink,
+}
+
+impl Tab {
+    /// Construct a self-contained (unlinked) tab. The common case — every
+    /// non-link-aware open path uses this so the `link` default stays in one
+    /// place. status: tab-linking
+    pub const fn new(id: TabId, kind: TabKind, sticky: bool) -> Self {
+        Self { id, kind, sticky, link: TabLink::new() }
+    }
+}
+
+/// A reference to another open tab or tab group, the endpoint of a
+/// [`TabLink`]. `GroupId`/`TileId` is the workbench's per-window group
+/// handle; it is NOT stable across restart, so persisted links re-resolve
+/// through a path key (see `Tab::persist_key` / the autosave snapshot).
+/// status: tab-linking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRef {
+    /// A specific tab, by id.
+    Tab(TabId),
+    /// A tab group (editor split), by workbench group handle.
+    Group(egui_workbench::workspace::GroupId),
+}
+
+/// A viz tab's cross-tab wiring. `source` drives FOLLOW (this tab highlights
+/// whatever note is active in the referenced group/tab); `target` drives
+/// DRIVE (this tab's node-clicks open into the referenced group instead of
+/// its own preview slot). Either may be set independently; both `None` is a
+/// self-contained tab. status: tab-linking
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabLink {
+    /// The group/tab this tab FOLLOWS (reads the active note from).
+    pub source: Option<LinkRef>,
+    /// The group/tab this tab DRIVES (opens clicked notes into).
+    pub target: Option<LinkRef>,
+}
+
+impl TabLink {
+    /// An empty link (no source, no target) — the default for every tab.
+    pub const fn new() -> Self {
+        Self { source: None, target: None }
+    }
 }
 
 /// What's in an editor tab's buffer. Each variant maps to a different
@@ -135,8 +186,6 @@ pub enum TabKind {
     Agent { session_id: String },
     /// Patch review: lists pending proposals with accept/reject.
     PatchReview,
-    /// Plugins host (stub): lists `.hiker/plugins.json` entries.
-    Plugins,
     /// Indexer detail / control: model id, status, reindex.
     IndexerDetail,
     /// Sync detail / control: device fingerprint, enrollment, force-sync,
@@ -152,22 +201,12 @@ pub enum TabKind {
     /// Cluster tree visualised as a radial dendrogram. Payload is the
     /// `tree_id` to render.
     ClusterGraph { tree_id: String },
-    /// Capture tab: the form-over-frontmatter surface for a capture-spec
-    /// note (`hiker.kind: capture`). One renderer parameterized by the
-    /// note's `capture.mode` — `crawl` shows the crawl-job form
-    /// (`crawl-job-form`), `feed` shows the RSS subscription form
-    /// (`rss-subscription-lifecycle`). Editing a field writes the note's
-    /// `CrawlParams` / `FeedParams` frontmatter; Run launches the engine
-    /// off the UI thread. Per-doc (like Board), keyed by the note path.
-    ///
-    /// status: crawl-job-form
-    Capture { note_path: String },
     /// ZIM viewer: an offline `.zim` archive (e.g. a Wikipedia export)
     /// rendered as HTML via the `hiker-htmlview` renderer. `zim_path`
     /// is the archive's vault-relative path; `article` is the currently
     /// shown article (`None` = the archive's main page). Clicking an
     /// in-archive link navigates within this same tab. Per-archive, keyed
-    /// by path (like Board / Capture). status: zim-view
+    /// by path (like Board). status: zim-view
     ZimView { zim_path: String, article: Option<String> },
 }
 
@@ -281,15 +320,11 @@ impl TabKind {
             TabKind::BoardsIndex => "Boards".to_string(),
             TabKind::Agent { .. } => "Chat".to_string(),
             TabKind::PatchReview => "Patch review".to_string(),
-            TabKind::Plugins => "Plugins".to_string(),
             TabKind::IndexerDetail => "Index".to_string(),
             TabKind::Sync => "Sync".to_string(),
             TabKind::Changes => "Changes".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
-            TabKind::Capture { note_path } => {
-                format!("Capture · {}", path_basename(note_path))
-            }
             TabKind::ZimView { zim_path, .. } => {
                 format!("ZIM · {}", path_basename(zim_path))
             }
@@ -322,7 +357,6 @@ impl TabKind {
             TabKind::BoardsIndex => icons::ICONS.image(crate::icons::Icon::Clipboard),
             TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
             TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
-            TabKind::Plugins => icons::ICONS.image(crate::icons::Icon::Plugin),
             TabKind::IndexerDetail => icons::ICONS.image(crate::icons::Icon::Compass),
             // No dedicated sync glyph in the icon set; `Restore` is the
             // circular-arrow "refresh" mark, the closest fit for sync.
@@ -330,9 +364,6 @@ impl TabKind {
             TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
-            // The capture tab drives the web crawl / feed engine; the
-            // compass glyph reads as "go fetch from out there".
-            TabKind::Capture { .. } => icons::ICONS.image(crate::icons::Icon::Compass),
             // Offline encyclopedia archive — the compass "go read out
             // there, but cached" reads closest in the icon set.
             TabKind::ZimView { .. } => icons::ICONS.image(crate::icons::Icon::Compass),
@@ -361,6 +392,13 @@ impl Tab {
     /// tab survives a restart, `None` if the kind needs payload data we
     /// don't persist (preview-style editor tabs, Properties, Agent,
     /// QueueDetail, HomeDetail, ClusterReview, ClusterGraph).
+    ///
+    /// NOTE: `link` is intentionally NOT round-tripped here. Links reference
+    /// a `GroupId` (`TileId`), which is not restart-stable, and groups have no
+    /// persisted identity to re-resolve against. For v1 tab-linking is
+    /// in-session only. TODO(tab-linking-persist): persist links by the linked
+    /// group's active-tab `persist_key`, re-resolving to a `GroupId` after the
+    /// workbench layout restores. status: tab-linking
     pub fn persist_key(&self) -> Option<(String, String)> {
         Some(match &self.kind {
             TabKind::Editor { buffer: BufferSource::Vault { path }, diff: None } => {
@@ -382,13 +420,6 @@ impl Tab {
             TabKind::Canvas { path } => (format!("canvas:{path}"), "canvas".into()),
             // Singleton Boards index page. status: board-index-page
             TabKind::BoardsIndex => (":boards_index".into(), "boards_index".into()),
-            // Capture tabs are per-doc: persist the capture-note path so
-            // the tab reopens in the form view on restore (the "capture:"
-            // prefix disambiguates from a plain buffer tab on the same
-            // path). status: crawl-job-form
-            TabKind::Capture { note_path } => {
-                (format!("capture:{note_path}"), "capture".into())
-            }
             // ZIM tabs are per-archive: persist the archive path so the tab
             // reopens on the main page after restart. The current article
             // (if any) is intentionally not persisted — restore lands on the
@@ -397,7 +428,6 @@ impl Tab {
                 (format!("zim:{zim_path}"), "zim".into())
             }
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
-            TabKind::Plugins => (":plugins".into(), "plugins".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
             TabKind::Sync => (":sync".into(), "sync".into()),
             TabKind::Changes => (":changes".into(), "changes".into()),

@@ -28,7 +28,12 @@ use ulid::Ulid;
 
 const AUTOSAVE_DIRNAME: &str = "autosave";
 const INDEX_NAME: &str = "index.json";
-const SCHEMA_VERSION: u32 = 1;
+// v2: dropped the `Capture` / `Plugins` dock-tab kinds (web-source
+// acquisition + the plugin host left core). An index written by an older
+// binary may carry those kinds in its tab-state snapshot, so a version
+// mismatch resets the index to the bootstrap default rather than restoring a
+// layout referencing tabs that no longer exist.
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -36,8 +41,6 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("schema version mismatch: index is v{found}, binary expects v{expected}")]
-    VersionMismatch { found: u32, expected: u32 },
 }
 
 /// Tab-state snapshot. `open_paths` is the ordered list the frontend
@@ -156,16 +159,14 @@ impl Autosave {
             dir,
             lock: Mutex::new(()),
         };
-        // Best-effort schema check: if index.json exists with a future
-        // version, fail loud (mirrors `store-version-fail-loud`).
-        match me.read_index_for_version_check()? {
-            Some(v) if v != SCHEMA_VERSION => {
-                return Err(Error::VersionMismatch {
-                    found: v,
-                    expected: SCHEMA_VERSION,
-                });
-            }
-            _ => {}
+        // Schema check: if index.json exists at a different version, reset it
+        // to the bootstrap default. The tab-state snapshot it carries may
+        // reference tab kinds this binary no longer knows; a clean reset means
+        // a vanished tab reads as an expected reset, not a mysterious failure.
+        if let Some(v) = me.read_index_for_version_check()?
+            && v != SCHEMA_VERSION
+        {
+            me.write_index_atomic(&IndexFile::default())?;
         }
         Ok(me)
     }
@@ -561,24 +562,25 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_fails_loud() {
+    fn version_mismatch_resets_to_default() {
         let dir = tempdir().unwrap();
         let a = Autosave::open(dir.path()).unwrap();
-        // Write a future-version index by hand.
+        // Write a differing-version index by hand, carrying a stale tab-state
+        // snapshot that an older binary might have persisted.
         let raw = serde_json::json!({
             "version": 99,
             "entries": {},
-            "tab_state": null,
+            "tab_state": { "open_paths": ["gone.md"] },
         });
         std::fs::write(a.index_path(), raw.to_string()).unwrap();
-        match Autosave::open(dir.path()) {
-            Err(Error::VersionMismatch { found, expected }) => {
-                assert_eq!(found, 99);
-                assert_eq!(expected, SCHEMA_VERSION);
-            }
-            Err(e) => panic!("expected VersionMismatch, got {e:?}"),
-            Ok(_) => panic!("expected VersionMismatch, got Ok"),
-        }
+        // Re-open: the mismatch resets the index to the bootstrap default
+        // (no error), so the stale tab-state is gone and the version is current.
+        let a2 = Autosave::open(dir.path()).unwrap();
+        assert!(a2.load_tab_state().unwrap().is_none());
+        assert_eq!(
+            a2.read_index_for_version_check().unwrap(),
+            Some(SCHEMA_VERSION),
+        );
     }
 
     #[test]

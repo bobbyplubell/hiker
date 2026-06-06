@@ -1,8 +1,9 @@
-//! Backlinks feature — sidebar surface listing notes whose `[[wikilink]]`
+//! Backlinks view — sidebar surface listing notes whose `[[wikilink]]`
 //! resolves to the active note. Migrated off `panels::backlinks` +
-//! `panels_registry` to a real `Feature` rendering through the narrow
-//! `feature::Ctx` (reads via ctx; open-note deferred via `ctx.defer`).
-//! [feature-backlinks-migration]
+//! `panels_registry` to a real `View` rendering through the narrow
+//! `activity::Ctx` (reads via ctx; open-note deferred via `ctx.defer`).
+//! Surfaced by the `context` container activity (`crate::context`)
+//! alongside related. [feature-backlinks-migration]
 //!
 //! The backlinks set is a vault-wide content scan (no structural-index
 //! API yet), cached by active path so it only re-runs on note switch.
@@ -14,7 +15,7 @@ use eframe::egui;
 use hiker_core::vault::Vault;
 
 use crate::editor_pane;
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Ctx, View};
 use crate::icons;
 use hiker_theme as theme;
 
@@ -31,29 +32,16 @@ pub struct State {
     pub backlinks_for: Option<String>,
 }
 
-/// Zero-sized `Feature` descriptor for backlinks. State lives in
+/// Zero-sized `View` descriptor for backlinks. State lives in
 /// `AppState::backlinks_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`.
-pub struct Backlinks;
+/// `Ctx::state.downcast_mut::<State>()`. Exposed so the `context`
+/// container activity can list it among its `views()`.
+pub struct BacklinksSidebar;
 
-impl Feature for Backlinks {
+impl View for BacklinksSidebar {
     fn id(&self) -> &'static str {
         "backlinks"
     }
-    fn label(&self) -> &'static str {
-        "Backlinks"
-    }
-    fn icon(&self) -> egui::Image<'static> {
-        icons::ICONS.image(icons::Icon::Bookmark)
-    }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&BacklinksSidebar)
-    }
-}
-
-struct BacklinksSidebar;
-
-impl SidebarSurface for BacklinksSidebar {
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         // The workbench accordion owns the section header + collapse;
         // the body is just the content. [feature-panel-single-accordion]
@@ -106,14 +94,22 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
     }
     for rel in &hits {
         let label = rel.rsplit('/').next().unwrap_or(rel.as_str());
-        if ui
+        let resp = ui
             .add(egui::Button::image_and_text(
                 icons::ICONS.image(icons::Icon::File),
                 label,
             ))
-            .on_hover_text(rel)
-            .clicked()
-        {
+            .on_hover_text(rel);
+        if resp.hovered() {
+            crate::widgets::preview::register_note_hover(ui, resp.rect, rel);
+        }
+        crate::item_menu::attach_note_item_menu(
+            &resp,
+            ctx,
+            rel,
+            crate::item_menu::BaseOpts { reveal: true },
+        );
+        if resp.clicked() {
             let rel_owned = rel.clone();
             ctx.defer(move |app| editor_pane::open_file(app, &rel_owned, false));
         }

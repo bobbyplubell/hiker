@@ -2,19 +2,7 @@
 
 The single substrate every write rides on. One Yrs document per hiker document plus a side-table of editorial metadata (author, status, surface). Markdown on disk is the canonical materialization of *accepted* operations; pending agent operations are held in a per-document queue until the user accepts.
 
-The headline decisions:
-
-- **One Yrs `Doc` per hiker document.** Native markdown notes have a Yrs Doc keyed by the note's `doc_id` — a ULID minted on first ingest, kept only in the op-log's internal `path → doc_id` mapping (`doc-index.db`) and never stamped into the note file. The note's user-facing identity is its vault path; the `doc_id` is an implementation detail that keeps op-log history stable across renames (rename updates the mapping; the `doc_id` itself never changes). **`doc_id` is the single internal ULID per document.** The indexer's `notes.id`, every chunk's `note_id` FK, and any other internal handle that needs a stable per-document identifier all use this same ULID — read from `doc-index.db` via `oplog::doc_id_for_path`. No subsystem mints its own parallel id. Non-md sources (PDF, image, audio, external) have Yrs Docs keyed by the *sidecar* — the .md alongside the source (or the `.hiker/external/<id>--slug.md` for external-pointer mode per `design.md`'s "Source-derived notes"). Sidecars are the unit of CRDT history; the underlying source is read-only as far as the log is concerned. [op-log-document-identity, op-log-sidecar-document]
-- **Yrs is the CRDT library, and the whole `.md` file is one `Y.Text`.** Mature Rust port of Yjs. The document's entire markdown text — frontmatter fence and body together — is a single `Y.Text`; frontmatter gets no structural modeling. Fine-grained character-level merge handles concurrent edits anywhere in the file (each save is diffed into minimal localized ops, so only changed bytes carry CRDT operations). Each Doc's Yrs `client_id` is the per-replica identifier the CRDT uses to keep concurrent edits distinct and merge them deterministically; *who* authored an op (user / agent / external / remote device) is recorded separately in the side-table `author` field, not inferred from the `client_id`. Frontmatter as a `Y.Map` would buy concurrent set-union on list fields like `tags`, but that benefit can't be exercised until cross-device sync ships, while the structural round-trip would corrupt frontmatter *today* — reordered keys, dropped comments, coerced scalars, phantom watcher diffs. Plaintext keeps `materialize()` byte-identical to disk and matches the editor's existing rope buffer. [op-log-yrs-backed]
-- **Markdown on disk is canonical.** For every native-md note and every sidecar, the on-disk `.md` file equals the materialization of the document's *accepted* Yrs state. Copying the vault's markdown out gives the latest accepted state with no separate state to ship alongside. [op-log-disk-canonical]
-- **Layered model: `accepted` + `working` + `pending`.** The buffer renders the merge of three CRDT op layers — committed `accepted` (on disk, synced), the user's uncommitted `working` edits, and the agent's `pending` proposals. User typing and agent proposals coexist in one buffer; Save commits `working`, Accept commits a `pending` op (immediately, even for closed files), Reject drops it. [op-log-layered-model]
-- **The editor binds to the CRDT at the op level.** Every editor edit becomes a `user` op on `working` (forward); `accepted` / `pending` / external changes flow back into the editor as change sets (reverse); both directions are origin-tagged to avoid an echo loop. User edits are first-class CRDT ops, so they merge and sync like agent and external ops. [op-log-editor-binding]
-- **Pending operations live in a local queue, not the synced CRDT.** Agent operations enter as serialized Yrs updates in `<doc-id>.pending` paired with side-table metadata (`author`, `surface`, `session_id`, `batch_id`). Accept applies the update to `accepted`; reject discards. Pending ops never sync — they're editorial state, not collaborative state. [op-log-pending-queue]
-- **Editorial metadata lives in a side table.** Yrs operations are positional CRDT primitives without per-op author tags; hiker keeps `oplog_meta.db` keyed by `(doc_id, op_id)` with `{ author, op_kind, status, surface, session_id, batch_id, metadata }`. The `author` vocabulary is the same as the prior changelog. [op-log-author-classes, op-log-status-states, op-log-side-table]
-- **Each op carries a logical kind.** A typed `OpKind` (`Replace` / `SetFrontmatter` / `Rename` / `Create` / `Tombstone`) rides on every op — on the `PendingOp` while pending, copied to the `op_metadata` row on accept — so the activity feed, rollback, and agent introspection have a typed handle over the otherwise-opaque Yrs update. [op-log-op-shape]
-- **Review hunks are the diff of the agent's layer.** The hunks the user reviews are `diff(materialize(accepted + working), materialize(accepted + working + pending(session)))` — what the agent's `pending` ops add on top of the user's current view, so the user's own `working` edits never render as hunks (they're on both sides). Per-hunk accept applies the contributing pending updates to `accepted`; per-hunk reject drops them. The diff recomputes from ropes each frame — `DiffLayer` from `diff.md` is the rendering primitive. [op-log-hunk-view, op-log-per-hunk-accept-reject]
-- **External edits are reconciled into the CRDT.** A `.md` file that changes on disk outside hiker (Syncthing receive, manual edit) is detected by hash mismatch against `materialize(accepted)`; the delta is computed and applied to `accepted` as a Yrs update tagged `author=external`. The CRDT absorbs external state cleanly. [op-log-external-edit-sync]
-- **Embeddings sync as an LWW cache, not through the CRDT.** Embedding vectors are content-derived; they don't have meaningful concurrent edits. Sync as a separate content-addressed blob store keyed by `(content_hash, model_version)`. Each device can regenerate locally if the cache is missing. [op-log-embeddings-lww-cache]
+Orientation: each hiker document is one Yrs `Doc` (the whole `.md` file as one `Y.Text`) keyed by an internal `doc_id` ULID, with editorial metadata in a side table. The buffer renders three CRDT op layers — `accepted` (on disk, synced) + `working` (uncommitted user edits) + `pending` (agent proposals). The editor binds to the CRDT at the op level. External disk edits (including offline ones) reconcile back in as `author=external` ops. Embeddings sync as a separate content-addressed cache, not through the CRDT. Each unique behavior is specced in its section below.
 
 
 ## Document identity
@@ -60,20 +48,11 @@ Y.Doc
 
 [op-log-document-shape]
 
-**Why the whole file as one `Y.Text`:** matches the user's mental model (a markdown file is a stream of text), supports fine-grained CRDT merge during concurrent edits, and lets the editor's existing rope-based buffer stay unchanged — the buffer reads `Y.Text` as a string, and each save is diffed against the accepted state into the minimal localized Yrs operations (a char-level diff; untouched bytes — including a concurrent remote edit elsewhere — are never rewritten). [op-log-yrs-backed] Frontmatter rides inside the same `Y.Text` as plain bytes; it gets no structural modeling. The cost is that two devices concurrently adding different entries to the same `tags:` line merge as a character-level text merge rather than a clean set-union — acceptable because that race only exists once sync ships, and the alternative (frontmatter as a `Y.Map`) makes `materialize()` lossy against the user's authored bytes today.
+**Why the whole file as one `Y.Text`:** matches the user's mental model (a markdown file is a stream of text), supports fine-grained CRDT merge during concurrent edits, and lets the editor's existing rope-based buffer stay unchanged — the buffer reads `Y.Text` as a string, and each save is diffed against the accepted state into the minimal localized Yrs operations (a char-level diff; untouched bytes — including a concurrent remote edit elsewhere — are never rewritten). [op-log-yrs-backed] Frontmatter rides inside the same `Y.Text` as plain bytes; it gets no structural modeling. The cost: concurrent same-line `tags:` edits across devices merge as character-level text, not clean set-union — acceptable because that race only exists once sync ships, while frontmatter-as-`Y.Map` would make `materialize()` lossy against the user's authored bytes today (reordered keys, dropped comments, coerced scalars, phantom watcher diffs).
 
 **Why `meta` stays a `Y.Map`:** `kind`, `path`, and `tombstone` are document state that never appears in the `.md` file, so they have no round-trip to corrupt. `tombstone` needs cross-device merge semantics (a delete on one device must merge against an edit on another), and `path` is what regenerates `doc-index.db` after a loss (per "Storage layout"). The sidecar's source handle is *not* duplicated here — it lives in the frontmatter text as `hiker.source_ref` (per "Document identity").
 
-**Materialization writes the canonical `.md`:**
-
-```rust
-fn materialize(doc: &yrs::Doc) -> String {
-    let txn = doc.transact();
-    doc.get_text("text").get_string(&txn)   // verbatim bytes; no re-serialization
-}
-```
-
-Pure function over Yrs state; no I/O. The returned string is byte-identical to what the user (or any external editor) last wrote — there is no parse/re-emit step to reorder keys, drop comments, or coerce scalars.
+**Materialization writes the canonical `.md`:** `materialize(doc)` reads `text: Y.Text` as a string (verbatim bytes, no re-serialization). Pure function over Yrs state; no I/O. The returned string is byte-identical to what the user (or any external editor) last wrote — no parse/re-emit step to reorder keys, drop comments, or coerce scalars. (Full shape under "Materialization".)
 
 
 ## Layered document model
@@ -93,12 +72,13 @@ Why `working` is its own layer rather than committing user typing straight to `a
 
 The editor and the document's CRDT stay in lockstep at the *operation* level — every edit is a CRDT op, both directions: [op-log-editor-binding]
 
-**The editable buffer is `materialize_working`.** The agent's pending ops are *not* folded into the buffer text; they render as a suggestion overlay on top (the buffer diffed against `materialize_review = working + pending`: additions as phantom blocks, deletions struck through). This is the y-codemirror.next shape — the editor crate stays CRDT-agnostic; this binding is the only adapter — and it keeps the user's edits in one coordinate space (`working`) with no offset remapping.
+The buffer is `materialize_working`; pending ops render as an overlay (the buffer diffed against `materialize_review = working + pending`: additions as phantom blocks, deletions struck through). This is the y-codemirror.next shape — the editor crate stays CRDT-agnostic; this binding is the only adapter — keeping the user's edits in one coordinate space (`working`) with no offset remapping.
 
 - **Forward (editor → `working`).** The editor emits a change set — a list of retain / delete / insert ops over byte ranges — for each edit it applies. Because the buffer *is* `working`, the offsets are already working coordinates: each delete/insert is applied to the `working` layer as a `user` op directly, no translation.
 - **Reverse (CRDT → editor).** When `working` advances without matching user typing — an accepted agent op replayed onto `working`, or an external edit — hiker pulls the new `working` into the buffer and **maps the selection through the change** (CodeMirror's `ChangeSet.mapPos` discipline), so an edit landing above the cursor carries the cursor with it rather than stranding it at a stale offset. Positions are mapped through changes, never clamped.
 - **Overlay.** Each frame the binding stashes `materialize_review` as the buffer's `agent_proposal`; the inline review diffs the buffer (`working`) against it to render the pending ops. Cleared when there are no pending ops (`review == working`).
 - **Origin tagging.** Host-applied edits (the reverse direction) bypass the widget's input path, so they never re-enter the forward sink — no echo loop, no explicit origin marker needed.
+- **Fidelity invariant.** The forward mirror may not silently drop an edit: `materialize(working)` equals the editor's text at all times, asserted at Save. A failed forward apply is a hard error that forces a full resync of `working` from the editor's text, never a logged-and-ignored warning. Without this the reverse step — which treats `working` as the source of truth — would re-point the editor back and erase the user's keystroke on the next frame, and Save would commit the stale `working` while the dirty/clean check reads the editor text, both losing the edit and mis-flagging the buffer clean. [op-log-binding-fidelity-invariant]
 
 Capturing the editor's own change set (rather than re-diffing the whole buffer to guess what changed) is what makes user typing a first-class CRDT op, so the `working` layer merges with `pending` and `accepted` exactly as agent and external ops do — every mutation in the system is a CRDT op (`user`, `agent:*`, `external`, `sync:*`), uniformly syncable.
 
@@ -113,22 +93,7 @@ Capturing the editor's own change set (rather than re-diffing the whole buffer t
 
 ## Pending queue
 
-```rust
-// <doc-id>.pending — one row per pending update
-pub struct PendingOp {
-    pub op_id: OpId,                    // ulid
-    pub yrs_update: Vec<u8>,            // serialized Yrs update bytes; applies against `accepted`'s current state
-    pub op_kind: OpKind,                // logical shape of the edit; see "Op shapes"
-    pub author: Author,                 // agent:<client-id> | auto:* | extractor:*
-    pub session_id: Option<String>,
-    pub surface: String,                // "mcp-tool-call" | "triage" | "extractor" | ...
-    pub batch_id: Option<String>,       // groups e.g. multi-edit `edit_note` calls
-    pub created_at_ms: i64,
-    pub metadata: serde_json::Value,
-}
-```
-
-[op-log-pending-queue]
+`<doc-id>.pending` holds one `PendingOp` row per pending update: `op_id` (ulid); `yrs_update` (serialized Yrs update bytes, applied against `accepted`'s current state); `op_kind` (logical shape, see "Op shapes"); `author` (`agent:<client-id>` | `auto:*` | `extractor:*`); `session_id`; `surface` (`"mcp-tool-call"` | `"triage"` | `"extractor"` | ...); `batch_id` (groups e.g. multi-edit `edit_note` calls); `created_at_ms`; `metadata`. [op-log-pending-queue]
 
 Pending updates are pre-computed: when the agent calls `edit_note(rel_path, [{ old_str, new_str }, ...])`, the producer:
 
@@ -147,29 +112,7 @@ The clone is discarded; only the serialized update bytes are kept. Accept applie
 
 Yrs ops don't carry author/status/surface. Hiker layers this in `oplog_meta.db` — one SQLite database for the whole vault: [op-log-side-table]
 
-```sql
-CREATE TABLE op_metadata (
-    doc_id        TEXT NOT NULL,
-    op_id         TEXT NOT NULL,          -- ulid; for accepted ops, matches a Yrs op range
-    yrs_client_id INTEGER NOT NULL,       -- which Yrs client_id authored this op range
-    yrs_clock_lo  INTEGER NOT NULL,       -- inclusive lower bound on Yrs clock
-    yrs_clock_hi  INTEGER NOT NULL,       -- exclusive upper bound
-    author        TEXT NOT NULL,          -- 'user' | 'agent:<id>' | 'external' | 'extractor:<id>' | 'auto:<producer>' | 'sync:<device>'
-    op_kind       TEXT NOT NULL,          -- 'replace' | 'set_frontmatter' | 'rename' | 'create' | 'tombstone' (see "Op shapes")
-    rename_from   TEXT,                   -- prior vault-relative path; non-NULL only when op_kind = 'rename'
-    status        TEXT NOT NULL,          -- 'accepted' | 'rejected'  (pending lives in <doc-id>.pending)
-    timestamp_ms  INTEGER NOT NULL,
-    content_hash  TEXT,                   -- blake3 of materialize(accepted) as of this op; sync's enrollment hash-classification reads it (sync-content-hash-column)
-    surface       TEXT,                   -- producer's surface name
-    session_id    TEXT,
-    batch_id      TEXT,
-    metadata      TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX op_metadata_doc_ts ON op_metadata(doc_id, timestamp_ms DESC);
-CREATE INDEX op_metadata_author_ts ON op_metadata(author, timestamp_ms DESC);
-CREATE INDEX op_metadata_status ON op_metadata(status, timestamp_ms DESC);
-```
+`op_metadata` columns: `doc_id`; `op_id` (ulid; for accepted ops matches a Yrs op range); `yrs_client_id` + `yrs_clock_lo` (inclusive) + `yrs_clock_hi` (exclusive) — the Yrs op range this row describes; `author` (`'user'` | `'agent:<id>'` | `'external'` | `'extractor:<id>'` | `'auto:<producer>'` | `'sync:<device>'`); `op_kind` (`'replace'` | `'set_frontmatter'` | `'rename'` | `'create'` | `'tombstone'`); `rename_from` (prior path, non-NULL only when `op_kind = 'rename'`); `status` (`'accepted'` | `'rejected'`; pending lives in `<doc-id>.pending`); `timestamp_ms`; `content_hash` (blake3 of `materialize(accepted)` as of this op; sync's enrollment hash-classification reads it, `sync-content-hash-column`); `surface`; `session_id`; `batch_id`; `metadata` (default `'{}'`). Indexed on `(doc_id, timestamp_ms DESC)`, `(author, timestamp_ms DESC)`, and `(status, timestamp_ms DESC)`.
 
 The `(yrs_client_id, yrs_clock_lo, yrs_clock_hi)` tuple identifies the Yrs op range this metadata row describes. Hiker logical ops can span multiple Yrs ops (e.g. `edit_note`'s `Replace { old_str, new_str }` = delete + insert in Yrs); one metadata row covers the whole range.
 
@@ -182,15 +125,7 @@ The `(yrs_client_id, yrs_clock_lo, yrs_clock_hi)` tuple identifies the Yrs op ra
 
 A Yrs update is an opaque position-delta; hiker layers a logical `OpKind` over each one so the activity feed, rollback, and agent introspection have a typed handle. The kind is born with the op — carried on `PendingOp.op_kind` while pending, copied to the `op_metadata` row on accept — so it's available before *and* after the op reaches `accepted`. [op-log-op-shape]
 
-```rust
-pub enum OpKind {
-    Replace { anchor: Option<AnchorHint> },  // a `text` Y.Text edit; `anchor` carries the edit_note old_str
-    SetFrontmatter,                          // a `text` edit whose byte range falls inside the frontmatter fence
-    Rename { from: String },                 // a meta.path change; `from` is the prior vault-relative path
-    Create,                                  // the first op establishing a new document
-    Tombstone,                               // sets meta.tombstone = true
-}
-```
+`OpKind` variants: `Replace { anchor: Option<AnchorHint> }` (a `text` Y.Text edit; `anchor` carries the `edit_note` old_str); `SetFrontmatter` (a `text` edit whose byte range falls inside the frontmatter fence); `Rename { from: String }` (a `meta.path` change; `from` is the prior vault-relative path); `Create` (the first op establishing a new document); `Tombstone` (sets `meta.tombstone = true`).
 
 `SetFrontmatter` is a **logical label, not a distinct mechanism**: a frontmatter change is a `Replace` on the one `text: Y.Text` whose byte range lands inside the leading `---` fence. The producer tags it `SetFrontmatter` rather than `Replace` so the activity feed and `ChangeOp` projection can say "edited frontmatter" vs "edited body"; the underlying Yrs update is an ordinary text edit. (Mint the label by testing whether the edit's byte range falls before the closing `---`.)
 
@@ -248,24 +183,14 @@ Paths are the key in the vault; the op log keys on `doc_id`. The first open seed
 2. Create the note's Yrs Doc: one `Create` op, then a `Replace` inserting the file's current on-disk bytes as the initial `text` state. Set `meta.kind` and `meta.path`. Author the seed ops `user` — the existing file is the user's accepted state.
 3. Persist `<doc-id>.yrs` and the `op_metadata` rows. The on-disk `.md` is already equal to `materialize(accepted)` by construction, so no rewrite happens.
 
-The seed is idempotent: a path already mapped in `doc-index.db` is skipped, so subsequent opens are a cheap walk.
+The seed is idempotent: a path already mapped in `doc-index.db` is skipped, so subsequent opens are a cheap walk. Seeding only mints docs for *new* paths — an already-mapped file whose disk bytes drifted (or which vanished) while hiker was closed is handled by the startup disk-reconcile pass (per "External-edit sync"), not here.
 
 **Op-log bootstraps before the indexer.** `index.db` (search/embeddings, per `index.md`) is a separate, independently-regenerable store, but it shares the ULID space: when the indexer upserts a note, it reads `doc_id` from `doc-index.db` and uses it as `notes.id`. The indexer never mints document ids of its own. This is what enforces "one ULID per document" across the whole system. [op-log-bootstraps-first]
 
 
 ## Materialization
 
-```rust
-fn materialize(doc: &yrs::Doc) -> Materialized {
-    let txn = doc.transact();
-    Materialized {
-        text: doc.get_text("text").get_string(&txn).into(),   // verbatim file bytes
-        tombstone: doc.get_map("meta").get(&txn, "tombstone").as_bool().unwrap_or(false),
-    }
-}
-```
-
-[op-log-materialization]
+`materialize(doc) -> Materialized` returns `{ text, tombstone }` — `text` is `text: Y.Text` as a string (verbatim file bytes), `tombstone` is `meta.tombstone` (default false). [op-log-materialization]
 
 Pure read over the Yrs Doc; `text` is the file's bytes verbatim, no parse/re-emit. Drives every diff render, save-to-disk, accept dry-run. The buffer renders from `materialize(accepted + working + pending(session))`; the canonical disk file equals `materialize(accepted)`. Because materialization is the identity over the stored text, `op-log-disk-canonical` holds byte-for-byte: opening and saving a note never rewrites a single character the user didn't change.
 
@@ -277,27 +202,25 @@ The op log is the changelog: it answers "who/what/when" (the side table) *and*
 [op-log-history-materialization]
 
 - **Accepted-op retention.** Every accepted op appends a frame to a per-doc
-  history log `<doc-id>.ops` (length-prefixed bincode). A frame holds the op id,
-  the tombstone flag, and the *materialized content* as of that op — stored as
-  either a **keyframe** (the full text, zstd-compressed) or a **delta** (the
-  text zstd-compressed against the *previous* frame's text as a dictionary, so
-  an incremental edit costs roughly its own size). A keyframe is written for the
-  first frame of a doc, on a tombstone, every `KEYFRAME_INTERVAL` (16) frames,
-  and on the first write after a (re)open; the frames between are deltas. This
-  is content history (not the full Yrs Doc state, which would carry the doc's
-  *entire* op history in every frame), so the log stays linear in content, and
-  delta-packing cuts it further toward linear in *edit size*. Appended on
-  create, user edit, agent-op accept, external edit, rename, and tombstone.
-  [op-log-accepted-op-retention]
-- **`materialize_at(doc_id, op_id)`** finds that op's frame and reconstructs its
-  text by decoding from the nearest preceding keyframe forward (each delta
-  decompressed with the running text as its dictionary) — never touching the
-  live `accepted` Doc and never decoding Yrs on the read path. `KEYFRAME_INTERVAL`
-  bounds the walk to at most that many deltas. `None` when no frame matches
-  (unknown op, pre-retention, or a lifecycle marker like the bare `Create` of a
-  non-empty note, whose content frame is keyed to the content op). Returns
-  `{ text, tombstone }`, so a point past a tombstone reconstructs the deleted
-  state.
+  history log `<doc-id>.ops` (length-prefixed bincode), holding the op id, the
+  tombstone flag, and the *materialized content* as of that op — stored as a
+  **keyframe** (full text, zstd-compressed) or a **delta** (zstd-compressed
+  against the *previous* frame's text as a dictionary, so an incremental edit
+  costs roughly its own size). A keyframe is written for the first frame of a
+  doc, on a tombstone, every `KEYFRAME_INTERVAL` (16) frames, and on the first
+  write after a (re)open; the frames between are deltas. Storing content history
+  (not full Yrs Doc state, which would carry the doc's *entire* op history in
+  every frame) keeps the log linear in content, and delta-packing cuts it toward
+  linear in *edit size*. Appended on create, user edit, agent-op accept,
+  external edit, rename, and tombstone. [op-log-accepted-op-retention]
+- **`materialize_at(doc_id, op_id)`** reconstructs an op's text by decoding from
+  the nearest preceding keyframe forward (each delta decompressed with the
+  running text as its dictionary) — never touching the live `accepted` Doc or
+  decoding Yrs on the read path; `KEYFRAME_INTERVAL` bounds the walk. Returns
+  `{ text, tombstone }` (so a point past a tombstone reconstructs the deleted
+  state), or `None` when no frame matches (unknown op, pre-retention, or a
+  lifecycle marker like the bare `Create` of a non-empty note, whose content
+  frame is keyed to the content op).
 - **History listing.** `doc_history(doc_id, limit)` / `vault_history(limit)`
   project the side table (`status = Accepted`, newest-first) — the version
   dropdown, per-file history, and recent-activity feed read these plus
@@ -308,17 +231,15 @@ The op log is the changelog: it answers "who/what/when" (the side table) *and*
 
 A torn trailing `.ops` frame from a crash mid-append is tolerated — the reader
 stops at the first short/undecodable frame, and `.yrs` stays canonical for
-*current* state, so at most the in-flight op's history granularity is at risk.
-A delta frame depends on its preceding frames, soer torn frame also truncates
-the deltas after it — bounded by the keyframe cadence (the next keyframe
-re-anchors), and current state is never at risk.
+*current* state. A delta depends on its preceding frames, so a torn frame also
+truncates the deltas after it — bounded by the keyframe cadence (the next
+keyframe re-anchors); current state is never at risk.
 
 Deferred: (1) **coalescing** — a frame is currently minted per accepted op,
-including each autosave-driven commit; debouncing so a burst of saves collapses
-into one history frame would mint far fewer frames. (2) a **retention bound**
-(drop frames older than N days / keep last K) — droppablen y keyframe-bounded
-runs (drop whole keyframe→next-keyframe spans so no delta is orphaned).
-[op-log-history-retention]
+including each autosave-driven commit; debouncing a burst of saves into one
+history frame would mint far fewer. (2) a **retention bound** (drop frames older
+than N days / keep last K), dropping whole keyframe→next-keyframe spans so no
+delta is orphaned. [op-log-history-retention]
 
 
 ### Change-row projection
@@ -410,16 +331,73 @@ Uncommitted `working` edits and `pending` ops don't trigger steps (1)-(4): `work
 
 ## External-edit sync
 
-Watcher (per `watcher.md`) reports a `.md` file change hiker didn't initiate: [op-log-external-edit-sync]
+The `.md` on disk is a projection of `materialize(accepted)`, but the disk is also a write surface other tools own (Syncthing receive, a manual edit, a delete or rename in another editor). Any divergence between disk and `accepted` is folded back into the CRDT as one `author=external` op. [op-log-external-edit-sync]
+
+**The fold.** Given a tracked doc and its current disk bytes:
 
 1. Read the file's current bytes.
 2. Compute `materialize(accepted)`.
-3. If they match, the watcher event is a self-write echo — ignore (existing `watcher-suppress-self-writes` machinery still applies; this is the safety net).
-4. If they differ, diff `materialize(accepted)` → disk_bytes and apply the text delta to `accepted`'s `text: Y.Text` inside a transaction tagged with `author=external` in the metadata side table. Frontmatter and body are the same `Y.Text`, so the whole reconciliation is one text diff — no separate frontmatter handling.
+3. If they match, it's a self-write echo — no-op (the `watcher-suppress-self-writes` machinery is the first line; this hash check is the safety net).
+4. If they differ, diff `materialize(accepted)` → disk_bytes and apply the text delta to `accepted`'s `text: Y.Text` in a transaction tagged `author=external`. Frontmatter and body share one `Y.Text`, so the whole reconciliation is a single text diff.
 
-The CRDT absorbs the external edit cleanly. Concurrent in-app edits race the same way they do today — last writer wins at the materialization layer, and the editor's `pre-write-drift-check` still fires when an in-buffer save would overwrite an external edit it hadn't seen.
+The fold is **hash-gated, not mtime-gated**: a file touched but byte-identical to `materialize(accepted)` produces no op and no rewrite, so `op-log-disk-canonical` holds and an idle reopen mints nothing.
 
-For sidecars, external edits on the *source* (the PDF) trigger re-extraction, not a direct synthesized op on the sidecar — see "Re-extraction" below.
+### Three triggers
+
+The same fold runs from three places:
+
+| Trigger | When | Scope |
+| ------- | ---- | ----- |
+| Live (per `watcher.md`) | a watcher event for a tracked path while hiker runs | one doc |
+| Startup reconcile | vault open, before bootstrap seeds new paths | every tracked doc [op-log-startup-disk-reconcile] |
+| Open-time reconcile | a buffer opens | that one doc, before its text loads [op-log-open-time-disk-reconcile] |
+
+The watcher only reports changes that happen *while it is watching* — it never replays edits made while hiker was closed. The **startup reconcile** closes that gap: it walks the tracked docs (an mtime/size pre-filter skips rehashing files that plainly didn't change; the commit decision is still the byte hash), and folds any drift. The **open-time reconcile** is the per-doc backstop for anything the watcher dropped in-session (a suppressed-write window, a notify-queue overflow) — the buffer's text loads from the now-reconciled `accepted`.
+
+### Ordering invariant
+
+At vault open the order is **reconcile, then bootstrap-seed, then the first sync round** — and that order is load-bearing in two ways. [op-log-startup-disk-reconcile]
+
+- **Reconcile before bootstrap.** Bootstrap seeds an untracked path as a fresh document; reconcile must claim an offline rename's *new* path while it is still untracked, or the rename degrades into "tombstone the old doc, seed the new one as a fresh lineage" and the history is orphaned. Reconcile works off the prior session's persisted `doc-index.db` mapping, so it needs no seeding first; on a first-ever open the mapping is empty, reconcile is a no-op, and bootstrap seeds everything from disk.
+- **Reconcile before sync.** A stale `accepted` is never pushed to a peer, and an offline disk edit is never overwritten by an inbound update that lands first. A reconcile-vs-inbound-sync race on the same doc resolves by reconcile-first ordering plus the standard three-way merge at the materialization layer.
+
+At startup `working` is empty; a pending agent op re-anchors through the existing drift detection (per "Pending queue").
+
+### Offline delete and rename
+
+A tracked path *gone* from disk at reconcile time is an offline delete: tombstone the doc (`OpKind::Tombstone`, `author=external`) and route it through the trash (`delete-note-core-cmd` in `files.md`), with `materialize(accepted)` — the last known content — written as the recoverable trash artifact since the original bytes are gone. The doc's Yrs state and history (`<doc-id>.yrs`/`.yrslog`/`.ops` + metadata) are **retained, keyed by `doc_id`** rather than purged: the op-log is path-independent, so the history simply stays put and the trash entry references the `doc_id`. Restore (`vault-trash-restore`) rebinds `path → doc_id` and clears the tombstone, recovering content *and* full history — not a fresh import. Trash is where a tracked doc's history lives once its file is gone.
+
+An offline rename (one tracked path gone, a new untracked path present) is recognized as the same lineage when the new path's content hash matches the gone doc's current or recent history — rebind `path → doc_id` and record an `OpKind::Rename { from }`, reusing the rename handling in "Document identity". No match → treat as delete-to-trash of the old path plus a fresh seed of the new one.
+
+For sidecars, an external edit on the *source* (the PDF) triggers re-extraction, not a synthesized op on the sidecar — see "Re-extraction".
+
+### Acceptance set
+
+Integration tests over a real `OpLog` + temp vault (these are not retrieval-quality eval — see `qa.md` for that distinction):
+
+1. Offline edit to a tracked file → reopen → `accepted` matches disk; the `.md` is byte-unchanged; `content_hash` advanced.
+2. Offline edit, then a sync round → the edit propagates (proves reconcile-before-sync ordering).
+3. No offline change → reopen → no-op (no op minted, no rewrite).
+4. Touched-but-byte-identical file → no spurious commit (hash gate, not mtime).
+5. New file added offline → still seeded by bootstrap (regression guard, unchanged behavior).
+6. Offline edit with a pending agent op present → the disk edit folds in; the pending op drifts / re-anchors correctly.
+7. Open-time path: a change the watcher missed in-session → opening the buffer reconciles it.
+8. A reconcile op surfaces as `author=external` in the history / activity feed.
+9. A torn trailing `.yrslog` frame plus an offline edit → still converges (crash-safety).
+10. Large vault → unchanged docs are skipped by the pre-filter.
+11. After reconcile + open → the editor shows the reconciled content and the buffer reports clean.
+12. Offline delete → file in trash, Yrs history retained keyed by `doc_id`, doc tombstoned; restore recovers content and history.
+13. Doc diverged on a peer *and* on disk → the offline disk edit (folded `author=external` before the round, per the ordering invariant) and the inbound peer edit merge as a Yrs three-way: disjoint edits both survive, both devices converge, and the disk edit propagates back to the peer.
+14. A present-but-unreadable file (non-UTF-8, a permission error) → skipped, NOT mistaken for a delete; and one un-reconcilable doc doesn't abort the pass (best-effort per doc).
+15. A tombstoned doc whose file reappears on disk → resurrected (tombstone cleared, current bytes folded, same `doc_id`) rather than left a ghost.
+16. Three (or more) peers editing the *same line* concurrently → every replica converges to one deterministic text regardless of delivery order, and no peer's edit is lost.
+17. Offline delete vs a concurrent peer edit → both replicas converge tombstoned (the delete wins; a concurrent edit doesn't silently resurrect it).
+
+### Limitations
+
+- **Same-region concurrent edits can't merge *semantically*** — no automatic merge of two contended prose edits recovers intent. Rather than silently interleaving, a same-region sync conflict Blocks the document for user resolution (`sync.md` `sync-conflict-detect-same-region`); disjoint-region edits still merge automatically.
+- **Rename + heavy edit isn't recognized as a rename.** A file renamed *and* substantially edited while closed no longer content-hash-matches the gone doc's history, so it degrades to delete-old (to trash, recoverable) + seed-new (fresh lineage). No data is lost; the lineage splits. Same limitation as the sync layer's rename detection.
+- **Live double-write race.** While hiker runs, a peer update writing the `.md` (a self-write the watcher suppresses) can race an external editor writing the same file; reconciliation then rests on self-write suppression + last-writer-wins at the materialization layer. The offline (startup) path is clean; this in-session corner is not specifically serialized.
 
 
 ## Author classes
@@ -429,7 +407,7 @@ The `author` field is recorded in `op_metadata` for every Yrs operation range hi
 - `user` — keystroke / save / direct UI action.
 - `agent:<client-id>` — an MCP-attached agent's tool call. `<client-id>` from MCP handshake.
 - `external` — file on disk changed outside hiker; reconciled via the external-edit-sync path.
-- `extractor:<plugin-id>` — a source extractor re-ran. Preserves the future WASM-extractor case without committing to it now.
+- `extractor:<producer>` — a source-derived note was re-extracted / re-imported by an external producer.
 - `auto:<producer>` — write from internal automation (`auto:triage` per `cluster-editor.md`); the producer is the author whether the write was unattended or user-reviewed (`metadata.auto_accepted` distinguishes them).
 - `sync:<device-id>` — Yrs operations received from another device via the sync transport.
 
@@ -558,7 +536,7 @@ Sync transport, encryption, conflict copies, key management — the remaining sy
 ## Out of scope
 
 - **Sync transport design.** Lives in `sync.md`; this doc specs the substrate it rides on.
-- **WASM source-type plugins.** Re-extraction policies are specced so the future WASM-extractor path slots in cleanly, but the plugin host itself is not part of this spec.
+- **External extraction / import tooling.** Re-extraction versioning rides the op-log (an `extractor`-authored op), but the external producer / importer itself is out of this spec.
 - **Cross-document atomic *transactions*.** Each Yrs Doc is independent; a multi-file refactor is N independent op streams with no all-or-nothing guarantee (partial apply is allowed). A `batch_id` *may* span documents to group a reorganization for review (per "Multi-file reorganization", `op-log-reorg-batch`) — but that grouping is display-only, not a transaction.
 - **Encryption at rest.** Orthogonal to the log shape.
 - **Per-character review UI.** `op-log-per-op-status-flip` lands the primitive; surfacing as UI is deferred.

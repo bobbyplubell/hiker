@@ -1,9 +1,12 @@
 //! Trails: curated, ordered walks through the vault. See `docs/trails.md`.
 //!
-//! This slice (slice 1 of 3) lands type definitions, frontmatter
-//! parse/write helpers, and storage-layout helpers only. The ops
-//! (`create_trail`, `append_waypoint`, `delete_trail`, `on_note_moved`)
-//! and the derived `trail_waypoints` index table land in slice 2.
+//! This module owns the trail-doc / waypoint-note type definitions,
+//! frontmatter parse/write helpers, storage-layout helpers, and the
+//! read-only listing/detail surface (`list`, `get_trail`,
+//! `containing_note_with_paths`). The mutation verbs (`create_trail`,
+//! `append_waypoint`, `remove_waypoint`, `delete_trail`, the append-cursor
+//! / activation stamps) and the note-move path-remap pass live in
+//! `ops.rs`.
 //!
 //! A trail-doc is a regular markdown note with `hiker.kind: trail` in its
 //! frontmatter; a waypoint-note lives in the trail-doc's *visible
@@ -87,15 +90,6 @@ pub struct TrailDocFrontmatter {
     /// status: trail-append-cursor
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_under: Option<String>,
-    /// Draft flag (per `docs/trails.md` §"Draft trails"). When `true`,
-    /// the trail-doc is a proposal (agent- or clustering-emitted) the
-    /// user reviews before it becomes a real trail; it lives under
-    /// `.hiker/trails/drafts/` and is excluded from listings unless the
-    /// caller opts in. Absent / `false` in YAML both parse as `false`.
-    ///
-    /// status: trail-draft-review-surface
-    #[serde(default)]
-    pub draft: bool,
 }
 
 /// Parsed `hiker.*` frontmatter for a waypoint-note. References are
@@ -177,19 +171,10 @@ pub fn parse_trail_doc(source: &str) -> Result<TrailDocFrontmatter, Error> {
         .and_then(|v| v.as_str())
         .map(std::string::ToString::to_string);
 
-    // status: trail-draft-review-surface
-    // Missing key or non-bool both map to false; only an explicit
-    // `draft: true` flags the trail-doc as a draft proposal.
-    let draft = hiker_map
-        .get("draft")
-        .and_then(YamlValue::as_bool)
-        .unwrap_or(false);
-
     Ok(TrailDocFrontmatter {
         last_activated_at,
         waypoints,
         append_under,
-        draft,
     })
 }
 
@@ -313,13 +298,6 @@ pub fn write_trail_doc_frontmatter(
             serde_json::Value::String(cursor.clone()),
         );
     }
-    // status: trail-draft-review-surface
-    // Only emit `draft: true` when the trail is a draft. When false the
-    // key is stripped below (mirroring the `append_under` posture) so an
-    // accepted trail-doc carries no stale `draft` marker.
-    if fm.draft {
-        hiker_patch.insert("draft".into(), serde_json::Value::Bool(true));
-    }
     hiker_patch.insert(
         "waypoints".into(),
         serde_json::Value::Array(
@@ -353,13 +331,6 @@ pub fn write_trail_doc_frontmatter(
         // anything pre-existing via the deep-merge.
         if fm.append_under.is_none() {
             hiker.remove("append_under");
-        }
-        // status: trail-draft-review-surface
-        // When fm.draft is false, strip any pre-existing `draft` key so an
-        // accept (false-after-true) clears the flag rather than leaving a
-        // stale `draft: false`. When true the patch's key lands via merge.
-        if !fm.draft {
-            hiker.remove("draft");
         }
     }
     merge_json_into_yaml(&mut existing, patch);
@@ -451,17 +422,6 @@ pub fn dir() -> String {
 /// status: trail-storage-layout
 pub fn dir_prefix() -> String {
     format!("{}/", dir())
-}
-
-/// Vault-relative path of the drafts dir (`.hiker/trails/drafts`). Draft
-/// trail-docs live here as `<id>.md` with their waypoints in the sibling
-/// companion folder `<id>/`; accepting a draft relocates both out to the
-/// configured `new_trail_dir`.
-///
-/// status: trail-storage-layout
-/// status: trail-draft-review-surface
-pub fn drafts_dir() -> String {
-    format!("{}/{DRAFTS_DIRNAME}", dir())
 }
 
 /// Vault-relative path of a trail's waypoints directory: the trail-doc's
@@ -654,13 +614,6 @@ pub struct TrailListItem {
     pub title: String,
     pub waypoint_count: u32,
     pub last_activated_at: Option<String>,
-    /// True when this trail-doc carries `hiker.draft: true` (an
-    /// unaccepted proposal). Only surfaced when the caller passed
-    /// `include_drafts = true`; the default-filtered listing never
-    /// returns draft rows.
-    ///
-    /// status: trail-draft-review-surface
-    pub draft: bool,
 }
 
 /// One waypoint of `get_trail`, post-resolution. The body is the
@@ -708,24 +661,13 @@ pub struct TrailDetail {
 /// frontmatter doesn't carry `hiker.kind: trail` produce a parse error
 /// and are silently skipped — same shape an external editor would see.
 ///
-/// Draft trail-docs (`hiker.draft: true`, parked under
-/// `.hiker/trails/drafts/`) are filtered OUT unless `include_drafts` is
-/// true — they don't pollute the user's dropdown / MCP `trails_list` /
-/// CLI listing until accepted. Passing `include_drafts = true` surfaces
-/// them (each row's `draft` flag distinguishes which are proposals); this
-/// backs the Trails sidebar "Show drafts" toggle and the review surface.
-/// [trail-draft-review-surface]
-///
 /// Pure data-shaping: the same listing drives the UI dropdown,
 /// `mcp-tool-trails-list`, and `cli-trail-list`. Lives in core so the
 /// three surfaces don't fork.
-///
-/// status: trail-draft-review-surface
 pub fn list(
     vault: &Vault,
     store: &Store,
     log: &OpLog,
-    include_drafts: bool,
 ) -> Result<Vec<TrailListItem>, HikerError> {
     let paths = store
         .all_note_paths()
@@ -743,10 +685,6 @@ pub fn list(
             Ok(fm) => fm,
             Err(_) => continue,
         };
-        // status: trail-draft-review-surface
-        if fm.draft && !include_drafts {
-            continue;
-        }
         let mut count: u32 = 0;
         walk_waypoints_depth_first(&fm.waypoints, &mut |_, _, _| {
             count += 1;
@@ -765,7 +703,6 @@ pub fn list(
             },
             waypoint_count: count,
             last_activated_at: fm.last_activated_at,
-            draft: fm.draft,
         });
     }
     Ok(out)
@@ -848,10 +785,8 @@ pub fn containing_note_with_paths(
     // listing once. List-trails is the same data-shaping used by the
     // sidebar dropdown so the two stay consistent (e.g. trail-doc
     // renamed but indexer not yet caught up — both surfaces see the
-    // same view). Drafts are included here so the per-trail idempotency
-    // check ("is this note already a waypoint of THIS trail?") still
-    // matches a draft trail the agent is appending to.
-    let listing = list(vault, store, log, true)?;
+    // same view).
+    let listing = list(vault, store, log)?;
     let mut by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for t in &listing {
         by_id.insert(t.trail_id.as_str(), t.rel_path.as_str());

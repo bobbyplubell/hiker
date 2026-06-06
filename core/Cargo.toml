@@ -39,7 +39,6 @@ ndarray.workspace = true
 single-clustering.workspace = true
 yrs.workspace = true
 bincode.workspace = true
-wasmi.workspace = true
 regex.workspace = true
 
 [dev-dependencies]

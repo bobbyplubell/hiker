@@ -222,20 +222,16 @@ impl Menus<'_> {
             );
         }
         ui.separator();
-        // Reader / focus view (`editor-reader-view`). Per-buffer flip;
-        // hides every chrome region around the editor canvas. Also bound
-        // to `editor.reader-view` (Mod-Shift-R).
-        let mut reader_view = false;
-        if let Some(buffer) = app.session.buffers.get(path) {
-            reader_view = buffer.reader_view;
-        }
+        // Reader / focus mode (`view-reader-mode`). Workbench-level flip;
+        // hides every chrome region around the editor canvas. Also bound to
+        // `view.reader_mode` (Ctrl+R) and the global book button.
+        let mut reader_mode = app.workbench.reader_mode();
         if ui
-            .checkbox(&mut reader_view, "Reader view")
-            .on_hover_text("Hide all chrome and render the editor full-bleed (editor-reader-view)")
+            .checkbox(&mut reader_mode, "Reader mode")
+            .on_hover_text("Hide all chrome and focus the active tab full-window (view-reader-mode)")
             .changed()
-            && let Some(buffer) = app.session.buffers.get_mut(path)
         {
-            buffer.reader_view = reader_view;
+            app.workbench.set_reader_mode(reader_mode);
         }
         if ui
             .checkbox(&mut heading_breadcrumb, "Show heading breadcrumb")

@@ -48,29 +48,68 @@ fn auto_create_writes_defaults() {
 }
 
 #[test]
-fn extract_section_loads() {
-    // status: settings-section-extract
-    // A well-formed [extract] table must load under strict-load (it was
-    // deferred before; it lands now). Defaults fill in omitted keys.
+fn legacy_extract_section_tolerated() {
+    // Web-source acquisition (scrape / crawl / feed) moved to external
+    // producers, so `core` no longer interprets `[extract]`. An old vault TOML
+    // that still carries the table must still load under strict-load — the
+    // legacy table is parsed as an opaque value, not rejected as an unknown
+    // field, and is never written back.
     let toml = r#"schema_version = 1
 [extract]
 auto_globs = ["inbox/", "**/*.pdf"]
 clip_folder = "captures/"
+feed_default_poll = "6h"
 "#;
     let cfg: Config = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.extract.auto_globs, vec!["inbox/".to_string(), "**/*.pdf".to_string()]);
-    assert_eq!(cfg.extract.clip_folder, "captures/");
-    // Omitted keys take their in-code defaults.
-    assert_eq!(cfg.extract.artifact_retention, "latest");
-    assert_eq!(cfg.extract.feed_default_poll, "6h");
-    assert_eq!(cfg.extract.feed_item_retention, "keep:200");
+    assert!(cfg.extract.is_some(), "legacy [extract] table is tolerated");
+    // It's dropped on serialize-back, not round-tripped.
+    let back = toml::to_string_pretty(&cfg).unwrap();
+    assert!(!back.contains("[extract]"), "legacy table is not re-emitted");
 }
 
 #[test]
-fn extract_section_rejects_unknown_key() {
-    let bad = "[extract]\nmystery = true\n";
-    let err = toml::from_str::<Config>(bad).unwrap_err();
-    assert!(err.to_string().contains("mystery"));
+fn write_back_canvas_scroll_mode_validates_allowed_values() {
+    // status: canvas-scroll-mode
+    // `[ui] canvas_scroll_mode` is an enum-as-string (`auto`/`pan`/`zoom`): a
+    // member of the allowed set lands on the typed field, anything else is
+    // rejected by the eligibility path — the `sync.mode` precedent.
+    let dir = tempdir().unwrap();
+    let cfg = Config::set(
+        SettingsScope::Vault,
+        "ui.canvas_scroll_mode",
+        &serde_json::Value::String("zoom".into()),
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(cfg.ui.canvas_scroll_mode, CanvasScrollMode::Zoom);
+
+    let err = Config::set(
+        SettingsScope::Vault,
+        "ui.canvas_scroll_mode",
+        &serde_json::Value::String("spin".into()),
+        dir.path(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("invalid value"));
+}
+
+#[test]
+fn legacy_canvas_scroll_zooms_tolerated_and_adopts_auto() {
+    // status: canvas-scroll-mode
+    // The old bool `[ui] canvas_scroll_zooms` was superseded by the tri-state
+    // `canvas_scroll_mode`. An old vault TOML that still carries the bool must
+    // still load under strict-load (`deny_unknown_fields`) — it's absorbed by an
+    // opaque, ignored field — and the vault adopts the new `auto` default rather
+    // than inheriting the old pan/zoom choice.
+    let toml = r#"schema_version = 1
+[ui]
+canvas_scroll_zooms = true
+"#;
+    let cfg: Config = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.ui.canvas_scroll_mode, CanvasScrollMode::Auto);
+    // The legacy key is dropped on serialize-back, not round-tripped.
+    let back = toml::to_string_pretty(&cfg).unwrap();
+    assert!(!back.contains("canvas_scroll_zooms"), "legacy key is not re-emitted");
 }
 
 #[test]

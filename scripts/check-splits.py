@@ -75,21 +75,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from _rust_roots import RUST_ROOTS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-RUST_ROOTS = [
-    "core/src",
-    "mcp-server/src",
-    "cli/src",
-    "app/src",
-    "editor/editor-core/src",
-    "editor/editor-view/src",
-    "editor/editor-egui/src",
-    "editor/editor-md/src",
-    "editor/editor-diff/src",
-    "editor/editor-ts/src",
-    "egui-workbench/src",
-]
 SKIP_DIRS = ("node_modules", "dist", "target", "tests")
 
 # (1) Function-name suffix smell.
@@ -128,12 +117,28 @@ SIBLING_ONLY_EXEMPT_STEMS = {"mod", "lib", "main", "build", "tests"}
 # (7) Heavy `use super::` reach.
 USE_SUPER_RE = re.compile(r"^\s*use\s+super::")
 USE_SUPER_GROUP_RE = re.compile(r"^\s*use\s+super::\{([^}]+)\}")
+# Opening line of a MULTI-LINE `use super::{` group (rustfmt wraps long
+# import lists across lines); names continue on following lines until `}`.
+# Without handling this, the opener matches only `USE_SUPER_RE` and the
+# whole list counts as a single name — a hole that let 10+ name imports
+# slip under the cap.
+USE_SUPER_GROUP_OPEN_RE = re.compile(r"^\s*use\s+super::\{(.*)$")
 SUPER_REACH_MAX = 5
 
 # (8) Cross-sibling module coupling.
 # When two sibling module directories reference each other heavily,
 # flag the pair. References counted via stem occurrences in source.
 COUPLING_MIN_REFS_EACH_WAY = 4
+
+# (9) Re-export farm on a mid-tree `mod.rs`. A non-root `mod.rs` that re-exports
+# many sibling paths via `pub use <child>::…` flattens sharded children into one
+# namespace (the `pub use` length-dodge facade). A crate-root `lib.rs` doing this
+# is the crate's legitimate public surface, so only `mod.rs` is checked. Imports
+# from `crate::`/`super::`/`self::` are not child re-exports and don't count.
+REEXPORT_FARM_MAX = 12
+PUB_USE_REEXPORT_RE = re.compile(
+    r"^\s*pub(?:\([^)]+\))?\s+use\s+(?!crate::|super::|self::)\w+::"
+)
 
 # Impl-split exemption (see module docstring). A module-level item
 # definition disqualifies a file from the pure-`impl` exemption; a
@@ -239,11 +244,59 @@ def is_pure_impl_split(stripped_text: str) -> bool:
     return has_impl
 
 
+def is_test_rel(rel: str) -> bool:
+    """A dedicated test file (the parent includes it via `#[cfg(test)] mod
+    tests;`). Test code legitimately imports many parent items (super-reach)
+    and uses descriptive helper names (`key_a`, `..._to_c`), so it is exempt
+    from the function-name-suffix and super-reach checks."""
+    base = os.path.basename(rel)
+    return base == "tests.rs" or base.endswith("_test.rs") or base.endswith(
+        "_tests.rs"
+    )
+
+
+def blank_cfg_test_modules(text: str) -> str:
+    """Return `text` with inline `#[cfg(test)] mod … { … }` blocks blanked
+    out (lines replaced by empty strings so line numbers stay aligned for
+    reporting). Inline test modules get the same exemption as dedicated test
+    files. Brace-counted and coarse (ignores braces inside strings/comments)
+    — consistent with this file's heuristic posture."""
+    lines = text.splitlines()
+    out = list(lines)
+    i = 0
+    n = len(lines)
+    while i < n:
+        if lines[i].strip().startswith("#[cfg(test)]"):
+            j = i
+            limit = min(i + 4, n)
+            while j < limit and "{" not in lines[j]:
+                j += 1
+            if j < n and "{" in lines[j] and re.search(
+                r"\bmod\s+\w+", " ".join(lines[i : j + 1])
+            ):
+                for a in range(i, j):
+                    out[a] = ""
+                depth = 0
+                k = j
+                while k < n:
+                    depth += lines[k].count("{") - lines[k].count("}")
+                    out[k] = ""
+                    if depth <= 0:
+                        break
+                    k += 1
+                i = k + 1
+                continue
+        i += 1
+    return "\n".join(out)
+
+
 # ----- individual checks ----------------------------------------------
 
 
 def check_fn_suffix(rel: str, text: str, failures: list[str]) -> None:
-    for i, line in enumerate(text.splitlines(), start=1):
+    if is_test_rel(rel):
+        return
+    for i, line in enumerate(blank_cfg_test_modules(text).splitlines(), start=1):
         m = FN_SUFFIX_RE.match(line)
         if m:
             failures.append(
@@ -313,21 +366,65 @@ def check_min_size(path: Path, rel: str, text: str, failures: list[str]) -> None
         )
 
 
+def _count_super_names(group_body: str) -> int:
+    """Count comma-separated names in a `use super::{...}` group body.
+    Newlines (from a wrapped multi-line group) strip out per token. A
+    nested `a::{b, c}` group's inner commas are counted as separate names,
+    which only over-counts (stricter) in the rare nested case — acceptable
+    for a heuristic reach check."""
+    return sum(1 for tok in group_body.split(",") if tok.strip())
+
+
+def check_reexport_farm(path: Path, rel: str, text: str, failures: list[str]) -> None:
+    if path.name != "mod.rs":
+        return
+    count = sum(1 for line in text.splitlines() if PUB_USE_REEXPORT_RE.match(line))
+    if count >= REEXPORT_FARM_MAX:
+        failures.append(
+            f"  {rel}: {count} `pub use <child>::…` re-exports in a mid-tree "
+            f"mod.rs (max {REEXPORT_FARM_MAX - 1}); a re-export farm flattens "
+            f"sharded children into one namespace — expose the API on the "
+            f"children or justify the facade"
+        )
+
+
 def check_super_reach(path: Path, rel: str, text: str, failures: list[str]) -> None:
     if path.name in MOD_ROOTS:
         return
+    # Test code legitimately imports its parent's items — exempt.
+    if is_test_rel(rel):
+        return
+    text = blank_cfg_test_modules(text)
     # Legitimate impl-split (pure `impl ParentType`, no own defs) inherently
     # reaches into the parent's layers — exempt (see module docstring).
     if is_pure_impl_split(strip_strings_and_comments(text)):
         return
     count = 0
-    for line in text.splitlines():
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Single-line grouped import: `use super::{a, b, c};`
         m = USE_SUPER_GROUP_RE.match(line)
         if m:
-            count += sum(1 for tok in m.group(1).split(",") if tok.strip())
+            count += _count_super_names(m.group(1))
+            i += 1
             continue
+        # Multi-line grouped import: `use super::{` with names on the
+        # following lines until the closing `}`.
+        mo = USE_SUPER_GROUP_OPEN_RE.match(line)
+        if mo:
+            body = mo.group(1)
+            while "}" not in body and i + 1 < len(lines):
+                i += 1
+                body += "\n" + lines[i]
+            count += _count_super_names(body.split("}", 1)[0])
+            i += 1
+            continue
+        # Bare path import: `use super::module::Item;` — one name.
         if USE_SUPER_RE.match(line):
             count += 1
+        i += 1
     if count >= SUPER_REACH_MAX:
         failures.append(
             f"  {rel}: pulls {count} names from `super` (max "
@@ -336,22 +433,16 @@ def check_super_reach(path: Path, rel: str, text: str, failures: list[str]) -> N
         )
 
 
-def _externally_exposed(parent_root_src: str, stem: str) -> bool:
-    """Does the parent `mod.rs` / `lib.rs` expose this file's
-    contents past the module boundary? True if any of:
-      - `pub mod <stem>`
-      - `pub use <stem>::...`
-      - `pub use <stem>;`
-      - `pub(crate) use <stem>::...` (crate-wide visibility is still external to the module)
+def _exposed_as_submodule(parent_root_src: str, stem: str) -> bool:
+    """Does the parent declare `pub mod <stem>`? That is an HONEST submodule
+    boundary — the `stem::` path survives, so a reader can see the file was
+    split out as its own module. Contrast `pub use <stem>::…`, which ERASES
+    that path and glues the file's items into the parent's flat namespace —
+    the classic length-dodge. So a bare `pub use` re-export no longer exempts
+    a file from the sibling-only check (it must have a real external consumer,
+    checked separately); only `pub mod` does.
     """
-    patterns = [
-        rf"\bpub\s+mod\s+{re.escape(stem)}\b",
-        rf"\bpub(?:\([^)]+\))?\s+use\s+{re.escape(stem)}\b",
-    ]
-    for pat in patterns:
-        if re.search(pat, parent_root_src):
-            return True
-    return False
+    return bool(re.search(rf"\bpub\s+mod\s+{re.escape(stem)}\b", parent_root_src))
 
 
 def _items_referenced_externally(
@@ -427,7 +518,9 @@ def check_sibling_only_files(
                 break
         if parent_root is None:
             continue
-        if _externally_exposed(stripped[parent_root], stem):
+        # `pub mod stem` = honest submodule boundary, exempt. A bare `pub use`
+        # re-export does NOT launder a shard (see `_exposed_as_submodule`).
+        if _exposed_as_submodule(stripped[parent_root], stem):
             continue
         if _items_referenced_externally(f, stripped, stripped[f]):
             continue
@@ -523,6 +616,7 @@ def main() -> int:
         check_pub_density(f, rel, text, failures)
         check_min_size(f, rel, text, failures)
         check_super_reach(f, rel, text, failures)
+        check_reexport_farm(f, rel, text, failures)
 
     check_sibling_only_files(all_files, stripped, failures)
     check_cross_sibling_coupling(all_files, stripped, failures)

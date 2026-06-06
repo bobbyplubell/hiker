@@ -4,24 +4,28 @@
 //! default vault, opens it, and launches the eframe loop.
 
 mod actions;
+mod activity;
+mod appears_in;
 mod autocomplete;
 mod backlinks;
 mod buffer;
 mod buffer_view;
 mod bootstrap;
+mod canvas_activity;
 mod chat;
 mod clusters;
 mod command_center;
 mod completion_sources;
+mod context;
 mod editor_pane;
-mod extract;
-mod feature;
 mod files;
 mod icons;
+mod item_menu;
 mod keybinds;
 // Old `palette.rs` was replaced by `panels::command_palette` per the
 // `command-palette` spec; the new module re-exports `command_palette`
 // on `AppState`, so the call site in `update()` is unchanged.
+mod os_open;
 mod panels;
 mod profiling;
 mod related;
@@ -100,6 +104,13 @@ fn main() -> eframe::Result<()> {
             .and_then(|v| v.get("custom_titlebar").and_then(serde_json::Value::as_bool))
             .unwrap_or(false);
     state.ui.custom_titlebar = custom_titlebar;
+    // Reader-mode chrome preferences. [view-reader-hide-top-bar,
+    // view-reader-hide-tabs, view-reader-hide-toolbar]
+    if let Ok(cfg) = state.vault_session.config.read() {
+        state.ui.reader_hide_top_bar = cfg.ui.reader_hide_top_bar;
+        state.ui.reader_hide_tabs = cfg.ui.reader_hide_tabs;
+        state.ui.reader_hide_toolbar = cfg.ui.reader_hide_toolbar;
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("hiker")
@@ -322,6 +333,7 @@ impl eframe::App for HikerApp {
             self.state.drain_sync_events();
             self.state.drain_fork_diff_results();
             self.state.reconcile_sync();
+            self.state.notify_sync_attention();
             self.state.drain_mutation_events();
         }
 
@@ -347,76 +359,58 @@ impl eframe::App for HikerApp {
         // repaint cadence.)
         ctx.request_repaint_after(std::time::Duration::from_millis(750));
 
-        // Reader / focus view (`editor-reader-view`): the active buffer
-        // wants distraction-free chrome. Hide the top toolbar, the
-        // workbench's side bars + activity bar + status bar, and the
-        // command center. Reader view is a per-buffer flag — switching
-        // tabs picks up the new tab's state on the next frame. Non-buffer
-        // tab kinds report `reader_view = false` here, so they ignore it.
-        let reader_view_active = crate::state::active_buffer_reader_view(&self.state);
+        // Reader / focus mode (`view-reader-mode`): a workbench-level focus
+        // mode that hides all chrome except the global top bar, so the
+        // active tab fills the window. The workbench flag is the single
+        // source of truth — it gates the side bars + activity bar + status
+        // bar + panel area at render time (see `Workbench::ui`). Here we
+        // only handle the top-bar chrome the host owns.
+        let reader_view_active = self.state.workbench.reader_mode();
+        // When reader mode also hides the top bar (`view-reader-hide-top-bar`,
+        // the `ui.reader_hide_top_bar` setting): drop the titlebar / top
+        // toolbar entirely. In frameless mode this removes the only window
+        // controls, so resize handles are kept below and Ctrl+R is the exit.
+        let hide_top_bar = reader_view_active && self.state.ui.reader_hide_top_bar;
 
         // Frameless mode (default): the merged custom titlebar claims the
         // top strip and hosts the centered command center; edge/corner
         // grips provide window resize (no OS border). When off, the
         // command center is inlined into the top toolbar instead (below).
-        // Suppressed in reader view. [frameless-merged-titlebar]
+        // In reader mode the command center is suppressed; when also hiding
+        // the top bar, only the resize grips remain. [frameless-merged-titlebar]
         if self.state.ui.custom_titlebar {
-            self.state.titlebar(ctx, !reader_view_active);
+            if !hide_top_bar {
+                self.state.titlebar(ctx, !reader_view_active);
+            }
             crate::titlebar::window_resize_handles(ctx);
         }
 
         // Toolbar: kept above the workbench for now. The plan is to
         // migrate its items into `HikerWbBehavior::status_bar_ui` /
         // activity-bar context menus, but that's a per-action port —
-        // tracked separately.
-        if !reader_view_active {
+        // tracked separately. In reader mode the secondary toolbars are
+        // skipped; the native top toolbar stays (the global top bar) unless
+        // the top bar is also hidden.
+        {
             crate::profile_scope!("toolbar");
             if self.state.ui.custom_titlebar {
                 // Frameless: the first top toolbar + command center are
                 // folded into the titlebar (rendered above). Only the
-                // secondary (bottom/left/right) toolbars render here.
-                self.state.render_secondary_toolbars(ctx);
-            } else {
+                // secondary (bottom/left/right) toolbars render here, and
+                // they are skipped in reader mode.
+                if !reader_view_active {
+                    self.state.render_secondary_toolbars(ctx);
+                }
+            } else if !hide_top_bar {
                 // Native chrome: inline the command center into the first
-                // top toolbar; fall back to a dedicated bar when there's
-                // no top toolbar to share. [command-center-topbar]
-                let placed = self.state.render_toolbars(ctx, true);
-                if !placed {
+                // top toolbar (suppressed in reader mode); fall back to a
+                // dedicated bar when there's no top toolbar to share.
+                // [command-center-topbar]
+                let placed = self.state.render_toolbars(ctx, !reader_view_active);
+                if !placed && !reader_view_active {
                     self.state.command_center_bar(ctx);
                 }
             }
-        }
-
-        // Flip workbench chrome visibility for reader view. Only the
-        // per-frame *transition* matters — we drive the hide / show
-        // edges off the previous frame's value so toggling reader view
-        // off restores the chrome without trampling the user's
-        // independent collapse choices on the next frame.
-        if reader_view_active && !self.state.ui.reader_view_chrome_hidden {
-            self.state.ui.reader_view_chrome_hidden = true;
-            self.state.ui.reader_view_prev_primary_visible =
-                self.state.workbench.primary_side_bar.visible;
-            self.state.ui.reader_view_prev_secondary_visible =
-                self.state.workbench.secondary_side_bar.visible;
-            self.state.ui.reader_view_prev_status_visible =
-                self.state.workbench.status_bar.visible;
-            self.state.ui.reader_view_prev_activity_visible =
-                self.state.workbench.activity_bar.is_visible();
-            self.state.workbench.primary_side_bar.visible = false;
-            self.state.workbench.secondary_side_bar.visible = false;
-            self.state.workbench.status_bar.visible = false;
-            self.state.workbench.activity_bar.set_visible(false);
-        } else if !reader_view_active && self.state.ui.reader_view_chrome_hidden {
-            self.state.ui.reader_view_chrome_hidden = false;
-            self.state.workbench.primary_side_bar.visible =
-                self.state.ui.reader_view_prev_primary_visible;
-            self.state.workbench.secondary_side_bar.visible =
-                self.state.ui.reader_view_prev_secondary_visible;
-            self.state.workbench.status_bar.visible =
-                self.state.ui.reader_view_prev_status_visible;
-            self.state.workbench.activity_bar.set_visible(
-                self.state.ui.reader_view_prev_activity_visible,
-            );
         }
 
         // Central layout: egui_workbench owns the activity bar + side
@@ -424,6 +418,11 @@ impl eframe::App for HikerApp {
         {
             crate::profile_scope!("workbench");
             let _g = crate::profiling::FrameProf::guard("workbench");
+            // Reader mode optionally hides the tab strip (`view-reader-hide-tabs`):
+            // a render-time gate on the workbench, shown by default.
+            self.state
+                .workbench
+                .set_hide_tab_strip(reader_view_active && self.state.ui.reader_hide_tabs);
             self.state.sync_workbench_tabs();
             // Snapshot the workbench's active tab AFTER `sync_tabs`
             // pushed `session.active_tab` into the strip. Comparing
@@ -464,6 +463,32 @@ impl eframe::App for HikerApp {
                 let tab_id = tab.id;
                 crate::state::activate_tab(&mut self.state, tab_id);
             }
+        }
+
+        // Rich-row hover-expand previews: drawn AFTER the workbench (which renders
+        // the sidebars), in non-interactable `Order::Tooltip` `Area`s so they never
+        // occlude the row hitboxes that registered them
+        // (`preview-hover-expand-side-anchor`). No-ops when no row is hovered. Both
+        // are gated by `[ui].hover_previews_enabled` (the eye-menu toggle,
+        // `preview-toggle`) — off suppresses the popups (any inline thumbnails
+        // stay). Registration still runs cheaply; only the draw is gated.
+        let hover_previews = self
+            .state
+            .vault_session
+            .config
+            .read()
+            .map(|c| c.ui.hover_previews_enabled)
+            .unwrap_or(true);
+        if hover_previews {
+            // Canvas live-paint / cluster-tree cached-image expand.
+            crate::widgets::preview::render_expanded_preview(
+                ctx,
+                &self.state.vault_session.vault_root,
+            );
+            // Note rows: a read-only live-preview markdown render (with diagrams)
+            // of the hovered note. Runs at the frame-loop level because rendering a
+            // note needs `&mut AppState` (diagram cache, buffers, title resolver).
+            crate::widgets::preview::render_note_preview(ctx, &mut self.state);
         }
 
         // Command palette overlay (Ctrl+K). Renders after panels so the
@@ -553,7 +578,6 @@ fn drain_fs_events(&mut self) {
             FileEvent::Created { path } | FileEvent::Modified { path } => {
                 state.invalidate_for_path(path);
                 state.maybe_reload_clean_buffer(path);
-                state.maybe_auto_extract(path);
             }
             FileEvent::Deleted { path } => {
                 state.invalidate_for_path(path);
@@ -574,31 +598,6 @@ fn drain_fs_events(&mut self) {
 fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     self.file_tree_state.dir_cache.remove(parent);
-}
-
-/// Auto-extract a watcher-seen non-md source if it sits under an
-/// `[extract].auto_globs` folder. Indexable paths (`.md` / `.txt`) ride the
-/// ordinary ingest path and are skipped here; non-md elsewhere stays ignored
-/// until an explicit "Make searchable". The startup-scan counterpart is the
-/// indexer's initial pass — auto-globbed sources present at open are picked
-/// up the same way the next time they change; an initial bulk pass is a
-/// follow-up. See docs/extract.md `extract-trigger-auto-glob`.
-//
-// status: extract-trigger-auto-glob
-fn maybe_auto_extract(&mut self, path: &str) {
-    if hiker_core::indexer::is_indexable_path(path) {
-        return;
-    }
-    let auto = self
-        .vault_session
-        .config
-        .read()
-        .map(|c| c.extract.auto_globs.clone())
-        .unwrap_or_default();
-    if auto.is_empty() || !hiker_extract::trigger::matches_any_glob(path, &auto) {
-        return;
-    }
-    crate::extract::make_searchable(self, path);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`
@@ -851,6 +850,10 @@ fn drain_indexer_events(&mut self) {
     if drained.is_empty() {
         return;
     }
+    // Indexing activity may have changed which notes carry the cluster-preset
+    // frontmatter (a saved/imported/edited preset note); drop the cached preset
+    // list so the Clusters `+` dropdown re-queries. status: cluster-preset
+    state.clusters_state.preset_cache = None;
     for line in drained {
         state.vault_session.events.indexer_events.push_back(line);
     }
@@ -977,6 +980,86 @@ fn reconcile_sync(&mut self) {
     }
 }
 
+/// Proactively surface sync attention beyond the Sync page: fire a toast the
+/// FIRST time a doc newly blocks, a per-doc/per-peer error newly appears, or a
+/// content-key change is newly held. Diffs the live engine snapshot against
+/// `sync_attention_seen` so a steady-state round (the same items still
+/// present) is silent — only a NEW item speaks, never every no-op round. The
+/// Sync page + tab badge carry the standing state; this is the one-shot nudge
+/// so the user knows without opening Sync. Cheap (a std-mutex snapshot read +
+/// set diffs); no node lock. status: sync-attention-badge
+fn notify_sync_attention(&mut self) {
+    let state = self;
+    let Some(service) = state.vault_session.services.sync.clone() else {
+        // Sync off / torn down: forget what we'd seen so a re-enable starts
+        // clean (and an old block doesn't re-toast on reconnect).
+        state.sync_attention_seen = crate::state::SyncAttentionSeen::default();
+        return;
+    };
+    let snap = service.state_snapshot();
+    let seen = &mut state.sync_attention_seen;
+
+    // Newly blocked docs (forks) — point the user at the Sync page to resolve.
+    let mut new_blocks = Vec::new();
+    for doc in &snap.blocked {
+        if seen.blocked_paths.insert(doc.path.clone()) {
+            new_blocks.push(doc.path.clone());
+        }
+    }
+    // Drop entries that resolved so a future re-fork on the same path re-toasts.
+    let live_blocked: std::collections::HashSet<String> =
+        snap.blocked.iter().map(|d| d.path.clone()).collect();
+    seen.blocked_paths.retain(|p| live_blocked.contains(p));
+
+    // Newly errored items (per-doc/per-peer skips from the last round).
+    let report_errored = snap
+        .last_report
+        .as_ref()
+        .map(|r| r.errored.clone())
+        .unwrap_or_default();
+    let mut new_errors = Vec::new();
+    for pair in &report_errored {
+        if seen.errored.insert(pair.clone()) {
+            new_errors.push(pair.clone());
+        }
+    }
+    let live_errored: std::collections::HashSet<(String, String)> =
+        report_errored.iter().cloned().collect();
+    seen.errored.retain(|e| live_errored.contains(e));
+
+    // A newly held content-key change (established key differs from a peer's).
+    let new_key_change = match (&snap.pending_content_key_change, &seen.pending_key_peer) {
+        (Some(peer), prev) if prev.as_deref() != Some(peer.as_str()) => Some(peer.clone()),
+        _ => None,
+    };
+    seen.pending_key_peer = snap.pending_content_key_change.clone();
+
+    // Fire at most one toast per kind per frame; the standing state lives on the
+    // Sync page + tab badge.
+    if !new_blocks.is_empty() {
+        let msg = if new_blocks.len() == 1 {
+            format!("Sync conflict: \"{}\" forked — open Sync to resolve", new_blocks[0])
+        } else {
+            format!("{} sync conflicts — open Sync to resolve", new_blocks.len())
+        };
+        state.push_toast(msg, crate::state::ToastLevel::Warn);
+    }
+    if !new_errors.is_empty() {
+        let msg = if new_errors.len() == 1 {
+            format!("Sync skipped an item: {} — {}", new_errors[0].0, new_errors[0].1)
+        } else {
+            format!("Sync skipped {} items — see Sync page", new_errors.len())
+        };
+        state.push_toast(msg, crate::state::ToastLevel::Error);
+    }
+    if let Some(peer) = new_key_change {
+        state.push_toast(
+            format!("Sync: peer {peer} uses a different content key — open Sync to confirm"),
+            crate::state::ToastLevel::Warn,
+        );
+    }
+}
+
 /// Drain note-mutation outcomes posted by the wand-menu awaiter. Applied
 /// outcomes replace the buffer body in-place (provided the source hash
 /// still matches what we submitted with). Failed/Cancelled outcomes just
@@ -1081,13 +1164,6 @@ fn autosave_tick(&mut self) {
 
     state.persist_tab_state(&autosave);
 
-    if let Err(err) = bootstrap::save_trails(
-        &state.vault_session.vault_root,
-        &state.trails_state.trails,
-    ) {
-        tracing::debug!(error = %err, "trails persist failed");
-    }
-
     // Primary side-panel accordion: writes only when the arrangement
     // changed since the last tick (no dirty flag — it mutates inside
     // egui_workbench). [feature-multi-region-sidebar]
@@ -1125,16 +1201,24 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
         open_paths.push(key.clone());
         open_tab_kinds.insert(key, kind_str);
     }
+    // Persist the active/preview tab by their `persist_key` — the SAME key form
+    // stored in `open_paths` — so restore matches them for every tab kind. Using
+    // the raw `buffer_path` here only matched plain note tabs: a Canvas/Board key
+    // is prefixed (`canvas:`/`board:`) and singleton page tabs (Home, Graph, …)
+    // have no buffer path at all, so a non-note active tab was silently dropped
+    // and restore fell back to the first tab.
     let active_path = state
         .session
         .active_tab
         .and_then(|id| state.tab_by_id(id))
-        .and_then(|t| t.buffer_path().map(str::to_string));
+        .and_then(crate::tab::Tab::persist_key)
+        .map(|(key, _)| key);
     let preview_path = state
         .session
         .preview_tab
         .and_then(|id| state.tab_by_id(id))
-        .and_then(|t| t.buffer_path().map(str::to_string));
+        .and_then(crate::tab::Tab::persist_key)
+        .map(|(key, _)| key);
 
     let snapshot = hiker_core::autosave::TabState {
         open_paths,

@@ -46,7 +46,7 @@ pub const fn known_keybindings(self) -> &'static [KnownKeybind] {
     &[
         KnownKeybind { id: "editor.save",         chord: "Mod-S",          label: "Save the active buffer" },
         KnownKeybind { id: "editor.find",         chord: "Mod-F",          label: "Find in note" },
-        KnownKeybind { id: "editor.reader_view",  chord: "Mod-Shift-R",    label: "Toggle reader / focus view" },
+        KnownKeybind { id: "editor.reader_view",  chord: "Mod-R",          label: "Toggle reader / focus view" },
         KnownKeybind { id: "file.new_note",       chord: "Mod-N",          label: "New note (on the active canvas, or a new tab)" },
         KnownKeybind { id: "file.close_tab",      chord: "Mod-W",          label: "Close the active tab" },
         KnownKeybind { id: "vault.open_settings", chord: "Mod-,",          label: "Open Settings" },
@@ -88,7 +88,7 @@ mod keybinds_tests {
             assert!(k.id.contains('.'), "action id {} should be area.verb", k.id);
         }
         let chords: Vec<&str> = list.iter().map(|k| k.chord).collect();
-        for required in &["Mod-S", "Mod-W", "Ctrl-Tab", "F1 or ?", "Mod-F", "Mod-Shift-R", "Mod-Shift-P"] {
+        for required in &["Mod-S", "Mod-W", "Ctrl-Tab", "F1 or ?", "Mod-F", "Mod-R", "Mod-Shift-P"] {
             assert!(
                 chords.contains(required),
                 "known_keybindings missing {required}; got {chords:?}",
@@ -203,13 +203,11 @@ pub fn handle_keybinds(&mut self, ctx: &egui::Context) {
         }
     }
 
-    // Mod-Shift-R: toggle reader / focus view on the active buffer.
-    if ctx.input_mut(|i| i.consume_key(shift_cmd, egui::Key::R)) {
-        if let Some(path) = active_buffer_path(state) {
-            if let Some(b) = state.session.buffers.get_mut(&path) {
-                b.reader_view = !b.reader_view;
-            }
-        }
+    // Mod-R: toggle reader / focus mode. Consumed so the key never reaches
+    // the editor, then routed through the action registry — the workbench
+    // flag is the single source of truth (`view.reader_mode`).
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::R)) {
+        crate::actions::dispatch(state, "view.reader_mode");
     }
 
     // Ctrl-K / Mod-Shift-P: open the command palette. The palette is

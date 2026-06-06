@@ -12,14 +12,14 @@
 //!   unknown fields (they round-trip untouched).
 //! - [`color`] — the [`color::Color`] enum (preset slot or hex literal) with
 //!   bare-string serde.
-//! - [`canonical`] — deterministic, tab-indented, idempotent serialization via
-//!   [`model::Canvas::to_canonical_json`], so a single node edit is a localized
-//!   text diff.
 //! - [`geometry`] — egui-free [`geometry::Point`] / [`geometry::Rect`], node
 //!   bounds, z-ordered hit testing, content bounds, and edge anchors.
 //! - [`ops`] — pure, invertible [`ops::EditOp`] verbs for a future undo stack.
+//!
+//! Deterministic, tab-indented, idempotent serialization lives on the model as
+//! [`model::Canvas::to_canonical_json`], so a single node edit is a localized
+//! text diff rather than a whole-file rewrite.
 
-pub mod canonical;
 pub mod color;
 pub mod geometry;
 pub mod model;

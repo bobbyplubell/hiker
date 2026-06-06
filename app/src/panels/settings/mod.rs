@@ -152,6 +152,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                 ctx.llm_section();
                 ctx.mcp_section();
                 ctx.editor_section();
+                ctx.render_section();
                 ctx.search_section();
                 ctx.tasks_section();
                 ctx.acp_section();
@@ -231,6 +232,47 @@ fn window_section(&mut self) {
                     "Custom titlebar setting saved (restart to apply)",
                     ToastLevel::Info,
                 );
+            }
+            // Reader-mode chrome toggles. Unlike the custom titlebar these
+            // take effect on the next frame — no restart needed.
+            let mut hide = app.ui.reader_hide_top_bar;
+            if ui
+                .checkbox(&mut hide, "Hide top bar in reader mode")
+                .changed()
+            {
+                app.ui.reader_hide_top_bar = hide;
+                commit(app, Scope::Vault, "ui.reader_hide_top_bar", &serde_json::json!(hide));
+            }
+            let mut hide_tabs = app.ui.reader_hide_tabs;
+            if ui.checkbox(&mut hide_tabs, "Hide tabs in reader mode").changed() {
+                app.ui.reader_hide_tabs = hide_tabs;
+                commit(app, Scope::Vault, "ui.reader_hide_tabs", &serde_json::json!(hide_tabs));
+            }
+            let mut hide_toolbar = app.ui.reader_hide_toolbar;
+            if ui.checkbox(&mut hide_toolbar, "Hide toolbar in reader mode").changed() {
+                app.ui.reader_hide_toolbar = hide_toolbar;
+                commit(app, Scope::Vault, "ui.reader_hide_toolbar", &serde_json::json!(hide_toolbar));
+            }
+            ui.separator();
+            // Input / navigation. Read live config (no `app.ui` mirror — the
+            // canvas widget + swipe handler read `[ui]` config directly).
+            // Canvas scroll behavior: Auto (mouse zooms, touchpad pans) / Pan /
+            // Zoom. Shares the canvas gear menu's selector. [canvas-scroll-mode]
+            ui.horizontal(|ui| {
+                ui.label("Canvas scroll:");
+                crate::panels::canvas::render::canvas_scroll_mode_selector(ui, app);
+            });
+            let mut swipe = app
+                .vault_session
+                .config
+                .read()
+                .map(|c| c.ui.swipe_nav_enabled)
+                .unwrap_or(true);
+            if ui
+                .checkbox(&mut swipe, "Two-finger horizontal swipe navigates Back/Forward")
+                .changed()
+            {
+                commit(app, Scope::Vault, "ui.swipe_nav_enabled", &serde_json::json!(swipe));
             }
         });
 }
@@ -496,6 +538,42 @@ fn editor_section(&mut self) {
             string_row(ui, app, st, "Double-click pattern", "editor.double_click_pattern", &e.double_click_pattern);
             string_row(ui, app, st, "Triple-click pattern", "editor.triple_click_pattern", &e.triple_click_pattern);
             help(ui, r#"Defaults: "\w+" (Unicode word, so foo-bar splits at "-") and ".*\n?" (whole line incl. newline). Try "[\w-]+" to select hyphenated words whole, or "\S+" for runs of non-whitespace. Empty resets to default; an invalid regex falls back to default. Takes effect on the next click in any open buffer."#);
+        });
+}
+
+// status: settings-section-render
+fn render_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
+    if matches!(st.scope, Scope::User) {
+        // `[render]` is vault-scope (the cache lives in the vault). Show a hint
+        // instead of the form, mirroring the editor / sync sections.
+        egui::CollapsingHeader::new("Rendering")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Rendering settings live in vault scope.")
+                        .color(theme::muted())
+                        .small(),
+                );
+            });
+        return;
+    }
+    egui::CollapsingHeader::new("Rendering")
+        .default_open(false)
+        .show(ui, |ui| {
+            // status: render-cache-diagrams-toggle
+            bool_row(
+                ui,
+                app,
+                st,
+                "Cache rendered diagrams to disk",
+                "render.cache_diagrams",
+                snap.render.cache_diagrams,
+            );
+            help(
+                ui,
+                "Persists rasterized math / Mermaid / WaveDrom widgets under .hiker/diagram-cache so reopening a note skips re-rendering. Off uses in-memory caching only. Takes effect immediately.",
+            );
         });
 }
 

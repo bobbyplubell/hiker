@@ -163,6 +163,134 @@ async fn enroll_promotes_already_seen_peer_for_next_round() {
     );
 }
 
+/// A partial-success round — one peer converges, another is unreachable — must
+/// NOT discard the failing peer's error: the folded report carries it in
+/// `errored` (alongside the good docs) rather than swallowing it.
+/// Regression for `bug-sync-partial-failure-swallowed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_round_failure_is_recorded_not_swallowed() {
+    use hiker_sync::config::Settings;
+    use hiker_sync::crypto::{ContentKey, SharedContentKey};
+
+    let content_key = ContentKey::generate();
+
+    // Good peer A: source of truth with one doc, running its responder loop.
+    let dir_a = tempfile::tempdir().unwrap();
+    let oplog_a = Arc::new(hiker_core::oplog::OpLog::open(dir_a.path()).unwrap());
+    let doc_path = "notes/partial.md";
+    oplog_a
+        .create_document(doc_path, "note", "alpha\n", &hiker_core::oplog::shapes::Author::User)
+        .unwrap();
+
+    let kp_a = DeviceKeypair::generate();
+    let kp_b = DeviceKeypair::generate();
+    let fp_a = kp_a.fingerprint();
+    let fp_b = kp_b.fingerprint();
+
+    let mut node_a = SyncNode::new(
+        Arc::clone(&oplog_a),
+        SharedContentKey::new(ContentKey::from_bytes(*content_key.as_bytes())),
+        kp_a,
+        Settings::default(),
+        EnrolledPeers::new(),
+    );
+    node_a.enroll_peer(fp_b).unwrap();
+    let bound = node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = tokio::spawn(async move {
+        let _ = node_a.run(Duration::from_secs(15)).await;
+    });
+
+    // B knows TWO enrolled peers: the live A, and a dead address nothing
+    // listens on. A fresh fingerprint is enrolled + seeded for the dead addr so
+    // it's a real round target whose dial fails (transport-level).
+    let dir_b = tempfile::tempdir().unwrap();
+    let oplog_b = Arc::new(hiker_core::oplog::OpLog::open(dir_b.path()).unwrap());
+    let node_b_inner = SyncNode::new(
+        Arc::clone(&oplog_b),
+        SharedContentKey::new(ContentKey::from_bytes(*content_key.as_bytes())),
+        kp_b,
+        Settings::default(),
+        EnrolledPeers::new(),
+    );
+    node_b_inner.enroll_peer(fp_a.clone()).unwrap();
+    node_b_inner.record_discovered_for_test(&fp_a, &bound);
+    let fp_dead = DeviceKeypair::generate().fingerprint();
+    node_b_inner.enroll_peer(fp_dead.clone()).unwrap();
+    node_b_inner.record_discovered_for_test(&fp_dead, "/ip4/127.0.0.1/tcp/1");
+    let node_b = Arc::new(tokio::sync::Mutex::new(node_b_inner));
+
+    let report = SyncService::run_sync_round(
+        &node_b,
+        RoundTargets { uses_server: false, server_url: String::new() },
+    )
+    .await
+    .expect("partial success → Ok, not Err")
+    .expect("round ran (peers known)");
+
+    // The good peer's doc converged.
+    assert_eq!(report.converged.len(), 1, "good peer converged: {report:?}");
+    // The dead peer's failure survived into the report instead of being dropped.
+    assert!(
+        !report.errored.is_empty(),
+        "the unreachable peer's error is recorded, not swallowed: {report:?}"
+    );
+
+    server.abort();
+}
+
+/// The config-sanity warning fires for the unreachable combo (enabled + peer
+/// mode + discovery off + no server) and stays quiet when there's a path to a
+/// peer (discovery on, or a server set, or sync disabled).
+/// Regression / coverage for `sync-config-sanity-warning`.
+#[test]
+fn config_unreachable_warning_fires_only_when_no_path_to_peer() {
+    use hiker_sync::config::{Settings, SyncMode};
+
+    // Enabled, peer mode, discovery OFF, no server → unreachable → warn.
+    let unreachable = Settings {
+        enabled: true,
+        mode: SyncMode::Peer,
+        discovery: false,
+        server_url: String::new(),
+        ..Settings::default()
+    };
+    assert!(
+        config_unreachable_warning(&unreachable).is_some(),
+        "peer mode + discovery off + no server must warn"
+    );
+
+    // Discovery ON → has a path → quiet.
+    assert!(
+        config_unreachable_warning(&Settings {
+            discovery: true,
+            ..unreachable.clone()
+        })
+        .is_none(),
+        "discovery on → no warning"
+    );
+
+    // A server URL set (server/both mode) → has a path → quiet.
+    assert!(
+        config_unreachable_warning(&Settings {
+            mode: SyncMode::Both,
+            server_url: "/dns4/hub.example/tcp/4001".to_string(),
+            ..unreachable.clone()
+        })
+        .is_none(),
+        "server configured → no warning"
+    );
+
+    // Sync disabled → never warns.
+    assert!(
+        config_unreachable_warning(&Settings {
+            enabled: false,
+            ..unreachable
+        })
+        .is_none(),
+        "disabled → no warning"
+    );
+}
+
 #[test]
 fn key_store_round_trips_device_and_content() {
     let tmp = tempfile::tempdir().unwrap();
@@ -190,12 +318,20 @@ fn store_content_overwrites_persisted_key() {
     let tmp = tempfile::tempdir().unwrap();
     let store = KeyStore::at(tmp.path().join("ks"));
     let _generated = store.load_or_generate_content().unwrap();
+    // A freshly generated key is NOT established.
+    assert!(!store.content_established(), "generated key starts non-established");
 
     let imported = ContentKey::from_bytes([3u8; 32]);
-    store.store_content(&imported).unwrap();
+    store.store_content(&imported, true).unwrap();
     // Re-loading reads the imported key, not the original generated one.
     let back = store.load_or_generate_content().unwrap();
     assert_eq!(*back.as_bytes(), [3u8; 32], "imported key persisted");
+    // And the established marker now survives a reload.
+    assert!(store.content_established(), "deliberate store marks established");
+
+    // Storing a non-established key clears the marker again.
+    store.store_content(&ContentKey::from_bytes([4u8; 32]), false).unwrap();
+    assert!(!store.content_established(), "non-established store clears the marker");
 }
 
 #[test]

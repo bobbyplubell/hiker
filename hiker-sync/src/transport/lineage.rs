@@ -44,7 +44,7 @@ impl SyncNode {
         };
         self.oplog
             .adopt_lineage(&local.0, &state)
-            .map_err(|e| Error::Transport(format!("adopt_lineage: {e}")))?;
+            .map_err(|e| Error::Apply(format!("adopt_lineage: {e}")))?;
         Ok(())
     }
 
@@ -73,7 +73,7 @@ impl SyncNode {
         let device_id = self.peer_fingerprint(&peer_id).0;
         self.oplog
             .adopt_lineage_theirs(&local.0, &state, &device_id)
-            .map_err(|e| Error::Transport(format!("adopt_lineage_theirs: {e}")))?;
+            .map_err(|e| Error::Apply(format!("adopt_lineage_theirs: {e}")))?;
         Ok(())
     }
 
@@ -149,7 +149,7 @@ impl SyncNode {
             .unwrap_or_else(|| peer_id.to_string());
         self.oplog
             .apply_remote_update(&local.0, &update, &device_id)
-            .map_err(|e| Error::Transport(format!("apply_remote_update: {e}")))?;
+            .map_err(|e| Error::Apply(format!("apply_remote_update: {e}")))?;
         // Blind-id rotation on rename: if applying the delta updated the doc's
         // path, the old blind_id (HMAC of the OLD path) is now orphaned on the
         // hub. Issue a `DeleteBlob` so the server GCs the stream + cursors. The

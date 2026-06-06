@@ -19,11 +19,10 @@ use crate::store::dto::{new_id, MetaEntry, NoteUpsert};
 use crate::store::Store;
 use crate::watcher::is_ignored;
 
-use super::{
-    now_secs, path_extension, submit_embedder_load_task, update_status,
-    update_total_notes, IndexJob, IndexJobTx, IndexStatus, Error, ProgressEvent,
-    MAX_FILE_BYTES,
-};
+// Only the most heavily-used parent items are imported; the rest are reached
+// via explicit `super::` paths at their use sites so this file doesn't lean on
+// a wide slice of its parent's namespace (per `check-splits` super-reach).
+use super::{update_status, Error, IndexJob, ProgressEvent};
 
 /// Borrow-bundle of the long-lived handles every indexer-job handler
 /// in this module reads from. The writer `Store` is owned by the
@@ -36,9 +35,9 @@ pub(super) struct JobCtx<'a> {
     pub vault_root: &'a Path,
     pub embedder: &'a Arc<dyn Embedder>,
     pub progress: &'a broadcast::Sender<ProgressEvent>,
-    pub status: &'a watch::Sender<IndexStatus>,
+    pub status: &'a watch::Sender<super::IndexStatus>,
     pub pending: &'a Arc<Mutex<HashSet<String>>>,
-    pub self_tx: &'a IndexJobTx,
+    pub self_tx: &'a super::IndexJobTx,
     pub watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
     pub oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
     /// status: inbox-rules
@@ -51,7 +50,7 @@ pub(super) struct UpsertCtx<'a> {
     pub vault_root: &'a Path,
     pub embedder: &'a Arc<dyn Embedder>,
     pub progress: &'a broadcast::Sender<ProgressEvent>,
-    pub status: &'a watch::Sender<IndexStatus>,
+    pub status: &'a watch::Sender<super::IndexStatus>,
     /// Cell holding the vault's `OpLog` once `attach_oplog` runs. Per
     /// `op-log-bootstraps-first`, this is populated before the indexer
     /// processes any jobs in the steady state, so handlers read it via
@@ -193,11 +192,23 @@ impl<'a> UpsertCtx<'a> {
         let trash = crate::trash::Trash::open(vault.root());
         match crate::vault::restore_note(vault, None, &trash, id) {
             Ok(entry) => {
+                // History-preserving restore: when the trashed entry references
+                // an op-log `doc_id` (a tracked note whose Yrs history was
+                // retained, not purged, on delete), rebind `path → doc_id` to
+                // that retained doc and clear its tombstone so the document
+                // comes back with its full change history rather than as a
+                // brand-new import. An entry with no `doc_id` (hand-dropped
+                // file, never-seeded note, or folder — whose members rebind by
+                // path on re-ingest) takes the existing fresh-import path.
+                // status: vault-trash-restore
+                record_oplog_restore(self.oplog_cell, &entry);
                 // Re-ingest the restored .md files inline so the index
                 // picks them up without waiting on watcher events
                 // (which the caller suppressed). For folders, walk
                 // the manifest's recorded members; for files, just the
-                // single original_path.
+                // single original_path. Because `notes.id` == the op-log
+                // `doc_id` (`store-id-from-oplog`), re-ingest reattaches
+                // fresh chunks/embeddings under the rebound identity.
                 let to_index: Vec<String> = match &entry.members {
                     Some(m) => m.clone(),
                     None => vec![entry.original_path.clone()],
@@ -253,9 +264,9 @@ pub(super) struct ReloadCtx<'a> {
     pub embedder: &'a mut Arc<dyn Embedder>,
     pub embedder_cell: &'a Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     pub store: &'a mut Store,
-    pub status: &'a watch::Sender<IndexStatus>,
+    pub status: &'a watch::Sender<super::IndexStatus>,
     pub progress: &'a broadcast::Sender<ProgressEvent>,
-    pub self_tx: &'a IndexJobTx,
+    pub self_tx: &'a super::IndexJobTx,
     pub tasks: Option<&'a Arc<crate::tasks::queue::Queue>>,
 }
 
@@ -283,7 +294,7 @@ impl<'a> ReloadCtx<'a> {
             "indexer: hot-reloading embedder",
         );
         let load_task_id = match self.tasks {
-            Some(q) => Some(submit_embedder_load_task(q, &model_id).await),
+            Some(q) => Some(super::submit_embedder_load_task(q, &model_id).await),
             None => None,
         };
         let id_for_load = model_id.clone();
@@ -517,7 +528,14 @@ pub(super) async fn handle_simple_job(
             // (just a path) so we build one per call rather than threading
             // it through the loop signature.
             let trash = crate::trash::Trash::open(vault.root());
-            let result = crate::vault::delete_note(vault, store, None, &trash, &rel);
+            // Resolve the doc_id while the path is still mapped, so the trash
+            // entry can carry it for a history-preserving restore.
+            // status: vault-trash-restore
+            let doc_id = ctx
+                .oplog_cell
+                .get()
+                .and_then(|log| log.doc_id_for_path(&rel).ok().flatten());
+            let result = crate::vault::delete_note(vault, store, None, &trash, &rel, doc_id);
             match &result {
                 Ok(entry) => {
                     // status: board-cards-derived-table
@@ -663,6 +681,36 @@ fn record_oplog_tombstone(
     }
 }
 
+/// Rebind the op-log `doc_id` of a restored trash entry so the document comes
+/// back with its retained history. A no-op when the entry has no recorded
+/// `doc_id` (hand-dropped file, never-seeded note, or a folder whose members
+/// re-bind by path on re-ingest) or when no op-log handle is attached
+/// (CLI / tests). Best-effort, like [`record_oplog_tombstone`]: a failure is
+/// logged, not propagated — the filesystem restore already succeeded and the
+/// note is recoverable; only its history rebind is at risk.
+///
+/// status: vault-trash-restore
+fn record_oplog_restore(
+    oplog_cell: &Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    entry: &crate::trash::Entry,
+) {
+    let Some(doc_id) = &entry.doc_id else { return };
+    let Some(log) = oplog_cell.get() else { return };
+    if let Err(e) = crate::oplog::writes::restore(
+        log,
+        doc_id,
+        &entry.original_path,
+        &crate::oplog::shapes::Author::User,
+    ) {
+        tracing::warn!(
+            error = %e,
+            doc_id = %doc_id,
+            path = %entry.original_path,
+            "indexer: op-log restore rebind failed",
+        );
+    }
+}
+
 /// Convenience for the rename "from-path-not-indexed" branch: do an upsert
 /// without re-emitting Started/Finished pairs.
 async fn handle_inline_upsert(
@@ -700,7 +748,7 @@ async fn handle_inline_upsert(
             });
         }
     }
-    update_total_notes(status, store);
+    super::update_total_notes(status, store);
     Ok(())
 }
 
@@ -762,7 +810,7 @@ async fn process_upsert(
     rel_path: &str,
     force: bool,
 ) -> Result<UpsertOutcome, Error> {
-    let chunker: &dyn Chunker = match path_extension(rel_path) {
+    let chunker: &dyn Chunker = match super::path_extension(rel_path) {
         Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
             &Markdown
         }
@@ -793,7 +841,7 @@ async fn process_upsert(
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if size > MAX_FILE_BYTES {
+    if size > super::MAX_FILE_BYTES {
         // Persist a Skipped row so the UI can mark this file across launches
         // (per index.md `cmd-file-index-state`). Reason string is the
         // exact human-readable text the tooltip / status bar will display.
@@ -831,7 +879,7 @@ async fn process_upsert(
         // embeddings to insert.
         // status: store-id-from-oplog
         let id = resolve_doc_id(oplog, store, rel_path);
-        let indexed_at = now_secs();
+        let indexed_at = super::now_secs();
         store.upsert_note(&NoteUpsert {
             id: &id,
             path: rel_path,
@@ -859,7 +907,7 @@ async fn process_upsert(
 
     // status: store-id-from-oplog
     let id = resolve_doc_id(oplog, store, rel_path);
-    let indexed_at = now_secs();
+    let indexed_at = super::now_secs();
 
     // status: trail-waypoints-derived-table
     // Re-derive `trail_waypoints` rows for trail-docs and waypoint

@@ -81,7 +81,6 @@ async fn rename_trail_doc_moves_companion_folder_and_rewrites_refs() {
         &vault,
         &cfg,
         "my-trail",
-        false,
     )
     .await
     .unwrap();

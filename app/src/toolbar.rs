@@ -15,7 +15,9 @@
 
 use eframe::egui;
 
-use crate::actions::{self, ActionRegistry, ID_ACTIONS_MENU, ID_SEP, ID_SPACER, ID_VAULT_LABEL};
+use crate::actions::{
+    self, ActionRegistry, ID_ACTIONS_MENU, ID_SEP, ID_SPACER, ID_VAULT_LABEL, ID_VIEW_MENU,
+};
 use crate::icons;
 use crate::state::{AppState, Toolbar, ToolbarSide, ToastLevel};
 use crate::tab::TabKind;
@@ -288,6 +290,9 @@ fn render_single(
         ID_ACTIONS_MENU => {
             app.render_actions_menu(ui);
         }
+        ID_VIEW_MENU => {
+            app.render_view_menu(ui);
+        }
         _ => {
             app.render_action_button(ui, bar_idx, slot, id, customize, pending);
         }
@@ -304,25 +309,36 @@ fn render_vault_label(&mut self, ui: &mut egui::Ui) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| state.vault_session.vault_root.to_string_lossy().into_owned());
     let resp = ui.label(egui::RichText::new(vault_label).color(theme::muted()));
-    resp.context_menu(|ui| {
-        if ui.button("Set as default vault").clicked() {
-            let p = state.vault_session.vault_root.to_string_lossy().to_string();
-            match hiker_core::config::Config::set(
-                hiker_core::config::SettingsScope::User,
-                "vault.default",
-                &serde_json::json!(p),
-                &state.vault_session.vault_root,
-            ) {
-                Ok(_) => state.push_toast("Set as default vault", ToastLevel::Info),
-                Err(err) => state.push_toast(
-                    format!("Set default failed: {err}"),
-                    ToastLevel::Error,
-                ),
-            }
-            ui.close();
+    let mut chosen = None;
+    resp.context_menu(|ui| chosen = egui_workbench::menu::show(ui, build_vault_label_menu()));
+    if let Some(VaultLabelVerb::SetAsDefault) = chosen {
+        let p = state.vault_session.vault_root.to_string_lossy().to_string();
+        match hiker_core::config::Config::set(
+            hiker_core::config::SettingsScope::User,
+            "vault.default",
+            &serde_json::json!(p),
+            &state.vault_session.vault_root,
+        ) {
+            Ok(_) => state.push_toast("Set as default vault", ToastLevel::Info),
+            Err(err) => state.push_toast(
+                format!("Set default failed: {err}"),
+                ToastLevel::Error,
+            ),
         }
-    });
+    }
 }
+}
+
+/// The single verb on the toolbar vault-label menu.
+#[derive(Clone, Copy)]
+enum VaultLabelVerb {
+    SetAsDefault,
+}
+
+/// Build the toolbar vault-label menu (status: ctxmenu-toolbar). One verb:
+/// persist the current vault as the user-scope default.
+fn build_vault_label_menu() -> egui_workbench::menu::Menu<VaultLabelVerb> {
+    egui_workbench::menu::Menu::new().action("Set as default vault", VaultLabelVerb::SetAsDefault)
 }
 
 impl AppState {
@@ -373,6 +389,15 @@ fn render_action_button(
 
     if !customize && resp.clicked() {
         crate::actions::dispatch(app, action.id);
+    }
+    // Right-clicking the reader-mode (book) button surfaces the reader-view-
+    // specific options — the same "hide … in reader mode" toggles the eye View
+    // menu holds — straight from the reader icon. [global-view-menu]
+    if !customize && action.id == "view.reader_mode" {
+        resp.context_menu(|ui| {
+            ui.label(egui::RichText::new("Reader options").strong());
+            reader_view_options(app, ui);
+        });
     }
     if customize {
         // Drag-to-reorder. Use egui dnd via Memory: when dragged, store
@@ -536,10 +561,6 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             open_singleton_tab(state, TabKind::Sync);
             ui.close();
         }
-        if tab_menu_row(ui, &TabKind::Plugins, 0) {
-            open_singleton_tab(state, TabKind::Plugins);
-            ui.close();
-        }
         ui.separator();
         if menu_row(ui, icons::ICONS.image(crate::icons::Icon::Plus), "New chat session", 0) {
             crate::actions::dispatch(state, "chat.new_session");
@@ -554,22 +575,89 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             crate::actions::dispatch(state, "palette.open");
             ui.close();
         }
-        // Feature-registry entries. Per `feature-consumer-hamburger`,
-        // the hamburger walks the registry and renders any feature
+        // Activity-registry entries. Per `feature-consumer-hamburger`,
+        // the hamburger walks the registry and renders any activity
         // that returns a `HamburgerEntry`. The hardcoded rows above
-        // stay until each owning feature migrates them in.
-        render_feature_hamburger_entries(ui, state);
+        // stay until each owning activity migrates them in.
+        render_activity_hamburger_entries(ui, state);
     });
 }
 }
 
-/// Walk the per-vault feature registry and render any entries opting
+impl AppState {
+/// Global "View options" menu — an eye-icon button on the top strip that
+/// opens a popup of workbench-level view toggles. Modelled on
+/// [`Self::render_actions_menu`]. Leaves room for future global view
+/// options. [global-view-menu]
+fn render_view_menu(&mut self, ui: &mut egui::Ui) {
+    let state = self;
+    let trigger = ui.add(egui::ImageButton::new(
+        icons::ICONS.image(crate::icons::Icon::Eye),
+    ));
+    let trigger = trigger.on_hover_text("View options");
+    egui::Popup::menu(&trigger).show(|ui| {
+        // Reader mode toggle — dispatches the same global action as the
+        // book button and Ctrl+R.
+        let mut reader = state.workbench.reader_mode();
+        if ui.checkbox(&mut reader, "Reader mode").changed() {
+            crate::actions::dispatch(state, "view.reader_mode");
+        }
+        reader_view_options(state, ui);
+    });
+}
+}
+
+/// The reader-mode-specific view options (the "hide … in reader mode" toggles).
+/// Shared by the eye-icon View menu and the reader-icon right-click menu, so
+/// both surface the same controls. Each reads + flips the mirrored `ui.*`
+/// setting and persists it vault-scoped, so the behaviour is reachable without
+/// opening Settings. [view-reader-hide-top-bar, view-reader-hide-tabs,
+/// view-reader-hide-toolbar]
+fn reader_view_options(state: &mut AppState, ui: &mut egui::Ui) {
+    let mut hide_top = state.ui.reader_hide_top_bar;
+    if ui.checkbox(&mut hide_top, "Hide top bar in reader mode").changed() {
+        state.ui.reader_hide_top_bar = hide_top;
+        commit_vault_bool(state, "ui.reader_hide_top_bar", hide_top);
+    }
+    let mut hide_tabs = state.ui.reader_hide_tabs;
+    if ui.checkbox(&mut hide_tabs, "Hide tabs in reader mode").changed() {
+        state.ui.reader_hide_tabs = hide_tabs;
+        commit_vault_bool(state, "ui.reader_hide_tabs", hide_tabs);
+    }
+    let mut hide_toolbar = state.ui.reader_hide_toolbar;
+    if ui.checkbox(&mut hide_toolbar, "Hide toolbar in reader mode").changed() {
+        state.ui.reader_hide_toolbar = hide_toolbar;
+        commit_vault_bool(state, "ui.reader_hide_toolbar", hide_toolbar);
+    }
+}
+
+/// Persist a vault-scoped bool config key and swap the in-memory copy so a
+/// later read sees it. Mirrors the settings panel's `commit` path; toasts
+/// the result. [view-reader-hide-top-bar]
+fn commit_vault_bool(state: &mut AppState, key: &str, value: bool) {
+    let vault_root = state.vault_session.vault_root.clone();
+    match hiker_core::config::Config::set(
+        hiker_core::config::SettingsScope::Vault,
+        key,
+        &serde_json::json!(value),
+        &vault_root,
+    ) {
+        Ok(new_cfg) => {
+            if let Ok(mut guard) = state.vault_session.config.write() {
+                *guard = new_cfg;
+            }
+        }
+        Err(err) => state.push_toast(format!("Save {key} failed: {err}"), ToastLevel::Error),
+    }
+}
+
+/// Walk the per-vault activity registry and render any entries opting
 /// into the hamburger menu. Built fresh per open so dynamic entries
-/// (e.g. plugin features in Phase 3) appear as soon as they register.
+/// (e.g. plugin activities in Phase 3) appear as soon as they register.
 /// [feature-consumer-hamburger]
-fn render_feature_hamburger_entries(ui: &mut egui::Ui, state: &mut AppState) {
-    let features = state.features.clone();
-    let entries: Vec<(String, &'static str)> = features
+fn render_activity_hamburger_entries(ui: &mut egui::Ui, state: &mut AppState) {
+    let activities = state.activities.clone();
+    let entries: Vec<(String, &'static str)> = activities
         .iter()
         .filter_map(|f| f.hamburger().map(|h| (f.id().to_string(), h.label())))
         .collect();
@@ -577,9 +665,9 @@ fn render_feature_hamburger_entries(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
     ui.separator();
-    for (feature_id, label) in entries {
+    for (activity_id, label) in entries {
         if ui.button(label).clicked() {
-            crate::feature::dispatch_hamburger(state, &feature_id);
+            crate::activity::dispatch_hamburger(state, &activity_id);
             ui.close();
         }
     }

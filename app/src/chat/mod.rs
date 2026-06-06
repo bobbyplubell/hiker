@@ -24,10 +24,10 @@ pub mod state;
 
 use eframe::egui;
 
-use crate::feature::{Ctx, Feature, SidebarSurface};
+use crate::activity::{Activity, Ctx, View};
 use crate::icons;
 
-/// Zero-sized `Feature` impl for the docked chat sidebar. Pure
+/// Zero-sized `Activity` impl for the docked chat sidebar. Pure
 /// descriptor: holds no state. The real state (the in-memory session
 /// registry + lazy-discover gate) lives in `AppState::chat_state`; the
 /// sidebar surface reaches it via `Ctx::state.downcast_mut::<State>()`
@@ -39,7 +39,7 @@ use crate::icons;
 /// renders against `&mut AppState` via `render::show_tab`.
 pub struct Chat;
 
-impl Feature for Chat {
+impl Activity for Chat {
     fn id(&self) -> &'static str {
         "chat"
     }
@@ -49,19 +49,24 @@ impl Feature for Chat {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Chat)
     }
-    fn sidebar(&self) -> Option<&dyn SidebarSurface> {
-        Some(&ChatSidebar)
+    fn views(&self) -> Vec<&dyn View> {
+        vec![&ChatSidebar]
     }
-    /// Chat docks into the secondary (right) side bar, not the primary
-    /// activity bar. [feature-consumer-activity-bar]
-    fn primary_activity(&self) -> bool {
-        false
+    /// Chat docks into the secondary (right) side bar. It renders through
+    /// the same generic `SidePanelStack` path as the left activities, just
+    /// on the right stack, and is summoned via the right-sidebar toggle
+    /// rather than the left activity strip. [feature-consumer-activity-bar]
+    fn default_location(&self) -> egui_workbench::side_bar::Location {
+        egui_workbench::side_bar::Location::RightBar
     }
 }
 
 struct ChatSidebar;
 
-impl SidebarSurface for ChatSidebar {
+impl View for ChatSidebar {
+    fn id(&self) -> &'static str {
+        "chat"
+    }
     fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
         sidebar::render_sidebar(ui, ctx);
     }

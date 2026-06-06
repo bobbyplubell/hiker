@@ -139,7 +139,7 @@ fn drive_frame(
     };
     let _ = ctx.run(raw, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            view.show(ui, canvas, renderer);
+            view.show(ui, canvas, renderer, &mut crate::renderer::NoMenus);
         });
     });
 }

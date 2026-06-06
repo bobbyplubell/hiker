@@ -10,5 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 hiker-core.workspace = true
-hiker-extract.workspace = true
 ulid.workspace = true

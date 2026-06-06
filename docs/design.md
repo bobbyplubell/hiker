@@ -45,8 +45,8 @@ Other components:
 ```
 core/             vault model, chunker, indexer, search, extractors, agent, llm, mcp handler, staging, sessions, trees, autosave, changes — pure library, no UI deps
 cli/              clap-based CLI, calls core
-mcp-server/       rmcp adapter, calls core (and reuses core::mcp::HikerHandler for in-process MCP)
-app/              egui desktop app. Owns tabs, panels, sidebar, toolbar, chat, settings, modals. Holds long-lived subsystems (vault, indexer, watcher, autosave, changes, staging, trees, chat, mcp) on AppState and pumps mpsc channels each frame.
+mcp-server/       rmcp adapter, calls core (reuses core::mcp::HikerHandler for in-process MCP)
+app/              egui desktop app — tabs, panels, sidebar, toolbar, chat, settings, modals; holds long-lived subsystems on AppState, pumps mpsc channels each frame
 editor/
   editor-core/    rope, EditorState, decoration model, selection, transactions — pure data
   editor-view/    commands, decoration providers, completion source trait, search, multi-cursor — platform-agnostic
@@ -108,7 +108,7 @@ Storage modes (each row maps unambiguously to one combination of source-location
 | --------------- | ----------- | ---------- | ------------------ | ------------------------------------------------- | --------------------------------------------- |
 | Vault-internal  | markdown    | no         | (none)             | the file itself is the note                       | the file's own contents                       |
 | Vault-internal  | non-md      | no         | `sidecar`          | next to source as `<full-source-filename>.md`     | extracted text (cached)                       |
-| URL capture     | web/feed    | no         | `capture`          | a visible capture note in the vault (`clips/`, a crawl/feed companion folder) | extracted text; see `extract.md` `capture-spec-note` |
+| Imported        | web/other   | no         | `imported`         | a visible note in the vault, original/archive beside it | a markdown shadow; original opens in its viewer (`import.md`) |
 | External (file) | markdown    | no         | `external-pointer` | `.hiker/external/<id>--slug.md`                   | annotations only; original re-read on refresh |
 | External (file) | non-md      | no         | `external-cached`  | `.hiker/external/<id>--slug.md`                   | extracted text (cached)                       |
 | Either          | any         | yes        | `versioned`        | sidecar note (op-log history) + `.hiker/refs/<id>/` retained artifacts | extracted text, versioned via the op-log; old artifacts kept per `extract-artifact-retention` |
@@ -116,20 +116,18 @@ Storage modes (each row maps unambiguously to one combination of source-location
 Notes:
 
 - Vault-internal markdown needs no source-derived note — the file is the note. All other rows produce a hiker note.
-- A captured **URL** (a one-off scrape, a crawled page, a feed entry) is a visible capture note, not a hidden cache file — `capture` mode in `extract.md`. The `external-cached` / `external-pointer` rows cover **external files on disk outside the vault** that hiker watches read-only, a distinct case from URL capture.
+- **Imported** content (a web page, a crawled site, produced by an external tool — `import.md`) lands as a visible note, not a hidden cache file. The `external-cached` / `external-pointer` rows cover **external files on disk outside the vault** that hiker watches read-only, a distinct case from imported content.
 - External-pointer is the only file mode without a content cache; markdown is already plain text and cheap to re-read, so caching adds drift without benefit.
 - Versioned mode is reached by opt-in (per-glob in vault config or per-source frontmatter); it supersedes sidecar / external-cached / external-pointer when active.
 
-**Subsystem notes are first-class visible files.** Any document a subsystem produces that carries a *user-authored body* — trail waypoints, chat sessions, captured pages — lives at a real vault path (a folder, a companion folder) and is an ordinary indexed note, surfaced cleanly in Vault mode by source-type/provenance grouping. `.hiker/` is reserved for non-note machinery only: regenerable caches (`index.db`, `doc-index.db`, `changes.db`), in-flight scratch (`autosave/`), deleted content (`trash/`), retained binary artifacts (`refs/`), external-file caches (`external/`), and config. This is why the watcher needs no per-subsystem carve-out of its `.hiker/` ignore — nothing indexable lives under `.hiker/`. [subsystem-notes-visible]
+**Subsystem notes are first-class visible files, typed by frontmatter.** Any document a subsystem produces that is *user-created or imported content* — trail waypoints, chat sessions, captured pages, cluster-tree presets, cluster trees, boards — lives at a real vault path and is an ordinary indexed note. A note's *type* is carried in its `hiker.kind` frontmatter (`board` / `cluster-tree` / `cluster-preset` / …) and discovered through the store's frontmatter index (`store-note-query`), never inferred from a hiker-owned location. The load-bearing consequence: a note the user hand-typed or imported with the right frontmatter is treated identically to one hiker authored — there is no hidden registry that confers special status, only the note's own frontmatter. `.hiker/` holds **only data that can be lost and regenerated** (caches, autosave scratch, trash, retained artifacts, external-file caches, config) and never user-created or imported content — so the watcher needs no per-subsystem carve-out of its `.hiker/` ignore, since nothing indexable lives there. [subsystem-notes-visible]
 
-Per-type extractors:
+Source/binary types are converted by external producers or handled by core viewers (`import.md`):
 
-- PDF — pdftotext (poppler) for clean text, marker / docling for scanned/complex layouts
-- Image — tesseract for printed text; vision LLM (Claude / GPT-4o) for handwriting, results cached by image hash
-- Audio — whisper.cpp (CPU-only ok)
-- Office docs — pandoc (.docx/.odt), markitdown for xlsx/pptx
-- HTML / web archives — monolith + readability/mdream/html-to-md
-- Code files — index original directly; optional LLM-summary sidecar for semantic discoverability
+- HTML / web archives — produced externally; displayed via `hiker-htmlview`, indexed from the markdown shadow
+- PDF — text layer indexed like `.txt` (cheap deterministic chunking); the PDF opens in its viewer
+- Image / audio — OCR / transcription via external producers; the artifact opens in its OS handler
+- Code files — indexed directly; optional LLM-summary sidecar for semantic discoverability
 
 External file interaction:
 
@@ -151,7 +149,7 @@ Re-link is supported (flips back to linked + re-extracts to overwrite local edit
 
 ## Versioned sources
 
-The version history of a source-derived note is the op-log (`op-log.md`), not a parallel per-version store. A sidecar is a Yrs document; a re-extraction (changed source, bumped extractor version, re-fetch, re-crawl) lands as an `extractor`-authored op on its `accepted` state. So a source's "versions" are its op-log history, and diff / per-hunk restore / the version dropdown reuse the existing op-log surfaces. An identical re-extraction is a no-op, so versions accrue only on real change. The concrete slice — re-extraction policies, the crawl-job manifest note, retention — lives in `extract.md` and `op-log.md`.
+The version history of a source-derived note is the op-log (`op-log.md`), not a parallel per-version store. A sidecar is a Yrs document; a re-import (changed source, re-fetch) lands as an `extractor`-authored op on its `accepted` state. So a source's "versions" are its op-log history, and diff / per-hunk restore / the version dropdown reuse the existing op-log surfaces. An identical re-import is a no-op, so versions accrue only on real change. Re-import policies and retention live in `import.md` and `op-log.md`.
 
 - **Logical documents spanning many sources** (a crawl, a multi-file capture) are represented by a manifest note; members carry `hiker.parent: <manifest-ulid>`. A single scraped or dropped source needs no manifest — the sidecar note is itself the versioned unit.
 - **Binary artifacts** (the source bytes, the per-capture HTML archive) are what the op-log can't hold — it versions text, not blobs. Whether old artifacts are retained is a per-source retention cascade (`extract-artifact-retention`): vault default → per-crawl/glob → per-source frontmatter; values `latest` / `keep:N` / `forever`. Retained artifacts live under `.hiker/refs/<doc_id>/` keyed by the producing op, and are device-local (the op-log syncs sidecar text, not blobs).
@@ -250,22 +248,9 @@ Delete remains the destructive option: file removed → all index entries remove
 Linking metadata (general): Trails are one instance of a broader idea — first-class metadata that links content items together with semantics. Other instances: tags (set membership), collections (named groupings), typed edges between notes (cites, contradicts, supersedes, depends-on, derived-from), annotations on those edges. Stored as structured metadata (frontmatter and/or a sidecar index file), exposed to search and to agents. Keeps the substrate plain markdown while letting structure accrete on top.
 
 
-## Extractors
+## Source import & viewers
 
-Trait-based, all built-in, living in a decoupled `hiker-extract` leaf crate that `core` does not depend on (the sidecar `.md` on disk is the seam — see `extract.md`). No runtime plugin loading (no dynamic libs, no WASM, no plugin manifest) for this registry: the binary formats (PDF, image, audio, office) need native libraries and form a small finite set, so a real plugin system isn't worth it here. The concrete first slice — the registry, sidecar write path, PDF, website-to-markdown, and the governed crawl loop — is specified in `extract.md`. The unbounded text-transform tail (per-site scrapers, niche text formats) is a separate, plugin-eligible source-fetcher surface — `plugins.md`'s source plugins — not part of this built-in set.
-
-Shape:
-
-```rust
-pub trait Extractor: Send + Sync {
-    fn name(&self) -> &str;
-    fn matches(&self, source: &SourcePath) -> bool;     // file ext, mime, URL pattern
-    fn extract(&self, source: &SourcePath, ctx: &Ctx) -> Result<Option<Extracted>>;
-    fn version(&self) -> &str;                          // participates in cache key
-}
-```
-
-A Registry holds Box<dyn Extractor> instances and routes a source to the first matching one. Adding a new type = one new module + one registration line.
+Content that originates outside the vault — a web page, a PDF, a crawled site — is produced by external tools and imported, never fetched or scraped by hiker itself. Hiker imports the result through one tool-agnostic manifest, displays each item through a finite built-in viewer registry (markdown, and HTML/CSS via `hiker-htmlview`; PDF/image later), and indexes a markdown shadow as the search layer. No runtime plugin loading — the formats hiker handles are a finite, built-in set. Full spec: `import.md`.
 
 Per-type modules under hiker_extract::*: pdf, image, audio, office, html, code, markdown, command.
 
@@ -289,17 +274,14 @@ User can support a new format without writing code, just by pointing at an exist
 
 ## LLM strategy
 
-Generative LLM access lives in `core::llm` (built on the [`llm`](https://crates.io/crates/llm) crate, multi-provider). Background and fan-out features call it directly. Interactive features go through `core::agent` (a basic in-hiker agent loop using `core::llm`), or optionally via `core::acp` to an external ACP agent (Claude Code, Goose, etc.) as an escape hatch. The whole layer is disable-able. ACP is interactive-only — never wired for background or fan-out — which keeps subscription-billed agents in the role they're priced for. Embeddings stay local in `core::embed` and are out of scope of the LLM strategy.
+Generative LLM access lives in `core::llm` (built on the [`llm`](https://crates.io/crates/llm) crate, multi-provider). Background and fan-out features call it directly. Interactive features go through `core::agent` (a basic in-hiker agent loop using `core::llm`), or optionally via `core::acp` to an external ACP agent (Claude Code, Goose, etc.). The whole layer is disable-able. ACP is interactive-only — never wired for background or fan-out. Embeddings stay local in `core::embed`, out of scope of the LLM strategy.
 
 Full spec in [`llm.md`](llm.md). Anywhere `design.md` mentions an LLM-driven feature (vision OCR, auto-tag, summary, cluster naming, RAG chat, etc.), the implementation flows through the path described there.
 
 
 ## Architecture
 
-Two layers, in-process, no IPC:
-
-- **`app/`** — owns the UI tree and `AppState`, which holds `Arc` handles to every long-lived subsystem (vault, indexer, watcher, autosave, changes, staging, trees, chat, mcp).
-- **`core/`** — vault, indexer, search, extractors, agent, LLM, in-process MCP handler. No UI deps.
+Two layers (`app/`, `core/`), in-process, no IPC — roles per the crate layout above; `AppState` holds `Arc` handles to every long-lived subsystem.
 
 Communication: direct function calls (panels take `&mut AppState` and call subsystem APIs), `tokio::sync::mpsc` channels for async events drained each frame, `Mutex`/`RwLock` for the few cross-thread subsystems (held briefly, never across `.await`). Channels follow one pattern across `fs_events`, `indexer_events`, `mutation_events`, and `ChatRegistry::rx`: a tokio task posts, the frame loop drains with `try_recv`, state mutates before rendering.
 
@@ -318,18 +300,16 @@ Single window, fixed layout:
 
 `TabKind` (in `app/src/tab.rs`) dispatches on the central pane; renderers live under `panels/`. Singletons (Home, Queue, Settings, Graph, PatchReview, Plugins, IndexerDetail, Changes) open-or-focus via `toolbar::open_singleton_tab`.
 
-- `Buffer { path }` — editor widget. Chrome (version dropdown, diff-vs-disk, view-options wrench, wand-menu) and status bar in `panels/buffer/`. When the active buffer's path has pending `edit_note` staging proposals, the panel renders the inline patch-review decorations + per-file pill on top — no separate tab kind, no mode flip.
-- `BufferDiff { path }`, `SnapshotPreview`, `StagingPreview`, `TrashPreview` — read-only review surfaces over the same widget. StagingPreview includes per-hunk review (line numbers, ±2 lines context, partial-apply via byte-range splice).
-- `Home` / `HomeDetail { which }` — vault summary, snapshots, per-path history (`HomeDetail::ActivityRow`). The dashboard-wide activity widget moved into the unified `Changes` tab.
+- `Editor { buffer: BufferSource, diff: Option<DiffSource> }` — editor widget over a buffer (vault file, history version, proposal, or trash entry), optionally layered with a diff. Chrome (version dropdown, diff-vs-disk, view-options wrench, wand-menu) and status bar in `panels/buffer/`. When the active buffer's path has pending `edit_note` staging proposals, the panel renders the inline patch-review decorations + per-file pill on top — no separate tab kind, no mode flip. The diff/snapshot/staging/trash review surfaces are read-only `Editor` layerings over the same widget; staging review includes per-hunk review (line numbers, ±2 lines context, partial-apply via byte-range splice).
+- `Home` / `HomeDetail { which }` — vault summary, snapshots, per-path history (`HomeDetail::ActivityRow`).
 - `Queue` / `QueueDetail { task_id }` — task queue with state filter pills, leased-row pulse, worker controls.
 - `IndexerDetail` — model id, status, reindex, progress log with filter pills.
 - `Settings` — scope-aware form (Refresh / Open / Reveal / Reset-to-defaults), raw-TOML fallback.
 - `Properties { path }` — disk + indexer metadata + trails / clusters membership.
 - `Graph` — vault-wide note-link force-directed graph (`petgraph` + painter).
-- `ClusterReview { config_json }` — preview-then-persist build flow.
-- `ClusterGraph { tree_id }` — radial dendrogram (color-by-policy, size-by-members, staleness tint).
-- `PatchReview` — cross-vault list of pending staging proposals with bulk + per-row accept/reject. Sibling to the in-buffer inline UI on `Buffer` tabs.
-- `Changes` — unified activity / changes feed (replaces the prior `AgentChanges` tab). One filterable view over `core::activity::list` (a projection over the op log carrying both pending and accepted ops) with author / source / op filter chips. The legacy `:agent_changes` persist key maps forward to this tab.
+- `ClusterReview { config_json }` — preview-then-persist build flow; `ClusterGraph { tree_id }` — radial dendrogram (color-by-policy, size-by-members, staleness tint).
+- `PatchReview` — cross-vault list of pending staging proposals with bulk + per-row accept/reject. Sibling to the in-buffer inline UI on editor tabs.
+- `Changes` — unified activity / changes feed. One filterable view over `core::activity::list` (a projection over the op log carrying both pending and accepted ops) with author / source / op filter chips. (`:agent_changes` persist key maps forward to this tab.)
 - `Agent { session_id }` — full-tab chat.
 - `Plugins` — manifest viewer for `<vault>/.hiker/plugins.json`. No host runtime — manifest edits only.
 - `ZimView { zim_path, article }` — offline `.zim` archive viewer with browser-style link nav (`zim.md`).
@@ -353,40 +333,7 @@ State only mutates inside the frame loop or via channel events folded by it.
 
 ## MCP surface
 
-Treat agent retrieval as activation, not just retrieval — the MCP server is responsible for fitting results into a bounded context with appropriate detail level, not just returning everything that matched.
-
-Tools exposed:
-
-- `search_notes(query, scope?, budget?, detail?)` — hybrid search with explicit budget and detail control
-- `get_note(id, detail?)` — fetch a single note at a given detail level
-- `related_notes(id, k?, budget?)` — neighbors in embedding space for a known note
-- `list_trails(scope?)`, `get_trail(id)` — walk a curated trail
-- `list_landmarks(scope?)` — landmarks for orientation
-- `list_collections(scope?)`, `get_collection(id)` — saved queries / groupings
-
-Budget-aware returns:
-
-- Every search/related call accepts a `budget` (approx token count or chunk count). Server returns the highest-priority hits that fit; remainder is truncated and reported as `truncated_count` in the response.
-- Default budget chosen so a single call fits comfortably in a typical agent's context allocation.
-
-Progressive disclosure (detail levels):
-
-- digest — id + title + 1–3 sentence summary (from the Summary enrichment stage) + score. Cheapest. Default for multi-hit search responses.
-- snippet — digest + the matching chunk(s) with surrounding context. Default for single-hit / direct lookups.
-- full — entire note body. Returned only on explicit request.
-- Each result carries its own `id`, so the agent can call `get_note(id, detail="full")` to escalate just the ones it cares about. Avoids dumping full bodies on first hit.
-
-Stable references:
-
-- Every returned chunk has a stable `chunk_id` (note ulid + chunk index or hash). Agents can reference prior results in subsequent calls (`expand_chunk(chunk_id)`, `get_note_context(chunk_id, before, after)`) without re-querying.
-- Trail and landmark ids are likewise stable; agents can pin specific waypoints across a session.
-
-Lifecycle awareness:
-
-- By default, search excludes notes with `archived`, `redacted`, or `retired` set. Agents can opt-in via scope flags to include them when intentionally auditing or recovering history.
-- Redacted notes are returned as id + title only; their bodies and chunks are unreachable via MCP.
-
-Streaming: Long-running operations (large reindex, scrape refresh) expose progress via MCP notifications rather than blocking call-response.
+Agent retrieval is activation, not just retrieval — the MCP server fits results into a bounded context at an appropriate detail level. Read/search tools take a `budget` and a `detail` level (digest / snippet / full) for progressive disclosure; chunks/trails/landmarks carry stable ids for cross-call reference; lifecycle flags (`archived` / `redacted` / `retired`) are excluded from search by default and opt-in via scope. Full spec in `mcp.md`.
 
 
 ## Build order

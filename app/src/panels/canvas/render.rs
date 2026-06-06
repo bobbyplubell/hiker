@@ -35,67 +35,240 @@ pub fn header(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &str) 
     ui.horizontal(|ui| {
         ui.heading(title);
         ui.separator();
+        view_menu(ui, app, tab_id);
         let current = app
             .panels
             .canvases
             .get(&tab_id)
             .map(|p| p.view)
             .unwrap_or_default();
-        if icon_toggle(ui, Icon::Canvas, current == ViewMode::Canvas, "Canvas view") {
-            app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Canvas;
-        }
-        if icon_toggle(ui, Icon::Braces, current == ViewMode::Json, "JSON view") {
-            app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Json;
-        }
-        if current == ViewMode::Canvas {
+        // The node-creation toolbar + canvas settings gear are hidden in reader
+        // mode when the user opts into hiding in-tab toolbars. [view-reader-hide-toolbar]
+        let show_canvas_tools = current == ViewMode::Canvas && !app.reader_hides_view_toolbar();
+        if show_canvas_tools {
             ui.separator();
             create_toolbar(ui, app, tab_id);
+        }
+        ui.separator();
+        link_control(ui, app, tab_id);
+        // Gear: canvas-scoped interaction settings, rightmost on the toolbar.
+        // status: canvas-settings-menu
+        if show_canvas_tools {
+            ui.separator();
+            canvas_settings_menu(ui, app);
         }
     });
 }
 
-/// The per-kind create toolbar. Each verb drops a node at the viewport center
-/// immediately (one click) and selects it — no arm-then-place gesture. `+ Text`
-/// and `+ Group` create directly; `+ Link` opens a small inline URL prompt that
-/// drops a built `Link` node on submit. `Fit` frames all content.
-/// status: canvas-node-create
+/// The eye-icon **View** menu: the Canvas / JSON mode switch plus the canvas-only
+/// "Fit to content" action, folded into one dropdown so the header row stays
+/// uncluttered. status: canvas-view-toggle
+fn view_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+    let current = app
+        .panels
+        .canvases
+        .get(&tab_id)
+        .map(|p| p.view)
+        .unwrap_or_default();
+    let resp = ui
+        .add(
+            egui::ImageButton::new(ICONS.image(Icon::Eye))
+                .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+        )
+        .on_hover_text("View options");
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.label(
+            egui::RichText::new("View as")
+                .small()
+                .color(hiker_theme::muted()),
+        );
+        let canvas_btn = egui::Button::image_and_text(ICONS.image(Icon::Canvas), "Canvas")
+            .selected(current == ViewMode::Canvas);
+        if ui.add(canvas_btn).clicked() {
+            app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Canvas;
+            ui.close();
+        }
+        let json_btn = egui::Button::image_and_text(ICONS.image(Icon::Braces), "JSON")
+            .selected(current == ViewMode::Json);
+        if ui.add(json_btn).clicked() {
+            app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Json;
+            ui.close();
+        }
+        if current == ViewMode::Canvas {
+            ui.separator();
+            if ui.button("Fit to content").clicked() {
+                if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+                    pane.fit_pending = true;
+                }
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Small "Link" control in the canvas header: opens a popup to wire this
+/// canvas tab to follow / drive another editor group, identical to the graph
+/// tab's control. status: tab-linking
+fn link_control(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+    let linked = app
+        .tab_by_id(tab_id)
+        .map(|t| t.link.source.is_some() || t.link.target.is_some())
+        .unwrap_or(false);
+    // A tab-with-link-in-the-corner icon; pressed-state when this tab is linked.
+    let resp = ui
+        .add(
+            egui::ImageButton::new(ICONS.image(Icon::TabLink))
+                .selected(linked)
+                .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+        )
+        .on_hover_text(if linked {
+            "Linked to another tab group"
+        } else {
+            "Link this canvas to another tab group"
+        });
+    egui::Popup::menu(&resp).show(|ui| {
+        crate::editor_pane::link_menu_ui(ui, app, tab_id);
+    });
+}
+
+/// The gear **Settings** menu: canvas-scoped interaction toggles surfaced on the
+/// toolbar for quick access. These also live in the global Settings window; both
+/// read/write the same `[ui]` config keys, which the canvas widget + swipe
+/// handler consult live, so a toggle here takes effect immediately. The two
+/// settings are scroll-pans-vs-zooms (`canvas-scroll-mode`) and the two-finger
+/// swipe-to-navigate opt-out (`navigation-swipe-disable`). status: canvas-settings-menu
+fn canvas_settings_menu(ui: &mut egui::Ui, app: &mut AppState) {
+    let resp = ui
+        .add(
+            egui::ImageButton::new(ICONS.image(Icon::Settings))
+                .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+        )
+        .on_hover_text("Canvas settings");
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.label(
+            egui::RichText::new("Canvas")
+                .small()
+                .color(hiker_theme::muted()),
+        );
+        // Scroll behavior: Auto (detect device) / Pan / Zoom. [canvas-scroll-mode]
+        ui.label(
+            egui::RichText::new("Scroll")
+                .small()
+                .color(hiker_theme::muted()),
+        );
+        canvas_scroll_mode_selector(ui, app);
+        ui.separator();
+        // Two-finger horizontal swipe → Back/Forward. [navigation-swipe-disable]
+        let mut swipe = app
+            .vault_session
+            .config
+            .read()
+            .map(|c| c.ui.swipe_nav_enabled)
+            .unwrap_or(true);
+        if ui
+            .checkbox(&mut swipe, "Two-finger swipe navigates Back/Forward")
+            .on_hover_text("Turn off if a horizontal scroll misfires as Back/Forward navigation.")
+            .changed()
+        {
+            app.set_setting(
+                hiker_core::config::SettingsScope::Vault,
+                "ui.swipe_nav_enabled",
+                &serde_json::json!(swipe),
+                "Save swipe navigation toggle failed",
+            );
+        }
+    });
+}
+
+/// Radio selector for `[ui].canvas_scroll_mode` (Auto / Pan / Zoom), shared by
+/// the canvas gear menu and the global Settings window so both stay in sync. Reads
+/// live config and commits via `set_setting`; the canvas widget reads the same
+/// `[ui]` key each frame, so a change applies immediately. status: canvas-scroll-mode
+pub(crate) fn canvas_scroll_mode_selector(ui: &mut egui::Ui, app: &mut AppState) {
+    use hiker_core::config::CanvasScrollMode as M;
+    let current = app
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.ui.canvas_scroll_mode)
+        .unwrap_or_default();
+    let mut choice = current;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut choice, M::Auto, "Auto")
+            .on_hover_text("Detect the device: a mouse wheel zooms to the cursor, a touchpad pans.");
+        ui.selectable_value(&mut choice, M::Pan, "Pan")
+            .on_hover_text("Always pan the camera (\u{2318}/Ctrl+scroll still zooms).");
+        ui.selectable_value(&mut choice, M::Zoom, "Zoom")
+            .on_hover_text("Always zoom to the cursor.");
+    });
+    if choice != current {
+        app.set_setting(
+            hiker_core::config::SettingsScope::Vault,
+            "ui.canvas_scroll_mode",
+            &serde_json::json!(choice.as_str()),
+            "Save canvas scroll mode failed",
+        );
+    }
+}
+
+/// Map the persisted `[ui].canvas_scroll_mode` onto the canvas widget's view-state
+/// enum. The two are deliberately separate types — the canvas crates stay free of
+/// `hiker_core::config` so they can be lifted into a standalone repo (`canvas-crate-split`).
+const fn to_view_scroll_mode(mode: hiker_core::config::CanvasScrollMode) -> canvas_view_core::state::ScrollMode {
+    use canvas_view_core::state::ScrollMode as V;
+    use hiker_core::config::CanvasScrollMode as C;
+    match mode {
+        C::Auto => V::Auto,
+        C::Pan => V::Pan,
+        C::Zoom => V::Zoom,
+    }
+}
+
+/// The create toolbar: the Select/Hand tool toggle plus a `+` split-button. The
+/// primary `+` mints a new vault note and drops a pointer to it at the viewport
+/// center (`canvas-new-note`); the caret dropdown holds the other insert verbs —
+/// Add text, Insert from vault…, Add link… (a small inline URL prompt on
+/// submit), Add group. Each drops a node at the viewport center immediately (one
+/// click) and selects it — no arm-then-place gesture. (Fit-to-content lives in
+/// the header View menu, `view_menu`.) status: canvas-node-create
 fn create_toolbar(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
     tool_toggle(ui, app, tab_id);
     ui.separator();
-    if ui.button("+ Text").clicked() {
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            pane.view_widget.create_centered(CreateKind::Text);
+    let add = crate::widgets::split_button::split_add_button(ui, "New note", |ui| {
+        if ui.button("Add text").clicked() {
+            if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+                pane.view_widget.create_centered(CreateKind::Text);
+            }
+            ui.close();
         }
-    }
-    // Insert from vault: open the autocomplete picker over notes + sources; a
-    // pick drops a `File { file, subpath: None }` pointer at the viewport
-    // center. status: canvas-insert-from-vault
-    if ui.button("Insert from vault").clicked() {
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            pane.insert_picker.open();
+        // Insert from vault: open the autocomplete picker over notes + sources;
+        // a pick drops a `File { file, subpath: None }` pointer at the viewport
+        // center. status: canvas-insert-from-vault
+        if ui.button("Insert from vault\u{2026}").clicked() {
+            if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+                pane.insert_picker.open();
+            }
+            ui.close();
         }
-    }
-    let link_resp = ui.button("+ Link");
-    if link_resp.clicked() {
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            // Toggle the inline prompt: open with an empty draft, or close it.
-            pane.link_prompt = match pane.link_prompt {
-                Some(_) => None,
-                None => Some(String::new()),
-            };
+        // Open the inline link prompt anchored beneath the split-button.
+        if ui.button("Add link\u{2026}").clicked() {
+            if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+                pane.link_prompt = Some(String::new());
+            }
+            ui.close();
         }
-    }
-    if ui.button("+ Group").clicked() {
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            pane.view_widget.arm_group_draw();
+        if ui.button("Add group").clicked() {
+            if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+                pane.view_widget.arm_group_draw();
+            }
+            ui.close();
         }
+    });
+    // Primary `+`: mint a fresh vault note + pointer node. status: canvas-new-note
+    if add.primary_clicked {
+        super::new_note_on_canvas(app, tab_id);
     }
-    if ui.button("Fit").clicked() {
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            pane.fit_pending = true;
-        }
-    }
-    link_prompt(app, tab_id, &link_resp);
+    link_prompt(app, tab_id, &add.response);
     insert_from_vault(ui, app, tab_id);
 }
 
@@ -125,9 +298,13 @@ fn tool_toggle(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
 /// click. Backs the canvas/JSON view switch and the Select/Hand tool toggle so
 /// both read as icons rather than text. status: canvas-view-toggle
 fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, hover: &str) -> bool {
-    ui.add(egui::ImageButton::new(ICONS.image(icon)).selected(selected))
-        .on_hover_text(hover)
-        .clicked()
+    ui.add(
+        egui::ImageButton::new(ICONS.image(icon))
+            .selected(selected)
+            .corner_radius(crate::widgets::split_button::BUTTON_CORNER_RADIUS),
+    )
+    .on_hover_text(hover)
+    .clicked()
 }
 
 /// Drive one frame of the "Insert from vault" autocomplete picker. While the
@@ -178,8 +355,8 @@ fn file_node(rel: &str) -> hiker_canvas::model::Node {
     }
 }
 
-/// The inline `+ Link` URL prompt: a popup below the button with a text field +
-/// OK. On submit (non-empty, trimmed) it builds a `Link { url }` node and drops
+/// The inline "Add link" URL prompt: a popup below the split-button with a text
+/// field + OK. On submit (non-empty, trimmed) it builds a `Link { url }` node and drops
 /// it at the viewport center via `insert_node_centered`; Esc / click-outside
 /// closes it. The pane's `link_prompt` is the source of truth for open + draft;
 /// egui's `open_bool` mirrors it so click-outside closes cleanly.
@@ -302,10 +479,39 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
     // the full clip rect (which would include the header and let the view's
     // interaction surface cover the toolbar). Mirrors `CanvasView::show`.
     let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
-    if taken.fit_pending {
-        taken.view_widget.fit(viewport, &taken.canvas);
-        taken.fit_pending = false;
+    // Scroll mode (`[ui].canvas_scroll_mode`): drive the widget's pan-vs-zoom
+    // behavior. In PAN and AUTO a touchpad two-finger scroll pans the canvas, so
+    // claim its rect as a swipe-nav skip region — otherwise the same gesture would
+    // also fire back/forward navigation. ZOOM never pans, so swipe-nav stays live.
+    // status: canvas-scroll-mode
+    let scroll_mode = app
+        .vault_session
+        .config
+        .read()
+        .map(|c| c.ui.canvas_scroll_mode)
+        .unwrap_or_default();
+    taken.view_widget.set_scroll_mode(to_view_scroll_mode(scroll_mode));
+    if !matches!(scroll_mode, hiker_core::config::CanvasScrollMode::Zoom) {
+        app.session.nav.swipe_skip_rects.push(viewport);
     }
+    // A pending "snap to node" (opened from the "Appears in" sidebar) takes
+    // precedence over the one-shot fit: framing the whole board would undo the
+    // point of jumping to a specific node. status: canvas-appears-in
+    let focusing = app
+        .panels
+        .canvases
+        .get(&tab_id)
+        .is_some_and(|p| p.focus_note_pending.is_some());
+    if taken.fit_pending && !focusing {
+        taken.view_widget.fit(viewport, &taken.canvas);
+    }
+    taken.fit_pending = false;
+    // FOLLOW: when this canvas is linked to a source group, select + center the
+    // file-node referencing whatever note is active there. Deduped on `followed`
+    // so the camera only moves when the linked note changes — the user keeps free
+    // pan/zoom in between. status: tab-linking
+    apply_follow(app, tab_id, &mut taken, viewport);
+    apply_pending_focus(app, tab_id, &mut taken, viewport);
     // content seam: the real all-source content engine, behind the same
     // `NodeContentRenderer` trait. It resolves file-node paths against the vault
     // root and caches heavyweight per-node state (editor / htmlview panes) in a
@@ -321,9 +527,13 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
         .map(|(path, buf)| (path.clone(), buf.current_text()))
         .collect();
     let mut content = ContentRenderer::new(tab_id, app.vault_session.vault_root.clone(), live_text);
+    // The app owns the canvas right-click menus (the lean widget has no menu lib);
+    // it implements the widget's menu seam with `egui_workbench::menu`.
+    // status: ctxmenu-canvas
+    let mut menus = super::menu::CanvasMenus;
     let resp = taken
         .view_widget
-        .show(ui, &mut taken.canvas, &mut content);
+        .show(ui, &mut taken.canvas, &mut content, &mut menus);
 
     if !resp.committed.is_empty() {
         persist_canvas(app, path, &taken.canvas, &mut taken.last_parsed_text);
@@ -333,6 +543,43 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
     // or LOD placeholder opens in a tab). status: canvas-link-node-card, canvas-inline-edit
     if let Some(id) = resp.activated.clone() {
         activate_or_edit(ui, app, tab_id, &taken, &id, viewport);
+    }
+    // Enter inline-edit WITHOUT a double-click: a click-again on the already-sole-
+    // selected node (`resp.edit_requested`), or Enter / F2 on a single selected
+    // editable node. Gated on NOT already editing (and no host popup) — the canvas
+    // reads keys globally, so a Backspace/Enter inside the overlay must never
+    // re-trigger entry. status: canvas-inline-edit
+    let busy = app
+        .panels
+        .canvases
+        .get(&tab_id)
+        .is_some_and(|p| p.editing.is_some() || p.link_prompt.is_some());
+    let edit_target = if busy {
+        None
+    } else {
+        resp.edit_requested.clone().or_else(|| {
+            // Only treat Enter/F2 as "edit the selected node" when no widget owns
+            // the keyboard — else it would steal Enter from a focused field (e.g.
+            // the edge-label editor). The canvas surface surrenders focus each
+            // frame, so an idle canvas reports no focus.
+            if ui.memory(|m| m.focused().is_some()) {
+                return None;
+            }
+            let enter = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::F2)
+            });
+            if !enter {
+                return None;
+            }
+            let sel = taken.view_widget.selection();
+            (sel.edges.is_empty() && sel.nodes.len() == 1)
+                .then(|| sel.nodes.iter().next().cloned())
+                .flatten()
+        })
+    };
+    if let Some(id) = edit_target {
+        try_enter_edit(app, tab_id, &taken, &id, viewport);
     }
     // Context-menu verbs that need host-side UI: open the link prompt / vault
     // picker on the pane (the same state the toolbar drives). status: canvas-context-menu
@@ -380,21 +627,40 @@ fn activate_or_edit(
     id: &str,
     viewport: egui::Rect,
 ) {
+    // Double-click: enter inline-edit for an editable full-detail card, else
+    // activate (open a link / file pointer / LOD placeholder in a tab).
+    if !try_enter_edit(app, tab_id, taken, id, viewport) {
+        activate_node(ui, app, tab_id, &taken.canvas, id);
+    }
+}
+
+/// Enter inline-edit for node `id` iff it's an EDITABLE, full-detail (non-LOD)
+/// card. Returns whether it entered edit. The shared seam behind every way to
+/// start editing — double-click (`activate_or_edit`), click-again, and Enter/F2
+/// on the selected node — so all three behave identically and never edit a
+/// non-editable node. status: canvas-inline-edit
+fn try_enter_edit(
+    app: &mut AppState,
+    tab_id: TabId,
+    taken: &TakenDoc,
+    id: &str,
+    viewport: egui::Rect,
+) -> bool {
     use crate::panels::canvas::edit;
     let Some(node) = taken.canvas.nodes.iter().find(|n| n.id == id) else {
-        return;
+        return false;
     };
-    if edit::is_editable(node) && !taken.view_widget.is_node_lod(viewport, node) {
-        // Seed the edit overlay at the card's current scroll so clicking into a
-        // note keeps its position instead of jumping to the top.
-        let scroll = taken.view_widget.card_scroll(id);
-        edit::enter(tab_id, node, scroll);
-        if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
-            pane.editing = Some(id.to_string());
-        }
-    } else {
-        activate_node(ui, app, &taken.canvas, id);
+    if !(edit::is_editable(node) && !taken.view_widget.is_node_lod(viewport, node)) {
+        return false;
     }
+    // Seed the edit overlay at the card's current scroll so clicking into a note
+    // keeps its position instead of jumping to the top.
+    let scroll = taken.view_widget.card_scroll(id);
+    edit::enter(tab_id, node, scroll);
+    if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+        pane.editing = Some(id.to_string());
+    }
+    true
 }
 
 /// Decide whether the inline-edit overlay should render this frame and where.
@@ -459,6 +725,21 @@ fn render_edit_overlay(
     edit_rect: egui::Rect,
 ) {
     use crate::panels::canvas::edit;
+    // Clear "you're editing" affordance: a bright accent outline around the
+    // active overlay so inline-edit mode is unmistakable — distinct from the
+    // plain selection outline. Painted on a foreground layer so it sits above the
+    // card. status: canvas-inline-edit
+    ui.ctx()
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(("canvas-edit-outline", tab_id)),
+        ))
+        .rect_stroke(
+            edit_rect.expand(3.0),
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(2.0, theme::accent()),
+            egui::StrokeKind::Outside,
+        );
     let path_owned = path.to_string();
     let mut persist = move |app: &mut AppState, op: &hiker_canvas::ops::EditOp| {
         persist_text_edit(app, tab_id, &path_owned, op);
@@ -502,7 +783,7 @@ fn persist_text_edit(app: &mut AppState, tab_id: TabId, path: &str, op: &hiker_c
 /// file node's referenced vault file in a tab (routing `.canvas` to the canvas
 /// view, everything else through the standard open path). Other kinds (text /
 /// group) have no activation. status: canvas-link-node-card
-fn activate_node(ui: &egui::Ui, app: &mut AppState, canvas: &Canvas, id: &str) {
+fn activate_node(ui: &egui::Ui, app: &mut AppState, tab_id: TabId, canvas: &Canvas, id: &str) {
     use hiker_canvas::model::NodeKind;
     let Some(node) = canvas.nodes.iter().find(|n| n.id == id) else {
         return;
@@ -515,10 +796,74 @@ fn activate_node(ui: &egui::Ui, app: &mut AppState, canvas: &Canvas, id: &str) {
             if file.ends_with(".canvas") {
                 super::open(app, file);
             } else {
-                crate::editor_pane::open_file(app, file, /* sticky */ true);
+                // DRIVE: a linked target group opens the note there instead
+                // of this canvas's own preview/active slot. status: tab-linking
+                let target = app.tab_by_id(tab_id).and_then(|t| t.link.target);
+                match crate::editor_pane::drive_target_group(app, target) {
+                    Some(group) => {
+                        crate::editor_pane::open_file_in_group(app, file, group, true);
+                    }
+                    None => crate::editor_pane::open_file(app, file, /* sticky */ true),
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// FOLLOW seam: if this canvas tab links to a source group, resolve that
+/// group's active note and — when it changed since last frame — single-select
+/// and center the file-node referencing it. No-op when unlinked, when the
+/// followed note hasn't changed, or when no node references it.
+/// status: tab-linking
+fn apply_follow(app: &mut AppState, tab_id: TabId, taken: &mut TakenDoc, viewport: egui::Rect) {
+    use hiker_canvas::model::NodeKind;
+    let source = app.tab_by_id(tab_id).and_then(|t| t.link.source);
+    let Some(path) = crate::editor_pane::followed_note_path(app, source) else {
+        return;
+    };
+    let already = app
+        .panels
+        .canvases
+        .get(&tab_id)
+        .and_then(|p| p.followed.clone());
+    if already.as_deref() == Some(path.as_str()) {
+        return;
+    }
+    let node_id = taken.canvas.nodes.iter().find_map(|n| match &n.kind {
+        NodeKind::File { file, .. } if *file == path => Some(n.id.clone()),
+        _ => None,
+    });
+    if let Some(node_id) = node_id {
+        taken.view_widget.focus_node(viewport, &taken.canvas, &node_id);
+    }
+    if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
+        pane.followed = Some(path);
+    }
+}
+
+/// One-shot "snap to node" seam: when the pane carries a `focus_note_pending`
+/// (set by `canvas::open_focused` from the "Appears in" sidebar), single-select
+/// and center the file-node referencing that note, then clear the flag. No-op
+/// when nothing is pending or no node references the note. Mirrors `apply_follow`
+/// but fires once per request rather than tracking a linked group.
+/// status: canvas-appears-in
+fn apply_pending_focus(app: &mut AppState, tab_id: TabId, taken: &mut TakenDoc, viewport: egui::Rect) {
+    use hiker_canvas::model::NodeKind;
+    let Some(note) = app
+        .panels
+        .canvases
+        .get_mut(&tab_id)
+        .and_then(|p| p.focus_note_pending.take())
+    else {
+        return;
+    };
+    let node_id = taken.canvas.nodes.iter().find_map(|n| match &n.kind {
+        NodeKind::File { file, .. } if *file == note => Some(n.id.clone()),
+        _ => None,
+    });
+    if let Some(node_id) = node_id {
+        taken.view_widget.focus_node(viewport, &taken.canvas, &node_id);
     }
 }
 
@@ -553,35 +898,75 @@ fn put_pane_doc(app: &mut AppState, tab_id: TabId, taken: TakenDoc) {
     pane.fit_pending = taken.fit_pending;
 }
 
-/// Forward binding: re-serialize the live canvas to canonical JSON and persist
-/// it through the same op-log user-save path boards use (`op_writes::user_save`
-/// → minimal localized Yrs ops), so a node move is a mergeable, versioned,
-/// syncable edit. Skips the write when the serialization is unchanged. Also
-/// mirrors the new text into the shared buffer so the JSON view follows
-/// immediately, and updates `last_parsed_text` so the reverse binding doesn't
-/// re-parse our own write. status: canvas-oplog-binding
+/// Forward binding: re-serialize the live canvas to canonical JSON and mirror
+/// it into the op-log `working` layer — the SAME dirty/save model the text
+/// editor uses (`editor_binding::run`). A canvas edit becomes an uncommitted
+/// `working` edit (buffer DIRTY), not a write straight to `accepted`/disk; the
+/// fold to `accepted` + the `.canvas` rewrite + the peer poke all happen on
+/// Ctrl+S (`save_canvas_document`), exactly like a note save. Skips the write
+/// when the serialization is unchanged. Also keeps the shared buffer's editable
+/// text in lockstep so a flip to the JSON view shows the just-edited canvas, and
+/// updates `last_parsed_text` so the reverse binding doesn't re-parse our own
+/// write. status: canvas-oplog-binding
 fn persist_canvas(app: &mut AppState, path: &str, canvas: &Canvas, last_parsed_text: &mut String) {
     let json = canvas.to_canonical_json();
     if json == *last_parsed_text {
         return;
     }
+    let log = &app.vault_session.services.oplog;
+    let doc_id = match log.doc_id_for_path(path) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            app.push_toast(
+                format!("Canvas edit failed: no op-log document for {path}"),
+                ToastLevel::Error,
+            );
+            return;
+        }
+        Err(e) => {
+            app.push_toast(format!("Canvas edit failed: {e}"), ToastLevel::Error);
+            return;
+        }
+    };
+    // Mirror the serialized canvas into `working` so `materialize_working ==
+    // json` and the buffer reads DIRTY (`is_dirty()` is `hash(editor.doc) !=
+    // loaded_hash`; we set `editor.doc` to `json` below but DON'T advance
+    // `loaded_hash`, so it stays dirty until Ctrl+S commits). This is the
+    // canvas analogue of `editor_binding`'s forward step — there's no editor
+    // change set to walk (the canvas isn't a text widget), so we replace the
+    // full `working` span with the new JSON in one edit.
+    if let Err(e) = mirror_json_to_working(log, &doc_id, &json) {
+        app.push_toast(format!("Canvas edit failed: {e}"), ToastLevel::Error);
+        return;
+    }
     // Keep the shared buffer's editable text in lockstep so a flip to the JSON
-    // view shows the just-edited canvas. The buffer is clean (we route the
-    // change through the op-log, not the editor), so a later fs-event reload is
-    // a no-op against the same bytes.
+    // view shows the just-edited canvas. We DON'T touch `loaded_text` /
+    // `loaded_hash` — leaving them at the last-saved baseline is what makes
+    // `is_dirty()` true, lighting the tab dirty dot like a text buffer.
     if let Some(buf) = app.session.buffers.get_mut(path) {
         buf.set_doc_clamping_selection(&json);
     }
-    let result = hiker_core::ops::op_writes::user_save(
-        &app.vault_session.services.oplog,
-        &app.vault_session.vault,
-        path,
-        &json,
-    );
-    match result {
-        Ok(()) => *last_parsed_text = json,
-        Err(e) => app.push_toast(format!("Canvas save failed: {e}"), ToastLevel::Error),
-    }
+    *last_parsed_text = json;
+}
+
+/// Make `materialize_working(doc_id) == json` by replacing the whole current
+/// `working` span with `json` in one `apply_working_edit` (`working` is seeded
+/// from `accepted` on the first edit, so its length is the current materialized
+/// length). The canvas pure-binding step, factored out of [`persist_canvas`] so
+/// it runs against a plain `&OpLog` — testable end-to-end against a real op-log
+/// without an egui pane (`persist_canvas` itself is wired to `AppState` + the
+/// canvas widget). status: canvas-oplog-binding
+fn mirror_json_to_working(
+    log: &hiker_core::oplog::OpLog,
+    doc_id: &str,
+    json: &str,
+) -> Result<(), hiker_core::oplog::error::Error> {
+    // One atomic whole-span replace (`replace_working`) — NOT a length read
+    // followed by a separate `apply_working_edit`. With live dirty-buffer sync
+    // on, the autosave tick's `commit_working` clears `working` on its own
+    // cadence; reading the length and replacing across two locks could race it
+    // and tear the buffer. status: canvas-oplog-binding
+    log.replace_working(doc_id, json)
 }
 
 /// Handle Cmd/Ctrl+S while the Canvas view is active. Consumes the chord (so it
@@ -607,37 +992,56 @@ fn handle_canvas_save(ui: &egui::Ui, app: &mut AppState, tab_id: TabId, path: &s
     // If editing a File node, save that referenced note's buffer instead of the
     // canvas. (Text-node edits live in the `.canvas` itself, so they fall
     // through to the canvas-document save.)
+    // A File node in inline-edit mode holds its TEXT in the note, not the
+    // `.canvas` — save that note's buffer too (a no-op when it isn't dirty).
+    // But ALWAYS also commit the canvas document below: spatial edits (move /
+    // delete / edge) live in the canvas `working` layer regardless of which node
+    // is selected or inline-edited, so the save must never be diverted away from
+    // the canvas. status: canvas-inline-edit
     let editing_file = editing_file_path(app, tab_id);
-    if let Some(file) = editing_file {
-        if let Err(err) = crate::editor_pane::save_buffer(app, &file) {
+    if let Some(file) = &editing_file {
+        if let Err(err) = crate::editor_pane::save_buffer(app, file) {
             app.push_toast(format!("Save failed: {err}"), ToastLevel::Error);
-        } else {
-            app.push_toast(format!("Saved {file}"), ToastLevel::Info);
         }
-        return;
     }
+    tracing::info!(target: "hiker::canvas_save", path, editing = ?editing_file, "canvas Ctrl+S");
     save_canvas_document(app, path);
 }
 
-/// The vault path of the File node currently in inline-edit mode on this canvas
-/// tab, if any. `None` when nothing is editing, or the editing node is a Text
-/// node (which saves with the canvas document). status: canvas-inline-edit
+/// The vault path of the File node whose note a canvas Ctrl+S should ALSO save:
+/// the single SELECTED node, or (falling back) the node in inline-edit mode. A
+/// File node's TEXT lives in its `.md`, not the `.canvas`, so saving the canvas
+/// also flushes that note. Keying on SELECTION (not just inline-edit) is the fix
+/// for "click out of the editor, re-select the node, then save" — selecting it
+/// is enough. `None` for a Text node, a non-File / multi / empty selection with
+/// nothing inline-edited (then Ctrl+S just saves the canvas). status: canvas-inline-edit
 fn editing_file_path(app: &AppState, tab_id: TabId) -> Option<String> {
     use hiker_canvas::model::NodeKind;
     let pane = app.panels.canvases.get(&tab_id)?;
-    let editing = pane.editing.as_ref()?;
     let canvas = pane.canvas.as_ref()?;
-    let node = canvas.nodes.iter().find(|n| &n.id == editing)?;
+    // A single selected node takes precedence; otherwise the inline-edited node.
+    let sel = pane.view_widget.selection();
+    let id = if sel.edges.is_empty() && sel.nodes.len() == 1 {
+        sel.nodes.iter().next().cloned()
+    } else {
+        pane.editing.clone()
+    }?;
+    let node = canvas.nodes.iter().find(|n| n.id == id)?;
     match &node.kind {
         NodeKind::File { file, .. } if !file.trim().is_empty() => Some(file.clone()),
         _ => None,
     }
 }
 
-/// Commit the canvas document's op-log `working` layer to disk. Mirrors
-/// `editor_pane::save_buffer`'s commit path, but reaches for the canvas doc
-/// directly because the canvas buffer is kept clean (edits ride the op-log), so
-/// `save_buffer`'s dirty-gate would skip it. status: canvas-inline-edit
+/// Commit the canvas document's op-log `working` layer to disk — the canvas
+/// Ctrl+S, mirroring `editor_pane::save_buffer`'s commit path. The forward
+/// binding (`persist_canvas`) mirrors every spatial edit into `working`, so by
+/// the time the user saves, `commit_working` has real content to fold into
+/// `accepted` and rewrite the `.canvas` with. On a successful commit it advances
+/// the shared buffer's saved baseline (`loaded_text` / `loaded_hash`) to the
+/// committed JSON so `is_dirty()` clears (the tab dirty dot goes out), and pokes
+/// enrolled peers so the edit syncs — exactly like a note save.
+/// status: canvas-inline-edit
 fn save_canvas_document(app: &mut AppState, path: &str) {
     let log = &app.vault_session.services.oplog;
     let doc_id = match log.doc_id_for_path(path) {
@@ -651,8 +1055,44 @@ fn save_canvas_document(app: &mut AppState, path: &str) {
             return;
         }
     };
+    // The committed text is `materialize_working` — capture it before the commit
+    // folds + clears `working`, so the buffer's clean baseline matches exactly
+    // what landed on `accepted`/disk.
+    let committed = log.materialize_working(&doc_id).map(|c| c.text);
+    // Advance the buffer's saved baseline to the (just-)committed JSON so
+    // `is_dirty()` clears, like `save_buffer`. Without this the buffer's
+    // `editor.doc` (set to the edited JSON by `persist_canvas`) stays ahead of
+    // `loaded_hash` and the dirty dot never goes out. Safe whether or not the
+    // commit advanced `accepted` (on a no-op, working == accepted already).
+    let advance_baseline = |app: &mut AppState| {
+        if let Ok(text) = &committed {
+            let saved_hash = hiker_core::hash_string(text);
+            if let Some(buf) = app.session.buffers.get_mut(path) {
+                buf.loaded_text = text.clone();
+                buf.loaded_hash = saved_hash;
+            }
+        }
+    };
     match log.commit_working(&doc_id) {
-        Ok(_) => app.push_toast(format!("Saved {path}"), ToastLevel::Info),
+        Ok(true) => {
+            // A real commit advanced `accepted`. Clear dirty, poke enrolled peers
+            // to pull promptly (poke-on-commit), and confirm. status: sync-poke-on-commit
+            advance_baseline(app);
+            if let Some(sync) = &app.vault_session.services.sync {
+                sync.notify_local_change();
+            }
+            tracing::info!(target: "hiker::canvas_save", path, "canvas committed + poked");
+            app.push_toast(format!("Saved {path}"), ToastLevel::Info);
+        }
+        Ok(false) => {
+            // Nothing to commit — the canvas `working` already matched `accepted`
+            // (e.g. only an inline-edited note changed, or no spatial edit since
+            // the last save). Keep the baseline consistent, but do NOT poke or
+            // claim a save: a no-op must not masquerade as a synced change (that
+            // was the "saved but didn't sync" symptom).
+            advance_baseline(app);
+            tracing::info!(target: "hiker::canvas_save", path, "canvas save was a no-op (working == accepted)");
+        }
         Err(e) => app.push_toast(format!("Save failed: {e}"), ToastLevel::Error),
     }
 }
@@ -666,5 +1106,153 @@ fn render_parse_error(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, err:
     ui.add_space(6.0);
     if ui.button("Edit as JSON").clicked() {
         app.panels.canvases.entry(tab_id).or_default().view = ViewMode::Json;
+    }
+}
+
+#[cfg(test)]
+mod canvas_working_binding {
+    //! The canvas forward binding routed through the op-log `working` layer
+    //! (`canvas-oplog-binding`), driven against a *real* `OpLog` + `Vault` +
+    //! `Buffer` — no egui pane. `persist_canvas` itself is wired to `AppState`
+    //! and the canvas widget, so the model→json→`working` step is exercised via
+    //! the extracted [`super::mirror_json_to_working`] helper plus the real
+    //! `commit_working` Save path; the `is_dirty()` semantics are checked against
+    //! a real `Buffer` whose `editor.doc`/baseline mirror what `persist_canvas`
+    //! sets. The sync half (a committed canvas — including a node-DELETE — landing
+    //! on a peer in one settle) lives in `hiker-sync/tests/scenarios.rs`.
+
+    use std::sync::Arc;
+
+    use hiker_canvas::model::Canvas;
+    use hiker_core::oplog::OpLog;
+    use hiker_core::vault::Vault;
+    use tempfile::TempDir;
+
+    use super::mirror_json_to_working;
+    use crate::buffer::Buffer;
+
+    /// A real op-log-backed vault holding `board.canvas`, seeded from `initial`
+    /// on disk exactly as `bootstrap` does at vault open, plus the editable
+    /// `Buffer` the app opens over it.
+    struct Fixture {
+        td: TempDir,
+        log: Arc<OpLog>,
+        buffer: Buffer,
+        doc_id: String,
+    }
+
+    const PATH: &str = "board.canvas";
+
+    fn setup(initial: &str) -> Fixture {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join(PATH), initial).unwrap();
+        let vault = Vault::open(td.path()).unwrap();
+        let log = Arc::new(OpLog::open(td.path()).unwrap());
+        // The op-log bootstrap walk skips `.canvas` (it's not markdown-chunked,
+        // so `is_indexable_path` excludes it); the app seeds the canvas doc
+        // lazily on open via `ensure_doc` (in `ensure_vault_buffer_loaded`). Do
+        // the same so the doc exists with `meta.kind = "canvas"` before edits.
+        let doc_id =
+            hiker_core::ops::op_writes::ensure_doc(&log, &vault, PATH).unwrap();
+        let buffer = Buffer::with_config_and_vault(
+            PATH.to_string(),
+            initial,
+            hiker_core::hash_string(initial),
+            None,
+            None,
+        );
+        Fixture { td, log, buffer, doc_id }
+    }
+
+    impl Fixture {
+        /// Replay exactly what `persist_canvas` does to the editable buffer +
+        /// `working` for a live canvas edit: mirror the serialized JSON into
+        /// `working` and set `editor.doc` to it WITHOUT advancing the saved
+        /// baseline (so the buffer reads dirty).
+        fn edit(&mut self, canvas: &Canvas) -> String {
+            let json = canvas.to_canonical_json();
+            mirror_json_to_working(&self.log, &self.doc_id, &json).unwrap();
+            self.buffer.set_doc_clamping_selection(&json);
+            json
+        }
+
+        /// Replay `save_canvas_document`: commit `working` → `accepted`/disk and
+        /// advance the buffer's saved baseline so `is_dirty()` clears.
+        fn save(&mut self) {
+            let committed = self.log.materialize_working(&self.doc_id).unwrap().text;
+            assert!(self.log.commit_working(&self.doc_id).unwrap(), "a working commit");
+            self.buffer.loaded_hash = hiker_core::hash_string(&committed);
+            self.buffer.loaded_text = committed;
+        }
+
+        fn working(&self) -> String {
+            self.log.materialize_working(&self.doc_id).unwrap().text
+        }
+        fn accepted(&self) -> String {
+            self.log.materialize_accepted(&self.doc_id).unwrap().text
+        }
+        fn disk(&self) -> String {
+            std::fs::read_to_string(self.td.path().join(PATH)).unwrap()
+        }
+    }
+
+    /// A canvas with two file-pointer nodes, used as the starting document.
+    fn two_node_canvas() -> Canvas {
+        let json = r#"{
+  "nodes": [
+    {"id": "n1", "type": "file", "file": "a.md", "x": 0, "y": 0, "width": 300, "height": 200},
+    {"id": "n2", "type": "file", "file": "b.md", "x": 400, "y": 0, "width": 300, "height": 200}
+  ],
+  "edges": []
+}"#;
+        Canvas::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn edit_makes_working_dirty_accepted_unchanged_then_save_clears() {
+        // Canvas edit → `working` DIRTY; `accepted` unchanged; Ctrl+S folds
+        // `working` into `accepted` + writes the `.canvas`; `is_dirty()` clears.
+        let mut fx = setup("{\n  \"nodes\": [],\n  \"edges\": []\n}");
+        assert!(!fx.buffer.is_dirty(), "clean on open");
+        let accepted_before = fx.accepted();
+
+        // Move a node (here: drop in the two-node canvas via a full edit).
+        let canvas = two_node_canvas();
+        let json = fx.edit(&canvas);
+
+        assert!(fx.buffer.is_dirty(), "a canvas edit marks the buffer dirty");
+        assert_eq!(fx.working(), json, "materialize(working) == the new JSON");
+        assert_eq!(fx.accepted(), accepted_before, "accepted is untouched before Save");
+
+        fx.save();
+        assert!(!fx.buffer.is_dirty(), "Save clears dirty");
+        assert_eq!(fx.accepted(), json, "Save folded working into accepted");
+        assert_eq!(fx.disk(), json, "Save rewrote the .canvas on disk");
+    }
+
+    #[test]
+    fn deleting_a_node_is_a_normal_working_edit_committed_on_save() {
+        // The deletion-bug regression at the binding level: removing a node is a
+        // plain `working` edit that commits on the FIRST Save (no second change
+        // needed). Start with two nodes (committed), delete one, save once.
+        let mut fx = setup("{\n  \"nodes\": [],\n  \"edges\": []\n}");
+        let two = two_node_canvas();
+        let two_json = fx.edit(&two);
+        fx.save();
+        assert_eq!(fx.accepted(), two_json);
+
+        // Delete n2.
+        let mut one = two;
+        one.nodes.retain(|n| n.id != "n2");
+        let one_json = fx.edit(&one);
+        assert!(fx.buffer.is_dirty(), "delete marks dirty");
+        assert!(one_json.contains("n1") && !one_json.contains("n2"), "n2 removed from JSON");
+
+        // ONE save commits the delete — no second change required.
+        fx.save();
+        assert!(!fx.buffer.is_dirty());
+        assert_eq!(fx.accepted(), one_json, "the delete folded to accepted on the first Save");
+        assert_eq!(fx.disk(), one_json);
+        assert!(!fx.disk().contains("n2"), "the deleted node is gone from disk");
     }
 }

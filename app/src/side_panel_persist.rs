@@ -1,8 +1,9 @@
-//! Per-vault persistence of the workbench chrome: the primary side-panel
-//! accordion (which feature sections are open top-to-bottom, which are
-//! collapsed, their height weights, the focused section, and whether the
-//! bar is visible) plus the secondary side bar (Chat) and bottom status
-//! bar visibility, so the user's show/hide choices survive a restart.
+//! Per-window persistence of the workbench chrome: the side-panel
+//! placements across BOTH locations (the primary/left accordion and the
+//! secondary/right accordion) — which views are open, in what order,
+//! which are collapsed, their height weights — plus the focused section
+//! per side and the three visibility flags (left bar, right bar, bottom
+//! status bar), so the user's arrangement survives a restart.
 //!
 //! Stored as `.hiker/side-panel.json`. Decoupled from the editor dock
 //! layout (`layout.rs` / `.hiker/layout.json`) because the accordion
@@ -12,97 +13,147 @@
 
 use std::path::{Path, PathBuf};
 
+use egui_workbench::side_bar::Location;
 use serde::{Deserialize, Serialize};
 
+use crate::activity::split_view_id;
 use crate::state::AppState;
 
 /// Schema version. Bumped when the shape changes; unknown versions are
-/// ignored on load (the bar falls back to its default single section).
+/// ignored on load (the bootstrap default seed — Files/Context left,
+/// Agent right — stands instead, with no migration shim).
 ///
 /// v2: the activity `Mode` type changed from the `HikerMode` enum to the
-/// feature-id `String`, so the serialized section keys are now lowercase
-/// ids (`"files"`) instead of enum names (`"Files"`). A v1 file is
-/// treated as a version mismatch and reset to the default layout — no
-/// migration shim. [feature-consumer-activity-bar]
-const VERSION: u32 = 2;
+/// activity-id `String` (section keys became lowercase ids).
+///
+/// v3: the schema became a flat list of per-view `PlacementEntry`s
+/// spanning BOTH stacks (left + right), each carrying its `location`,
+/// `group` (container id), `order`, `collapsed`, and `weight`, plus a
+/// per-side focused view and the three visibility flags. A v2 (or v1)
+/// file is a version mismatch and resets to the bootstrap default — no
+/// migration shim, matching the v1→v2 approach. [feature-multi-region-sidebar]
+const VERSION: u32 = 3;
 
-/// Serializable snapshot of the accordion arrangement. Sections are keyed
-/// by feature id.
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
-pub struct SidePanelState {
-    pub version: u32,
-    /// Open sections, top to bottom.
-    pub sections: Vec<String>,
-    /// Which sections are collapsed (header only).
-    pub collapsed: Vec<String>,
-    /// Per-section height weights, parallel-ish to `sections`.
-    pub weights: Vec<(String, f32)>,
-    /// The focused section (drives the activity-bar highlight).
-    pub focused: Option<String>,
-    /// Whether the primary side bar is visible.
-    pub visible: bool,
-    /// Whether the secondary side bar (Chat) is visible. Defaults to
-    /// visible so pre-existing files (written before this field) keep the
-    /// historical always-shown behaviour rather than hiding the bar.
-    #[serde(default = "default_true")]
-    pub secondary_visible: bool,
-    /// Whether the bottom status bar is visible. Defaults to visible for
-    /// the same backward-compat reason as `secondary_visible`.
-    #[serde(default = "default_true")]
-    pub status_bar_visible: bool,
+/// One view's placement in the workbench chrome — the unit of the v3
+/// persistence schema. `location` partitions views between the left and
+/// right stacks; `group` keys the saved-group memory (the container id);
+/// `order`/`collapsed`/`weight` reproduce each stack's accordion
+/// arrangement. [feature-multi-region-sidebar]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PlacementEntry {
+    /// Wire `ViewId` (`"chat"`, `"context/backlinks"`, …).
+    pub view_id: String,
+    /// Which stack the view lives in.
+    pub location: Location,
+    /// The saved-group anchor this view belongs to (the container id).
+    pub group: String,
+    /// Position within its stack, top to bottom.
+    pub order: u32,
+    /// Whether the section is collapsed (header only).
+    pub collapsed: bool,
+    /// Relative height weight within its stack.
+    pub weight: f32,
 }
 
-fn default_true() -> bool {
-    true
+/// Serializable snapshot of the workbench chrome: every view's placement
+/// across both stacks plus per-side focus and the visibility flags.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SidePanelState {
+    pub version: u32,
+    /// All open views, both locations, flat. Partitioned by `location`
+    /// and sorted by `order` on restore.
+    pub placements: Vec<PlacementEntry>,
+    /// The focused view in the left (primary) stack.
+    pub left_focused: Option<String>,
+    /// The focused view in the right (secondary) stack.
+    pub right_focused: Option<String>,
+    /// Whether the primary (left) side bar is visible.
+    pub left_visible: bool,
+    /// Whether the secondary (right) side bar is visible.
+    pub right_visible: bool,
+    /// Whether the bottom status bar is visible.
+    pub status_bar_visible: bool,
 }
 
 fn state_path(vault_root: &Path) -> PathBuf {
     vault_root.join(".hiker/side-panel.json")
 }
 
+/// Collect one stack's open views into `PlacementEntry`s at the given
+/// location. Iterates `open_modes()` (ordered) so `order` and the result
+/// are deterministic frame-to-frame.
+fn capture_stack(
+    panels: &egui_workbench::side_panel_stack::SidePanelStack<String>,
+    location: Location,
+) -> Vec<PlacementEntry> {
+    let collapsed = panels.collapsed_modes();
+    panels
+        .open_modes()
+        .iter()
+        .enumerate()
+        .map(|(i, mode)| PlacementEntry {
+            view_id: mode.clone(),
+            location,
+            group: split_view_id(mode).0.to_string(),
+            order: i as u32,
+            collapsed: collapsed.contains(mode),
+            weight: panels.section_weight(mode),
+        })
+        .collect()
+}
+
 impl SidePanelState {
-    /// Snapshot the live workbench. Iterates `sections` (ordered) for the
-    /// weights so the result is deterministic and comparable frame-to-frame.
+    /// Snapshot the live workbench across both stacks. Deterministic
+    /// (ordered) so the result is comparable frame-to-frame for the
+    /// autosave dedup.
     fn capture(app: &AppState) -> Self {
-        let panels = &app.workbench.primary_panels;
-        let sections = panels.open_modes().to_vec();
-        let weights = sections
-            .iter()
-            .map(|m| (m.clone(), panels.section_weight(m)))
-            .collect();
-        // While reader view has temporarily hidden the chrome, the live
-        // workbench flags are all false; persist the user's underlying
-        // choices (snapshotted before reader view took over) so we don't
-        // write — and later restore — the transient all-hidden state.
-        let (primary, secondary, status) = if app.ui.reader_view_chrome_hidden {
-            (
-                app.ui.reader_view_prev_primary_visible,
-                app.ui.reader_view_prev_secondary_visible,
-                app.ui.reader_view_prev_status_visible,
-            )
-        } else {
-            (
-                app.workbench.primary_side_bar.visible,
-                app.workbench.secondary_side_bar.visible,
-                app.workbench.status_bar.visible,
-            )
-        };
+        let mut placements = capture_stack(&app.workbench.primary_panels, Location::LeftBar);
+        placements.extend(capture_stack(
+            &app.workbench.secondary_panels,
+            Location::RightBar,
+        ));
+        // Reader mode gates the chrome at render time only — it never
+        // mutates the `visible` flags — so the live workbench state always
+        // holds the user's true collapse choices and is safe to persist
+        // even while reader mode is active. [view-reader-mode]
         Self {
             version: VERSION,
-            collapsed: panels.collapsed_modes(),
-            weights,
-            focused: panels.focused().cloned(),
-            visible: primary,
-            secondary_visible: secondary,
-            status_bar_visible: status,
-            sections,
+            placements,
+            left_focused: app.workbench.primary_panels.focused().cloned(),
+            right_focused: app.workbench.secondary_panels.focused().cloned(),
+            left_visible: app.workbench.primary_side_bar.visible,
+            right_visible: app.workbench.secondary_side_bar.visible,
+            status_bar_visible: app.workbench.status_bar.visible,
         }
     }
 }
 
-/// Load the persisted arrangement and apply it to the workbench. No-op
-/// (keeping the caller's default single section) when the file is
-/// missing, unreadable, an unknown version, or has no sections.
+/// Apply the placements for one `location` to `panels`: filter the flat
+/// list, sort by `order`, then drive the stack's `restore`.
+fn restore_stack(
+    panels: &mut egui_workbench::side_panel_stack::SidePanelStack<String>,
+    placements: &[PlacementEntry],
+    location: Location,
+    focused: Option<String>,
+) {
+    let mut entries: Vec<&PlacementEntry> =
+        placements.iter().filter(|p| p.location == location).collect();
+    entries.sort_by_key(|p| p.order);
+    let sections: Vec<String> = entries.iter().map(|p| p.view_id.clone()).collect();
+    let collapsed: Vec<String> = entries
+        .iter()
+        .filter(|p| p.collapsed)
+        .map(|p| p.view_id.clone())
+        .collect();
+    let weights: Vec<(String, f32)> =
+        entries.iter().map(|p| (p.view_id.clone(), p.weight)).collect();
+    panels.restore(sections, collapsed, weights, focused);
+}
+
+/// Load the persisted arrangement and apply it to the workbench across
+/// both stacks. No-op — leaving the bootstrap default seed (Files/Context
+/// left, Agent right) in place — when the file is missing, unreadable, or
+/// an unknown version. Reset-on-mismatch, no migration shim.
 pub fn restore(app: &mut AppState, vault_root: &Path) {
     let Ok(bytes) = std::fs::read(state_path(vault_root)) else {
         return;
@@ -114,17 +165,23 @@ pub fn restore(app: &mut AppState, vault_root: &Path) {
             return;
         }
     };
-    if saved.version != VERSION || saved.sections.is_empty() {
+    if saved.version != VERSION {
         return;
     }
-    app.workbench.primary_panels.restore(
-        saved.sections.clone(),
-        saved.collapsed.clone(),
-        saved.weights.clone(),
-        saved.focused.clone(),
+    restore_stack(
+        &mut app.workbench.primary_panels,
+        &saved.placements,
+        Location::LeftBar,
+        saved.left_focused.clone(),
     );
-    app.workbench.primary_side_bar.visible = saved.visible;
-    app.workbench.secondary_side_bar.visible = saved.secondary_visible;
+    restore_stack(
+        &mut app.workbench.secondary_panels,
+        &saved.placements,
+        Location::RightBar,
+        saved.right_focused.clone(),
+    );
+    app.workbench.primary_side_bar.visible = saved.left_visible;
+    app.workbench.secondary_side_bar.visible = saved.right_visible;
     app.workbench.status_bar.visible = saved.status_bar_visible;
     let focused = app.workbench.primary_panels.focused().cloned();
     app.workbench.activity_bar.set_active(focused);
@@ -134,9 +191,9 @@ pub fn restore(app: &mut AppState, vault_root: &Path) {
 }
 
 impl AppState {
-    /// Persist the accordion arrangement if it changed since the last
-    /// write. Cheap: a small JSON, gated on a value compare. Called from
-    /// the autosave tick.
+    /// Persist the chrome arrangement if it changed since the last write.
+    /// Cheap: a small JSON, gated on a value compare. Called from the
+    /// autosave tick.
     pub fn persist_side_panel(&mut self) {
         let current = SidePanelState::capture(self);
         if self.session.side_panel_saved.as_ref() == Some(&current) {
@@ -153,5 +210,76 @@ impl AppState {
             }
             Err(err) => tracing::debug!(error = %err, "side-panel serialize failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_workbench::side_panel_stack::SidePanelStack;
+
+    /// A two-location arrangement (Files+Context left, Agent right, one
+    /// collapsed section, custom weights) round-trips through
+    /// serialize → deserialize → restore byte-for-byte at the
+    /// placement/focus/visibility level.
+    #[test]
+    fn v3_round_trips_both_stacks() {
+        // Build the "saved" state directly (avoids needing a full
+        // AppState): Files+Context left (Context collapsed, custom
+        // weights), Agent right.
+        let saved = SidePanelState {
+            version: VERSION,
+            placements: vec![
+                PlacementEntry {
+                    view_id: "files".into(),
+                    location: Location::LeftBar,
+                    group: "files".into(),
+                    order: 0,
+                    collapsed: false,
+                    weight: 2.5,
+                },
+                PlacementEntry {
+                    view_id: "context/backlinks".into(),
+                    location: Location::LeftBar,
+                    group: "context".into(),
+                    order: 1,
+                    collapsed: true,
+                    weight: 0.5,
+                },
+                PlacementEntry {
+                    view_id: "chat".into(),
+                    location: Location::RightBar,
+                    group: "chat".into(),
+                    order: 0,
+                    collapsed: false,
+                    weight: 1.0,
+                },
+            ],
+            left_focused: Some("files".into()),
+            right_focused: Some("chat".into()),
+            left_visible: true,
+            right_visible: false,
+            status_bar_visible: true,
+        };
+
+        let bytes = serde_json::to_vec_pretty(&saved).unwrap();
+        let back: SidePanelState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved, back);
+
+        // Drive the restore helpers against fresh stacks and confirm each
+        // location reproduces its arrangement.
+        let mut left = SidePanelStack::<String>::new();
+        let mut right = SidePanelStack::<String>::new();
+        restore_stack(&mut left, &back.placements, Location::LeftBar, back.left_focused.clone());
+        restore_stack(&mut right, &back.placements, Location::RightBar, back.right_focused.clone());
+
+        assert_eq!(left.open_modes(), &["files".to_string(), "context/backlinks".to_string()]);
+        assert_eq!(left.collapsed_modes(), vec!["context/backlinks".to_string()]);
+        assert_eq!(left.section_weight(&"files".to_string()), 2.5);
+        assert_eq!(left.section_weight(&"context/backlinks".to_string()), 0.5);
+        assert_eq!(left.focused(), Some(&"files".to_string()));
+
+        assert_eq!(right.open_modes(), &["chat".to_string()]);
+        assert_eq!(right.focused(), Some(&"chat".to_string()));
     }
 }
