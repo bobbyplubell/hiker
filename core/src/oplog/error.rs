@@ -1,8 +1,8 @@
 //! Error type for the op-log substrate. All failure modes the `OpLog`
-//! surface can hit — SQLite, filesystem, Yrs update decode/apply, JSON
-//! (de)serialization of the pending queue, bincode of the history frames,
-//! and the fail-loud schema-version guard — funnel through one enum so
-//! consumers match per-variant the same way they do for `StoreError`.
+//! surface can hit — SQLite, filesystem, JSON (de)serialization of the pending
+//! queue, bincode of the history frames, and the fail-loud schema-version
+//! guard — funnel through one enum so consumers match per-variant the same way
+//! they do for `StoreError`.
 
 use std::io;
 
@@ -18,10 +18,6 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("history-frame encode/decode: {0}")]
     Bincode(#[from] bincode::Error),
-    /// A serialized Yrs update failed to decode (corruption) or failed to
-    /// apply against the target Doc. Carries the doc id for correlation.
-    #[error("yrs update for doc {doc_id}: {message}")]
-    YrsUpdate { doc_id: String, message: String },
     /// The `old_str` anchor of a producer edit did not resolve to exactly
     /// one byte range in `materialize(accepted)`. Distinguishes "no match"
     /// from "multiple matches without replace_all" via the message.
@@ -36,9 +32,9 @@ pub enum Error {
     /// No pending op with the given id exists in the queue.
     #[error("unknown pending op: {0}")]
     UnknownPendingOp(String),
-    /// `accept_pending` refused because the op's Yrs update was produced
-    /// against `accepted + the session's prior pending ops` (the fallback
-    /// path in `stage_pending`), and at least one of those predecessor ops
+    /// `accept_pending` refused because the op's edit was produced against
+    /// `accepted + the session's prior pending ops` (the fallback path in
+    /// `stage_pending`), and at least one of those predecessor ops
     /// is still pending — accepting this op alone would land a drifted
     /// update against positions the predecessor establishes. The user must
     /// accept (or reject) the listed predecessor(s) first. Local-only:

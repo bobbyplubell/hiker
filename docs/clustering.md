@@ -111,7 +111,7 @@ The current `Params` set (`core::cluster::Params`):
 - **`summary_confidence_threshold`** — marks below-threshold clusters "uncertain" in the review surface.
 - **`include_outliers`** — force-routes outliers at the top-level Split when false.
 - **`min_clusters_to_recurse`** — a dead field, retained as `#[serde(skip_serializing)]` (no longer read; superseded by the per-branch leaf conditions). Persisted trees that carry it deserialize fine and the value is ignored; new saves don't write it.
-- **Leiden knobs** (`LeidenParams`) — detailed in §"Leiden"; the recipe's first Split substitutes `top_level_resolution` (default `0.3`) for `resolution` (default `1.0`) to get 3–8 broad top-level clusters. [cluster-leiden-params]
+- **Leiden knobs** (`LeidenParams`) — detailed in §"Leiden"; the recipe's first Split substitutes `top_level_resolution` (default `1.0`) for `resolution` (default `1.0`) on the virtual-root cut. The review-tab γ slider drives `top_level_resolution` directly, and the recipe escalates it automatically if the cut collapses to a single community (§"Leiden"). [cluster-leiden-params]
 
 PLANNED (`bug-clustering-params-spec-drift`): a `representation` param (centroid / summary / lexical, §"Representation"); a `max_depth` recursion cap promoted from a build-time const (`build/mod.rs`) to a `Params` field; the `RecursionMode` enum and `SummarizeMode::Extractive` (above).
 
@@ -131,6 +131,8 @@ The stream is owned by `core::cluster` and consumed through a channel-shaped int
 
 The LLM summarization pass (Summarize op) is async via the task queue (`cluster-op-summarize-sweep`) and not part of this stream — structural and naming are separate operations with separate progress surfaces.
 
+**Live preview.** Once a first Run has loaded the note set, the review tab re-runs the structural pass automatically (debounced) whenever a config knob changes, so tuning is interactive rather than click-Run-and-wait. Three caches keep this cheap: the resolved inputs (vault walk + per-note embeddings) are held in memory keyed by scope so tweaks don't re-hit SQLite; the top-level Leiden kNN graph is cached and reused so re-tuning γ / `min_cluster_size` skips the O(n²) sweep (the partitioner is split into `build_leiden_graph` + `leiden_communities` for exactly this — the build returns the graph it used in `BuildEvent::Done { top_graph }`, validated against `k_nearest` / `edge_weight_floor` before reuse); and a per-algorithm note-count gate auto-disables live preview on large vaults (Leiden tolerates a high cap because its γ re-tune is graph-cached; HDBSCAN re-partitions from scratch so it gets a tighter one). [cluster-review-tab-live-preview]
+
 
 ## Note embeddings input
 
@@ -149,7 +151,9 @@ Empty notes (no chunks) are excluded from clustering — they land in the "inbox
 
 ### Leiden (default)
 
-Modularity-optimization community detection over a kNN cosine-similarity graph. Every node lands in some community; small communities (below `min_cluster_size`) post-flag as outliers. Default because loose `bge-small` embeddings often give HDBSCAN 0–1 cohesive clusters plus everything-as-outliers, while Leiden produces 5–20 communities; γ is a direct granularity knob (coarse `top_level_resolution` `0.3` / finer `resolution` `1.0`). [cluster-leiden]
+Modularity-optimization community detection over a kNN cosine-similarity graph. Every node lands in some community; small communities (below `min_cluster_size`) post-flag as outliers. Default because loose `bge-small` embeddings often give HDBSCAN 0–1 cohesive clusters plus everything-as-outliers, while Leiden produces 5–20 communities; γ is a direct granularity knob (`resolution` / `top_level_resolution`, both default `1.0`). [cluster-leiden]
+
+**Why γ defaults to `1.0`, not a coarser value.** The RB quality of a single all-notes community is `Q_single = m·(1 − 2γ)` (with `m` = total edge weight). For any `γ < 0.5` that is positive, so on a dense kNN graph the one-giant-community partition is the optimum and the top-level Split collapses to a single community — which the recipe then rejects as `VaultTooSmall`. An earlier `top_level_resolution = 0.3` default hit this on essentially every vault. Two guards keep it from recurring: the default sits at the modularity-equivalent `1.0` (where `Q_single = −m < 0`, so any non-trivial split wins), and the recipe **escalates** γ geometrically (×1.6, up to 4 retries) whenever a top-level cut still yields fewer than 2 communities before surfacing the error. [cluster-leiden, cluster-build-recipe]
 
 Pipeline: [cluster-leiden-knn-graph]
 
@@ -164,8 +168,8 @@ Tunables: [cluster-leiden-params]
 
 - `k_nearest` — number of nearest neighbors per node. Default `15`. Smaller = sparser graph = more, smaller communities; larger = denser graph = fewer, bigger communities. Clamped to `n-1` so it doesn't ask for more neighbors than exist.
 - `edge_weight_floor` — minimum cosine similarity for a kNN edge to survive. Default `0.0` (keep every kNN edge). Raise to strip weak neighbor links and tighten community boundaries.
-- `resolution` (γ) — Reichardt-Bornholdt resolution parameter on sub-splits. Default `1.0`. γ > 1 biases toward finer / more communities; γ < 1 toward coarser / fewer.
-- `top_level_resolution` — γ override for the *first* Split call against the virtual root (when Split is invoked from the build recipe). Default `0.3` — explicitly coarser than `resolution` to produce 3–8 broad top-level clusters that the recursive sub-splits drill into. Ignored when Split is invoked on a non-virtual target.
+- `resolution` (γ) — Reichardt-Bornholdt resolution parameter on sub-splits. Default `1.0`. γ > 1 biases toward finer / more communities; γ < 1 toward coarser / fewer. The review-tab "Resolution (γ)" slider sets both this and `top_level_resolution`.
+- `top_level_resolution` — γ for the *first* Split call against the virtual root (when Split is invoked from the build recipe). Default `1.0`. The build recipe escalates this value automatically (×1.6, up to 4 retries) when a cut produces fewer than 2 communities, so a too-low value self-corrects rather than aborting the build. Ignored when Split is invoked on a non-virtual target.
 - `iterations` — cap on Leiden refinement iterations (`LeidenConfig.max_iterations`). Default `100`. Algorithm converges fast; the cap is a safety rail.
 - `min_cluster_size` — minimum community size; smaller communities flag as outliers. Default `2`.
 

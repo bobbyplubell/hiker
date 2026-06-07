@@ -6,27 +6,28 @@
 //! canvas appears in the existing `TabKind::Canvas` tab. No new tab kind:
 //! this is a list-only summon of the canvas-tab machinery. The listing is
 //! read fresh each frame, so the activity carries no real state; the
-//! zero-field `State` marker keeps the registry's `with_ctx` seam uniform.
+//! zero-field `State` marker keeps the registry's `AppCtx::session` seam uniform.
 
 use eframe::egui;
 
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::icons;
 use hiker_theme as theme;
 
 /// Per-activity UI state for the Canvases sidebar. The view is
 /// effectively stateless — the listing is read fresh from disk each frame
-/// — but the registry's `with_ctx` hands every activity a `&mut dyn Any`
+/// — but the registry's `AppCtx::session` hands every activity a `&mut dyn Any`
 /// state slice, so a zero-field marker keeps the seam uniform. Owned by
 /// `AppState::canvases_activity_state` (top-level, per
 /// `feature-state-ownership`).
 #[derive(Default)]
 pub struct State;
 
-/// Render the canvas listing through the narrow activity `Ctx`. Each row
+/// Render the canvas listing through the narrow activity `SurfaceCtx`. Each row
 /// is a clickable title; clicking queues `panels::canvas::open` via
 /// `ctx.defer` (opening a tab needs full `&mut AppState`).
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let canvases = crate::panels::canvas::list_canvases(ctx.vault);
 
     if canvases.is_empty() {
@@ -89,7 +90,7 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// from disk and defers opening to `&mut AppState`.
 pub struct CanvasActivity;
 
-impl Activity for CanvasActivity {
+impl Activity<dyn AppCtx> for CanvasActivity {
     fn id(&self) -> &'static str {
         "canvases"
     }
@@ -99,18 +100,22 @@ impl Activity for CanvasActivity {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Canvas)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&CanvasListView]
     }
 }
 
 struct CanvasListView;
 
-impl View for CanvasListView {
+impl View<dyn AppCtx> for CanvasListView {
     fn id(&self) -> &'static str {
         "canvases"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         egui::ScrollArea::vertical()
             .id_salt("panel-canvases-body")
             .auto_shrink([false, false])

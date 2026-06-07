@@ -13,7 +13,7 @@ use hiker_core::chunker::Chunk;
 use hiker_core::config::sections::{McpAuditConfig, McpConfig, McpToolsConfig};
 use hiker_core::embed::{Error, Embedder};
 use hiker_core::indexer::{start as start_indexer, Handle};
-use hiker_core::store::dto::{new_id, NoteUpsert};
+use hiker_core::store::dto::NoteUpsert;
 use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 use hiker_core::watcher::Watcher;
@@ -295,7 +295,7 @@ async fn board_get_returns_columns_and_cards() {
     })).await;
     let s = structured(&resp);
     assert_eq!(s["rel_path"], "boards/roadmap.md");
-    // board_id comes from op-log's path→doc_id mapping (`store-id-from-oplog`),
+    // board_id comes from op-log's path→doc_id mapping (`store-path-is-identity`),
     // not the frontmatter `hiker.id`. The seeded id is a fresh ULID; just
     // assert presence.
     let expected_id = b.oplog.doc_id_for_path("boards/roadmap.md").unwrap().unwrap();
@@ -360,7 +360,6 @@ async fn get_note_snippet_uses_indexed_chunk() {
     // handle (fine for tests; in prod the indexer owns the writer).
     {
         let mut s = b.read_store.lock().unwrap();
-        let id = new_id();
         let chunk = Chunk {
             index: 0,
             byte_start: 0,
@@ -369,7 +368,6 @@ async fn get_note_snippet_uses_indexed_chunk() {
             heading_path: Some("Setup > Database".into()),
         };
         s.upsert_note(&NoteUpsert {
-            id: &id,
             path: "a.md",
             content_hash: "h",
             mtime: 1,
@@ -674,9 +672,7 @@ async fn search_top_k_clamped_by_max_top_k() {
     {
         let mut s = b.read_store.lock().unwrap();
         for i in 0..5 {
-            let id = new_id();
             s.upsert_note(&NoteUpsert {
-                id: &id,
                 path: &format!("note{i}.md"),
                 content_hash: "h",
                 mtime: 1,

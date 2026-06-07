@@ -30,7 +30,9 @@ use crate::errors::HikerError;
 mod io;
 mod patch;
 pub mod sections;
+pub mod vcs;
 
+use vcs::GitSection;
 use sections::{
     AcpConfig, BoardsConfig, ChatConfig, ClusteringConfig, EditorConfig, InboxConfig,
     IndexingConfig, LlmConfig, McpConfig, OpLogConfig, RenderConfig, SearchConfig, SuggestionsConfig,
@@ -104,6 +106,9 @@ pub struct Config {
     /// status: sync-config-section
     #[serde(default)]
     pub sync: SyncSection,
+    /// status: git-config-section
+    #[serde(default)]
+    pub git: GitSection,
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
     /// status: trail-draft-from-clustering
@@ -249,6 +254,7 @@ impl Default for Config {
             acp: AcpConfig::default(),
             op_log: OpLogConfig::default(),
             sync: SyncSection::default(),
+            git: GitSection::default(),
             suggestions: SuggestionsConfig::default(),
             clustering: ClusteringConfig::default(),
             inbox: InboxConfig::default(),

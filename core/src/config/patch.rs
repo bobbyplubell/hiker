@@ -102,6 +102,12 @@ impl EligibleKey {
             (ValueType::SyncMode, J::String(s)) => {
                 matches!(s.as_str(), "peer" | "server" | "both")
             }
+            (ValueType::SyncTransport, J::String(s)) => {
+                matches!(s.as_str(), "libp2p" | "git" | "none")
+            }
+            (ValueType::GitMode, J::String(s)) => {
+                matches!(s.as_str(), "integrated" | "manual")
+            }
             (ValueType::CanvasScrollMode, J::String(s)) => {
                 matches!(s.as_str(), "auto" | "pan" | "zoom")
             }
@@ -237,12 +243,16 @@ pub(super) enum ValueType {
     MinimapBarGap,
     /// Editor scroll-wheel multiplier: `0.25..=10.0`.
     ScrollSpeed,
-    /// `[op-log] compact_threshold` — Yrs-snapshot size multiple over the
-    /// materialized content size that triggers compaction. `1.0..=64.0`
+    /// `[op-log] compact_threshold` — vestigial size multiple over the
+    /// materialized content size that once triggered compaction. `1.0..=64.0`
     /// (a multiple below 1.0 would compact constantly).
     CompactThreshold,
     /// `peer | server | both` for `[sync] mode`. status: sync-config-section.
     SyncMode,
+    /// `libp2p | git | none` for `[sync] transport`. status: sync-transport-seam.
+    SyncTransport,
+    /// `integrated | manual` for `[git] mode`. status: git-config-section.
+    GitMode,
 }
 
 pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
@@ -408,6 +418,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // content key + per-device private key) are user-scope and never
     // appear here — the same posture as `[llm].api_key`.
     EligibleKey { path: "sync.enabled",                     ty: ValueType::Bool },
+    // status: sync-transport-seam
+    EligibleKey { path: "sync.transport",                   ty: ValueType::SyncTransport },
     EligibleKey { path: "sync.mode",                        ty: ValueType::SyncMode },
     EligibleKey { path: "sync.server_url",                  ty: ValueType::String },
     EligibleKey { path: "sync.discovery",                   ty: ValueType::Bool },
@@ -418,6 +430,15 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     // from handshakes (seeded from config), not user-set, so it is not an
     // eligible write key.
     EligibleKey { path: "sync.device_name",                 ty: ValueType::String },
+    // status: git-config-section
+    // [git] is per-vault — configures the git transport when
+    // `[sync].transport = "git"`. Credentials never live here (the user's git
+    // credential helper / SSH agent supplies them), so no secret keys appear.
+    EligibleKey { path: "git.mode",                         ty: ValueType::GitMode },
+    EligibleKey { path: "git.remote",                       ty: ValueType::String },
+    EligibleKey { path: "git.auto_commit",                  ty: ValueType::Bool },
+    EligibleKey { path: "git.commit_debounce_ms",           ty: ValueType::NonNegativeInt },
+    EligibleKey { path: "git.gc_interval_days",             ty: ValueType::NonNegativeInt },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },

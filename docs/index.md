@@ -13,14 +13,14 @@ Brute-force search over sqlite-vec is fine at this scale (10k–500k chunks); on
 
 Schema (initial) — three tables:
 
-- **`notes`** (one row per indexed file): `id` PK, `path` (vault-relative, unique), `content_hash` (blake3 of body, skip re-embed if unchanged), `mtime` (cheap pre-check before hashing), `size`, `indexed_at`, `embedder_version` (forces re-embed on model change), `note_embedding` (packed-f32 mean-pool of chunk embeddings, lazy, per `cluster-note-embeddings`).
-- **`chunks`** (one row per chunk): `id` = `"<note_id>:<chunk_index>"`, `note_id` FK → `notes(id)` ON DELETE CASCADE, `chunk_index` (0-based, contiguous), `byte_start` / `byte_end`, `text` (chunk content, for snippets), `heading_path` (e.g. `"Setup > Database"` or NULL), `UNIQUE(note_id, chunk_index)`.
-- **`chunk_vecs`** (vec0 virtual table, one row per chunk): `chunk_id` PK, `embedding FLOAT[N]` where `N` is filled at CREATE time from the loaded embedder's `dim()` (384 bge-small / 768 embedding-gemma-300m / 1024 bge-m3 — see "Dim-from-model").
+- **`notes`** (one row per indexed file): `path` PK (vault-relative — the note's identity), `content_hash` (blake3 of body, skip re-embed if unchanged), `mtime` (cheap pre-check before hashing), `size`, `indexed_at`, `embedder_version` (forces re-embed on model change), `note_embedding` (packed-f32 mean-pool of chunk embeddings, lazy, per `cluster-note-embeddings`).
+- **`chunks`** (one row per chunk): `note_path` FK → `notes(path)` ON DELETE CASCADE ON UPDATE CASCADE (a rename re-keys the chunks with the note), `chunk_index` (0-based, contiguous), `byte_start` / `byte_end`, `text` (chunk content, for snippets), `heading_path` (e.g. `"Setup > Database"` or NULL), `PRIMARY KEY (note_path, chunk_index)`. The vec-join key is `"<note_path>:<chunk_index>"`.
+- **`chunk_vecs`** (vec0 virtual table, one row per chunk): `chunk_id` PK (= `"<note_path>:<chunk_index>"`), `embedding FLOAT[N]` where `N` is filled at CREATE time from the loaded embedder's `dim()` (384 bge-small / 768 embedding-gemma-300m / 1024 bge-m3 — see "Dim-from-model").
 
 Notes:
 
 - `chunks.text` is duplicated from the source file for snippet rendering and to decouple the index from filesystem reads on every query.
-- **`notes.id` is op-log's `doc_id` for this path** — one ULID per document, minted by op-log on first ingest. The indexer reads it from op-log's `doc-index.db` (`oplog::doc_id_for_path`) when upserting; it never mints its own. This is why there is no separate `path_ids` table: the authoritative path↔id mapping lives in op-log, renames update it there, the id never changes. [store-id-from-oplog]
+- **A note's identity is its vault path** — `notes.path` is the primary key; there is no minted document id, no `doc_id`, no `doc-index.db`, and no `path_ids` table (`op-log-path-identity`). A rename is a path update — an observed content-preserving move (`op-log-observed-move`) — handled by `rename_note` (Renames, below), which updates the `notes.path` PK and cascades to `chunks.note_path`; because `content_hash` is unchanged across a pure rename, the move never triggers re-embed. [store-path-is-identity]
 - Schema version pragma (`PRAGMA user_version = N`) so future migrations have a hook.
 
 **Static linking.** Both SQLite itself and the sqlite-vec extension are statically linked into the Hiker binary — `rusqlite` with the `bundled` feature compiles the SQLite C source in, and the `sqlite-vec` crate compiles the vec extension's C source in via its `cc` build-script. No system libsqlite3 dependency, no runtime extension load, no separate `vec0.so` to ship. One binary, no surprises across OS/distro versions. [store-sqlite-vec-static]
@@ -47,7 +47,7 @@ v1 is permissive about what's already in the user's vault. No "init" step rewrit
 
 **Non-markdown files are silently ignored.** PDFs, images, audio, office docs, code files — all sit in the vault untouched. The indexer doesn't error, doesn't warn, doesn't produce sidecars. They aren't searchable until the extractor pipeline lands (`design.md` extractor section, v4+). A mixed-content folder gets a working v1 over its markdown subset on day one.
 
-**Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. The path→id table in the store is the authoritative id source in v1; the `hiker.id` field in frontmatter only starts being written when an explicit user action requires a stable id in the file itself (creating a wikilink target, pinning a trail waypoint, etc.) — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, other markdown apps, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
+**Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. Identity is the vault path (`op-log-path-identity`), so the index needs no id written into the file; the `hiker.id` field in frontmatter only starts being written if an explicit user action ever requires a stable in-file id — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, other markdown apps, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
 
 
 ## Chunking (v1)
@@ -62,7 +62,7 @@ Heading-bounded splits over the markdown AST, with a soft size cap.
 
 `heading_path` is the breadcrumb (`"Section > Subsection"`) of the heading whose body the chunk falls under, or `NULL` for content above any heading. Not used for v1 ranking; stored for future use (snippet rendering, structural index). [chunker-heading-path]
 
-`chunk_index` is contiguous and 0-based per note. The chunk id `<note_id>:<idx>` is stable as long as a note's chunk count and order don't change. Edits invalidate ids — fine for v1; agent stable-reference concerns (`design.md` MCP section) are an MCP-era problem.
+`chunk_index` is contiguous and 0-based per note. The chunk id `<note_path>:<idx>` is stable as long as a note's chunk count and order don't change. Edits invalidate ids — fine for v1; agent stable-reference concerns (`design.md` MCP section) are an MCP-era problem.
 
 
 ## Embedder
@@ -135,7 +135,7 @@ read file → compute blake3 hash → if hash matches notes.content_hash AND
                                                    of the new chunk embeddings →
                                                    notes.note_embedding
                                                  upsert notes row
-                                                 delete old chunks + vecs for note_id
+                                                 delete old chunks + vecs for note_path
                                                  insert new chunks + vecs
                                                COMMIT
          → emit indexer-progress events
@@ -146,7 +146,7 @@ The note-level pool is computed and persisted in the same transaction as the chu
 
 Deletes: cascade via the FK on `chunks`; vec rows cleaned up explicitly (vec0 has no FK enforcement). [ingest-delete-cascade]
 
-Renames: detected by the watcher's rename event when available; otherwise inferred (delete + create within a small window with matching content hash → rename, preserve id). v1 starts with the simple version: rely on notify's rename events on Linux/macOS, fall back to "treat as delete + create with new ulid" on Windows or when events arrive non-paired. [ingest-rename-preserve-id]
+Renames: a rename is a path update, since identity is the path (`op-log-path-identity`). `rename_note` rewrites `notes.path` (and the derived `chunks` rows) for an observed content-preserving move (`op-log-observed-move`); `content_hash` is unchanged, so no chunk is re-embedded. Detection follows op-log: the watcher's rename event when available, otherwise inferred from a delete + create within a small window with matching content hash. When events arrive non-paired and similarity can't bridge it, the index simply drops the old path and indexes the new one — no identity is lost because there was none to preserve, only the cached embeddings are recomputed. [ingest-rename-preserve-id]
 
 Concurrency:
 
@@ -161,15 +161,15 @@ The v1 panel: open a note, list the top N notes whose chunks are most similar.
 
 Algorithm:
 
-1. Look up `note_id` from path. If the note has no chunks (empty or unindexed), panel is empty.
+1. Look up the note by path. If it has no chunks (empty or unindexed), panel is empty.
 2. Fetch all of this note's chunk embeddings.
 3. For each one, KNN search the `chunk_vecs` table for top 20 nearest *excluding* chunks belonging to the same note.
-4. Group hits by their `note_id`; score each candidate note as `max(similarity)` across its hit chunks.
+4. Group hits by their `note_path`; score each candidate note as `max(similarity)` across its hit chunks.
 5. Return top 10 notes by score, with: title (filename stem until frontmatter parsing lands), path, score, best-matching chunk's `heading_path` and a short snippet. [related-notes-query, related-notes-snippet]
 
 No reranking, no rank fusion, no entity boosting — good enough to validate the pipeline; the full query pipeline (`design.md` query-pipeline section) arrives in v2 alongside lexical search.
 
-The full algorithm lives behind a single `Store::related_notes(source_note_id, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (host command handlers, MCP later) hand it a note id and receive note-shaped hits.
+The full algorithm lives behind a single `Store::related_notes(source_path, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (host command handlers, MCP later) hand it a note path and receive note-shaped hits.
 
 Latency budget: the panel updates on file-open and on save (debounced 500ms). Brute-force KNN over a 100k-chunk vault should be <100ms; if it isn't, that's the signal to add an ANN index, not before.
 
@@ -178,7 +178,7 @@ Latency budget: the panel updates on file-open and on save (debounced 500ms). Br
 
 A queryable index over each note's frontmatter, backing *structured* retrieval — "notes tagged `project` with `status: active`, newest first" — distinct from the semantic / lexical content indexes. Powers `search-tag-scope`.
 
-- **`note_meta` table.** The note's frontmatter flattened to `(note_id, key, value, num)` rows: nested maps use dotted keys (`hiker.author`), list elements explode to one row each (`tags: [a, b]` → two rows), null values are skipped. `num` mirrors `value` for YAML numbers / bools so range filters and numeric ordering need no parse at query time. Re-derived from frontmatter on every ingest (mirrors `trail_waypoints`), cleared on skip / delete. Entries are capped per note to bound pathological frontmatter. [store-note-metadata-index]
+- **`note_meta` table.** The note's frontmatter flattened to `(note_path, key, value, num)` rows: nested maps use dotted keys (`hiker.author`), list elements explode to one row each (`tags: [a, b]` → two rows), null values are skipped. `num` mirrors `value` for YAML numbers / bools so range filters and numeric ordering need no parse at query time. Re-derived from frontmatter on every ingest (mirrors `trail_waypoints`), cleared on skip / delete. Entries are capped per note to bound pathological frontmatter. [store-note-metadata-index]
 - **`query_notes(NoteQuery)`.** Structured query: AND-ed filters (`Equals` / `Exists` / `NumRange`), a `folder` subtree restriction, `order` (mtime / path / a meta key's numeric or text value), `limit`, and a `select` projection that packs chosen keys into each row's `fields`. Each filter compiles to an EXISTS subquery against `note_meta`; every user-supplied string is a bound parameter, never interpolated. Skipped notes are excluded. [store-note-query]
 
 Tags ride this index as `Equals { key: "tags", value: "<tag>" }` — there is no separate tag table; list-valued frontmatter is simply multiple rows under one key. Lifecycle (`hiker.archived` …), authorship (`hiker.author`), and source type (`hiker.type`) are likewise plain frontmatter keys, so the lifecycle / authorship / source-type filters from `design.md` fall out of the same query surface with no new structure.
@@ -195,7 +195,7 @@ Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_h
 - `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time and re-indexing (only difference is whether rows existed before). Returns immediately; progress via indexer-progress events. [cmd-index]
 - `chunks_for(path: String) -> Vec<ChunkBounds>` — ordered chunk bounds (`{ chunk_index, byte_start, byte_end, heading_path: Option<String> }`) for the note at `path`. Empty vec for unindexed/empty notes; never errors on absence. Backs the chunk-boundary view (`view-show-chunk-boundaries` in `editor.md`). [cmd-chunks-for-path]
 
-`RelatedHit` (note-level): `note_id`, `path`, `title` (filename stem until frontmatter parsing lands), `score`, `best_heading_path: Option<String>`, `snippet` (text from the highest-scoring chunk).
+`RelatedHit` (note-level): `path`, `title` (filename stem until frontmatter parsing lands), `score`, `best_heading_path: Option<String>`, `snippet` (text from the highest-scoring chunk).
 
 DTOs live in `core::dto` and are auto-exported to TS via `ts-rs` (per `design.md`'s DTO/ts-rs convention).
 

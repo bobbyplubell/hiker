@@ -1,9 +1,9 @@
 //! First-contact lineage adoption verbs: bringing two independently-seeded
-//! Yrs lineages onto one shared base before any deltas flow. Two
-//! independently-seeded Yrs Docs at the same path do not auto-merge — identical
-//! bytes interleave because the lineages share no history — so at first
-//! contact the receiving device adopts the canonical replica's base rather
-//! than applying the peer's update onto its own Doc. [sync-lineage-adoption]
+//! lineages onto one shared base before any deltas flow. Two
+//! independently-seeded documents at the same path do not auto-merge — identical
+//! bytes would interleave because the lineages share no history — so at first
+//! contact the receiving device adopts the canonical replica's text rather
+//! than applying the peer's update onto its own text. [sync-lineage-adoption]
 //!
 //! Pure `impl SyncNode` continuation; no items of its own. The dispatch into
 //! these verbs lives in [`super::dialer`] and [`super::fork`]; the steady-state
@@ -71,13 +71,17 @@ impl SyncNode {
             }
         };
         let device_id = self.peer_fingerprint(&peer_id).0;
+        // A StateRequest/LineageBase fork keep-theirs adopts the peer's LIVE
+        // content (a content fork is a divergence, not a delete), so tombstone is
+        // false here. A keep-deleted converge instead rides `PushAdopt`, which
+        // carries the delete flag explicitly. [sync-conflict-delete-vs-edit]
         self.oplog
-            .adopt_lineage_theirs(&local.0, &state, &device_id)
+            .adopt_lineage_theirs(&local.0, &state, false, &device_id)
             .map_err(|e| Error::Apply(format!("adopt_lineage_theirs: {e}")))?;
         Ok(())
     }
 
-    /// Push OUR canonical Yrs base to the peer so it adopts it — the "keep mine"
+    /// Push OUR canonical text to the peer so it adopts it — the "keep mine"
     /// converge half. Sends `export_state(local)` as the canonical base for the
     /// doc at `path`; the peer replaces its diverged doc with it, establishing a
     /// shared lineage on OUR side's base. Our own doc is untouched (the push
@@ -94,9 +98,19 @@ impl SyncNode {
             .oplog
             .export_state(&local.0)
             .map_err(|e| Error::Transport(format!("export_state: {e}")))?;
+        // Carry our tombstone flag so a keep-deleted converge pushes the DELETE
+        // (text alone can't — a tombstoned doc keeps its last-known text). The
+        // peer tombstones rather than resurrecting that text.
+        // [sync-conflict-delete-vs-edit]
+        let tombstone = self
+            .oplog
+            .materialize_accepted(&local.0)
+            .map_err(|e| Error::Transport(format!("materialize for push-adopt: {e}")))?
+            .tombstone;
         let req = Message::PushAdopt {
             path: path.to_string(),
             state,
+            tombstone,
         };
         match self.request(peer_id, req).await? {
             Message::PushAdoptAck { .. } => Ok(()),
@@ -106,23 +120,32 @@ impl SyncNode {
         }
     }
 
-    /// Pull the peer's incremental update past our state vector and apply it via
-    /// the receive path — the steady-state streaming case once both sides share
-    /// the lineage. The update is content-decrypted, then `apply_remote_update`
-    /// records a `sync:<peer>`-authored op. [sync-content-encryption-aes256]
+    /// Pull the peer's current document TEXT and reconcile it via the receive
+    /// path — the steady-state streaming case once both sides share a logical
+    /// document. The payload is content-decrypted whole-file text (not a
+    /// delta), then `apply_remote_update` runs the 3-way TEXT merge over the
+    /// content-hash merge-base and records a `sync:<peer>`-authored op.
+    /// `peer_hashes` is the peer's recent content-hash window (from the manifest
+    /// entry) — it anchors the merge-base; `peer_tombstone` carries the peer's
+    /// delete flag (text alone can't, since a tombstone keeps the last-known
+    /// text). [sync-content-encryption-aes256, sync-three-way-merge,
+    /// sync-conflict-delete-vs-edit]
     ///
-    /// On a path-changing op (a `Rename` rode in with the delta) this also
-    /// rotates the server-side blob stream: the old blind_id (HMAC of the OLD
-    /// path) is now orphaned on the hub, so this device kicks a `DeleteBlob`
-    /// request on the same peer channel. The P2P path's `peer_id` IS the hub
-    /// when this node is talking to the relay; for direct LAN peers the call
-    /// goes nowhere useful but is harmless (an unknown-blind-id delete is a
-    /// successful no-op). [sync-rename-blob-rotation]
+    /// When the manifest path differs from our local doc's current path, the
+    /// peer RENAMED the doc (text carries no path move, so the rename rides the
+    /// manifest path-identity). After landing the text we apply the rename
+    /// explicitly with `rename_document`, then rotate the server-side blob
+    /// stream: the old blind_id (HMAC of the OLD path) is now orphaned on the
+    /// hub, so this device kicks a `DeleteBlob` on the same channel. The request
+    /// is idempotent (an unknown blind_id is a successful no-op), so it is safe
+    /// on a direct LAN peer too. [sync-rename-blob-rotation, sync-path-identity]
     pub(super) async fn apply_delta_from_peer(
         &mut self,
         peer_id: PeerId,
         local: &LocalDocId,
         path: &str,
+        peer_hashes: &std::collections::HashSet<String>,
+        peer_tombstone: bool,
     ) -> Result<(), Error> {
         let state_vector = self
             .oplog
@@ -140,7 +163,7 @@ impl SyncNode {
                 )));
             }
         };
-        let update = self.content_key.get().decrypt(&ciphertext)?;
+        let peer_text = self.content_key.get().decrypt(&ciphertext)?;
         // Tag the op with the peer's enrolled fingerprint as the sync device id.
         let device_id = self
             .enrolled
@@ -148,30 +171,53 @@ impl SyncNode {
             .map(|fp| fp.0)
             .unwrap_or_else(|| peer_id.to_string());
         self.oplog
-            .apply_remote_update(&local.0, &update, &device_id)
+            .apply_remote_update(&local.0, &peer_text, peer_tombstone, &device_id, peer_hashes)
             .map_err(|e| Error::Apply(format!("apply_remote_update: {e}")))?;
-        // Blind-id rotation on rename: if applying the delta updated the doc's
-        // path, the old blind_id (HMAC of the OLD path) is now orphaned on the
-        // hub. Issue a `DeleteBlob` so the server GCs the stream + cursors. The
+        // A peer rename: text carries no path move, so the rename is conveyed by
+        // the manifest listing the doc at a NEW path. Our local doc still lives
+        // at its old path (`local.0`); relabel it to the manifest path so both
+        // replicas share the path-identity. Lineage-safe under path-as-identity
+        // (`op-log-path-identity`): `rename_document` relocates the per-doc files
+        // and repoints history; a no-op when the paths already match.
+        if local.0 != path {
+            self.oplog
+                .rename_document(&local.0, path, &Author::User)
+                .map_err(|e| Error::Apply(format!("apply rename: {e}")))?;
+            // Move the on-disk `.md` to the new path so the projection follows
+            // the rename (the op-log records the logical move; the file move is
+            // the caller's per `rename_document`).
+            let root = self.oplog.vault_root().to_path_buf();
+            let from_abs = root.join(&local.0);
+            let to_abs = root.join(path);
+            if from_abs.exists() {
+                if let Some(parent) = to_abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&from_abs, &to_abs);
+            }
+        }
+        // Blind-id rotation on rename: the old blind_id (HMAC of the OLD path) is
+        // now orphaned on the hub. Under path-as-identity (`op-log-path-identity`)
+        // the rename relocated the per-doc files, so the path we requested under
+        // (`local.0`) NO LONGER RESOLVES — that absence is the rename signal.
+        // Issue a `DeleteBlob` so the server GCs the stream + cursors. The
         // request is idempotent — an unknown blind_id is a successful no-op,
         // which is also why this is safe to send on a direct LAN peer
         // connection (it has no blobs at that id; it just acks). The hub clears
         // both its blob log and its per-device cursors for the old id, and the
         // new path's blind_id naturally starts a fresh stream on the next push.
         // [sync-rename-blob-rotation]
-        if let Ok(Some(current_path)) = self.oplog.path_for_doc(&local.0)
-            && current_path != path
-        {
+        let renamed_away = matches!(self.oplog.doc_id_for_path(&local.0), Ok(None));
+        if renamed_away {
             let key = self.content_key.get();
-            let old_blind = crypto::blind_id(&key, path);
+            let old_blind = crypto::blind_id(&key, &local.0);
             let del = Message::DeleteBlob {
                 blind_id: old_blind.clone(),
             };
             match self.request(peer_id, del).await {
                 Ok(Message::DeleteBlobAck { .. }) => {
                     tracing::debug!(
-                        old_path = %path,
-                        new_path = %current_path,
+                        old_path = %local.0,
                         old_blind_id = %old_blind,
                         "sync: GC'd old blind_id stream after rename"
                     );

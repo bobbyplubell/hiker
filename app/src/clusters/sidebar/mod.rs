@@ -17,12 +17,12 @@ use eframe::egui;
 use hiker_core::trees::types::Db;
 
 use crate::clusters::state::State;
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::state::{AppState, Toast, ToastLevel};
 use hiker_theme as theme;
 
 /// Shared per-frame context for the cluster sidebar. Wraps the narrow
-/// feature `Ctx` with the `trees` handle (cloned once at the top of
+/// feature `SurfaceCtx` with the `trees` handle (cloned once at the top of
 /// `render_body`) so the render/mutation helpers across this module's
 /// files can be `&mut self` methods on one receiver. Broad effects
 /// (open a tab, open a note) are queued via `ctx.defer`; everything else
@@ -31,9 +31,9 @@ use hiker_theme as theme;
 /// (`ctx.vault`), the config (`ctx.config`), and the toast sink
 /// (`ctx.toasts`). The frame already runs inside the tokio runtime
 /// guard, so the LLM jobs' ambient `tokio::spawn` keeps working without
-/// a `Handle` on `Ctx`.
+/// a `Handle` on `SurfaceCtx`.
 pub(super) struct ClusterCtx<'a, 'c> {
-    pub(super) ctx: &'a mut Ctx<'c>,
+    pub(super) ctx: &'a mut SurfaceCtx<'c>,
     pub(super) trees: Arc<Db>,
 }
 
@@ -48,7 +48,7 @@ impl ClusterCtx<'_, '_> {
         self.ctx.state.downcast_ref::<State>().expect("clusters state")
     }
 
-    /// Push a toast onto the shared sink (the narrow `Ctx` carries the
+    /// Push a toast onto the shared sink (the narrow `SurfaceCtx` carries the
     /// `Vec<Toast>` directly; there is no `&mut AppState` here for
     /// `push_toast`).
     pub(super) fn toast(&mut self, message: impl Into<String>, level: ToastLevel) {
@@ -57,9 +57,9 @@ impl ClusterCtx<'_, '_> {
 }
 
 /// Render the cluster-trees sidebar body through the narrow feature
-/// `Ctx`. Clones the `trees` handle once, hydrates, then paints header /
+/// `SurfaceCtx`. Clones the `trees` handle once, hydrates, then paints header /
 /// picker / toolbar / inline editors / the selected tree.
-pub(super) fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+pub(super) fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let trees = ctx.services.trees.clone();
     let mut cx = ClusterCtx { ctx, trees };
 
@@ -105,26 +105,24 @@ fn advanced_params_popover(&mut self, ui: &mut egui::Ui) {
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label("Min cluster size");
-                    ui.add(egui::DragValue::new(&mut p.min_cluster_size).range(2..=500));
-                    ui.end_row();
-                    ui.label("Min samples");
-                    ui.add(egui::DragValue::new(&mut p.min_samples).range(1..=50));
-                    ui.end_row();
-                    ui.label("k nearest");
-                    ui.add(egui::DragValue::new(&mut p.k_nearest).range(2..=100));
-                    ui.end_row();
+                    use crate::clusters::param_slider;
+                    param_slider(ui, "Min cluster size", &mut p.min_cluster_size, 2..=500, true,
+                        "Smallest cluster the algorithm will form");
+                    param_slider(ui, "Min samples", &mut p.min_samples, 1..=50, false,
+                        "Higher is more conservative — more points fall out as outliers");
+                    param_slider(ui, "k nearest", &mut p.k_nearest, 2..=100, false,
+                        "Neighbors per node in the Leiden kNN similarity graph");
                     ui.label("Algorithm");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut p.use_leiden, false, "HDBSCAN");
                         ui.selectable_value(&mut p.use_leiden, true, "Leiden");
                     });
                     ui.end_row();
-                    ui.label("Outlier threshold");
-                    ui.add(egui::Slider::new(&mut p.outlier_threshold, 0.0..=1.0));
-                    ui.end_row();
+                    param_slider(ui, "Outlier threshold", &mut p.outlier_threshold, 0.0..=1.0, false,
+                        "Notes below this similarity to their cluster become outliers");
                     ui.label("Include outliers");
-                    ui.checkbox(&mut p.include_outliers, "");
+                    ui.checkbox(&mut p.include_outliers, "")
+                        .on_hover_text("Keep unclustered notes in an outliers bucket instead of force-routing them into the nearest cluster");
                     ui.end_row();
                 });
             if ui.small_button("Close").clicked() {
@@ -490,7 +488,7 @@ fn empty_message(ui: &mut egui::Ui, msg: &str) {
     ui.label(egui::RichText::new(msg).color(theme::muted()).italics());
 }
 
-/// Push a toast directly onto the `Ctx` toast sink. Free fn (rather than
+/// Push a toast directly onto the `SurfaceCtx` toast sink. Free fn (rather than
 /// the `ClusterCtx::toast` method) for the inline-editor / toolbar
 /// closures, which split-borrow the disjoint `ctx.toasts` field and so
 /// can't re-borrow `&mut self`.
@@ -679,7 +677,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
     let Some(tree_id) = self.st().selected_tree.clone() else {
         return;
     };
-    let Ctx {
+    let SurfaceCtx {
         state,
         toasts,
         services,

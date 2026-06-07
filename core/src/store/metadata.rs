@@ -79,15 +79,15 @@ impl Store {
     /// status: vault-view-source-groups
     pub fn notes_with_meta(&self) -> Result<Vec<NoteMetaRow>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.path,
+            "SELECT n.path, n.path,
                     (SELECT m.value FROM note_meta m
-                       WHERE m.note_id = n.id AND m.key = 'hiker.parent' LIMIT 1),
+                       WHERE m.note_id = n.path AND m.key = 'hiker.parent' LIMIT 1),
                     (SELECT m.value FROM note_meta m
-                       WHERE m.note_id = n.id AND m.key = 'hiker.author' LIMIT 1),
+                       WHERE m.note_id = n.path AND m.key = 'hiker.author' LIMIT 1),
                     (SELECT m.value FROM note_meta m
-                       WHERE m.note_id = n.id AND m.key = 'hiker.provenance' LIMIT 1),
+                       WHERE m.note_id = n.path AND m.key = 'hiker.provenance' LIMIT 1),
                     (SELECT m.value FROM note_meta m
-                       WHERE m.note_id = n.id AND m.key = 'hiker.kind' LIMIT 1)
+                       WHERE m.note_id = n.path AND m.key = 'hiker.kind' LIMIT 1)
              FROM notes n
              WHERE n.skipped = 0",
         )?;
@@ -114,7 +114,7 @@ impl Store {
     ///
     /// status: store-note-query
     pub fn query_notes(&self, q: &NoteQuery) -> Result<Vec<NoteQueryRow>, Error> {
-        let mut sql = String::from("SELECT n.id, n.path, n.mtime FROM notes n WHERE n.skipped = 0");
+        let mut sql = String::from("SELECT n.path, n.path, n.mtime FROM notes n WHERE n.skipped = 0");
         // Bound values, in the exact order their `?` appears in `sql`.
         let mut binds: Vec<Box<dyn ToSql>> = Vec::new();
 
@@ -123,7 +123,7 @@ impl Store {
                 MetaFilter::Equals { key, value } => {
                     sql.push_str(
                         " AND EXISTS (SELECT 1 FROM note_meta m \
-                         WHERE m.note_id = n.id AND m.key = ? AND m.value = ?)",
+                         WHERE m.note_id = n.path AND m.key = ? AND m.value = ?)",
                     );
                     binds.push(Box::new(key.clone()));
                     binds.push(Box::new(value.clone()));
@@ -131,14 +131,14 @@ impl Store {
                 MetaFilter::Exists { key } => {
                     sql.push_str(
                         " AND EXISTS (SELECT 1 FROM note_meta m \
-                         WHERE m.note_id = n.id AND m.key = ?)",
+                         WHERE m.note_id = n.path AND m.key = ?)",
                     );
                     binds.push(Box::new(key.clone()));
                 }
                 MetaFilter::NumRange { key, min, max } => {
                     sql.push_str(
                         " AND EXISTS (SELECT 1 FROM note_meta m \
-                         WHERE m.note_id = n.id AND m.key = ? AND m.num IS NOT NULL",
+                         WHERE m.note_id = n.path AND m.key = ? AND m.num IS NOT NULL",
                     );
                     binds.push(Box::new(key.clone()));
                     if let Some(lo) = min {
@@ -176,7 +176,7 @@ impl Store {
             Some(NoteOrder::MetaNum { key, dir }) => {
                 sql.push_str(
                     " ORDER BY (SELECT m.num FROM note_meta m \
-                     WHERE m.note_id = n.id AND m.key = ? LIMIT 1) ",
+                     WHERE m.note_id = n.path AND m.key = ? LIMIT 1) ",
                 );
                 sql.push_str(dir_sql(*dir));
                 binds.push(Box::new(key.clone()));
@@ -184,7 +184,7 @@ impl Store {
             Some(NoteOrder::MetaText { key, dir }) => {
                 sql.push_str(
                     " ORDER BY (SELECT m.value FROM note_meta m \
-                     WHERE m.note_id = n.id AND m.key = ? LIMIT 1) ",
+                     WHERE m.note_id = n.path AND m.key = ? LIMIT 1) ",
                 );
                 sql.push_str(dir_sql(*dir));
                 binds.push(Box::new(key.clone()));

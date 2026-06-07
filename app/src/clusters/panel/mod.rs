@@ -25,11 +25,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use hiker_core::cluster::build::stream::build_tree_structural_streaming;
 use hiker_core::trees::build_adapter::node_inserts;
+use hiker_core::cluster::algo::LeidenGraph;
 use hiker_core::cluster::{
     BuildEvent, BuildMethod, BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree,
     Algorithm, Params, FolderDeriveParams, NoteInput, Phase, SummarizeMode,
@@ -37,6 +38,7 @@ use hiker_core::cluster::{
 use hiker_core::trees::types::TreeInsert;
 use tokio::sync::mpsc::Receiver;
 
+use crate::clusters::param_slider;
 use crate::state::{AppState, ToastLevel};
 use crate::tab::TabId;
 use hiker_theme as theme;
@@ -153,6 +155,32 @@ pub struct ReviewPane {
     /// True once a Run has completed (or is in flight) so the config
     /// section auto-collapses per `cluster-review-tab-config-section`.
     pub config_collapsed: bool,
+
+    // ── Live preview (cluster-review-tab-live-preview) ───────────────
+    /// Resolved inputs (vault walk + per-note embedding load) cached so a
+    /// config tweak re-clusters without re-querying SQLite for every
+    /// note's embedding. Keyed by `cached_scope_sig`.
+    pub cached_notes: Option<Arc<Vec<NoteInput>>>,
+    pub cached_titles: Option<Arc<HashMap<String, String>>>,
+    /// Signature of the scope (`source_types` + semantic-vs-folders) the
+    /// cached notes were loaded for; a mismatch reloads and invalidates
+    /// `cached_top_graph`.
+    pub cached_scope_sig: Option<u64>,
+    /// Top-level Leiden kNN graph from the last Leiden build, handed back
+    /// to the next build so a γ / min-size tweak skips the O(n²) sweep.
+    pub cached_top_graph: Option<Arc<LeidenGraph>>,
+    /// Config signature of the last run; an auto-rerun fires only when the
+    /// current config differs from this.
+    pub last_run_sig: Option<u64>,
+    /// Debounced pending auto-rerun: the config signature being waited on
+    /// plus its fire deadline. Reset whenever the signature changes again.
+    pub pending_rerun: Option<(u64, Instant)>,
+    /// True while a *live* re-run is in flight. Unlike a manual run, a live
+    /// rebuild keeps the old result on screen (swapped atomically on
+    /// `Done`), leaves the config section open, and suppresses the progress
+    /// row + the done-toast — so tuning updates in place instead of
+    /// flashing the page. Per `cluster-review-tab-live-preview`.
+    pub live_rebuild: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -217,12 +245,12 @@ impl Review<'_> {
     ui.add_space(4.0);
 
     let tab_id = self.tab_id;
-    let (pane_has_result, pane_running, pane_collapsed) = self.app
+    let (pane_has_result, pane_running, pane_collapsed, pane_live_rebuild) = self.app
         .clusters_state
         .review_panes
         .get(&tab_id)
-        .map(|p| (p.result.is_some(), p.running, p.config_collapsed))
-        .unwrap_or((false, false, false));
+        .map(|p| (p.result.is_some(), p.running, p.config_collapsed, p.live_rebuild))
+        .unwrap_or((false, false, false, false));
 
     // Action row.
     let mut want_run = false;
@@ -232,10 +260,13 @@ impl Review<'_> {
     // status: cluster-preset-save — set to the entered name when the user saves
     // the current params as a reusable preset.
     let mut want_save_preset: Option<String> = None;
+    // A live rebuild runs in the background without taking over the
+    // controls — only a manual run counts as "busy" for the action row.
+    let busy = pane_running && !pane_live_rebuild;
     ui.horizontal_wrapped(|ui| {
         // status: cluster-review-tab-async-pass
         // status: cluster-review-tab-cancel-pass
-        if pane_running {
+        if busy {
             if ui
                 .add(egui::Button::new("Cancel"))
                 .on_hover_text("Abort the in-flight structural pass and discard partial results")
@@ -260,7 +291,7 @@ impl Review<'_> {
         // status: cluster-review-tab-confirm-single-path
         if ui
             .add_enabled(
-                pane_has_result && !pane_running,
+                pane_has_result && !busy,
                 egui::Button::new("Confirm"),
             )
             .on_hover_text(
@@ -331,19 +362,22 @@ impl Review<'_> {
 
     ui.add_space(4.0);
 
-    // Configuration section.
+    // Configuration section. Expanded, the form sits in a fixed-width column
+    // beside the result view (stacking it pushes the graph far down and reads
+    // awkwardly, especially during live tuning); collapsed, the one-line
+    // summary stacks above the full-width result.
+    // status: cluster-review-tab-config-section
     let header_label = if pane_collapsed {
         "[+] Configuration"
     } else {
         "[-] Configuration"
     };
     let mut toggle_collapse = false;
-    if ui.button(header_label).clicked() {
-        toggle_collapse = true;
-    }
-    if !pane_collapsed {
-        self.render_config_form(ui, &mut cfg);
-    } else {
+
+    if pane_collapsed {
+        if ui.button(header_label).clicked() {
+            toggle_collapse = true;
+        }
         let p = &self.app.clusters_state.advanced_params;
         let types = if cfg.source_types.trim().is_empty() {
             "all".to_string()
@@ -356,23 +390,45 @@ impl Review<'_> {
             p.min_cluster_size,
             p.include_outliers,
         );
-        ui.label(
-            egui::RichText::new(summary)
-                .small()
-                .color(theme::muted()),
-        );
+        ui.label(egui::RichText::new(summary).small().color(theme::muted()));
+
+        // Progress row — only for a manual run; a live rebuild updates in
+        // place. status: cluster-review-tab-progress-row
+        if pane_running && !pane_live_rebuild {
+            self.render_progress_row(ui);
+        }
+        ui.separator();
+        self.render_result_panel(ui);
+    } else {
+        ui.horizontal_top(|ui| {
+            let avail_h = ui.available_height();
+            let col_w = (ui.available_width() * 0.42).clamp(300.0, 440.0);
+            // Left: config column (header + form), constrained width.
+            ui.allocate_ui_with_layout(
+                egui::vec2(col_w, avail_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(col_w);
+                    if ui.button(header_label).clicked() {
+                        toggle_collapse = true;
+                    }
+                    self.render_config_form(ui, &mut cfg);
+                },
+            );
+            ui.separator();
+            // Right: progress + result view, takes the remaining width.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), avail_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    if pane_running && !pane_live_rebuild {
+                        self.render_progress_row(ui);
+                    }
+                    self.render_result_panel(ui);
+                },
+            );
+        });
     }
-
-    // Progress row — visible only while a run is in flight.
-    // status: cluster-review-tab-progress-row
-    if pane_running {
-        self.render_progress_row(ui);
-    }
-
-    ui.separator();
-
-    // Result panel — view toggle + body.
-    self.render_result_panel(ui);
 
     if toggle_collapse {
         let pane = self.app.clusters_state.review_panes.entry(tab_id).or_default();
@@ -387,7 +443,7 @@ impl Review<'_> {
     }
 
     if want_run {
-        self.run_structural_streaming(ui.ctx(), &cfg);
+        self.run_structural_streaming(ui.ctx(), &cfg, /*live=*/ false);
     }
     if want_cancel {
         self.cancel_run();
@@ -398,6 +454,10 @@ impl Review<'_> {
     if want_discard {
         self.discard();
     }
+
+    // Live preview — debounced auto-rerun on config change (no-op while a
+    // build is running or before the first run). status: cluster-review-tab-live-preview
+    self.maybe_live_rerun(ui.ctx(), &cfg);
 
     // Keep the frame loop ticking while the background build is alive so
     // streamed events surface promptly even if the user isn't moving the
@@ -418,6 +478,16 @@ impl Review<'_> {
 /// Extracted from `show` to keep that function under clippy's per-fn
 /// line budget.
 fn render_config_form(&mut self, ui: &mut egui::Ui, cfg: &mut ReviewConfig) {
+    // Note count drives the live-preview size gate (read before the
+    // `advanced_params` borrow below). Zero until the first run loads it.
+    let note_count = self
+        .app
+        .clusters_state
+        .review_panes
+        .get(&self.tab_id)
+        .and_then(|pane| pane.cached_notes.as_ref())
+        .map_or(0, |v| v.len());
+    let live_gate = live_preview_max(cfg.algorithm);
     let app = &mut *self.app;
     let llm_enabled = app
         .vault_session.config
@@ -492,66 +562,133 @@ fn render_config_form(&mut self, ui: &mut egui::Ui, cfg: &mut ReviewConfig) {
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
+                    // Every numeric knob renders as an `egui::Slider` (see
+                    // `param_slider`) so the form reads as one consistent
+                    // control set instead of a mix of sliders and drag-boxes.
+                    // Booleans stay checkboxes — they aren't numbers.
                     match cfg.algorithm {
                         ReviewAlgorithm::Leiden => {
-                            ui.label("k nearest");
-                            ui.add(egui::DragValue::new(&mut p.k_nearest).range(2..=100));
-                            ui.end_row();
-                            ui.label("Edge weight floor");
-                            ui.add(egui::Slider::new(&mut p.edge_weight_floor, 0.0..=1.0));
-                            ui.end_row();
-                            ui.label("Resolution (γ)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.resolution)
-                                    .range(0.1..=5.0)
-                                    .speed(0.05),
-                            );
-                            ui.end_row();
-                            ui.label("Iterations");
-                            ui.add(egui::DragValue::new(&mut p.iterations).range(10..=1000));
-                            ui.end_row();
-                            ui.label("Min cluster size");
-                            ui.add(
-                                egui::DragValue::new(&mut p.min_cluster_size).range(2..=500),
-                            );
-                            ui.end_row();
+                            param_slider(ui, "k nearest", &mut p.k_nearest, 2..=100, false,
+                                "Neighbors per node in the kNN similarity graph");
+                            param_slider(ui, "Edge weight floor", &mut p.edge_weight_floor, 0.0..=1.0, false,
+                                "Drop kNN edges below this cosine similarity to sharpen community boundaries");
+                            param_slider(ui, "Resolution (γ)", &mut p.resolution, 0.1..=5.0, false,
+                                "Higher splits into more, smaller clusters; lower merges into fewer, larger ones");
+                            param_slider(ui, "Iterations", &mut p.iterations, 10..=1000, true,
+                                "Cap on Leiden refinement passes (it converges fast; this is a safety rail)");
+                            param_slider(ui, "Min cluster size", &mut p.min_cluster_size, 2..=500, true,
+                                "Communities smaller than this are flagged as outliers");
                         }
                         ReviewAlgorithm::Hdbscan
                         | ReviewAlgorithm::Hybrid
                         | ReviewAlgorithm::Gmm => {
-                            ui.label("Min cluster size");
-                            ui.add(
-                                egui::DragValue::new(&mut p.min_cluster_size).range(2..=500),
-                            );
-                            ui.end_row();
-                            ui.label("Min samples");
-                            ui.add(egui::DragValue::new(&mut p.min_samples).range(1..=50));
-                            ui.end_row();
+                            param_slider(ui, "Min cluster size", &mut p.min_cluster_size, 2..=500, true,
+                                "Smallest cluster the algorithm will form");
+                            param_slider(ui, "Min samples", &mut p.min_samples, 1..=50, false,
+                                "Higher is more conservative — more points fall out as outliers");
                         }
                         ReviewAlgorithm::FromFolders => {
-                            ui.label("Outlier threshold");
-                            ui.add(egui::Slider::new(&mut p.outlier_threshold, 0.0..=1.0));
-                            ui.end_row();
+                            param_slider(ui, "Outlier threshold", &mut p.outlier_threshold, 0.0..=1.0, false,
+                                "Notes below this similarity to their folder centroid become outliers");
                         }
                     }
                     if !is_from_folders {
-                        ui.label("Summary confidence threshold");
-                        ui.add(egui::Slider::new(
-                            &mut p.summary_confidence_threshold,
-                            0.0..=1.0,
-                        ));
-                        ui.end_row();
+                        param_slider(ui, "Summary confidence threshold", &mut p.summary_confidence_threshold, 0.0..=1.0, false,
+                            "Clusters below this confidence are flagged uncertain in the review surface");
                         ui.label("Disable recursion");
                         ui.checkbox(&mut p.disable_recursion, "")
                             .on_hover_text("Run a single-level Split (no recursive sub-splits)");
                         ui.end_row();
                     }
                     ui.label("Include outliers");
-                    ui.checkbox(&mut p.include_outliers, "");
+                    ui.checkbox(&mut p.include_outliers, "")
+                        .on_hover_text("Keep unclustered notes in an outliers bucket instead of force-routing them into the nearest cluster");
+                    ui.end_row();
+
+                    // Live preview toggle + size-gate notice.
+                    // status: cluster-review-tab-live-preview
+                    let gated = note_count > live_gate;
+                    ui.label("Live preview");
+                    ui.vertical(|ui| {
+                        ui.add_enabled_ui(!gated, |ui| {
+                            ui.checkbox(&mut p.live_preview, "")
+                                .on_hover_text(
+                                    "Re-cluster automatically (debounced) when you change a knob, \
+                                     after the first Run",
+                                );
+                        });
+                        if gated {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "off — {note_count} notes over the {live_gate} live limit; use Run"
+                                ))
+                                .small()
+                                .color(theme::muted()),
+                            );
+                        } else if note_count == 0 {
+                            ui.label(
+                                egui::RichText::new("starts after the first Run")
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                        }
+                    });
                     ui.end_row();
                 });
         });
 }
+}
+
+// ── Live preview (cluster-review-tab-live-preview) ───────────────────
+
+/// Debounce window before an auto-rerun fires after the last config change.
+const LIVE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Per-algorithm note-count ceiling above which live preview auto-disables.
+/// Tuned to the measured O(n²) structural-build cost: Leiden re-tunes γ over
+/// a *cached* kNN graph (tens of ms even at 2k), so it tolerates a high cap;
+/// HDBSCAN re-partitions from scratch on every change (≈0.5s at 600), so it
+/// gets a tighter one; FromFolders is O(n) folder grouping — effectively
+/// unbounded.
+const fn live_preview_max(algo: ReviewAlgorithm) -> usize {
+    match algo {
+        ReviewAlgorithm::Leiden => 2000,
+        ReviewAlgorithm::FromFolders => 100_000,
+        ReviewAlgorithm::Hdbscan | ReviewAlgorithm::Hybrid | ReviewAlgorithm::Gmm => 600,
+    }
+}
+
+/// Hash the scope-determining inputs (file extensions + semantic-vs-folders
+/// mode). A change here means the *note set* differs, so cached notes +
+/// graph must be reloaded.
+fn scope_signature(source_types: &str, is_semantic: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source_types.trim().hash(&mut h);
+    is_semantic.hash(&mut h);
+    h.finish()
+}
+
+/// Hash every knob that affects the clustering *result* (algorithm + scope +
+/// all tunables). A change here triggers a debounced auto-rerun under live
+/// preview. Floats hash via `to_bits` so NaN-free param values compare
+/// exactly.
+fn config_signature(cfg: &ReviewConfig, p: &crate::clusters::state::AdvancedClusterParams) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (cfg.algorithm as u8).hash(&mut h);
+    cfg.source_types.trim().hash(&mut h);
+    p.min_cluster_size.hash(&mut h);
+    p.min_samples.hash(&mut h);
+    p.k_nearest.hash(&mut h);
+    p.edge_weight_floor.to_bits().hash(&mut h);
+    p.iterations.hash(&mut h);
+    p.resolution.to_bits().hash(&mut h);
+    p.outlier_threshold.to_bits().hash(&mut h);
+    p.include_outliers.hash(&mut h);
+    p.summary_confidence_threshold.to_bits().hash(&mut h);
+    p.disable_recursion.hash(&mut h);
+    h.finish()
 }
 
 const fn algo_label(a: ReviewAlgorithm) -> &'static str {
@@ -632,7 +769,16 @@ fn drain_events(&mut self) {
                     }
                 }
             }
-            BuildEvent::Done { tree } => {
+            BuildEvent::Done { tree, top_graph } => {
+                // Cache the top-level Leiden graph for the next live-preview
+                // run. Keep the prior graph if this build produced none
+                // (HDBSCAN / FromFolders) so a Leiden→HDBSCAN→Leiden detour
+                // doesn't force a needless rebuild.
+                if top_graph.is_some() {
+                    pane.cached_top_graph = top_graph;
+                }
+                let was_live = pane.live_rebuild;
+                pane.live_rebuild = false;
                 let leaf_count = tree.levels.first().map(std::vec::Vec::len).unwrap_or(0);
                 let outlier_count = tree.outliers.len();
                 // BuildResult needs scope + method; reconstruct cheap
@@ -651,13 +797,18 @@ fn drain_events(&mut self) {
                 pane.running = false;
                 pane.cancel = None;
                 pane.events_rx = None;
-                pane.config_collapsed = true;
-                terminal_message = Some((
-                    format!(
-                        "Clustering done — {leaf_count} clusters, {outlier_count} outliers"
-                    ),
-                    ToastLevel::Info,
-                ));
+                // A live rebuild leaves the config open and stays quiet —
+                // collapsing + toasting on every debounced tweak is exactly
+                // the page-flash the user is tuning to avoid.
+                if !was_live {
+                    pane.config_collapsed = true;
+                    terminal_message = Some((
+                        format!(
+                            "Clustering done — {leaf_count} clusters, {outlier_count} outliers"
+                        ),
+                        ToastLevel::Info,
+                    ));
+                }
             }
             BuildEvent::Cancelled => {
                 pane.running = false;
@@ -733,37 +884,38 @@ fn render_progress_row(&self, ui: &mut egui::Ui) {
 // ── Run / Cancel ─────────────────────────────────────────────────────
 
 impl Review<'_> {
-/// Kick off an async structural pass. Spawns the streaming build on a
-/// `spawn_blocking` worker (inside the runtime entered by the egui
-/// frame) and stashes the `Receiver<BuildEvent>` + cancel atomic on the
-/// pane. The frame loop drains the receiver via `drain_events`.
-///
-/// status: cluster-review-tab-async-pass
-fn run_structural_streaming(
+/// Resolve the build inputs: the vault walk + per-note embedding load.
+/// Cached on the pane keyed by scope (`source_types` + semantic mode) so
+/// live-preview re-runs don't re-query SQLite for every note's embedding;
+/// a scope change reloads and drops the stale top-level graph. Returns
+/// `None` (after toasting) when the walk fails or nothing is left to
+/// cluster. Per `cluster-review-tab-live-preview`.
+fn resolve_notes(
     &mut self,
-    ctx: &egui::Context,
     cfg: &ReviewConfig,
-) {
+) -> Option<(Arc<Vec<NoteInput>>, Arc<HashMap<String, String>>)> {
     let tab_id = self.tab_id;
-    let app = &mut *self.app;
+    let is_semantic = !matches!(cfg.algorithm, ReviewAlgorithm::FromFolders);
+    let scope_sig = scope_signature(&cfg.source_types, is_semantic);
+
+    // Cache hit: same scope → reuse the loaded embeddings.
+    if let Some(pane) = self.app.clusters_state.review_panes.get(&tab_id)
+        && pane.cached_scope_sig == Some(scope_sig)
+        && let (Some(notes), Some(titles)) =
+            (pane.cached_notes.clone(), pane.cached_titles.clone())
     {
-        let pane = app.clusters_state.review_panes.entry(tab_id).or_default();
-        if pane.running {
-            return;
-        }
+        return Some((notes, titles));
     }
 
-    // Collect inputs synchronously (vault walk + embeddings lookup) so
-    // the spawned task only does the partition work. Walk failures land
-    // as a toast; we never start a build with nothing to feed it.
+    let app = &mut *self.app;
+    // Walk failures land as a toast; we never start a build with nothing.
     let paths = match app.vault_session.vault.walk_indexable_files("") {
         Ok(v) => v,
         Err(err) => {
             app.push_toast(format!("walk vault: {err}"), ToastLevel::Error);
-            return;
+            return None;
         }
     };
-    let is_semantic = !matches!(cfg.algorithm, ReviewAlgorithm::FromFolders);
     let mut titles: HashMap<String, String> = HashMap::with_capacity(paths.len());
     let mut notes: Vec<NoteInput> = Vec::with_capacity(paths.len());
     let mut missing_embedding = 0usize;
@@ -812,7 +964,7 @@ fn run_structural_streaming(
             "vault has no notes".to_string()
         };
         app.push_toast(msg, ToastLevel::Error);
-        return;
+        return None;
     }
     if missing_embedding > 0 {
         app.push_toast(
@@ -821,8 +973,62 @@ fn run_structural_streaming(
         );
     }
 
+    let notes = Arc::new(notes);
+    let titles = Arc::new(titles);
+    let pane = app.clusters_state.review_panes.entry(tab_id).or_default();
+    pane.cached_notes = Some(notes.clone());
+    pane.cached_titles = Some(titles.clone());
+    pane.cached_scope_sig = Some(scope_sig);
+    // New note set → any cached top-level graph is stale.
+    pane.cached_top_graph = None;
+    Some((notes, titles))
+}
+
+/// Kick off an async structural pass. Spawns the streaming build on a
+/// `spawn_blocking` worker (inside the runtime entered by the egui
+/// frame) and stashes the `Receiver<BuildEvent>` + cancel atomic on the
+/// pane. The frame loop drains the receiver via `drain_events`. Reuses
+/// the cached note set + top-level Leiden graph when available so a
+/// live-preview re-run skips the SQLite load and the O(n²) kNN sweep.
+///
+/// `live = true` is a live-preview rebuild: keep the current result on
+/// screen (swapped on `Done`), leave the config open, and skip the progress
+/// row + done-toast so the update happens in place. `false` is a manual Run
+/// (clears the result, collapses config, shows progress).
+///
+/// status: cluster-review-tab-async-pass
+/// status: cluster-review-tab-live-preview
+fn run_structural_streaming(
+    &mut self,
+    ctx: &egui::Context,
+    cfg: &ReviewConfig,
+    live: bool,
+) {
+    let tab_id = self.tab_id;
+    if self
+        .app
+        .clusters_state
+        .review_panes
+        .get(&tab_id)
+        .is_some_and(|p| p.running)
+    {
+        return;
+    }
+
+    let (notes, titles) = match self.resolve_notes(cfg) {
+        Some(v) => v,
+        None => return,
+    };
+    let app = &mut *self.app;
+    let prebuilt_graph = app
+        .clusters_state
+        .review_panes
+        .get(&tab_id)
+        .and_then(|p| p.cached_top_graph.clone());
+
     // Translate the form into core types.
     let p = app.clusters_state.advanced_params.clone();
+    let run_sig = config_signature(cfg, &p);
     let method = match cfg.algorithm {
         ReviewAlgorithm::FromFolders => BuildMethod::FromFolders {
             params: FolderDeriveParams {
@@ -844,6 +1050,12 @@ fn run_structural_streaming(
                 edge_weight_floor: p.edge_weight_floor,
                 iterations: p.iterations,
                 resolution: p.resolution,
+                // Drive the decisive top-level (virtual-root) cut from the
+                // same slider the user sees. Previously the top-level Split
+                // ran at the hidden `top_level_resolution` default and the
+                // slider only affected sub-splits, so turning the knob had
+                // no effect on whether the build produced ≥2 clusters.
+                top_level_resolution: p.resolution,
                 min_cluster_size: p.min_cluster_size as u32,
                 ..hiker_core::cluster::LeidenParams::default()
             };
@@ -864,19 +1076,31 @@ fn run_structural_streaming(
 
     // Spawn the streaming build. The closure must run inside a tokio
     // runtime: the egui frame loop enters the runtime each tick, so
-    // `Handle::current` is live here.
+    // `Handle::current` is live here. The note set is cloned out of the
+    // Arc because the build owns its inputs; the embeddings memcpy is
+    // negligible next to the SQLite load we just skipped.
     let cancel = Arc::new(AtomicBool::new(false));
-    let (_handle, rx) =
-        build_tree_structural_streaming(method, notes, cancel.clone());
+    let (_handle, rx) = build_tree_structural_streaming(
+        method,
+        (*notes).clone(),
+        cancel.clone(),
+        prebuilt_graph,
+    );
 
     let pane = app.clusters_state.review_panes.entry(tab_id).or_default();
     pane.running = true;
+    pane.live_rebuild = live;
     pane.cancel = Some(cancel);
     pane.events_rx = Some(Arc::new(Mutex::new(rx)));
     pane.started_at = Some(Instant::now());
     pane.phase = None;
     pane.counters = ProgressCounters::default();
-    pane.result = None;
+    // A live rebuild keeps the prior result visible (swapped atomically on
+    // Done) and the config open; a manual run clears + collapses.
+    if !live {
+        pane.result = None;
+        pane.config_collapsed = true;
+    }
     pane.user_renamed.clear();
     pane.editing = None;
     pane.live_top.clear();
@@ -886,12 +1110,65 @@ fn run_structural_streaming(
     // user keeps the layout they were working in. Leftover node ids in
     // `expanded` from a prior run are harmless — node ids are fresh per
     // run and stale lookups just return false.
-    pane.note_titles = titles;
-    pane.config_collapsed = true;
+    pane.note_titles = (*titles).clone();
+    // Record what config this run reflects so live preview only re-fires
+    // on an actual change, and clear any pending debounce.
+    pane.last_run_sig = Some(run_sig);
+    pane.pending_rerun = None;
 
     // Prime a repaint so the progress row renders without waiting for
     // user input.
     ctx.request_repaint();
+}
+
+/// Live preview: when a config knob changes after a first run, schedule a
+/// debounced auto-rerun (and fire it once the debounce elapses). Gated by
+/// the global `live_preview` toggle and a per-algorithm note-count ceiling
+/// so large vaults don't auto-trigger multi-second rebuilds. Per
+/// `cluster-review-tab-live-preview`.
+fn maybe_live_rerun(&mut self, ctx: &egui::Context, cfg: &ReviewConfig) {
+    let tab_id = self.tab_id;
+    let live_on = self.app.clusters_state.advanced_params.live_preview;
+    let p = self.app.clusters_state.advanced_params.clone();
+    let sig = config_signature(cfg, &p);
+
+    let mut fire = false;
+    {
+        let Some(pane) = self.app.clusters_state.review_panes.get_mut(&tab_id) else {
+            return;
+        };
+        // Only after a first run (so the note set exists), while idle.
+        if pane.running || pane.last_run_sig.is_none() {
+            return;
+        }
+        let n = pane.cached_notes.as_ref().map_or(0, |v| v.len());
+        if !live_on || n == 0 || n > live_preview_max(cfg.algorithm) {
+            pane.pending_rerun = None;
+            return;
+        }
+        if Some(sig) == pane.last_run_sig {
+            pane.pending_rerun = None; // nothing changed since the last run
+            return;
+        }
+        let now = Instant::now();
+        match pane.pending_rerun {
+            // Same change still pending — fire once the debounce elapses.
+            Some((psig, deadline)) if psig == sig => {
+                if now >= deadline {
+                    pane.pending_rerun = None;
+                    fire = true;
+                }
+            }
+            // New (or changed) config → (re)start the debounce window.
+            _ => pane.pending_rerun = Some((sig, now + LIVE_DEBOUNCE)),
+        }
+    }
+    if fire {
+        self.run_structural_streaming(ctx, cfg, /*live=*/ true);
+    } else {
+        // Keep the frame loop ticking toward the debounce deadline.
+        ctx.request_repaint_after(LIVE_DEBOUNCE);
+    }
 }
 
 /// Flip the shared cancel atomic. The background task notices on its

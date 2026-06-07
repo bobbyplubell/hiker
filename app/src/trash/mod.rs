@@ -1,7 +1,7 @@
 //! Trash — a sidebar `Activity` listing the vault's trashed items, each
 //! with Restore / Purge actions, plus a clickable read-only preview.
 //! Migrated off `panels_registry`'s `P_TRASH` to a real `Activity` whose
-//! `View` renders through the narrow `activity::Ctx`: the
+//! `View` renders through the narrow `activity::SurfaceCtx`: the
 //! listing is read from disk via `ctx.vault.root()` and every mutation
 //! (restore / purge / open-preview) is deferred with full `&mut
 //! AppState` via `ctx.defer`. The batch "Empty trash" verb stays in the
@@ -12,13 +12,14 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::icons;
 use hiker_theme as theme;
 
 /// Per-activity UI state for the Trash sidebar. The panel is effectively
 /// stateless — the listing is read fresh from disk each frame — but the
-/// registry's `with_ctx` hands every activity a `&mut dyn Any` state
+/// registry's `AppCtx::session` hands every activity a `&mut dyn Any` state
 /// slice, so a zero-field marker keeps the seam uniform. Owned by
 /// `AppState::trash_state` (top-level, per `feature-state-ownership`).
 #[derive(Default)]
@@ -26,7 +27,7 @@ pub struct State;
 
 /// A user action collected during the render loop. Each is applied via
 /// `ctx.defer` so the mutation runs with full `&mut AppState` after the
-/// narrow ctx borrow is released.
+/// narrow session borrow is released.
 enum Action {
     Restore { id: String },
     Purge { trashed_name: String },
@@ -34,10 +35,10 @@ enum Action {
     Preview { trash_path: String, original_path: String },
 }
 
-/// Render the trash listing through the narrow activity `Ctx`. The
+/// Render the trash listing through the narrow activity `SurfaceCtx`. The
 /// listing comes from `hiker_core::trash::Trash` opened on the vault
 /// root; restore/purge/preview are deferred to `&mut AppState`.
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     use hiker_core::trash::Trash;
     let trash = Trash::open(ctx.vault.root());
     let items = trash.list_from_disk().unwrap_or_default();
@@ -112,7 +113,7 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// Queue the collected action onto `ctx.defer`, where it runs with full
 /// `&mut AppState` (restore/purge mutate the vault + toasts + file tree;
 /// preview opens an editor tab).
-fn defer_action(ctx: &mut Ctx<'_>, action: Action) {
+fn defer_action(ctx: &mut SurfaceCtx<'_>, action: Action) {
     ctx.defer(move |state| apply(state, action));
 }
 
@@ -173,7 +174,7 @@ fn format_ts(unix_secs: i64) -> String {
 /// disk and defers every mutation.
 pub struct Trash;
 
-impl Activity for Trash {
+impl Activity<dyn AppCtx> for Trash {
     fn id(&self) -> &'static str {
         "trash"
     }
@@ -183,18 +184,22 @@ impl Activity for Trash {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Trash)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&TrashSidebar]
     }
 }
 
 struct TrashSidebar;
 
-impl View for TrashSidebar {
+impl View<dyn AppCtx> for TrashSidebar {
     fn id(&self) -> &'static str {
         "trash"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         egui::ScrollArea::vertical()
             .id_salt("panel-trash-body")
             .auto_shrink([false, false])

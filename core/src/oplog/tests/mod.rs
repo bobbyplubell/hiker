@@ -68,7 +68,7 @@ fn content_write_resurrects_tombstoned_path() {
 #[test]
 fn frontmatter_keys_comments_scalars_survive_byte_for_byte() {
     // Reordered keys / comments / unusual scalars are all plain text inside
-    // the single Y.Text — no YAML re-emit can touch them.
+    // the single text run — no YAML re-emit can touch them.
     // status: op-log-document-shape
     let weird = "---\nzeta: 1\nalpha: \"quoted\"\n# keep me\nnested:\n  - x\n  - y\nbool_as_str: 'true'\n---\nbody\n";
     let dir = tempdir().unwrap();
@@ -279,15 +279,16 @@ fn rename_repoints_index_and_drops_old_path() {
     let log = OpLog::open(dir.path()).unwrap();
     let doc_id = log.create_document("a.md", "note", "body\n", &Author::User).unwrap();
     log.rename_document(&doc_id, "b.md", &Author::User).unwrap();
-    // The path index follows the move: old path dropped, new path resolves.
+    // The id IS the path: a rename relabels the doc, so the old path no longer
+    // resolves and the new path resolves to itself (path-as-identity).
     assert_eq!(log.doc_id_for_path("a.md").unwrap(), None, "old path mapping not dropped");
     assert_eq!(
         log.doc_id_for_path("b.md").unwrap().as_deref(),
-        Some(doc_id.as_str()),
+        Some("b.md"),
         "new path not mapped to the doc"
     );
-    // Content is unchanged by the rename; history can still reconstruct it.
-    assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, "body\n");
+    // Content is unchanged by the rename; the doc now lives at its new path.
+    assert_eq!(log.materialize_accepted("b.md").unwrap().text, "body\n");
 }
 
 #[test]
@@ -405,8 +406,13 @@ fn accept_applies_to_accepted_and_disk() {
 }
 
 #[test]
-fn reject_discards_and_writes_audit_row() {
+fn reject_discards_and_leaves_no_history_row() {
+    // A rejected pending edit is transient editorial state: it leaves NO
+    // durable history row (the regenerable `op_history` index rebuilds from
+    // `.ops`, which only holds accepted history). Rejection is observable via
+    // the pending edit disappearing, not via a history row.
     // status: op-log-status-states
+    // status: op-log-no-oplog-db
     let dir = tempdir().unwrap();
     let log = OpLog::open(dir.path()).unwrap();
     let doc_id = log
@@ -422,19 +428,23 @@ fn reject_discards_and_writes_audit_row() {
             &user_ctx(),
         )
         .unwrap();
+    // Before rejection: exactly one pending edit, one accepted (Create) row.
+    assert_eq!(log.pending_ops(&doc_id).unwrap().len(), 1);
+    let accepted_before = log.doc_history(&doc_id, 50).unwrap().len();
     log.reject_pending(&doc_id, &out.op_ids[0]).unwrap();
-    // accepted untouched, queue emptied.
+    // accepted untouched, queue emptied — the rejection is observable here.
     assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, "hello world\n");
     assert!(log.pending_ops(&doc_id).unwrap().is_empty());
-    // A rejected audit row carries the update bytes in metadata.
-    let rows = log
+    // No rejected query is possible (the status is a no-op filter) and the
+    // accepted history is unchanged — no audit row was written.
+    let rejected = log
         .query_metadata(&meta::Filter {
             status: Some(meta::OpStatus::Rejected),
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].metadata.get("rejected_update").is_some());
+    assert!(rejected.is_empty());
+    assert_eq!(log.doc_history(&doc_id, 50).unwrap().len(), accepted_before);
 }
 
 #[test]
@@ -628,8 +638,13 @@ fn doc_index_maps_path_to_id() {
 }
 
 #[test]
-fn gc_removes_old_rejected_rows() {
+fn gc_trims_old_accepted_history_rows() {
+    // GC trims the regenerable `op_history` query-index (the activity-retention
+    // window). A `Rejected` GC is a no-op (no rejected rows are ever stored —
+    // a rejected pending edit leaves no frame); an `Accepted` GC with a future
+    // cutoff trims the accepted history rows.
     // status: op-log-status-states
+    // status: op-log-no-oplog-db
     let dir = tempdir().unwrap();
     let log = OpLog::open(dir.path()).unwrap();
     let doc_id = log
@@ -646,16 +661,94 @@ fn gc_removes_old_rejected_rows() {
         )
         .unwrap();
     log.reject_pending(&doc_id, &out.op_ids[0]).unwrap();
-    // Cutoff in the far future removes the just-written rejected row.
-    let deleted = log.gc_metadata(meta::OpStatus::Rejected, i64::MAX).unwrap();
+    // Rejecting wrote no row, so a Rejected GC deletes nothing.
+    assert_eq!(log.gc_metadata(meta::OpStatus::Rejected, i64::MAX).unwrap(), 0);
+    // The one accepted (Create) row is present; an Accepted GC with a future
+    // cutoff trims it.
+    assert_eq!(log.doc_history(&doc_id, 50).unwrap().len(), 1);
+    let deleted = log.gc_metadata(meta::OpStatus::Accepted, i64::MAX).unwrap();
     assert_eq!(deleted, 1);
-    let rows = log
-        .query_metadata(&meta::Filter {
-            status: Some(meta::OpStatus::Rejected),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(rows.is_empty());
+    assert!(log.doc_history(&doc_id, 50).unwrap().is_empty());
+}
+
+#[test]
+fn op_history_index_is_regenerable_from_ops() {
+    // The `op_history` query-index is a REGENERABLE cache over the durable
+    // `.ops` frames (`changes-query-api` / `op-log-no-oplog-db`): dropping it
+    // and replaying every doc's frames must yield IDENTICAL rows (same op-ids,
+    // ordering, content-hash sets). `rm index.db` + reopen exercises exactly
+    // the on-open rebuild path.
+    // status: changes-query-api
+    // status: op-log-no-oplog-db
+    let dir = tempdir().unwrap();
+    // Build a non-trivial history across a few docs: a create + agent edit
+    // accept, a rename, and a tombstone — every op-kind that writes a frame.
+    {
+        let log = OpLog::open(dir.path()).unwrap();
+        log.create_document("a.md", "note", "hello world\n", &Author::User)
+            .unwrap();
+        let out = log
+            .stage_pending(
+                &"a.md".to_string(),
+                &[EditSpec {
+                    old_str: Some("world".to_string()),
+                    new_str: "earth".to_string(),
+                }],
+                &user_ctx(),
+            )
+            .unwrap();
+        log.accept_pending("a.md", &out.op_ids[0]).unwrap();
+        log.create_document("b.md", "note", "beta\n", &Author::User)
+            .unwrap();
+        log.rename_document("b.md", "c.md", &Author::User).unwrap();
+        log.create_document("d.md", "note", "delta\n", &Author::User)
+            .unwrap();
+        log.tombstone_document("d.md", &Author::User).unwrap();
+    }
+    // Snapshot the full vault history + per-doc content-hash sets from the
+    // index as first opened.
+    let snapshot = |log: &OpLog| {
+        let hist = log.vault_history(1000).unwrap();
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<String>)> = hist
+            .iter()
+            .map(|m| {
+                (
+                    m.doc_id.clone(),
+                    m.op_id.clone(),
+                    m.op_kind.clone(),
+                    m.timestamp_ms,
+                    m.content_hash.clone(),
+                    m.rename_from.clone(),
+                )
+            })
+            .collect();
+        let mut hash_sets: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
+        for doc in ["a.md", "c.md", "d.md"] {
+            hash_sets.push((doc.to_string(), log.doc_history_hashes(doc).unwrap()));
+        }
+        (rows, hash_sets)
+    };
+    let before = {
+        let log = OpLog::open(dir.path()).unwrap();
+        snapshot(&log)
+    };
+    // Drop the regenerable index entirely (and its WAL sidecars) and reopen:
+    // the on-open `rebuild_from_ops` replays the `.ops` frames.
+    for ext in ["", "-wal", "-shm"] {
+        let p = dir.path().join(".hiker").join(format!("index.db{ext}"));
+        if p.exists() {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    let after = {
+        let log = OpLog::open(dir.path()).unwrap();
+        snapshot(&log)
+    };
+    assert_eq!(before.0, after.0, "history rows must be identical after rebuild");
+    assert_eq!(before.1, after.1, "content-hash sets must be identical after rebuild");
+    // Sanity: the rebuild actually produced rows (create+accept on a, create+
+    // rename on b→c, create+tombstone on d = 6 frames).
+    assert_eq!(before.0.len(), 6);
 }
 
 #[test]
@@ -686,10 +779,12 @@ fn rename_updates_path_and_index() {
         .create_document("old.md", "note", "hello\n", &Author::User)
         .unwrap();
     log.rename_document(&doc_id, "new.md", &Author::User).unwrap();
-    assert_eq!(log.doc_id_for_path("new.md").unwrap(), Some(doc_id.clone()));
+    // The id IS the path: the new path resolves to itself; history rows
+    // repoint to the new path key (path-as-identity).
+    assert_eq!(log.doc_id_for_path("new.md").unwrap(), Some("new.md".to_string()));
     let rows = log
         .query_metadata(&meta::Filter {
-            doc_id: Some(doc_id),
+            doc_id: Some("new.md".to_string()),
             ..Default::default()
         })
         .unwrap();
@@ -698,115 +793,59 @@ fn rename_updates_path_and_index() {
 }
 
 #[test]
-fn compaction_rewrites_oversized_snapshot_on_open() {
-    // status: op-log-compaction
-    // A tiny threshold forces compaction on reopen; the doc content must
-    // survive the rewrite unchanged.
-    let dir = tempdir().unwrap();
-    let doc_id;
-    {
-        let log = OpLog::open(dir.path()).unwrap();
-        // Many small appends inflate the .yrs history (per-edit position
-        // metadata) relative to the materialized size. 40 edits is plenty to
-        // push the snapshot past the 1024-byte floor *and* past 1× the
-        // materialized size, which is all the aggressive reopen threshold
-        // below needs — no point paying 200 fsyncs to prove the same thing.
-        doc_id = log
-            .create_document("a.md", "note", "seed\n", &Author::User)
-            .unwrap();
-        for i in 0..40 {
-            let cur = log.materialize_accepted(&doc_id).unwrap().text;
-            let len = cur.len();
-            log.apply_user_edit(&doc_id, len, 0, &format!("line {i}\n"))
-                .unwrap();
-        }
-    }
-    let before = log_yrs_size(dir.path(), &doc_id);
-    // Reopen with an aggressive threshold; compaction fires on open.
-    let log = OpLog::open_with_threshold(dir.path(), 1.0).unwrap();
-    let after = log_yrs_size(dir.path(), &doc_id);
-    assert!(after <= before, "compaction should not grow the snapshot");
-    // Content intact.
-    let text = log.materialize_accepted(&doc_id).unwrap().text;
-    assert!(text.starts_with("seed\n"));
-    assert!(text.contains("line 39\n"));
-}
-
-/// Total on-disk Yrs footprint for a doc: the `.yrs` base snapshot plus its
-/// `.yrslog` incremental-delta log. Edits append to the log; compaction folds
-/// the log back into the base and clears it. The combined size is what the
-/// compaction threshold and the "didn't grow" assertion are about.
-#[test]
-fn edits_append_to_delta_log_and_replay_on_reopen() {
-    // status: op-log-yrs-delta-log
-    // A commit appends a delta to `.yrslog` rather than rewriting the `.yrs`
-    // base, and reopening replays base + deltas to reconstruct the content.
+fn ops_log_is_sole_durable_representation_across_reopen() {
+    // status: op-log-accepted-op-retention
+    // status: op-log-materialization
+    // The `.ops` history log is the document's sole durable representation now
+    // that `accepted` is plain text — there is no `.yrs` snapshot. Each edit
+    // appends one frame; reopening reconstructs `accepted` from the NEWEST
+    // frame, so content survives a close/reopen byte-for-byte. (The
+    // keyframe/delta machinery keeps the log linear; this test asserts
+    // correctness, not the keyframe cadence.)
     let dir = tempdir().unwrap();
     let oplog = dir.path().join(".hiker").join("oplog");
-    let base_size = |doc_id: &str| {
-        std::fs::metadata(oplog.join(format!("{doc_id}.yrs"))).map(|m| m.len()).unwrap_or(0)
-    };
-    let log_size = |doc_id: &str| {
-        std::fs::metadata(oplog.join(format!("{doc_id}.yrslog"))).map(|m| m.len()).unwrap_or(0)
+    let ops_size = |doc_id: &str| {
+        std::fs::metadata(oplog.join(format!("{doc_id}.ops"))).map(|m| m.len()).unwrap_or(0)
     };
 
     let doc_id;
-    let base_after_create;
     {
         let log = OpLog::open(dir.path()).unwrap();
         doc_id = log.create_document("a.md", "note", "seed\n", &Author::User).unwrap();
-        base_after_create = base_size(&doc_id);
-        assert_eq!(log_size(&doc_id), 0, "no deltas yet right after create");
-        for i in 0..5 {
+        // The create wrote the first (keyframe) frame; there is no `.yrs`.
+        assert!(ops_size(&doc_id) > 0, "create writes the first .ops frame");
+        assert!(
+            !oplog.join(format!("{doc_id}.yrs")).exists(),
+            "no .yrs snapshot is written under the text substrate",
+        );
+        let before = ops_size(&doc_id);
+        for i in 0..40 {
             let len = log.materialize_accepted(&doc_id).unwrap().text.len();
             log.apply_user_edit(&doc_id, len, 0, &format!("line {i}\n")).unwrap();
         }
-        // The base snapshot is untouched; the edits live in the append log.
-        assert_eq!(base_size(&doc_id), base_after_create, "edits must not rewrite the .yrs base");
-        assert!(log_size(&doc_id) > 0, "edits append to the .yrslog delta log");
+        assert!(ops_size(&doc_id) > before, "each edit appends a frame to .ops");
     }
 
-    // Reopen with a high threshold so compaction does NOT fire — this exercises
-    // the base + delta *replay* path specifically.
-    let log = OpLog::open_with_threshold(dir.path(), 1000.0).unwrap();
-    assert!(log_size(&doc_id) > 0, "delta log retained (no compaction at this threshold)");
+    // Reopen: `accepted` reconstructs from the newest `.ops` frame.
+    let log = OpLog::open(dir.path()).unwrap();
     let text = log.materialize_accepted(&doc_id).unwrap().text;
-    assert!(text.starts_with("seed\n"), "replayed content starts with the seed");
-    assert!(text.contains("line 4\n"), "replayed content includes every appended edit");
-    // A further edit after reopen keeps appending (persisted_sv tracked across
-    // the reload), and replays correctly again.
+    assert!(text.starts_with("seed\n"), "reconstructed content starts with the seed");
+    assert!(text.contains("line 39\n"), "reconstructed content includes every appended edit");
+
+    // A further edit after reopen keeps appending and reconstructs again.
     let len = text.len();
     log.apply_user_edit(&doc_id, len, 0, "tail\n").unwrap();
     drop(log);
-    let log = OpLog::open_with_threshold(dir.path(), 1000.0).unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
     assert!(log.materialize_accepted(&doc_id).unwrap().text.contains("tail\n"));
 }
 
-fn log_yrs_size(vault: &std::path::Path, doc_id: &str) -> u64 {
-    let oplog = vault.join(".hiker").join("oplog");
-    let size = |ext: &str| {
-        std::fs::metadata(oplog.join(format!("{doc_id}.{ext}")))
-            .map(|m| m.len())
-            .unwrap_or(0)
-    };
-    size("yrs") + size("yrslog")
-}
-
-#[test]
-fn version_mismatch_fails_loud() {
-    // status: op-log-side-table
-    use rusqlite::Connection;
-    let dir = tempdir().unwrap();
-    let oplog_dir = dir.path().join(".hiker").join("oplog");
-    std::fs::create_dir_all(&oplog_dir).unwrap();
-    let conn = Connection::open(oplog_dir.join("oplog_meta.db")).unwrap();
-    conn.pragma_update(None, "user_version", 999i32).unwrap();
-    drop(conn);
-    match OpLog::open(dir.path()) {
-        Err(error::Error::VersionMismatch { found: 999, .. }) => {}
-        other => panic!("expected version mismatch, got {:?}", other.err()),
-    }
-}
+// The op log's history query-index (`op_history`) lives in the vault's
+// `index.db` and is REGENERABLE from `.ops`, so it carries no schema-version
+// gate of its own — a shape change is a drop-and-replay, never a fail-loud
+// migration (`op-log-no-oplog-db`). The former `version_mismatch_fails_loud`
+// test guarded the now-deleted `oplog_meta.db`; the store's own `index.db`
+// `user_version` fail-loud is covered by the `core::store` tests.
 
 // ── Multi-file reorganization (reorg batch) ──────────────────────────
 
@@ -887,11 +926,15 @@ fn reorg_batch_accept_moves_each_file_on_disk() {
         std::fs::read_to_string(dir.path().join("archive/b.md")).unwrap(),
         "beta\n"
     );
-    // The path index repointed: old paths unresolve, new paths resolve.
+    // The doc relabeled: old paths unresolve, new paths resolve to themselves
+    // (path-as-identity), and the consumed pending queue is empty at the new id.
     assert!(log.doc_id_for_path("inbox/a.md").unwrap().is_none());
-    assert_eq!(log.doc_id_for_path("archive/a.md").unwrap().as_deref(), Some(a.as_str()));
-    assert!(log.pending_ops(&a).unwrap().is_empty());
-    assert!(log.pending_ops(&b).unwrap().is_empty());
+    assert_eq!(
+        log.doc_id_for_path("archive/a.md").unwrap().as_deref(),
+        Some("archive/a.md"),
+    );
+    assert!(log.pending_ops("archive/a.md").unwrap().is_empty());
+    assert!(log.pending_ops("archive/b.md").unwrap().is_empty());
 }
 
 #[test]
@@ -964,16 +1007,22 @@ fn reorg_batch_reject_drops_the_batch() {
     assert!(dir.path().join("inbox/b.md").exists());
     assert!(log.pending_ops(&a).unwrap().is_empty());
     assert!(log.pending_ops(&b).unwrap().is_empty());
-    // A rejected audit row exists, stamped auto:cluster.
-    let rows = log
+    // Rejection is transient editorial state: no durable audit rows are
+    // written (`op-log-no-oplog-db`). Only the two `Create` rows remain.
+    let rejected_rows = log
         .query_metadata(&meta::Filter {
-            author_class: Some("auto".to_string()),
             status: Some(meta::OpStatus::Rejected),
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|r| matches!(&r.author, Author::Auto(p) if p == "cluster")));
+    assert!(rejected_rows.is_empty());
+    let auto_rows = log
+        .query_metadata(&meta::Filter {
+            author_class: Some("auto".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(auto_rows.is_empty(), "no auto-authored rows: the renames were rejected, not accepted");
 }
 
 #[test]
@@ -1011,10 +1060,10 @@ fn multi_span_delta_localizes_and_skips_unchanged_middle() {
     // A save that touches two distant regions yields two small spans; the
     // unchanged middle appears in neither — so a concurrent remote edit over
     // it would still merge.
-    // status: op-log-yrs-backed
+    // status: op-log-materialization
     let before = "alpha\nMIDDLE_UNCHANGED\nomega\n";
     let after = "ALPHA\nMIDDLE_UNCHANGED\nOMEGA\n";
-    let spans = super::doc::multi_span_delta(before, after);
+    let spans = crate::merge::multi_span_delta(before, after);
     assert_eq!(spans.len(), 2, "two disjoint change regions, got {spans:?}");
     for (start, removed_len, inserted) in &spans {
         let removed = &before[*start..*start + *removed_len];
@@ -1022,18 +1071,19 @@ fn multi_span_delta_localizes_and_skips_unchanged_middle() {
         assert!(!inserted.contains("MIDDLE_UNCHANGED"), "inserted touched middle");
     }
     // An empty diff (no change) stages nothing.
-    assert!(super::doc::multi_span_delta(before, before).is_empty());
+    assert!(crate::merge::multi_span_delta(before, before).is_empty());
 }
 
 #[test]
 fn user_save_commits_localized_ops_not_whole_document() {
     // The keystone sync-correctness property: a whole-buffer save diffs into
-    // minimal localized Yrs ops. Flipping a few characters deep in a large
-    // note advances the Yrs clock by ~that change, NOT by the document length
-    // (which a whole-`text` delete+reinsert would). The op's recorded clock
-    // range is the proof: untouched bytes are never rewritten, so a remote op
-    // over them still merges.
-    // status: op-log-yrs-backed
+    // minimal localized TEXT spans. Flipping a few characters deep in a large
+    // note produces a span covering ~that change, NOT the document length
+    // (which a whole-`text` delete+reinsert would). Untouched bytes are never
+    // rewritten, so a remote edit over them still merges. Under the text model
+    // the proof is the diff itself (`multi_span_delta`) — the same engine the
+    // commit path runs inside its lock — rather than a clock range.
+    // status: op-log-materialization
     let dir = tempdir().unwrap();
     let log = OpLog::open(dir.path()).unwrap();
     let big = format!(
@@ -1047,13 +1097,13 @@ fn user_save_commits_localized_ops_not_whole_document() {
     let edited = big.replacen("lorem", "LOREM", 1);
     assert!(log.apply_user_text(&doc_id, &edited).unwrap());
     assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, edited);
-    // Newest accepted op covers only the inserted change — orders of
-    // magnitude smaller than the >1500-byte document.
-    let hist = log.doc_history(&doc_id, 1).unwrap();
-    let span = hist[0].yrs_clock_hi - hist[0].yrs_clock_lo;
+    // The localized spans the commit diffed cover only the changed region —
+    // orders of magnitude smaller than the >1500-byte document.
+    let spans = crate::merge::multi_span_delta(&big, &edited);
+    let touched: usize = spans.iter().map(|(_, removed, ins)| (*removed).max(ins.len())).sum();
     assert!(
-        span <= "LOREM".len() as i64,
-        "expected a localized op (<= {} clocks), got {span} for a {}-byte doc",
+        touched <= "LOREM".len(),
+        "expected a localized edit (<= {} bytes touched), got {touched} for a {}-byte doc",
         "LOREM".len(),
         big.len()
     );
@@ -1102,7 +1152,7 @@ fn unreadable_pending_queue_is_tolerated() {
     // A `.pending` left in a stale/foreign byte format (e.g. a prior on-disk
     // encoding) must not block editing: it reads as an empty queue and the
     // next stage overwrites it. Pending ops are local editorial state — an
-    // unreadable queue never costs document content (which lives in `.yrs`).
+    // unreadable queue never costs document content (which lives in `.ops`).
     // status: op-log-pending-survives-restart
     let dir = tempdir().unwrap();
     let doc_id = {
@@ -1137,16 +1187,16 @@ fn unreadable_pending_queue_is_tolerated() {
 fn bug_sync_accept_pending_trusts_metadata_newpath() {
     // status: bug-sync-accept-pending-trusts-metadata-newpath
     //
-    // `accept_pending` uses the pending op's `metadata["new_path"]` to repoint
-    // the path index, but uses the post-apply Yrs `meta.path` to choose where
-    // the `.md` lands on disk. When the two disagree (corrupted `.pending`,
-    // producer bug, manual edit) the index and the on-disk file desync: the
-    // file is written at the Yrs path but the index points elsewhere.
+    // Under the text-edit pending model a `Rename` carries exactly one source
+    // of truth: `metadata["new_path"]`. `accept_pending` both repoints the path
+    // index and `apply_rename`s `accepted` from that single field, so the
+    // post-apply `meta.path`, the `.md` location, and the index can never
+    // disagree — the desync this bug described is structurally impossible.
     //
-    // We construct the disagreement by mutating the JSON `.pending` file after
-    // staging — leaving the Yrs update bytes (which advance `meta.path` to
-    // `notes/b.md`) untouched, but rewriting `metadata.new_path` to
-    // `notes/c.md`. Reopen so `ensure_loaded` re-reads the queue, then accept.
+    // We still corrupt the `.pending` JSON's `new_path` to `notes/c.md` and
+    // assert the invariant the bug guarded: the on-disk `.md`, `meta.path`, and
+    // the index all follow that one field in lockstep (here, `notes/c.md`).
+    // Reopen so `ensure_loaded` re-reads the queue, then accept.
     let dir = tempdir().unwrap();
     let doc_id = {
         let log = OpLog::open(dir.path()).unwrap();
@@ -1163,8 +1213,9 @@ fn bug_sync_accept_pending_trusts_metadata_newpath() {
     };
 
     // Mutate the on-disk .pending: change metadata.new_path to a third path
-    // while leaving op_kind (which carries `from`) and the yrs_update bytes
-    // (which mutate meta.path to "notes/b.md") untouched.
+    // (`notes/c.md`), leaving op_kind (which carries `from`) untouched. Under
+    // the text model this single field now drives both the apply and the index
+    // repoint, so accept must move the doc to `notes/c.md` consistently.
     let pending_path = dir
         .path()
         .join(".hiker")
@@ -1200,33 +1251,33 @@ fn bug_sync_accept_pending_trusts_metadata_newpath() {
 
     log.accept_pending(&doc_id, &op_id).unwrap();
 
-    // The Yrs update advances meta.path to `notes/b.md`, so the .md must land
-    // there — and the index must agree.
+    // `apply_rename` advances meta.path to `notes/c.md` (the single source of
+    // truth), so the .md lands there and the index agrees — no desync.
     assert!(
-        dir.path().join("notes/b.md").exists(),
-        ".md should be written at the post-apply Yrs path"
+        dir.path().join("notes/c.md").exists(),
+        ".md should be written at the renamed path"
     );
     assert!(
-        !dir.path().join("notes/c.md").exists(),
-        ".md must not be written at the (corrupted) metadata path"
+        !dir.path().join("notes/b.md").exists(),
+        "the original staged path must not be written"
+    );
+    // The id IS the path: after the rename the doc lives at `notes/c.md`, so
+    // it resolves to itself and the old id no longer resolves.
+    assert_eq!(
+        log.path_for_doc("notes/c.md").unwrap().as_deref(),
+        Some("notes/c.md"),
+        "path_for_doc must follow the applied meta.path"
+    );
+    assert_eq!(log.path_for_doc(&doc_id).unwrap(), None);
+    assert_eq!(
+        log.doc_id_for_path("notes/c.md").unwrap().as_deref(),
+        Some("notes/c.md"),
+        "doc_id_for_path on the renamed path must resolve"
     );
     assert_eq!(
-        log.path_for_doc(&doc_id).unwrap().as_deref(),
-        Some("notes/b.md"),
-        "path_for_doc must follow the actual Yrs meta.path"
-    );
-    // Desync symptom: with the bug, the index was repointed using
-    // metadata.new_path (`notes/c.md`), so the post-apply Yrs path resolves
-    // to None and the corrupted path resolves to the doc instead.
-    assert_eq!(
-        log.doc_id_for_path("notes/b.md").unwrap().as_deref(),
-        Some(doc_id.as_str()),
-        "doc_id_for_path on the Yrs path must resolve — bug: index was repointed to metadata.new_path"
-    );
-    assert_eq!(
-        log.doc_id_for_path("notes/c.md").unwrap(),
+        log.doc_id_for_path("notes/b.md").unwrap(),
         None,
-        "the corrupted metadata path must NOT be in the index"
+        "the original staged path must NOT be in the index"
     );
 }
 

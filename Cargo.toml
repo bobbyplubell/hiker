@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "core",
     "hiker-sync",
+    "hiker-git",
     "hiker-canvas/core",
     "hiker-canvas/view-core",
     "hiker-canvas/view",
@@ -12,9 +13,10 @@ members = [
     "mcp-server",
     "app",
     "zxr",
-    "hiker-features",
     "hiker-lite",
     "site",
+    "tools/dagre-compare",
+    "tools/wavedrom-compare",
     "tools/diff-overlay-snapshot",
     "tools/graph-snapshot",
     "tools/minimap-render",
@@ -45,6 +47,9 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 hiker-core = { path = "core" }
+# Git transport backend (git.md). `git2`/libgit2 is confined to this crate
+# (git-backend-trait); consumers see only its plain-Rust `GitBackend` surface.
+hiker-git = { path = "hiker-git" }
 hiker-canvas = { path = "hiker-canvas/core" }
 canvas-view-core = { path = "hiker-canvas/view-core" }
 # Shared LLM client extracted from core (status: crawler-shared-llm). Consumed
@@ -97,10 +102,6 @@ ndarray = "0.17"
 # so any minor bump should be a deliberate re-test rather than a passive
 # cargo-update sweep.
 single-clustering = "=0.6.1"
-# status: op-log-yrs-backed
-# CRDT substrate for the op log (core::oplog). Confined to that module per
-# its module-discipline doc — no yrs types leak past the OpLog boundary.
-yrs = "0.26"
 # bincode 1.x: serde-driven binary encoding for the `<doc-id>.pending`
 # Vec<PendingOp> file (op-log-store-layout). 1.x keeps the serde-derive
 # path; 2.x's encode/decode-trait API would mean re-deriving every type.
@@ -136,11 +137,10 @@ eframe = { version = "0.32", default-features = false, features = ["default_font
 egui_dock = "0.17"
 egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { path = "egui-workbench" }
-hiker-features = { path = "hiker-features" }
 # Graph layout lives egui-agnostically in the `hiker-render` submodule
 # (`hiker-graph`); `widgets/graph-widgets` is the thin egui adapter the app +
 # graph-snapshot consume (it converts at the `egui::Vec2` boundary).
-hiker-graph = { path = "hiker-render/hiker-render/graph" }
+hiker-graph = { path = "hiker-render/graph" }
 graph-widgets = { path = "widgets/graph-widgets" }
 # Thin egui shell over the egui-free `canvas-view-core`: the painter + widget +
 # pointer plumbing + the `NodeContentRenderer` content seam. Stays free of
@@ -149,7 +149,7 @@ canvas-view = { path = "hiker-canvas/view" }
 # From-scratch HTML/CSS renderer (Stylo + our layout + egui paint) in the
 # `hiker-render` submodule. Replaces the old `egui-blitz` widget as the ZIM
 # viewer's HTML engine; the app talks only to this crate, never Blitz.
-hiker-htmlview = { path = "hiker-render/hiker-render/htmlview" }
+hiker-htmlview = { path = "hiker-render/htmlview" }
 petgraph = { version = "0.6", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }

@@ -394,7 +394,7 @@ pub fn list(
         let Ok(src) = vault.read_file(&rel) else { continue };
         let Ok(board) = parse_board_for(&rel, &src) else { continue };
         let card_count: u32 = board.columns.iter().map(|c| c.cards.len() as u32).sum();
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         let board_id = match log.doc_id_for_path(&rel) {
             Ok(Some(id)) => id,
             _ => continue,
@@ -441,7 +441,7 @@ pub fn get_board(
         })
         .collect();
 
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     let board_id = log
         .doc_id_for_path(board_doc_rel)
         .map_err(|e| HikerError::Io(e.to_string()))?

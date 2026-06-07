@@ -4,7 +4,7 @@
 //! `core::trails::list` / `get_trail` and drives every mutation (create /
 //! append / remove / set-cursor / delete / activate) through the
 //! `crate::trails::bridge` sync→async bridge, mirroring
-//! `crate::panels::board`'s service-access + `Ctx::defer` pattern.
+//! `crate::panels::board`'s service-access + `SurfaceCtx::defer` pattern.
 //!
 //! Read-only invariant (`trails-mode-sidebar-read-only`): no
 //! drag-to-reorder, no inline rename, no in-place annotation editing. The
@@ -16,7 +16,7 @@
 
 use eframe::egui;
 
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::editor_pane;
 use crate::trails::bridge;
 use crate::trails::state::State;
@@ -42,13 +42,13 @@ struct TrailActions {
 }
 
 /// Per-frame context for the trails sidebar. Wraps the narrow activity
-/// `Ctx` so the render/mutation helpers can be `&mut self` methods on one
+/// `SurfaceCtx` so the render/mutation helpers can be `&mut self` methods on one
 /// receiver (exempt from `single_call_fn`). Trail data is read live from
 /// disk via [`crate::trails::bridge`]; transient UI state lives in the
 /// activity's own `State` (via `ctx.state`); broad effects (open a note,
 /// the remove-confirm modal, activation config write) ride `ctx.defer`.
 pub(crate) struct TrailsCtx<'a, 'c> {
-    pub(crate) ctx: &'a mut Ctx<'c>,
+    pub(crate) ctx: &'a mut SurfaceCtx<'c>,
 }
 
 impl TrailsCtx<'_, '_> {

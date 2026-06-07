@@ -5,7 +5,7 @@
 //! `feature-cluster-migration`). Each activity now owns its own state
 //! type; the registry shell never has to know what each activity stores.
 //! Held on `AppState` as a top-level `clusters_state` field, surfaced
-//! through `Ctx::state` as `&mut dyn Any` downcastable to
+//! through `SurfaceCtx.state` as `&mut dyn Any` downcastable to
 //! `&mut State`.
 
 use std::collections::{HashMap, HashSet};
@@ -70,6 +70,11 @@ pub struct AdvancedClusterParams {
     pub include_outliers: bool,
     pub summary_confidence_threshold: f32,
     pub disable_recursion: bool,
+    /// Live preview: re-run the structural pass (debounced) when a config
+    /// knob changes, once a first run has established the note set. Default
+    /// on; force-disabled above a per-algorithm note-count gate. Per
+    /// `cluster-review-tab-live-preview`.
+    pub live_preview: bool,
 }
 
 impl Default for AdvancedClusterParams {
@@ -86,6 +91,7 @@ impl Default for AdvancedClusterParams {
             include_outliers: true,
             summary_confidence_threshold: 0.5,
             disable_recursion: false,
+            live_preview: true,
         }
     }
 }

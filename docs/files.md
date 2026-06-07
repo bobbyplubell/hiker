@@ -102,7 +102,7 @@ Planned richer interactions (the bullets below describe the intended surface; th
 
 Restore is a `move_note` from the trash entry's on-disk location to its `original_path` (from the manifest), followed by a re-ingest so search/related see it again. `move_note` already routes through the indexer's owned store connection and emits the correct watcher suppression, so restore inherits that path — no separate code, no second writer.
 
-The op-log `doc_id` and its history survive the round trip: delete tombstones the doc and retains its Yrs state + history keyed by `doc_id` (per `op-log-external-edit-sync` in `op-log.md`); restore rebinds `path → doc_id` and clears the tombstone, so the document comes back with full change history. The store re-ingests fresh chunks + embeddings under that same `doc_id`, and since `notes.id` *is* the `doc_id` (`store-id-from-oplog`), search rebinds to the restored identity automatically.
+The document's `.ops` history survives the round trip: delete tombstones the document and retains its `.ops` history keyed by path (per `op-log-external-edit-sync` in `op-log.md`); restore clears the tombstone, so the document comes back with full change history. The store re-ingests fresh chunks + embeddings keyed by the restored path (`store-path-is-identity`), so search rebinds to the restored identity automatically.
 
 Edge cases:
 

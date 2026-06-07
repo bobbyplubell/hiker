@@ -12,10 +12,7 @@
 //!
 //! Discovery is by the `hiker.kind: cluster-tree` frontmatter query
 //! (`store-note-query`), not a directory glob — so a tree the user moved,
-//! hand-typed, or imported is found exactly like one hiker authored. A
-//! one-time migration (`migrate_legacy_trees`) relocates legacy
-//! `.hiker/trees/<id>.md` files to the visible default on first open,
-//! preserving each tree's op-log identity.
+//! hand-typed, or imported is found exactly like one hiker authored.
 //!
 //! No rusqlite, no schema-version file — the frontmatter is self-describing
 //! and non-`hiker` keys round-trip untouched.
@@ -268,14 +265,11 @@ impl Db {
     /// Create a trees handle backed by the op-log + vault. No directory is
     /// created — the visible tree dir (`new_cluster_tree_dir`, default
     /// `cluster-trees/`) is created lazily by `vault.write_file` on the first
-    /// tree. Runs the one-time legacy-location migration
-    /// (`migrate_legacy_trees`) so a vault carrying `.hiker/trees/<id>.md`
-    /// files surfaces them at the visible default. The watcher/indexer
-    /// handles and the configured dir are wired later via [`Db::wire`] (they
-    /// don't exist at construction time).
+    /// tree. The watcher/indexer handles and the configured dir are wired
+    /// later via [`Db::wire`] (they don't exist at construction time).
     pub fn new(oplog: Arc<OpLog>, vault: Arc<Vault>) -> Result<Self, Error> {
         let store = crate::store::Store::open(vault.root()).map_err(|e| Error::Store(e.to_string()))?;
-        let db = Self {
+        Ok(Self {
             oplog,
             vault,
             centroids: Mutex::new(store),
@@ -284,9 +278,7 @@ impl Db {
             index_jobs: std::sync::OnceLock::new(),
             new_tree_dir: Mutex::new(DEFAULT_TREE_DIR.to_string()),
             id_paths: Mutex::new(HashMap::new()),
-        };
-        db.migrate_legacy_trees()?;
-        Ok(db)
+        })
     }
 
     /// Wire the watcher + indexer handles and the configured default tree
@@ -299,94 +291,6 @@ impl Db {
         if let Ok(mut dir) = self.new_tree_dir.lock() {
             *dir = new_tree_dir.to_string();
         }
-    }
-
-    /// One-time, idempotent relocation of legacy `.hiker/trees/<id>.md` trees
-    /// to the visible default (`cluster-trees/<id>.md`), run at `Db::new`.
-    /// Legacy trees were unindexed (everything under `.hiker/` is watcher-
-    /// ignored), so this is what makes them discoverable by the frontmatter
-    /// query. Guarded to no-op when `.hiker/trees/` is absent.
-    ///
-    /// Per-tree ordering — **the single biggest correctness risk**: the
-    /// op-log doc is repointed to the new path (`oplog::writes::rename`, which
-    /// preserves the doc_id + full history) **before** the file bytes move.
-    /// Doing the fs move first, or a `user_save` at the new path before the
-    /// repoint, would leave the op-log mapping at the old path and the next
-    /// write would mint a *fresh* doc — forking history. The repoint comes
-    /// first; only then do the bytes move. A legacy tree with no op-log
-    /// mapping (never saved while the op-log was running) just has its bytes
-    /// moved — the bootstrap / full-scan seeds a fresh doc at the new path.
-    ///
-    /// Indexing is deferred: the indexer's initial full-scan (which runs after
-    /// `Db::new` in bootstrap and walks the visible vault) picks the relocated
-    /// files up — no `Upsert` enqueue is needed here, and the watcher isn't
-    /// running yet so no suppression is needed either.
-    ///
-    /// status: cluster-tree-migration
-    fn migrate_legacy_trees(&self) -> Result<(), Error> {
-        let legacy_dir = self.vault.root().join(".hiker").join("trees");
-        if !legacy_dir.is_dir() {
-            return Ok(());
-        }
-        let target_dir = DEFAULT_TREE_DIR.trim_end_matches('/');
-        let entries = match std::fs::read_dir(&legacy_dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(stem) = name.strip_suffix(".md") else {
-                continue;
-            };
-            let old_rel = format!(".hiker/trees/{name}");
-            let new_rel = if target_dir.is_empty() {
-                format!("{stem}.md")
-            } else {
-                format!("{target_dir}/{stem}.md")
-            };
-            // Idempotent: a tree already at the new path means a prior run (or
-            // a hand-moved file) already relocated it; leave the legacy copy
-            // for the unlink at loop end and skip.
-            if self.vault.abs_path(&new_rel).map(|p| p.exists()).unwrap_or(false) {
-                continue;
-            }
-            // 1. Repoint the op-log doc FIRST (preserves doc_id + history).
-            //    No-op when the legacy file was never op-log-seeded.
-            if matches!(self.oplog.doc_id_for_path(&old_rel), Ok(Some(_)))
-                && let Err(e) = crate::oplog::writes::rename(
-                    &self.oplog,
-                    &old_rel,
-                    &new_rel,
-                    &crate::oplog::shapes::Author::User,
-                )
-            {
-                tracing::warn!(error = %e, %old_rel, %new_rel, "tree migration: op-log repoint failed; skipping");
-                continue;
-            }
-            // 2. Move the bytes to the visible path (create parent on first).
-            let Ok(old_abs) = self.vault.abs_path(&old_rel) else {
-                continue;
-            };
-            let Ok(new_abs) = self.vault.abs_path(&new_rel) else {
-                continue;
-            };
-            if let Some(parent) = new_abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if let Err(e) = std::fs::rename(&old_abs, &new_abs) {
-                tracing::warn!(error = %e, %old_rel, %new_rel, "tree migration: file move failed");
-                continue;
-            }
-            // Cache the relocated path so a `load` before the full-scan indexes
-            // it still resolves (the id is the filename stem here).
-            self.cache_path(stem, &new_rel);
-        }
-        // 3. Best-effort cleanup of the now-empty legacy shell so a second
-        //    open takes the early-return path above.
-        let _ = std::fs::remove_dir(&legacy_dir);
-        Ok(())
     }
 
     /// Resolve a tree id to the vault-relative path of its `.md` via the

@@ -27,6 +27,7 @@ mod keybinds;
 // on `AppState`, so the call site in `update()` is unchanged.
 mod os_open;
 mod panels;
+mod git_sync;
 mod profiling;
 mod related;
 mod search;

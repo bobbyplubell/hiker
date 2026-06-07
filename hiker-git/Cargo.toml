@@ -1,0 +1,28 @@
+[package]
+name = "hiker-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# --- git-only dep (confined to this crate per module discipline) ---------
+# libgit2 behind the `GitBackend` trait (git-backend-trait). libgit2 itself is
+# vendored (no system libgit2 on the dev/CI host — only cmake + cc, which
+# `vendored-libgit2` uses to compile the C source in). OpenSSL is NOT vendored:
+# the host has system OpenSSL 3.x, and `openssl-src` (what `vendored-openssl`
+# would pull) needs perl's FindBin to build from source, which the host lacks —
+# so `https` links the system OpenSSL via `openssl-sys` instead.
+# `default-features = false` drops ssh; `https` + `vendored-libgit2` are the
+# minimal set for commit + http push/pull. No `git2::` type ever crosses this
+# crate's public API.
+# status: git-backend-trait
+[dependencies.git2]
+version = "0.19"
+default-features = false
+features = ["vendored-libgit2", "https"]
+
+[dev-dependencies]
+tempfile = "3"

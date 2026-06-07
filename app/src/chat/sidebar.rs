@@ -1,7 +1,7 @@
-//! Docked chat sidebar surface (the `feature::Ctx` path).
+//! Docked chat sidebar surface (the `activity::SurfaceCtx` path).
 //!
 //! The docked chat region is migrated onto the `Chat` feature's
-//! `View`. It renders through the narrow `feature::Ctx`
+//! `View`. It renders through the narrow `activity::SurfaceCtx`
 //! (`render_sidebar`) rather than `&mut AppState`: chat state comes from
 //! `ctx.state` (the feature's `State`), services/vault/config/toasts from
 //! the shared ctx, and broad mutations that need full `&mut AppState`
@@ -20,21 +20,21 @@ use crate::chat::render::{
 };
 use crate::chat::session;
 use crate::chat::state::{ChatRegistry, ChatRole, State};
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::state::AppState;
 use hiker_theme as theme;
 
-/// Render the docked chat sidebar body through the narrow feature `Ctx`.
+/// Render the docked chat sidebar body through the narrow feature `SurfaceCtx`.
 /// Mirrors `Chat::render_full_tab(show_header=false)`: a transcript area
 /// over a multiline composer.
-pub(crate) fn render_sidebar(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+pub(crate) fn render_sidebar(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     SideBar { ctx }.show(ui);
 }
 
 /// Per-frame docked-sidebar render context. Wraps the narrow feature
-/// `Ctx` so the helpers can be `&mut self` methods on one receiver.
+/// `SurfaceCtx` so the helpers can be `&mut self` methods on one receiver.
 struct SideBar<'a, 'c> {
-    ctx: &'a mut Ctx<'c>,
+    ctx: &'a mut SurfaceCtx<'c>,
 }
 
 impl SideBar<'_, '_> {
@@ -76,7 +76,7 @@ impl SideBar<'_, '_> {
         self.composer(ui);
     }
 
-    /// The active-session combobox, rendered against the narrow `Ctx`
+    /// The active-session combobox, rendered against the narrow `SurfaceCtx`
     /// (chat registry via `ctx.state`). Mirrors `AppState::chat_session_picker`
     /// but without needing full `&mut AppState`.
     fn session_picker(&mut self, ui: &mut egui::Ui) {
@@ -121,7 +121,7 @@ impl SideBar<'_, '_> {
     fn transcript(&mut self, ui: &mut egui::Ui) {
         // Recompute the per-frame pending-op map off the op log (the tab
         // path reads `ui_cache.pending_snapshot`, which isn't on the
-        // narrow ctx; this is the same `list_pending_proposals` walk that
+        // narrow session; this is the same `list_pending_proposals` walk that
         // populates it).
         let mut live_ops_by_path: std::collections::HashMap<String, Vec<LiveOp>> =
             std::collections::HashMap::new();

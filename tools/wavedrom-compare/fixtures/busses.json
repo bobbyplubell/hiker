@@ -1,0 +1,7 @@
+{ "signal": [
+  {"name":"bus2","wave":"x2222x","data":["A","B","C","D"]},
+  {"name":"bus3","wave":"x3333x","data":["A","B","C","D"]},
+  {"name":"bus4","wave":"x4444x","data":["A","B","C","D"]},
+  {"name":"bus5","wave":"x5555x","data":["A","B","C","D"]},
+  {"name":"mix","wave":"x2345x","data":["w","x","y","z"]}
+] }

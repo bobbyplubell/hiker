@@ -1009,11 +1009,11 @@ pub type PickerEntry = (String, String, Vec<String>);
 /// Gather every board-doc + its columns, the set of board paths `note_rel`
 /// is already a card on, and whether `note_rel` is itself a board-doc.
 /// Read-only; runs on menu open. Used by the file-tree "Add to board…" verb,
-/// reading the vault + read-store + oplog off the narrow `feature::Ctx`.
+/// reading the vault + read-store + oplog off the narrow `activity::SurfaceCtx`.
 ///
 /// status: board-add-card
 pub fn picker_context_ctx(
-    ctx: &crate::activity::Ctx<'_>,
+    ctx: &crate::activity::SurfaceCtx<'_>,
     note_rel: &str,
 ) -> (Vec<PickerEntry>, std::collections::HashSet<String>, bool) {
     picker_context_parts(
@@ -1025,7 +1025,7 @@ pub fn picker_context_ctx(
 }
 
 /// Shared body for `picker_context_ctx`. Takes the services it needs by
-/// handle so the narrow `feature::Ctx` can drive it without an `&AppState`.
+/// handle so the narrow `activity::SurfaceCtx` can drive it without an `&AppState`.
 fn picker_context_parts(
     vault: &hiker_core::vault::Vault,
     read_store: &std::sync::Mutex<hiker_core::store::Store>,

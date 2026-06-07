@@ -197,16 +197,9 @@ impl App {
             .read_store
             .lock()
             .map_err(|_| HikerError::Io("read_store mutex poisoned".into()))?;
-        // status: store-id-from-oplog
-        let id = match store
-            .get_note_by_path(rel)
-            .map_err(|e| HikerError::Io(e.to_string()))?
-        {
-            Some(row) => row.id,
-            None => return Ok(None),
-        };
+        // status: store-path-is-identity — the note's path is its key.
         let mut chunks = store
-            .get_note_chunks(&id)
+            .get_note_chunks(rel)
             .map_err(|e| HikerError::Io(e.to_string()))?;
         if chunks.is_empty() {
             Ok(None)
@@ -225,13 +218,13 @@ impl App {
         let store = self.state.read_store.lock().map_err(|_| {
             ErrorData::internal_error("read_store mutex poisoned", None)
         })?;
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         let row = store
             .get_note_by_path(&p.rel_path)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let hits = match row {
             Some(r) => store
-                .related_notes(&r.id, top_k)
+                .related_notes(&r.path, top_k)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
             None => Vec::new(),
         };

@@ -144,7 +144,7 @@ async fn server_relays_ciphertext_and_b_converges() {
                 .any(|w| w == plaintext_marker),
             "stored blob must not contain plaintext"
         );
-        // Only the content key recovers a valid Yrs update; a wrong key fails.
+        // Only the content key recovers the text blob; a wrong key fails.
         assert!(
             content_key.decrypt(ciphertext).is_ok(),
             "content key decrypts the stored ciphertext"
@@ -163,7 +163,7 @@ async fn server_relays_ciphertext_and_b_converges() {
 /// converge with NO duplication; then a client RE-PULLS the same blobs and does
 /// NOT double content. Idempotency is the corruption probe here: the hub's
 /// append-only log returns the same ciphertext on a re-pull from a reset cursor,
-/// and `apply_remote_update` must merge those already-known Yrs ops as a no-op
+/// and `apply_remote_update` must merge that already-known text as a no-op
 /// (not re-insert the body). We force the re-pull by resetting B's pull cursor
 /// (`reset_server_cursor_for_test`) so it re-fetches from seq 0 — exactly the
 /// "client re-pulls the same blobs" case. [sync-zero-knowledge-server]

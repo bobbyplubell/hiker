@@ -350,10 +350,18 @@ pub struct LeidenParams {
     /// invoked against the virtual root (`target_node_id = None`), the
     /// Leiden partition runs with this γ instead of `resolution`.
     /// Recursive sub-splits and direct user-driven splits against a real
-    /// node use the normal `resolution`. Default `0.3` biases the
-    /// top-level partition toward coarser / fewer communities so the
-    /// initial "broad-strokes" cut isn't over-fragmented; recursive
-    /// passes then refine each subtree at γ=1.0. [cluster-op-split]
+    /// node use the normal `resolution`.
+    ///
+    /// Default `1.0` (modularity-equivalent). Earlier builds defaulted to
+    /// `0.3` to bias the top-level cut toward coarser / fewer communities,
+    /// but on a dense kNN graph the RB quality function makes a single
+    /// all-notes community the optimum for any γ < 0.5 (`Q_single =
+    /// m·(1 − 2γ)` is positive there), so the top-level Split collapsed to
+    /// one community and the build aborted with `VaultTooSmall`. The
+    /// build recipe now escalates γ automatically when a cut yields < 2
+    /// communities (`build/mod.rs::partition_top_level_escalating`), and
+    /// the review-tab slider drives this value directly, so a coarse
+    /// default no longer earns its keep. [cluster-op-split]
     #[serde(default = "default_leiden_top_resolution")]
     pub top_level_resolution: f32,
 }
@@ -363,7 +371,7 @@ const fn default_leiden_resolution() -> f32 {
 }
 
 const fn default_leiden_top_resolution() -> f32 {
-    0.3
+    1.0
 }
 
 impl Default for LeidenParams {
@@ -374,7 +382,7 @@ impl Default for LeidenParams {
             iterations: 100,
             min_cluster_size: 2,
             resolution: 1.0,
-            top_level_resolution: 0.3,
+            top_level_resolution: 1.0,
         }
     }
 }
@@ -656,7 +664,7 @@ pub trait Summarizer {
 pub enum BuildError {
     #[error("no notes in the resolved scope")]
     EmptyScope,
-    #[error("clustering didn't separate the inputs: {found} notes resolved into fewer than 2 clusters. Try lowering min_cluster_size or include outliers.")]
+    #[error("clustering didn't separate the inputs: {found} notes resolved into fewer than 2 clusters. For Leiden, raise the resolution (γ) or lower the edge-weight floor; for HDBSCAN, lower min_cluster_size or include outliers.")]
     VaultTooSmall { found: usize },
     #[error("cluster: {0}")]
     Cluster(#[from] Error),
@@ -737,7 +745,16 @@ pub enum BuildEvent {
         parent: Option<Id>,
     },
     /// Terminal: the full tree is ready. Following events are not emitted.
-    Done { tree: BuiltClusterTree },
+    ///
+    /// `top_graph` carries the top-level Leiden kNN graph the build used
+    /// (or built), so a live-preview consumer can hand it back on the next
+    /// run to skip the O(n²) kNN sweep when only γ / `min_cluster_size`
+    /// changed (`cluster-review-tab-live-preview`). `None` for HDBSCAN /
+    /// FromFolders builds, which have no such graph.
+    Done {
+        tree: BuiltClusterTree,
+        top_graph: Option<std::sync::Arc<algo::LeidenGraph>>,
+    },
     /// Terminal: the producer signalled cancel via the shared atomic and
     /// the pass aborted cleanly. Partial in-flight tree is discarded.
     Cancelled,

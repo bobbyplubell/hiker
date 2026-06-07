@@ -6,7 +6,7 @@
 //! expand/collapse and accept drag-dropped paths to re-parent subtrees.
 //!
 //! Migrated onto the Files `Activity`'s `View`: rendering goes
-//! through the narrow `feature::Ctx` instead of `&mut AppState`. The
+//! through the narrow `activity::SurfaceCtx` instead of `&mut AppState`. The
 //! tree UI state lives in `AppState::file_tree_state` (reached via
 //! `ctx.state`); directory listings come from `ctx.vault`; the index /
 //! dirty / skip / trail decorations come from the once-per-frame
@@ -20,7 +20,7 @@ use eframe::egui;
 
 use hiker_core::vault::{DirEntryDto, EntryKind};
 
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::item_menu;
 use crate::state::{AppState, FileTreeState};
 use hiker_theme as theme;
@@ -28,7 +28,7 @@ use hiker_theme as theme;
 /// A context-menu verb picked on a file row. The menu render records one
 /// of these; the mutation runs afterwards as a deferred effect so the
 /// `&mut AppState` helpers don't fight the menu closure's `ui` borrow nor
-/// the narrow `Ctx` borrow.
+/// the narrow `SurfaceCtx` borrow.
 enum FileVerb {
     /// A shared note-item base action (Open / Reveal-in-tree / Properties),
     /// composed from [`item_menu::note_item_base`] so the universal verbs live
@@ -63,12 +63,44 @@ enum FileVerb {
     Delete,
 }
 
+/// Fixed height of a single tree row, in points. Used both to paint rows
+/// ([`row_button_with_chevron`]) and to drive `ScrollArea::show_rows`
+/// virtualization — the two must agree or the viewport math drifts. The
+/// global item-spacing (`hiker_theme`) is added between rows by egui.
+const ROW_HEIGHT: f32 = 22.0;
+
+/// One visible row in the flattened, virtualized tree. The tree is walked
+/// into a `Vec<FlatRow>` in render order each frame so `show_rows` can lay
+/// out / paint only the rows inside the scroll viewport.
+enum FlatRow {
+    /// A file or folder row at the given indent depth.
+    Entry { entry: DirEntryDto, depth: usize },
+    /// A directory whose listing failed — renders the error inline, as the
+    /// recursive walk did before.
+    Error {
+        rel: String,
+        err: String,
+        depth: usize,
+    },
+}
+
+impl FlatRow {
+    /// Vault-relative path of an entry row (folders + files); `None` for
+    /// error rows. Used to match the one-shot reveal scroll target.
+    fn rel_path(&self) -> Option<&str> {
+        match self {
+            FlatRow::Entry { entry, .. } => Some(&entry.rel_path),
+            FlatRow::Error { .. } => None,
+        }
+    }
+}
+
 /// Shared per-frame context for the files sidebar. Wraps the narrow
-/// feature `Ctx` so the render/mutation helpers can be `&mut self`
+/// feature `SurfaceCtx` so the render/mutation helpers can be `&mut self`
 /// methods on one receiver. `ui` is threaded as a method arg rather than
 /// held here so the deferred closures don't contend with the `ui` borrow.
 pub(crate) struct FilesCtx<'a, 'c> {
-    pub(crate) ctx: &'a mut Ctx<'c>,
+    pub(crate) ctx: &'a mut SurfaceCtx<'c>,
 }
 
 impl FilesCtx<'_, '_> {
@@ -94,17 +126,101 @@ impl FilesCtx<'_, '_> {
     }
 
     /// Sidebar entry point: refresh the decoration snapshot for next
-    /// frame, then draw the sort header + the tree from the vault root.
+    /// frame, draw the (fixed) sort header, then the virtualized tree.
     pub(crate) fn render(&mut self, ui: &mut egui::Ui) {
         // Pre-pass: snapshot the AppState-only row decorations (dirty
         // buffers, skipped paths, active-trail membership) into
         // `file_tree_state.deco` for next frame. Deferred so it runs with
         // full `&mut AppState`; the render below reads only the snapshot,
-        // keeping the render path within the narrow `Ctx`.
+        // keeping the render path within the narrow `SurfaceCtx`.
         self.ctx.defer(refresh_deco);
         self.sort_header(ui);
         let _g = crate::profiling::FrameProf::guard("files:tree");
-        self.show_dir(ui, "", 0);
+
+        // Flatten the visible tree (expanded folders + their children) into
+        // a row list, then hand it to `show_rows` so egui only lays out /
+        // paints the rows inside the scroll viewport. Building the flat list
+        // is O(visible rows) of cheap string clones; the expensive per-row
+        // work (galley layout, hover hit-testing, painting) now runs only
+        // for the ~viewport-height band of rows, not the whole vault.
+        let rows = self.flatten_visible();
+
+        // Reveal-from-discovery (`reveal-in-sidebar-scroll`): a one-shot
+        // scroll target arms a jump to a specific row. With virtualization
+        // that row may sit outside the rendered band, so `scroll_to_me`
+        // can't reach it — instead translate the target into an explicit
+        // scroll offset that centres the row, then consume the one-shot.
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("panel-files-body")
+            .auto_shrink([false, false]);
+        if let Some(target) = self.st_ref().scroll_target.clone() {
+            if let Some(idx) = rows.iter().position(|r| r.rel_path() == Some(target.as_str())) {
+                let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
+                let centred = (idx as f32 * stride) - (ui.available_height() - stride) * 0.5;
+                scroll = scroll.vertical_scroll_offset(centred.max(0.0));
+            }
+            self.st().scroll_target = None;
+        }
+
+        scroll.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+            for i in range {
+                self.render_flat_row(ui, &rows[i]);
+            }
+        });
+    }
+
+    /// Walk the expanded tree from the vault root into a flat, render-order
+    /// list of visible rows. Lists each expanded directory on demand (via
+    /// [`Self::ensure_listed`]) so the cache fills as folders open.
+    fn flatten_visible(&mut self) -> Vec<FlatRow> {
+        let mut rows = Vec::new();
+        self.flatten_dir(&mut rows, "", 0);
+        rows
+    }
+
+    fn flatten_dir(&mut self, rows: &mut Vec<FlatRow>, rel: &str, depth: usize) {
+        if let Some(err) = self.ensure_listed(rel) {
+            rows.push(FlatRow::Error {
+                rel: rel.to_string(),
+                err,
+                depth,
+            });
+            return;
+        }
+        // Clone the listing out so the recursive walk can keep reading /
+        // mutating `dir_cache` (e.g. listing a child) without overlapping
+        // borrows — mirrors the old `show_dir` clone.
+        let entries = self
+            .st_ref()
+            .dir_cache
+            .get(rel)
+            .cloned()
+            .unwrap_or_default();
+        for entry in entries {
+            let expanded = matches!(entry.kind, EntryKind::Dir)
+                && self.st_ref().expanded.contains(&entry.rel_path);
+            let child_rel = expanded.then(|| entry.rel_path.clone());
+            rows.push(FlatRow::Entry { entry, depth });
+            if let Some(child_rel) = child_rel {
+                self.flatten_dir(rows, &child_rel, depth + 1);
+            }
+        }
+    }
+
+    /// Render one flattened row at its captured depth.
+    fn render_flat_row(&mut self, ui: &mut egui::Ui, row: &FlatRow) {
+        match row {
+            FlatRow::Error { rel, err, .. } => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("failed to list {rel}: {err}"),
+                );
+            }
+            FlatRow::Entry { entry, depth } => match entry.kind {
+                EntryKind::Dir => self.render_dir_row(ui, entry, *depth),
+                EntryKind::File => self.render_file_row(ui, entry, *depth),
+            },
+        }
     }
 
     /// Tiny header strip with the sort-by control. A sort change persists
@@ -160,30 +276,6 @@ impl FilesCtx<'_, '_> {
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::File))
             .count()
-    }
-
-    fn show_dir(&mut self, ui: &mut egui::Ui, rel: &str, depth: usize) {
-        if let Some(err) = self.ensure_listed(rel) {
-            ui.colored_label(
-                egui::Color32::LIGHT_RED,
-                format!("failed to list {rel}: {err}"),
-            );
-            return;
-        }
-        // Clone the entries out so we can mutate state below without
-        // overlapping borrows.
-        let entries = self
-            .st_ref()
-            .dir_cache
-            .get(rel)
-            .cloned()
-            .unwrap_or_default();
-        for entry in entries {
-            match entry.kind {
-                EntryKind::Dir => self.render_dir_row(ui, &entry, depth),
-                EntryKind::File => self.render_file_row(ui, &entry, depth),
-            }
-        }
     }
 
     /// Ensure `rel`'s listing is cached, capping the cache so an
@@ -249,9 +341,6 @@ impl FilesCtx<'_, '_> {
             }
             st.selected_folder = Some(rel);
         }
-        if expanded {
-            self.show_dir(ui, &entry.rel_path, depth + 1);
-        }
     }
 
     fn render_file_row(&mut self, ui: &mut egui::Ui, entry: &DirEntryDto, depth: usize) {
@@ -273,12 +362,6 @@ impl FilesCtx<'_, '_> {
         );
         let resp = row_button_with_chevron(ui, &label, depth, is_active, None);
 
-        // Honour a pending reveal-from-discovery: bring the matching row
-        // into view once, then clear the one-shot target.
-        if self.st_ref().scroll_target.as_deref() == Some(entry.rel_path.as_str()) {
-            resp.scroll_to_me(Some(egui::Align::Center));
-            self.st().scroll_target = None;
-        }
         // Drag payload: vault-relative source path.
         resp.clone()
             .dnd_set_drag_payload::<String>(entry.rel_path.clone());
@@ -422,7 +505,7 @@ impl FilesCtx<'_, '_> {
 // ----- deferred-effect free helpers (full &mut AppState) -----
 
 /// Refresh the row-decoration snapshot from the AppState data the narrow
-/// `Ctx` doesn't carry: the dirty-buffer set (`session.buffers`), the
+/// `SurfaceCtx` doesn't carry: the dirty-buffer set (`session.buffers`), the
 /// skipped-paths set (`ui_cache.skipped_paths`), and the active-trail
 /// name + membership / all trail names (`trails_state`). Runs as a
 /// deferred pre-pass so the render path reads only the snapshot.
@@ -781,6 +864,9 @@ fn move_into_folder(app: &mut AppState, src: &str, dest_dir: &str) {
     app.file_tree_state.dir_cache.remove(src_parent);
     app.file_tree_state.dir_cache.remove(dest_dir);
     repoint_open_buffer(app, src, &dest);
+    if !is_dir {
+        commit_observed_rename(app, src, &dest);
+    }
     app.push_toast(format!("Moved -> {dest}"), crate::state::ToastLevel::Info);
 }
 
@@ -816,7 +902,18 @@ fn commit_rename(app: &mut AppState, from: &str, draft: &str) {
     }
     app.file_tree_state.dir_cache.remove(parent);
     repoint_open_buffer(app, from, &to);
+    commit_observed_rename(app, from, &to);
     app.push_toast(format!("Renamed -> {to}"), crate::state::ToastLevel::Info);
+}
+
+/// When the git transport is active, land a dedicated pure-rename commit for an
+/// observed move (`git-observed-rename-commit`) so `git log --follow` recovers
+/// it. A no-op when git sync isn't the active transport — the libp2p path and
+/// the no-transport path are untouched.
+fn commit_observed_rename(app: &AppState, from: &str, to: &str) {
+    if let Some(git) = &app.vault_session.services.git_sync {
+        git.commit_observed_rename(from, to);
+    }
 }
 
 /// Move any loaded buffer + open editor tabs from `from` to `to` after a
@@ -842,7 +939,7 @@ fn repoint_open_buffer(app: &mut AppState, from: &str, to: &str) {
 // ----- free helpers (pure / UI) -----
 
 /// The precomputed per-row context the menu renders against (everything the
-/// pure-data `build_file_menu` can't reach through the narrow `Ctx`).
+/// pure-data `build_file_menu` can't reach through the narrow `SurfaceCtx`).
 struct MenuArgs<'a> {
     rel: &'a str,
     active_trail: Option<(String, bool)>,
@@ -1189,7 +1286,7 @@ fn row_button_with_chevron(
     chevron: Option<bool>,
 ) -> egui::Response {
     let indent = (depth as f32) * 12.0;
-    let row_height = 22.0;
+    let row_height = ROW_HEIGHT;
     let total_width = ui.available_width();
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(total_width, row_height), egui::Sense::click());

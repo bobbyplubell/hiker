@@ -1,0 +1,5 @@
+{ "signal": [
+  {"name":"dontcare","wave":"x.x.x."},
+  {"name":"hiz","wave":"z.z.z."},
+  {"name":"mix","wave":"01xz10"}
+] }

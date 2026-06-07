@@ -62,7 +62,7 @@ pub async fn create_board(
     vault.write_file(&plan.board_doc_rel, &plan.body)?;
     watcher.suppress(plan.board_doc_rel.clone());
 
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     // Seed the op-log document so the board has a stable storage key
     // (its `doc_id`) before any cards are added.
     let board_id =

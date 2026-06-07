@@ -213,7 +213,7 @@ pub async fn append_waypoint(
         annotation,
     } = args;
 
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     // No source-side id stamping — `note-id-stamping` retired with
     // path-as-identity. The source is referenced by its vault path; the
     // op-log keeps the path↔doc_id mapping internally.
@@ -618,19 +618,20 @@ pub async fn on_note_moved(
             Vec::new()
         }
     };
-    // status: store-id-from-oplog
-    // The trail id of a moved trail-doc is the op-log's doc_id for the
-    // doc's path — the same id for old or new path after the rename
-    // committed in `doc-index.db`.
-    let trail_id_candidate: Option<String> = log.and_then(|l| {
-        l.doc_id_for_path(new_rel)
-            .ok()
-            .flatten()
-            .or_else(|| l.doc_id_for_path(old_rel).ok().flatten())
-    });
-    let waypoints_of_trail = match &trail_id_candidate {
-        Some(trail_id) => store.waypoints_of(trail_id).unwrap_or_default(),
-        None => Vec::new(),
+    // status: store-path-is-identity
+    // The trail id IS the trail-doc's path (`op-log-path-identity`). The
+    // derived `trail_waypoints` rows are keyed by the path the trail-doc had at
+    // its last ingest — the OLD path, since this rewrite runs before the
+    // re-ingest at the new path. So look up the waypoints under `old_rel`; a
+    // trail-doc that was never ingested (no rows) falls back to the new path.
+    let _ = log;
+    let waypoints_of_trail = {
+        let by_old = store.waypoints_of(old_rel).unwrap_or_default();
+        if by_old.is_empty() {
+            store.waypoints_of(new_rel).unwrap_or_default()
+        } else {
+            by_old
+        }
     };
 
     let rctx = RewriteCtx { watcher, jobs, vault };
@@ -1117,15 +1118,20 @@ fn migrate_one_trail(
     trail_id: &str,
     legacy_waypoints_rel: &str,
 ) -> Result<bool, HikerError> {
-    // Resolve the trail-doc path from its op-log doc_id (the dir name).
-    let trail_doc_rel = match log
-        .path_for_doc(trail_id)
-        .map_err(|e| HikerError::Io(e.to_string()))?
-    {
+    // Resolve the trail-doc path. Under path-as-identity the hidden dir name is
+    // no longer the trail-doc's id, so read it from a legacy waypoint's
+    // `hiker.in_trail` instead (every waypoint points back at its trail-doc).
+    let members =
+        crate::ops::op_writes::walk_hidden_md_subtree(vault, legacy_waypoints_rel)
+            .unwrap_or_default();
+    let trail_doc_rel = match members.iter().find_map(|m| {
+        let src = vault.read_file(m).ok()?;
+        super::parse_waypoint(&src).ok().map(|fm| fm.in_trail)
+    }) {
         Some(p) => p,
         None => {
             tracing::warn!(trail_id = %trail_id,
-                "trails migration: no op-log path for hidden trail dir; leaving in place");
+                "trails migration: no waypoint resolves a trail-doc for hidden dir; leaving in place");
             return Ok(false);
         }
     };
@@ -1150,9 +1156,6 @@ fn migrate_one_trail(
     // prunes (no per-subsystem carve-out), so `walk_indexable_files` can't
     // reach it — walk the hidden subtree directly instead.
     let legacy_prefix = format!("{legacy_waypoints_rel}/");
-    let members =
-        crate::ops::op_writes::walk_hidden_md_subtree(vault, legacy_waypoints_rel)
-            .unwrap_or_default();
     let pairs: Vec<(String, String)> = members
         .iter()
         .map(|m| {

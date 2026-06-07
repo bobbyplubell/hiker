@@ -1,198 +1,54 @@
-//! Activity registry — small descriptor registry that App-shell consumers
-//! (sidebar mode switcher, activity bar, hamburger menu, command palette,
-//! keybind registry) iterate to discover what to render.
+//! App-side binding of the generic activity registry that lives in the
+//! `egui_workbench` shell. The trait machinery (`Activity`/`View`/the
+//! surface sub-traits/`ActivityRegistry`/`ActionError`/`split_view_id`)
+//! is the shell's generic family, re-exported here; this module supplies
+//! only the hiker-specific glue: the umbrella requirement trait
+//! [`AppCtx`], the per-surface [`SurfaceCtx`] borrow it hands back, and
+//! the `impl AppCtx for AppState` whose body resolves the disjoint
+//! `AppState`-field borrows per `state_key`. See `docs/activity-registry.md`.
 //!
-//! Each `Activity` impl exposes a list of `View` render surfaces (plus
-//! optional descriptors for the hamburger menu, etc.). An activity with
-//! no views opts out of the activity bar. The registry is built once per vault in
-//! `bootstrap::open_vault` and stashed on `AppState::activities`. New
-//! consumers iterate the registry generically rather than hardcoding an
-//! activity list. See `docs/activity-registry.md`.
+//! App-owned activities impl `Activity<dyn AppCtx>`; each `View::render`
+//! opens its borrow with one line — `ctx.surface_ctx(self.state_key())` —
+//! then works against `SurfaceCtx`, with simultaneous disjoint access to
+//! `services`/`state`/`active_path`/`defer`.
 //!
-//! Layout note: trait, ctx, registry, and builtin-list helper all live
-//! in this single root file rather than each in its own sibling under
-//! `app/src/activity/`. Per-piece sibling files would each fall under
-//! `scripts/check-splits.py`'s 20-line minimum (the shapes here are 5-20
-//! lines each), and `pub use` re-exports are banned by clippy's
-//! anti-arbitrary-split posture, so the file would be the wrong
-//! boundary either way.
+//! Layout note: the app-side glue (trait + session + builtin list) all
+//! lives in this single root file rather than each in its own sibling
+//! under `app/src/activity/`. Per-piece sibling files would each fall
+//! under `scripts/check-splits.py`'s 20-line minimum, and `pub use`
+//! re-exports are banned by clippy's anti-arbitrary-split posture, so the
+//! file would be the wrong boundary either way.
 
 use std::any::Any;
 use std::sync::{Arc, RwLock};
 
-use eframe::egui;
+use egui_workbench::activity::{Activity, Ctx};
 use hiker_core::config::Config;
 
-use crate::state::{NavState, Services, Toast};
+use crate::state::{Services, Toast};
 
-// ---- Activity trait + surface sub-traits -----------------------------
+/// The app's activity registry: the shell's generic `ActivityRegistry`
+/// bound to hiker's umbrella [`AppCtx`]. A type alias (not a `pub use`
+/// re-export, which the project's clippy posture forbids) so consumers
+/// name `crate::activity::ActivityRegistry` without spelling the binding.
+pub type ActivityRegistry = egui_workbench::activity::ActivityRegistry<dyn AppCtx>;
 
-/// A registered activity (a container of one or more `View`s).
-/// Singleton in the registry; per-instance state (e.g. multiple tabs of
-/// the same activity) lives in tab payloads, not here. An activity
-/// declares its `views()`; descriptor accessors default to empty/`None`
-/// so a new activity only implements what it wants.
-pub trait Activity: Send + Sync {
-    /// Stable kebab-case id, e.g. `"clusters"`. Used as the activity
-    /// dispatch key and persisted in settings.
-    fn id(&self) -> &'static str;
-    /// Human-facing label, e.g. `"Cluster trees"`.
-    fn label(&self) -> &'static str;
-    /// Activity-bar / mode-button icon.
-    fn icon(&self) -> egui::Image<'static>;
-    /// Optional keybind chord descriptor (e.g. `"ctrl+shift+c"`); for
-    /// the future `keybind-registry` consumer. v1 returns `None`.
-    fn keybind_chord(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Ordered list of render surfaces this activity contributes. A
-    /// single-view activity returns one element (rendered headerless);
-    /// multi-view containers return several. Empty (the default) opts
-    /// out of the activity bar.
-    fn views(&self) -> Vec<&dyn View> {
-        Vec::new()
-    }
-    /// View-id for one of this activity's views, per the
-    /// `"<activity>/<view>"` convention. Single-view activities (or a
-    /// view whose id equals the activity id) collapse to the bare
-    /// activity id, keeping wire ids byte-identical; multi-view
-    /// containers slash. Centralized here — call sites never hand-build
-    /// the id. See [`split_view_id`] for the inverse.
-    fn view_id(&self, view: &dyn View) -> String {
-        if self.views().len() <= 1 || view.id() == self.id() {
-            self.id().to_string()
-        } else {
-            format!("{}/{}", self.id(), view.id())
-        }
-    }
-    /// Whether this activity belongs on the PRIMARY (left) activity bar.
-    /// Default: any activity with at least one `View` whose default
-    /// location is the left bar. Right-bar activities (chat) render in
-    /// the secondary side bar and are summoned via the right-sidebar
-    /// toggle, not the activity strip. [feature-consumer-activity-bar]
-    fn on_activity_bar(&self) -> bool {
-        !self.views().is_empty()
-            && matches!(self.default_location(), egui_workbench::side_bar::Location::LeftBar)
-    }
-    /// Which side bar this activity's views dock into by default. Left
-    /// (the primary accordion driven by the activity bar) for most
-    /// activities; right (the secondary accordion) for chat. The
-    /// placement overlay can later override this per-view, but the
-    /// declaration seeds the default. [feature-multi-region-sidebar]
-    fn default_location(&self) -> egui_workbench::side_bar::Location {
-        egui_workbench::side_bar::Location::LeftBar
-    }
-    fn hamburger(&self) -> Option<&dyn HamburgerEntry> {
-        None
-    }
-    fn activity_bar(&self) -> Option<&dyn ActivityBarItem> {
-        None
-    }
-    fn command_palette(&self, _ctx: &Ctx<'_>) -> Vec<PaletteCommand> {
-        Vec::new()
-    }
-
-    /// Inter-activity action dispatch. Default returns `UnknownAction`.
-    /// Activities that want to expose verbs to peers (or to the command
-    /// palette / hamburger) override this. `args` and the return value
-    /// are `serde_json::Value` so the seam stays generic without
-    /// pulling each activity's typed args into the trait. Typed wrappers
-    /// (e.g. `crate::trails::actions`) keep callers honest at the call
-    /// site. [feature-inter-feature-actions]
-    fn dispatch_action(
-        &self,
-        _ctx: &mut Ctx<'_>,
-        action: &str,
-        _args: serde_json::Value,
-    ) -> Result<serde_json::Value, ActionError> {
-        Err(ActionError::UnknownAction {
-            activity: self.id().to_string(),
-            action: action.to_string(),
-        })
-    }
-}
-
-/// Errors returned by `ActivityRegistry::invoke` /
-/// `Activity::dispatch_action`. [feature-inter-feature-actions]
-#[derive(Debug, thiserror::Error)]
-pub enum ActionError {
-    #[error("unknown activity `{0}`")]
-    UnknownActivity(String),
-    #[error("activity `{activity}` does not have action `{action}`")]
-    UnknownAction { activity: String, action: String },
-    #[error("invalid args for `{activity}::{action}`: {reason}")]
-    InvalidArgs {
-        activity: String,
-        action: String,
-        reason: String,
-    },
-    #[error("{0}")]
-    Failed(String),
-}
-
-/// A render surface contributed by an activity. The mode-switcher (per
-/// `feature-consumer-sidebar`) invokes `render` for the currently-active
-/// view.
-pub trait View: Send + Sync {
-    /// Stable kebab-case id, unique within its activity (e.g.
-    /// `"backlinks"`). For a single-view activity this equals the
-    /// activity id. Composed into the wire `ViewId` via
-    /// [`Activity::view_id`].
-    fn id(&self) -> &'static str;
-    /// Key for this view's per-activity state slice in [`with_ctx`].
-    /// Defaults to the view id; a view backed by a differently-named
-    /// `AppState` slice overrides it.
-    fn state_key(&self) -> &'static str {
-        self.id()
-    }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>);
-}
-
-/// Top-strip hamburger menu entry. Phase 2 — defined here so the trait
-/// vocabulary is stable.
-#[allow(dead_code)]
-pub trait HamburgerEntry: Send + Sync {
-    fn label(&self) -> &'static str;
-    fn keybind_id(&self) -> Option<&'static str> {
-        None
-    }
-    fn invoke(&self, ctx: &mut Ctx<'_>);
-}
-
-/// Activity-bar item override. By default an activity with a
-/// `View` auto-renders an activity item using `Activity::icon`
-/// + `Activity::label`; implementing this trait overrides those (e.g.
-/// for a dynamic badge). Phase 2.
-#[allow(dead_code)]
-pub trait ActivityBarItem: Send + Sync {
-    fn icon(&self) -> egui::Image<'static>;
-    fn tooltip(&self) -> &'static str;
-    fn invoke(&self, ctx: &mut Ctx<'_>);
-}
-
-/// Command-palette entry. The palette implementation is unfinished
-/// (see `editor.md::command-palette`); this struct is the data shape
-/// the palette will consume. Phase 2 wires the consumer.
-#[allow(dead_code)]
-pub struct PaletteCommand {
-    pub id: &'static str,
-    pub label: String,
-    /// Erased action closure. The palette dispatcher invokes it inside
-    /// a fresh `Ctx`.
-    pub action: Box<dyn FnOnce(&mut Ctx<'_>) + Send>,
+/// Parse a wire view-id back into `(activity_id, view_key)`. Thin
+/// forwarder to the shell's [`egui_workbench::activity::split_view_id`]
+/// so call sites stay on `crate::activity::split_view_id`.
+pub fn split_view_id(view_id: &str) -> (&str, &str) {
+    egui_workbench::activity::split_view_id(view_id)
 }
 
 // ---- Per-surface borrow ----------------------------------------------
 
-/// Per-surface context borrow. Built fresh inside the consumer (sidebar
-/// switcher, palette dispatcher, ...) right before invoking a surface;
-/// dropped immediately after so the borrow window is single-call.
-/// Surfaces touch only their own `state` slice plus the shared
-/// `services`/`nav`/`toasts`/`config`, never the wider `AppState`.
-pub struct Ctx<'a> {
+/// Per-surface context borrow. Built fresh inside [`AppCtx::surface_ctx`]
+/// right before invoking a surface and dropped immediately after, so the
+/// borrow window is single-call. Surfaces touch only their own `state`
+/// slice plus the shared `services`/`toasts`/`config`/`vault`,
+/// never the wider `AppState`.
+pub struct SurfaceCtx<'a> {
     pub services: &'a mut Services,
-    pub nav: &'a mut NavState,
     pub toasts: &'a mut Vec<Toast>,
     pub config: &'a Arc<RwLock<Config>>,
     /// Read handle to the open vault (list/read files). Shared because
@@ -206,14 +62,14 @@ pub struct Ctx<'a> {
     /// registry shell never sees the concrete type.
     pub state: &'a mut dyn Any,
     /// Vault-relative path of the active note, if a buffer is focused.
-    /// A cheap read filled at ctx-build time so a surface reads "the
+    /// A cheap read filled at session-build time so a surface reads "the
     /// current note" here instead of reaching into `session`. Shared
     /// because ≥2 activities (backlinks, related, search, ...) need it.
     pub active_path: Option<String>,
     /// Deferred-effect sink. A surface pushes closures here (via
-    /// [`Ctx::defer`]) for cross-cutting effects that need broad
+    /// [`SurfaceCtx::defer`]) for cross-cutting effects that need broad
     /// `&mut AppState` (open a note, reveal a path) and so can't run
-    /// inside the narrow ctx borrow. The consumer drains them right
+    /// inside the narrow session borrow. The consumer drains them right
     /// after the surface returns. Mirrors helix's compositor callback
     /// queue; closures reuse the existing `&mut AppState` helpers.
     pub effects: &'a mut Vec<Effect>,
@@ -221,135 +77,99 @@ pub struct Ctx<'a> {
 
 /// A deferred effect queued by an activity surface and applied by the
 /// consumer after the surface returns, with full `&mut AppState`.
-pub type Effect = Box<dyn FnOnce(&mut crate::state::AppState)>;
+///
+/// `+ Send` so the field that holds the queue ([`AppState::pending_effects`])
+/// doesn't make `AppState` itself `!Send` — the vault-switch path builds a
+/// fresh `AppState` on a worker thread and sends it back to the UI thread.
+/// The closures themselves only ever run on the UI thread (drained
+/// synchronously right after each surface), so the bound costs nothing in
+/// practice and every existing effect already captures only `Send` data.
+pub type Effect = Box<dyn FnOnce(&mut crate::state::AppState) + Send>;
 
-impl Ctx<'_> {
+impl SurfaceCtx<'_> {
     /// Queue a cross-cutting effect to run after the surface returns,
     /// with full `&mut AppState`. Use for "open this note", "reveal in
-    /// tree", etc. — anything the narrow ctx can't do inline.
-    pub fn defer(&mut self, f: impl FnOnce(&mut crate::state::AppState) + 'static) {
+    /// tree", etc. — anything the narrow session can't do inline.
+    pub fn defer(&mut self, f: impl FnOnce(&mut crate::state::AppState) + Send + 'static) {
         self.effects.push(Box::new(f));
     }
 }
 
-// ---- Registry --------------------------------------------------------
+// ---- Umbrella requirement trait --------------------------------------
 
-/// Ordered list of `Arc<dyn Activity>` built once at vault open.
-/// Consumers iterate via `iter()`. Order is meaningful: sidebar mode
-/// buttons + activity items render in registry order.
-pub struct ActivityRegistry {
-    activities: Vec<Arc<dyn Activity>>,
+/// Hiker's umbrella requirement trait — the `'static` trait object the
+/// shell binds as `Activity<dyn AppCtx>`. It supertraits the universal
+/// [`Ctx`] marker base and adds the one accessor that hands an activity
+/// its per-surface [`SurfaceCtx`]. App-owned activities take
+/// `&mut dyn AppCtx` and open their borrow with
+/// `ctx.surface_ctx(self.state_key())`; the resolution of the disjoint
+/// `AppState`-field borrows + the `state_key` → slice match is
+/// irreducibly app-specific and lives in [`AppCtx::surface_ctx`].
+pub trait AppCtx: Ctx {
+    /// Build a [`SurfaceCtx`] scoped to `state_key`. Returns `None` when
+    /// the key doesn't resolve to a state slice on `AppState` — which,
+    /// now that every activity is migrated, means a bug (a registered
+    /// view whose `state_key` has no slice), logged at the `_` arm. The
+    /// key is a view's [`View::state_key`].
+    fn surface_ctx(&mut self, state_key: &str) -> Option<SurfaceCtx<'_>>;
 }
 
-impl ActivityRegistry {
-    /// Build a registry from the given ordered list of activities.
-    /// `bootstrap::open_vault` is the canonical call site; tests can
-    /// build a registry directly with whichever activity set they need.
-    pub fn build(activities: Vec<Arc<dyn Activity>>) -> Arc<Self> {
-        Arc::new(Self { activities })
-    }
+// `Ctx` is a marker base (no methods); hiker reaches per-surface state
+// through [`AppCtx::surface_ctx`], not a universal single-slice accessor.
+impl Ctx for crate::state::AppState {}
 
-    /// Iterate the registered activities in their stable order.
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Activity>> {
-        self.activities.iter()
-    }
-
-    /// O(N) lookup by stable id. N is expected to be ~5-15 activities so
-    /// no hashmap is warranted (per the spec's "Lookup is O(N)" point).
-    pub fn by_id(&self, id: &str) -> Option<&Arc<dyn Activity>> {
-        self.activities.iter().find(|f| f.id() == id)
-    }
-
-    /// Dispatch `(activity_id, action, args)` through the registry —
-    /// the entry point for inter-activity calls (one activity invoking
-    /// another) and for the generic command-palette / hamburger
-    /// dispatch path. Returns `UnknownActivity` when the id doesn't
-    /// resolve; otherwise forwards to the activity's
-    /// `dispatch_action`. [feature-inter-feature-actions]
-    pub fn invoke(
-        &self,
-        ctx: &mut Ctx<'_>,
-        activity_id: &str,
-        action: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, ActionError> {
-        let activity = self
-            .activities
-            .iter()
-            .find(|f| f.id() == activity_id)
-            .ok_or_else(|| ActionError::UnknownActivity(activity_id.to_string()))?;
-        activity.dispatch_action(ctx, action, args)
+impl AppCtx for crate::state::AppState {
+    fn surface_ctx(&mut self, state_key: &str) -> Option<SurfaceCtx<'_>> {
+        let app = self;
+        // Compute the active note path first (immutable read, released
+        // before the disjoint &mut field borrows below). A canvas tab with a File
+        // node in inline-edit surfaces the EDITED note as the active note, so the
+        // context panel follows what you're editing on the canvas rather than the
+        // `.canvas` file itself. status: canvas-inline-edit
+        let active_path = app.session.active_tab.and_then(|id| {
+            crate::panels::canvas::inline_edited_note(app, id).or_else(|| {
+                app.tab_by_id(id)
+                    .and_then(crate::tab::Tab::buffer_path)
+                    .map(str::to_string)
+            })
+        });
+        // The state-slice lookup is inlined here so the compiler can
+        // verify the disjoint borrows of `AppState` fields. A helper
+        // returning a single `&mut dyn Any` can't be combined with the
+        // parallel borrows of the other fields.
+        let state: &mut dyn Any = match state_key {
+            "files" => &mut app.file_tree_state,
+            "clusters" => &mut app.clusters_state,
+            "trails" => &mut app.trails_state,
+            "vault" => &mut app.vault_state,
+            "backlinks" => &mut app.backlinks_state,
+            "appears-in" => &mut app.appears_in_state,
+            "related" => &mut app.related_state,
+            "search" => &mut app.search_state,
+            "trash" => &mut app.trash_state,
+            "canvases" => &mut app.canvases_activity_state,
+            "chat" => &mut app.chat_state,
+            _ => {
+                tracing::warn!(
+                    state_key,
+                    "activity surface_ctx: no AppState slice for this state_key"
+                );
+                return None;
+            }
+        };
+        Some(SurfaceCtx {
+            services: &mut app.vault_session.services,
+            toasts: &mut app.toasts,
+            config: &app.vault_session.config,
+            vault: &app.vault_session.vault,
+            state,
+            active_path,
+            effects: &mut app.pending_effects,
+        })
     }
 }
 
 // ---- Builtins --------------------------------------------------------
-
-/// Split a wire `ViewId` into `(activity_id, view_key)`. The convention
-/// is `"<activity>/<view>"`; an id with no slash is a single-view
-/// activity, so both halves are the whole string. Inverse of
-/// [`Activity::view_id`]. The single point where the slash convention is
-/// parsed — call sites never split the string themselves.
-pub fn split_view_id(view_id: &str) -> (&str, &str) {
-    view_id
-        .split_once('/')
-        .map_or((view_id, view_id), |(a, v)| (a, v))
-}
-
-/// Build a `Ctx` borrow scoped to `state_key` and run `f` against
-/// it. Returns `None` when the key doesn't resolve to a state slice on
-/// `AppState` (Phase 2 wires only the migrated activities). The key is
-/// a view's [`View::state_key`] (== the old activity id for every
-/// existing slice).
-///
-/// The state-slice lookup is inlined here so the compiler can verify
-/// the four disjoint borrows of `AppState` fields. An
-/// `activity_state_mut` helper returning a single `&mut dyn Any`
-/// can't be combined with parallel borrows of the other fields.
-pub fn with_ctx<R>(
-    app: &mut crate::state::AppState,
-    state_key: &str,
-    effects: &mut Vec<Effect>,
-    f: impl FnOnce(&mut Ctx<'_>) -> R,
-) -> Option<R> {
-    // Compute the active note path first (immutable read, released
-    // before the disjoint &mut field borrows below). A canvas tab with a File
-    // node in inline-edit surfaces the EDITED note as the active note, so the
-    // context panel follows what you're editing on the canvas rather than the
-    // `.canvas` file itself. status: canvas-inline-edit
-    let active_path = app.session.active_tab.and_then(|id| {
-        crate::panels::canvas::inline_edited_note(app, id).or_else(|| {
-            app.tab_by_id(id)
-                .and_then(crate::tab::Tab::buffer_path)
-                .map(str::to_string)
-        })
-    });
-    let state: &mut dyn Any = match state_key {
-        "files" => &mut app.file_tree_state,
-        "clusters" => &mut app.clusters_state,
-        "trails" => &mut app.trails_state,
-        "vault" => &mut app.vault_state,
-        "backlinks" => &mut app.backlinks_state,
-        "appears-in" => &mut app.appears_in_state,
-        "related" => &mut app.related_state,
-        "search" => &mut app.search_state,
-        "trash" => &mut app.trash_state,
-        "canvases" => &mut app.canvases_activity_state,
-        "chat" => &mut app.chat_state,
-        _ => return None,
-    };
-    let mut ctx = Ctx {
-        services: &mut app.vault_session.services,
-        nav: &mut app.session.nav,
-        toasts: &mut app.toasts,
-        config: &app.vault_session.config,
-        vault: &app.vault_session.vault,
-        state,
-        active_path,
-        effects,
-    };
-    Some(f(&mut ctx))
-}
 
 /// Hamburger-menu dispatch: look up `activity_id` in the registry and
 /// invoke its `HamburgerEntry::invoke`. No-op when the activity is
@@ -362,9 +182,8 @@ pub fn dispatch_hamburger(app: &mut crate::state::AppState, activity_id: &str) {
     let Some(entry) = activity.hamburger() else {
         return;
     };
-    let mut effects: Vec<Effect> = Vec::new();
-    with_ctx(app, activity_id, &mut effects, |ctx| entry.invoke(ctx));
-    for eff in effects {
+    entry.invoke(app);
+    for eff in std::mem::take(&mut app.pending_effects) {
         eff(app);
     }
 }
@@ -372,150 +191,28 @@ pub fn dispatch_hamburger(app: &mut crate::state::AppState, activity_id: &str) {
 /// Construct the built-in activity list in sidebar/activity-bar order.
 /// `Files` is first (the primary mode). Plugins are appended after
 /// built-ins by callers once Phase 3's adapter lands.
-pub fn builtin_activities() -> Vec<Arc<dyn Activity>> {
+pub fn builtin_activities() -> Vec<Arc<dyn Activity<dyn AppCtx>>> {
     vec![
-        Arc::new(crate::files::Files) as Arc<dyn Activity>,
-        Arc::new(crate::clusters::Clusters) as Arc<dyn Activity>,
-        Arc::new(crate::trails::Trails) as Arc<dyn Activity>,
-        Arc::new(crate::vault_view::Vault) as Arc<dyn Activity>,
-        Arc::new(crate::canvas_activity::CanvasActivity) as Arc<dyn Activity>,
-        Arc::new(crate::context::Context) as Arc<dyn Activity>,
-        Arc::new(crate::search::Search) as Arc<dyn Activity>,
-        Arc::new(crate::trash::Trash) as Arc<dyn Activity>,
-        Arc::new(crate::chat::Chat) as Arc<dyn Activity>,
+        Arc::new(crate::files::Files) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::clusters::Clusters) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::trails::Trails) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::vault_view::Vault) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::canvas_activity::CanvasActivity) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::context::Context) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::search::Search) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::trash::Trash) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::chat::Chat) as Arc<dyn Activity<dyn AppCtx>>,
     ]
 }
 
 // ---- Tests -----------------------------------------------------------
 
-/// Registry + dispatch tests. Use synthetic `Activity` impls so the
-/// tests don't need a real `AppState` / `Services` /
-/// `VaultSession`; the seam shape is what we're guarding here, not
-/// any particular activity's behavior.
+/// App-side registry tests. The generic trait machinery (routing,
+/// view-id parsing, `on_activity_bar`) is covered by the shell's own
+/// tests; here we only guard the hiker-specific builtin list order.
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A no-state synthetic activity whose `dispatch_action` records
-    /// every call into a shared counter and echoes the args back as
-    /// the return value. Lets a test cross-invoke between two
-    /// activities through the registry and confirm the routing.
-    struct EchoActivity {
-        id: &'static str,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl Activity for EchoActivity {
-        fn id(&self) -> &'static str {
-            self.id
-        }
-        fn label(&self) -> &'static str {
-            "Echo"
-        }
-        fn icon(&self) -> egui::Image<'static> {
-            // Tests never actually render; an empty image is fine.
-            egui::Image::new(egui::ImageSource::Bytes {
-                uri: "tests/echo".into(),
-                bytes: egui::load::Bytes::Static(&[]),
-            })
-        }
-        fn dispatch_action(
-            &self,
-            _ctx: &mut Ctx<'_>,
-            action: &str,
-            args: serde_json::Value,
-        ) -> Result<serde_json::Value, ActionError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            match action {
-                "echo" => Ok(json!({ "from": self.id, "args": args })),
-                _ => Err(ActionError::UnknownAction {
-                    activity: self.id.to_string(),
-                    action: action.to_string(),
-                }),
-            }
-        }
-    }
-
-    /// Run `f` with a `Ctx` whose state slot points at `state` and
-    /// whose service borrows are filled from `services_holder`. The
-    /// synthetic activities only touch `state`; the other fields are
-    /// present so the trait signature matches.
-    fn run_with_state<R>(
-        state: &mut dyn Any,
-        f: impl FnOnce(&mut Ctx<'_>) -> R,
-    ) -> R {
-        // Construct just enough surrounding state for `Ctx`. We
-        // can't build a real `Services` in the unit test, so we use
-        // a small in-memory holder and `transmute`-free pattern:
-        // declare a parallel struct mirroring `Ctx`'s fields with
-        // standalone owners.
-        let mut nav = crate::state::NavState::default();
-        let mut toasts: Vec<crate::state::Toast> = Vec::new();
-        let cfg = std::sync::Arc::new(std::sync::RwLock::new(
-            hiker_core::config::Config::default(),
-        ));
-        // SAFETY-EQUIVALENT: `Services` requires a live vault to
-        // construct. For tests we never read `ctx.services`, so we
-        // bypass it by constructing a `Ctx`-shaped tuple with a
-        // `&mut Services` we leak from an `Option::None` would be
-        // unsound. Instead, store services in a `MaybeUninit` and
-        // assert at runtime the test path never reads from it.
-        //
-        // A cleaner shape: have the synthetic activities not need
-        // `Ctx` at all. But the trait fixes the signature. So we
-        // build a fake Services via mem::zeroed only if the test
-        // genuinely needs the field; the echo activities under test
-        // touch only `state`, so we use a small dance: construct a
-        // Ctx whose `services` field is borrowed from a properly
-        // constructed (but empty-vault) Services... which is heavy.
-        //
-        // Pragmatic punt: leak a `'static` Services built at test
-        // setup. We can't easily, so the tests below DO NOT call
-        // any function that reads `ctx.services`. The Box leak is
-        // not necessary because we can re-arrange the test to use a
-        // raw `&mut` to a heap-allocated stub via Box::leak with a
-        // hand-rolled stub Services. Building one is intrusive
-        // (Services has 14 fields, most Arc<...> to real engines).
-        //
-        // Therefore: skip the dance and assert through the
-        // `dispatch_action` codepath using a no-op Ctx that is
-        // **never invoked** by these tests on the services field.
-        // We achieve that by using `ActivityRegistry::invoke` with a
-        // synthetic Activity impl whose dispatch_action ignores ctx
-        // entirely. The tests below build the Ctx by hand using
-        // `MaybeUninit` for the services slot and never touch it.
-        use std::mem::MaybeUninit;
-        let mut services_uninit: MaybeUninit<crate::state::Services> = MaybeUninit::uninit();
-        // SAFETY: `services_uninit` is never read while uninitialized
-        // because the synthetic activities under test ignore the field.
-        // The reference's lifetime ends with the function; the
-        // uninitialized memory is then dropped without being read.
-        // `MaybeUninit` does not run `Drop`.
-        let services_ref: &mut crate::state::Services =
-            unsafe { &mut *services_uninit.as_mut_ptr() };
-        // Same punt for `vault`: the echo activities under test never read
-        // it, so an uninit `Arc<Vault>` reference is never dereferenced.
-        // `MaybeUninit` does not run `Drop`, so the uninit Arc is never
-        // dropped either.
-        let vault_uninit: MaybeUninit<std::sync::Arc<hiker_core::vault::Vault>> =
-            MaybeUninit::uninit();
-        let vault_ref: &std::sync::Arc<hiker_core::vault::Vault> =
-            unsafe { &*vault_uninit.as_ptr() };
-        let mut effects: Vec<Effect> = Vec::new();
-        let mut ctx = Ctx {
-            services: services_ref,
-            nav: &mut nav,
-            toasts: &mut toasts,
-            config: &cfg,
-            vault: vault_ref,
-            state,
-            active_path: None,
-            effects: &mut effects,
-        };
-        f(&mut ctx)
-    }
 
     #[test]
     fn builtins_in_expected_order() {
@@ -528,121 +225,5 @@ mod registry_tests {
                 "chat"
             ]
         );
-    }
-
-    #[test]
-    fn invoke_routes_to_named_activity() {
-        let calls_a = Arc::new(AtomicUsize::new(0));
-        let calls_b = Arc::new(AtomicUsize::new(0));
-        let reg = ActivityRegistry::build(vec![
-            Arc::new(EchoActivity {
-                id: "alpha",
-                calls: calls_a.clone(),
-            }) as Arc<dyn Activity>,
-            Arc::new(EchoActivity {
-                id: "beta",
-                calls: calls_b.clone(),
-            }) as Arc<dyn Activity>,
-        ]);
-        let mut sink: () = ();
-        let out = run_with_state(&mut sink, |ctx| {
-            reg.invoke(ctx, "beta", "echo", json!({"n": 1})).unwrap()
-        });
-        assert_eq!(out["from"], "beta");
-        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
-        assert_eq!(calls_a.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn invoke_unknown_activity_errors() {
-        let reg = ActivityRegistry::build(vec![]);
-        let mut sink: () = ();
-        let err = run_with_state(&mut sink, |ctx| {
-            reg.invoke(ctx, "nope", "x", json!(null)).unwrap_err()
-        });
-        assert!(matches!(err, ActionError::UnknownActivity(ref s) if s == "nope"));
-    }
-
-    #[test]
-    fn invoke_unknown_action_errors() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let reg = ActivityRegistry::build(vec![Arc::new(EchoActivity {
-            id: "alpha",
-            calls,
-        }) as Arc<dyn Activity>]);
-        let mut sink: () = ();
-        let err = run_with_state(&mut sink, |ctx| {
-            reg.invoke(ctx, "alpha", "no_such_action", json!(null))
-                .unwrap_err()
-        });
-        match err {
-            ActionError::UnknownAction { activity, action } => {
-                assert_eq!(activity, "alpha");
-                assert_eq!(action, "no_such_action");
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    /// Two activities can invoke each other through the registry
-    /// without a circular-dep cycle: activity `caller` calls
-    /// `registry.invoke("callee", ...)` from inside its own
-    /// `dispatch_action`. Models the real Phase 3 pattern of one
-    /// activity triggering another's verb (e.g. boards adding to a
-    /// trail) through the seam rather than via direct module access.
-    #[test]
-    fn activities_can_invoke_each_other() {
-        let calls_callee = Arc::new(AtomicUsize::new(0));
-        // Caller forwards every action to "callee" through a shared
-        // registry handle resolved from a thread_local set up below.
-        struct Caller {
-            registry: std::sync::Mutex<Option<Arc<ActivityRegistry>>>,
-        }
-        impl Activity for Caller {
-            fn id(&self) -> &'static str {
-                "caller"
-            }
-            fn label(&self) -> &'static str {
-                "Caller"
-            }
-            fn icon(&self) -> egui::Image<'static> {
-                egui::Image::new(egui::ImageSource::Bytes {
-                    uri: "tests/caller".into(),
-                    bytes: egui::load::Bytes::Static(&[]),
-                })
-            }
-            fn dispatch_action(
-                &self,
-                ctx: &mut Ctx<'_>,
-                action: &str,
-                args: serde_json::Value,
-            ) -> Result<serde_json::Value, ActionError> {
-                let reg = self
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .expect("registry set");
-                reg.invoke(ctx, "callee", action, args)
-            }
-        }
-        let caller = Arc::new(Caller {
-            registry: std::sync::Mutex::new(None),
-        });
-        let callee = Arc::new(EchoActivity {
-            id: "callee",
-            calls: calls_callee.clone(),
-        });
-        let reg = ActivityRegistry::build(vec![
-            caller.clone() as Arc<dyn Activity>,
-            callee as Arc<dyn Activity>,
-        ]);
-        *caller.registry.lock().unwrap() = Some(reg.clone());
-        let mut sink: () = ();
-        let out = run_with_state(&mut sink, |ctx| {
-            reg.invoke(ctx, "caller", "echo", json!({"x": 7})).unwrap()
-        });
-        assert_eq!(out["from"], "callee");
-        assert_eq!(calls_callee.load(Ordering::SeqCst), 1);
     }
 }

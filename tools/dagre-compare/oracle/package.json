@@ -1,0 +1,10 @@
+{
+  "name": "dagre-compare-oracle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runs real @dagrejs/dagre on a shared fixture so the pure-Rust port can be diffed against it.",
+  "type": "commonjs",
+  "dependencies": {
+    "@dagrejs/dagre": "1.1.4"
+  }
+}

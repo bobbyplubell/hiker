@@ -25,6 +25,10 @@
 //!     --minimap            include the minimap widget
 //!     --markdown           push real editor-md markdown_decorations
 //!     --viewport-scoped    push a synthetic viewport-scoped Replace layer
+//!     --diff N             push a diff overlay rewriting the first N lines
+//!     --widget-churn       re-Arc a viewport-scoped height layer every frame
+//!                          (mimics rendered table/mermaid/math widgets that
+//!                          bump `geometry_epoch` on scroll → minimap re-raster)
 //!     --no-wrap            disable soft wrap (default: enabled)
 //!     --heap               enable dhat heap profiling
 //!
@@ -53,6 +57,19 @@ struct Args {
     minimap: bool,
     markdown: bool,
     viewport_scoped: bool,
+    /// Push a (cached, stable) diff overlay simulating an agent rewrite of the
+    /// first `diff` lines of the doc — big contiguous removed/added blocks plus
+    /// per-line modified blocks. Reproduces the `paint_block_text` cost.
+    diff: usize,
+    /// Rebuild the diff overlay from scratch EVERY frame (doc.to_string +
+    /// diff::lines + proposal_decorations), mirroring the host's uncached
+    /// `diff_overlay_for` call. Without this, `--diff` caches the overlay.
+    diff_recompute: bool,
+    /// Re-Arc a viewport-scoped HEIGHT-affecting layer every frame (mimics the
+    /// rendered table/mermaid/math widget layers, which are keyed on the
+    /// viewport and so bump `geometry_epoch` on every scroll). Drives the
+    /// minimap's full re-raster + texture re-upload per frame.
+    widget_churn: bool,
     wrap: bool,
     heap: bool,
 }
@@ -68,6 +85,9 @@ impl Default for Args {
             minimap: false,
             markdown: false,
             viewport_scoped: false,
+            diff: 0,
+            diff_recompute: false,
+            widget_churn: false,
             wrap: true,
             heap: false,
         }
@@ -91,6 +111,9 @@ fn parse_args() -> Result<Args> {
             "--minimap" => a.minimap = true,
             "--markdown" => a.markdown = true,
             "--viewport-scoped" => a.viewport_scoped = true,
+            "--diff" => a.diff = next_val(&mut it)?.parse()?,
+            "--diff-recompute" => a.diff_recompute = true,
+            "--widget-churn" => a.widget_churn = true,
             "--no-wrap" => a.wrap = false,
             "--heap" => a.heap = true,
             "-h" | "--help" => {
@@ -172,6 +195,64 @@ fn viewport_scoped_layer(editor: &Editor, visible_lines: std::ops::Range<usize>)
     RangeSet::from_iter(ranges)
 }
 
+/// Build a diff overlay simulating an agent rewriting the first `n` lines of
+/// the buffer with entirely different content. A wholesale rewrite of a
+/// contiguous region produces big `Removed` + `Added` hunks, which
+/// `proposal_decorations` turns into tall single `BlockKind::Text` decorations
+/// (one block holding hundreds/thousands of `BlockTextLine`s). This is the
+/// real diff overlay code path; the host caches it (stable Arc across scroll),
+/// so we build it once and reuse it — the cost we're measuring is in *paint*
+/// (`paint_block_text`), not construction.
+fn make_proposal(buffer_text: &str, n: usize) -> String {
+    use editor_core::rope::Rope;
+    let buffer_rope = Rope::from_str(buffer_text);
+    // Replace the first `n` lines with brand-new, unrelated content (forces a
+    // big remove+add rather than per-line modifies), keep the rest.
+    let mut proposal = String::with_capacity(buffer_text.len());
+    for i in 0..n {
+        proposal.push_str(&format!("rewritten proposal line {i} — entirely new content here\n"));
+    }
+    let tail_start = buffer_rope.line_to_byte(n.min(buffer_rope.len_lines()));
+    proposal.push_str(&buffer_text[tail_start.min(buffer_text.len())..]);
+    proposal
+}
+
+/// Build the diff overlay the way the host's uncached `agent_overlay` does:
+/// full line diff + `proposal_decorations`. `--diff` calls this once and caches
+/// the result; `--diff-recompute` calls it every frame to mirror the bug.
+fn diff_overlay(buffer_text: &str, proposal: &str, line_height: f32) -> DecorationSet {
+    use editor_core::rope::Rope;
+    let buffer_rope = Rope::from_str(buffer_text);
+    let hunks = editor_core::diff::lines(buffer_text, proposal);
+    editor_diff::view::proposal_decorations(&buffer_rope, proposal, &hunks, line_height, None, true)
+}
+
+/// A viewport-scoped, HEIGHT-affecting layer that mimics the rendered
+/// table/mermaid/math widget layers: a small `Block` anchored at each visible
+/// line. Because it carries height, the host must push it via
+/// `push_with_heights` (the viewport-scoped lane forbids height) — and because
+/// it's rebuilt over the (scroll-dependent) visible band, its `content_id`
+/// changes every scroll frame, bumping `geometry_epoch`. That's the signal the
+/// minimap keys its texture on, so it forces a full re-raster + GPU re-upload
+/// every frame.
+fn widget_churn_layer(editor: &Editor, visible_lines: std::ops::Range<usize>) -> DecorationSet {
+    use editor_core::decoration::{BlockDeco, BlockKind, BlockSide, Color};
+    let last_line = editor.doc.len_lines().saturating_sub(1);
+    let mut ranges: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
+    for line in visible_lines.start..visible_lines.end.min(last_line + 1) {
+        let anchor = editor.doc.line_to_byte(line);
+        ranges.push((
+            anchor..anchor,
+            Decoration::Block(BlockDeco {
+                side: BlockSide::Above,
+                height: 2.0,
+                kind: BlockKind::Hatched(Color::rgba(120, 120, 120, 40)),
+            }),
+        ));
+    }
+    RangeSet::from_iter(ranges)
+}
+
 /// Frame-time stats reported as microseconds.
 struct Stats {
     mean: u128,
@@ -217,6 +298,14 @@ fn run(args: &Args) {
     // cost of the markdown decorator and mask the partial-walk wins.
     let mut markdown_cache: Option<(usize, DecorationSet)> = None;
 
+    // The proposal text (stable). `--diff` caches the overlay once; the real
+    // app does NOT cache — `--diff-recompute` rebuilds it every frame instead.
+    let proposal: Option<String> = (args.diff > 0).then(|| make_proposal(&text, args.diff));
+    let diff_layer: Option<DecorationSet> = match (&proposal, args.diff_recompute) {
+        (Some(p), false) => Some(diff_overlay(&text, p, view.line_height)),
+        _ => None,
+    };
+
     let ctx = egui::Context::default();
 
     // Pick a screen big enough for the editor + a minimap strip beside it.
@@ -229,7 +318,7 @@ fn run(args: &Args) {
     // Run one warm-up frame so font metrics, height map, and caches settle
     // before we start sampling.
     let mut scroll_y = 0.0f32;
-    drive_frame(&ctx, screen, args, &mut editor, &mut view, &mut paint_cache, &mut mm_cache, &mut markdown_cache, scroll_y);
+    drive_frame(&ctx, screen, args, &mut editor, &mut view, &mut paint_cache, &mut mm_cache, &mut markdown_cache, diff_layer.as_ref(), proposal.as_deref(), scroll_y);
 
     let mut frame_times = Vec::with_capacity(args.frames);
     let total_start = Instant::now();
@@ -243,7 +332,7 @@ fn run(args: &Args) {
         scroll_y = ((f as f32 + 1.0) * args.scroll_px) % scroll_range;
 
         let t0 = Instant::now();
-        drive_frame(&ctx, screen, args, &mut editor, &mut view, &mut paint_cache, &mut mm_cache, &mut markdown_cache, scroll_y);
+        drive_frame(&ctx, screen, args, &mut editor, &mut view, &mut paint_cache, &mut mm_cache, &mut markdown_cache, diff_layer.as_ref(), proposal.as_deref(), scroll_y);
         frame_times.push(t0.elapsed());
     }
 
@@ -255,6 +344,9 @@ fn run(args: &Args) {
         minimap = args.minimap,
         markdown = args.markdown,
         viewport_scoped = args.viewport_scoped,
+        diff = args.diff,
+        diff_recompute = args.diff_recompute,
+        widget_churn = args.widget_churn,
         wrap = args.wrap,
         total_ms = total.as_millis() as u64,
         mean_us = stats.mean as u64,
@@ -276,6 +368,8 @@ fn drive_frame(
     paint_cache: &mut PaintCache,
     mm_cache: &mut editor_egui::minimap::Cache,
     markdown_cache: &mut Option<(usize, DecorationSet)>,
+    diff_layer: Option<&DecorationSet>,
+    proposal: Option<&str>,
     scroll_y: f32,
 ) {
     // Set scroll directly. We're profiling the per-frame work the widget
@@ -319,6 +413,28 @@ fn drive_frame(
                     let vis = view.visible_lines();
                     let set = viewport_scoped_layer(state, vis);
                     view.decorations.push_viewport_scoped(set);
+                }
+                // Cached diff overlay (stable Arc). Pushed via the heights lane
+                // because its phantom blocks reserve space.
+                if let Some(diff) = diff_layer {
+                    view.decorations.push_with_heights(diff.clone());
+                }
+                // Uncached diff overlay: rebuild from scratch every frame, like
+                // the host's per-frame `diff_overlay_for`.
+                if args.diff_recompute {
+                    if let Some(p) = proposal {
+                        let working = state.doc.to_string();
+                        let set = diff_overlay(&working, p, view.line_height);
+                        view.decorations.push_with_heights(set);
+                    }
+                }
+                // Viewport-scoped height-affecting layer rebuilt every frame —
+                // bumps `geometry_epoch` on scroll, exactly like the rendered
+                // widget layers. This is what defeats the minimap texture cache.
+                if args.widget_churn {
+                    let vis = view.visible_lines();
+                    let set = widget_churn_layer(state, vis);
+                    view.decorations.push_with_heights(set);
                 }
             };
 

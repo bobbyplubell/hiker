@@ -15,7 +15,7 @@ Transactions, decorations, and selections referenced below are the widget's type
 
 One open buffer at a time in v0. Switching files replaces the buffer's contents via a single `dispatch` that swaps the entire doc.
 
-The buffer renders the merged working materialization of the document's op layers — `materialize(accepted + working + pending(session))` per `op-log-layered-model`. User typing doesn't write disk or the `accepted` layer directly; the editor binding (per `op-log-editor-binding`) turns each edit into a `user` op on the `working` layer, and Save commits that layer. An agent's `pending` proposals coexist in the same buffer, reviewed via `patch-review.md`.
+The buffer is the editor's rope — the user's own text, `accepted + working` (per `op-log-layered-model`). User typing lands at plain byte offsets; the host mirrors each editor change set into the `working` layer (per `op-log-working-layer`), and Save commits that layer. An agent's `pending(session)` proposals render *on top* as an editor-native anchored overlay — a `DiffLayer` recomputed from two ropes (per `op-log-three-way-overlay`), reviewed via `patch-review.md`.
 
 State tracked per buffer:
 
@@ -29,7 +29,7 @@ Multi-buffer / tabs deferred. When tabs land, the same per-buffer state moves in
 
 ### `transactions_out` seam
 
-The editor widget exposes the change sets it applied from user input — the per-edit list of retain / delete / insert ops over byte ranges, the forward half of the editor binding (per `op-log-editor-binding`). The host drains this stream each frame and mirrors each change set into the document's CRDT `working` layer as `user` ops, so the editor stays the source of *what changed* rather than the host re-diffing. Reverse-direction edits (an accepted/pending/external change applied back into the editor) carry a sync origin and are not re-emitted, so the binding can't echo. The seam is editor-crate-owned and host-agnostic — it feeds any consumer needing a precise edit log, not just the op log. [editor-transactions-out]
+The editor widget exposes the change sets it applied from user input — the per-edit `ChangeSet` (retain / delete / insert over byte ranges). The host drains this stream each frame and mirrors each change set into the `working` layer (per `op-log-working-layer`), so the editor stays the source of *what changed* rather than the host re-diffing. The same change sets remap the pending overlay's anchors via the editor's `map_pos` (exact, not fuzzy), keeping the agent's anchored ranges in place as the user types (per `op-log-three-way-overlay`). Reverse-direction edits (an accepted/pending/external change applied back into the editor) carry a sync origin and are not re-emitted, so the mirror can't echo. The seam is editor-crate-owned and host-agnostic — it feeds any consumer needing a precise edit log. [editor-transactions-out]
 
 
 ### Embedded buffer view (one note, many places)
@@ -38,7 +38,7 @@ A reusable primitive for rendering an **editable** view of a vault note *anywher
 
 - **Shared (one per path):** the note's `Editor` — document + selection/cursor + undo history — lives in the single `session.buffers[path]` buffer. There is never a second dirty copy of a note; loading a note that already has a dirty buffer just attaches to that buffer. Cursor and undo are shared across every view, because they live on the one `Editor`.
 - **Per-view (one per embedding site):** each host owns its own `ViewState` + `PaintCache` (scroll offset, content zoom, wrap, viewport, galley cache). So a 300px canvas card and a full-height tab of the same note scroll and zoom independently while showing the same text.
-- **Host-agnostic render call:** a single helper renders `session.buffers[path]`'s `Editor` through the editor widget against a caller-supplied `(ViewState, PaintCache)` at the caller's rect, drains `editor-transactions-out`, and runs the op-log editor binding (`op-log-editor-binding`) for that path. Because the binding runs from *whichever host drew the editor this frame*, edits reach `working` even when no buffer tab is open — so save / autosave / agent-review / dirty-tracking work identically regardless of where the editing happened. (Only the focused view receives keystrokes per frame, so the binding is driven by one host at a time; views render sequentially, never holding two `&mut Editor` borrows at once.)
+- **Host-agnostic render call:** a single helper renders `session.buffers[path]`'s `Editor` through the editor widget against a caller-supplied `(ViewState, PaintCache)` at the caller's rect, drains `editor-transactions-out`, and mirrors the change sets into the `working` layer (`op-log-working-layer`) for that path. Because the mirror runs from *whichever host drew the editor this frame*, edits reach `working` even when no buffer tab is open — so save / autosave / agent-review / dirty-tracking work identically regardless of where the editing happened. (Only the focused view receives keystrokes per frame, so the mirror is driven by one host at a time; views render sequentially, never holding two `&mut Editor` borrows at once.)
 - **Lifecycle.** Buffer eviction is reference-counted across *all* hosts, not just tabs: a note kept open only by a canvas card (no tab) stays loaded, dirty-tracked, and autosaved until the last host releases it. The tab-only "drop when no tab references this path" rule generalizes to "drop when no tab **or embed** references it." [embedded-buffer-view-lifecycle]
 
 Consumers: the canvas inline editor (`canvas-inline-edit`), and — as they adopt it — the board Markdown view (`board-view-toggle`) and editor split panes, which today each load the buffer but render their own editor. The buffer tab panel is the reference renderer; the helper is the extracted, chrome-free core it and every embed share.
@@ -123,8 +123,8 @@ The left region of the status bar is a single dropdown that lists every addressa
 Entries, in fixed group order, newest within each group:
 
 1. **Current** — the live, editable on-disk version. Always present, always the first entry. Selecting it exits any snapshot / staging preview the buffer is in and returns to the editable buffer (same code path as the existing exit-preview transitions).
-2. **Snapshots** — every `core::changes` row for this path within retention (`Changes::history_for_path`), one entry per row. Label: `Snapshot · <relative-time> · <author> · <op>`. Selecting an entry enters `snapshot-preview-mode` against that change-id (same code path as clicking a row on the activity detail page). The current on-disk state already appears as the top "Current" entry, so the most-recent snapshot row is *not* hidden — it represents the saved version, which may diverge from the live buffer if the user has unsaved edits.
-3. **Staging proposals** — every `core::staging` proposal whose `target_path` equals this file (`Staging::list({by_path})`). Label: `Staging · <surface> · <relative-time>`. Selecting an entry opens the proposal's content as a read-only staging preview (same code path as clicking a proposal row on the activity detail page).
+2. **Snapshots** — every `.ops` history frame for this path within retention (`op_writes::path_history`), one entry per frame. Label: `Snapshot · <relative-time> · <author> · <op>`. Selecting an entry enters `snapshot-preview-mode` against that frame (same code path as clicking a row on the activity detail page). The current on-disk state already appears as the top "Current" entry, so the most-recent snapshot row is *not* hidden — it represents the saved version, which may diverge from the live buffer if the user has unsaved edits.
+3. **Pending proposals** — every pending whole-file proposal whose `target_path` equals this file (`op_writes::list_whole_file_proposals`). Label: `Proposal · <surface> · <relative-time>`. Selecting an entry opens the proposal's content as a read-only proposal preview (same code path as clicking a proposal row on the activity detail page).
 
 The selected entry reflects what's currently in view. Closed-state label mirrors that selection (e.g. `note.md — Snapshot 2m ago · agent:claude`), so the user can tell at a glance which version the editor is showing without opening the dropdown. Mode-specific verbs (Restore, Accept / Reject, Diff toggle) stay in the editor toolbar's `#mode-controls` slot per `editor-toolbar-mode-controls`; the dropdown is purely a version selector. [status-bar-version-dropdown-selection]
 
@@ -185,11 +185,11 @@ Constraints:
 
 ### Show changes menu
 
-The right-click context menu on the diff toggle (and the buffer's body, when no selection is active) carries a `Show changes…` entry whose submenu lists recent op-log rows for the active buffer's path (via `core::changes`), newest first. Selecting a row sets the tab's `DiffSource = ChangeRow(op_id)` and turns diff mode on; the buffer's `current` text stays put, and `agent_base` (if any) is unaffected. [editor-show-changes-menu]
+The right-click context menu on the diff toggle (and the buffer's body, when no selection is active) carries a `Show changes…` entry whose submenu lists recent `.ops` history frames for the active buffer's path (via `op_writes::path_history`), newest first. Selecting a row sets the tab's `DiffSource = HistoryVersion { path, frame_id }` and turns diff mode on; the buffer's `current` text stays put, and `agent_base` (if any) is unaffected. [editor-show-changes-menu]
 
 - **Submenu shape.** Up to 20 recent rows. Each row shows timestamp (relative + absolute on hover), op kind (`created` / `modified` / `deleted` / `renamed`), and author. Final row: `Browse all… → ` opens the `home-detail { which: activity-row { path } }` tab filtered to this path (per `vault-home-recent-activity-detail`).
-- **Per-hunk restore.** When the diff source is `ChangeRow(op_id)`, hunks carry a `Restore this hunk` overlay verb (owner `Snapshot` per `diff.md`'s `diff-layer-owner`). Restore writes the historical text for that hunk's range into `current` and lets the user save through the normal path. Full-snapshot restore stays on the row-level surface (`vault-home-recent-activity-detail`), unchanged.
-- **No URI scheme.** The diff resolves directly through `core::changes::materialization_at(op_id)`; the editor crate doesn't go through a custom URI provider.
+- **Per-hunk restore.** When the diff source is `HistoryVersion { path, frame_id }`, hunks carry a `Restore this hunk` overlay verb (owner `Snapshot` per `diff.md`'s `diff-layer-owner`). Restore writes the historical text for that hunk's range into `current` and lets the user save through the normal path. Full-snapshot restore stays on the row-level surface (`vault-home-recent-activity-detail`), unchanged.
+- **No URI scheme.** The diff resolves directly through `oplog::materialize_at(path, frame_id)`; the editor crate doesn't go through a custom URI provider.
 
 
 ## Find in note
@@ -305,7 +305,7 @@ Mutations are LLM-driven content rewrites of the active note. Single-note user-i
 
 1. The user clicks a mutation entry. Hiker submits a `Direct`-shape task to `core::tasks` (per `task-queue.md`) at `High` priority — the user is watching. The task carries the buffer's *live* text (not last-saved, same rule as `chat-active-note-context-injection`) so the mutation operates on what the user sees. The buffer is set read-only for the duration of the task, and the source tab is pinned (a preview tab promotes to sticky on submit per `editor-preview-tab-promotion` so a preview-slot swap can't displace the buffer the result needs to land on). [note-mutation-buffer-ro-while-in-flight]
 2. The queue's direct-LLM worker drains the task by calling `core::llm::chat` with the mutation's prompt. External MCP-attached clients can also drain the task per the queue's worker rules. The home-page Task queue widget (`task-queue-home-widget`) is the in-flight progress surface — no per-mutation toast.
-3. On `TaskCompleted`: the result replaces the source buffer's content as a single editor transaction, the buffer's read-only flag clears, and the buffer becomes dirty. Works whether the source tab is the active one (dispatch through the live editor view) or a background tab (rewrite the tab's saved editor state in place via a transaction off the existing state, preserving history so Ctrl-Z reverts the whole replacement as one undo step on activation). The user reviews by reading the buffer; the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) flips the editor view to a line-level diff against on-disk content for explicit comparison. **Save** writes the mutated content through the regular save path (which appends a `'modified'` row to `core::changes`). **Ctrl-Z** reverts the mutation as a single undo step. If the user closed the source tab mid-flight (only possible from the explicit close path, since the tab is RO + pinned during the flight), the result is dropped silently — no toast, no held state. [note-mutation-applies-as-buffer-edit]
+3. On `TaskCompleted`: the result replaces the source buffer's content as a single editor transaction, the buffer's read-only flag clears, and the buffer becomes dirty. Works whether the source tab is the active one (dispatch through the live editor view) or a background tab (rewrite the tab's saved editor state in place via a transaction off the existing state, preserving history so Ctrl-Z reverts the whole replacement as one undo step on activation). The user reviews by reading the buffer; the dirty-buffer Diff toggle (`editor-diff-vs-disk-toggle`) flips the editor view to a line-level diff against on-disk content for explicit comparison. **Save** writes the mutated content through the regular save path (which appends a `'modified'` history frame). **Ctrl-Z** reverts the mutation as a single undo step. If the user closed the source tab mid-flight (only possible from the explicit close path, since the tab is RO + pinned during the flight), the result is dropped silently — no toast, no held state. [note-mutation-applies-as-buffer-edit]
 4. On `TaskFailed`, the buffer's read-only flag clears and a toast surfaces the error. No content change. On `TaskCancelled` (user cancels via the queue widget), the buffer's read-only flag clears, no content change, no toast.
 
 [note-mutations-menu-task-shape]
@@ -361,7 +361,7 @@ UI scope: minimal. Header with vault root path, three widgets stacked, no charts
 
 Out of scope for v1 of the home page: pinned/landmark notes, active-trail display, search shortcuts, discovery hints from clustering, recent-searches list, vocabulary stats, sync status. All slot in as additional widgets as their backing features land.
 
-### Recent activity widget (lands with `core::changes`)
+### Recent activity widget (lands with `core::activity`)
 
 A fourth widget appears on the home page once the op log's accepted-op feed (`core::activity`, per `op-log.md` "History materialization") has any rows — i.e. as soon as any save / rename / delete has happened in this vault. Hidden when the feed is empty so a fresh vault doesn't show a confusing zero-count tile. [vault-home-recent-activity-widget]
 
@@ -371,7 +371,7 @@ Preview content (the home tile):
 - Top 3–5 most recent change events: timestamp, path, op (created / modified / deleted / renamed), author class. Click → detail view (see below).
 - Mixed-author by default — user saves and (when MCP lands) agent writes share the stream. Not agent-specific; the agent-activity use case is a filter preset, not a separate surface.
 
-Refresh: subscribes to an op-log append event emitted whenever a row is appended to `core::changes`. Light debounce (a few hundred ms) so save bursts don't repaint per keystroke.
+Refresh: subscribes to an op-log change event emitted whenever a history frame is appended. Light debounce (a few hundred ms) so save bursts don't repaint per keystroke.
 
 
 ### Detail views
@@ -390,7 +390,7 @@ Per-widget detail views, in roughly the order they earn their keep:
     - **Chunks** — per-note chunk count, sortable; flags pathologies (>100 chunks, 0 chunks). A surface for spotting chunker pathology, ahead of the deferred `eval-sanity-stats` work.
     - **Queued** — live list of notes currently in the indexer's pending set (`is_pending` per `cmd-file-index-state`). Updates on every indexer-progress event.
     - **Skipped** — list of skipped notes with their reasons (already tracked via `notes.skipped` + `notes.skip_reason`). Per-row "retry" affordance reroutes through `IndexJob::Upsert` with `force=true` so users can manually retry after fixing the underlying issue (file size, encoding).
-- **`vault-home-recent-activity-detail`** — full list from `core::changes::recent`, all author classes. Mental model: **each row is a saved version of the file.** Row layout: op label · path · author · time-ago, plus a `current` badge on the most recent row per path and a `↩ restored` badge on rows that were themselves a Restore. Filter pills (author class) live in the header. [vault-home-recent-activity-detail]
+- **`vault-home-recent-activity-detail`** — full list from `core::activity` (`recent`), all author classes. Mental model: **each row is a saved version of the file.** Row layout: op label · path · author · time-ago, plus a `current` badge on the most recent row per path and a `↩ restored` badge on rows that were themselves a Restore. Filter pills (author class) live in the header. [vault-home-recent-activity-detail]
 
     The interaction shape:
 

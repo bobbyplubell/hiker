@@ -805,7 +805,7 @@ fn conflicts_section(
 /// Render the inline "view diff" surface for one forked-doc row, dispatching on
 /// the path's [`ForkDiffState`] in the Sync page cache. `Ready(their_text)`
 /// computes a unified diff of OUR `materialize_accepted(path).text` (base) vs
-/// THEIR text (current) via `core::diff::compute` and renders it bounded +
+/// THEIR text (current) via `editor_core::diff::lines` and renders it bounded +
 /// colored. Lock-free on the render path: reads the UI cache and the read-side
 /// op log, never the sync node. [sync-fork-diff]
 fn render_fork_diff(ui: &mut egui::Ui, app: &AppState, path: &str) {
@@ -842,15 +842,15 @@ fn render_fork_diff(ui: &mut egui::Ui, app: &AppState, path: &str) {
 }
 
 /// Render a bounded, read-only unified diff of `ours` (base) vs `theirs`
-/// (current) using `core::diff::compute`: changed lines carry `+`/`-` with
+/// (current) using `editor_core::diff::lines`: changed lines carry `+`/`-` with
 /// restrained add/remove colors, equal-context lines are muted, and the line
 /// count is capped with a "…" marker so a huge fork stays bounded inside the
 /// page scroll. [sync-fork-diff]
 fn render_unified_diff(ui: &mut egui::Ui, ours: &str, theirs: &str) {
-    use hiker_core::diff::Op;
-    let outcome = hiker_core::diff::compute(ours, theirs);
-    let total: usize = outcome.hunks.iter().map(|h| h.lines.len()).sum();
-    if total == 0 {
+    use editor_core::diff::HunkKind;
+    // Empty-vs-empty produces no rows; preserve the legacy "(no differences)"
+    // message which fired only when both inputs had zero lines.
+    if ours.lines().count() == 0 && theirs.lines().count() == 0 {
         ui.label(
             egui::RichText::new("(no differences — versions match)")
                 .color(theme::muted())
@@ -859,37 +859,66 @@ fn render_unified_diff(ui: &mut egui::Ui, ours: &str, theirs: &str) {
         );
         return;
     }
+    let ours_lines: Vec<&str> = ours.lines().collect();
+    let theirs_lines: Vec<&str> = theirs.lines().collect();
+    let hunks = editor_core::diff::lines(ours, theirs);
     // Restrained add/remove colors; equal lines muted.
     let add = egui::Color32::from_rgb(90, 170, 90);
     let del = egui::Color32::from_rgb(200, 90, 90);
+
+    // Build the ordered list of rows first so the remainder math ("N more
+    // lines") and the cap match the legacy per-line iteration exactly.
+    // (prefix char, line text, optional color)
+    let mut rows: Vec<(char, &str, Option<egui::Color32>)> = Vec::new();
+    for hunk in &hunks {
+        match hunk.kind {
+            HunkKind::Context => {
+                for r in hunk.right_lines.clone() {
+                    rows.push((' ', theirs_lines[r], None));
+                }
+            }
+            HunkKind::Added => {
+                for r in hunk.right_lines.clone() {
+                    rows.push(('+', theirs_lines[r], Some(add)));
+                }
+            }
+            HunkKind::Removed => {
+                for l in hunk.left_lines.clone() {
+                    rows.push(('-', ours_lines[l], Some(del)));
+                }
+            }
+            HunkKind::Modified => {
+                // Deletes before inserts, matching the legacy delete-run-then-
+                // insert-run ordering.
+                for l in hunk.left_lines.clone() {
+                    rows.push(('-', ours_lines[l], Some(del)));
+                }
+                for r in hunk.right_lines.clone() {
+                    rows.push(('+', theirs_lines[r], Some(add)));
+                }
+            }
+        }
+    }
+
+    let total = rows.len();
     let mut shown = 0usize;
-    'outer: for hunk in &outcome.hunks {
-        for line in &hunk.lines {
-            if shown >= FORK_DIFF_MAX_LINES {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "\u{2026} ({} more lines)",
-                        total - shown
-                    ))
+    for (prefix, line_text, color) in rows {
+        if shown >= FORK_DIFF_MAX_LINES {
+            ui.label(
+                egui::RichText::new(format!("\u{2026} ({} more lines)", total - shown))
                     .color(theme::muted())
                     .small(),
-                );
-                break 'outer;
-            }
-            let (prefix, color) = match line.op {
-                Op::Insert => ('+', Some(add)),
-                Op::Delete => ('-', Some(del)),
-                Op::Equal => (' ', None),
-            };
-            let text = format!("{prefix} {}", line.line);
-            let mut rich = egui::RichText::new(text).monospace().small();
-            rich = match color {
-                Some(c) => rich.color(c),
-                None => rich.color(theme::muted()),
-            };
-            ui.label(rich);
-            shown += 1;
+            );
+            break;
         }
+        let text = format!("{prefix} {line_text}");
+        let rich = egui::RichText::new(text).monospace().small();
+        let rich = match color {
+            Some(c) => rich.color(c),
+            None => rich.color(theme::muted()),
+        };
+        ui.label(rich);
+        shown += 1;
     }
 }
 

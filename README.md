@@ -24,7 +24,7 @@ The same vault is navigable by a human in the desktop UI and by agents over MCP,
 
 ## Core ideals
 
-1. **Plain markdown on disk is the source of truth.** Every note is a file you can open, read, and edit with any tool. The system never traps content behind a database or proprietary format.
+1. **Plain markdown on disk is the source of truth.** Every note is a file you can open, read, and edit with any tool. The system never traps content behind a database or proprietary format. Editing is plain text and sync is file-level — there is no CRDT or hidden binary edit log between you and your files; concurrent changes reconcile by 3-way text merge, and same-region conflicts surface for you to resolve rather than silently interleaving.
 
 2. **The index is disposable; content is precious.** Anything regenerable from notes (embeddings, vector store, full-text index, extraction caches) is throwaway and can be rebuilt at any time. Backup, sync, and version-control rules apply to content only. If a feature requires the index to be authoritative, the design is wrong.
 
@@ -56,7 +56,9 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 ### Editor and vault
 
 - **[implemented]** Native Rust editor widget (`editor/`, embedded via `editor-egui`) with tree-sitter syntax highlighting, multi-cursor, undo tree, and markdown live preview (cursor-line reveal, fade markers, heading styles, fenced code reveal)
+- **[implemented]** Inline rendered widgets in live preview: LaTeX math (`$…$` / `$$…$$`), Mermaid diagrams (~25 types), WaveDrom waveforms, and natively-painted tables — drawn in place by Hiker's own pure-Rust engines (no browser, no JavaScript, no network), with cursor-reveal editing, a floating edit-preview popup, and a persisted on-disk diagram cache
 - **[implemented]** Three-column layout: file tree, editor, discovery panel; collapsible and resizable sides
+- **[partial]** Vault view: a read-only sidebar lens that regroups the tree by authorship, source, or capture/trail nesting and surfaces sidecar notes
 - **[implemented]** Sidebar mode switcher (Files / Clusters / Trails) with persistent per-vault default
 - **[implemented]** File tree with drag-and-drop move, inline rename, context menu, sort options, refresh-on-watcher
 - **[implemented]** Soft-delete trash with restore, permanent delete, empty-trash, and orphan recovery
@@ -79,7 +81,7 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[implemented]** Vault-wide hybrid search (FTS5 lexical + semantic vectors, RRF fusion) in the discovery panel
 - **[implemented]** Type-ahead search with debounce, epoch cancellation, click-to-chunk navigation, full keyboard nav
 - **[implemented]** Lexical and semantic option menus (case sensitivity, prefix match, min-similarity, recency bias) persisted per vault
-- **[partial]** CLI surface (`hiker reindex`, `hiker query` wired; trash commands and additional verbs still in progress)
+- **[planned]** CLI surface (the `hiker` binary is a stub today; reindex, query, and trash verbs specced but not yet implemented)
 - **[planned]** Pluggable embedder backends (OpenAI, Ollama, Cohere, Mistral, HuggingFace) via the `llm` crate
 - **[planned]** Folder, tag, lifecycle, and authorship scoping; multi-vault search; saved-collection results
 - **[planned]** Tantivy lexical engine swap for ranking quality
@@ -94,16 +96,33 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 - **[implemented]** Staging & review: pending agent proposals (`write_note`, `edit_note`, frontmatter, tags) route through `.hiker/staging/` when review-mode is on, surfaced in the unified activity feed and the version dropdown with author/source filtering
 - **[implemented]** Patch review: per-hunk accept/reject for agent `edit_note` proposals, conflicted-state detection, anchor-drift safeguards, batch grouping
 - **[partial]** LLM audit log (JSONL at `.hiker/agent-log/`, daily rotation, shared by core agent + MCP + ACP surfaces) done; cost-transparency status indicator planned
-- **[planned]** Recursive RAPTOR-shaped clustering with HDBSCAN/GMM, LLM cluster naming, saved topic trees
-- **[planned]** Cluster editor surface (interactive tree editing, policies, node operations, triage view)
+- **[implemented]** Topic trees: recursive RAPTOR-shaped clustering (Leiden + HDBSCAN) with LLM-generated cluster names, saved as editable markdown outlines in the vault, plus a beam-search placement classifier that triages new notes on save
+- **[implemented]** Cluster editor: sidebar and full-pane tree editing (move / merge / split / recluster), per-cluster policies (tag / move / freeze), and a force-directed graph visualization encoding policy and member count
+- **[in progress]** Deterministic (extractive) cluster naming as an LLM-free fallback, and GMM partitioning
+- **[partial]** Inbox rules: basename/body regex matching to auto-move and auto-tag notes on creation (TOML config; no settings UI yet)
 - **[planned]** One-shot suggestion proposals (move and tag modes) with markdown audit log and rejection history
-- **[planned]** Confidence-tiered triage: high-confidence auto-apply with undo, medium queued for review
 
 ### Spatial navigation
 
 - **[implemented]** Trails: ordered, memex-style walks through notes — create, append waypoints, reorder, remove with cascade, side-trail hierarchies, capture-to-active, append-cursor insertion, watcher-driven auto-update on note move
 - **[planned]** Landmarks: pinned anchors with nearest-landmark tagging in embedding space
 - **[planned]** Map: graph visualization of the vault
+
+### Canvas, boards, and linking
+
+- **[implemented]** Canvas: an infinite pan/zoom whiteboard with file, text, link, and group nodes, bezier connectors, multi-select drag/resize, insert-from-vault, and viewport-culled rendering (`hiker-canvas/`)
+- **[implemented]** Kanban boards: a board is a regular markdown note (`hiker.kind: board`) holding user-named columns of note-card and freeform-text cards; drag between columns, board index page, and full MCP control
+- **[implemented]** Wikilinks: `[[Name]]` / `[[folder/Name]]` references with autocomplete, hover preview, click-to-resolve, ambiguity policies, rename-rewrite, and backlinks
+- **[implemented]** Offline ZIM archive viewer (Wikipedia and friends) via the native-Rust `zxr` reader: article navigation plus Xapian BM25 full-text search, federated into vault search — no C/C++ dependencies
+
+### Multi-device sync
+
+Replaces the former Yrs-CRDT-over-libp2p model (now fully removed) with a file-level substrate that keeps plain markdown as the unit of sync.
+
+- **[implemented]** 3-way text merge with content-hash merge-base recovery: disjoint edits merge automatically, same-region conflicts are detected and persisted across restarts
+- **[implemented]** libp2p transport: mDNS peer discovery, Noise-encrypted file blobs, device enrollment, and a fork/rename/delete conflict surface
+- **[partial]** Git transport (integrated and manual modes): commit-on-save, `Hiker-Author` authorship trailers, and observed-rename tracking
+- **[in progress]** In-app sync UI: transport selector, in-editor conflict resolver, and push/pull status
 
 ### Multimodal ingest
 
@@ -116,8 +135,9 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 ### Agent surface (MCP)
 
 - **[implemented]** MCP server (`rmcp` over streamable HTTP) brought up per-vault, with discovery file and per-tool toggles
-- **[implemented]** Read tools: `search_notes`, `get_note`, `related_notes`
+- **[implemented]** Read tools: `search_notes`, `get_note`, `related_notes`, plus UI-context tools `get_active_note`, `get_open_notes`, `get_selection`
 - **[implemented]** Write tools: `write_note`, `set_frontmatter`, `apply_tag`, `remove_tag`; `edit_note` (span-anchored patches, per-edit staging proposals)
+- **[implemented]** Board tools: `boards_list`, `board_get`, `board_create`, `board_add_card`, `board_add_text_card`, `board_move_card`, `board_set_card_text`, `board_remove_card`, and column ops (`board_add_column`, `board_rename_column`, `board_reorder_column`, `board_delete_column`)
 - **[implemented]** Audit log and per-tool review-mode routing through staging
 - **[planned]** Staging introspection (`list_pending_proposals`, `get_pending_proposal` with per-edit anchor-status liveness) and `amend_pending_proposal`
 - **[planned]** Trails, landmarks, collections, and bulk write tools (`move_note`, `delete_note`) — each lands with its backing feature
@@ -126,13 +146,17 @@ Status legend: **[implemented]** working today, **[in progress]** partially buil
 
 - **[implemented]** Unified diff renderer with line + intraline character-level highlights
 - **[implemented]** Snapshot preview diff, dirty-buffer-vs-disk diff, and pending-proposal-vs-disk diff via toolbar toggle
+- **[planned]** Three-way merge diff for drift-conflict and whole-file proposal resolution
 
 ### Platform
 
-- **[implemented]** egui desktop shell (migrated from the original Tauri + CodeMirror 6 stack to an all-Rust UI). Workspace layout:
+- **[implemented]** All-Rust egui desktop shell. Workspace layout:
   - `app/` — the eframe binary (`hiker`) wiring panels, vault state, and the MCP runtime
   - `egui-workbench/` — reusable IDE-style layout crate (activity bar, dockable sides, tabbed editor groups, bottom panel, status bar) built on `egui_tiles`; the desktop shell is built on top of it
-  - `editor/` — in-house editor widget (`editor-core`, `editor-view`, `editor-egui`, `editor-md`, `editor-ts`, `editor-diff`): a CodeMirror-6-class engine in Rust with tree-sitter highlighting, multi-cursor, undo tree, decorations, and markdown live preview
+  - `editor/` — in-house editor widget (`editor-core`, `editor-view`, `editor-egui`, `editor-md`, `editor-ts`, `editor-diff`): a class-leading editing engine in Rust with tree-sitter highlighting, multi-cursor, undo tree, decorations, and markdown live preview
+  - `hiker-render/` — egui-agnostic renderer umbrella: `hiker-math` (LaTeX), `hiker-mermaid` (diagrams), `hiker-wavedrom` (waveforms), `hiker-htmlview` (HTML/CSS), and `hiker-graph` (graph layout), each emitting SVG/paint data
+  - `hiker-canvas/` — canvas/whiteboard model + view; `hiker-sync/` + `hiker-git/` — pluggable file-level sync transports; `zxr/` — native-Rust Xapian/ZIM reader
+  - `hiker-llm/`, `hiker-theme/`, `hiker-features/`, `hiker-lite/` — LLM provider abstractions, theming, capability flags, and a lightweight build
   - `core/`, `mcp-server/`, `cli/` — vault, index, agent, and MCP runtime crates (rusqlite, fastembed, notify each isolated to one module)
 - **[implemented]** Per-vault settings (TOML, user + vault layered, strict load, write-back preserving comments)
 - **[implemented]** Tracing-based observability with daily-rotating file logs; chunk-boundary editor gutter

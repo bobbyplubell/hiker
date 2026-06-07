@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::vcs::SyncTransport;
+
 pub(super) const fn yes() -> bool {
     true
 }
@@ -148,15 +150,15 @@ pub struct InboxAction {
     pub add_tag: Option<String>,
 }
 
-/// `[op-log]` section. Tunables for the `core::oplog` substrate (the CRDT
+/// `[op-log]` section. Tunables for the `core::oplog` substrate (the text
 /// op log that owns every write). See `docs/op-log.md` §`[op-log]` config section.
 ///
 /// status: op-log-config-section
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpLogConfig {
-    /// GC age threshold (days) for `op_metadata.status='accepted'` rows.
-    /// The Yrs Doc content lives forever (it IS the document); only the
+    /// GC age threshold (days) for accepted `op_history` index rows.
+    /// The `.ops` history content lives forever (it IS the document); only the
     /// side-table author/timestamp data is bounded.
     #[serde(default = "default_metadata_retention_days")]
     pub metadata_retention_days: u32,
@@ -171,8 +173,9 @@ pub struct OpLogConfig {
     /// Surface-specific overrides (`[mcp.tools]`, `[llm.background]`) win.
     #[serde(default = "yes")]
     pub review_required: bool,
-    /// Yrs Doc size multiple over the materialized size that triggers
-    /// compaction on vault open.
+    /// Vestigial size multiple that once triggered compaction on vault open;
+    /// compaction is gone now that the `.ops` log is the durable representation,
+    /// but the tunable is retained so the config plumbing doesn't churn.
     #[serde(default = "default_compact_threshold")]
     pub compact_threshold: f32,
 }
@@ -217,6 +220,15 @@ pub struct SyncSection {
     /// vault never advertises or connects.
     #[serde(default = "no")]
     pub enabled: bool,
+    /// Which transport carries cross-device sync (`sync-transport-seam`):
+    /// `libp2p` (default — encrypted file blobs over the authenticated P2P /
+    /// relay channel), `git` (hiker drives, or tolerates, a git repo per
+    /// `git.md`), or `none` (local-only; `.ops` history still accrues). The
+    /// single-bidirectional rule (`sync-single-bidirectional-transport`) makes
+    /// libp2p and git-as-sync mutually exclusive — only one bidirectional
+    /// cross-device transport runs at a time.
+    #[serde(default)]
+    pub transport: SyncTransport,
     /// Topology this vault participates in (`peer` / `server` / `both`).
     #[serde(default)]
     pub mode: SyncMode,
@@ -247,6 +259,7 @@ impl Default for SyncSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            transport: SyncTransport::default(),
             mode: SyncMode::default(),
             server_url: String::new(),
             discovery: true,

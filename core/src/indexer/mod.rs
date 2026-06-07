@@ -812,7 +812,7 @@ pub(super) fn update_total_notes(status: &watch::Sender<IndexStatus>, store: &St
 }
 
 // `frontmatter_hiker_id` retired with `note-id-stamping`. Under
-// path-as-identity (`store-id-from-oplog`), `notes.id` is sourced from
+// path-as-identity (`store-path-is-identity`), `notes.id` is sourced from
 // the op-log's `doc-index.db` rather than from the note's frontmatter,
 // so the empty-`path_ids` fallback that read this helper is gone.
 

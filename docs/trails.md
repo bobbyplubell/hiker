@@ -25,7 +25,7 @@ A trail is a *trail-doc* plus a **companion folder** of *waypoint-notes* beside 
         └── scratchpad--9X4N6C.md
 ```
 
-The trail-doc lives at a user-chosen vault location (default `trails/`, configurable), and its waypoints live in the sibling `<trail>/` companion folder (`note-companion-folder` in `files.md`) — visible, indexed notes, not hidden under `.hiker/`. The waypoint-note basename is `<source-basename>--<rand6>.md` where `<rand6>` is a 6-char random alphanumeric disambiguator so two waypoints can point at the same source. Renaming or moving the trail-doc moves its companion folder in the same `move_note` transaction and rewrites the trail↔waypoint paths through the shared `wikilink-rename-rewrite` pass; the trail's identity is still its op-log `doc_id` (per `op-log-document-identity`, read from `doc-index.db`, never stamped into frontmatter), so a rename never re-mints the trail. [trail-storage-layout]
+The trail-doc lives at a user-chosen vault location (default `trails/`, configurable), and its waypoints live in the sibling `<trail>/` companion folder (`note-companion-folder` in `files.md`) — visible, indexed notes, not hidden under `.hiker/`. The waypoint-note basename is `<source-basename>--<rand6>.md` where `<rand6>` is a 6-char random alphanumeric disambiguator so two waypoints can point at the same source. The trail-doc's identity is its vault path (per `op-log-path-identity`) — no stored id, nothing stamped into frontmatter. Renaming or moving the trail-doc is an observed content-preserving move (`op-log-observed-move`): it moves the companion folder in the same `move_note` transaction and rewrites the trail↔waypoint paths through the shared `wikilink-rename-rewrite` pass, so the trail never loses identity across the rename. [trail-storage-layout]
 
 The companion folder is **flat regardless of tree depth** — side trails don't get nested directories. The trail-doc's `hiker.waypoints` frontmatter is the only source of truth for both *order* and *tree shape*; filenames are stable identifiers, not position encoders, so reordering, re-parenting, or moving waypoints between depths never renames a file. Vault mode nests the waypoints under the trail-doc by the `hiker.waypoints` tree (`vault-view.md`), preserving order and side-trail shape.
 
@@ -47,7 +47,7 @@ hiker:
 ---
 ```
 
-(The trail's identity is its `doc_id` — not in frontmatter, per Storage layout. Waypoint paths point into the companion folder and are rewritten on rename like any other reference.)
+(The trail's identity is its vault path — nothing in frontmatter, per Storage layout. Waypoint paths point into the companion folder and are rewritten on rename like any other reference.)
 
 `hiker.waypoints` is a tree: each entry is a vault-relative path to a waypoint-note and may carry its own `waypoints:` array of child entries forming a side trail. Children are themselves trees — side trails nest arbitrarily deep. A waypoint with no `waypoints:` key (or an empty array) is a leaf; the common case for v1 is a flat tree where most or all waypoints sit at the root and side trails appear only where the user has explicitly digressed. [trail-side-trail-shape]
 
@@ -188,7 +188,7 @@ A new trail comes from one of three entry points, all going through the same `cr
 - **Sidebar `+` right-click cross-type picker** — picking "New trail" from the picker (per `sidebar-new-item-button`) creates a trail regardless of current sidebar mode.
 - **MCP `trail_create` tool** — agents can create trails as part of bookkeeping their investigations (per the MCP integration section below).
 
-**Default placement.** New trails land at `<vault>/<new_trail_dir>/<name>.md`, where `new_trail_dir` is configurable. Config key `[trails] new_trail_dir = "trails/"` (default `"trails/"`, vault-scope eligible). The dir is auto-created on first trail. Setting `new_trail_dir = ""` (empty string) places trails at vault root. Users can move trail-docs anywhere in the vault later via filetree DnD — the placement is just a default; the trail-doc carries its own identity in frontmatter. [trails-default-location]
+**Default placement.** New trails land at `<vault>/<new_trail_dir>/<name>.md`, where `new_trail_dir` is configurable. Config key `[trails] new_trail_dir = "trails/"` (default `"trails/"`, vault-scope eligible). The dir is auto-created on first trail. Setting `new_trail_dir = ""` (empty string) places trails at vault root. Users can move trail-docs anywhere in the vault later via filetree DnD — the placement is just a default; the move is an observed content-preserving move (`op-log-observed-move`), and since the trail-doc's identity is its vault path the move just rewrites references, never re-mints the trail. [trails-default-location]
 
 
 ## Capturing into a trail
@@ -281,7 +281,7 @@ The search panel's per-source-type filter (`search-source-type-filter`) grows tw
 
 ## MCP integration
 
-Trails are a first-class MCP surface (read and write) so attached agents can consume curated trails as context and transcribe their investigations. All MCP writes go through `core::ops::agent_*` helpers, append `core::changes` rows tagged `author='agent:<client-id>'`, stamp `hiker.author: agent-authored`, and ride the normal op-log pending/patch-review path like any other agent write — uniform with the existing MCP write tools. `mcp-tool-toggles` lets the user disable any individual trail tool.
+Trails are a first-class MCP surface (read and write) so attached agents can consume curated trails as context and transcribe their investigations. All MCP writes go through `core::ops::agent_*` helpers, so each write appends a history frame authored `Author::Agent(<client-id>)` (per `op-log-attribution`) and rides the normal op-log pending/patch-review path like any other agent write — uniform with the existing MCP write tools. `mcp-tool-toggles` lets the user disable any individual trail tool.
 
 ### Read tools
 
@@ -291,11 +291,11 @@ Trails are a first-class MCP surface (read and write) so attached agents can con
 
 ### Write tools
 
-- **`trail_create(name)`** — create a new trail (empty waypoint list, default placement per `[trails] new_trail_dir`). Returns the new trail-doc's id and rel-path. Agent-authored trails ride the normal op-log pending/patch-review path like any other agent write. [mcp-tool-trail-create]
+- **`trail_create(name)`** — create a new trail (empty waypoint list, default placement per `[trails] new_trail_dir`). Returns the new trail-doc's vault path (its identity). Agent-authored trails ride the normal op-log pending/patch-review path like any other agent write. [mcp-tool-trail-create]
 - **`trail_append_waypoint(trail_id, source_rel, parent_waypoint_id?, annotation?)`** — append a new waypoint to a trail. Creates the waypoint-note in the trail-doc's companion folder, links to the source, and seeds the annotation with the optional `annotation` argument (omitted → empty body, the v1 capture-flow shape). When `parent_waypoint_id` is provided, the new waypoint is appended as the last child of that parent (a side-trail append); omitted → root-level append. [mcp-tool-trail-append-waypoint]
 - **`trail_remove_waypoint(trail_id, waypoint_id)`** — remove a waypoint from a trail. Symmetric to the sidebar's "Remove waypoint" verb; cascades to descendants if the target has children, per the sidebar verb's cascade rule. [mcp-tool-trail-remove-waypoint]
 
-Agent-authored trails are auditable two ways: the `hiker.author: agent-authored` stamp on the trail-doc and every waypoint-note, plus the `mcp-audit-log-mcp-calls` record of every trail tool call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` — surface `mcp-tool-call`, feature `trails_list` / `trail_get` / `trail_create` / etc., redacted-by-default body content per `[mcp.audit] log_full_input`.
+Agent-authored trails are auditable two ways: the `Author::Agent(<client-id>)` class on every history frame for the trail-doc and its waypoint-notes (per `op-log-attribution`), plus the `mcp-audit-log-mcp-calls` record of every trail tool call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` — surface `mcp-tool-call`, feature `trails_list` / `trail_get` / `trail_create` / etc., redacted-by-default body content per `[mcp.audit] log_full_input`.
 
 
 ## Out of scope (v1)

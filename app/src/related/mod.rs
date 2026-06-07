@@ -1,6 +1,6 @@
 //! Related-notes view — sidebar surface listing vector-similar notes
 //! for the active note. Migrated off `panels::related` + `panels_registry`
-//! to a real `View` rendering through the narrow `activity::Ctx` (reads
+//! to a real `View` rendering through the narrow `activity::SurfaceCtx` (reads
 //! via ctx; open-note deferred via `ctx.defer`). Surfaced by the
 //! `context` container activity (`crate::context`) alongside backlinks.
 //! [feature-related-migration]
@@ -17,10 +17,12 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::activity::{Ctx, View};
+use egui_workbench::activity::View;
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::icons;
 use crate::search::DiscoveryHit;
 use crate::state::Services;
+use hiker_core::store::service::IndexerQueryApi;
 use hiker_theme as theme;
 
 /// Per-feature UI state for the related-notes surface — a cached
@@ -58,15 +60,19 @@ impl State {
 
 /// Zero-sized `View` descriptor for related notes. State lives in
 /// `AppState::related_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`. Exposed so the `context`
+/// `ctx.state.downcast_mut::<State>()`. Exposed so the `context`
 /// container activity can list it among its `views()`.
 pub struct RelatedSidebar;
 
-impl View for RelatedSidebar {
+impl View<dyn AppCtx> for RelatedSidebar {
     fn id(&self) -> &'static str {
         "related"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         // The workbench accordion owns the section header + collapse;
         // the body is just the content. [feature-panel-single-accordion]
         ui.add_space(8.0);
@@ -74,7 +80,7 @@ impl View for RelatedSidebar {
     }
 }
 
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let Some(rel) = ctx.active_path.clone() else {
         // No active buffer; clear the cache so reopening re-fires.
         let st = ctx.state.downcast_mut::<State>().expect("related state");
@@ -169,23 +175,31 @@ fn related_label(hit: &DiscoveryHit) -> String {
 /// poisoned, query error) so the caller leaves the old cache intact and
 /// retries next frame, matching the legacy early-return behavior. Called
 /// only when the active path changes.
-/// status: store-id-from-oplog
+/// status: store-path-is-identity
 fn refresh_cache(services: &Services, path: &str) -> Option<State> {
+    let store = services.read_store.lock().ok()?;
+    query_related(&*store, path)
+}
+
+/// The pure similarity query against the indexer service. Depends only on
+/// [`IndexerQueryApi`], not on how the store is held or locked, so it can move
+/// with the feature when `related` becomes a self-contained extension.
+fn query_related(index: &dyn IndexerQueryApi, path: &str) -> Option<State> {
     let mut out = State {
         cached_for: Some(path.to_string()),
         ..State::default()
     };
-    let store = services.read_store.lock().ok()?;
-    let note_id = match store.get_note_by_path(path) {
-        Ok(Some(row)) => row.id,
+    // The note's path IS its identity (`store-path-is-identity`); the related
+    // query keys on it directly.
+    let note_path = match index.get_note_by_path(path) {
+        Ok(Some(row)) => row.path,
         Ok(None) => {
             out.cached_unindexed = true;
             return Some(out);
         }
         Err(_) => return None,
     };
-    let raw = store.related_notes(&note_id, 8).unwrap_or_default();
-    drop(store);
+    let raw = index.related_notes(&note_path, 8).unwrap_or_default();
     let hits: Vec<DiscoveryHit> = raw
         .into_iter()
         .map(|h| DiscoveryHit {

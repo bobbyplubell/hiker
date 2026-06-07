@@ -9,6 +9,7 @@ Key decisions (detailed below):
 - **Default on.** That's the editor's intended look; the toggle is `view-live-preview-toggle` in the View options menu (`editor.md`), and off shows raw markdown. [live-preview-default-on]
 - **Built on the editor's markdown parse** (the `editor-md` crate's syntax tree); no heavy rich-markdown packages. [live-preview-built-on-lang-markdown]
 - **Disabled for non-markdown buffers** (plain `.txt` mode with `txt-render-as-markdown-default` off, or future formats). [live-preview-disabled-non-md]
+- **Conflict regions render raw**, not preview-styled — a conflicted buffer (per the unified conflict surface, `sync.md` `sync-unified-conflict-surface`) shows its markers verbatim so the user resolves against the real text, not a fading-marker view. [live-preview-conflict-regions-raw]
 
 
 ## Scope: tiers

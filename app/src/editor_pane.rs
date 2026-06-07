@@ -533,7 +533,7 @@ impl AppState {
 /// `accepted`, so the save can't carry one to disk: the "saved without
 /// reviewing" failure mode is gone. After commit, the buffer's `loaded_hash` /
 /// `loaded_text` advance to the committed text so `is_dirty()` clears.
-/// Because `working` is CRDT-merged, the old disk-drift modal for user saves
+/// Because `working` is text-merged, the old disk-drift modal for user saves
 /// is superseded; external-edit reconciliation is handled separately by the
 /// watcher (`op_writes::external_edit`).
 ///
@@ -609,6 +609,14 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
             // status: sync-poke-on-commit
             if let Some(sync) = &state.vault_session.services.sync {
                 sync.notify_local_change();
+            }
+            // The git transport hooks the same save trigger: a save schedules a
+            // debounced commit-on-save (and push, integrated mode w/ remote).
+            // Mutually exclusive with the libp2p `sync` engine above.
+            // status: git-commit-on-save
+            if let Some(git) = &state.vault_session.services.git_sync {
+                use hiker_sync::seam::Transport;
+                git.notify_local_change();
             }
             state.push_toast(format!("Saved {}", rel), ToastLevel::Info);
             Ok(())

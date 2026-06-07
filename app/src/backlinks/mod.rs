@@ -1,7 +1,7 @@
 //! Backlinks view — sidebar surface listing notes whose `[[wikilink]]`
 //! resolves to the active note. Migrated off `panels::backlinks` +
 //! `panels_registry` to a real `View` rendering through the narrow
-//! `activity::Ctx` (reads via ctx; open-note deferred via `ctx.defer`).
+//! `activity::SurfaceCtx` (reads via ctx; open-note deferred via `ctx.defer`).
 //! Surfaced by the `context` container activity (`crate::context`)
 //! alongside related. [feature-backlinks-migration]
 //!
@@ -15,7 +15,8 @@ use eframe::egui;
 use hiker_core::vault::Vault;
 
 use crate::editor_pane;
-use crate::activity::{Ctx, View};
+use egui_workbench::activity::View;
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::icons;
 use hiker_theme as theme;
 
@@ -34,15 +35,19 @@ pub struct State {
 
 /// Zero-sized `View` descriptor for backlinks. State lives in
 /// `AppState::backlinks_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`. Exposed so the `context`
+/// `ctx.state.downcast_mut::<State>()`. Exposed so the `context`
 /// container activity can list it among its `views()`.
 pub struct BacklinksSidebar;
 
-impl View for BacklinksSidebar {
+impl View<dyn AppCtx> for BacklinksSidebar {
     fn id(&self) -> &'static str {
         "backlinks"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         // The workbench accordion owns the section header + collapse;
         // the body is just the content. [feature-panel-single-accordion]
         ui.add_space(8.0);
@@ -50,7 +55,7 @@ impl View for BacklinksSidebar {
     }
 }
 
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let Some(active) = ctx.active_path.clone() else {
         ui.label(
             egui::RichText::new("(open a note to see backlinks)")

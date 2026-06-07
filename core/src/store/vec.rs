@@ -31,11 +31,13 @@ pub fn knn_chunks_on(
     // Pull a wider candidate set than top_k since we filter post-hoc; vec0
     // doesn't support arbitrary WHERE filters in the MATCH clause.
     let candidate_k = top_k.saturating_mul(4).max(top_k + 16);
+    // status: store-path-is-identity — chunks key on `note_path`, the note's
+    // identity; the vec-join key is `chunk_vecs.chunk_id = "<note_path>:<idx>"`.
     let mut stmt = conn.prepare(
-        "SELECT v.chunk_id, c.note_id, n.path, c.heading_path, c.text, v.distance
+        "SELECT v.chunk_id, c.note_path, n.path, c.heading_path, c.text, v.distance
          FROM chunk_vecs v
          JOIN chunks c ON c.id = v.chunk_id
-         JOIN notes n ON n.id = c.note_id
+         JOIN notes n ON n.path = c.note_path
          WHERE v.embedding MATCH ?1 AND k = ?2
          ORDER BY v.distance",
     )?;

@@ -10,6 +10,7 @@ use std::sync::Once;
 
 use rusqlite::{params, Connection};
 
+pub mod service;
 pub mod error;
 pub mod dto;
 pub mod vec;
@@ -76,12 +77,9 @@ use vec::read_chunk_vecs_dim;
 /// re-insert), cleared on board-doc delete. See `docs/kanban.md`
 /// §"Indexer integration" — `board-cards-derived-table`.
 ///
-/// v10 dropped the `path_ids` table. Under path-as-identity
-/// (`wikilink-path-form`), the path↔doc_id mapping lives in op-log's
-/// `doc-index.db` (`op-log-document-identity`) — the indexer reads each
-/// note's `doc_id` from there on upsert and uses it as `notes.id`, so the
-/// indexer no longer needs its own parallel mapping. See `docs/index.md`
-/// §"Store: sqlite-vec" — `store-id-from-oplog`.
+/// v10 dropped the `path_ids` table. The indexer no longer needs its own
+/// parallel path↔id mapping; the note's path is its key. See `docs/index.md`
+/// §"Store: sqlite-vec" — `store-path-is-identity`.
 ///
 /// v11 dropped the dead `trail_waypoints.source_id` and
 /// `board_cards.card_note_id` columns (+ their indexes). Under path-as-identity
@@ -89,7 +87,16 @@ use vec::read_chunk_vecs_dim;
 /// `boards_containing_note`) key purely on the note's rel-path; the parallel
 /// ULID columns were populated by the indexer but never queried by production
 /// callers, so they're gone.
-pub const SCHEMA_VERSION: i32 = 11;
+///
+/// v12 made the note's vault path its identity (`op-log-path-identity`):
+/// `notes.id` (the minted ULID / op-log doc_id) is dropped — `notes.path` is
+/// now the primary key. `chunks.note_id` becomes `chunks.note_path`
+/// (FK → `notes(path)` ON DELETE/UPDATE CASCADE), and the vec-join key
+/// `chunk_vecs.chunk_id` is `"<note_path>:<idx>"`. The derived-table key
+/// columns (`note_meta.note_id`, `trail_waypoints.{waypoint_id,trail_id}`,
+/// `board_cards.board_id`) now carry vault paths rather than ULIDs — same
+/// shape, path-valued. There is no `doc-index.db` and no separate document id.
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Default embedding dimension — matches the v1 default model
 /// (`bge-small-en-v1.5`). Used as the initial `chunk_vecs` column width on
@@ -144,8 +151,7 @@ impl Store {
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS notes (
-                id               TEXT PRIMARY KEY,
-                path             TEXT NOT NULL UNIQUE,
+                path             TEXT PRIMARY KEY,
                 content_hash     TEXT NOT NULL,
                 mtime            INTEGER NOT NULL,
                 size             INTEGER NOT NULL,
@@ -163,30 +169,34 @@ impl Store {
                 note_embedding   BLOB
             );
 
+            -- status: store-path-is-identity
+            -- A note's identity is its vault path (`op-log-path-identity`):
+            -- `chunks.note_path` is the FK to `notes(path)`, cascading on
+            -- delete AND update so a rename (a `notes.path` UPDATE) re-keys the
+            -- chunks with the note. The vec-join key `chunk_vecs.chunk_id` is
+            -- `"<note_path>:<idx>"`; chunks.id holds that same string.
             CREATE TABLE IF NOT EXISTS chunks (
                 id           TEXT PRIMARY KEY,
-                note_id      TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                note_path    TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE ON UPDATE CASCADE,
                 chunk_index  INTEGER NOT NULL,
                 byte_start   INTEGER NOT NULL,
                 byte_end     INTEGER NOT NULL,
                 text         TEXT NOT NULL,
                 heading_path TEXT,
-                UNIQUE(note_id, chunk_index)
+                UNIQUE(note_path, chunk_index)
             );
 
-            CREATE INDEX IF NOT EXISTS chunks_note_id ON chunks(note_id);
+            CREATE INDEX IF NOT EXISTS chunks_note_path ON chunks(note_path);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vecs USING vec0(
                 chunk_id  TEXT PRIMARY KEY,
                 embedding float[{dim}]
             );
 
-            -- status: store-id-from-oplog
-            -- The legacy `path_ids` table is gone in v10. The authoritative
-            -- path → doc_id mapping lives in op-log's `doc-index.db`; the
-            -- indexer reads it via `oplog::doc_id_for_path` on upsert and
-            -- uses the value as `notes.id`. The `notes.path UNIQUE` index
-            -- already gives us path-keyed lookup; basename queries (for the
+            -- status: store-path-is-identity
+            -- The note's vault path is its identity — `notes.path` is the
+            -- primary key, there is no minted id and no `doc-index.db`. The PK
+            -- already gives path-keyed lookup; basename queries (for the
             -- wikilink ambiguity resolver) read `notes.path` directly.
             CREATE INDEX IF NOT EXISTS notes_path_basename
               ON notes(path);

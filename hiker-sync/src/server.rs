@@ -6,9 +6,9 @@
 //! The server never holds the vault content key, so it cannot decrypt. It
 //! degrades to the only thing it can do on ciphertext: an **append-only
 //! encrypted-blob log per document, keyed by blind id, with a per-device
-//! cursor** (store-and-forward). Clients push sequenced encrypted update blobs;
-//! a device pulls everything past its cursor, decrypts, and lets Yrs merge.
-//! All CRDT logic stays on the client. The hub only moves opaque
+//! cursor** (store-and-forward). Clients push sequenced encrypted text blobs;
+//! a device pulls everything past its cursor, decrypts, and text-merges.
+//! All merge logic stays on the client. The hub only moves opaque
 //! `(blind_id, seq, ciphertext)` triples — never a key, a path, or plaintext.
 //! [sync-zero-knowledge-server, sync-blind-id]
 
@@ -48,7 +48,7 @@ pub trait BlobStore {
     /// Record that `device` has caught up to `seq` for `blind_id` (per-device
     /// store-and-forward cursor). The default is a no-op — only a persistent
     /// store ([`FileBlobStore`]) needs to survive cursors across restarts; an
-    /// in-memory store re-pulls from a live client's own cursor and Yrs merges
+    /// in-memory store re-pulls from a live client's own cursor and text-merges
     /// the redundancy idempotently. [sync-zero-knowledge-server]
     fn set_cursor(&self, _device: &str, _blind_id: &str, _seq: u64) -> Result<(), Error> {
         Ok(())
@@ -578,7 +578,7 @@ impl<S: BlobStore> Hub<S> {
                 let latest = self.store.latest_seq(&blind_id).unwrap_or(seq);
                 // Record the pushing device's cursor so it doesn't re-pull its
                 // own blob (best-effort; a failed write just means a redundant
-                // pull later, which Yrs merges idempotently).
+                // pull later, which the text merge handles idempotently).
                 let _ = self.record_cursor(peer, &blind_id, latest);
                 Message::PushAck {
                     blind_id,

@@ -13,7 +13,10 @@
 //!
 //! status: widget-render-pipeline
 
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use hiker_math::{MathOptions, MathRender, MathStyle, render_latex_with_preamble};
 use hiker_mermaid::{
@@ -62,6 +65,65 @@ impl MathKind {
     }
 }
 
+/// Process-wide in-memory render cache, above the disk cache. Keyed on the
+/// render's `content_hash` (per [`Domain`]), it holds the already-rasterized
+/// [`RenderedWidget`] (and, for mermaid, its interaction regions) so a layer
+/// rebuild — which now emits the WHOLE document, not just the viewport — costs a
+/// hash + map lookup + memcpy per diagram instead of a PNG decode (or a mermaid
+/// re-parse). That's what makes whole-document emission cheap enough to run on
+/// every keystroke / cursor move, which in turn lets the decoration layer drop
+/// its viewport key and stop churning `geometry_epoch` on pure scroll
+/// (`widget-render-cache`).
+///
+/// Bounded by entry count with FIFO eviction; the disk cache (and a live
+/// re-render) backs any miss, so eviction only ever costs a recompute, never
+/// correctness.
+struct MemCache {
+    widgets: HashMap<(Domain, u64), RenderedWidget>,
+    regions: HashMap<u64, Vec<DiagramRegion>>,
+    order: VecDeque<(Domain, u64)>,
+}
+
+/// Max distinct rendered diagrams held in memory. A vault note tops out well
+/// below this; the cap is a runaway guard, not a tuning knob.
+const MEM_CACHE_CAP: usize = 512;
+
+impl MemCache {
+    fn get_widget(&self, domain: Domain, hash: u64) -> Option<RenderedWidget> {
+        self.widgets.get(&(domain, hash)).cloned()
+    }
+
+    fn put_widget(&mut self, domain: Domain, rendered: &RenderedWidget) {
+        let key = (domain, rendered.content_hash);
+        if self.widgets.insert(key, rendered.clone()).is_none() {
+            self.order.push_back(key);
+            self.evict();
+        }
+    }
+
+    fn evict(&mut self) {
+        while self.order.len() > MEM_CACHE_CAP {
+            if let Some(key) = self.order.pop_front() {
+                self.widgets.remove(&key);
+                if key.0 == Domain::Mermaid {
+                    self.regions.remove(&key.1);
+                }
+            }
+        }
+    }
+}
+
+fn mem_cache() -> &'static Mutex<MemCache> {
+    static CACHE: OnceLock<Mutex<MemCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(MemCache {
+            widgets: HashMap::new(),
+            regions: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
 /// Guard against a pathological SVG viewBox or `dpr` blowing up memory — the
 /// same cap `hiker-htmlview` uses for its inline diagrams. `pub(crate)` so the
 /// reusable preview-thumbnail renderer (`widgets::preview`) shares this cap
@@ -89,7 +151,12 @@ pub fn render_math(
     // the hash folds in every input that affects the pixels, so a hit is the
     // exact render we'd have produced (`widget-render-disk-cache`).
     let content_hash = hash_math(src, kind, font_px, dpr, fg, preamble);
+    // In-memory cache first (cheap on a whole-doc rebuild), then disk.
+    if let Some(hit) = mem_cache().lock().unwrap().get_widget(Domain::Math, content_hash) {
+        return Some(hit);
+    }
     if let Some(hit) = cache.and_then(|c| c.load(Domain::Math, content_hash)) {
+        mem_cache().lock().unwrap().put_widget(Domain::Math, &hit);
         return Some(hit);
     }
 
@@ -124,6 +191,7 @@ pub fn render_math(
     if let Some(c) = cache {
         c.store(Domain::Math, &rendered);
     }
+    mem_cache().lock().unwrap().put_widget(Domain::Math, &rendered);
     Some(rendered)
 }
 
@@ -140,7 +208,11 @@ pub fn render_mermaid(
     cache: Option<&DiagramCacheCtx>,
 ) -> Option<RenderedWidget> {
     let content_hash = hash_mermaid(src, font_px, dpr, colors);
+    if let Some(hit) = mem_cache().lock().unwrap().get_widget(Domain::Mermaid, content_hash) {
+        return Some(hit);
+    }
     if let Some(hit) = cache.and_then(|c| c.load(Domain::Mermaid, content_hash)) {
+        mem_cache().lock().unwrap().put_widget(Domain::Mermaid, &hit);
         return Some(hit);
     }
 
@@ -164,6 +236,7 @@ pub fn render_mermaid(
     if let Some(c) = cache {
         c.store(Domain::Mermaid, &out);
     }
+    mem_cache().lock().unwrap().put_widget(Domain::Mermaid, &out);
     Some(out)
 }
 
@@ -181,7 +254,11 @@ pub fn render_wavedrom(
     cache: Option<&DiagramCacheCtx>,
 ) -> Option<RenderedWidget> {
     let content_hash = hash_wavedrom(src, font_px, dpr, colors);
+    if let Some(hit) = mem_cache().lock().unwrap().get_widget(Domain::WaveDrom, content_hash) {
+        return Some(hit);
+    }
     if let Some(hit) = cache.and_then(|c| c.load(Domain::WaveDrom, content_hash)) {
+        mem_cache().lock().unwrap().put_widget(Domain::WaveDrom, &hit);
         return Some(hit);
     }
 
@@ -206,6 +283,7 @@ pub fn render_wavedrom(
     if let Some(c) = cache {
         c.store(Domain::WaveDrom, &out);
     }
+    mem_cache().lock().unwrap().put_widget(Domain::WaveDrom, &out);
     Some(out)
 }
 
@@ -248,27 +326,46 @@ pub fn render_mermaid_with_regions(
     colors: MermaidColors,
     cache: Option<&DiagramCacheCtx>,
 ) -> Option<(RenderedWidget, Vec<DiagramRegion>)> {
-    // The mermaid parse/layout is cheap relative to the resvg blit, and it
-    // also yields the interaction regions (which the disk cache doesn't store).
-    // So always run the layout, but let a disk-cache hit skip the rasterize.
+    // The pixel hash is a pure function of the inputs (no parse needed), so an
+    // in-memory hit returns the rendered widget AND its regions without parsing
+    // or rasterizing — the case that makes a whole-doc rebuild cheap.
+    let content_hash = hash_mermaid(src, font_px, dpr, colors);
+    {
+        let mc = mem_cache().lock().unwrap();
+        if let (Some(widget), Some(regions)) =
+            (mc.get_widget(Domain::Mermaid, content_hash), mc.regions.get(&content_hash).cloned())
+        {
+            return Some((widget, regions));
+        }
+    }
+
+    // Cache miss: run the parse/layout, which yields the interaction regions
+    // (the disk cache doesn't store them). A disk-cache hit still skips the
+    // rasterize.
     let MermaidLayout { svg, content_hash, regions } =
         mermaid_layout(src, font_px, dpr, colors)?;
 
-    if let Some(hit) = cache.and_then(|c| c.load(Domain::Mermaid, content_hash)) {
-        return Some((hit, regions));
-    }
-
-    let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
-    let rendered = RenderedWidget {
-        rgba,
-        width,
-        height,
-        // Block widget: no baseline alignment.
-        baseline: None,
-        content_hash,
+    let rendered = if let Some(hit) = cache.and_then(|c| c.load(Domain::Mermaid, content_hash)) {
+        hit
+    } else {
+        let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
+        let rendered = RenderedWidget {
+            rgba,
+            width,
+            height,
+            // Block widget: no baseline alignment.
+            baseline: None,
+            content_hash,
+        };
+        if let Some(c) = cache {
+            c.store(Domain::Mermaid, &rendered);
+        }
+        rendered
     };
-    if let Some(c) = cache {
-        c.store(Domain::Mermaid, &rendered);
+    {
+        let mut mc = mem_cache().lock().unwrap();
+        mc.put_widget(Domain::Mermaid, &rendered);
+        mc.regions.insert(content_hash, regions.clone());
     }
     Some((rendered, regions))
 }
@@ -350,6 +447,11 @@ fn normalize_regions(hits: &[HitRegion], width_px: f32, height_px: f32) -> Vec<D
 pub struct MermaidColors {
     /// Canvas background (alpha 0 → transparent).
     pub background: [u8; 4],
+    /// Opaque surface color behind edge/relationship labels and hollow markers
+    /// (mermaid's `edgeLabelBackground`). The canvas is transparent so the
+    /// diagram blends with the editor, but labels need an opaque backing to read
+    /// over the edge lines — this is the editor surface color.
+    pub edge_label_bg: [u8; 4],
     /// Node fill / stroke.
     pub node_fill: [u8; 4],
     pub node_stroke: [u8; 4],
@@ -362,6 +464,7 @@ pub struct MermaidColors {
 impl MermaidColors {
     const fn apply(self, opts: &mut MermaidOptions) {
         opts.background = self.background;
+        opts.edge_label_bg = self.edge_label_bg;
         opts.node_fill = self.node_fill;
         opts.node_stroke = self.node_stroke;
         opts.edge_stroke = self.edge_stroke;
@@ -538,6 +641,7 @@ mod tests {
     fn mermaid_colors() -> MermaidColors {
         MermaidColors {
             background: [0, 0, 0, 0],
+            edge_label_bg: [30, 30, 40, 255],
             node_fill: [40, 40, 60, 255],
             node_stroke: [120, 110, 200, 255],
             edge_stroke: [200, 200, 200, 255],

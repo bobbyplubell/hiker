@@ -15,7 +15,7 @@ use crate::chunker::txt::Txt;
 use crate::embed::{Embedder, Error as EmbedError, FastembedEmbedder};
 use crate::hash_string;
 use crate::oplog::OpLog;
-use crate::store::dto::{new_id, MetaEntry, NoteUpsert};
+use crate::store::dto::{MetaEntry, NoteUpsert};
 use crate::store::Store;
 use crate::watcher::is_ignored;
 
@@ -55,7 +55,7 @@ pub(super) struct UpsertCtx<'a> {
     /// `op-log-bootstraps-first`, this is populated before the indexer
     /// processes any jobs in the steady state, so handlers read it via
     /// `oplog_cell.get()` to translate vault paths to `doc_id` for
-    /// `notes.id`. status: store-id-from-oplog
+    /// `notes.id`. status: store-path-is-identity
     pub oplog_cell: &'a Arc<OnceCell<Arc<OpLog>>>,
 }
 
@@ -133,7 +133,7 @@ impl<'a> JobCtx<'a> {
         let status = self.status;
         let self_tx = self.self_tx;
         let watcher_cell = self.watcher_cell;
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         // Rename targets the `notes.path UNIQUE` row directly. False means
         // the source path was never indexed; treat the destination as a
         // fresh upsert. The op-log's `doc-index.db` rename happens through
@@ -193,7 +193,7 @@ impl<'a> UpsertCtx<'a> {
         match crate::vault::restore_note(vault, None, &trash, id) {
             Ok(entry) => {
                 // History-preserving restore: when the trashed entry references
-                // an op-log `doc_id` (a tracked note whose Yrs history was
+                // an op-log `doc_id` (a tracked note whose `.ops` history was
                 // retained, not purged, on delete), rebind `path → doc_id` to
                 // that retained doc and clear its tombstone so the document
                 // comes back with its full change history rather than as a
@@ -207,7 +207,7 @@ impl<'a> UpsertCtx<'a> {
                 // (which the caller suppressed). For folders, walk
                 // the manifest's recorded members; for files, just the
                 // single original_path. Because `notes.id` == the op-log
-                // `doc_id` (`store-id-from-oplog`), re-ingest reattaches
+                // `doc_id` (`store-path-is-identity`), re-ingest reattaches
                 // fresh chunks/embeddings under the rebound identity.
                 let to_index: Vec<String> = match &entry.members {
                     Some(m) => m.clone(),
@@ -758,34 +758,6 @@ enum UpsertOutcome {
     Skipped(String),
 }
 
-/// Read the document's `doc_id` from the op-log's `doc-index.db` for
-/// `rel_path`. Op-log bootstraps before the indexer (per
-/// `op-log-bootstraps-first`), so every path the indexer sees has a row
-/// here in the steady state. Two fallbacks for paths that haven't been
-/// seeded yet:
-///
-///   1. The indexer's own `notes.id` row, when the path was upserted in a
-///      previous run — keeps the id stable across re-indexes when an
-///      op-log isn't attached (CLI / test paths).
-///   2. A fresh ULID, only when no other source has one — first ingest of
-///      a brand-new file.
-///
-/// status: store-id-from-oplog
-fn resolve_doc_id(oplog: Option<&OpLog>, store: &Store, rel_path: &str) -> String {
-    if let Some(log) = oplog {
-        match log.doc_id_for_path(rel_path) {
-            Ok(Some(id)) => return id,
-            Ok(None) => {} // fall through
-            Err(e) => tracing::warn!(error = %e, path = %rel_path,
-                "indexer: doc_id_for_path lookup failed; trying store"),
-        }
-    }
-    if let Ok(Some(row)) = store.get_note_by_path(rel_path) {
-        return row.id;
-    }
-    new_id()
-}
-
 /// Flatten a note's frontmatter into `note_meta` write entries. Empty when
 /// the file has no (well-formed) frontmatter. status: store-note-metadata-index
 fn note_metadata_entries(contents: &str) -> Vec<MetaEntry> {
@@ -846,8 +818,7 @@ async fn process_upsert(
         // (per index.md `cmd-file-index-state`). Reason string is the
         // exact human-readable text the tooltip / status bar will display.
         let reason = "file too large";
-        let id = resolve_doc_id(oplog, store, rel_path);
-        store.upsert_skipped(&id, rel_path, reason, mtime, size as i64)?;
+        store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
         return Ok(UpsertOutcome::Skipped(reason.into()));
     }
     let bytes = tokio::fs::read(&abs).await?;
@@ -855,8 +826,7 @@ async fn process_upsert(
         Ok(s) => s,
         Err(_) => {
             let reason = "not UTF-8";
-            let id = resolve_doc_id(oplog, store, rel_path);
-            store.upsert_skipped(&id, rel_path, reason, mtime, size as i64)?;
+            store.upsert_skipped(rel_path, reason, mtime, size as i64)?;
             return Ok(UpsertOutcome::Skipped(reason.into()));
         }
     };
@@ -877,11 +847,9 @@ async fn process_upsert(
     if chunks.is_empty() {
         // Empty note: still record the row so deletes/renames work, but no
         // embeddings to insert.
-        // status: store-id-from-oplog
-        let id = resolve_doc_id(oplog, store, rel_path);
+        // status: store-path-is-identity
         let indexed_at = super::now_secs();
         store.upsert_note(&NoteUpsert {
-            id: &id,
             path: rel_path,
             content_hash: &content_hash,
             mtime,
@@ -893,8 +861,8 @@ async fn process_upsert(
         // status: store-note-metadata-index
         // Re-derive the metadata index even for empty-body notes: their
         // frontmatter (tags, lifecycle, author) is the whole point of a
-        // metadata-only note.
-        store.replace_note_metadata(&id, &note_metadata_entries(&contents))?;
+        // metadata-only note. The note's path is its `note_meta` key.
+        store.replace_note_metadata(rel_path, &note_metadata_entries(&contents))?;
         // status: trail-waypoints-derived-table
         // Also re-derive on the empty-body branch — waypoint-notes
         // intentionally have empty bodies (`trail-empty-waypoint-body`),
@@ -905,8 +873,7 @@ async fn process_upsert(
         return Ok(UpsertOutcome::Indexed);
     }
 
-    // status: store-id-from-oplog
-    let id = resolve_doc_id(oplog, store, rel_path);
+    // status: store-path-is-identity
     let indexed_at = super::now_secs();
 
     // status: trail-waypoints-derived-table
@@ -956,7 +923,6 @@ async fn process_upsert(
 
     let zipped: Vec<_> = chunks.into_iter().zip(embeddings).collect();
     store.upsert_note(&NoteUpsert {
-        id: &id,
         path: rel_path,
         content_hash: &content_hash,
         mtime,
@@ -965,7 +931,7 @@ async fn process_upsert(
         embedder_version: embedder.version(),
         chunks: zipped,
     })?;
-    store.replace_note_metadata(&id, &meta_entries)?;
+    store.replace_note_metadata(rel_path, &meta_entries)?;
 
     Ok(UpsertOutcome::Indexed)
 }
@@ -1040,7 +1006,7 @@ impl<'a> WaypointIngest<'a> {
                 return;
             }
         };
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         // Trail id is the op-log's `doc_id` for `fm.in_trail` (the
         // waypoint-note's parent trail-doc path). The source note is
         // referenced by path only (path-as-identity).
@@ -1088,7 +1054,7 @@ impl<'a> WaypointIngest<'a> {
         use crate::store::dto::WaypointRow;
         use crate::trails::{parse_trail_doc_for, walk_waypoints_depth_first};
         let Ok(fm) = parse_trail_doc_for(self.rel_path, self.contents) else { return };
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         // The trail's id is the op-log's `doc_id` for the trail-doc's
         // path; absent (oplog not seeded yet) is a soft no-op so the
         // next ingest re-derives once the cell is populated.
@@ -1120,7 +1086,7 @@ impl<'a> WaypointIngest<'a> {
                 .get(&entry.path)
                 .cloned()
                 .unwrap_or_default();
-            // status: store-id-from-oplog
+            // status: store-path-is-identity
             // Waypoint id / parent waypoint id are the op-log doc_ids
             // for each waypoint-note path. Both default to empty when
             // the lookup misses — the rows still wire correctly via
@@ -1172,7 +1138,7 @@ fn update_board_cards_if_relevant(
         return;
     }
     let Ok(board) = parse_board_for(rel_path, contents) else { return };
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     // The board's storage key is the op-log's `doc_id` for the
     // board-doc's path; absent (oplog not seeded yet) is a soft no-op so
     // the next ingest re-derives once the cell is populated.
@@ -1278,7 +1244,7 @@ fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, Error> {
             "indexer: delete_board_cards_by_board_path failed",
         );
     }
-    // status: store-id-from-oplog / ingest-delete-cascade
+    // status: store-path-is-identity / ingest-delete-cascade
     Ok(store.delete_note_by_path(rel_path)?)
 }
 

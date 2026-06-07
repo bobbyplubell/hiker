@@ -190,8 +190,8 @@ impl BufCtx<'_> {
 /// exempt from `clippy::single_call_fn`.
 impl AppState {
     /// Per-hunk Accept: flip every pending op contributing to the hunk to
-    /// `Accepted` via `op_writes::flip_op_status`, which applies the op's Yrs
-    /// update to `accepted` *and* `working` and atomically rewrites the `.md`.
+    /// `Accepted` via `op_writes::flip_op_status`, which applies the op's text
+    /// edit to `accepted` *and* `working` and atomically rewrites the `.md`.
     /// No reload from disk: the next frame's editor binding picks up the new
     /// `materialize_review` (with the op now folded into `accepted`/`working`
     /// and dropped from the pending queue) via its reverse step, with the

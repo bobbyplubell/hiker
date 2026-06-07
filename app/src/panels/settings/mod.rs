@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 
 use hiker_core::config::{Config, SettingsScope};
+use hiker_core::config::vcs::{GitMode, SyncTransport};
 use hiker_core::config::sections::{RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
@@ -158,6 +159,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                 ctx.acp_section();
                 ctx.trails_section();
                 ctx.sync_section();
+                ctx.git_section();
                 ctx.suggestions_section();
             }
 
@@ -350,7 +352,7 @@ fn indexing_section(&mut self) {
             help(ui, "Changing the model re-embeds the entire vault on next index pass.");
 
             // Note-ID-stamping setting retired with `note-id-stamping` —
-            // under path-as-identity (`store-id-from-oplog`), notes are
+            // under path-as-identity (`store-path-is-identity`), notes are
             // addressed by their vault path and the op-log keeps an
             // internal `path → doc_id` map. There's nothing to stamp.
         });
@@ -686,9 +688,24 @@ fn sync_section(&mut self) {
         .show(ui, |ui| {
             let s = &snap.sync;
             bool_row(ui, app, st, "Enabled", "sync.enabled", s.enabled);
+            // status: sync-transport-seam
             enum_combo(
                 ui, app, st,
-                "Mode",
+                "Transport",
+                "sync.transport",
+                s.transport,
+                &[
+                    (SyncTransport::Libp2p, "libp2p (P2P file blobs)", "libp2p"),
+                    (SyncTransport::Git, "git (commit + push/pull)", "git"),
+                    (SyncTransport::None, "None (local only)", "none"),
+                ],
+            );
+            // libp2p-only rows. They still serialize for git/none, but the
+            // active engine ignores them — keep them visible so a user
+            // switching transports doesn't lose their values.
+            enum_combo(
+                ui, app, st,
+                "Mode (libp2p)",
                 "sync.mode",
                 s.mode,
                 &[
@@ -697,8 +714,8 @@ fn sync_section(&mut self) {
                     (SyncMode::Both, "Both", "both"),
                 ],
             );
-            string_row(ui, app, st, "Server URL", "sync.server_url", &s.server_url);
-            bool_row(ui, app, st, "Discovery", "sync.discovery", s.discovery);
+            string_row(ui, app, st, "Server URL (libp2p)", "sync.server_url", &s.server_url);
+            bool_row(ui, app, st, "Discovery (libp2p)", "sync.discovery", s.discovery);
 
             // Enrolled devices are read-only here — enrollment (the
             // fingerprint swap) happens on the Sync page, not in settings.
@@ -721,6 +738,62 @@ fn sync_section(&mut self) {
             help(
                 ui,
                 "Secrets (device key + per-vault content key) live in user scope and never travel with the synced vault.",
+            );
+        });
+}
+
+// status: git-config-section
+fn git_section(&mut self) {
+    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
+    if matches!(st.scope, Scope::User) {
+        // [git] is per-vault, like [sync].
+        egui::CollapsingHeader::new("Git transport")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Git transport settings live in vault scope.")
+                        .color(theme::muted())
+                        .small(),
+                );
+            });
+        return;
+    }
+    egui::CollapsingHeader::new("Git transport")
+        .default_open(false)
+        .show(ui, |ui| {
+            let g = &snap.git;
+            help(
+                ui,
+                "Active only when Sync transport is set to git. The .md files are canonical; .hiker/ is gitignored.",
+            );
+            enum_combo(
+                ui, app, st,
+                "Mode",
+                "git.mode",
+                g.mode,
+                &[
+                    (GitMode::Integrated, "Integrated (hiker drives)", "integrated"),
+                    (GitMode::Manual, "Manual (you drive git)", "manual"),
+                ],
+            );
+            string_row(ui, app, st, "Remote (push/pull URL)", "git.remote", &g.remote);
+            help(ui, "Empty remote = commit-only local versioning (no push/pull).");
+            bool_row(ui, app, st, "Commit on save", "git.auto_commit", g.auto_commit);
+            int_row(
+                ui, app, st,
+                "Commit debounce (ms)",
+                "git.commit_debounce_ms",
+                &IntField { current: u64::from(g.commit_debounce_ms), min: 0, max: u32::MAX as u64 },
+            );
+            int_row(
+                ui, app, st,
+                "git gc interval (days)",
+                "git.gc_interval_days",
+                &IntField { current: u64::from(g.gc_interval_days), min: 0, max: u32::MAX as u64 },
+            );
+            help(
+                ui,
+                "Credentials come from your git credential helper / SSH agent — never stored by hiker.",
             );
         });
 }

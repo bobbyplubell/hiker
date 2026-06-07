@@ -799,7 +799,7 @@ impl AppState {
 
     /// Accept a pending whole-file proposal: flip the op to `accepted` via the
     /// op log (`op_writes::flip_op_status` → `OpLog::accept_pending`), which
-    /// applies its Yrs update to `accepted` and atomically rewrites the `.md`.
+    /// applies its text edit to `accepted` and atomically rewrites the `.md`.
     /// `proposal_id` is the pending op id; `target_path` the note it targets.
     /// On success, navigate to the target as a preview tab per
     /// `staging-accept-navigates-to-preview`.

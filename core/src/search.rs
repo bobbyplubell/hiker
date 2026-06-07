@@ -235,13 +235,13 @@ impl<'a> LexicalEngine for Fts5LexicalEngine<'a> {
         // `case_sensitive` / `diacritic_sensitive` can run against the raw
         // chunk body rather than the highlighted snippet.
         let sql = format!(
-            "SELECT c.id AS chunk_id, c.note_id, n.path, c.chunk_index, c.heading_path,
+            "SELECT c.id AS chunk_id, c.note_path AS note_id, n.path, c.chunk_index, c.heading_path,
                     snippet(chunks_fts, 0, '<mark>', '</mark>', '…', {win}) AS snip,
                     c.text AS chunk_text,
                     bm25(chunks_fts) AS score
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
-             JOIN notes  n ON n.id    = c.note_id
+             JOIN notes  n ON n.path  = c.note_path
              WHERE chunks_fts MATCH ?1
                AND n.skipped = 0
              ORDER BY score
@@ -502,8 +502,10 @@ pub fn query(
                             }
                             placeholders.push('?');
                         }
+                        // status: store-path-is-identity — `h.note_id` carries
+                        // the note's path, the `notes` PK.
                         let sql = format!(
-                            "SELECT id, mtime FROM notes WHERE id IN ({placeholders})"
+                            "SELECT path, mtime FROM notes WHERE path IN ({placeholders})"
                         );
                         let mut stmt = conn.prepare(&sql)?;
                         let params_iter: Vec<&dyn rusqlite::ToSql> = hits
@@ -644,7 +646,7 @@ pub fn pick_bucket(
 mod tests {
     use super::*;
     use crate::chunker::Chunk;
-    use crate::store::dto::{new_id, NoteUpsert};
+    use crate::store::dto::NoteUpsert;
     use tempfile::tempdir;
 
     fn unit_vec(seed: f32) -> Vec<f32> {
@@ -670,10 +672,10 @@ mod tests {
     #[test]
     fn fts5_finds_lexical_match_and_renders_mark() {
         let (_dir, mut store) = fresh_store();
-        let id = new_id();
+        // Under path-as-identity the hit's `note_id` is the note's path.
+        let id = "alpha.md";
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path: "alpha.md",
                 content_hash: "h",
                 mtime: 1,
@@ -699,10 +701,8 @@ mod tests {
     #[test]
     fn fts5_groups_by_note_keeping_best_chunk() {
         let (_dir, mut store) = fresh_store();
-        let id = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path: "a.md",
                 content_hash: "h",
                 mtime: 1,
@@ -726,15 +726,13 @@ mod tests {
     fn fts5_excludes_skipped_notes() {
         let (_dir, mut store) = fresh_store();
         store
-            .upsert_skipped(&new_id(), "big.md", "file too large", 1, 1)
+            .upsert_skipped("big.md", "file too large", 1, 1)
             .unwrap();
 
         // Indexed counterpart so the test confirms the skipped one is the
         // only thing being filtered, not "everything is empty."
-        let id_ok = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id_ok,
                 path: "ok.md",
                 content_hash: "h",
                 mtime: 1,
@@ -755,11 +753,10 @@ mod tests {
     #[test]
     fn semantic_engine_returns_note_hits() {
         let (_dir, mut store) = fresh_store();
-        let id_a = new_id();
-        let id_b = new_id();
+        // Under path-as-identity the hit's `note_id` is the note's path.
+        let id_a = "a.md";
         store
             .upsert_note(&NoteUpsert {
-                id: &id_a,
                 path: "a.md",
                 content_hash: "h",
                 mtime: 1,
@@ -771,7 +768,6 @@ mod tests {
             .unwrap();
         store
             .upsert_note(&NoteUpsert {
-                id: &id_b,
                 path: "b.md",
                 content_hash: "h",
                 mtime: 1,
@@ -799,14 +795,14 @@ mod tests {
         // - n4 appears only in semantic.
         // RRF should push n1 and n3 above n2 and n4 in the fused output.
         let (_dir, mut store) = fresh_store();
-        let id_n1 = "n1".to_string();
-        let id_n2 = "n2".to_string();
-        let id_n3 = "n3".to_string();
-        let id_n4 = "n4".to_string();
+        // Under path-as-identity the fused hit's `note_id` is the note's path.
+        let id_n1 = "n1.md".to_string();
+        let id_n2 = "n2.md".to_string();
+        let id_n3 = "n3.md".to_string();
+        let id_n4 = "n4.md".to_string();
         // n1: strong lexical AND near-query embedding.
         store
             .upsert_note(&NoteUpsert {
-                id: &id_n1,
                 path: "n1.md",
                 content_hash: "h",
                 mtime: 1,
@@ -822,7 +818,6 @@ mod tests {
         // n2: lexical only (no semantic relevance — far embedding).
         store
             .upsert_note(&NoteUpsert {
-                id: &id_n2,
                 path: "n2.md",
                 content_hash: "h",
                 mtime: 1,
@@ -835,7 +830,6 @@ mod tests {
         // n3: weaker lexical and mid-distance semantic.
         store
             .upsert_note(&NoteUpsert {
-                id: &id_n3,
                 path: "n3.md",
                 content_hash: "h",
                 mtime: 1,
@@ -848,7 +842,6 @@ mod tests {
         // n4: semantic only (no lexical match) — closer than n2.
         store
             .upsert_note(&NoteUpsert {
-                id: &id_n4,
                 path: "n4.md",
                 content_hash: "h",
                 mtime: 1,
@@ -904,10 +897,8 @@ mod tests {
     #[test]
     fn query_lexical_only_skips_embedding() {
         let (_dir, mut store) = fresh_store();
-        let id = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path: "n.md",
                 content_hash: "h",
                 mtime: 1,

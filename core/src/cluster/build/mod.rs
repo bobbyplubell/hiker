@@ -16,8 +16,8 @@
 pub mod stream;
 
 use super::algo::{
-    cosine_similarity, l2_normalize, mean_normalize, ninetieth_percentile_distance, partition,
-    partition_leiden,
+    build_leiden_graph, cosine_similarity, l2_normalize, leiden_communities, mean_normalize,
+    ninetieth_percentile_distance, partition, partition_leiden, LeidenGraph,
 };
 use super::{
     BuildError, BuildMethod, BuildResult, BuildScope, BuiltClusterNode, BuiltClusterTree,
@@ -58,7 +58,8 @@ pub fn tree(
                 partition_loop_counter: 0,
                 max_partition_level_emitted: -1,
             };
-            build_cluster_tree(notes, params, summarizer, &mut sctx)?
+            // Blocking entry: no cross-run graph cache to thread through.
+            build_cluster_tree(notes, params, summarizer, &mut sctx, &mut None)?
         }
         BuildMethod::FromFolders { params } => build_from_folders(notes, params, summarizer)?,
     };
@@ -131,6 +132,7 @@ enum SplitNode {
 }
 
 use self::stream::StreamCtx;
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -139,13 +141,28 @@ use std::sync::Arc;
 /// off (folded into the first child after recursion).
 type PartitionSplit = (std::collections::BTreeMap<i32, Vec<usize>>, Vec<usize>);
 
+/// Run the structural build. `top_graph` is an in/out cache for the
+/// top-level Leiden kNN graph: pass `Some` to reuse a graph from a prior
+/// run (skipping the O(n²) kNN sweep when `k_nearest` / `edge_weight_floor`
+/// are unchanged), and on return it holds the graph actually used so the
+/// caller can cache it for next time. `None`/unchanged for HDBSCAN and
+/// FromFolders. Per `cluster-review-tab-live-preview`.
 pub(super) fn build_cluster_tree(
     notes: &[NoteInput],
     params: &Params,
     summarizer: &dyn Summarizer,
     sctx: &mut StreamCtx,
+    top_graph: &mut Option<Arc<LeidenGraph>>,
 ) -> Result<BuiltClusterTree, BuildError> {
-    Builder { notes, params, summarizer }.run(sctx)
+    let builder = Builder {
+        notes,
+        params,
+        summarizer,
+        top_graph: RefCell::new(top_graph.take()),
+    };
+    let tree = builder.run(sctx)?;
+    *top_graph = builder.top_graph.into_inner();
+    Ok(tree)
 }
 
 /// Borrow-bundle for the build entry point. Splitting `run` into
@@ -156,6 +173,12 @@ struct Builder<'a> {
     notes: &'a [NoteInput],
     params: &'a Params,
     summarizer: &'a dyn Summarizer,
+    /// In/out cache for the top-level Leiden kNN graph (interior
+    /// mutability so the `&self` recursion methods can populate it). Built
+    /// lazily by `top_level_leiden_graph` on the first top-level Leiden
+    /// cut and reused across the resolution-escalation retries; lifted out
+    /// by `build_cluster_tree` for cross-run caching.
+    top_graph: RefCell<Option<Arc<LeidenGraph>>>,
 }
 
 impl<'a> Builder<'a> {
@@ -224,23 +247,8 @@ impl<'a> Builder<'a> {
         sctx.check_cancel()?;
         sctx.emit_partition_phase_if_new(0);
         let indices: Vec<usize> = (0..self.notes.len()).collect();
-        let top_assignments = partition_indices(
-            self.notes,
-            &indices,
-            self.params,
-            /* top_level */ true,
-        )?;
-        sctx.check_cancel()?;
-        let mut top_groups: std::collections::BTreeMap<i32, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for a in &top_assignments {
-            top_groups
-                .entry(a.cluster_label)
-                .or_default()
-                .push(indices[a.point_index]);
-        }
-        let mut top_outliers: Vec<usize> =
-            top_groups.remove(&OUTLIER_LABEL).unwrap_or_default();
+        let (mut top_groups, mut top_outliers) =
+            self.partition_top_level_escalating(&indices, sctx)?;
         if top_groups.len() < 2 {
             return Err(BuildError::VaultTooSmall {
                 found: self.notes.len(),
@@ -262,6 +270,81 @@ impl<'a> Builder<'a> {
         sctx.outliers = top_outliers.len() as u32;
         sctx.emit_counters();
         Ok((top_groups, top_outliers))
+    }
+
+    /// Run the top-level partition and group the assignments into
+    /// `(communities, outliers)`.
+    ///
+    /// For Leiden, the kNN graph plus a low γ can make a single all-notes
+    /// community the RB-quality optimum (the classic "γ too low → one
+    /// giant community" collapse that surfaced as a `VaultTooSmall`
+    /// abort). When the cut yields fewer than 2 communities we escalate
+    /// `top_level_resolution` geometrically and retry, up to
+    /// `MAX_ESCALATIONS` times, before letting the caller raise the error.
+    /// Crucially the kNN graph is built (or reused from cache) **once** and
+    /// every γ retry runs `leiden_communities` over that same graph — the
+    /// escalation costs near-nothing, and a cached graph from a prior run
+    /// skips the O(n²) sweep entirely.
+    ///
+    /// HDBSCAN (and any non-Leiden algorithm) runs exactly once — its
+    /// density model has no resolution knob to bump.
+    fn partition_top_level_escalating(
+        &self,
+        indices: &[usize],
+        sctx: &mut StreamCtx,
+    ) -> Result<PartitionSplit, BuildError> {
+        const MAX_ESCALATIONS: u32 = 4;
+        const ESCALATION_FACTOR: f32 = 1.6;
+
+        if !matches!(self.params.algorithm, Algorithm::Leiden) {
+            sctx.check_cancel()?;
+            let assignments =
+                partition_indices(self.notes, indices, self.params, /* top_level */ true)?;
+            sctx.check_cancel()?;
+            return Ok(group_assignments(&assignments, indices));
+        }
+
+        let lp = &self.params.leiden;
+        let graph = self.top_level_leiden_graph(indices)?;
+        let mut gamma = lp.top_level_resolution;
+        let mut attempt: u32 = 0;
+        loop {
+            sctx.check_cancel()?;
+            let assignments = leiden_communities(&graph, gamma, lp.iterations, lp.min_cluster_size)
+                .map_err(|e| BuildError::Compute(format!("leiden: {e}")))?;
+            let (groups, outliers) = group_assignments(&assignments, indices);
+            if groups.len() >= 2 || attempt >= MAX_ESCALATIONS {
+                return Ok((groups, outliers));
+            }
+            attempt += 1;
+            let next = gamma.max(0.1) * ESCALATION_FACTOR;
+            tracing::info!(
+                attempt,
+                from = gamma,
+                to = next,
+                communities = groups.len(),
+                "cluster: top-level Leiden cut produced <2 communities — escalating resolution (graph reused)"
+            );
+            gamma = next;
+        }
+    }
+
+    /// The top-level Leiden kNN graph: reuse the cached one if it was built
+    /// from the same node set and `k_nearest` / `edge_weight_floor`,
+    /// otherwise build it (the O(n²) sweep) and cache it back for the next
+    /// run. Per `cluster-review-tab-live-preview`.
+    fn top_level_leiden_graph(&self, indices: &[usize]) -> Result<Arc<LeidenGraph>, BuildError> {
+        let lp = &self.params.leiden;
+        if let Some(g) = self.top_graph.borrow().as_ref()
+            && g.matches(indices.len(), lp.k_nearest, lp.edge_weight_floor)
+        {
+            return Ok(g.clone());
+        }
+        let embeddings: Vec<Vec<f32>> =
+            indices.iter().map(|&i| self.notes[i].embedding.clone()).collect();
+        let g = Arc::new(build_leiden_graph(&embeddings, lp.k_nearest, lp.edge_weight_floor)?);
+        *self.top_graph.borrow_mut() = Some(g.clone());
+        Ok(g)
     }
 
     /// `include_outliers = false` → force-route every outlier into
@@ -328,6 +411,23 @@ impl<'a> Builder<'a> {
         let ctx = self.split_branch_ctx();
         ctx.split_top_level_groups(top_groups, sctx)
     }
+}
+
+/// Group a partition's `Assignment`s into `(communities, outliers)`,
+/// translating each local `point_index` back to the global `notes` index
+/// via `indices`. Communities keyed by label in a `BTreeMap` for stable
+/// ordering; the `OUTLIER_LABEL` bucket is split out separately.
+fn group_assignments(assignments: &[Assignment], indices: &[usize]) -> PartitionSplit {
+    let mut groups: std::collections::BTreeMap<i32, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for a in assignments {
+        groups
+            .entry(a.cluster_label)
+            .or_default()
+            .push(indices[a.point_index]);
+    }
+    let outliers = groups.remove(&OUTLIER_LABEL).unwrap_or_default();
+    (groups, outliers)
 }
 
 /// Partition the `indices` subset of `notes` by their embeddings. The

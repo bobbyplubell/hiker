@@ -1,0 +1,5 @@
+{ "reg": [
+  {"bits":8,"name":"data"},
+  {"bits":4,"name":"flags"},
+  {"bits":4,"name":"op","type":2}
+] }

@@ -2,17 +2,19 @@
 //!
 //! This crate is the layer on top of the op-log substrate (`core::oplog`,
 //! specced in `docs/op-log.md`): device identity, enrollment, the encrypted
-//! transport, and the relay server. The op log ships Yrs `update_v2` blobs
-//! between replicas; this crate moves those blobs, authenticates endpoints,
-//! encrypts content, and decides which local replicas are the same logical
-//! document. See `docs/sync.md` for the full design.
+//! transport, and the relay server. The substrate ships whole-file TEXT + a
+//! version hash between replicas (`op-log-sync-substrate`) — no CRDT on the
+//! wire; this crate moves those text blobs, authenticates endpoints, encrypts
+//! content, and decides which local replicas are the same logical document,
+//! reconciling concurrent edits via one 3-way text merge. See `docs/sync.md`
+//! for the full design.
 //!
 //! # Module discipline
 //!
 //! The `libp2p` and `aes-gcm` dependencies are **confined to this crate**, the
-//! same rule `core::oplog` applies to `yrs`/`rusqlite`. The public API returns
-//! plain Rust types only — no `libp2p` swarm/identity type, no `aes_gcm`
-//! cipher, and no Yrs `Doc`/`Update` ever crosses the crate boundary. Wire
+//! same rule `core::oplog` applies to `rusqlite`. The public API returns
+//! plain Rust types only — no `libp2p` swarm/identity type and no `aes_gcm`
+//! cipher ever crosses the crate boundary. Wire
 //! payloads are `Vec<u8>` blobs; identities are newtype `String`s; keys are
 //! opaque newtypes over fixed byte arrays. A consumer (`app`, `cli`,
 //! `hiker-syncd`) links `hiker-sync` and never transitively sees libp2p in its
@@ -33,6 +35,7 @@ pub mod crypto;
 pub mod enroll;
 pub mod identity;
 pub mod protocol;
+pub mod seam;
 pub mod server;
 pub mod transport;
 

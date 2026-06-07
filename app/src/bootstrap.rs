@@ -253,7 +253,13 @@ impl Spawner {
         sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
         fork_diff_tx: crate::sync_service::ForkDiffSender,
     ) -> Option<Arc<crate::sync_service::SyncService>> {
-        if !section.enabled {
+        use hiker_core::config::vcs::SyncTransport;
+        // The transport seam (`sync-transport-seam`): only build the libp2p
+        // engine when it is the selected transport. `git` / `none` are handled
+        // by `spawn_git_engine` / nothing. The single-bidirectional rule
+        // (`sync-single-bidirectional-transport`) is enforced by this exclusive
+        // selection — at most one bidirectional transport is constructed.
+        if !section.enabled || section.transport != SyncTransport::Libp2p {
             return None;
         }
         let service = match crate::sync_service::SyncService::new(
@@ -394,6 +400,93 @@ impl Spawner {
         Some(service)
     }
 
+    /// The git transport engine behind the sync seam (`git.md`,
+    /// `sync-transport-seam`): built + driven only when `[sync].enabled` and
+    /// `[sync].transport = "git"`. Spawns the debounced commit-on-save task and
+    /// (integrated mode, remote set) a periodic + startup push/pull driver on
+    /// the SAME triggers the libp2p engine uses. Returns `None` when git isn't
+    /// the selected transport or the repo can't be opened (both non-fatal).
+    /// status: sync-transport-seam
+    /// status: git-integrated-mode
+    pub(crate) fn spawn_git_engine(
+        &self,
+        vault_root: &std::path::Path,
+        oplog: Arc<hiker_core::oplog::OpLog>,
+        sync_section: &hiker_core::config::sections::SyncSection,
+        git_section: &hiker_core::config::vcs::GitSection,
+        sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Option<Arc<crate::git_sync::GitSyncEngine>> {
+        use hiker_core::config::vcs::{GitMode, SyncTransport};
+        if !sync_section.enabled || sync_section.transport != SyncTransport::Git {
+            return None;
+        }
+        // Enforce the single-bidirectional rule (`sync-single-bidirectional-
+        // transport`). Selection already makes libp2p and git mutually exclusive
+        // (this engine is only built when git is THE transport), so libp2p is
+        // not also running. The check is stated here as the authority and logs
+        // a clear signal if the invariant is ever violated out-of-band.
+        let git_has_remote = !git_section.remote.trim().is_empty();
+        if let Err(reason) = hiker_sync::seam::check_single_bidirectional(
+            hiker_sync::seam::TransportKind::Git,
+            git_has_remote,
+            false,
+        ) {
+            tracing::warn!(target: "hiker::sync", "{reason}");
+            let _ = sync_tx.send(format!("git: {reason}"));
+            return None;
+        }
+        let engine = match crate::git_sync::GitSyncEngine::new(
+            vault_root,
+            oplog,
+            git_section,
+            sync_tx,
+            tokio::runtime::Handle::current(),
+        ) {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                tracing::warn!(error = %e, "git: failed to build engine (non-fatal)");
+                return None;
+            }
+        };
+        // Debounced commit-on-save (`git-commit-on-save`).
+        engine.spawn_commit_task();
+
+        // Push/pull driver on the sync triggers (`git-push-pull-rounds`):
+        // a startup round then a periodic interval. Integrated mode with a
+        // remote pulls+pushes; manual mode's only coupling is the HEAD-move
+        // fold, which `push_pull_round` routes to `manual_reconcile`. A no-op
+        // round (no remote, nothing diverged) is silent.
+        let drive = engine.clone();
+        let cancel = self.cancel.clone();
+        let engine_cancel = engine.cancel_token();
+        let manual = git_section.mode == GitMode::Manual;
+        tokio::spawn(async move {
+            const STARTUP_DELAY: Duration = Duration::from_secs(2);
+            const ROUND_INTERVAL: Duration = Duration::from_secs(15);
+            tokio::time::sleep(STARTUP_DELAY).await;
+            let mut interval = tokio::time::interval(ROUND_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = engine_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        // Run the blocking libgit2 round off the async worker.
+                        let e = drive.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            if manual { e.manual_reconcile() } else { e.push_pull_round() }
+                        })
+                        .await;
+                        if let Ok(Err(msg)) = res {
+                            tracing::warn!(target: "hiker::sync", "{msg}");
+                        }
+                    }
+                }
+            }
+        });
+        Some(engine)
+    }
+
     /// Indexer progress forwarder. Formats each `ProgressEvent` to a status
     /// line and forwards it onto an unbounded channel the UI drains.
     fn indexer_progress_relay(
@@ -531,11 +624,12 @@ impl Spawner {
 }
 
 /// Open the vault's op log and seed it from the on-disk notes on first
-/// open. The op log is the CRDT write substrate every producer rides on
+/// open. The op log is the text write substrate every producer rides on
 /// (`op-log-ops-producer-helpers`); the seed (`op-log-doc-id-bootstrap`)
 /// mints a doc per existing note and is idempotent — already-mapped notes
-/// are skipped — so subsequent opens are a cheap walk. The compaction
-/// threshold comes from `[op-log] compact_threshold`. A bootstrap seed
+/// are skipped — so subsequent opens are a cheap walk. The vestigial
+/// `[op-log] compact_threshold` is still read but no longer triggers
+/// compaction (the `.ops` log is the durable representation). A bootstrap seed
 /// failure is non-fatal (logged) so a single unreadable note can't block
 /// the whole vault opening.
 ///
@@ -627,9 +721,9 @@ fn run_trails_companion_migration_on_open(vault: &Vault, oplog: &Arc<OpLog>) {
 }
 
 /// On-open retention GC (`op-log-retention`): drop accepted/rejected
-/// side-table rows past their `[op-log]` retention horizons. Compaction of
-/// the `.yrs` snapshots already ran inside `OpLog::open_with_threshold`, so
-/// this only covers the side-table sweep. Failures are logged, not fatal —
+/// side-table rows past their `[op-log]` retention horizons. This only
+/// covers the side-table sweep (the `.ops` history itself is retained, not
+/// compacted). Failures are logged, not fatal —
 /// a vault still opens with stale metadata rows.
 fn run_oplog_retention_gc_on_open(oplog: &Arc<OpLog>, config: &std::sync::RwLock<Config>) {
     let (meta_days, rejected_days) = config
@@ -842,13 +936,18 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // Live sync engine: built + responder-spawned only when `[sync].enabled`.
     // When disabled, `None` — no keys, no swarm, no listener. The `sync_tx`
     // end is also stashed in `VaultEvents` so the UI drains the progress ring.
-    let sync_section = config.read().map(|c| c.sync.clone()).unwrap_or_default();
+    let (sync_section, git_section) = config
+        .read()
+        .map(|c| (c.sync.clone(), c.git.clone()))
+        .unwrap_or_default();
     let sync = spawner.spawn_sync_service(
-        &root,
-        oplog.clone(),
-        &sync_section,
-        sync_tx.clone(),
-        fork_diff_tx.clone(),
+        &root, oplog.clone(), &sync_section, sync_tx.clone(), fork_diff_tx.clone(),
+    );
+    // The git transport (`git.md`) behind the same seam: built only when
+    // `[sync].transport = "git"`, mutually exclusive with the libp2p `sync`
+    // engine above (`sync-single-bidirectional-transport`).
+    let git_sync = spawner.spawn_git_engine(
+        &root, oplog.clone(), &sync_section, &git_section, sync_tx.clone(),
     );
 
     // Wire the UI `watch` channels + snapshot pollster and fold them in
@@ -880,6 +979,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         mcp_tools_cfg,
         mcp_ui_context,
         sync,
+        git_sync,
     };
     let vault_session = VaultSession {
         vault: vault.clone(),
@@ -929,6 +1029,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         activities: crate::activity::ActivityRegistry::build(crate::activity::builtin_activities()),
         ui: UiState::default(),
         toasts: Vec::new(),
+        pending_effects: Vec::new(),
         sync_attention_seen: crate::state::SyncAttentionSeen::default(),
         vault_switch: VaultSwitchState::Idle,
         workbench: {

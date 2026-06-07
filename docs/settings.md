@@ -193,24 +193,28 @@ Stub. The full schema lives in `llm.md` (`llm-acp-client-optional`); enables rou
 
 ### [sync]
 
-The full schema lives in `sync.md` (`sync-config-section`); summarized here so the section list is complete. Per-vault: `enabled` / `mode` / `server_url` / `discovery` / `device_name`; `devices` + the learned `device_names` map are enrollment state. Secrets (content key, device private key) are user-scope and never appear. Exposed as standard settings rows (vault scope); `devices` is read-only there. [settings-section-sync]
+The full schema lives in `sync.md` (`sync-config-section`); summarized here so the section list is complete. Per-vault: `enabled` / `transport` (`libp2p` | `git` | `none`, the pluggable transport seam) / `mode` / `server_url` / `discovery` / `device_name`; `devices` + the learned `device_names` map are enrollment state (libp2p transport). Secrets (content key, device private key) are user-scope and never appear. Exposed as standard settings rows (vault scope); `devices` is read-only there. [settings-section-sync]
+
+### [git]
+
+The git transport's config; full schema in `git.md` (`git-config-section`), summarized here for the section list. Per-vault: `mode` (`integrated` hiker drives commit + push/pull | `manual` the user drives) / `remote` (empty = local-only versioning) / `auto_commit` / `commit_debounce_ms` / `gc_interval_days`. Active only when `[sync].transport = "git"`. [settings-section-git]
 
 
 ## Pending change review
 
-Some writes shouldn't land directly on disk: the user didn't author the bytes (agent writes), or can't watch them all at once (batch mutations). These land as `status=pending` ops in the op log (per `op-log.md`) until accepted. Accept/reject lives inline on every surface that cares (enumerated below) — no dedicated staging editor sub-mode.
+Some writes shouldn't land directly on disk: the user didn't author the bytes (agent writes), or can't watch them all at once (batch mutations). These land as pending edits (per `op-log.md`) — anchored against `accepted`, staged for review — until accepted. Accept/reject lives inline on every surface that cares (enumerated below) — no dedicated review editor sub-mode.
 
-Two flows produce pending ops:
+Two flows produce pending edits:
 
-- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on makes the produced ops enter the log as `status=pending` instead of `status=accepted`. [agent-write-review-mode]
+- **Agent writes (opt-in)** — MCP tool calls and background features are gated by `review_required` flags; flipping them on stages the produced edits as pending instead of committing them straight to `accepted`. [agent-write-review-mode]
 - **Batch mutations (always pending)** — multi-note mutation actions (e.g., "reformat every `.txt` in `inbox/`") fan out N tasks per `task-queue.md`; the user can't watch N buffers, so each result lands as pending unconditionally. Single-note user-initiated mutations stay in-buffer per `editor.md`'s Note-mutations menu.
 
-The substrate — per-document pending queue (`<doc-id>.pending`), op shapes (`edit_note` → N `Replace` ops sharing a `batch_id`; `write_note`/`set_frontmatter`/`apply_tag` → one op; `move_note`/`rename` → `Rename`), drift detection, status states, and restart survival — is owned by `op-log.md` (`op-log-pending-queue`, `op-log-op-shape`, `op-log-status-states`, `op-log-pending-survives-restart`). What this doc owns is the settings-facing review surface behavior:
+The substrate — the per-document set of anchored pending edits persisted to `.pending`, the edit-kind vocabulary (`OpKind` = `Replace{anchor}` / `SetFrontmatter` / `Rename{from}` / `Create` / `Tombstone`), drift detection, status states, and restart survival — is owned by `op-log.md` (`op-log-pending-patch`, `op-log-op-shape`, `op-log-status-states`, `op-log-pending-survives-restart`). What this doc owns is the settings-facing review surface behavior:
 
-- **Agent-write review is off by default; opt-in per write surface.** Agent ops enter as `status=accepted` and reach disk immediately by default; users flip the per-surface `review_required` flag for a checkpoint. [agent-write-review-mode]
-- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders accept/reject inline (chat cards, trails panel, file tree context menu, unified `Changes` tab). Hunk-shaped pending ops render in the live editable buffer as inline decorations + per-file pill; whole-file pending ops open via the read-only-buffer-with-diff-toggle pattern, framed "Review rewrite" / "Review new note" (both per `patch-review.md`, `write-note-review-surface`). Drifted ops surface with Accept disabled, Reject active.
-- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the author-class pills) showing all pending ops across all sources; each row carries [Accept] [Reject], with [Accept all (N)] at the top. [staging-review-activity-detail-filter]
-- **MCP write responses are honest about pending.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "pending"` plus the op id. [staging-review-pending-response]
+- **Agent-write review is off by default; opt-in per write surface.** Agent edits commit to `accepted` and reach disk immediately by default; users flip the per-surface `review_required` flag for a checkpoint. [agent-write-review-mode]
+- **Accept/reject is integrated into every relevant surface, not a separate editor mode.** Each surface renders accept/reject inline (chat cards, trails panel, file tree context menu, unified `Changes` tab). Hunk-shaped pending edits render in the live editable buffer as inline decorations + per-file pill; whole-file pending edits open via the read-only-buffer-with-diff-toggle pattern, framed "Review rewrite" / "Review new note" (both per `patch-review.md`, `write-note-review-surface`). Drifted edits surface with Accept disabled, Reject active.
+- **The activity detail page is the central review surface.** The existing `vault-home-recent-activity-detail` page gains a "Pending" filter pill (alongside the author-class pills) showing all pending edits across all sources; each row carries [Accept] [Reject], with [Accept all (N)] at the top. [staging-review-activity-detail-filter]
+- **MCP write responses are honest about pending.** When review mode is on, MCP write tools return success-with-pending — the JSON response carries `status: "pending"` plus the pending-edit id. [staging-review-pending-response]
 - **Accept navigates to the target note as a preview tab.** After an individual accept (not batch), the UI opens the affected note at its target path with `preview: true`. Batch accept (`Accept all`) stays on the current surface. [staging-accept-navigates-to-preview]
 
 ### Review surfaces
@@ -240,7 +244,7 @@ Two cases.
 │ [Accept trail]  [Reject]                   │
 ```
 
-Waypoint cards render normally below for inspection. Accept → moves trail-doc to `[trails] new_trail_dir`, strips `hiker.draft`, appends `core::changes` row. Reject → confirm then hard-deletes trail-doc + waypoint dir (no trash — never user data). [staging-accept-reject-from-trails]
+Waypoint cards render normally below for inspection. Accept → moves trail-doc to `[trails] new_trail_dir`, strips `hiker.draft`, appends a history frame. Reject → confirm then hard-deletes trail-doc + waypoint dir (no trash — never user data). [staging-accept-reject-from-trails]
 
 **Active trail has pending waypoint additions.** Collapsed rows at the end of the waypoint list:
 
@@ -327,24 +331,24 @@ No green/red. All Accept/Reject use the muted token system and the text-link wei
 
 ### Storage, lifecycle, and queries
 
-The substrate is owned by `op-log.md` and `patch-review.md`, not respecified here. Pending-op storage layout, the produce → `stage_pending` → surface-refresh → accept/reject (`flip_op_status`) lifecycle, drift derivation, query filters (`core::oplog::query` by `path` / `trail_id` / `surface` / `session_id` / `status`), op-log change events, and retention/auto-reject behavior all live in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-status-states`, `op-log-config-section`). There is no separate staging database; the `[staging]` config section is replaced by `[op-log]`. The substrate API is `core::oplog`; producer helpers and `flip_op_status` live in `core::ops`.
+The substrate is owned by `op-log.md` and `patch-review.md`, not respecified here. Pending-edit storage layout (anchored edits persisted to `.pending`), the produce → `stage_pending` → surface-refresh → accept/reject (`flip_op_status`) lifecycle, drift derivation, query filters (by `path` / `trail_id` / `surface` / `session_id` / `status`), change events, and retention/auto-reject behavior all live in `op-log.md` (`op-log-store-layout`, `op-log-op-shape`, `op-log-status-states`, `op-log-config-section`). The only database is the regenerable search index; there is no separate staging database, and `[op-log]` owns the review config. The substrate API is `core::oplog`; producer helpers and `flip_op_status` live in `core::ops`.
 
 ### Config keys for review
 
-Per-surface gates live in their owning sections; log-level behavior (`auto_reject_on_drift`, `metadata_retention_days`, `rejected_retention_days`) lives in `[op-log]` per `op-log-config-section`.
+Per-surface gates live in their owning sections; substrate-level behavior (`auto_reject_on_drift`, `rejected_retention_days`) lives in `[op-log]` per `op-log-config-section`.
 
-- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every MCP tool-write enters the log as `status=Pending` instead of `Accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section.
-- **`[llm.background].review_required`** (bool, default `false`) — lands with the `[llm]` section. When true, debounced background features emit pending ops instead of mutating frontmatter directly.
+- **`[mcp.tools].review_required`** (bool, default `true`) — extends `mcp-config-section`. When true, every MCP tool-write stages as a pending edit instead of committing to `accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section.
+- **`[llm.background].review_required`** (bool, default `false`) — lands with the `[llm]` section. When true, debounced background features stage pending edits instead of mutating frontmatter directly.
 
-Batch mutations have no `review_required` flag — they always emit pending ops.
+Batch mutations have no `review_required` flag — they always stage pending edits.
 
 ### Forward refs
 
-- `op-log.md` — the substrate; storage, op shape, status states, materialization, drift, config section, unified activity feed (`metadata.agent_op_id` carries the originating op for traceability).
-- `patch-review.md` — inline per-hunk accept/reject for `Replace` ops plus the write-note review surface for whole-file ops; `diff.md` is the underlying diff primitive.
-- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` produces per-edit `Replace` ops.
+- `op-log.md` — the substrate; storage, op shape, status states, materialization, drift, config section, unified activity feed (a `PendingItem` carries `surface` / `session_id` / `target_path` for traceability).
+- `patch-review.md` — inline per-hunk accept/reject for `Replace` edits plus the write-note review surface for whole-file edits; `diff.md` is the underlying diff primitive.
+- `mcp.md` `mcp-config-section` gets the `tools.review_required` row; `mcp-tool-edit-note` produces per-edit `Replace` edits.
 - `llm.md` `[llm.background]` config gets `review_required`.
-- `task-queue.md` — batch mutation fan-out producers append pending ops on completion.
+- `task-queue.md` — batch mutation fan-out producers stage pending edits on completion.
 - `trails.md` — draft trail review hooks into the surfaces described here.
 
 
@@ -463,12 +467,11 @@ Selected in-app UI changes persist by writing back to the appropriate TOML file.
 - `[editor].render_txt_as_markdown`, `live_preview`, `word_wrap`, `show_line_numbers`, `show_whitespace`, `highlight_trailing_whitespace`, `show_chunk_boundaries` — written on View menu flip. Vault-scope.
 - `[vault].sidebar_open`, `related_open`, `trash_expanded`, `tree.sort_by` — written on the corresponding UI action. Vault-scope.
 - `[vault].recent` — written by the Open Vault flow (push-to-front, dedupe, cap at ~10 entries). User-scope.
-- `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools route through staging. User + vault scope. Live-applied.
-- `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features write to staging. User + vault scope. Live-applied.
-- `[op-log].auto_reject_on_drift` — bool toggle in the Op-log settings section. When on, pending ops that become drifted auto-flip to `rejected`. User + vault scope. Live-applied. Per `op-log-config-section`.
-- `[op-log].metadata_retention_days` — int (>0) in the Op-log settings section. GC age threshold for accepted-op metadata rows (the Yrs Doc content lives indefinitely). User + vault scope. Live-applied.
-- `[op-log].rejected_retention_days` — int (>0) in the Op-log settings section. GC age threshold for rejected ops (defaults shorter than accepted retention). User + vault scope. Live-applied.
-- `[op-log].review_required` — bool toggle. Default policy for agent-authored ops. Surface-specific overrides win. User + vault scope. Live-applied.
+- `[mcp.tools].review_required` — bool toggle in the MCP server settings section. When on, MCP write tools stage pending edits. User + vault scope. Live-applied.
+- `[llm.background].review_required` — bool toggle in the LLM settings section's background subsection. When on, background features stage pending edits. User + vault scope. Live-applied.
+- `[op-log].auto_reject_on_drift` — bool toggle in the Op-log settings section. When on, pending edits that become drifted auto-flip to `rejected`. User + vault scope. Live-applied. Per `op-log-config-section`.
+- `[op-log].rejected_retention_days` — int (>0) in the Op-log settings section. GC age threshold for dropped pending edits in `.hiker/pending/`. User + vault scope. Live-applied.
+- `[op-log].review_required` — bool toggle. Default policy for agent-authored writes. Surface-specific overrides win. User + vault scope. Live-applied.
 
 Single command `set_setting(scope: SettingsScope, key: String, value: serde_json::Value) -> Result<()>` is the only write path, where `scope` is `User` or `Vault`. Each call:
 

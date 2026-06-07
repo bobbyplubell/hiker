@@ -12,27 +12,16 @@ impl Store {
     /// to the editor pane stays small even on long notes.
     ///
     /// status: cmd-chunks-for-path
+    /// status: store-path-is-identity
     pub fn chunk_bounds_for(&self, rel_path: &str) -> Result<Vec<ChunkBounds>, Error> {
-        // Under `store-id-from-oplog`, `notes.id` is the op-log doc_id and
-        // also keyed by `notes.path UNIQUE`, so a path lookup goes directly
-        // through the `notes` table.
-        let id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM notes WHERE path = ?1",
-                params![rel_path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(id) = id else {
-            return Ok(Vec::new());
-        };
+        // The note's path IS its identity (`store-path-is-identity`); chunks
+        // key on `note_path`, so the lookup is a direct path query.
         let mut stmt = self.conn.prepare(
             "SELECT chunk_index, byte_start, byte_end, heading_path
-             FROM chunks WHERE note_id = ?1 ORDER BY chunk_index",
+             FROM chunks WHERE note_path = ?1 ORDER BY chunk_index",
         )?;
         let rows = stmt
-            .query_map(params![id], |row| {
+            .query_map(params![rel_path], |row| {
                 Ok(ChunkBounds {
                     chunk_index: row.get::<_, i64>(0)? as u32,
                     byte_start: row.get::<_, i64>(1)? as u64,
@@ -84,19 +73,11 @@ impl Store {
         &mut self,
         rel_path: &str,
     ) -> Result<Option<Vec<f32>>, Error> {
-        // status: store-id-from-oplog
-        let note_id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM notes WHERE path = ?1",
-                params![rel_path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(note_id) = note_id else {
+        // status: store-path-is-identity
+        if !self.note_exists(rel_path)? {
             return Ok(None);
-        };
-        let weighted = self.collect_weighted_chunk_embeddings(&note_id)?;
+        }
+        let weighted = self.collect_weighted_chunk_embeddings(rel_path)?;
         if weighted.is_empty() {
             // Empty notes get no embedding (see clustering.md "Level 0
             // input"). Leave the column NULL so the cluster pass excludes
@@ -106,8 +87,8 @@ impl Store {
         let pooled = byte_weighted_mean_pool(&weighted, self.dim)?;
         let blob = embedding_to_blob(&pooled);
         self.conn.execute(
-            "UPDATE notes SET note_embedding = ?1 WHERE id = ?2",
-            params![blob, note_id],
+            "UPDATE notes SET note_embedding = ?1 WHERE path = ?2",
+            params![blob, rel_path],
         )?;
         Ok(Some(pooled))
     }
@@ -129,16 +110,16 @@ impl Store {
     /// pooling. Private; callers go through `compute_and_store_note_embedding`.
     fn collect_weighted_chunk_embeddings(
         &self,
-        note_id: &str,
+        note_path: &str,
     ) -> Result<Vec<(Vec<f32>, u64)>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT v.embedding, c.byte_end - c.byte_start
              FROM chunk_vecs v
              JOIN chunks c ON c.id = v.chunk_id
-             WHERE c.note_id = ?1",
+             WHERE c.note_path = ?1",
         )?;
         let rows = stmt
-            .query_map(params![note_id], |row| {
+            .query_map(params![note_path], |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 let weight: i64 = row.get(1)?;
                 Ok((blob_to_embedding(&blob), weight.max(0) as u64))
@@ -147,14 +128,16 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch all chunks for a note, ordered by chunk_index.
-    pub fn get_note_chunks(&self, note_id: &str) -> Result<Vec<ChunkRow>, Error> {
+    /// Fetch all chunks for a note (keyed by its path), ordered by chunk_index.
+    ///
+    /// status: store-path-is-identity
+    pub fn get_note_chunks(&self, note_path: &str) -> Result<Vec<ChunkRow>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, note_id, chunk_index, byte_start, byte_end, text, heading_path
-             FROM chunks WHERE note_id = ?1 ORDER BY chunk_index",
+            "SELECT id, note_path, chunk_index, byte_start, byte_end, text, heading_path
+             FROM chunks WHERE note_path = ?1 ORDER BY chunk_index",
         )?;
         let rows = stmt
-            .query_map(params![note_id], |row| {
+            .query_map(params![note_path], |row| {
                 Ok(ChunkRow {
                     id: row.get(0)?,
                     note_id: row.get(1)?,
@@ -198,13 +181,13 @@ impl Store {
             Some(embedding_to_blob(&byte_weighted_mean_pool(&weighted, expected)?))
         };
 
-        // Upsert notes row. Successful upsert clears any prior Skipped flag
-        // — the file made it through ingest, so it's no longer skipped.
+        // Upsert notes row, keyed by the note's path (its identity). A
+        // successful upsert clears any prior Skipped flag — the file made it
+        // through ingest. status: store-path-is-identity
         tx.execute(
-            "INSERT INTO notes (id, path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason, note_embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
-             ON CONFLICT(id) DO UPDATE SET
-               path = excluded.path,
+            "INSERT INTO notes (path, content_hash, mtime, size, indexed_at, embedder_version, skipped, skip_reason, note_embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7)
+             ON CONFLICT(path) DO UPDATE SET
                content_hash = excluded.content_hash,
                mtime = excluded.mtime,
                size = excluded.size,
@@ -214,7 +197,6 @@ impl Store {
                skip_reason = NULL,
                note_embedding = excluded.note_embedding",
             params![
-                upsert.id,
                 upsert.path,
                 upsert.content_hash,
                 upsert.mtime,
@@ -225,33 +207,28 @@ impl Store {
             ],
         )?;
 
-        // status: store-id-from-oplog
-        // No separate `path_ids` write — `notes.path UNIQUE` keys the row,
-        // and the id supplied here is the op-log's `doc_id` for this path
-        // (read by the indexer via `oplog::doc_id_for_path` before this
-        // call). The on-disk path↔id mapping lives in `doc-index.db`.
-
         // Replace chunks. Drop existing chunks (chunk_vecs cleaned up
         // explicitly — vec0 doesn't honor the FK cascade).
         let old_chunk_ids: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_id = ?1")?;
-            stmt.query_map(params![upsert.id], |row| row.get::<_, String>(0))?
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE note_path = ?1")?;
+            stmt.query_map(params![upsert.path], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         for cid in &old_chunk_ids {
             tx.execute("DELETE FROM chunk_vecs WHERE chunk_id = ?1", params![cid])?;
         }
-        tx.execute("DELETE FROM chunks WHERE note_id = ?1", params![upsert.id])?;
+        tx.execute("DELETE FROM chunks WHERE note_path = ?1", params![upsert.path])?;
 
-        // Insert new chunks + vecs.
+        // Insert new chunks + vecs. The chunk id / vec join key is
+        // `"<note_path>:<idx>"` (`store-path-is-identity`).
         for (chunk, embedding) in &upsert.chunks {
-            let chunk_id = format!("{}:{}", upsert.id, chunk.index);
+            let chunk_id = format!("{}:{}", upsert.path, chunk.index);
             tx.execute(
-                "INSERT INTO chunks (id, note_id, chunk_index, byte_start, byte_end, text, heading_path)
+                "INSERT INTO chunks (id, note_path, chunk_index, byte_start, byte_end, text, heading_path)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     chunk_id,
-                    upsert.id,
+                    upsert.path,
                     chunk.index as i64,
                     chunk.byte_start as i64,
                     chunk.byte_end as i64,

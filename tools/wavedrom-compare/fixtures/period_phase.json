@@ -1,0 +1,5 @@
+{ "signal": [
+  {"name":"clk","wave":"p.....","period":2},
+  {"name":"shifted","wave":"01.0.1","phase":0.5},
+  {"name":"ref","wave":"0.1.0."}
+] }

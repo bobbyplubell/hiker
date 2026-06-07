@@ -1,15 +1,18 @@
-//! The multi-device sync substrate verbs (`op-log-multi-device-sync`): plain-
-//! bytes lineage export/import, the inbound Yrs-update receive path, and
-//! lineage adoption at enrollment. These are a second `impl OpLog` block kept
-//! here so `mod.rs` stays within its file-length budget; they share the same
-//! private lock / `ensure_loaded` / persistence machinery defined alongside
-//! `OpLog` in `mod.rs`.
+//! The multi-device sync substrate verbs (`op-log-multi-device-sync`,
+//! `op-log-sync-substrate`): whole-file TEXT export/import, the inbound
+//! text-merge receive path, and lineage adoption at enrollment. These are a
+//! second `impl OpLog` block kept here so `mod.rs` stays within its
+//! file-length budget; they share the same private lock / `ensure_loaded` /
+//! persistence machinery defined alongside `OpLog` in `mod.rs`.
 //!
-//! **Boundary discipline.** Per the module contract, no `yrs` type crosses the
-//! `OpLog` surface: every signature here takes/returns only `&str`, `Vec<u8>`,
-//! and `bool`. The `StateVector` encode/decode lives in `doc.rs`; this module
-//! only moves opaque `Vec<u8>` payloads (the same bytes the transport encrypts
-//! and ships).
+//! **Text on the wire (Option N).** The sync substrate ships whole-file TEXT +
+//! a version hash. `accepted` and `working` are plain TEXT internally, and every
+//! byte payload crossing this surface is the document's canonical `.md` text.
+//! The receiver reconciles by a 3-way TEXT merge over the content-hash
+//! merge-base (`sync-three-way-merge`), then lands the merged text through the
+//! `commit_text_edit` path. The `_watermark`/`state_vector_bytes` args are
+//! vestigial — text has no state-vector delta, so shipping the full current
+//! text is correct (the receiver fast-forwards / merges by content hash).
 
 use std::path::Path;
 
@@ -22,6 +25,9 @@ use super::error::Error;
 use super::meta;
 use super::OpLog;
 use crate::trash::Trash;
+
+// `doc::kind_for` derives a document's kind from its path extension (the doc id
+// IS the path under path-identity).
 
 /// The verdict of [`OpLog::delete_vs_edit_verdict`]: whether a bound doc's peer
 /// delta is a delete concurrent with an edit (which must BLOCK for the user to
@@ -39,7 +45,7 @@ pub enum DeleteVsEdit {
     /// are, the live side never edited past the shared base (a pure
     /// fast-forward delete of a version we already have — auto-applies → trash),
     /// or there is no reconstructable shared base. The caller falls through to
-    /// the existing same-region / fast-forward / Yrs-merge paths.
+    /// the existing same-region / fast-forward / text-merge paths.
     NotApplicable,
 }
 
@@ -53,8 +59,8 @@ pub enum SameRegion {
     /// signature, left to enrollment classification; the bound-doc gate does
     /// not silently merge it.
     NoSharedBase,
-    /// A fast-forward or disjoint-region edit: the existing Yrs merge applies
-    /// the delta automatically with no block.
+    /// A fast-forward or disjoint-region edit: the existing 3-way text merge
+    /// applies the delta automatically with no block.
     CleanMerge,
     /// Both sides edited overlapping byte ranges since the common base —
     /// applying the delta would interleave a genuine conflict, so the doc
@@ -86,16 +92,19 @@ fn longest_digit_run(s: &str) -> usize {
 }
 
 impl OpLog {
-    /// The doc's full v2 state update — `encode_state_as_update_v2(&Default)`,
-    /// the same bytes as the `.yrs` base. The transport ships this when a peer
-    /// has no prior watermark (first contact, or as the canonical base another
-    /// device adopts). Wraps [`doc::encode_full`]; returns plain bytes.
+    /// The doc's current canonical TEXT (`materialize(accepted).text` bytes) —
+    /// the content a peer adopts at first contact or merges in steady state.
+    /// The wire carries text, not a serialized base blob
+    /// (`op-log-sync-substrate`). A peer adopting this seeds its
+    /// own lineage from the same text; a peer merging it runs the 3-way text
+    /// merge in [`apply_remote_update`].
     ///
     /// status: op-log-multi-device-sync
+    /// status: op-log-sync-substrate
     pub fn export_state(&self, doc_id: &str) -> Result<Vec<u8>, Error> {
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            Ok(doc::encode_full(&state.accepted))
+            Ok(state.accepted().text.into_bytes())
         })
     }
 
@@ -118,8 +127,8 @@ impl OpLog {
     /// `theirs == base`) it is a fast-forward → [`SameRegion::CleanMerge`].
     /// Otherwise the span-overlap predicate decides: overlapping divergent byte
     /// ranges → [`SameRegion::Conflict`] (BLOCK); disjoint ranges →
-    /// [`SameRegion::CleanMerge`] (let the existing Yrs merge auto-apply). The
-    /// span logic is shared with [`doc::three_way_merge`] — same overlap rule,
+    /// [`SameRegion::CleanMerge`] (let the existing text merge auto-apply). The
+    /// span logic is shared with [`crate::merge::three_way_merge`] — same overlap rule,
     /// detection-only so the merge callers are unchanged.
     ///
     /// status: sync-conflict-detect-same-region
@@ -130,7 +139,7 @@ impl OpLog {
         peer_hashes: &std::collections::HashSet<String>,
     ) -> Result<SameRegion, Error> {
         let base_op = self.locked(|inner| {
-            meta::most_recent_shared_op_id(&inner.meta, doc_id, peer_hashes)
+            meta::most_recent_shared_op_id(&inner.index, doc_id, peer_hashes)
         })?;
         let Some(base_op) = base_op else {
             return Ok(SameRegion::NoSharedBase);
@@ -148,7 +157,7 @@ impl OpLog {
         if ours == base || theirs == base {
             return Ok(SameRegion::CleanMerge);
         }
-        if doc::spans_overlap(&base, &ours, theirs) {
+        if crate::merge::spans_overlap(&base, &ours, theirs) {
             Ok(SameRegion::Conflict)
         } else {
             Ok(SameRegion::CleanMerge)
@@ -204,7 +213,7 @@ impl OpLog {
             return Ok(DeleteVsEdit::NotApplicable);
         }
         let base_op = self.locked(|inner| {
-            meta::most_recent_shared_op_id(&inner.meta, doc_id, peer_hashes)
+            meta::most_recent_shared_op_id(&inner.index, doc_id, peer_hashes)
         })?;
         let Some(base_op) = base_op else {
             // No reconstructable common base → not a clean delete-vs-edit; leave
@@ -234,390 +243,244 @@ impl OpLog {
         Ok(DeleteVsEdit::Conflict)
     }
 
-    /// "Ops since the peer's watermark" — `encode_state_as_update_v2(&peer_sv)`
-    /// — the incremental payload the transport streams once both sides share a
-    /// lineage. `peer_state_vector` is the peer's [`state_vector_bytes`] (v2);
-    /// it's decoded inside `doc.rs` so no yrs `StateVector` crosses this surface.
+    /// The doc's current canonical TEXT, same as [`export_state`]. Under the
+    /// text substrate there is no state-vector delta to compute, so there is
+    /// no smaller "ops since the watermark" payload: the receiver merges /
+    /// fast-forwards by content hash, so shipping the full current text is
+    /// correct (and idempotent — an identical resend is a no-op merge). The
+    /// `_watermark` arg (the peer's vestigial [`state_vector_bytes`]) is kept in
+    /// the signature to minimize transport churn but no longer carries a delta.
     ///
     /// status: op-log-multi-device-sync
-    pub fn export_since(
-        &self,
-        doc_id: &str,
-        peer_state_vector: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        self.locked(|inner| {
-            let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            doc::encode_since_sv_bytes(&state.accepted, doc_id, peer_state_vector)
-        })
+    /// status: op-log-sync-substrate
+    pub fn export_since(&self, doc_id: &str, _watermark: &[u8]) -> Result<Vec<u8>, Error> {
+        self.export_state(doc_id)
     }
 
-    /// The doc's current state vector encoded as v2 bytes — the watermark this
-    /// device ships so a peer can compute the delta to send back
-    /// ([`export_since`]). Plain bytes; the yrs `StateVector` stays in `doc.rs`.
+    /// A VESTIGIAL watermark: under the text substrate the wire carries whole
+    /// files reconciled by content hash, not state-vector deltas, so there
+    /// is no per-client SV to ship. Returns the doc's current content-hash bytes
+    /// (a stable per-content token) purely so the transport's
+    /// `DeltaRequest { state_vector }` field has something to send; the responder
+    /// ignores it ([`export_since`] returns the full text regardless). Kept as a
+    /// `Vec<u8>` so the `hiker-sync` signatures don't churn.
     ///
     /// status: op-log-multi-device-sync
+    /// status: op-log-sync-substrate
     pub fn state_vector_bytes(&self, doc_id: &str) -> Result<Vec<u8>, Error> {
-        self.locked(|inner| {
-            let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            Ok(doc::state_vector_v2(&state.accepted))
-        })
+        let text = self.materialize_accepted(doc_id)?.text;
+        Ok(super::content_hash(&text).into_bytes())
     }
 
-    /// The inbound receive path: apply a remote device's v2 update to this
-    /// doc's `accepted` Doc. The Yrs-update analog of [`apply_external_edit`]
-    /// (which takes disk text) — here the transport hands over the peer's
-    /// `update_v2` bytes directly, so the merge is Yrs's native one rather than
-    /// a text diff. Follows the `op-log-atomic-write` persistence order under
-    /// one lock hold:
+    /// The inbound receive path: reconcile a remote device's whole-file TEXT
+    /// into this doc as a 3-way TEXT merge (`op-log-sync-substrate`).
+    /// `peer_bytes` is the peer's document text (UTF-8). `peer_tombstone` is the
+    /// peer's delete flag (a deleted doc keeps its last-known text, so text alone
+    /// can't carry it). `peer_hashes` is the peer's recent content-hash window,
+    /// used to recover the merge-base the SAME way the conflict gates do.
     ///
-    /// 1. apply the update to `accepted`;
-    /// 2. mirror the gained ops onto the `working` overlay if present (capture
-    ///    before-SV, `encode_since`, apply — the same technique `accept_pending`
-    ///    and `commit_text_edit` use, so the user's uncommitted edits stay
-    ///    layered on top of the newly-arrived state);
-    /// 3. only if state advanced: append the `.yrslog` delta, retain a history
-    ///    frame, insert a `sync:<device>`-authored `op_metadata` row with the
-    ///    new `content_hash`, and rewrite the `.md`.
+    /// The transport has already GATED this call: a genuine same-region overlap
+    /// or delete-vs-edit conflict BLOCKS before reaching here
+    /// (`same_region_verdict` / `delete_vs_edit_verdict`), so what arrives is a
+    /// clean fast-forward, a disjoint merge, or a fast-forward delete. The merge
+    /// is therefore the proven, deterministic [`crate::merge::three_way_merge`]:
     ///
-    /// Returns `true` when state advanced, `false` when the update carried only
-    /// already-known ops (a no-op — Yrs `apply_update` is idempotent, so this
-    /// is safe to call with overlapping/duplicate payloads). A no-op writes
-    /// nothing.
+    /// - **base** = the most recent content whose hash is in BOTH our `.ops`
+    ///   history and `peer_hashes` (`most_recent_shared_op_id` + `materialize_at`),
+    ///   exactly as the gates reconstruct it. With no shared base (e.g. the
+    ///   server path ships no hashes) we fall back to `base = ours`, which makes
+    ///   the merge a pure fast-forward to the peer's text — the safe behavior the
+    ///   gate's clean classification implies.
+    /// - **ours** = `materialize(accepted).text`. **theirs** = `peer_bytes`.
+    /// - the merged text lands as a `sync:<device>`-authored `user`-class commit
+    ///   through [`commit_text_edit`](super::OpLog::commit_text_edit), which
+    ///   reuses the whole persist/frame/metadata/`.md` path AND the `working`
+    ///   overlay reconcile. A fast-forward (`ours == base`) yields `merged ==
+    ///   theirs`; identical content is a no-op.
+    ///
+    /// A `peer_tombstone` that is a live → deleted transition tombstones the doc
+    /// (authored `sync:<device>`) and moves the lingering `.md` to trash. A
+    /// converged delete (both sides
+    /// tombstoned) is a no-op. Renames are NOT seen here — text carries no path;
+    /// the transport conveys a rename via the manifest path and applies it with
+    /// an explicit `rename_document`.
+    ///
+    /// Returns `true` when content advanced, `false` on a no-op — the same
+    /// contract as before.
     ///
     /// status: op-log-multi-device-sync
+    /// status: op-log-sync-substrate
     /// status: op-log-atomic-write
     pub fn apply_remote_update(
         &self,
         doc_id: &str,
-        update: &[u8],
+        peer_bytes: &[u8],
+        peer_tombstone: bool,
         device_id: &str,
+        peer_hashes: &std::collections::HashSet<String>,
     ) -> Result<bool, Error> {
-        let now = super::now_ms();
-        // The locked block returns the advance flag plus, on a remote
-        // tombstone *transition* (was-live → now-deleted) of a doc whose `.md`
-        // still exists, the bytes + path needed to move that file to trash.
-        // The fs move runs AFTER the lock is released (it's independent of the
-        // oplog mutex), mirroring how the offline-delete reconcile keeps the
-        // trash capture out of the op-log critical section.
-        let (advanced, pending_trash): (bool, Option<RemoteDeleteToTrash>) = self.locked(|inner| {
-            let op_id = ulid::Ulid::new().to_string();
-            // Pre-flight collision check: apply the update to a CLONE of
-            // `accepted` so we can see the post-merge path WITHOUT mutating
-            // real state. If the rename would land on a path already owned by
-            // another doc, refuse — mirrors `accept_pending`'s pre-check
-            // (mod.rs ~line 650). Without this, `repoint_doc` would silently
-            // steal the path mapping from the existing doc and `write_md_file`
-            // would overwrite its `.md` on disk
-            // (bug-sync-remote-rename-overwrites-collision).
-            {
-                let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-                let prev_path = doc::meta_string(&state.accepted, "path");
-                let preview = doc::clone_doc(&state.accepted);
-                doc::apply_update(&preview, doc_id, update)?;
-                let preview_path = doc::meta_string(&preview, "path");
-                if let Some(new_path) = preview_path
-                    && prev_path.as_deref() != Some(new_path.as_str())
-                    && meta::doc_id_for_path(&inner.index, &new_path)?
-                        .is_some_and(|other| other != doc_id)
-                {
-                    return Err(Error::Anchor(format!(
-                        "remote rename target already occupied: {new_path}"
-                    )));
-                }
-            }
-            let (advanced, client_id, lo, hi, hash, rel_path, prev_path, prev_tombstone, materialized) = {
-                let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-                // Capture the full SV before applying so we can both record the
-                // peer's gained clock range (per-client SV diff — the local
-                // cid's clock never advances on a peer-authored update, so the
-                // recorded range must be the *peer's* cid + its actual advance)
-                // and (below) encode exactly the ops the update introduced for
-                // the `working` mirror.
-                let before_sv = doc::state_vector(&state.accepted);
-                // The tombstone flag BEFORE the merge: a remote delta can carry
-                // a peer-side tombstone op on the shared lineage. Comparing this
-                // against the post-merge flag detects the *transition* to deleted
-                // (not a re-applied/idempotent tombstone), which is the only case
-                // that must move the still-present local `.md` to trash.
-                // status: op-log-external-edit-sync
-                let prev_tombstone = doc::materialize(&state.accepted).tombstone;
-                // The path BEFORE the merge: a remote delta can carry a peer-side
-                // rename (a `meta.path` op on the shared lineage), so we compare
-                // this against the post-merge path to detect a rename that must
-                // repoint `doc-index.db` (the `.md` write alone leaves the path
-                // index stale, so a later manifest match by the new path would
-                // mint a SECOND doc — content duplication).
-                let prev_path = doc::meta_string(&state.accepted, "path");
-                // The accepted text BEFORE the merge — the common base for the
-                // `working` overlay reconciliation below, and (gated on canvas
-                // kind) the digit-run corruption probe.
-                let before_text = doc::materialize(&state.accepted).text;
-                // Canvas-corruption probe: for a `.canvas` doc (numeric-dense
-                // JSON-as-Y.Text), snapshot the longest digit run BEFORE applying
-                // the peer's update so we can warn if the apply lengthens it — the
-                // cross-lineage interleave signature. Gated on kind so notes (which
-                // legitimately hold long digit runs: timestamps, ids) never probe.
-                // [sync-canvas-corruption-probe]
-                let canvas_before_run = (doc::meta_string(&state.accepted, "kind").as_deref()
-                    == Some("canvas"))
-                .then(|| longest_digit_run(&before_text));
-                doc::apply_update(&state.accepted, doc_id, update)?;
-                let after_sv = doc::state_vector(&state.accepted);
-                // A no-op (already-known ops) leaves the SV unchanged — nothing
-                // to persist, so return early without touching disk.
-                if after_sv == before_sv {
-                    (false, 0, 0, 0, String::new(), None, None, prev_tombstone, doc::materialize(&state.accepted))
-                } else {
-                    // The dominant cid that advanced — fixes
-                    // `bug-sync-clock-range-records-local-cid`.
-                    let (client_id, lo, hi) = doc::dominant_advance(&before_sv, &after_sv)
-                        .expect("SV changed but no client advanced");
-                    // Reconcile the user's uncommitted overlay (`working`) so the
-                    // editable buffer stays `accepted + local divergence`. We do a
-                    // TEXT-level three-way merge, NOT a Yrs `apply_update` of the
-                    // peer delta onto `working`: `working` holds locally-authored
-                    // edits the accepted-level same-region gate can't see (they're
-                    // uncommitted), so a peer edit that DUPLICATES one of them (same
-                    // content, different client id) would be kept by Yrs ALONGSIDE
-                    // it — doubling the buffer (the dirty-buffer-sync corruption).
-                    // `three_way_merge` dedupes the identical twin and shifts a
-                    // genuine disjoint edit, matching the on-disk `accepted`; a real
-                    // same-region conflict drops to the peer's content there. The
-                    // result lands as a localized diff so the reverse binding maps
-                    // the cursor through it. Best-effort: a failed reconcile leaves
-                    // `working` as-is (disk `.md` is `materialize(accepted)`).
-                    if let Some(working) = &state.working {
-                        let old_working = doc::materialize(working).text;
-                        let new_accepted = doc::materialize(&state.accepted).text;
-                        let merged = doc::three_way_merge(&before_text, &old_working, &new_accepted);
-                        if merged != old_working {
-                            let spans = doc::multi_span_delta(&old_working, &merged);
-                            doc::apply_replaces(working, &spans);
-                        }
-                    }
-                    let rel_path = doc::meta_string(&state.accepted, "path");
-                    let materialized = doc::materialize(&state.accepted);
-                    // Canvas-corruption probe: a healthy delta never lengthens a
-                    // digit run; if this remote apply did on a canvas doc, the two
-                    // replicas are almost certainly on DISJOINT Yrs lineages and
-                    // the positional merge interleaved their near-identical numeric
-                    // JSON. Warn (never error / never change behavior) so it's
-                    // caught in the field. [sync-canvas-corruption-probe]
-                    if let Some(before_run) = canvas_before_run {
-                        let after_run = longest_digit_run(&materialized.text);
-                        // A legit large coordinate can be ~6 digits; an 8+ digit
-                        // run that the apply GREW is near-certainly interleave.
-                        if after_run > before_run && after_run >= 8 {
-                            tracing::warn!(
-                                target: "hiker::sync",
-                                doc_id,
-                                peer = %device_id,
-                                path = rel_path.as_deref().unwrap_or("?"),
-                                before_run,
-                                after_run,
-                                bytes = materialized.text.len(),
-                                "sync: a remote delta apply LENGTHENED a digit run in a canvas doc \
-                                 ({before_run}->{after_run}) — cross-lineage interleave (the canvas \
-                                 corruption). This doc and {device_id} are on disjoint Yrs lineages; \
-                                 the bound-doc delta path should not have run."
-                            );
-                        }
-                    }
-                    // Persist the Yrs delta before the metadata row that
-                    // references its clock range (op-log-atomic-write step 2/3).
-                    Self::persist_accepted(&self.oplog_dir, doc_id, state)?;
-                    Self::retain_frame(
-                        &self.oplog_dir, doc_id, state, op_id.clone(),
-                        &materialized.text, materialized.tombstone, now,
-                    )?;
-                    (
-                        true,
-                        client_id,
-                        lo,
-                        hi,
-                        super::content_hash(&materialized.text),
-                        rel_path,
-                        prev_path,
-                        prev_tombstone,
-                        materialized,
-                    )
-                }
-            };
-            if !advanced {
-                return Ok((false, None));
-            }
-            // If the merged update carried a peer-side rename, the doc's
-            // `meta.path` moved. Repoint `doc-index.db` so `doc_id_for_path`
-            // resolves the NEW path to THIS same doc — otherwise a later
-            // manifest path-match would mint a second doc for the same content.
-            // Lineage-safe: this only updates the path→doc_id mapping for the
-            // doc that already owns the rename op on the shared lineage; it
-            // never binds across lineages. The old path's row is dropped by
-            // `repoint_doc` so a fresh note can later reuse it.
-            if let Some(new_path) = &rel_path
-                && prev_path.as_deref() != Some(new_path.as_str())
-            {
-                meta::repoint_doc(&inner.index, doc_id, new_path)?;
-            }
-            // A received update is one logical `Replace` authored by the peer
-            // device (an opaque positional edit, so `anchor: None`). Its clock
-            // range is the span gained on this doc's client id; the side stream
-            // merges rows by range per `op-log-multi-device-sync`.
-            meta::insert_metadata(
-                &inner.meta,
-                &meta::MetadataInsert {
+        let peer_text = String::from_utf8(peer_bytes.to_vec())
+            .map_err(|e| Error::Anchor(format!("remote update is not UTF-8 text: {e}")))?;
+        let ours = self.materialize_accepted(doc_id)?;
+
+        // A converged delete: both sides tombstoned. Idempotent no-op (no
+        // transition, nothing to trash again).
+        if peer_tombstone && ours.tombstone {
+            return Ok(false);
+        }
+        // A fast-forward delete: the peer deleted a version we hold and we did
+        // not concurrently edit (the delete-vs-edit gate already classified a
+        // concurrent edit as a conflict and blocked it). Tombstone our doc as a
+        // `sync:<device>` op and move the lingering `.md` to trash — a
+        // recoverable transition.
+        if peer_tombstone && !ours.tombstone {
+            return self.apply_sync_tombstone(doc_id, device_id);
+        }
+
+        // Live merge. Recover the content-hash merge-base exactly as the gates
+        // do; with no shared base, fall back to `ours` (→ fast-forward to the
+        // peer's text). A peer text equal to ours is a no-op.
+        let base = self.merge_base_text(doc_id, peer_hashes)?.unwrap_or_else(|| ours.text.clone());
+        let is_canvas = doc::kind_for(doc_id) == "canvas";
+        let merged = crate::merge::three_way_merge(&base, &ours.text, &peer_text);
+        // Canvas-corruption probe: a healthy text merge never produces a digit
+        // run longer than either input held; if it does on a canvas doc, the
+        // positional re-application spliced numeric tokens. Warn only — behavior
+        // is unchanged. [sync-canvas-corruption-probe]
+        if is_canvas {
+            let merged_run = longest_digit_run(&merged);
+            let input_run = longest_digit_run(&ours.text).max(longest_digit_run(&peer_text));
+            if merged_run > input_run && merged_run >= 8 {
+                tracing::warn!(
+                    target: "hiker::sync",
                     doc_id,
-                    op_id: &op_id,
-                    yrs_client_id: client_id,
-                    yrs_clock_lo: lo,
-                    yrs_clock_hi: hi,
-                    author: &super::shapes::Author::Sync(device_id.to_string()),
-                    op_kind: &super::shapes::OpKind::Replace { anchor: None },
-                    status: meta::OpStatus::Accepted,
-                    timestamp_ms: now,
-                    content_hash: Some(&hash),
-                    surface: Some("sync"),
-                    session_id: None,
-                    batch_id: None,
-                    metadata: &serde_json::Value::Null,
-                },
-            )?;
-            // Step 4: the `.md` is the projection of `accepted`. For a
-            // tombstoned doc this writes nothing (the projection of a deleted
-            // doc is "no file") — the still-present local `.md` is removed by
-            // the trash move below, NOT by `write_md_file`. For a non-tombstone
-            // (incl. a remote resurrect: was-tombstoned → now-live) it writes
-            // the file, so an un-delete is never stranded.
-            super::write_md_file(&self.oplog_dir, rel_path.as_deref(), &materialized)?;
-            // A remote tombstone *transition* on a path-bound doc: capture the
-            // bytes + path so the caller can move the lingering `.md` to trash
-            // after the lock. Only the live → deleted transition qualifies — a
-            // re-applied tombstone (already `prev_tombstone`) is a no-op here,
-            // so an idempotent re-delete never double-trashes.
-            // status: op-log-external-edit-sync
-            let pending_trash = match (&rel_path, prev_tombstone, materialized.tombstone) {
-                (Some(rel), false, true) => Some(RemoteDeleteToTrash {
-                    rel: rel.clone(),
-                    content: materialized.text.clone(),
-                    doc_id: doc_id.to_string(),
-                }),
-                _ => None,
-            };
-            Ok((true, pending_trash))
+                    peer = %device_id,
+                    input_run,
+                    merged_run,
+                    "sync: a remote text merge LENGTHENED a digit run in a canvas doc \
+                     ({input_run}->{merged_run}) — positional interleave (the canvas corruption)."
+                );
+            }
+        }
+        // Land the merged text through the shared commit path, authored
+        // `sync:<device>`. This persists the `.ops` frame and the `.md`
+        // atomically, mirrors onto the `working` overlay, and clears a tombstone if the
+        // merged text resurrects a deleted doc. Returns false on an identical
+        // no-op (e.g. a re-sent fast-forward we already hold).
+        self.commit_text_edit(
+            doc_id,
+            super::EditInput::FullText(&merged),
+            &super::shapes::Author::Sync(device_id.to_string()),
+            Some("sync"),
+        )
+    }
+
+    /// The content-hash merge-base text for `(doc_id, peer_hashes)`: the most
+    /// recent content whose hash appears in BOTH our `.ops` history and the
+    /// peer's recent window, reconstructed via [`materialize_at`](Self::materialize_at)
+    /// — the same base [`same_region_verdict`](Self::same_region_verdict) uses.
+    /// `None` when there is no reconstructable shared base (the fork / no-hashes
+    /// case; the caller falls back to `ours`).
+    fn merge_base_text(
+        &self,
+        doc_id: &str,
+        peer_hashes: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>, Error> {
+        let base_op = self.locked(|inner| {
+            meta::most_recent_shared_op_id(&inner.index, doc_id, peer_hashes)
         })?;
-        // Outside the oplog lock: move the lingering `.md` to trash, referencing
-        // the `doc_id` so a later restore rebinds `path → doc_id` and recovers
-        // history — exactly like the offline-delete reconcile
-        // (`op_writes::reconcile_one_doc`) and unlike a one-way projection that
-        // would leave a stale ghost file that could be edited to resurrect the
-        // doc. Idempotent: a transition only fires once (re-applied tombstones
-        // carry `prev_tombstone = true`), and the move is a no-op when the file
-        // is already gone (already trashed on a prior apply).
+        let Some(base_op) = base_op else {
+            return Ok(None);
+        };
+        Ok(self.materialize_at(doc_id, &base_op)?.map(|c| c.text))
+    }
+
+    /// Tombstone `doc_id` as a `sync:<device>` op and move its lingering `.md`
+    /// to trash — the inbound fast-forward-delete landing. Mirrors
+    /// [`tombstone_document_to_trash`](Self::tombstone_document_to_trash) but
+    /// authored by the syncing device. Returns `true` (the delete advanced
+    /// state).
+    fn apply_sync_tombstone(&self, doc_id: &str, device_id: &str) -> Result<bool, Error> {
+        // Capture the recoverable artifact (last-known text + path) under the
+        // lock while the doc is still live, then tombstone (its own lock), then
+        // the fs trash move runs outside the lock — the same staged shape
+        // `tombstone_document_to_trash` uses.
+        let pending_trash = self.locked(|inner| {
+            let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
+            let materialized = state.accepted();
+            // The doc id IS the path (path-identity).
+            Ok(Some(RemoteDeleteToTrash {
+                rel: doc_id.to_string(),
+                content: materialized.text,
+                doc_id: doc_id.to_string(),
+            }))
+        })?;
+        self.tombstone_document(doc_id, &super::shapes::Author::Sync(device_id.to_string()))?;
         if let Some(t) = pending_trash {
             t.move_to_trash(super::vault_root_of(&self.oplog_dir))?;
         }
-        Ok(advanced)
+        Ok(true)
     }
 
-    /// Adopt a peer's canonical lineage at enrollment (`sync-lineage-adoption`).
+    /// Adopt a peer's canonical TEXT at first contact (`sync-lineage-adoption`),
+    /// PRESERVING our local divergence. The peer ships text, so "adoption" is a
+    /// 3-way TEXT merge over the shared pre-divergence seed — there is no base-blob
+    /// swap, no lineage tower:
     ///
-    /// Two independently-seeded Yrs Docs can never CRDT-merge into the intended
-    /// text: each lineage assigns its own client ids and clocks to the *same*
-    /// bytes, so a positional merge interleaves the two copies character-by-
-    /// character into nonsense rather than recognizing them as equal. So a
-    /// newly-bound device does not apply the peer's update onto its own Doc — it
-    /// *replaces* its lineage with the peer's canonical base, then re-expresses
-    /// only its local divergence as fresh `user` ops on that shared lineage:
-    ///
-    /// 1. read this doc's current local materialized text;
-    /// 2. swap `accepted` for a fresh Doc loaded from `canonical_state` (the
-    ///    peer's full v2 base) and persist it as the new `.yrs` base;
-    /// 3. three-way merge our local divergence onto the canonical text over the
-    ///    common pre-divergence ancestor (our `.ops` history's first keyframe —
-    ///    the seed both lineages shared at path-match), then commit the merged
-    ///    text through the whole-file commit path ([`apply_user_text`] →
-    ///    `commit_text_edit`) as `user` ops on the canonical lineage. Disjoint
-    ///    edits both survive; an overlap resolves to the canonical content. The
-    ///    adopting device's pre-binding op history collapses into that one
-    ///    reconciliation. (A naive canonical→local diff can't preserve the
-    ///    peer's divergence — it would revert it — so the three-way merge over
-    ///    the shared seed is what keeps both sides.)
-    ///
-    /// The non-reentrant lock forces two hops: swap + persist the base under one
-    /// `locked`, then let `commit_text_edit` take its own lock for the reconcile
-    /// (the same multi-hop discipline [`commit_working`] uses).
+    /// 1. read our effective local text (the `working` overlay if present, else
+    ///    `accepted`) as `ours` — uncommitted typing must flow into the merge;
+    /// 2. recover the shared seed (our `.ops` history's first keyframe — the
+    ///    content both devices started from at path-match) as `base`; with none,
+    ///    fall back to `ours` (so the merge keeps the full local text);
+    /// 3. `merged = three_way_merge(base, ours, theirs=canonical_text)` and
+    ///    commit it through the whole-file path ([`commit_text_edit`]) as `user`
+    ///    ops on the text `accepted`. Disjoint edits both survive; an
+    ///    overlap resolves to the canonical (peer) content; a fast-forward /
+    ///    identical content is a no-op.
     ///
     /// status: op-log-multi-device-sync
+    /// status: op-log-sync-substrate
     /// status: op-log-atomic-write
-    pub fn adopt_lineage(&self, doc_id: &str, canonical_state: &[u8]) -> Result<(), Error> {
-        // Hop 1: capture our local text + the shared pre-divergence seed, swap
-        // the lineage to the peer's canonical base, persist it, and compute the
-        // merged text. A fresh keyframe re-anchors the `.ops` chain on the next
-        // commit.
-        let merged = self.locked(|inner| {
+    pub fn adopt_lineage(&self, doc_id: &str, canonical_text: &[u8]) -> Result<(), Error> {
+        let canonical_text = String::from_utf8(canonical_text.to_vec())
+            .map_err(|e| Error::Anchor(format!("adopt_lineage canonical is not UTF-8 text: {e}")))?;
+        // Capture our effective local text (working overlay if dirty, else
+        // accepted) and the shared pre-divergence seed under one lock; the merge
+        // + commit run on their own locks (non-reentrant discipline).
+        let is_canvas = doc::kind_for(doc_id) == "canvas";
+        let (local_text, base_text) = self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            // Mirror `materialize_working`: the user's effective local text is
-            // the working overlay if present, else accepted. Reading only
-            // accepted here would silently discard uncommitted typing — the
-            // working edits must flow into the three-way merge as `ours`.
-            let local_doc = state.working.as_ref().unwrap_or(&state.accepted);
-            let local_text = doc::materialize(local_doc).text;
-            // The common ancestor: our lineage's first retained history frame is
-            // a self-contained keyframe of the seed both devices started from.
-            // Falling back to the local text means "no recoverable seed" → treat
-            // local as its own base, so the merge keeps the full local text.
+            let local_text = state.working_text().to_string();
+            // The shared seed: our `.ops` chain's first retained keyframe. No
+            // recoverable seed → treat local as its own base (keep all of ours).
             let base_text = super::store::load_ops(&self.oplog_dir, doc_id)?
                 .first()
                 .map(|frame| frame.decode(""))
                 .transpose()?
                 .unwrap_or_else(|| local_text.clone());
-            // Load the peer's base into a fresh Doc and make it canonical.
-            let adopted = doc::load_doc(doc_id, canonical_state)?;
-            let canonical_text = doc::materialize(&adopted).text;
-            let is_canvas = doc::meta_string(&adopted, "kind").as_deref() == Some("canvas");
-            // Rewrite the `.yrs` base to the adopted lineage (atomic), and clear
-            // the `.yrslog`: the old deltas belong to the abandoned lineage and
-            // must not replay onto the new base.
-            super::store::save_yrs(&self.oplog_dir, doc_id, &doc::encode_full(&adopted))?;
-            super::store::clear_yrslog(&self.oplog_dir, doc_id)?;
-            // Swap the in-memory state to the adopted lineage. `working` is
-            // dropped: any uncommitted edits are part of `local_text` and fold
-            // back in via the merge. `persisted_sv` matches the just-written
-            // base; the next history frame is forced to a keyframe.
-            state.accepted = adopted;
-            state.working = None;
-            state.persisted_sv = doc::state_vector(&state.accepted);
-            state.last_retained_text = None;
-            state.deltas_since_keyframe = 0;
-            // Three-way merge: canonical (peer) is the new base, our divergence
-            // re-applied on top over the shared seed.
-            let merged = doc::three_way_merge(&base_text, &local_text, &canonical_text);
-            // Canvas-corruption probe: the text-level 3-way merge should never
-            // produce a digit run longer than either input held; if it does on a
-            // canvas doc, the divergence re-application spliced numeric tokens.
-            // Warn only — behavior is unchanged. [sync-canvas-corruption-probe]
-            if is_canvas {
-                let merged_run = longest_digit_run(&merged);
-                let input_run = longest_digit_run(&local_text).max(longest_digit_run(&canonical_text));
-                if merged_run > input_run && merged_run >= 8 {
-                    tracing::warn!(
-                        target: "hiker::sync",
-                        doc_id,
-                        input_run,
-                        merged_run,
-                        "sync: lineage-adoption 3-way merge LENGTHENED a digit run in a canvas doc \
-                         ({input_run}->{merged_run}) — the divergence re-application spliced numeric \
-                         tokens during fork/adoption reconcile."
-                    );
-                }
-            }
-            Ok(merged)
+            Ok((local_text, base_text))
         })?;
-        // Hop 2: reconcile by committing the merged text. The whole-file commit
-        // diffs it against the now-canonical `accepted` and lands the difference
-        // as `user` ops (persisting `.yrs` delta, the metadata row, history
-        // frame, and `.md` atomically). When the merge equals canonical (a pure
-        // fast-forward or identical content) this is a no-op.
+        let merged = crate::merge::three_way_merge(&base_text, &local_text, &canonical_text);
+        // Canvas-corruption probe: a healthy 3-way merge never grows a digit run
+        // past either input's; on a canvas doc that signals a numeric splice.
+        // Warn only. [sync-canvas-corruption-probe]
+        if is_canvas {
+            let merged_run = longest_digit_run(&merged);
+            let input_run = longest_digit_run(&local_text).max(longest_digit_run(&canonical_text));
+            if merged_run > input_run && merged_run >= 8 {
+                tracing::warn!(
+                    target: "hiker::sync",
+                    doc_id,
+                    input_run,
+                    merged_run,
+                    "sync: lineage-adoption 3-way merge LENGTHENED a digit run in a canvas doc \
+                     ({input_run}->{merged_run}) — the divergence re-application spliced numeric \
+                     tokens during fork/adoption reconcile."
+                );
+            }
+        }
+        // Commit the merged text as `user` ops; a fast-forward / identical
+        // content is a no-op. This also reconciles `working` and rewrites `.md`.
         self.commit_text_edit(doc_id, super::EditInput::FullText(&merged), &super::shapes::Author::User, None)?;
         Ok(())
     }
@@ -641,14 +504,14 @@ impl OpLog {
         // tombstone, under the lock, while the doc is still live.
         let pending_trash = self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let materialized = doc::materialize(&state.accepted);
+            let materialized = state.accepted();
             if materialized.tombstone {
                 // Already deleted — nothing to trash.
                 return Ok(None);
             }
-            let rel = doc::meta_string(&state.accepted, "path");
-            Ok(rel.map(|rel| RemoteDeleteToTrash {
-                rel,
+            // The doc id IS the path (path-identity).
+            Ok(Some(RemoteDeleteToTrash {
+                rel: doc_id.to_string(),
                 content: materialized.text,
                 doc_id: doc_id.to_string(),
             }))
@@ -662,113 +525,62 @@ impl OpLog {
         Ok(())
     }
 
-    /// Adopt a peer's canonical lineage, DISCARDING this device's local
-    /// divergence — the "keep theirs" fork-resolution primitive. Unlike
-    /// [`adopt_lineage`] (which three-way-merges local edits back on top), this
-    /// replaces both the lineage AND the content with the peer's: after it the
-    /// doc materializes exactly the peer's `canonical_state`. Used when the user
-    /// has explicitly chosen the peer's version over their own, so the local
-    /// branch must not survive. The `.yrs` base is swapped atomically and the
-    /// stale `.yrslog` cleared, same as [`adopt_lineage`]; no reconciliation
-    /// commit is made because the adopted base already IS the desired content.
+    /// Adopt a peer's canonical TEXT wholesale, DISCARDING this device's local
+    /// divergence — the "keep theirs" fork-resolution primitive (also the
+    /// keep-deleted / keep-edit converge over `PushAdopt`). Unlike
+    /// [`adopt_lineage`] (which 3-way-merges local edits back on top), after this
+    /// the doc materializes exactly the peer's chosen version. The peer ships
+    /// text + a `tombstone` flag, so this is a plain whole-file
+    /// commit authored `sync:<device>` — no base-blob swap.
+    ///
+    /// When `tombstone` is set, the peer's chosen version is a DELETE
+    /// (keep-deleted): we tombstone the doc as a `sync:<device>` op and move the
+    /// lingering `.md` to trash (a no-op when we were already deleted). When
+    /// clear, we adopt the peer's live `canonical_text` (resurrecting a
+    /// tombstoned doc if the peer's version is live — keep-edit). A no-op when we
+    /// already hold the chosen state.
     ///
     /// status: op-log-multi-device-sync
+    /// status: op-log-sync-substrate
     /// status: op-log-atomic-write
     pub fn adopt_lineage_theirs(
         &self,
         doc_id: &str,
-        canonical_state: &[u8],
+        canonical_text: &[u8],
+        tombstone: bool,
         device_id: &str,
     ) -> Result<(), Error> {
-        let now = super::now_ms();
-        let pending_trash: Option<RemoteDeleteToTrash> = self.locked(|inner| {
-            let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            // The tombstone flag BEFORE the swap: adopting a tombstoned base over
-            // a previously-live doc is a delete transition that must move the
-            // lingering local `.md` to trash, exactly like `apply_remote_update`.
-            // This is the keep-deleted convergence path — the peer adopts our
-            // tombstoned base via `PushAdopt` and its ghost `.md` is trashed.
-            // status: sync-conflict-delete-vs-edit
-            let prev_tombstone = doc::materialize(&state.accepted).tombstone;
-            // Load the peer's base into a fresh Doc and make it canonical.
-            let adopted = doc::load_doc(doc_id, canonical_state)?;
-            let materialized = doc::materialize(&adopted);
-            let rel_path = doc::meta_string(&adopted, "path");
-            // The adopted lineage replaces local accepted wholesale, so the
-            // gained range is *everything* in canonical: per-client SV diff
-            // against an empty SV picks the dominant authoring cid (the peer
-            // who built this lineage), avoiding the
-            // `bug-sync-clock-range-records-local-cid` mistake of recording the
-            // local cid against a zero-width range.
-            let after_sv = doc::state_vector(&adopted);
-            let (cid, lo, hi) = doc::dominant_advance(&yrs::StateVector::default(), &after_sv)
-                .unwrap_or_else(|| (adopted.client_id().get() as i64, 0, 0));
-            // Rewrite the `.yrs` base to the adopted lineage (atomic), clearing
-            // the `.yrslog` so the abandoned lineage's deltas never replay.
-            super::store::save_yrs(&self.oplog_dir, doc_id, &doc::encode_full(&adopted))?;
-            super::store::clear_yrslog(&self.oplog_dir, doc_id)?;
-            // Swap in the adopted lineage and drop any local divergence: the
-            // user chose theirs, so the local branch is gone. Force the next
-            // history frame to a keyframe of the adopted content.
-            state.accepted = adopted;
-            state.working = None;
-            state.persisted_sv = doc::state_vector(&state.accepted);
-            state.last_retained_text = None;
-            state.deltas_since_keyframe = 0;
-            // Retain a fresh keyframe + rewrite the `.md` so the projection and
-            // history reflect the adopted content (the same persistence tail
-            // `apply_remote_update` runs after it advances state).
-            let op_id = ulid::Ulid::new().to_string();
-            Self::retain_frame(
-                &self.oplog_dir,
-                doc_id,
-                state,
-                op_id.clone(),
-                &materialized.text,
-                materialized.tombstone,
-                now,
-            )?;
-            // Record the adoption as one `sync:<device>`-authored op so the
-            // resolved content shows in history with its provenance.
-            meta::insert_metadata(
-                &inner.meta,
-                &meta::MetadataInsert {
-                    doc_id,
-                    op_id: &op_id,
-                    yrs_client_id: cid,
-                    yrs_clock_lo: lo,
-                    yrs_clock_hi: hi,
-                    author: &super::shapes::Author::Sync(device_id.to_string()),
-                    op_kind: &super::shapes::OpKind::Replace { anchor: None },
-                    status: meta::OpStatus::Accepted,
-                    timestamp_ms: now,
-                    content_hash: Some(&super::content_hash(&materialized.text)),
-                    surface: Some("sync"),
-                    session_id: None,
-                    batch_id: None,
-                    metadata: &serde_json::Value::Null,
-                },
-            )?;
-            super::write_md_file(&self.oplog_dir, rel_path.as_deref(), &materialized)?;
-            // A live → deleted transition on a path-bound doc: capture the
-            // bytes + path so the lingering `.md` is trashed after the lock,
-            // mirroring `apply_remote_update`. Only fires on the transition, so
-            // adopting an already-tombstoned base over a tombstoned doc is a
-            // no-op here (no double-trash).
-            // status: sync-conflict-delete-vs-edit
-            let pending_trash = match (&rel_path, prev_tombstone, materialized.tombstone) {
-                (Some(rel), false, true) => Some(RemoteDeleteToTrash {
-                    rel: rel.clone(),
-                    content: materialized.text.clone(),
-                    doc_id: doc_id.to_string(),
-                }),
-                _ => None,
-            };
-            Ok(pending_trash)
+        let canonical_text = String::from_utf8(canonical_text.to_vec()).map_err(|e| {
+            Error::Anchor(format!("adopt_lineage_theirs canonical is not UTF-8 text: {e}"))
         })?;
-        if let Some(t) = pending_trash {
-            t.move_to_trash(super::vault_root_of(&self.oplog_dir))?;
+        // A keep-deleted converge: adopt the peer's DELETE. First adopt the
+        // peer's last-known text (so both sides' recoverable artifact matches —
+        // the deleted doc converges on ONE last-known content, not two), then
+        // tombstone our doc as a `sync:<device>` op and trash the lingering
+        // `.md`. Idempotent: a no-op when we were already tombstoned.
+        if tombstone {
+            if self.materialize_accepted(doc_id)?.tombstone {
+                return Ok(());
+            }
+            self.commit_text_edit(
+                doc_id,
+                super::EditInput::FullText(&canonical_text),
+                &super::shapes::Author::Sync(device_id.to_string()),
+                Some("sync"),
+            )?;
+            self.apply_sync_tombstone(doc_id, device_id)?;
+            return Ok(());
         }
+        // Commit the peer's live text wholesale, dropping any local divergence:
+        // the `commit_text_edit` diff against our current `accepted` collapses
+        // our branch into the peer's content and resurrects a tombstoned doc if
+        // the peer's chosen version is live. A no-op when we already hold it.
+        self.commit_text_edit(
+            doc_id,
+            super::EditInput::FullText(&canonical_text),
+            &super::shapes::Author::Sync(device_id.to_string()),
+            Some("sync"),
+        )?;
         Ok(())
     }
 }
@@ -780,7 +592,7 @@ impl OpLog {
 /// (`core::ops::op_writes::reconcile_one_doc`): the recoverable artifact is the
 /// document's last known content (`materialize(accepted).text`), the entry
 /// references the `doc_id` so restore rebinds `path → doc_id` and recovers
-/// history, and the Yrs state/history is retained keyed by `doc_id` rather than
+/// history, and the `.ops` history is retained keyed by `doc_id` rather than
 /// purged.
 struct RemoteDeleteToTrash {
     rel: String,

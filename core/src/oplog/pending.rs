@@ -6,19 +6,22 @@
 //! alongside `OpLog` in `mod.rs` and reach it through `super::`.
 
 use super::doc;
+use super::overlay;
+use super::shapes;
 use super::store;
+use super::store::{FrameMeta, FrameSpec};
 use super::meta;
 use super::{
-    content_hash, durable_metadata, now_ms, remove_old_md_file, write_md_file,
-    EditSpec, Error, OpKind, OpStatus, PendingOp, ProducerCtx, StageOutcome,
+    durable_metadata, now_ms, remove_old_md_file, write_md_file,
+    EditSpec, Error, OpKind, PendingOp, ProducerCtx, StageOutcome,
 };
 
 impl super::OpLog {
-    /// Stage a batch of producer edits as pending ops. Each edit is
-    /// translated to a serialized Yrs update against a clone of `accepted`
-    /// (the clone is discarded) and queued in `<doc-id>.pending`. No side-
-    /// table row is written yet — pending ops have no Yrs clock range until
-    /// they land in `accepted` on accept.
+    /// Stage a batch of producer edits as pending ops. Each edit is recorded
+    /// as a text edit (its `old_str`/`new_str` and a typed `op_kind` resolved
+    /// against the session's pending view) and queued in `<doc-id>.pending`. No
+    /// side-table row is written yet — pending ops are not in `accepted` until
+    /// they land there on accept.
     ///
     /// status: op-log-pending-queue
     /// status: op-log-agent-replica
@@ -33,27 +36,26 @@ impl super::OpLog {
         let mut op_ids = Vec::with_capacity(edits.len());
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            // Produce edits against this session's *pending view* (accepted +
+            // Resolve edits against this session's *pending view* (accepted +
             // the session's own queued ops), not bare `accepted`, so a follow-up
             // edit can anchor on (or diff against) content the agent staged in a
             // prior, not-yet-accepted edit — the `op-log-agent-replica` contract
-            // `get_note` already reads through. Each op's update is a delta
-            // against this view; `materialize_pending_view` applies the session's
-            // ops in order, so they compose. Built once before the loop: within
-            // one call every edit resolves against the pre-call view, matching
-            // the producer's own per-edit anchor validation.
-            let base_doc = doc::clone_doc(&state.accepted);
-            for op in &state.pending {
-                if op.session_id == ctx.session_id {
-                    let _ = doc::apply_update(&base_doc, doc_id, &op.yrs_update);
-                }
-            }
+            // `get_note` already reads through. Built once before the loop:
+            // within one call every edit resolves against the pre-call view,
+            // matching the producer's own per-edit anchor validation.
+            let accepted_text = state.accepted.clone();
+            let session_text = overlay::fold_session_text(
+                &accepted_text,
+                &state.pending,
+                ctx.session_id.as_deref(),
+                |_| false,
+            );
             // Session-id-matching pending op ids that were folded into
-            // `base_doc`. When the fallback path fires for an edit, the
-            // produced update implicitly depends on these — recorded on the
-            // op so `accept_pending` can refuse a cross-op accept that would
-            // drift. Computed once: the pending queue doesn't grow during
-            // this loop (we push only after the loop assembles each op).
+            // `session_text`. When the fallback path fires for an edit, the
+            // produced edit implicitly depends on these — recorded on the op so
+            // `accept_pending` can refuse a cross-op accept that would drift.
+            // Computed once: the pending queue doesn't grow during this loop (we
+            // push only after the loop assembles each op).
             let session_predecessors: Vec<String> = state
                 .pending
                 .iter()
@@ -62,31 +64,61 @@ impl super::OpLog {
                 .collect();
             for edit in edits {
                 // `used_fallback` flags edits whose anchor wasn't in bare
-                // `accepted`, so the encoded Yrs update references positions
-                // the session's prior pending ops establish.
-                let (produced, used_fallback) = match &edit.old_str {
+                // `accepted`, so the edit references positions the session's
+                // prior pending ops establish.
+                let (op_kind, used_fallback) = match &edit.old_str {
                     // Prefer resolving the anchor against `accepted` so an
                     // independent edit stays a standalone op (per-hunk
                     // accept/reject keeps working). Fall back to the session's
                     // pending view only when the anchor isn't in `accepted` —
                     // a follow-up edit anchored on the agent's own staged-but-
                     // unaccepted content.
-                    Some(old_str) => match doc::produce_replace(&state.accepted, old_str, &edit.new_str) {
-                        Ok(produced) => (produced, false),
-                        Err(_) => (doc::produce_replace(&base_doc, old_str, &edit.new_str)?, true),
-                    },
+                    Some(old_str) => {
+                        let (base_text, start, used_fallback) =
+                            match doc::resolve_anchor(&accepted_text, old_str) {
+                                Ok(start) => (&accepted_text, start, false),
+                                Err(_) => {
+                                    let start = doc::resolve_anchor(&session_text, old_str)?;
+                                    (&session_text, start, true)
+                                }
+                            };
+                        let op_kind = if shapes::is_frontmatter_range(
+                            base_text,
+                            start,
+                            start + old_str.len(),
+                        ) {
+                            OpKind::SetFrontmatter
+                        } else {
+                            OpKind::Replace {
+                                anchor: Some(shapes::AnchorHint::from_old_str(old_str)),
+                            }
+                        };
+                        (op_kind, used_fallback)
+                    }
                     // A whole-document rewrite (`write_note` / `set_frontmatter`
                     // / `apply_tag`): `new_str` is the full new file. Diff it
                     // against the pending view so the op replaces the whole
                     // `text` — never appends after the existing frontmatter
                     // fence (which would duplicate the frontmatter). An
                     // unchanged rewrite produces no op. The diff is against
-                    // `base_doc` (pending view), so the op depends on the
+                    // `session_text` (pending view), so the op depends on the
                     // session's prior pending ops whenever any exist.
-                    None => match doc::produce_content_replace(&base_doc, &edit.new_str) {
-                        Some(produced) => (produced, !session_predecessors.is_empty()),
-                        None => continue,
-                    },
+                    None => {
+                        if session_text == edit.new_str {
+                            continue;
+                        }
+                        let (start, removed, _) = crate::merge::text_delta(&session_text, &edit.new_str);
+                        let op_kind = if shapes::is_frontmatter_range(
+                            &session_text,
+                            start,
+                            start + removed,
+                        ) {
+                            OpKind::SetFrontmatter
+                        } else {
+                            OpKind::Replace { anchor: None }
+                        };
+                        (op_kind, !session_predecessors.is_empty())
+                    }
                 };
                 let op_id = ulid::Ulid::new().to_string();
                 op_ids.push(op_id.clone());
@@ -97,8 +129,7 @@ impl super::OpLog {
                 };
                 state.pending.push(PendingOp {
                     op_id,
-                    yrs_update: produced.yrs_update,
-                    op_kind: produced.op_kind,
+                    op_kind,
                     author: ctx.author.clone(),
                     session_id: ctx.session_id.clone(),
                     surface: ctx.surface.clone(),
@@ -136,15 +167,21 @@ impl super::OpLog {
         let mut op_ids = Vec::new();
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let Some(produced) = doc::produce_content_replace(&state.accepted, new_text) else {
+            let base = state.accepted.clone();
+            if base == new_text {
                 return Ok(());
+            }
+            let (start, removed, _) = crate::merge::text_delta(&base, new_text);
+            let op_kind = if shapes::is_frontmatter_range(&base, start, start + removed) {
+                OpKind::SetFrontmatter
+            } else {
+                OpKind::Replace { anchor: None }
             };
             let op_id = ulid::Ulid::new().to_string();
             op_ids.push(op_id.clone());
             state.pending.push(PendingOp {
                 op_id,
-                yrs_update: produced.yrs_update,
-                op_kind: produced.op_kind,
+                op_kind,
                 author: ctx.author.clone(),
                 session_id: ctx.session_id.clone(),
                 surface: ctx.surface.clone(),
@@ -182,12 +219,14 @@ impl super::OpLog {
         for (doc_id, new_path) in renames {
             let op_id = ulid::Ulid::new().to_string();
             self.locked(|inner| {
-                let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-                let produced = doc::produce_rename(&state.accepted, new_path);
+                // The doc id IS the path (path-identity), so a pending rename's
+                // `from` is the current doc_id.
+                Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
+                let from = doc_id.to_string();
+                let state = inner.docs.get_mut(doc_id).expect("just loaded");
                 state.pending.push(PendingOp {
                     op_id: op_id.clone(),
-                    yrs_update: produced.yrs_update,
-                    op_kind: produced.op_kind,
+                    op_kind: OpKind::Rename { from },
                     author: ctx.author.clone(),
                     session_id: ctx.session_id.clone(),
                     surface: ctx.surface.clone(),
@@ -244,8 +283,9 @@ impl super::OpLog {
     }
 
     /// Reject an entire reorg batch by `batch_id`: drop each pending op in the
-    /// batch from its document's queue (writing a `rejected` audit row). None
-    /// reach `accepted`. Returns the op ids that were rejected.
+    /// batch from its document's queue. None reach `accepted`, and rejection is
+    /// transient editorial state — no durable audit row (`op-log-no-oplog-db`).
+    /// Returns the op ids that were rejected.
     ///
     /// status: op-log-reorg-batch
     pub fn reject_batch(&self, batch_id: &str) -> Result<Vec<String>, Error> {
@@ -258,12 +298,12 @@ impl super::OpLog {
         Ok(rejected)
     }
 
-    /// Accept a pending op: apply its serialized update to `accepted`, write
-    /// an `accepted` side-table row, drop it from the queue, persist the
-    /// Yrs Doc and the materialized `.md`.
+    /// Accept a pending op: resolve its text edit into spans (or its rename)
+    /// and apply it to `accepted`, write an `accepted` side-table row, drop it
+    /// from the queue, append the `.ops` history frame and the materialized `.md`.
     ///
     /// A pending `Rename` op carries its prior path in `OpKind::Rename { from }`;
-    /// applying the update advances `meta.path` to the new location, so on
+    /// applying it advances `meta.path` to the new location, so on
     /// accept the doc's `.md` is written at the new path, the old `.md` is
     /// removed, and `doc-index.db` is repointed (old path dropped, new path
     /// upserted) — the file moves on disk per `op-log-reorg-batch`.
@@ -274,8 +314,8 @@ impl super::OpLog {
     pub fn accept_pending(&self, doc_id: &str, op_id: &str) -> Result<(), Error> {
         let now = now_ms();
         // Everything — the rename collision pre-check, applying the op to
-        // `accepted`, persisting `.yrs` / the metadata row / the history frame,
-        // repointing the path index, and the `.md` write/move — runs under one
+        // `accepted`, appending the `.ops` history frame, writing the metadata
+        // row, repointing the path index, and the `.md` write/move — runs under one
         // lock hold, so a concurrent writer can't interleave between the
         // in-memory mutation and its disk persistence (no lost update).
         self.locked(|inner| {
@@ -284,14 +324,13 @@ impl super::OpLog {
             // the failed op stays queued and a reorg batch's other moves still
             // apply (partial apply per `op-log-reorg-batch`).
             //
-            // The collision target is the path that results from APPLYING the
-            // Yrs update to a CLONE of `accepted` — NOT the op's
-            // `metadata["new_path"]` field. If those disagree (corrupted
-            // `.pending`, producer bug), trusting the metadata would repoint
-            // the index to one path while the `.md` is written at the
-            // post-apply Yrs path, desyncing the index from disk
-            // (bug-sync-accept-pending-trusts-metadata-newpath). Mirrors the
-            // clone-first pattern in `apply_remote_update` (sync.rs ~line 103).
+            // The collision target is the post-apply `meta.path` read off a
+            // CLONE of `accepted` after `apply_rename` — the same single source
+            // of truth (`metadata["new_path"]`) the real apply and the index
+            // repoint use below, so the index, the `.md` location, and
+            // `meta.path` can never disagree (bug-sync-accept-pending-trusts-
+            // metadata-newpath). Mirrors the clone-first collision pre-check in
+            // `apply_remote_update` (sync.rs).
             {
                 let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
                 let op = state
@@ -299,14 +338,14 @@ impl super::OpLog {
                     .iter()
                     .find(|p| p.op_id == op_id)
                     .ok_or_else(|| Error::UnknownPendingOp(op_id.to_string()))?;
-                // Cross-op dependency guard: the op's Yrs update was produced
+                // Cross-op dependency guard: the op's anchor was resolved
                 // against `accepted + listed predecessors` (the fallback path
                 // in `stage_pending`). Accepting now while any predecessor is
-                // still queued would land an update keyed on positions only
-                // the predecessor's apply establishes — silently corrupting
-                // `accepted` (the `bug-sync-per-hunk-accept-cross-op-deps`
-                // failure mode). Refuse with a clean signal that names the
-                // blockers; the caller accepts or rejects them first.
+                // still queued would resolve the anchor against content only
+                // the predecessor establishes — or fail to resolve and silently
+                // no-op (the `bug-sync-per-hunk-accept-cross-op-deps` failure
+                // mode). Refuse with a clean signal that names the blockers; the
+                // caller accepts or rejects them first.
                 let blockers: Vec<String> = op
                     .depends_on
                     .iter()
@@ -320,14 +359,12 @@ impl super::OpLog {
                     });
                 }
                 if matches!(op.op_kind, OpKind::Rename { .. }) {
-                    let prev_path = doc::meta_string(&state.accepted, "path");
-                    let preview = doc::clone_doc(&state.accepted);
-                    doc::apply_update(&preview, doc_id, &op.yrs_update)?;
-                    let preview_path = doc::meta_string(&preview, "path");
-                    if let Some(new_path) = preview_path
-                        && prev_path.as_deref() != Some(new_path.as_str())
-                        && meta::doc_id_for_path(&inner.index, &new_path)?
-                            .is_some_and(|other| other != doc_id)
+                    // Under path-identity the doc id IS the path, so a rename's
+                    // target is `metadata["new_path"]` directly (no Yrs meta).
+                    let new_path = op.metadata.get("new_path").and_then(|v| v.as_str());
+                    if let Some(new_path) = new_path
+                        && new_path != doc_id
+                        && store::ops_path(&self.oplog_dir, new_path).exists()
                     {
                         return Err(Error::Anchor(format!(
                             "rename target already occupied: {new_path}"
@@ -336,7 +373,7 @@ impl super::OpLog {
                 }
             }
             // Remove the op from the queue, apply it to `accepted`, materialize.
-            let (materialized, client_id, lo, hi, op, rel_path) = {
+            let (materialized, op, rel_path) = {
                 let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
                 let idx = state
                     .pending
@@ -344,75 +381,85 @@ impl super::OpLog {
                     .position(|p| p.op_id == op_id)
                     .ok_or_else(|| Error::UnknownPendingOp(op_id.to_string()))?;
                 let op = state.pending.remove(idx);
-                // The pending op was authored under a per-session client_id
-                // (the staged pending Doc's cid), NOT the local accepted cid —
-                // so a per-client SV diff records the actual (client_id, lo,
-                // hi) span the apply introduced. Fixes
-                // `bug-sync-clock-range-records-local-cid`.
-                let before_sv = doc::state_vector(&state.accepted);
-                doc::apply_update(&state.accepted, doc_id, &op.yrs_update)?;
-                // Replay the accepted op onto the user's uncommitted overlay
-                // too, so `working` stays equal to `accepted + the user's ops`.
-                // Without this the editable buffer (`materialize(accepted +
-                // working)`) would drop the just-accepted content. Best-effort:
-                // a drifted op simply doesn't contribute (the disk `.md` is
-                // `materialize(accepted)` regardless — `working` is never on disk).
-                if let Some(working) = &state.working {
-                    let _ = doc::apply_update(working, doc_id, &op.yrs_update);
+                // The post-apply path: a rename relabels the doc to `new_path`
+                // (path-identity); every other op keeps the current doc_id.
+                let mut rel_path = doc_id.to_string();
+                if matches!(op.op_kind, OpKind::Rename { .. }) {
+                    // A rename moves the document's path; no text effect.
+                    if let Some(np) = op.metadata.get("new_path").and_then(|v| v.as_str()) {
+                        rel_path = np.to_string();
+                    }
+                } else {
+                    // A text edit: resolve the op's spans against the accepted
+                    // text and splice them in.
+                    let spans = overlay::op_spans(&state.accepted, &op).unwrap_or_default();
+                    state.accepted = overlay::apply_spans_str(&state.accepted, &spans);
+                    // Replay the accepted op onto the user's uncommitted overlay
+                    // too, so `working` stays equal to `accepted + the user's
+                    // ops`. Without this the editable buffer (`accepted +
+                    // working`) would drop the just-accepted content.
+                    // Best-effort: a drifted op simply doesn't contribute (the
+                    // disk `.md` is `accepted` regardless — `working` is never on
+                    // disk).
+                    if let Some(working) = state.working.clone()
+                        && let Some(wspans) = overlay::op_spans(&working, &op)
+                    {
+                        state.working = Some(overlay::apply_spans_str(&working, &wspans));
+                    }
                 }
-                let after_sv = doc::state_vector(&state.accepted);
-                // A no-advance accept (e.g. an idempotent reapply) records the
-                // local cid with a zero-width range — semantically "nothing new
-                // landed", consistent with the side-table's per-row contract.
-                let (cid, lo, hi) = doc::dominant_advance(&before_sv, &after_sv)
-                    .unwrap_or_else(|| (state.accepted.client_id().get() as i64, 0, 0));
-                let materialized = doc::materialize(&state.accepted);
-                let rel_path = doc::meta_string(&state.accepted, "path");
+                let materialized = state.accepted();
                 store::save_pending(&self.oplog_dir, doc_id, &state.pending)?;
-                // Persist the Yrs delta before the metadata row that references
-                // its clock range, so a crash can't leave a row pointing at
-                // unpersisted state.
-                Self::persist_accepted(&self.oplog_dir, doc_id, state)?;
-                Self::retain_frame(
-                    &self.oplog_dir, doc_id, state, op.op_id.clone(),
-                    &materialized.text, materialized.tombstone, now,
-                )?;
-                (materialized, cid, lo, hi, op, rel_path)
+                (materialized, op, rel_path)
             };
-            // A Rename repoints the path index (atomically) so the `.md` move
-            // and later path resolution agree. The repoint target is the
-            // POST-APPLY Yrs `meta.path` (`rel_path`) — the same value used
-            // for the `.md` write below — so the index and the on-disk file
-            // can never desync, even if the op's `metadata["new_path"]` field
-            // is stale or corrupted
-            // (bug-sync-accept-pending-trusts-metadata-newpath).
-            if let (OpKind::Rename { .. }, Some(new_path)) = (&op.op_kind, &rel_path) {
-                meta::repoint_doc(&inner.index, doc_id, new_path)?;
+            // The `.ops` history frame is the durable persistence; it carries
+            // the op's self-describing metadata, and `retain_frame` appends the
+            // matching regenerable `op_history` row (keyed at the OLD doc_id —
+            // a rename relabel repoints it to the new path below).
+            let author_wire = op.author.as_wire();
+            let durable = durable_metadata(&op.metadata);
+            let rename_from = match &op.op_kind {
+                OpKind::Rename { from } => Some(from.as_str()),
+                _ => None,
+            };
+            {
+                let (index, state) = inner.index_and_state(&self.oplog_dir, doc_id)?;
+                Self::retain_frame(
+                    &self.oplog_dir, index, doc_id, state,
+                    &FrameSpec {
+                        op_id: &op.op_id,
+                        text: &materialized.text,
+                        tombstone: materialized.tombstone,
+                        timestamp_ms: now,
+                        meta: &FrameMeta {
+                            author: &author_wire,
+                            op_kind: op.op_kind.as_str(),
+                            rename_from,
+                            surface: Some(&op.surface),
+                            session_id: op.session_id.as_deref(),
+                            batch_id: op.batch_id.as_deref(),
+                            metadata: &durable,
+                        },
+                    },
+                )?;
             }
-            meta::insert_metadata(
-                &inner.meta,
-                &meta::MetadataInsert {
-                    doc_id,
-                    op_id: &op.op_id,
-                    yrs_client_id: client_id,
-                    yrs_clock_lo: lo,
-                    yrs_clock_hi: hi,
-                    author: &op.author,
-                    op_kind: &op.op_kind,
-                    status: OpStatus::Accepted,
-                    timestamp_ms: now,
-                    content_hash: Some(&content_hash(&materialized.text)),
-                    surface: Some(&op.surface),
-                    session_id: op.session_id.as_deref(),
-                    batch_id: op.batch_id.as_deref(),
-                    metadata: &durable_metadata(&op.metadata),
-                },
-            )?;
+            // A Rename relabels the document: the id IS the path, so relocate
+            // the path-keyed per-doc files, move the in-memory cache entry, and
+            // repoint the history rows from the old path to the new. The new id
+            // is `rel_path` — the same value used for the `.md` write below — so
+            // the substrate files and the on-disk `.md` can never desync.
+            // status: op-log-observed-move
+            if matches!(op.op_kind, OpKind::Rename { .. }) && rel_path.as_str() != doc_id {
+                store::move_doc_files(&self.oplog_dir, doc_id, &rel_path)?;
+                if let Some(state) = inner.docs.remove(doc_id) {
+                    inner.docs.insert(rel_path.clone(), state);
+                }
+                meta::repoint_metadata(&inner.index, doc_id, &rel_path)?;
+            }
             // Write the `.md` at the doc's (post-accept) path; a Rename also
             // removes the old file once the new one is written.
-            write_md_file(&self.oplog_dir, rel_path.as_deref(), &materialized)?;
+            write_md_file(&self.oplog_dir, Some(&rel_path), &materialized)?;
             if let OpKind::Rename { from } = &op.op_kind
-                && rel_path.as_deref() != Some(from.as_str())
+                && rel_path.as_str() != from.as_str()
             {
                 remove_old_md_file(&self.oplog_dir, from)?;
             }
@@ -420,59 +467,27 @@ impl super::OpLog {
         })
     }
 
-    /// Reject a pending op: drop it from the queue and write a `rejected`
-    /// audit row with the serialized update bytes stashed in the row's
-    /// metadata. The op never enters `accepted`.
+    /// Reject a pending op: drop it from the queue (and its `.pending`
+    /// persistence). The op never enters `accepted` and leaves NO durable
+    /// history row — a rejected pending edit is transient editorial state, not
+    /// committed history (`op-log-no-oplog-db`). The regenerable `op_history`
+    /// index rebuilds from `.ops` (accepted history only), so a rejected op —
+    /// which has no frame — is correctly absent. The rejection is observable via
+    /// the pending edit disappearing from the queue, not via a history row.
     ///
     /// status: op-log-status-states
+    /// status: op-log-no-oplog-db
     pub fn reject_pending(&self, doc_id: &str, op_id: &str) -> Result<(), Error> {
-        let now = now_ms();
-        let op = self.locked(|inner| {
+        self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
             let idx = state
                 .pending
                 .iter()
                 .position(|p| p.op_id == op_id)
                 .ok_or_else(|| Error::UnknownPendingOp(op_id.to_string()))?;
-            let op = state.pending.remove(idx);
+            state.pending.remove(idx);
             store::save_pending(&self.oplog_dir, doc_id, &state.pending)?;
-            Ok(op)
-        })?;
-        let mut metadata = op.metadata.clone();
-        if let serde_json::Value::Object(map) = &mut metadata {
-            map.insert(
-                "rejected_update".to_string(),
-                serde_json::Value::Array(
-                    op.yrs_update
-                        .iter()
-                        .map(|b| serde_json::Value::from(*b))
-                        .collect(),
-                ),
-            );
-        }
-        self.locked(|inner| {
-            meta::insert_metadata(
-                &inner.meta,
-                &meta::MetadataInsert {
-                    doc_id,
-                    op_id: &op.op_id,
-                    // No Yrs range — the op never landed in `accepted`.
-                    yrs_client_id: 0,
-                    yrs_clock_lo: 0,
-                    yrs_clock_hi: 0,
-                    author: &op.author,
-                    op_kind: &op.op_kind,
-                    status: OpStatus::Rejected,
-                    timestamp_ms: now,
-                    // Rejected ops never land in `accepted`, so they have no
-                    // materialized content to hash.
-                    content_hash: None,
-                    surface: Some(&op.surface),
-                    session_id: op.session_id.as_deref(),
-                    batch_id: op.batch_id.as_deref(),
-                    metadata: &metadata,
-                },
-            )
+            Ok(())
         })
     }
 }

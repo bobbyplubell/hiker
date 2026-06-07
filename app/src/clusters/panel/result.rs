@@ -401,6 +401,8 @@ impl Review<'_> {
             &state_key,
             &nodes,
             /*clickable_leaves=*/ false,
+            // Live preview re-clusters in place — keep the user's pan/zoom.
+            /*preserve_view=*/ true,
         );
     }
 

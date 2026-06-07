@@ -40,8 +40,8 @@ use crate::tab::DiffSource;
 ///   (resolved via `op_writes::ops_in_hunk`).
 /// - `KeepMine` / `KeepTheirs` / `KeepBoth`: conflict hunks (an agent op whose
 ///   region the user also edited in `working`, per `op-log-merge-conflict`).
-///   Keep-mine rejects the agent op; keep-both accepts it (the CRDT
-///   interleaves both edits); keep-theirs first reverts the user's overlapping
+///   Keep-mine rejects the agent op; keep-both accepts it (the merge keeps
+///   both edits); keep-theirs first reverts the user's overlapping
 ///   `working` edit to the accepted text (`revert` carries the precomputed
 ///   `apply_working_edit` args) then accepts.
 /// - `Restore`: history-version-owned hunks — write the historical text the hunk

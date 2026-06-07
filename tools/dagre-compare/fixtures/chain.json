@@ -1,0 +1,16 @@
+{
+  "name": "chain",
+  "rankdir": "TB",
+  "ranksep": 50,
+  "nodesep": 50,
+  "edgesep": 20,
+  "nodes": [
+    { "w": 80, "h": 40 },
+    { "w": 80, "h": 40 },
+    { "w": 80, "h": 40 }
+  ],
+  "edges": [
+    { "v": 0, "w": 1 },
+    { "v": 1, "w": 2 }
+  ]
+}

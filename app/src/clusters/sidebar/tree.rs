@@ -26,7 +26,7 @@ use hiker_core::trees::types::{Db, EditableNode, Error, NodeInsert, NodeKind, No
 use super::{push_toast, regenerate_names, summarize_subset, ClusterCtx};
 use crate::clusters::sidebar::node_menu;
 use crate::clusters::state::State;
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::state::{Toast, ToastLevel};
 use hiker_theme as theme;
 
@@ -130,7 +130,13 @@ fn paint_row(
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    child.set_clip_rect(rect);
+    // Intersect with (not replace) the inherited scroll-viewport clip:
+    // `set_clip_rect` would discard the panel's clip, letting rows scrolled
+    // past the top/bottom edge paint their text outside the sidebar. The
+    // Files tree avoids this by painting through `painter_at`, which
+    // intersects; here the row contents go through a child UI, so shrink the
+    // child's clip to the row rect instead.
+    child.shrink_clip_rect(rect);
     child.set_max_width(rect.width());
     child.add_space(indent);
     self.row_contents(&mut child, tree_id, node, has_children, expanded);
@@ -333,7 +339,7 @@ fn is_descendant_of(
 fn open_leaf(&mut self, node: &EditableNode) {
     // Path-as-identity: the leaf carries the source note's vault-relative
     // path directly, so open it with no doc-id resolution. Defer the actual
-    // open — `open_file` needs full `&mut AppState`, which the narrow ctx
+    // open — `open_file` needs full `&mut AppState`, which the narrow session
     // can't grant inline.
     let Some(rel) = node.note_path.as_deref() else {
         return;
@@ -662,7 +668,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     let mut graph_clicked = false;
     let mut export_style: Option<hiker_core::canvas::export::TreeCanvasStyle> = None;
     let trees = self.trees.clone();
-    let Ctx { state, toasts, .. } = &mut *self.ctx;
+    let SurfaceCtx { state, toasts, .. } = &mut *self.ctx;
     let state = state.downcast_mut::<State>().expect("clusters state");
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -832,7 +838,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     if graph_clicked {
         // Singleton-per-tree: focus an existing graph tab if one's open;
         // otherwise spawn a fresh ClusterGraph tab. Needs full
-        // `&mut AppState`, so defer past the narrow ctx borrow.
+        // `&mut AppState`, so defer past the narrow session borrow.
         let tid = tree_id.clone();
         self.ctx.defer(move |app| {
             use crate::tab::TabKind;
@@ -846,7 +852,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     if let Some(style) = export_style {
         // Snapshot the tree → a fresh `.canvas` and open it framed-to-fit.
         // The export reads vault + oplog + the trees Db, so it needs full
-        // `&mut AppState`; defer past the narrow ctx borrow. status:
+        // `&mut AppState`; defer past the narrow session borrow. status:
         // canvas-export-tree-verb
         let tid = tree_id.clone();
         self.ctx

@@ -34,7 +34,7 @@ use super::render::RenderedWidget;
 /// filename so two domains can't collide even if their `content_hash`es did
 /// (they already domain-tag their hashes, but the prefix keeps the directory
 /// human-readable and defends the key independently).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Domain {
     Math,
     Mermaid,

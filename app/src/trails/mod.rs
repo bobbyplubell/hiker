@@ -20,18 +20,19 @@ pub mod state;
 
 use eframe::egui;
 
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::AppCtx;
 use crate::icons;
 
 /// Zero-sized `Activity` impl for the Trails activity. Pure descriptor:
 /// holds no state. The real state (the trail forest + sidebar UI state)
 /// lives in `AppState::trails_state`; the sidebar surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()` and routes broad effects (open a
+/// `ctx.state.downcast_mut::<State>()` and routes broad effects (open a
 /// note, the remove-confirm modal, the trail-doc write) through
-/// `Ctx::defer`.
+/// `SurfaceCtx::defer`.
 pub struct Trails;
 
-impl Activity for Trails {
+impl Activity<dyn AppCtx> for Trails {
     fn id(&self) -> &'static str {
         "trails"
     }
@@ -41,18 +42,22 @@ impl Activity for Trails {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Boot)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&TrailsSidebar]
     }
 }
 
 struct TrailsSidebar;
 
-impl View for TrailsSidebar {
+impl View<dyn AppCtx> for TrailsSidebar {
     fn id(&self) -> &'static str {
         "trails"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         egui::ScrollArea::vertical()
             .id_salt("panel-trails-body")
             .auto_shrink([false, false])

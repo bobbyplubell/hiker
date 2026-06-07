@@ -1,9 +1,8 @@
 //! Document and device identity types.
 //!
 //! Documents are identified across devices by their **vault-relative path**.
-//! Each device keeps its own internal [`LocalDocId`] ULID for op-log
-//! bookkeeping (the per-device `<doc-id>.yrs` filename / `op_metadata.doc_id`
-//! key); the transport never exchanges those local ids. The wire speaks paths.
+//! Each device keeps its own internal [`LocalDocId`] for op-log bookkeeping;
+//! the transport never exchanges those local ids. The wire speaks paths.
 //! [sync-path-identity]
 //!
 //! A rename produces a new identity. Concurrent rename on two devices is
@@ -16,10 +15,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// A device-local document id — the local ULID `doc_id` that names the
-/// `<doc-id>.yrs` / `.pending` files and the `op_metadata.doc_id` key. Each
-/// device mints its own; the transport resolves it from a vault path via
-/// [`hiker_core::oplog::OpLog::doc_id_for_path`] and never exchanges it.
+/// A device-local document id, resolved from a vault path via
+/// [`hiker_core::oplog::OpLog::doc_id_for_path`]. Under path-identity the
+/// op-log files are keyed by the document's vault-relative path; this id is the
+/// transport's internal handle for a document and is never exchanged on the
+/// wire (the wire speaks paths).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LocalDocId(pub String);
 

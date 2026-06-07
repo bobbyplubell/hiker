@@ -7,8 +7,8 @@
 //! machinery defined alongside `OpLog`. `commit_working` (the Save bridge into
 //! the commit path) stays in `mod.rs` next to `commit_text_edit`.
 
-use super::doc;
 use super::error::Error;
+use super::overlay;
 use super::{DocContent, OpLog};
 
 impl OpLog {
@@ -31,10 +31,16 @@ impl OpLog {
     ) -> Result<(), Error> {
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let working = state
-                .working
-                .get_or_insert_with(|| doc::clone_doc(&state.accepted));
-            doc::apply_replace(working, byte_start, byte_len, new_text);
+            if state.working.is_none() {
+                state.working = Some(state.accepted.clone());
+            }
+            let working = state.working.as_ref().unwrap();
+            // Splice `[byte_start, byte_start + byte_len)` → `new_text`. A single
+            // span, applied defensively (a drifted span is skipped, never panics).
+            state.working = Some(overlay::apply_spans_str(
+                working,
+                &[(byte_start, byte_len, new_text.to_string())],
+            ));
             Ok(())
         })
     }
@@ -47,12 +53,12 @@ impl OpLog {
     /// localizes it, exactly as `docs/canvas.md` specifies ("minimal localized
     /// text ops on the working layer").
     ///
-    /// Localization is load-bearing for sync, not just churn: a full remove-all +
-    /// insert-all TOMBSTONES the entire working structure and re-authors it. When
-    /// a peer delta later mirrors onto that overlay
+    /// Localization is load-bearing for sync, not just churn: a full replace of
+    /// the whole working text rewrites every byte, so a concurrent peer edit
+    /// mirroring onto that overlay
     /// ([`apply_remote_update`](super::OpLog::apply_remote_update) keeps
-    /// `materialize_working == accepted + working`), the peer's ops are anchored
-    /// in now-tombstoned content and Yrs relocates them to byte 0 — the reported
+    /// `materialize_working == accepted + working`) finds no unchanged context to
+    /// anchor against and its content can land at byte 0 — the reported
     /// `<number>{`-prepended canvas corruption. Keeping the diff localized
     /// preserves the unchanged structure so a concurrent peer edit anchors in
     /// place and merges cleanly. The whole step runs under ONE lock so a
@@ -61,12 +67,12 @@ impl OpLog {
     pub fn replace_working(&self, doc_id: &str, new_text: &str) -> Result<(), Error> {
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let working = state
-                .working
-                .get_or_insert_with(|| doc::clone_doc(&state.accepted));
-            let current = doc::materialize(working).text;
-            let spans = doc::multi_span_delta(&current, new_text);
-            doc::apply_replaces(working, &spans);
+            if state.working.is_none() {
+                state.working = Some(state.accepted.clone());
+            }
+            let current = state.working.as_deref().unwrap();
+            let spans = crate::merge::multi_span_delta(current, new_text);
+            state.working = Some(overlay::apply_spans_str(current, &spans));
             Ok(())
         })
     }
@@ -81,8 +87,12 @@ impl OpLog {
     pub fn materialize_working(&self, doc_id: &str) -> Result<DocContent, Error> {
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let doc = state.working.as_ref().unwrap_or(&state.accepted);
-            Ok(doc::materialize(doc).into())
+            // The editable buffer's tombstone is the accepted flag (the working
+            // overlay is text-only; a tombstone is never an uncommitted edit).
+            Ok(DocContent {
+                text: state.working_text().to_string(),
+                tombstone: state.accepted_tombstone,
+            })
         })
     }
 
@@ -103,36 +113,34 @@ impl OpLog {
     ) -> Result<DocContent, Error> {
         self.locked(|inner| {
             let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
-            let base = state.working.as_ref().unwrap_or(&state.accepted);
-            // Fast path: no pending op in scope → review == base. Skip the
-            // `clone_doc` (a full Yrs encode→decode) + re-apply, which would
-            // otherwise run every frame on a clean buffer. This is the common
-            // case (no agent edits pending).
+            let base_text = state.working_text().to_string();
+            let base_tombstone = state.accepted_tombstone;
+            // Fast path: no pending op in scope → review == base. Skip the fold,
+            // which would otherwise run every frame on a clean buffer. This is
+            // the common case (no agent edits pending).
             let has_pending = state
                 .pending
                 .iter()
                 .any(|op| session.is_none() || op.session_id.as_deref() == session);
             if !has_pending {
-                return Ok(doc::materialize(base).into());
+                return Ok(DocContent {
+                    text: base_text,
+                    tombstone: base_tombstone,
+                });
             }
-            let view = doc::clone_doc(base);
-            for pos in 0..state.pending.len() {
-                let in_session =
-                    session.is_none() || state.pending[pos].session_id.as_deref() == session;
-                if !in_session {
-                    continue;
-                }
-                // Skip a drifted op: its anchor no longer matches `accepted`
-                // (e.g. a sync/external edit rewrote the region), so applying it
-                // best-effort would interleave into a positional-merge garble.
-                // The inline review shows only cleanly-applicable proposals;
-                // drifted ops surface (flagged) through the patch-review queue.
-                if Self::op_drifted(state, doc_id, pos) {
-                    continue;
-                }
-                let _ = doc::apply_update(&view, doc_id, &state.pending[pos].yrs_update);
-            }
-            Ok(doc::materialize(&view).into())
+            // Fold the session's pending ops onto the base text by splicing,
+            // skipping a drifted op: its anchor no longer matches `accepted`
+            // (e.g. a sync/external edit rewrote the region). The inline review
+            // shows only cleanly-applicable proposals; drifted ops surface
+            // (flagged) through the patch-review queue. Pending text ops don't
+            // change the tombstone flag — read it from the base doc.
+            let folded = overlay::fold_session_text(&base_text, &state.pending, session, |pos| {
+                Self::op_drifted(state, doc_id, pos)
+            });
+            Ok(DocContent {
+                text: folded,
+                tombstone: base_tombstone,
+            })
         })
     }
 

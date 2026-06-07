@@ -11,8 +11,8 @@
 //! one subdirectory per op that produced them, so a version's artifact is
 //! recoverable alongside that version's text in the op-log. They are
 //! **device-local**: the op-log syncs the sidecar text, not these blobs (per
-//! `op-log.md`'s "Versioned sources" / embedding-sync posture — the CRDT stays
-//! lean and blobs ride a separate, best-effort transport).
+//! `op-log.md`'s "Versioned sources" / embedding-sync posture — the op-log
+//! text stays lean and blobs ride a separate, best-effort transport).
 //!
 //! This module owns the *policy resolution* + the *refs store* + *pruning*. It
 //! lives in `core` (keyed on the op-log's `doc_id` / op-id, both core

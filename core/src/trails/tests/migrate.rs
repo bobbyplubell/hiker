@@ -23,14 +23,13 @@ fn setup() -> (TempDir, Vault, Arc<OpLog>) {
 fn migration_relocates_waypoints_and_rewrites_trail_doc() {
     let (td, vault, log) = setup();
 
-    // A trail-doc at the visible location, seeded in the op-log so the
-    // migration can resolve its path from its doc_id.
+    // A trail-doc at the visible location, seeded in the op-log. Under
+    // path-as-identity the legacy hidden dir name is an opaque id (a ULID in
+    // the old scheme); the migration resolves the trail-doc from a waypoint's
+    // `in_trail`, so the dir name no longer has to equal the doc id.
     std::fs::create_dir_all(td.path().join("trails")).unwrap();
-    // Trail-doc frontmatter still points at the OLD hidden waypoint paths.
-    // We don't know the doc_id yet; write a placeholder then rewrite once
-    // we know it — simpler: seed first to learn the id, then write the doc.
-    let trail_id = log
-        .create_document("trails/t.md", "markdown", "seed", &Author::User)
+    let trail_id = "01HLEGACYTRAILID";
+    log.create_document("trails/t.md", "markdown", "seed", &Author::User)
         .unwrap();
 
     let trail_doc = format!(
@@ -48,16 +47,18 @@ fn migration_relocates_waypoints_and_rewrites_trail_doc() {
             "---\nhiker:\n  kind: waypoint\n  references:\n    path: {src}\n  in_trail:\n    path: trails/t.md\n---\n"
         )
     };
-    std::fs::write(wp_dir.join("a--AAAAAA.md"), wp("research/a.md")).unwrap();
-    std::fs::write(wp_dir.join("b--BBBBBB.md"), wp("research/b.md")).unwrap();
     // Seed the waypoints in the op-log at their hidden paths so the
-    // migration's path-mapping repoint has something to update.
+    // migration's path-mapping repoint has something to update. Seed FIRST
+    // (create_document writes the `.md`), then write the frontmatter the
+    // migration reads `in_trail` from — otherwise the seed would overwrite it.
     let wp_a_old = format!(".hiker/trails/{trail_id}/waypoints/a--AAAAAA.md");
     let wp_b_old = format!(".hiker/trails/{trail_id}/waypoints/b--BBBBBB.md");
     log.create_document(&wp_a_old, "markdown", "", &Author::User)
         .unwrap();
     log.create_document(&wp_b_old, "markdown", "", &Author::User)
         .unwrap();
+    std::fs::write(wp_dir.join("a--AAAAAA.md"), wp("research/a.md")).unwrap();
+    std::fs::write(wp_dir.join("b--BBBBBB.md"), wp("research/b.md")).unwrap();
 
     let migrated = migrate_waypoints_to_companion_folders(&vault, &log).unwrap();
     assert_eq!(migrated, 1);

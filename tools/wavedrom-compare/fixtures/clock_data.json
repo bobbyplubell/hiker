@@ -1,0 +1,5 @@
+{ "signal": [
+  {"name":"clk","wave":"p......"},
+  {"name":"dat","wave":"x.34.5x","data":["a","b","c"]},
+  {"name":"req","wave":"0.1..0."}
+] }

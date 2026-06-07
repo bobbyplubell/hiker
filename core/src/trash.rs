@@ -46,7 +46,7 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<String>>,
     /// The op-log `doc_id` this entry's note was tracked under, when known.
-    /// A tracked note's Yrs history is retained keyed by `doc_id` rather than
+    /// A tracked note's `.ops` history is retained keyed by `doc_id` rather than
     /// purged on delete (per `op-log.md`'s "Offline delete and rename"), so
     /// restore can rebind `path → doc_id` to recover full history instead of
     /// minting a fresh document. `None` for a hand-dropped file or a note that

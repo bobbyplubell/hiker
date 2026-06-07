@@ -10,7 +10,7 @@
 
 use egui_workbench::menu::{Action, Menu};
 
-use crate::activity::Ctx;
+use crate::activity::SurfaceCtx;
 use crate::state::AppState;
 
 /// The base actions every note-referencing row supports. Copy-path is *not*
@@ -96,7 +96,7 @@ pub(crate) fn note_item_menu_response(
 /// the clickable row already exists, this only adds the right-click menu.
 pub(crate) fn attach_note_item_menu(
     response: &egui::Response,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut SurfaceCtx<'_>,
     path: &str,
     opts: BaseOpts,
 ) {

@@ -24,22 +24,23 @@ pub mod state;
 
 use eframe::egui;
 
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::AppCtx;
 use crate::icons;
 
 /// Zero-sized `Activity` impl for the docked chat sidebar. Pure
 /// descriptor: holds no state. The real state (the in-memory session
 /// registry + lazy-discover gate) lives in `AppState::chat_state`; the
-/// sidebar surface reaches it via `Ctx::state.downcast_mut::<State>()`
+/// sidebar surface reaches it via `ctx.state.downcast_mut::<State>()`
 /// and routes broad effects (open a linked note, accept/reject a pending
-/// op, the active-note send injection) through `Ctx::defer`.
+/// op, the active-note send injection) through `SurfaceCtx::defer`.
 ///
 /// Scope: only the docked secondary-side-bar chat region. The full-tab
 /// agent conversation is a separate `TabKind::Agent` surface that still
 /// renders against `&mut AppState` via `render::show_tab`.
 pub struct Chat;
 
-impl Activity for Chat {
+impl Activity<dyn AppCtx> for Chat {
     fn id(&self) -> &'static str {
         "chat"
     }
@@ -49,7 +50,7 @@ impl Activity for Chat {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Chat)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&ChatSidebar]
     }
     /// Chat docks into the secondary (right) side bar. It renders through
@@ -63,11 +64,15 @@ impl Activity for Chat {
 
 struct ChatSidebar;
 
-impl View for ChatSidebar {
+impl View<dyn AppCtx> for ChatSidebar {
     fn id(&self) -> &'static str {
         "chat"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         sidebar::render_sidebar(ui, ctx);
     }
 }

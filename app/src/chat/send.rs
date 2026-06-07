@@ -119,7 +119,7 @@ pub fn send(
     };
     // The whole egui frame runs inside `runtime.enter()`, so the ambient
     // tokio handle is live during render — no explicit runtime handle is
-    // threaded through. Both the docked sidebar surface (narrow `Ctx`, no
+    // threaded through. Both the docked sidebar surface (narrow `SurfaceCtx`, no
     // runtime handle) and the full-tab view share this path.
     tokio::spawn(async move {
         task.run().await;

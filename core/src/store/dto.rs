@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// boundaries cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteRow {
-    pub id: String,
+    /// The note's vault-relative path — its identity (`store-path-is-identity`).
     pub path: String,
     pub content_hash: String,
     pub mtime: i64,
@@ -252,7 +252,7 @@ pub struct BoardContainingHit {
 /// Bundle of everything needed to upsert a note in one transaction. Caller
 /// (the indexer task) builds this after chunking + embedding.
 pub struct NoteUpsert<'a> {
-    pub id: &'a str,
+    /// The note's vault-relative path — its identity (`store-path-is-identity`).
     pub path: &'a str,
     pub content_hash: &'a str,
     pub mtime: i64,

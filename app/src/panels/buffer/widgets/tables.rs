@@ -250,26 +250,35 @@ impl TableWidget {
         self.table.header.len().max(body).max(1)
     }
 
-    /// Column widths (logical pt) at `total_width`: start from each column's
-    /// natural content width (longest cell), then proportionally shrink to fit
-    /// `total_width` when the table would overflow. Cells wrap within the
-    /// resulting width.
+    /// Column widths (logical pt) at `total_width`. Each column carries two
+    /// measures: its *natural* width (longest full line) and its *floor* (the
+    /// longest single word — unbreakable, since cells wrap on word boundaries).
+    /// When the table fits, columns get their natural width; when it overflows,
+    /// only the flexible part (natural − floor) is shrunk to fit, so no column
+    /// ever drops below its longest word and that word can't spill into the
+    /// next column. If even the floors don't fit, every column keeps its floor
+    /// and the table extends past the content box rather than overlapping.
     fn column_widths(&self, font_px: f32, total_width: f32) -> Vec<f32> {
         let cols = self.col_count();
         let char_w = font_px * CHAR_W_RATIO;
+        let pad = CELL_PAD_X * 2.0;
         let mut natural = vec![0.0_f32; cols];
+        let mut floor = vec![0.0_f32; cols];
         let mut consider = |cells: &[String]| {
-            for (i, cell) in cells.iter().enumerate() {
+            for (i, cell) in cells.iter().enumerate().take(cols) {
                 let longest_word = cell
                     .split_whitespace()
                     .map(str::chars)
                     .map(Iterator::count)
                     .max()
                     .unwrap_or(0);
-                let chars = cell.chars().count().max(longest_word);
-                let w = chars as f32 * char_w + CELL_PAD_X * 2.0;
-                if w > natural[i] {
-                    natural[i] = w;
+                let nat = cell.chars().count() as f32 * char_w + pad;
+                let flr = longest_word as f32 * char_w + pad;
+                if nat > natural[i] {
+                    natural[i] = nat;
+                }
+                if flr > floor[i] {
+                    floor[i] = flr;
                 }
             }
         };
@@ -277,43 +286,67 @@ impl TableWidget {
         for row in &self.table.rows {
             consider(row);
         }
-        for w in &mut natural {
-            *w = w.max(char_w + CELL_PAD_X * 2.0);
+        let min_cell = char_w + pad;
+        for i in 0..cols {
+            floor[i] = floor[i].max(min_cell);
+            natural[i] = natural[i].max(floor[i]);
         }
-        let sum: f32 = natural.iter().sum();
-        if sum > total_width && sum > 0.0 {
-            let scale = total_width / sum;
-            for w in &mut natural {
-                *w *= scale;
-            }
+        let nat_sum: f32 = natural.iter().sum();
+        if nat_sum <= total_width || nat_sum <= 0.0 {
+            return natural;
         }
-        natural
+        let floor_sum: f32 = floor.iter().sum();
+        let avail_flex = total_width - floor_sum;
+        if avail_flex <= 0.0 {
+            return floor;
+        }
+        let flex_sum = nat_sum - floor_sum;
+        let scale = if flex_sum > 0.0 { avail_flex / flex_sum } else { 0.0 };
+        (0..cols)
+            .map(|i| floor[i] + (natural[i] - floor[i]) * scale)
+            .collect()
     }
 
-    /// Wrap `text` to the number of visual lines it occupies in a column of
-    /// `width` logical pt at `font_px`. Greedy word wrap on character-count
-    /// estimate; always at least one line.
-    fn wrapped_line_count(text: &str, width: f32, font_px: f32) -> usize {
+    /// Greedy word-wrap `text` into the visual lines it occupies in a column of
+    /// `width` logical pt at `font_px`. Whitespace is collapsed to single
+    /// spaces; a word wider than the column keeps its own line (no mid-word
+    /// break — `column_widths` sizes columns to the longest word). Always at
+    /// least one line (a single empty line for empty input). This is the single
+    /// source of truth for both the height measure ([`wrapped_line_count`]) and
+    /// the painted runs ([`paint_list`]), so they never disagree.
+    fn wrap_lines(text: &str, width: f32, font_px: f32) -> Vec<String> {
         let char_w = font_px * CHAR_W_RATIO;
         let avail = (width - CELL_PAD_X * 2.0).max(char_w);
         let cols = (avail / char_w).floor().max(1.0) as usize;
-        if text.is_empty() {
-            return 1;
-        }
-        let mut lines = 1;
-        let mut cur = 0;
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_len = 0usize;
         for word in text.split_whitespace() {
             let wlen = word.chars().count();
-            if cur == 0 {
-                cur = wlen;
-            } else if cur + 1 + wlen <= cols {
-                cur += 1 + wlen;
+            if cur_len == 0 {
+                cur.push_str(word);
+                cur_len = wlen;
+            } else if cur_len + 1 + wlen <= cols {
+                cur.push(' ');
+                cur.push_str(word);
+                cur_len += 1 + wlen;
             } else {
-                lines += 1;
-                cur = wlen;
+                lines.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+                cur_len = wlen;
             }
         }
-        lines.max(1)
+        if lines.is_empty() || !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    }
+
+    /// Number of visual lines `text` occupies in a column of `width` logical pt
+    /// at `font_px`. Always at least one. Delegates to [`wrap_lines`] so the
+    /// measured height matches the lines actually painted.
+    fn wrapped_line_count(text: &str, width: f32, font_px: f32) -> usize {
+        Self::wrap_lines(text, width, font_px).len()
     }
 
     /// Height (logical pt) of the row whose cells are `cells`, at `widths`.
@@ -415,14 +448,24 @@ impl BlockWidget for TableWidget {
                     ColumnAlign::Left | ColumnAlign::None => (x + CELL_PAD_X, TextAlign::Left),
                 };
                 if !cell.is_empty() {
-                    list.push(BlockPaint::Text {
-                        x: anchor_x,
-                        y: y + CELL_PAD_Y + (line_h - font_size) * 0.5,
-                        text: cell.as_str().into(),
-                        color: self.colors.text,
-                        font_scale: 1.0,
-                        align: text_align,
-                    });
+                    // Wrap to the column width and paint one run per visual
+                    // line (same wrap as the height measure), stacking lines
+                    // down the cell so long content never spills into its
+                    // neighbor. status: widget-table-render
+                    let top = y + CELL_PAD_Y + (line_h - font_size) * 0.5;
+                    for (li, line) in Self::wrap_lines(cell, col_w, font_size).iter().enumerate() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        list.push(BlockPaint::Text {
+                            x: anchor_x,
+                            y: top + li as f32 * line_h,
+                            text: line.as_str().into(),
+                            color: self.colors.text,
+                            font_scale: 1.0,
+                            align: text_align,
+                        });
+                    }
                 }
                 x += col_w;
             }
@@ -710,6 +753,77 @@ mod tests {
         let b = TableWidget::from_source("| a |\n|---|\n| 2 |\n", None, &[ColumnAlign::None], FONT)
             .unwrap();
         assert_ne!(a.widget_id(), b.widget_id(), "different bodies hash apart");
+    }
+
+    #[test]
+    fn long_cell_wraps_into_multiple_runs() {
+        // status: widget-table-render — a cell longer than its (overflow-shrunk)
+        // column paints as several stacked text runs, not one overflowing run,
+        // and the measured height reserves room for every line.
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let src = format!("| h | k |\n|---|---|\n| {long} | x |\n");
+        let w = TableWidget::from_source(&src, None, &[ColumnAlign::None, ColumnAlign::None], FONT)
+            .expect("a table widget");
+        let width = 200.0;
+        let runs: Vec<(f32, f32)> = w
+            .paint_list(FONT, width)
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                BlockPaint::Text { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        // The long body cell must occupy more than one line.
+        let line_count = TableWidget::wrapped_line_count(
+            long,
+            w.column_widths(FONT, width)[0],
+            FONT,
+        );
+        assert!(line_count > 1, "the long cell should wrap to multiple lines");
+        // Distinct y positions among the runs prove lines are stacked, not piled.
+        let distinct_ys = {
+            let mut ys: Vec<f32> = runs.iter().map(|&(_, y)| y).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys.dedup();
+            ys.len()
+        };
+        assert!(distinct_ys >= line_count, "stacked runs at distinct y per wrapped line");
+        // Every painted run sits within the measured table height.
+        let total_h = w.measure(FONT, width);
+        let line_h = FONT * LINE_H_RATIO;
+        assert!(
+            runs.iter().all(|&(_, y)| y + line_h <= total_h + 1e-3),
+            "all wrapped runs fit inside the measured height",
+        );
+    }
+
+    #[test]
+    fn narrow_column_never_shrinks_below_its_longest_word() {
+        // status: widget-table-render — under overflow shrink, a column whose
+        // content is a single unbreakable word keeps at least that word's
+        // width, so the word can't spill into the next column.
+        let word = "Postprocess";
+        // A wide second column forces overflow shrinking at a modest width.
+        let src = format!(
+            "| label | detail |\n|---|---|\n| {word} | this is a deliberately long second column to force the table to overflow and shrink |\n"
+        );
+        let w = TableWidget::from_source(&src, None, &[ColumnAlign::None, ColumnAlign::None], FONT)
+            .expect("a table widget");
+        let widths = w.column_widths(FONT, 240.0);
+        let char_w = FONT * CHAR_W_RATIO;
+        let word_floor = word.chars().count() as f32 * char_w + CELL_PAD_X * 2.0;
+        assert!(
+            widths[0] >= word_floor - 1e-3,
+            "label column ({}) stays >= its longest word's width ({word_floor})",
+            widths[0],
+        );
+        // And that single-word cell therefore renders on one line.
+        assert_eq!(
+            TableWidget::wrapped_line_count(word, widths[0], FONT),
+            1,
+            "the unbreakable label fits on one line in its protected column",
+        );
     }
 
     #[test]

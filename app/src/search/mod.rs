@@ -1,7 +1,7 @@
 //! Search activity — sidebar surface owning the query input, the per-mode
 //! options menus, the typeahead debounce machinery, and the result list.
 //! Migrated off `panels::search` + `panels_registry` to a real `Activity`
-//! rendering through the narrow `activity::Ctx`: UI state lives on
+//! rendering through the narrow `activity::SurfaceCtx`: UI state lives on
 //! `AppState::search_state` (reached via `ctx.state`), the index queries
 //! run against `ctx.services`/`ctx.vault`, and every broad mutation
 //! (open a note, reveal in the file tree, persist a setting, stash the
@@ -26,7 +26,8 @@ use hiker_core::store::Store;
 use hiker_core::vault::Vault;
 
 use crate::editor_pane;
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::panels::zim;
 use crate::search::state::{OrderBy, State};
 use crate::state::AppState;
@@ -38,10 +39,10 @@ const SEARCH_DEBOUNCE_MS: u64 = 250;
 
 /// Zero-sized `Activity` descriptor for search. State lives in
 /// `AppState::search_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`.
+/// `ctx.state.downcast_mut::<State>()`.
 pub struct Search;
 
-impl Activity for Search {
+impl Activity<dyn AppCtx> for Search {
     fn id(&self) -> &'static str {
         "search"
     }
@@ -51,18 +52,22 @@ impl Activity for Search {
     fn icon(&self) -> egui::Image<'static> {
         crate::icons::ICONS.image(crate::icons::Icon::Search)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&SearchSidebar]
     }
 }
 
 struct SearchSidebar;
 
-impl View for SearchSidebar {
+impl View<dyn AppCtx> for SearchSidebar {
     fn id(&self) -> &'static str {
         "search"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         // Apply any background-query results that landed since last frame
         // (`search-query-embed-spawn-blocking`) before drawing, so the freshest hits show.
         drain_results(ctx.state.downcast_mut::<State>().expect("search state"));
@@ -106,7 +111,7 @@ pub struct SearchOutcome {
 /// (per `search-mode-state-persisted`). Best-effort: a write failure logs
 /// and is otherwise silent, so the option still applies in-session. Runs
 /// as a deferred effect so it can reach the full `&AppState` (vault root
-/// + config guards) the narrow `Ctx` doesn't expose.
+/// + config guards) the narrow `SurfaceCtx` doesn't expose.
 fn persist_search_setting(app: &AppState, key: &str, value: &serde_json::Value) {
     crate::state::set_setting_quiet(
         app,
@@ -119,7 +124,7 @@ fn persist_search_setting(app: &AppState, key: &str, value: &serde_json::Value) 
 
 /// Queue a deferred persist of `key`=`value`. Owns its strings so the
 /// closure is `'static`.
-fn defer_persist(ctx: &mut Ctx<'_>, key: &'static str, value: serde_json::Value) {
+fn defer_persist(ctx: &mut SurfaceCtx<'_>, key: &'static str, value: serde_json::Value) {
     ctx.defer(move |app| persist_search_setting(app, key, &value));
 }
 
@@ -128,7 +133,7 @@ fn defer_persist(ctx: &mut Ctx<'_>, key: &'static str, value: serde_json::Value)
 /// prefix and phrase matching — every row persists per-vault to
 /// `search.lexical.*`. Caller sets `run` when any control changes so the
 /// panel re-fires the query.
-fn lexical_options_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
+fn lexical_options_menu(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) {
     ui.label(egui::RichText::new("Lexical options").strong().small());
     let mut lex = ctx.state.downcast_ref::<State>().expect("search state").lexical_opts;
     let mut lex_changed = false;
@@ -160,7 +165,7 @@ fn lexical_options_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
 /// Semantic-mode option picker, anchored under the brain toggle's
 /// right-click (`search-semantic-options`). Minimum-similarity floor and
 /// recency bias, persisted per-vault to `search.semantic.*`.
-fn semantic_options_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
+fn semantic_options_menu(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) {
     use hiker_core::config::sections::RecencyBias;
 
     ui.label(egui::RichText::new("Semantic options").strong().small());
@@ -207,7 +212,7 @@ fn semantic_options_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
 /// Limit / Types / Order filters that apply regardless of which backends
 /// are active. Per-mode tuning lives on the toggles themselves
 /// (`lexical_options_menu` / `semantic_options_menu`).
-fn filters_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
+fn filters_menu(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) {
     // Mode toggles — duplicate the left-click flip on the toggle buttons
     // so the menu is a complete control surface on its own.
     ui.label(egui::RichText::new("Modes").strong().small());
@@ -287,7 +292,7 @@ fn filters_menu(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
 /// Render the search input row (icon + text edit + keyboard nav), honour
 /// the typeahead debounce, and fire the search when the debounce window
 /// closes or Enter is pressed.
-fn search_input_and_run(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn search_input_and_run(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let mut run = false;
     let mut run_search_immediate = false;
     let resp = input_row(ui, ctx, &mut run);
@@ -334,7 +339,7 @@ fn search_input_and_run(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// Lay out the input row (magnifying-glass filter menu, the two mode
 /// toggles, and the query text field) and return the text field's
 /// response. Sets `run` when a toggle flips.
-fn input_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) -> egui::Response {
+fn input_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) -> egui::Response {
     ui.horizontal(|ui| {
         // Magnifying glass carries the cross-mode controls (mode
         // convenience switches + Limit / Types / Order) on right-click, so
@@ -370,7 +375,7 @@ fn input_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) -> egui::Resp
 /// The two icon-only mode toggles (semantic brain + lexical `Aa`) with
 /// their per-mode option context menus. Left-click flips the mode;
 /// right-click opens that mode's tuning menu (`search-mode-options-menu`).
-fn mode_toggles(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
+fn mode_toggles(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) {
     let sem_on = ctx.state.downcast_ref::<State>().expect("search state").semantic_on;
     let sem_resp = ui
         .add(
@@ -415,7 +420,7 @@ fn mode_toggles(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
 
 /// Keyboard nav on the focused input: ↑/↓ move the selected row, Esc
 /// clears the selection (then the query) per `search-keyboard-nav`.
-fn keyboard_nav(ui: &egui::Ui, ctx: &mut Ctx<'_>, resp: &egui::Response) {
+fn keyboard_nav(ui: &egui::Ui, ctx: &mut SurfaceCtx<'_>, resp: &egui::Response) {
     if !resp.has_focus() {
         return;
     }
@@ -453,7 +458,7 @@ fn keyboard_nav(ui: &egui::Ui, ctx: &mut Ctx<'_>, resp: &egui::Response) {
 /// `SEARCH_DEBOUNCE_MS` *and* the query has actually changed since the
 /// last fire. Keeps embedding-per-keystroke from landing under heavy
 /// typing. Sets `run` when the window closes on a changed query.
-fn honour_debounce(ui: &egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
+fn honour_debounce(ui: &egui::Ui, ctx: &mut SurfaceCtx<'_>, run: &mut bool) {
     let st = ctx.state.downcast_mut::<State>().expect("search state");
     let Some(deadline) = st.pending_query_at else {
         return;
@@ -482,7 +487,7 @@ fn honour_debounce(ui: &egui::Ui, ctx: &mut Ctx<'_>, run: &mut bool) {
 ///
 /// Outside a Tokio runtime (tests / headless) the work runs inline; the result
 /// still flows through the channel and is drained on the next `render`.
-fn fire_query(ctx: &mut Ctx<'_>, egui_ctx: &egui::Context) {
+fn fire_query(ctx: &mut SurfaceCtx<'_>, egui_ctx: &egui::Context) {
     let (q, epoch, params, tx) = {
         let st = ctx.state.downcast_mut::<State>().expect("search state");
         st.query_epoch = st.query_epoch.wrapping_add(1);
@@ -526,7 +531,7 @@ fn fire_query(ctx: &mut Ctx<'_>, egui_ctx: &egui::Context) {
 }
 
 /// Run the full query (index + federated ZIM) and package it as a
-/// [`SearchOutcome`] tagged with `epoch`. Pure of any UI/`Ctx` state so it can
+/// [`SearchOutcome`] tagged with `epoch`. Pure of any UI/`SurfaceCtx` state so it can
 /// run on a background `spawn_blocking` task.
 fn compute_outcome(
     epoch: u64,
@@ -584,7 +589,7 @@ fn drain_results(st: &mut State) {
 /// Render the Results section: the grouped hit list and the Open / Copy /
 /// Reveal actions emitted by the per-row cards. Mutations (open a note,
 /// reveal in the file tree) are deferred.
-fn results_section(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn results_section(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     // The workbench accordion is the panel's single header; results render
     // directly under the search input — no inner collapsible.
     // [feature-panel-single-accordion]
@@ -634,7 +639,7 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// full-text"), each row a clickable title that opens the ZIM viewer at that
 /// article. Returns `true` when there were no ZIM hits of either kind (so the
 /// caller can decide whether to show "(no matches)").
-fn render_zim_results(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) -> bool {
+fn render_zim_results(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) -> bool {
     let st = ctx.state.downcast_ref::<State>().expect("search state");
     if st.zim_results.is_empty() && st.zim_fulltext_results.is_empty() {
         return true;

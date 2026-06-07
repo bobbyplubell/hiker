@@ -4,13 +4,13 @@
 //! and per-op accept/reject flips a pending op's status. Producers (the app
 //! buffer-save command, the MCP write tools, the cluster/triage automations)
 //! call these helpers and never reach into the substrate themselves — keeping
-//! the Yrs / rusqlite dependency confined to the substrate crate and the
+//! the rusqlite dependency confined to the substrate crate and the
 //! orchestration policy (path → doc_id resolution, author class, surface
 //! naming) here.
 //!
 //! Module placement follows `op-log.md`'s "Module placement": `core::ops`
 //! wraps the substrate with the higher-level write paths; the substrate owns
-//! the CRDT and side table. Helpers return plain [`HikerError`] so adapters
+//! the text store and side table. Helpers return plain [`HikerError`] so adapters
 //! match per-variant the same way they do for every other `core::ops` verb.
 //
 // status: op-log-ops-producer-helpers
@@ -41,9 +41,9 @@ fn map_err(e: SubstrateError) -> HikerError {
 /// The op-log document `kind` for a vault-relative path. Native vault
 /// markdown is `"markdown"`; a `*.<ext>.md` next to a non-md source is a
 /// `"sidecar"` per `design.md`'s storage-mode table; a `.canvas` file is a
-/// `"canvas"` JSON Canvas document. The string is recorded in the Yrs Doc's
-/// `meta.kind` for the re-extraction / lifecycle surfaces that read it later;
-/// bootstrap and create both stamp it.
+/// `"canvas"` JSON Canvas document. Under path-identity the kind is derived
+/// from the path extension for the re-extraction / lifecycle surfaces that
+/// read it later; bootstrap and create both resolve it the same way.
 //
 // status: canvas-doc-kind
 fn kind_for(rel: &str) -> &'static str {
@@ -64,12 +64,12 @@ fn kind_for(rel: &str) -> &'static str {
 }
 
 /// Seed the op log from the on-disk vault. For every existing indexable
-/// document (`.md` notes and sidecars) with no `doc-index.db` entry yet,
-/// mint a doc_id, seed its Yrs Doc from the file's current bytes authored as
-/// `user`, set `meta.kind` / `meta.path`, and write the `path → doc_id` row.
+/// document (`.md` notes and sidecars) with no persisted `.ops` history yet,
+/// seed the document from the file's current bytes authored as
+/// `user` (the path IS the doc id under path-identity).
 /// Returns the number of documents freshly seeded.
 ///
-/// Idempotent: a path already mapped in `doc-index.db` is skipped, so a
+/// Idempotent: a path that already has `.ops` history is skipped, so a
 /// second open is a no-op walk. The on-disk `.md` already equals
 /// `materialize(accepted)` by construction, so [`OpLog::create_document`]
 /// performs no rewrite of the user's file.
@@ -92,13 +92,10 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
     for rel in walk_hidden_md_subtree(vault, &crate::trails::dir())? {
         seeded += seed_one(vault, log, &rel)? as usize;
     }
-    // Cluster-tree docs now live at a *visible* vault path
+    // Cluster-tree docs live at a *visible* vault path
     // (`cluster-tree-visible-note`, default `cluster-trees/`), so the main
     // `walk_indexable_files` pass above already seeds them like any other
-    // note — no `.hiker/trees/` second pass is needed. Legacy
-    // `.hiker/trees/<id>.md` files are relocated to the visible default by
-    // `core::trees::Db`'s one-time migration at vault open, before the
-    // indexer's full-scan runs.
+    // note — no separate cluster-tree pass is needed.
     Ok(seeded)
 }
 
@@ -199,9 +196,9 @@ pub fn ensure_doc(log: &OpLog, vault: &Vault, rel: &str) -> Result<String, Hiker
 /// Route a user save through the op log: resolve `rel` to its doc_id (seeding
 /// one if necessary), then commit the buffer's full text as a `user` edit on
 /// `accepted`. The op log diffs `new_text` against the current accepted state
-/// into minimal localized spans, so a save lands as mergeable Yrs ops over
+/// into minimal localized spans, so a save lands as a text edit over
 /// only the bytes that actually changed — never a whole-document rewrite. It
-/// persists the Yrs Doc and atomically writes the materialized `.md` (the
+/// persists the `.ops` frame and atomically writes the materialized `.md` (the
 /// `op-log-atomic-write` / `op-log-disk-canonical` path), so the caller does
 /// **not** also write the file itself. A save that changes nothing is a no-op.
 ///
@@ -440,7 +437,7 @@ pub fn flip_batch_status(
 
 /// Accept or reject pending ops by id. The single per-op primitive both the
 /// per-hunk verbs and the patch-review bulk actions ride on: accept applies
-/// the op's Yrs update to `accepted` (and atomically rewrites the `.md`),
+/// the op's text edit to `accepted` (and atomically rewrites the `.md`),
 /// reject writes a rejected audit row and drops the op. `accept = true`
 /// accepts; `false` rejects. Resolves the doc_id from `rel`.
 ///
@@ -682,8 +679,8 @@ pub fn pending_op_count(log: &OpLog) -> Result<usize, HikerError> {
 /// surface's `DiffLayer` compares. Returns `(accepted_text, proposed_text)`.
 /// `proposed_text` is `materialize(accepted + just this op)`; `accepted_text`
 /// is `materialize(accepted)`. `Ok(None)` when the path has no doc. The op-log
-/// preview path reads through here so the buffer never materializes Yrs state
-/// itself.
+/// preview path reads through here so the buffer never reaches into the
+/// substrate's internal state itself.
 ///
 /// status: write-note-review-surface
 pub fn proposal_materializations(
@@ -761,7 +758,7 @@ pub fn previous_accepted_content(
 /// already dropped self-write echoes); this reads the new disk bytes and
 /// hands them to the substrate, which compares against
 /// `materialize(accepted)`: equal → ignored as a self-write echo (the safety
-/// net); different → the text delta is applied to `accepted`'s `text` Y.Text
+/// net); different → the text delta is applied to `accepted`'s `text`
 /// tagged `author=external`. Producers / the watcher bridge never touch
 /// `OpLog` directly — this is the seam.
 ///
@@ -812,8 +809,8 @@ pub fn external_edit(log: &OpLog, vault: &Vault, rel: &str) -> Result<bool, Hike
 /// history. No match → the gone path is an offline delete: tombstone the doc
 /// (`author=external`) and capture `materialize(accepted)` — the last known
 /// content, since the disk bytes are gone — as a recoverable trash entry that
-/// references the `doc_id`. The Yrs state + history (`<doc-id>.yrs`/`.yrslog`/
-/// `.ops` + metadata) are RETAINED keyed by `doc_id`, not purged, so a later
+/// references the `doc_id`. The document's history (`<doc-id>.ops` + the
+/// metadata rows) is RETAINED keyed by `doc_id`, not purged, so a later
 /// restore rebinds and recovers full history. The new path of a rename, and
 /// any other untracked file, is seeded by `bootstrap` separately.
 ///
@@ -1048,9 +1045,8 @@ pub fn auto_reject_drifted(
 
 /// Run the on-open retention GC: drop accepted-op metadata rows older than
 /// `metadata_retention_days` and rejected-op rows older than
-/// `rejected_retention_days`. Called once at vault open (compaction of the
-/// `.yrs` snapshots already runs inside [`OpLog::open`] per
-/// `compact_threshold`). Returns `(accepted_dropped, rejected_dropped)`.
+/// `rejected_retention_days`. Called once at vault open. Returns
+/// `(accepted_dropped, rejected_dropped)`.
 ///
 /// A `retention_days` of `0` means "keep nothing older than now" — to avoid
 /// surprising data loss it is treated as "no GC".

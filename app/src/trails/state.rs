@@ -9,7 +9,7 @@
 //! config, not a field here.
 //!
 //! Held on `AppState` as the top-level `trails_state` field, surfaced
-//! through `activity::Ctx::state` as `&mut dyn Any` downcastable to
+//! through `SurfaceCtx.state` as `&mut dyn Any` downcastable to
 //! `&mut State`.
 
 use std::collections::HashSet;

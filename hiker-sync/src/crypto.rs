@@ -4,9 +4,9 @@
 //! `sync-secrets-user-scope`):
 //!
 //! - The per-vault **content key** ([`ContentKey`]): a 256-bit AES-GCM key
-//!   shared by all enrolled devices. Each Yrs `update_v2` is encrypted with it
-//!   on the client before it leaves the device, which is what makes the server
-//!   zero-knowledge. [sync-content-encryption-aes256]
+//!   shared by all enrolled devices. Each whole-file TEXT blob is encrypted with
+//!   it on the client before it leaves the device, which is what makes the
+//!   server zero-knowledge. [sync-content-encryption-aes256]
 //! - The per-device **static keypair** ([`DeviceKeypair`]): Ed25519, used to
 //!   authenticate the Noise channel. Its [`DeviceFingerprint`] is swapped out
 //!   of band to enroll. [sync-key-swap-enrollment]
@@ -124,7 +124,7 @@ impl ContentKey {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         // AES-GCM encryption only fails on absurd input sizes; treat it as
-        // infallible for our (Yrs-update-sized) payloads.
+        // infallible for our (whole-file-text-sized) payloads.
         let ciphertext = cipher
             .encrypt(nonce, plaintext)
             .expect("AES-256-GCM encryption of a bounded payload cannot fail");
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_round_trip() {
         let key = key_a();
-        let plaintext = b"a yrs update_v2 blob".to_vec();
+        let plaintext = b"a whole-file text blob".to_vec();
         let blob = key.encrypt(&plaintext);
         // Nonce is prepended, so the blob is longer than plaintext + tag.
         assert!(blob.len() > plaintext.len() + NONCE_LEN);

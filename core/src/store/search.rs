@@ -102,7 +102,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT v.embedding FROM chunk_vecs v
              JOIN chunks c ON c.id = v.chunk_id
-             WHERE c.note_id = ?1",
+             WHERE c.note_path = ?1",
         )?;
         let source_embeddings: Vec<Vec<u8>> = stmt
             .query_map(params![source_note_id], |row| row.get::<_, Vec<u8>>(0))?
@@ -118,10 +118,10 @@ impl Store {
             std::collections::HashMap::new();
 
         let mut knn_stmt = self.conn.prepare(
-            "SELECT v.chunk_id, c.note_id, n.path, c.heading_path, c.text, v.distance
+            "SELECT v.chunk_id, c.note_path, n.path, c.heading_path, c.text, v.distance
              FROM chunk_vecs v
              JOIN chunks c ON c.id = v.chunk_id
-             JOIN notes n ON n.id = c.note_id
+             JOIN notes n ON n.path = c.note_path
              WHERE v.embedding MATCH ?1 AND k = ?2
              ORDER BY v.distance",
         )?;

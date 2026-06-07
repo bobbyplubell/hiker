@@ -1,0 +1,17 @@
+{
+  "name": "clusters",
+  "_comment": "Subgraph membership via parents. Nodes 4 and 5 are cluster containers; 0,1 live in cluster 4, 2,3 in cluster 5.",
+  "rankdir": "TB",
+  "ranksep": 50, "nodesep": 50, "edgesep": 20,
+  "nodes": [
+    { "w": 60, "h": 40 }, { "w": 60, "h": 40 },
+    { "w": 60, "h": 40 }, { "w": 60, "h": 40 },
+    { "w": 0, "h": 0 }, { "w": 0, "h": 0 }
+  ],
+  "edges": [
+    { "v": 0, "w": 1 },
+    { "v": 2, "w": 3 },
+    { "v": 1, "w": 2 }
+  ],
+  "parents": [4, 4, 5, 5, null, null]
+}

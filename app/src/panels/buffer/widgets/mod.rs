@@ -289,6 +289,10 @@ pub fn math_widget_decorations(
         }
     };
 
+    // Hoisted out of the per-span loop: this layer now emits the whole
+    // document, so materializing the doc text once and slicing per span keeps
+    // it O(doc) instead of O(spans × doc).
+    let doc_text = state.doc.to_string();
     let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
     for span in math_spans(state, viewport) {
         match span.kind {
@@ -303,7 +307,7 @@ pub fn math_widget_decorations(
                 if revealed {
                     continue;
                 }
-                let src = &state.doc.to_string()[span.inner_range.clone()];
+                let src = &doc_text[span.inner_range.clone()];
                 let Some(rendered) = render_math(src, MathKind::Inline, font_px, dpr, fg, "", cache)
                 else {
                     continue; // parse failure → fall back to the source mark
@@ -327,7 +331,7 @@ pub fn math_widget_decorations(
                 if revealed {
                     continue;
                 }
-                let src = &state.doc.to_string()[span.inner_range.clone()];
+                let src = &doc_text[span.inner_range.clone()];
                 let Some(rendered) = render_math(src, MathKind::Display, font_px, dpr, fg, "", cache)
                 else {
                     continue;
@@ -374,6 +378,7 @@ pub fn mermaid_widget_decorations(
         }
     };
 
+    let doc_text = state.doc.to_string();
     let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
     for span in mermaid_spans(state, viewport) {
         // Reveal: cursor anywhere inside the fence span (delimiters inclusive)
@@ -386,7 +391,7 @@ pub fn mermaid_widget_decorations(
         if revealed {
             continue;
         }
-        let src = &state.doc.to_string()[span.inner_range.clone()];
+        let src = &doc_text[span.inner_range.clone()];
         let Some((rendered, regions)) =
             render_mermaid_with_regions(src, font_px, dpr, colors, cache)
         else {
@@ -433,6 +438,7 @@ pub fn wavedrom_widget_decorations(
         }
     };
 
+    let doc_text = state.doc.to_string();
     let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
     for span in wavedrom_spans(state, viewport) {
         let revealed = cursor_inside(state, &span.byte_range)
@@ -440,7 +446,7 @@ pub fn wavedrom_widget_decorations(
         if revealed {
             continue;
         }
-        let src = &state.doc.to_string()[span.inner_range.clone()];
+        let src = &doc_text[span.inner_range.clone()];
         let Some(rendered) = render_wavedrom(src, font_px, dpr, colors, cache) else {
             continue; // parse / unsupported failure → fall back to the mark
         };
@@ -645,6 +651,8 @@ fn theme_mermaid_colors(theme: Option<&Theme>) -> MermaidColors {
     match theme {
         Some(t) => MermaidColors {
             background: [0, 0, 0, 0],
+            // Opaque editor surface so labels/hollow markers read over edges.
+            edge_label_bg: { let mut c = rgba(t.palette.bg); c[3] = 255; c },
             node_fill: rgba(t.markdown.code_bg),
             node_stroke: rgba(t.palette.accent),
             edge_stroke: rgba(t.palette.fg),
@@ -654,6 +662,7 @@ fn theme_mermaid_colors(theme: Option<&Theme>) -> MermaidColors {
             let fg = rgba(editor_md::equations::COLOR_MATH_FG);
             MermaidColors {
                 background: [0, 0, 0, 0],
+                edge_label_bg: rgba(editor_md::diagrams::COLOR_MERMAID_BG),
                 node_fill: rgba(editor_md::diagrams::COLOR_MERMAID_BG),
                 node_stroke: fg,
                 edge_stroke: fg,
@@ -1079,6 +1088,31 @@ mod tests {
         let set = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
         let (above, below) = block_sides(&set);
         assert_eq!((above, below), (1, 0), "in-place render is an Above block");
+    }
+
+    #[test]
+    fn whole_doc_emits_diagram_below_viewport() {
+        // Regression (`widget-render-cache`): the diagram widget layers must be
+        // emitted whole-document so a pure scroll never has to rebuild them.
+        // A mermaid block far below the top: with a viewport that excludes it
+        // the old viewport-scoped path emitted nothing (forcing a rebuild when
+        // it scrolled into view); with `None` (whole-doc, how the host now calls
+        // it) it's always emitted, so the layer is stable across scroll.
+        let mut src = String::new();
+        for i in 0..200 {
+            src.push_str(&format!("filler line {i}\n"));
+        }
+        src.push_str("\n```mermaid\ngraph TD; A-->B\n```\n");
+        let state = EditorState::new(&src);
+
+        // Viewport covering only the top of the doc (excludes the fence).
+        let top_only = 0usize..50usize;
+        let scoped = mermaid_widget_decorations(&state, None, Some(&top_only), FONT, DPR, None);
+        assert_eq!(block_sides(&scoped), (0, 0), "viewport-scoped skips the off-screen fence");
+
+        // Whole-doc (viewport=None): the fence is emitted regardless of scroll.
+        let whole = mermaid_widget_decorations(&state, None, None, FONT, DPR, None);
+        assert_eq!(block_sides(&whole), (1, 0), "whole-doc emits the off-screen fence");
     }
 
     #[test]

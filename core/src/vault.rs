@@ -513,7 +513,7 @@ pub fn move_note(
     // alone is the whole operation. Any store error after a successful
     // rename gets a best-effort fs rollback so we don't leave the index and
     // disk disagreeing.
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     // No `id_for_path` indirection — the indexer rename targets the row
     // directly by its old path. Non-indexed `from` is a silent no-op
     // (`rename_note_by_path` returns false).
@@ -723,7 +723,7 @@ pub fn delete_note(
         let mut entry = trash.move_file_in(vault.root(), rel)?;
         // Record the op-log doc_id (when the note was tracked) so a later
         // restore can rebind `path → doc_id` and recover the doc's retained
-        // Yrs history rather than minting a fresh import. status: vault-trash-restore
+        // `.ops` history rather than minting a fresh import. status: vault-trash-restore
         entry.doc_id = doc_id;
         if let Some(w) = watcher {
             // Re-suppress so the TTL window starts close to when notify
@@ -732,7 +732,7 @@ pub fn delete_note(
         }
         // Index cleanup. Non-indexed files (e.g. `.md` files we haven't
         // ingested yet, or non-md files) just have nothing to remove.
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         if let Err(e) = store.delete_note_by_path(rel) {
             let _ = rollback_file(vault, trash, &entry);
             return Err(HikerError::Io(e.to_string()));
@@ -832,7 +832,7 @@ fn rollback_file(vault: &Vault, trash: &Trash, entry: &Entry) -> Result<(), Hike
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::dto::{new_id, NoteUpsert};
+    use crate::store::dto::NoteUpsert;
 use crate::store::Store;
     use crate::test_helpers;
     use tempfile::tempdir;
@@ -875,10 +875,8 @@ use crate::store::Store;
         let vault = Vault::open(dir.path()).unwrap();
         let mut store = Store::open(dir.path()).unwrap();
 
-        let id = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path: "from.md",
                 content_hash: "h",
                 mtime: 0,
@@ -894,7 +892,7 @@ use crate::store::Store;
         assert!(dir.path().join("to.md").exists());
         assert!(store.get_note_by_path("from.md").unwrap().is_none());
         let row = store.get_note_by_path("to.md").unwrap().unwrap();
-        assert_eq!(row.id, id);
+        assert_eq!(row.path, "to.md");
     }
 
     #[test]
@@ -934,10 +932,8 @@ use crate::store::Store;
     }
 
     fn upsert_stub(store: &mut Store, path: &str) -> String {
-        let id = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path,
                 content_hash: "h",
                 mtime: 0,
@@ -947,7 +943,7 @@ use crate::store::Store;
                 chunks: Vec::new(),
             })
             .unwrap();
-        id
+        path.to_string()
     }
 
     // status: note-companion-folder

@@ -1,6 +1,6 @@
 use super::*;
 use crate::embed::{MockEmbedder, Error as EmbedError};
-use crate::store::dto::{new_id, NoteUpsert};
+use crate::store::dto::NoteUpsert;
 use std::fs;
 use tempfile::tempdir;
 
@@ -45,7 +45,7 @@ async fn indexer_indexes_a_markdown_file() {
     // Reopen a reader Store and verify rows.
     let store2 = Store::open(dir.path()).unwrap();
     let note = store2.get_note_by_path("alpha.md").unwrap().unwrap();
-    let chunks = store2.get_note_chunks(&note.id).unwrap();
+    let chunks = store2.get_note_chunks(&note.path).unwrap();
     assert!(!chunks.is_empty());
 }
 
@@ -99,6 +99,34 @@ async fn force_reindex_bypasses_unchanged_short_circuit() {
 }
 
 #[tokio::test]
+async fn file_with_conflict_marker_text_is_indexed_normally() {
+    // status: sync-unified-conflict-surface
+    // Indexing is NOT gated on conflict-marker text: a legitimate file that merely
+    // contains `<<<<<<< / ======= / >>>>>>>` lines (a tutorial, a pasted git
+    // conflict, a bug report) is indexed normally, not skipped. The
+    // `has_unresolved_conflicts` predicate still recognizes the text — it's a
+    // building block for the future in-app conflict surface, not an index gate.
+    let dir = tempdir().unwrap();
+    let with_markers =
+        "intro\n<<<<<<< ours\nMINE\n=======\nTHEIRS\n>>>>>>> theirs\nbody.\n";
+    assert!(crate::merge::has_unresolved_conflicts(with_markers));
+    fs::write(dir.path().join("c.md"), with_markers.as_bytes()).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    let mut prog = handle.subscribe_progress();
+    await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+    handle.index_path("c.md").await.unwrap();
+    await_event(&mut prog, |e| {
+        matches!(e, ProgressEvent::Finished { path } if path == "c.md")
+    })
+    .await;
+    let store2 = Store::open(dir.path()).unwrap();
+    let note = store2.get_note_by_path("c.md").unwrap().unwrap();
+    assert!(!note.skipped, "marker-bearing file should index, not be skipped");
+}
+
+#[tokio::test]
 async fn deleting_a_note_removes_it_from_the_index() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("doomed.md"), b"# x\n").unwrap();
@@ -133,11 +161,11 @@ async fn renaming_preserves_id() {
     await_event(&mut prog, |e| matches!(e, ProgressEvent::Finished { .. })).await;
 
     let store_check = Store::open(dir.path()).unwrap();
-    let id_before = store_check
+    let hash_before = store_check
         .get_note_by_path("old.md")
         .unwrap()
         .unwrap()
-        .id;
+        .content_hash;
     drop(store_check);
 
     handle
@@ -149,10 +177,13 @@ async fn renaming_preserves_id() {
         .unwrap();
     await_event(&mut prog, |e| matches!(e, ProgressEvent::Renamed { .. })).await;
 
+    // Under path-as-identity the note's identity moves with its path; the row
+    // re-keys to the new path and the content (hash) is unchanged.
     let store_after = Store::open(dir.path()).unwrap();
     assert!(store_after.get_note_by_path("old.md").unwrap().is_none());
     let after = store_after.get_note_by_path("new.md").unwrap().unwrap();
-    assert_eq!(after.id, id_before);
+    assert_eq!(after.path, "new.md");
+    assert_eq!(after.content_hash, hash_before);
 }
 
 #[test]
@@ -189,10 +220,8 @@ fn full_scan_emits_delete_for_missing_files() {
     // Pre-populate the store with a note for a path that doesn't exist
     // on disk.
     let mut store = Store::open(dir.path()).unwrap();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "ghost.md",
             content_hash: "h",
             mtime: 0,
@@ -278,7 +307,7 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
 
     let store = Store::open(dir.path()).unwrap();
     let vault = crate::vault::Vault::open(dir.path()).unwrap();
-    // status: store-id-from-oplog / op-log-bootstraps-first
+    // status: store-path-is-identity / op-log-bootstraps-first
     // The trail / waypoint derived-table re-derive reads the op-log's
     // doc_id mapping; bootstrap + attach before any ingest. The waypoint
     // now lives in the visible companion folder, so the main bootstrap pass
@@ -319,7 +348,7 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     })
     .await;
 
-    // Verify derived rows. status: store-id-from-oplog —
+    // Verify derived rows. status: store-path-is-identity —
     // `trail_id` / `waypoint_id` are now the op-log doc_ids for the
     // trail-doc / waypoint-note paths, not the legacy `hiker.id` stamps.
     let trail_doc_id = oplog
@@ -360,7 +389,7 @@ async fn txt_files_are_indexed() {
 
     let store2 = Store::open(dir.path()).unwrap();
     let note = store2.get_note_by_path("note.txt").unwrap().unwrap();
-    let chunks = store2.get_note_chunks(&note.id).unwrap();
+    let chunks = store2.get_note_chunks(&note.path).unwrap();
     assert!(!chunks.is_empty());
     assert!(chunks.iter().any(|c| c.text.contains("first paragraph")));
     assert!(chunks.iter().any(|c| c.text.contains("second paragraph")));

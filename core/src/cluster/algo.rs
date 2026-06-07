@@ -107,30 +107,89 @@ pub fn partition(
     Ok(out)
 }
 
-/// Leiden community detection over a kNN cosine-similarity graph. Per
-/// `cluster-leiden` + `cluster-leiden-knn-graph`.
+/// A built kNN cosine-similarity graph, ready for Leiden community
+/// detection. Per `cluster-leiden-knn-graph`.
 ///
-/// Construction:
+/// The split between *building* this graph and *detecting communities* on
+/// it (`build_leiden_graph` vs `leiden_communities`) is deliberate: the
+/// build is the expensive O(n²) kNN sweep and depends only on the
+/// embeddings, `k_nearest`, and `edge_weight_floor`; community detection
+/// is comparatively cheap and varies `resolution` (γ) / `iterations` /
+/// `min_cluster_size`. Keeping the graph lets a caller re-tune γ over the
+/// *same* graph without paying the kNN cost again — used by the build
+/// recipe's resolution-escalation retry and by the review tab's
+/// live-preview cache (`cluster-review-tab-live-preview`).
+///
+/// Holds the deduped edge list (not a prebuilt `CSRNetwork`) so it stays
+/// trivially `Clone`/`Send`/`Sync` for caching across the async build
+/// boundary; rebuilding the CSR from edges is O(E) and negligible next to
+/// the kNN sweep.
+#[derive(Clone)]
+pub struct LeidenGraph {
+    n: usize,
+    edges: Vec<(usize, usize, f64)>,
+    /// The (clamped) `k_nearest` and `edge_weight_floor` this graph was
+    /// built with — so a caller reusing a cached graph can confirm it
+    /// still matches the requested params (`matches`).
+    k_nearest: u32,
+    edge_weight_floor: f32,
+}
+
+impl std::fmt::Debug for LeidenGraph {
+    /// Concise — the edge list can be large, so summarize rather than dump.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeidenGraph")
+            .field("n", &self.n)
+            .field("edges", &self.edges.len())
+            .field("k_nearest", &self.k_nearest)
+            .field("edge_weight_floor", &self.edge_weight_floor)
+            .finish()
+    }
+}
+
+impl LeidenGraph {
+    /// Node count (== input embedding count).
+    pub const fn len(&self) -> usize {
+        self.n
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// True when this graph was built from `n` points at the given
+    /// `k_nearest` / `edge_weight_floor`, so it can be reused instead of
+    /// rebuilt. `k_nearest` is compared after the same `n-1` clamp the
+    /// builder applies, so a pre-clamped caller still matches.
+    pub fn matches(&self, n: usize, k_nearest: u32, edge_weight_floor: f32) -> bool {
+        self.n == n
+            && self.k_nearest == clamp_k(k_nearest, n)
+            && self.edge_weight_floor.to_bits() == edge_weight_floor.to_bits()
+    }
+}
+
+/// Clamp a requested `k_nearest` to `[1, n-1]` so the kNN build never asks
+/// for more neighbors than exist. Shared by `build_leiden_graph` and
+/// `LeidenGraph::matches` so cache validation lines up with how the graph
+/// was actually built.
+fn clamp_k(k_nearest: u32, n: usize) -> u32 {
+    (k_nearest as usize).min(n.saturating_sub(1)).max(1) as u32
+}
+
+/// Build the kNN cosine-similarity graph (the expensive half of Leiden).
+/// Per `cluster-leiden-knn-graph`:
+///
 /// 1. L2-normalize the input embeddings (so cosine = dot product).
 /// 2. For each point, find its top-`k_nearest` neighbors by cosine
 ///    similarity (brute-force O(n²); fine at personal-vault scale).
 /// 3. Drop neighbor edges with weight < `edge_weight_floor`.
-/// 4. Build a `single-clustering` `CSRNetwork` from the deduped edges.
-/// 5. Run Leiden over a Reichardt-Bornholdt configuration partition.
-///    The `resolution` (γ) parameter lets the caller bias toward finer
-///    (γ > 1) or coarser (γ < 1) communities; γ=1.0 is the modularity
-///    equivalent.
-/// 6. The optimized partition's `membership(node)` gives a community id
-///    per node. Communities smaller than `min_cluster_size` are flagged
-///    as outliers.
-///
-/// Returns one `Assignment` per input point, in input order.
-/// `cluster_label = OUTLIER_LABEL` for noise points (small communities
-/// or — when the input is below the partition guard — every point).
-pub fn partition_leiden(
+/// 4. Symmetrize on insertion (dedup on `(min, max)`), keeping the score
+///    from whichever direction's kNN found the pair.
+pub fn build_leiden_graph(
     embeddings: &[Vec<f32>],
-    leiden: &LeidenParams,
-) -> Result<Vec<Assignment>, Error> {
+    k_nearest: u32,
+    edge_weight_floor: f32,
+) -> Result<LeidenGraph, Error> {
     if embeddings.is_empty() {
         return Err(Error::Empty);
     }
@@ -146,29 +205,12 @@ pub fn partition_leiden(
     }
 
     let n = embeddings.len();
-    let mut out: Vec<Assignment> = (0..n)
-        .map(|i| Assignment {
-            point_index: i,
-            cluster_label: OUTLIER_LABEL,
-        })
-        .collect();
-
-    let min_size = leiden.min_cluster_size.max(1) as usize;
-    if n < min_size {
-        return Ok(out);
-    }
+    let k = clamp_k(k_nearest, n) as usize;
+    let floor = edge_weight_floor;
 
     // L2-normalize once so cosine reduces to dot product.
     let normed: Vec<Vec<f32>> = embeddings.iter().map(|v| l2_normalize(v)).collect();
 
-    // kNN: brute-force for every point. Bound k by n-1 so we don't ask
-    // for more neighbors than exist.
-    let k = (leiden.k_nearest as usize).min(n.saturating_sub(1)).max(1);
-    let floor = leiden.edge_weight_floor;
-
-    // Collect undirected edges with cosine weights. Dedup on (min, max)
-    // so each unordered pair appears once with the score from whichever
-    // direction's kNN found it.
     let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let mut edges: Vec<(usize, usize, f64)> = Vec::new();
     for i in 0..n {
@@ -193,23 +235,58 @@ pub fn partition_leiden(
         }
     }
 
-    // Edge case: no kept edges (e.g. floor too high, or n=1) means every
-    // node is a singleton → mark them all outliers and return early.
-    // `single-clustering`'s Leiden also asserts a non-trivial graph.
-    if edges.is_empty() {
+    Ok(LeidenGraph {
+        n,
+        edges,
+        k_nearest: clamp_k(k_nearest, n),
+        edge_weight_floor: floor,
+    })
+}
+
+/// Detect communities on a prebuilt `LeidenGraph` (the cheap half). Runs
+/// Leiden over a Reichardt-Bornholdt configuration partition: `resolution`
+/// (γ) biases toward finer (γ > 1) or coarser (γ < 1) communities, γ=1.0
+/// being the modularity equivalent. The optimized partition's
+/// `membership(node)` gives a community id per node; communities smaller
+/// than `min_cluster_size` are flagged as outliers and the survivors get
+/// densified labels `0..num_communities`.
+///
+/// Returns one `Assignment` per node, in node order.
+/// `cluster_label = OUTLIER_LABEL` for noise (small communities, or — when
+/// the graph has no edges or fewer nodes than `min_cluster_size` — every
+/// node). Cheap enough to call repeatedly over one graph while sweeping γ.
+pub fn leiden_communities(
+    graph: &LeidenGraph,
+    resolution: f32,
+    iterations: u32,
+    min_cluster_size: u32,
+) -> Result<Vec<Assignment>, Error> {
+    let n = graph.n;
+    let mut out: Vec<Assignment> = (0..n)
+        .map(|i| Assignment {
+            point_index: i,
+            cluster_label: OUTLIER_LABEL,
+        })
+        .collect();
+
+    let min_size = min_cluster_size.max(1) as usize;
+    // Below the size floor, or with no edges (every node a singleton —
+    // `single-clustering`'s Leiden also asserts a non-trivial graph),
+    // everything is an outlier.
+    if n < min_size || graph.edges.is_empty() {
         return Ok(out);
     }
 
     let node_weights: Vec<f64> = vec![1.0; n];
-    let network: CSRNetwork<f64, f64> = CSRNetwork::from_edges(&edges, node_weights);
+    let network: CSRNetwork<f64, f64> = CSRNetwork::from_edges(&graph.edges, node_weights);
 
     let config = LeidenConfig {
-        max_iterations: (leiden.iterations as usize).max(1),
+        max_iterations: (iterations as usize).max(1),
         seed: Some(0),
         ..LeidenConfig::default()
     };
     let mut optimizer = LeidenOptimizer::new(config);
-    let resolution = leiden.resolution.max(0.0) as f64;
+    let resolution = resolution.max(0.0) as f64;
     let mut partition: RBConfigurationPartition<f64, VectorGrouping> =
         RBConfigurationPartition::with_resolution(network, resolution);
     optimizer
@@ -218,7 +295,8 @@ pub fn partition_leiden(
 
     // Group nodes by membership; communities below the size floor stay
     // OUTLIER_LABEL. Densify the surviving community ids so consumers
-    // see contiguous labels 0..num_communities.
+    // see contiguous labels 0..num_communities. Sort by raw community id
+    // for stable output across runs given the fixed seed.
     let mut by_comm: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for node in 0..n {
@@ -226,8 +304,6 @@ pub fn partition_leiden(
         by_comm.entry(comm).or_default().push(node);
     }
     let mut next_label: i32 = 0;
-    // Sort by raw community id for stable output across runs given a
-    // fixed seed.
     let mut comm_ids: Vec<usize> = by_comm.keys().copied().collect();
     comm_ids.sort_unstable();
     for cid in comm_ids {
@@ -244,6 +320,23 @@ pub fn partition_leiden(
     }
 
     Ok(out)
+}
+
+/// Leiden community detection over a freshly-built kNN cosine-similarity
+/// graph. Convenience wrapper composing `build_leiden_graph` +
+/// `leiden_communities` for callers that don't reuse the graph. Per
+/// `cluster-leiden`.
+pub fn partition_leiden(
+    embeddings: &[Vec<f32>],
+    leiden: &LeidenParams,
+) -> Result<Vec<Assignment>, Error> {
+    let graph = build_leiden_graph(embeddings, leiden.k_nearest, leiden.edge_weight_floor)?;
+    leiden_communities(
+        &graph,
+        leiden.resolution,
+        leiden.iterations,
+        leiden.min_cluster_size,
+    )
 }
 
 /// L2-normalize a single embedding in place, returning the normalized

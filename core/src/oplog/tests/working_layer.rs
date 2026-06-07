@@ -90,6 +90,33 @@ fn commit_working_folds_into_accepted() {
 }
 
 #[test]
+fn commit_working_saves_buffer_that_contains_conflict_marker_text() {
+    // status: sync-unified-conflict-surface
+    // The save path is NOT gated on conflict-marker text: a legitimate note that
+    // merely contains `<<<<<<< / ======= / >>>>>>>` lines (a tutorial, a pasted
+    // git conflict, a bug report) saves normally. Real conflict gating re-attaches
+    // when the in-app marker-injection surface sets a true conflicted state.
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("a.md", "note", "intro\nbody\n", &Author::User)
+        .unwrap();
+    // A buffer that happens to contain conflict-marker lines (as plain content).
+    let with_markers = "intro\n<<<<<<< ours\nMINE\n=======\nTHEIRS\n>>>>>>> theirs\nbody\n";
+    log.replace_working(&doc_id, with_markers).unwrap();
+    // The `has_unresolved_conflicts` predicate still recognizes the marker text —
+    // it's a building block for the future in-app surface, not a save gate.
+    assert!(crate::merge::has_unresolved_conflicts(with_markers));
+    // Save succeeds; accepted + disk now carry the exact content, markers and all.
+    assert!(log.commit_working(&doc_id).unwrap(), "marker-bearing buffer should save");
+    assert_eq!(log.materialize_accepted(&doc_id).unwrap().text, with_markers);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+        with_markers
+    );
+}
+
+#[test]
 fn discard_working_reverts_to_accepted() {
     // status: op-log-working-layer
     let dir = tempdir().unwrap();
@@ -675,8 +702,8 @@ fn commit_working_preserves_peer_edit_during_race() {
 fn bug_sync_per_hunk_accept_cross_op_deps() {
     // Bug: stage_pending falls back to producing op #2 against
     // `accepted + prior session pending` when op #2's anchor isn't in
-    // `accepted`. The Yrs update is encoded with before_sv =
-    // accepted.state_vector, so accepting op #2 alone (skipping op #1) either
+    // `accepted`. The op's anchor is resolved against that combined view, so
+    // accepting op #2 alone (skipping op #1) either
     // silently lands a drifted edit or fails — per-hunk independence breaks.
     //
     // Scenario:
@@ -779,19 +806,15 @@ fn bug_sync_per_hunk_accept_cross_op_deps() {
 fn bug_sync_working_mirror_cross_lineage_apply() {
     // status: bug-sync-working-mirror-cross-lineage-apply
     //
-    // The working Doc is cloned from accepted via `clone_doc`, which mints a
-    // fresh client_id. When a peer-authored update advances accepted and the
-    // working-mirror path (`apply_remote_update` in sync.rs:150-153) applies
-    // the encoded delta onto working, working sees foreign client_ids and the
-    // merge can drop, dup, or interleave bytes — exactly the cross-lineage
-    // failure mode the spec warns about.
+    // When a peer text advances accepted, `apply_remote_update` lands the merged
+    // text via `commit_text_edit`, whose working-mirror reconcile must keep the
+    // user's uncommitted working edit layered on top (a text 3-way merge of the
+    // working overlay over the new accepted) — not drop, dup, or interleave it.
     //
-    // Real cross-lineage scenario: two devices share a lineage via
-    // adopt_lineage. Device B holds an uncommitted working edit on line 2.
-    // Device A authors a disjoint edit on line 3 and ships the delta to B.
-    // After B applies the remote update, materialize_working should show
-    // BOTH edits (three-way merge). Today the cross-lineage apply doesn't
-    // preserve both correctly.
+    // Real cross-lineage scenario: two devices share a doc via adopt_lineage.
+    // Device B holds an uncommitted working edit on line 2. Device A authors a
+    // disjoint edit on line 3 and ships its text to B. After B applies the remote
+    // text, materialize_working should show BOTH edits (three-way merge).
     let seed = "alpha\nbeta\ngamma\n";
     let dir_a = tempdir().unwrap();
     let log_a = OpLog::open(dir_a.path()).unwrap();
@@ -818,14 +841,14 @@ fn bug_sync_working_mirror_cross_lineage_apply() {
         "alpha\nbeta MODIFIED-BY-USER\ngamma\n"
     );
 
-    // A: disjoint edit on line 3, then ship the delta to B.
+    // A: disjoint edit on line 3, then ship its text to B.
     assert!(log_a
         .apply_user_text(&doc_a, "alpha\nbeta\ngamma EXTENDED-BY-PEER\n")
         .unwrap());
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
+    let a_text = log_a.export_state(&doc_a).unwrap();
+    let a_hashes = log_a.doc_history_hashes(&doc_a).unwrap();
     assert!(log_b
-        .apply_remote_update(&doc_b, &delta, "deviceA")
+        .apply_remote_update(&doc_b, &a_text, false, "deviceA", &a_hashes)
         .unwrap());
 
     // Accepted on B carries A's peer edit; working should carry BOTH.

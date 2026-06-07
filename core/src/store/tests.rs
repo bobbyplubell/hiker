@@ -4,7 +4,7 @@ use super::{Store, DEFAULT_EMBED_DIM, SCHEMA_VERSION};
 use crate::chunker::Chunk;
 use crate::store::error::Error;
 use crate::store::dto::{
-    new_id, MetaEntry, MetaFilter, NoteOrder, NoteQuery, NoteUpsert, OrderDir, WaypointRow,
+    MetaEntry, MetaFilter, NoteOrder, NoteQuery, NoteUpsert, OrderDir, WaypointRow,
 };
 use crate::test_helpers::test_store as fresh_store;
 use tempfile::tempdir;
@@ -54,10 +54,8 @@ fn version_mismatch_fails_loud() {
 #[test]
 fn upsert_then_read() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "alpha.md",
             content_hash: "abc",
             mtime: 100,
@@ -72,10 +70,10 @@ fn upsert_then_read() {
         .unwrap();
 
     let note = store.get_note_by_path("alpha.md").unwrap().unwrap();
-    assert_eq!(note.id, id);
+    assert_eq!(note.path, "alpha.md");
     assert_eq!(note.size, 42);
 
-    let chunks = store.get_note_chunks(&id).unwrap();
+    let chunks = store.get_note_chunks("alpha.md").unwrap();
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].chunk_index, 0);
     assert_eq!(chunks[1].text, "second chunk");
@@ -84,15 +82,14 @@ fn upsert_then_read() {
         store
             .get_note_by_path("alpha.md")
             .unwrap()
-            .map(|r| r.id),
-        Some(id.clone())
+            .map(|r| r.path),
+        Some("alpha.md".to_string())
     );
 }
 
 #[test]
 fn note_embedding_computes_byte_weighted_mean_on_upsert() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
 
     // Two chunks; second chunk is 3× the byte-length so it dominates
     // the weighted mean.
@@ -109,7 +106,6 @@ fn note_embedding_computes_byte_weighted_mean_on_upsert() {
 
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "n.md",
             content_hash: "h1",
             mtime: 0,
@@ -133,7 +129,6 @@ fn note_embedding_computes_byte_weighted_mean_on_upsert() {
     // Re-upserting with new chunks refreshes the pool.
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "n.md",
             content_hash: "h2",
             mtime: 1,
@@ -153,10 +148,8 @@ fn note_embedding_computes_byte_weighted_mean_on_upsert() {
 #[test]
 fn note_embedding_none_for_empty_note() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "empty.md",
             content_hash: "h",
             mtime: 0,
@@ -172,10 +165,8 @@ fn note_embedding_none_for_empty_note() {
 #[test]
 fn upsert_replaces_chunks() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "a.md",
             content_hash: "v1",
             mtime: 1,
@@ -193,7 +184,6 @@ fn upsert_replaces_chunks() {
     // Re-upsert with fewer, different chunks. Old ones must vanish.
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "a.md",
             content_hash: "v2",
             mtime: 2,
@@ -204,7 +194,7 @@ fn upsert_replaces_chunks() {
         })
         .unwrap();
 
-    let chunks = store.get_note_chunks(&id).unwrap();
+    let chunks = store.get_note_chunks("a.md").unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].text, "new0");
 
@@ -213,7 +203,7 @@ fn upsert_replaces_chunks() {
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM chunk_vecs WHERE chunk_id LIKE ?1 || ':%'",
-            params![id],
+            params!["a.md"],
             |row| row.get(0),
         )
         .unwrap();
@@ -223,10 +213,8 @@ fn upsert_replaces_chunks() {
 #[test]
 fn delete_note_cascades() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "x.md",
             content_hash: "h",
             mtime: 1,
@@ -237,9 +225,9 @@ fn delete_note_cascades() {
         })
         .unwrap();
 
-    store.delete_note(&id).unwrap();
+    assert!(store.delete_note_by_path("x.md").unwrap());
     assert!(store.get_note_by_path("x.md").unwrap().is_none());
-    assert!(store.get_note_chunks(&id).unwrap().is_empty());
+    assert!(store.get_note_chunks("x.md").unwrap().is_empty());
     assert!(!store.note_exists("x.md").unwrap());
 
     let conn = store.open_reader().unwrap();
@@ -250,12 +238,10 @@ fn delete_note_cascades() {
 }
 
 #[test]
-fn rename_preserves_id_and_chunks() {
+fn rename_preserves_path_and_chunks() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path: "old.md",
             content_hash: "h",
             mtime: 1,
@@ -266,35 +252,42 @@ fn rename_preserves_id_and_chunks() {
         })
         .unwrap();
 
-    store.rename_note(&id, "new.md").unwrap();
+    assert!(store.rename_note_by_path("old.md", "new.md").unwrap());
 
     assert!(store.get_note_by_path("old.md").unwrap().is_none());
     let note = store.get_note_by_path("new.md").unwrap().unwrap();
-    assert_eq!(note.id, id);
+    assert_eq!(note.path, "new.md");
 
-    // Old path no longer maps to the id.
+    // Old path no longer resolves.
     assert!(!store.note_exists("old.md").unwrap());
     assert_eq!(
-        store.get_note_by_path("new.md").unwrap().map(|r| r.id),
-        Some(id.clone()),
+        store.get_note_by_path("new.md").unwrap().map(|r| r.path),
+        Some("new.md".to_string()),
     );
 
-    // Chunks survived.
-    assert_eq!(store.get_note_chunks(&id).unwrap().len(), 1);
+    // Chunks survived under the new path, and the vec rows re-keyed to it.
+    assert_eq!(store.get_note_chunks("new.md").unwrap().len(), 1);
+    let conn = store.open_reader().unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunk_vecs WHERE chunk_id = 'new.md:0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[test]
 fn knn_finds_nearest_and_excludes_self() {
     let (_dir, mut store) = fresh_store();
-    let id_a = new_id();
-    let id_b = new_id();
-    let id_c = new_id();
+    // Under path-as-identity the hit's `note_id` carries the note's path.
+    let (id_a, id_b, id_c) = ("a.md", "b.md", "c.md");
 
     // a's chunks are seeded near 0.0; b's near 0.0 too (so b is "close"
     // to a); c is far away at seed 100.0.
     store
         .upsert_note(&NoteUpsert {
-            id: &id_a,
             path: "a.md",
             content_hash: "h",
             mtime: 1,
@@ -306,7 +299,6 @@ fn knn_finds_nearest_and_excludes_self() {
         .unwrap();
     store
         .upsert_note(&NoteUpsert {
-            id: &id_b,
             path: "b.md",
             content_hash: "h",
             mtime: 1,
@@ -318,7 +310,6 @@ fn knn_finds_nearest_and_excludes_self() {
         .unwrap();
     store
         .upsert_note(&NoteUpsert {
-            id: &id_c,
             path: "c.md",
             content_hash: "h",
             mtime: 1,
@@ -340,7 +331,7 @@ fn knn_finds_nearest_and_excludes_self() {
     assert!(hits[1].score > hits[2].score);
 
     // Excluding a should drop a's chunks; b ranks first among the rest.
-    let hits = store.knn_chunks(&unit_vec(0.0), 3, Some(&id_a)).unwrap();
+    let hits = store.knn_chunks(&unit_vec(0.0), 3, Some(id_a)).unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].note_id, id_b);
     assert_eq!(hits[1].note_id, id_c);
@@ -349,14 +340,12 @@ fn knn_finds_nearest_and_excludes_self() {
 #[test]
 fn related_notes_aggregates_by_note() {
     let (_dir, mut store) = fresh_store();
-    let id_src = new_id();
-    let id_near = new_id();
-    let id_far = new_id();
+    // Under path-as-identity the related hit's `note_id` carries the path.
+    let (id_src, id_near, id_far) = ("src.md", "near.md", "far.md");
 
     // Source has two chunks at seeds 0 and 1.
     store
         .upsert_note(&NoteUpsert {
-            id: &id_src,
             path: "src.md",
             content_hash: "h",
             mtime: 1,
@@ -374,7 +363,6 @@ fn related_notes_aggregates_by_note() {
     // aggregation should pick the closer one as its representative.
     store
         .upsert_note(&NoteUpsert {
-            id: &id_near,
             path: "near.md",
             content_hash: "h",
             mtime: 1,
@@ -390,7 +378,6 @@ fn related_notes_aggregates_by_note() {
 
     store
         .upsert_note(&NoteUpsert {
-            id: &id_far,
             path: "far.md",
             content_hash: "h",
             mtime: 1,
@@ -401,7 +388,7 @@ fn related_notes_aggregates_by_note() {
         })
         .unwrap();
 
-    let hits = store.related_notes(&id_src, 5).unwrap();
+    let hits = store.related_notes(id_src, 5).unwrap();
     // Source note must not be present.
     assert!(!hits.iter().any(|h| h.note_id == id_src));
     // Near should outrank far.
@@ -424,10 +411,8 @@ fn related_notes_empty_when_source_unindexed() {
 #[test]
 fn embed_dim_mismatch_rejected() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     let bad = vec![0.0_f32; DEFAULT_EMBED_DIM - 1];
     let res = store.upsert_note(&NoteUpsert {
-        id: &id,
         path: "x.md",
         content_hash: "h",
         mtime: 1,
@@ -457,10 +442,8 @@ fn at_autocomplete_orders_by_recency_and_filters_by_basename() {
         ("notes.md", Some(400)),
         ("misc/notes.md", Some(50)),
     ] {
-        let id = new_id();
         store
             .upsert_note(&NoteUpsert {
-                id: &id,
                 path,
                 content_hash: "h",
                 mtime: 1,
@@ -606,7 +589,7 @@ fn rename_trail_waypoint_paths_rewrites_prefix() {
     );
 }
 
-// status: trail-reference-resolution / store-id-from-oplog
+// status: trail-reference-resolution / store-path-is-identity
 // Path-by-id round-trip retired with the `path_ids` table. The op-log
 // now owns the path↔doc_id mapping (`doc-index.db`), so this test moved
 // to `core::oplog::tests` (`doc_index_maps_path_to_id`).
@@ -614,9 +597,8 @@ fn rename_trail_waypoint_paths_rewrites_prefix() {
 #[test]
 fn at_autocomplete_skips_skipped_rows() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
-        .upsert_skipped(&id, "huge.md", "file too large", 1, 1)
+        .upsert_skipped("huge.md", "file too large", 1, 1)
         .unwrap();
     let hits = store.at_autocomplete("", 10).unwrap();
     assert!(hits.iter().all(|h| h.basename != "huge"));
@@ -625,18 +607,16 @@ fn at_autocomplete_skips_skipped_rows() {
 // ---- note metadata index (store-note-metadata-index / store-note-query) ----
 
 /// Create an indexed note at `path` with `mtime` and the given metadata
-/// entries; returns its id. Empty chunks — the metadata index doesn't need
-/// embeddings.
+/// entries; returns its path (its identity). Empty chunks — the metadata index
+/// doesn't need embeddings.
 fn put_note(
     store: &mut Store,
     path: &str,
     mtime: i64,
     meta: &[(&str, &str, Option<f64>)],
 ) -> String {
-    let id = new_id();
     store
         .upsert_note(&NoteUpsert {
-            id: &id,
             path,
             content_hash: "h",
             mtime,
@@ -654,8 +634,8 @@ fn put_note(
             num: *n,
         })
         .collect();
-    store.replace_note_metadata(&id, &entries).unwrap();
-    id
+    store.replace_note_metadata(path, &entries).unwrap();
+    path.to_string()
 }
 
 #[test]
@@ -792,7 +772,7 @@ fn query_notes_select_projects_fields() {
 fn delete_note_clears_metadata() {
     let (_dir, mut store) = fresh_store();
     let a = put_note(&mut store, "a.md", 1, &[("status", "active", None)]);
-    store.delete_note(&a).unwrap();
+    store.delete_note_by_path(&a).unwrap();
     let q = NoteQuery {
         filters: vec![MetaFilter::Exists {
             key: "status".into(),
@@ -879,9 +859,8 @@ fn notes_with_meta_projects_relationship_keys() {
 #[test]
 fn notes_with_meta_excludes_skipped() {
     let (_dir, mut store) = fresh_store();
-    let id = new_id();
     store
-        .upsert_skipped(&id, "huge.md", "file too large", 1, 1)
+        .upsert_skipped("huge.md", "file too large", 1, 1)
         .unwrap();
     put_note(&mut store, "ok.md", 2, &[]);
     let rows = store.notes_with_meta().unwrap();

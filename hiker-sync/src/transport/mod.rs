@@ -360,7 +360,8 @@ pub struct SyncNode {
     /// Per-blind-id outgoing push sequence: the next `seq` this device will
     /// stamp on an `UpdateBlob` it pushes to the hub. Monotonic per blind id so
     /// the server's append-only log orders one device's pushes; other devices'
-    /// pushes interleave by their own seqs and Yrs merges them commutatively.
+    /// pushes interleave by their own seqs and the client-side 3-way text merge
+    /// reconciles them on pull.
     pub(super) server_push_seq: Mutex<HashMap<String, u64>>,
     /// Per-blind-id pull cursor: the highest `seq` this device has already
     /// pulled + applied from the hub. The store-and-forward catch-up watermark.
@@ -548,7 +549,7 @@ impl SyncNode {
     /// [`sync_via_server`](Self::sync_via_server) re-fetches every blob from seq
     /// 0 — the test seam for the idempotent re-pull case (a client that pulls
     /// the same store-and-forward blobs again must not double content, since
-    /// `apply_remote_update` merges already-known Yrs ops as a no-op).
+    /// `apply_remote_update` re-merging the peer's identical text is a no-op).
     pub fn reset_server_cursor_for_test(&self) {
         self.server_pull_cursor.lock().unwrap().clear();
     }
@@ -1245,7 +1246,7 @@ mod tests {
         }
 
         // Compute the expected most-recent-32 content hashes by timestamp DESC,
-        // straight from op_metadata via the canonical accepted-row query.
+        // straight from the side table via the canonical accepted-row query.
         let accepted_rows = node
             .oplog
             .query_metadata(&Filter {

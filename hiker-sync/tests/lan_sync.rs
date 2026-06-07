@@ -7,7 +7,7 @@
 //! Wave-2 path: a genuine libp2p connection, the Hello + Manifest exchange,
 //! enrollment + classification, bind, lineage adoption, and — on a second
 //! round after A edits again — the content-encrypted delta-streaming receive
-//! path that records a `sync:`-authored `op_metadata` row.
+//! path that records a `sync:`-authored side-table row.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -15,6 +15,7 @@ editor-core = { path = "../../editor/editor-core" }
 editor-view = { path = "../../editor/editor-view" }
 editor-egui = { path = "../../editor/editor-egui" }
 editor-md = { path = "../../editor/editor-md" }
+editor-diff = { path = "../../editor/editor-diff" }
 egui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

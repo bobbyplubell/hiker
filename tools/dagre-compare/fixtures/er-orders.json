@@ -1,0 +1,27 @@
+{
+  "name": "er-orders",
+  "_comment": "The CUSTOMER/ORDER/INVOICE ER diagram from the mermaid docs that triggered this investigation. Node order = first-seen entity order: 0 CUSTOMER, 1 DELIVERY-ADDRESS, 2 ORDER, 3 INVOICE, 4 ORDER-ITEM, 5 PRODUCT-CATEGORY, 6 PRODUCT. Sizes are representative header-only entity boxes / edge-label boxes (font 16px); the exact values are arbitrary as long as BOTH engines get them.",
+  "rankdir": "TB",
+  "ranksep": 50,
+  "nodesep": 50,
+  "edgesep": 20,
+  "nodes": [
+    { "w": 93, "h": 36 },
+    { "w": 170, "h": 36 },
+    { "w": 64, "h": 36 },
+    { "w": 83, "h": 36 },
+    { "w": 112, "h": 36 },
+    { "w": 170, "h": 36 },
+    { "w": 83, "h": 36 }
+  ],
+  "edges": [
+    { "v": 0, "w": 1, "label": { "w": 39, "h": 25 } },
+    { "v": 0, "w": 2, "label": { "w": 67, "h": 25 } },
+    { "v": 0, "w": 3, "label": { "w": 96, "h": 25 } },
+    { "v": 1, "w": 2, "label": { "w": 86, "h": 25 } },
+    { "v": 3, "w": 2, "label": { "w": 67, "h": 25 } },
+    { "v": 2, "w": 4, "label": { "w": 86, "h": 25 } },
+    { "v": 5, "w": 6, "label": { "w": 86, "h": 25 } },
+    { "v": 6, "w": 4, "label": { "w": 106, "h": 25 } }
+  ]
+}

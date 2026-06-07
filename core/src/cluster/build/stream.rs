@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{NoopSummarizer, build_cluster_tree, build_from_folders};
+use crate::cluster::algo::LeidenGraph;
 use crate::cluster::{
     BuildError, BuildEvent, BuildMethod, BuiltClusterNode, BuiltClusterTree, Id,
     NoteInput, Phase, SummarizeMode,
@@ -93,16 +94,23 @@ impl StreamCtx {
 
 /// Async entry — spawns the structural pass on `spawn_blocking` and
 /// returns the join handle + an mpsc receiver the producer drains.
+/// `prebuilt_top_graph` lets a live-preview caller hand back the top-level
+/// Leiden graph from a prior run so this build can skip the O(n²) kNN sweep
+/// when only γ / `min_cluster_size` changed; the graph the build ends up
+/// using is returned in the terminal `BuildEvent::Done { top_graph, .. }`.
+/// Pass `None` for a cold build. Per `cluster-review-tab-live-preview`.
 pub fn build_tree_structural_streaming(
     method: BuildMethod,
     notes: Vec<NoteInput>,
     cancel: Arc<AtomicBool>,
+    prebuilt_top_graph: Option<Arc<LeidenGraph>>,
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::Receiver<BuildEvent>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel::<BuildEvent>(64);
     let handle = tokio::task::spawn_blocking(move || {
+        let mut top_graph = prebuilt_top_graph;
         let forced_method = match method {
             BuildMethod::Cluster { mut params } => {
                 params.summarize = SummarizeMode::None;
@@ -140,7 +148,7 @@ pub fn build_tree_structural_streaming(
 
         let result: Result<BuiltClusterTree, BuildError> = match &forced_method {
             BuildMethod::Cluster { params } => {
-                build_cluster_tree(&notes, params, &NoopSummarizer, &mut sctx)
+                build_cluster_tree(&notes, params, &NoopSummarizer, &mut sctx, &mut top_graph)
             }
             BuildMethod::FromFolders { params } => {
                 if sctx.check_cancel().is_err() {
@@ -168,7 +176,10 @@ pub fn build_tree_structural_streaming(
                     }
                 }
                 let _ = forced_method;
-                sctx.emit(BuildEvent::Done { tree });
+                sctx.emit(BuildEvent::Done {
+                    tree,
+                    top_graph: top_graph.take(),
+                });
             }
             Err(BuildError::Cancelled) => {
                 sctx.emit(BuildEvent::Cancelled);

@@ -25,7 +25,7 @@ A Reor-like personal notes + knowledge system, all-Rust.
 - UI shell: **egui** via eframe. Single native binary; no webview.
 - Editor: in-tree widget under `editor/` — `editor-core` (rope, `EditorState`, `Selection`, `Transaction`, `Decoration`/`DecorationSet`), `editor-view` (commands, decoration providers, `ViewState`, completion source trait), `editor-egui` (input translation + painter), `editor-diff` (read-only unified-diff view), `editor-md` (markdown indent; live-preview decorations live in `app/`).
 
-Live preview: per-frame decoration providers in `app/src/panels/buffer.rs` produce `DecorationSet` layers fingerprint-cached on `(doc_id, selection, folds, viewport, theme)`. Decoration kinds: `Mark`, `Line`, `Replace { display }`, `Block`, `Widget`. The markdown provider walks the buffer with `pulldown-cmark`; `Replace` fades syntax markers, `Mark`/`Line` styles content, and a decoration is suppressed when its line overlaps a selection so clicking in reveals raw markers. Widgets handle images, math, wikilink pills, callouts.
+Live preview: per-frame decoration providers in `app/src/panels/buffer.rs` produce `DecorationSet` layers fingerprint-cached on `(path, selection, folds, viewport, theme)`. Decoration kinds: `Mark`, `Line`, `Replace { display }`, `Block`, `Widget`. The markdown provider walks the buffer with `pulldown-cmark`; `Replace` fades syntax markers, `Mark`/`Line` styles content, and a decoration is suppressed when its line overlaps a selection so clicking in reveals raw markers. Widgets handle images, math, wikilink pills, callouts.
 
 Wikilinks: the markdown decoration provider emits a widget for `[[Name]]` / `[[folder/Name]]`; click resolves the path via `core::store`. `[[` opens an autocomplete popup driven by the same indexer path cache the chat `@`-mention picker uses (`editor-view`'s `CompletionSource` trait; `app::completion_sources::WikilinkSource`). Backlinks surface in the discovery panel alongside search results / related notes (`search.md`). Full spec: `wikilinks.md` (path form, autocomplete, render-from-live-title, rename-rewrite, backlinks).
 
@@ -90,7 +90,6 @@ The note's frontmatter is the same shape across cases:
 ```yaml
 ---
 hiker:
-  id: <ulid>
   source: <absolute path>
   source_sha256: <hash>
   source_mtime: <iso8601>
@@ -100,7 +99,7 @@ tags: [...]
 ---
 ```
 
-A path → ulid lookup table maintained by the indexer makes IDs stable across renames. Filenames in hiker-owned areas embed the ulid + a debuggable slug, e.g. `01HRX3...--design.md`.
+Identity is the note's vault path (`op-log-path-identity`) — there is no minted id and no path→id table. A rename is an observed content-preserving move (`op-log-observed-move`) that moves the note and rewrites references. Hiker-owned sidecar/cache filenames derive from the source basename (a debuggable slug), e.g. `design.md.pdf` → `design.md.pdf.md`; no id is embedded.
 
 Storage modes (each row maps unambiguously to one combination of source-location × type × versioned):
 
@@ -109,9 +108,9 @@ Storage modes (each row maps unambiguously to one combination of source-location
 | Vault-internal  | markdown    | no         | (none)             | the file itself is the note                       | the file's own contents                       |
 | Vault-internal  | non-md      | no         | `sidecar`          | next to source as `<full-source-filename>.md`     | extracted text (cached)                       |
 | Imported        | web/other   | no         | `imported`         | a visible note in the vault, original/archive beside it | a markdown shadow; original opens in its viewer (`import.md`) |
-| External (file) | markdown    | no         | `external-pointer` | `.hiker/external/<id>--slug.md`                   | annotations only; original re-read on refresh |
-| External (file) | non-md      | no         | `external-cached`  | `.hiker/external/<id>--slug.md`                   | extracted text (cached)                       |
-| Either          | any         | yes        | `versioned`        | sidecar note (op-log history) + `.hiker/refs/<id>/` retained artifacts | extracted text, versioned via the op-log; old artifacts kept per `extract-artifact-retention` |
+| External (file) | markdown    | no         | `external-pointer` | `.hiker/external/<slug>.md`                       | annotations only; original re-read on refresh |
+| External (file) | non-md      | no         | `external-cached`  | `.hiker/external/<slug>.md`                       | extracted text (cached)                       |
+| Either          | any         | yes        | `versioned`        | sidecar note (op-log history) + `.hiker/refs/<sidecar-path>/` retained artifacts | extracted text, versioned via the op-log; old artifacts kept per `extract-artifact-retention` |
 
 Notes:
 
@@ -134,26 +133,26 @@ External file interaction:
 - Read-only from Hiker. Hiker's editor never opens external files.
 - Search results show the source path with a snippet; clicking opens the file in the OS handler (xdg-open / equivalent), not in Hiker.
 - Watcher follows external paths; on change → re-read, re-chunk, re-embed.
-- Trails and links reference the hiker note's stable id, not the path.
+- Trails and links reference the hiker note by its vault path.
 - On missing source → mark `orphaned: true` in frontmatter, stop refreshing, keep the index entries so prior search/links/trails don't break. User decides whether to delete or fix the path.
 
 UI affordance: hide hiker-owned sidecar files (`*.<ext>.md` next to non-md sources, plus `.hiker/` contents) from the file tree by default; surface them via "view extracted text" actions on the original and in search results.
 
 **Linked vs. unlinked sidecars.** Every extracted-text sidecar (sidecar / external-cached / versioned modes) carries a `hiker.link_state: linked | unlinked` field, default `linked`. Semantics:
 
-- **Linked (default)** — the sidecar is read-only in hiker's editor. A re-extraction overwrites the sidecar's body in place via an `extractor` op on the document's `accepted` state, so the prior body stays in op-log history rather than in a separate version file. The user's role with a linked sidecar is reading + annotating the *source* via trails / links / search, not editing the extracted text.
+- **Linked (default)** — the sidecar is read-only in hiker's editor. A re-extraction overwrites the sidecar's body in place via an `extractor`-authored frame on the document's `accepted` state, so the prior body stays in op-log history rather than in a separate version file. The user's role with a linked sidecar is reading + annotating the *source* via trails / links / search, not editing the extracted text.
 - **Unlinked** — explicit user action ("Unlink from source") flips the sidecar to RW. Hiker stops overwriting it on re-extraction (the sidecar is now diverged from source by user choice). The relationship to the source survives in frontmatter (`hiker.source`, `hiker.source_sha256` at the time of unlink), but re-extractions of the source no longer touch this sidecar's body. Rationale: gives the user an escape hatch for cases where the extractor mangles content and they want to fix it by hand without permanently disabling extraction for the source-type.
 
-Re-link is supported (flips back to linked + re-extracts to overwrite local edits — confirm modal, since this discards the user's hand edits). Link-state is a property of the sidecar document, not of any one capture — re-extractions land as `extractor` ops on the linked sidecar and prior bodies stay in op-log history.
+Re-link is supported (flips back to linked + re-extracts to overwrite local edits — confirm modal, since this discards the user's hand edits). Link-state is a property of the sidecar document, not of any one capture — re-extractions land as `extractor`-authored frames on the linked sidecar and prior bodies stay in op-log history.
 
 
 ## Versioned sources
 
-The version history of a source-derived note is the op-log (`op-log.md`), not a parallel per-version store. A sidecar is a Yrs document; a re-import (changed source, re-fetch) lands as an `extractor`-authored op on its `accepted` state. So a source's "versions" are its op-log history, and diff / per-hunk restore / the version dropdown reuse the existing op-log surfaces. An identical re-import is a no-op, so versions accrue only on real change. Re-import policies and retention live in `import.md` and `op-log.md`.
+The version history of a source-derived note is the op-log (`op-log.md`), not a parallel per-version store. A sidecar is an op-log document (a plain `.md` text file on the substrate, no CRDT); a re-import (changed source, re-fetch) lands as an `extractor`-authored frame on its `accepted` state. So a source's "versions" are its op-log history (the per-document `.ops` text frames), and diff / per-hunk restore / the version dropdown reuse the existing op-log surfaces. An identical re-import is a no-op, so versions accrue only on real change. Re-import policies and retention live in `import.md` and `op-log.md`.
 
-- **Logical documents spanning many sources** (a crawl, a multi-file capture) are represented by a manifest note; members carry `hiker.parent: <manifest-ulid>`. A single scraped or dropped source needs no manifest — the sidecar note is itself the versioned unit.
-- **Binary artifacts** (the source bytes, the per-capture HTML archive) are what the op-log can't hold — it versions text, not blobs. Whether old artifacts are retained is a per-source retention cascade (`extract-artifact-retention`): vault default → per-crawl/glob → per-source frontmatter; values `latest` / `keep:N` / `forever`. Retained artifacts live under `.hiker/refs/<doc_id>/` keyed by the producing op, and are device-local (the op-log syncs sidecar text, not blobs).
-- **Search** indexes the current accepted state (what's on disk); historical versions live in the op-log and surface on demand rather than as separate default-search hits. Trails pin a point in a note's history via its op-log snapshot id.
+- **Logical documents spanning many sources** (a crawl, a multi-file capture) are represented by a manifest note; members carry `hiker.parent: <manifest-path>`. A single scraped or dropped source needs no manifest — the sidecar note is itself the versioned unit.
+- **Binary artifacts** (the source bytes, the per-capture HTML archive) are what the op-log can't hold — it versions text, not blobs. Whether old artifacts are retained is a per-source retention cascade (`extract-artifact-retention`): vault default → per-crawl/glob → per-source frontmatter; values `latest` / `keep:N` / `forever`. Retained artifacts live under `.hiker/refs/<sidecar-path>/` keyed by the sidecar's vault path (consistent with path identity), and are device-local (sync ships sidecar text, not blobs).
+- **Search** indexes the current accepted state (what's on disk); historical versions live in the op-log and surface on demand rather than as separate default-search hits. Trails pin a point in a note's history via its op-log frame id (`materialize_at(path, frame_id)`).
 
 
 ## Index model
@@ -359,13 +358,11 @@ Future, unimplemented, and fuzzier-than-spec concepts live in `ideas.md`.
 
 ## Sync / backup
 
-- No VCS. Reference-doc versioning lives in-app (named, semantic, diffable) where it has meaning; personal notes are continuous edits and don't benefit from git overhead.
-- Sync between machines: Syncthing — continuous, conflict-aware, no commit ceremony, handles phone.
-- Crash recovery: hiker autosaves dirty buffers Notepad++-style — every ~5s, each unsaved buffer's current text is written to a sidecar in `.hiker/autosave/`, overwritten in place per tick. A force-kill or power loss leaves at most ~5s of typing on the floor; on next vault open, a recovery modal lists each buffer whose autosaved content differs from disk and offers per-row Restore / Discard. Tab state restores silently. Full spec in `autosave.md`. Distinct from saving (autosave writes a sidecar, not the user's file) and from the op log (`op-log.md`, which records *committed* writes for agent rollback / sync, not in-flight content).
+- Sync between machines is a separate, pluggable transport that ships *files* (canonical `.md` + a version hash), never CRDT ops — specced in `sync.md`, with the git transport in `git.md`. Transports are swappable behind one seam: **libp2p** (encrypted file blobs + version metadata; zero-knowledge, LAN discovery, turnkey), **integrated git** (hiker drives commit + push/pull), **manual git** (the user drives; hiker tolerates HEAD moving), and **none**. All feed one 3-way text merge + one unified conflict surface — disjoint edits merge, same-region contention surfaces as a conflict, no common base forks rather than silently interleaving. The local substrate (`op-log.md`) is transport-agnostic.
+- Crash recovery: hiker autosaves dirty buffers Notepad++-style — every ~5s, each unsaved buffer's current text is written to a sidecar in `.hiker/autosave/`, overwritten in place per tick. A force-kill or power loss leaves at most ~5s of typing on the floor; on next vault open, a recovery modal lists each buffer whose autosaved content differs from disk and offers per-row Restore / Discard. Tab state restores silently. Full spec in `autosave.md`. Distinct from saving (autosave writes a sidecar, not the user's file) and from the op log (`op-log.md`, which records *committed* writes as history text frames, not in-flight content).
 - Backup with history: OS-level tooling (Time Machine, Backblaze, Restic, btrfs/zfs snapshots, etc.). The vault directory contains three classes of data with different backup semantics:
     1. **Source content** (notes, source files): canonical, must be backed up.
-    2. **Durable derived data** (`.hiker/trash/`, `.hiker/oplog/`, `.hiker/agent-log/`, `.hiker/autosave/index.json`, future `.hiker/conflicts/`): user-meaningful records that aren't regenerable from source content. Must be backed up. Typically much smaller than source content.
-    3. **Regenerable index** (`.hiker/index.db`, fastembed model cache, `.hiker/autosave/<id>.md` sidecars): rebuilt from source / running memory on demand. Doesn't need backup.
-   Simple backup tooling can include the whole `.hiker/` (slightly wasteful but correct); smarter tooling can exclude `index.db` and the model cache. The `.hiker/oplog/` directory (per `op-log.md`) is durable user data — losing it means losing edit history, agent-rollback substrate, and (when sync lands) device-sync state.
-- Mobile capture: Markor (Android) or Working Copy (iOS) against the synced folder until/unless a mobile client gets built.
-- Git remains an option to add later if collaboration or web-publishing needs appear; not a one-way door.
+    2. **Durable derived data** (per-document `.hiker/ops/<path>.ops` history frames, un-accepted `.hiker/pending/` edits, `.hiker/trash/`, retained artifacts under `.hiker/refs/`): user-meaningful records that aren't regenerable from source content. Must be backed up. Typically much smaller than source content.
+    3. **Regenerable index** (`.hiker/index.db` — the sole database, holding search/vector plus an activity/history query-index replayed from `.ops`; the fastembed model + embedding caches; `.hiker/autosave/<id>.md` sidecars): rebuilt from source / running memory on demand. Doesn't need backup.
+   Simple backup tooling can include the whole `.hiker/` (slightly wasteful but correct); smarter tooling can exclude `index.db` and the model cache. The `.hiker/ops/` history (per `op-log.md`) is durable user data — losing it means losing edit history; the current `.md` content itself is untouched.
+- Mobile capture: against a git-synced or libp2p-synced folder, or a third-party file sync of the vault directory, until/unless a mobile client gets built.

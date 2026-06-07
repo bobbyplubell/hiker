@@ -10,7 +10,7 @@
 //! The session flow these messages drive: `Hello` handshake → exchange
 //! [`Manifest`]s → [`crate::enroll::classify`] each path → adopt / stream
 //! delta / block. The transport speaks paths end-to-end; each device keeps
-//! its own internal `doc_id` ULID for op-log bookkeeping but never exchanges
+//! its own internal `doc_id` handle for op-log bookkeeping but never exchanges
 //! it. [sync-path-identity]
 //!
 //! See `docs/sync.md` "Transport".
@@ -26,7 +26,7 @@ pub struct ManifestEntry {
     pub path: String,
     /// blake3 of `materialize(accepted)` as of now.
     pub current_hash: String,
-    /// Recent `content_hash` history from `op_metadata`, for fast-forward
+    /// Recent `content_hash` history from the side table, for fast-forward
     /// classification.
     pub recent_history_hashes: Vec<String>,
     /// Vault paths this document has previously occupied on the sender (the
@@ -40,6 +40,14 @@ pub struct ManifestEntry {
     /// sync-rename-blob-rotation]
     #[serde(default)]
     pub prior_paths: Vec<String>,
+    /// Whether this document is tombstoned (deleted) on the sender. A deleted
+    /// doc keeps its last-known text (so `current_hash` alone can't reveal the
+    /// delete), so the manifest carries the flag explicitly: the receiver's
+    /// delete-vs-edit gate and the fast-forward-delete auto-apply both need to
+    /// know the peer deleted. `#[serde(default)]` keeps it additive (an older
+    /// peer that omits it parses as live). [sync-conflict-delete-vs-edit]
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 /// A device's full document manifest, exchanged after the hello handshake.
@@ -124,27 +132,30 @@ pub enum Message {
     /// The sender's full document manifest.
     Manifest(Manifest),
 
-    /// Ask the peer for the canonical Yrs base of the document at `path` (full
-    /// `export_state`), so the requester can adopt it as a fresh shared
-    /// lineage. The reply is a [`Message::LineageBase`]. [sync-path-identity]
+    /// Ask the peer for the canonical TEXT of the document at `path` (its
+    /// `export_state` whole-file content), so the requester can adopt / merge it.
+    /// The reply is a [`Message::LineageBase`]. Under the text substrate the
+    /// bytes are the document text. [sync-path-identity,
+    /// sync-lineage-adoption]
     StateRequest { path: String },
 
-    /// Ask the peer for the incremental update past a state-vector watermark
-    /// for the document at `path` once both sides already share a lineage.
-    /// `state_vector` is the requester's `state_vector_bytes`. The reply is a
-    /// [`Message::UpdateBlob`] (its `ciphertext` is
-    /// `content_key.encrypt(export_since(...))`).
-    /// [sync-content-encryption-aes256, sync-path-identity]
+    /// Ask the peer for the current TEXT of the document at `path` once both
+    /// sides already share a logical document. `state_vector` is the requester's
+    /// VESTIGIAL `state_vector_bytes` watermark (a content-hash token — the
+    /// responder ignores it and returns the full current text); kept so the
+    /// field shape doesn't churn. The reply is a [`Message::UpdateBlob`] (its
+    /// `ciphertext` is `content_key.encrypt(export_since(...))` = the whole-file
+    /// text). [sync-content-encryption-aes256, sync-path-identity]
     DeltaRequest { path: String, state_vector: Vec<u8> },
 
-    /// The canonical replica's Yrs base (`encode_state_as_update_v2`) that an
-    /// adopting device takes as the Doc for `path`. Opaque bytes — the Yrs
-    /// type never crosses the boundary. [sync-lineage-adoption]
+    /// The canonical replica's whole-file TEXT (`export_state`) that an adopting
+    /// device merges/adopts for `path`. Opaque bytes — the document's `.md` text.
+    /// [sync-lineage-adoption]
     LineageBase { path: String, state: Vec<u8> },
 
-    /// A sequenced, content-encrypted Yrs update blob, keyed by blind id.
-    /// `ciphertext` is AES-256-GCM output from [`crate::crypto::ContentKey`].
-    /// [sync-zero-knowledge-server]
+    /// A sequenced, content-encrypted whole-file TEXT blob, keyed by blind id.
+    /// `ciphertext` is AES-256-GCM output from [`crate::crypto::ContentKey`]
+    /// over the document text. [sync-zero-knowledge-server]
     UpdateBlob {
         blind_id: String,
         seq: u64,
@@ -169,16 +180,24 @@ pub enum Message {
     /// watermark). [sync-zero-knowledge-server]
     PushAck { blind_id: String, latest_seq: u64 },
 
-    /// Push OUR canonical Yrs base to an enrolled peer so the peer ADOPTS it —
-    /// the one-click "keep mine" fork-resolution converge for the document at
+    /// Push OUR canonical TEXT to an enrolled peer so the peer ADOPTS it — the
+    /// one-click "keep mine" fork-resolution converge for the document at
     /// `path`. The pusher's version wins: the peer replaces its diverged doc
-    /// with `state` (our full `export_state`), establishing a SHARED lineage so
-    /// subsequent deltas are safe. `state` is the canonical v2 base; it rides
-    /// the Noise-encrypted channel to a verified-enrolled peer (enrollment is
-    /// the consent), so it is not re-wrapped in the content layer, NEVER
-    /// logged, and NEVER written into the synced vault. The reply is a
-    /// [`Message::PushAdoptAck`]. [sync-blocked-state, sync-lineage-adoption]
-    PushAdopt { path: String, state: Vec<u8> },
+    /// with `state` (our full `export_state` whole-file text). `state` is the
+    /// document's `.md` text; it rides the Noise-encrypted channel to a
+    /// verified-enrolled peer (enrollment is the consent), so it is not
+    /// re-wrapped in the content layer, NEVER logged, and NEVER written into the
+    /// synced vault. `tombstone` carries the pusher's delete flag (text alone
+    /// can't — a tombstoned doc keeps its last-known text), so a keep-deleted
+    /// converge pushes the DELETE and the adopting peer tombstones rather than
+    /// resurrecting the last-known text. The reply is a [`Message::PushAdoptAck`].
+    /// [sync-blocked-state, sync-lineage-adoption, sync-conflict-delete-vs-edit]
+    PushAdopt {
+        path: String,
+        state: Vec<u8>,
+        #[serde(default)]
+        tombstone: bool,
+    },
 
     /// Acknowledge a [`Message::PushAdopt`]: the peer adopted our base at
     /// `path` and cleared its own block / pending resolution for it.
@@ -256,6 +275,7 @@ mod tests {
                     current_hash: "h0".into(),
                     recent_history_hashes: vec!["h-1".into()],
                     prior_paths: vec!["notes/a-old.md".into()],
+                    tombstone: false,
                 }],
             }),
             Message::StateRequest {
@@ -289,6 +309,7 @@ mod tests {
             Message::PushAdopt {
                 path: "notes/a.md".into(),
                 state: vec![1, 2, 3],
+                tombstone: false,
             },
             Message::PushAdoptAck {
                 path: "notes/a.md".into(),

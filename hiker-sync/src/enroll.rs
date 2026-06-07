@@ -1,6 +1,6 @@
 //! Enrollment-time hash classification.
 //!
-//! A fork must not be auto-merged: a positional CRDT merge of two genuinely
+//! A fork must not be auto-merged: a positional merge of two genuinely
 //! divergent texts interleaves into nonsense. At binding there is no shared
 //! lineage to trust, so divergence is classified from the **content-hash
 //! history** before any adoption. Hashes are blake3 over `materialize(accepted)`;

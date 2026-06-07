@@ -12,14 +12,15 @@
 
 use eframe::egui;
 
-use crate::activity::{Activity, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::AppCtx;
 use crate::appears_in::AppearsInSidebar;
 use crate::backlinks::BacklinksSidebar;
 use crate::related::RelatedSidebar;
 use crate::icons;
 
 /// Zero-sized container descriptor. Owns no state of its own; each of its
-/// views downcasts the relevant `AppState` slice via `Ctx::state`.
+/// views downcasts the relevant `AppState` slice via `SurfaceCtx.state`.
 pub struct Context;
 
 /// The two view singletons this container exposes, in stacked order
@@ -29,7 +30,7 @@ static BACKLINKS_VIEW: BacklinksSidebar = BacklinksSidebar;
 static APPEARS_IN_VIEW: AppearsInSidebar = AppearsInSidebar;
 static RELATED_VIEW: RelatedSidebar = RelatedSidebar;
 
-impl Activity for Context {
+impl Activity<dyn AppCtx> for Context {
     fn id(&self) -> &'static str {
         "context"
     }
@@ -39,7 +40,7 @@ impl Activity for Context {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Graph)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&BACKLINKS_VIEW, &APPEARS_IN_VIEW, &RELATED_VIEW]
     }
 }

@@ -126,7 +126,7 @@ impl Default for ThumbnailOpts {
 /// A pending hover-expand request, stashed in egui memory during the sidebar
 /// render and consumed once after the sidebar by [`render_expanded_preview`].
 /// Carries everything the expanded draw needs without threading `AppState`
-/// through the narrow activity `Ctx`.
+/// through the narrow activity `SurfaceCtx`.
 #[derive(Clone)]
 struct HoverRequest {
     key: PreviewKey,

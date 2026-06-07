@@ -2,7 +2,7 @@
 //! `TabKind::Agent`). A `Layout` enum picks the framing — the tab variant
 //! gets a session picker header strip + larger transcript area. The
 //! docked secondary-side-bar surface lives in `chat::sidebar` and renders
-//! through the narrow `feature::Ctx`, reusing the AppState-free helpers
+//! through the narrow `activity::SurfaceCtx`, reusing the AppState-free helpers
 //! here (`render_turn`, `ToolCard::render_card`, `mention_suggestions`,
 //! …) plus the `Chat` receiver for its deferred broad effects.
 

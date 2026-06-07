@@ -97,7 +97,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
         return;
     }
     // Persisted-tree entry point: clickable leaves resolve to vault paths.
-    show_with_nodes(ui, app, tree_id, &nodes, /*clickable_leaves=*/ true);
+    // The persisted tree is static, so a refit on (rare) shape change is fine.
+    show_with_nodes(ui, app, tree_id, &nodes, /*clickable_leaves=*/ true, /*preserve_view=*/ false);
 }
 
 /// Render the cluster graph from a pre-resolved `EditableNode` slice. Shared
@@ -108,13 +109,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
 /// `clickable_leaves = false` disables click-to-open for the review preview,
 /// whose leaf ids aren't necessarily resolvable through the read store.
 ///
+/// `preserve_view`: when the shape changes on a *re*-seed (i.e. the graph was
+/// already seeded once), keep the current pan/zoom instead of refitting to
+/// the new content. Used by the review tab's live preview so re-clustering
+/// as the user tweaks knobs updates in place rather than yanking the camera
+/// back to a fit. The very first seed always fits.
+///
 /// status: cluster-review-tab-result-graph-view
+/// status: cluster-review-tab-live-preview
 pub fn show_with_nodes(
     ui: &mut egui::Ui,
     app: &mut AppState,
     tree_id: &str,
     nodes: &[EditableNode],
     clickable_leaves: bool,
+    preserve_view: bool,
 ) {
     if nodes.is_empty() {
         ui.label(egui::RichText::new("(tree is empty)").color(theme::muted()));
@@ -131,6 +140,11 @@ pub fn show_with_nodes(
             .entry(tree_id.to_string())
             .or_insert_with(ClusterView::new);
         if view.data.seeded_for != shape_hash {
+            // Preserve the camera across a re-seed (live preview) so the
+            // viewport doesn't jump; the first seed (seeded_for == 0) still
+            // fits so a fresh graph frames itself.
+            let keep_view = (preserve_view && view.data.seeded_for != 0)
+                .then_some(view.engine.view);
             view.data.seed(nodes, shape_hash);
             let ClusterView {
                 engine,
@@ -139,6 +153,10 @@ pub fn show_with_nodes(
             } = view;
             let source = ClusterSource::new(nodes, data, vault.as_ref(), *show_leaves, clickable_leaves);
             engine.recompute_layout(&source, CLUSTER_CFG);
+            if let Some(v) = keep_view {
+                engine.view = v;
+                engine.needs_fit = false;
+            }
         }
     }
 

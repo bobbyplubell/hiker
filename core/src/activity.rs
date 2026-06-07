@@ -38,7 +38,7 @@ pub enum Error {
 
 // ── Change-row projection (changes-query-api) ──────────────────────────
 //
-// A `ChangeRow` is a projection of an accepted `op_metadata` row. The DTO
+// A `ChangeRow` is a projection of an accepted `op_history` index row. The DTO
 // shape is consumed by the host commands and the activity-feed UI.
 
 /// One accepted-op row, projected for the activity feed and history
@@ -759,7 +759,8 @@ mod tests {
             .unwrap();
         let doc_id = log.doc_id_for_path("a.md").unwrap().unwrap();
         log.rename_document(&doc_id, "b.md", &Author::User).unwrap();
-        log.tombstone_document(&doc_id, &Author::User).unwrap();
+        // The id IS the path: after the rename the doc lives at `b.md`.
+        log.tombstone_document("b.md", &Author::User).unwrap();
 
         let feed = AcceptedFeed::new(&log);
         let rows = feed.history_for_path("b.md", 50).unwrap();

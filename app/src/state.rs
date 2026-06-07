@@ -59,7 +59,7 @@ pub struct AppState {
     /// File-tree UI state (expanded dirs, dir listing cache, selection,
     /// inline-rename draft, reveal scroll target). Relocated off
     /// `Session::file_tree` so the `files` activity surface can reach it
-    /// through the registry `Ctx::state` slot, matching the other
+    /// through the registry `SurfaceCtx.state` slot, matching the other
     /// migrated activities. [feature-filetree-migration]
     pub file_tree_state: FileTreeState,
     pub ui_cache: UiCache,
@@ -96,7 +96,7 @@ pub struct AppState {
     /// Per-activity UI state for the `canvases` activity (lists the
     /// vault's `.canvas` files). Effectively stateless — the listing is
     /// read fresh from disk — so a zero-field marker keeps the registry
-    /// `with_ctx` seam uniform. status: feature-state-ownership
+    /// `AppCtx::session` seam uniform. status: feature-state-ownership
     pub canvases_activity_state: crate::canvas_activity::State,
     /// Per-activity state for the migrated docked `chat` sidebar: the
     /// in-memory session registry + the lazy-discover gate. Relocated
@@ -110,6 +110,12 @@ pub struct AppState {
     pub activities: std::sync::Arc<crate::activity::ActivityRegistry>,
     pub ui: UiState,
     pub toasts: Vec<Toast>,
+    /// Deferred-effect sink for activity surfaces. A `SurfaceCtx` borrows
+    /// this as its `effects` field; each consumer drains it (running each
+    /// closure with full `&mut AppState`) right after the surface
+    /// returns. Lives on `AppState` so the narrow `SurfaceCtx` borrow can
+    /// reach it disjointly from the other fields. See `activity::SurfaceCtx`.
+    pub pending_effects: Vec<crate::activity::Effect>,
     /// What the sync engine last surfaced as needing the user — the blocked-doc
     /// paths, whether a content-key change is held, and whether a last-error is
     /// present. The update loop diffs the live snapshot against this each frame
@@ -182,7 +188,7 @@ pub struct VaultSession {
 
 pub struct Services {
     pub read_store: Arc<Mutex<Store>>,
-    /// The vault's op log: the CRDT-shaped write substrate every producer
+    /// The vault's op log: the text write substrate every producer
     /// rides on (`op-log-ops-producer-helpers`). User saves and agent edits
     /// route through `core::ops::op_writes` against this handle. Seeded from the
     /// on-disk vault at open by `core::ops::op_writes::bootstrap`.
@@ -216,6 +222,12 @@ pub struct Services {
     /// case. Wrapped in `Arc` so the page can clone a handle to spawn async
     /// `force_sync` / `discover` work off the frame loop.
     pub sync: Option<Arc<crate::sync_service::SyncService>>,
+    /// The live git transport engine (`git.md`), present only when `[sync]
+    /// .enabled` and `[sync].transport = "git"`. Mutually exclusive with the
+    /// libp2p `sync` engine above by the single-bidirectional rule
+    /// (`sync-single-bidirectional-transport`) — at most one of `sync` /
+    /// `git_sync` is `Some`. The save site pokes whichever is present.
+    pub git_sync: Option<Arc<crate::git_sync::GitSyncEngine>>,
 }
 
 pub struct VaultEvents {
@@ -643,14 +655,14 @@ pub struct FileTreeState {
     /// Refreshed once per frame by the files sidebar surface via a
     /// deferred pre-pass (which has full `&mut AppState`), so the render
     /// path reads only this opaque snapshot rather than reaching past the
-    /// narrow `feature::Ctx` into `session.buffers` / the skipped-paths
+    /// narrow `activity::SurfaceCtx` into `session.buffers` / the skipped-paths
     /// channel / another feature's trail state. [feature-filetree-migration]
     pub deco: FileTreeDeco,
 }
 
 /// Row-decoration snapshot for the files filetree. The sets are populated
-/// from `AppState` data the narrow `feature::Ctx` doesn't carry, snapshotted
-/// once per frame so the render path stays `Ctx`-only. Holds opaque path
+/// from `AppState` data the narrow `activity::SurfaceCtx` doesn't carry, snapshotted
+/// once per frame so the render path stays `SurfaceCtx`-only. Holds opaque path
 /// strings — no feature-specific types leak in.
 #[derive(Default)]
 pub struct FileTreeDeco {

@@ -1,0 +1,21 @@
+[package]
+name = "wavedrom-compare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wavedrom-compare"
+path = "src/main.rs"
+
+[dependencies]
+# Our pure-Rust WaveDrom renderer — the exact engine the app drives. We feed
+# raw WaveJSON through `render` and compare the rasterized SVG against real
+# wavedrom.js (run in the oracle container) to drive pixel/palette parity.
+hiker-wavedrom = { path = "../../hiker-render/wavedrom" }
+# Rasterize BOTH SVGs identically. Pinned to the exact version hiker-wavedrom
+# uses so resvg/usvg behavior matches the crate's own example pipeline.
+resvg = "0.47.0"
+# Encode the side-by-side composite PNG (no decode/other formats needed).
+image = { version = "0.25", default-features = false, features = ["png"] }

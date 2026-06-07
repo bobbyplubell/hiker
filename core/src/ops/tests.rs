@@ -1,7 +1,6 @@
 use super::file::{create_with_suffix, delete, move_folder, move_note, restore};
 use crate::embed::{Error, Embedder};
-// One import for the op-log producer-bridge tests below; the bridge wraps
-// `OpLog`, so the tests construct one directly and assert through the bridge.
+// The op-log producer-bridge tests construct an `OpLog` directly and assert through the bridge.
 use crate::oplog::OpLog;
 use crate::indexer::{self, Handle};
 use crate::store::Store;
@@ -565,7 +564,7 @@ fn auto_reject_on_drift_flips_a_drifted_op() {
 }
 
 #[test]
-fn retention_gc_drops_old_rejected_rows_and_keeps_fresh() {
+fn retention_gc_keeps_fresh_accepted_and_rejection_leaves_no_row() {
     use crate::ops::op_writes::{self as bridge, AgentEdit};
     use crate::oplog::meta::{Filter, OpStatus};
 
@@ -574,8 +573,10 @@ fn retention_gc_drops_old_rejected_rows_and_keeps_fresh() {
     std::fs::write(td.path().join("a.md"), "hello world\n").unwrap();
     let log = OpLog::open(td.path()).unwrap();
     bridge::bootstrap(&vault, &log).unwrap();
+    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
 
-    // Stage + reject an op so a `rejected` audit row exists with a fresh ts.
+    // Stage + reject an op. Rejection is transient editorial state: it leaves
+    // NO durable history row (`op-log-no-oplog-db`), so no rejected row exists.
     let o = bridge::stage_agent_edits(
         &log,
         &vault,
@@ -586,7 +587,6 @@ fn retention_gc_drops_old_rejected_rows_and_keeps_fresh() {
     )
     .unwrap();
     bridge::flip_op_status(&log, "a.md", &o.op_ids, false).unwrap();
-    let id = log.doc_id_for_path("a.md").unwrap().unwrap();
     let rejected_now = log
         .query_metadata(&Filter {
             doc_id: Some(id.clone()),
@@ -594,24 +594,23 @@ fn retention_gc_drops_old_rejected_rows_and_keeps_fresh() {
             ..Filter::default()
         })
         .unwrap();
-    assert_eq!(rejected_now.len(), 1);
+    assert!(rejected_now.is_empty(), "rejected ops leave no durable row");
 
-    // Retention GC with generous horizons keeps the fresh rows.
+    // The fresh accepted (Create) history row survives a generous-horizon GC;
+    // the rejected horizon is a no-op (no rejected rows are ever stored).
     let (acc, rej) = bridge::run_retention_gc(&log, 365, 14).unwrap();
     assert_eq!((acc, rej), (0, 0), "fresh rows are within retention");
-
-    // A `0` horizon is treated as "no GC", not "drop everything".
     let (acc0, rej0) = bridge::run_retention_gc(&log, 0, 0).unwrap();
-    assert_eq!((acc0, rej0), (0, 0));
-    assert_eq!(
-        log.query_metadata(&Filter {
-            status: Some(OpStatus::Rejected),
+    assert_eq!((acc0, rej0), (0, 0), "0-day horizon is treated as no-GC");
+    assert!(
+        !log.query_metadata(&Filter {
+            doc_id: Some(id),
+            status: Some(OpStatus::Accepted),
             ..Filter::default()
         })
         .unwrap()
-        .len(),
-        1,
-        "0-day horizon must not wipe the rejected row"
+        .is_empty(),
+        "the accepted Create row survives a no-GC pass"
     );
 }
 
@@ -986,25 +985,27 @@ fn reconcile_disk_offline_rename_rebinds_and_preserves_history() {
     let reconciled = bridge::reconcile_disk(&vault, &log, &trash).unwrap();
     assert_eq!(reconciled, 1, "the rename is recognized as one reconcile");
 
-    // The mapping moved to the new path; the same doc_id, not a fresh one.
+    // The id IS the path: the doc relabeled to `new.md`, the old path is gone.
+    let _ = &id;
     assert_eq!(
-        log.path_for_doc(&id).unwrap().as_deref(),
+        log.path_for_doc("new.md").unwrap().as_deref(),
         Some("new.md"),
         "path_for_doc now resolves to the new path"
     );
     assert_eq!(
         log.doc_id_for_path("new.md").unwrap().as_deref(),
-        Some(id.as_str()),
+        Some("new.md"),
     );
     assert!(
         log.doc_id_for_path("old.md").unwrap().is_none(),
         "the old path no longer maps to the doc"
     );
 
-    // A Rename { from: old.md } op authored external was recorded.
+    // A Rename { from: old.md } op authored external was recorded; the history
+    // rows repointed to the new path key.
     let rows = log
         .query_metadata(&Filter {
-            doc_id: Some(id.clone()),
+            doc_id: Some("new.md".to_string()),
             status: Some(OpStatus::Accepted),
             ..Filter::default()
         })
@@ -1019,7 +1020,7 @@ fn reconcile_disk_offline_rename_rebinds_and_preserves_history() {
     );
 
     // Content (history) preserved, not tombstoned.
-    let mat = log.materialize_accepted(&id).unwrap();
+    let mat = log.materialize_accepted("new.md").unwrap();
     assert!(!mat.tombstone, "a rename does not tombstone");
     assert_eq!(mat.text, "stable content\n");
 
@@ -1151,16 +1152,18 @@ fn reconcile_before_bootstrap_keeps_offline_rename_one_lineage() {
         "only one document (the original lineage) exists after the real open order"
     );
 
-    // It is the SAME doc_id, now mapped to new.md; old.md no longer maps.
+    // The id IS the path: the single lineage relabeled to new.md (one doc,
+    // history preserved), and old.md no longer maps.
+    let _ = &id;
     assert_eq!(
-        log.path_for_doc(&id).unwrap().as_deref(),
+        log.path_for_doc("new.md").unwrap().as_deref(),
         Some("new.md"),
         "the original lineage moved to new.md"
     );
     assert_eq!(
         log.doc_id_for_path("new.md").unwrap().as_deref(),
-        Some(id.as_str()),
-        "new.md maps to the original doc_id, not a fresh one"
+        Some("new.md"),
+        "new.md resolves to itself, not a fresh second doc"
     );
     assert!(
         log.doc_id_for_path("old.md").unwrap().is_none(),
@@ -1168,10 +1171,10 @@ fn reconcile_before_bootstrap_keeps_offline_rename_one_lineage() {
     );
 
     // A Rename { from: old.md } op authored external was recorded — history
-    // is preserved on the same lineage, not orphaned to a new one.
+    // is preserved on the same lineage (repointed to the new path key).
     let rows = log
         .query_metadata(&Filter {
-            doc_id: Some(id.clone()),
+            doc_id: Some("new.md".to_string()),
             status: Some(OpStatus::Accepted),
             ..Filter::default()
         })
@@ -1184,7 +1187,7 @@ fn reconcile_before_bootstrap_keeps_offline_rename_one_lineage() {
         }),
         "an external Rename {{ from: old.md }} op exists on the lineage"
     );
-    let mat = log.materialize_accepted(&id).unwrap();
+    let mat = log.materialize_accepted("new.md").unwrap();
     assert!(!mat.tombstone, "the lineage is not tombstoned");
     assert_eq!(mat.text, "stable content\n", "content/history preserved");
 

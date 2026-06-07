@@ -11,10 +11,8 @@ either governed by both structural checks or neither.
 
 To bring a crate under the file-length cap AND the anti-split checks, add
 its `src` dir here. Excluded by intent: dev-only tooling (`tools/*`), the
-website crate (`site`), and the dead legacy `hiker-render/hiker-render/src`
-package (a duplicate LaTeX-math copy slated for deletion; its live
-replacement is `hiker-render/hiker-render/math/src`). Editing this list is a
-deliberate posture change, not an agent's escape hatch.
+website crate (`site`). Editing this list is a deliberate posture change,
+not an agent's escape hatch.
 """
 
 from __future__ import annotations
@@ -45,13 +43,13 @@ RUST_ROOTS = [
     "hiker-canvas/core/src",
     "hiker-canvas/view/src",
     "hiker-canvas/view-core/src",
-    # Render engines (the live subcrates; the legacy root package is excluded)
-    "hiker-render/hiker-render/graph/src",
-    "hiker-render/hiker-render/mermaid/src",
-    "hiker-render/hiker-render/htmlview/src",
-    "hiker-render/hiker-render/math/src",
-    "hiker-render/hiker-render/wavedrom/src",
-    "hiker-render/hiker-render/chart/src",
+    # Render engines (the submodule's crates, each at its root)
+    "hiker-render/graph/src",
+    "hiker-render/mermaid/src",
+    "hiker-render/htmlview/src",
+    "hiker-render/math/src",
+    "hiker-render/wavedrom/src",
+    "hiker-render/chart/src",
     # Widgets + archive reader
     "widgets/graph-widgets/src",
     "zxr/src",

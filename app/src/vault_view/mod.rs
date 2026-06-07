@@ -17,7 +17,7 @@
 //! lens never touches frontmatter on disk per render.
 //!
 //! Migrated off `panels_registry` to a real `Activity` (`Vault`) whose
-//! `View` renders through the narrow `activity::Ctx`: note paths
+//! `View` renders through the narrow `activity::SurfaceCtx`: note paths
 //! come from `ctx.services.read_store`, lens/collapse state from
 //! `ctx.state`, and opening a note is deferred via `ctx.defer`. The lens
 //! picker stays a free `actions_menu` invoked from the workbench `⋯`
@@ -26,7 +26,8 @@
 use eframe::egui;
 
 use crate::editor_pane;
-use crate::activity::{Activity, Ctx, View};
+use egui_workbench::activity::{Activity, View};
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::icons;
 use crate::state::AppState;
 
@@ -62,10 +63,10 @@ pub struct State {
     pub collapsed: std::collections::HashSet<String>,
 }
 
-/// Render the read-only derived tree through the narrow activity `Ctx`:
+/// Render the read-only derived tree through the narrow activity `SurfaceCtx`:
 /// note paths from the read store, lens/collapse from `ctx.state`,
 /// open-note via `ctx.defer`. Never mutates placement.
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let lens = ctx.state.downcast_ref::<State>().expect("vault state").lens;
     if lens == Lens::Composed {
         render_composed(ui, ctx);
@@ -91,7 +92,7 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// relationship/provenance projection + resolved waypoint rows, then walk
 /// it. Tree construction (the nesting authority) lives in `tree.rs`; this is
 /// the egui paint over its output.
-fn render_composed(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_composed(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let (notes, waypoints) = match ctx.services.read_store.lock() {
         Ok(s) => (
             s.notes_with_meta().unwrap_or_default(),
@@ -140,7 +141,7 @@ fn node_icon(kind: NodeKind) -> egui::Image<'static> {
 /// hover-expand.
 fn render_node(
     ui: &mut egui::Ui,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut SurfaceCtx<'_>,
     node: &VaultNode,
     depth: usize,
     tree_paths: &std::collections::HashSet<String>,
@@ -227,7 +228,7 @@ fn render_node(
 /// its nodes are loaded read-only via `trees.list_nodes`. A load failure draws
 /// nothing — the row still renders its label normally.
 /// status: vault-view-row-previews
-fn row_tree_thumbnail(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, path: &str) {
+fn row_tree_thumbnail(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, path: &str) {
     let Some(tree_id) = path.rsplit('/').next().and_then(|b| b.strip_suffix(".md")) else {
         return;
     };
@@ -247,14 +248,14 @@ fn row_tree_thumbnail(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, path: &str) {
     ui.add_space(4.0);
 }
 
-fn render_flat(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, mut paths: Vec<String>) {
+fn render_flat(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, mut paths: Vec<String>) {
     paths.sort_by(|a, b| basename(a).cmp(basename(b)));
     for rel in paths {
         note_row(ui, ctx, &rel, 0);
     }
 }
 
-fn render_by_folder(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, paths: Vec<String>) {
+fn render_by_folder(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, paths: Vec<String>) {
     // Group by top-level folder segment; root notes under "(root)".
     let mut groups: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -296,7 +297,7 @@ fn render_by_folder(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, paths: Vec<String>) {
 
 /// One clickable, read-only note row. Click opens in the preview slot
 /// (`editor-preview-tab-from-open-callsites`); Mod-click opens sticky.
-fn note_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, rel: &str, depth: usize) {
+fn note_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, rel: &str, depth: usize) {
     let indent = 8.0 + depth as f32 * 14.0;
     ui.horizontal(|ui| {
         ui.add_space(indent);
@@ -392,10 +393,10 @@ pub fn actions_menu(ui: &mut egui::Ui, app: &mut AppState) {
 
 /// Zero-sized `Activity` descriptor for the Vault lens. State lives in
 /// `AppState::vault_state`; the surface reaches it via
-/// `Ctx::state.downcast_mut::<State>()`.
+/// `ctx.state.downcast_mut::<State>()`.
 pub struct Vault;
 
-impl Activity for Vault {
+impl Activity<dyn AppCtx> for Vault {
     fn id(&self) -> &'static str {
         "vault"
     }
@@ -405,18 +406,22 @@ impl Activity for Vault {
     fn icon(&self) -> egui::Image<'static> {
         icons::ICONS.image(icons::Icon::Vault)
     }
-    fn views(&self) -> Vec<&dyn View> {
+    fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
         vec![&VaultSidebar]
     }
 }
 
 struct VaultSidebar;
 
-impl View for VaultSidebar {
+impl View<dyn AppCtx> for VaultSidebar {
     fn id(&self) -> &'static str {
         "vault"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         egui::ScrollArea::vertical()
             .id_salt("panel-vault-body")
             .auto_shrink([false, false])

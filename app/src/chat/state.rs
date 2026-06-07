@@ -111,7 +111,7 @@ pub enum ChatEvent {
 
 /// Per-feature chat state. Held on `AppState` as the top-level
 /// `chat_state` field; the chat sidebar surface downcasts the
-/// `feature::Ctx::state` opaque slot to `&mut State`. Owns the
+/// `SurfaceCtx.state` opaque slot to `&mut State`. Owns the
 /// in-memory session registry plus the one-shot "have we walked the
 /// sessions dir yet" gate. Relocated off `Session::chat` /
 /// `Session::chat_discovered` during the chat feature migration.

@@ -37,7 +37,6 @@ agent-client-protocol.workspace = true
 petal-clustering.workspace = true
 ndarray.workspace = true
 single-clustering.workspace = true
-yrs.workspace = true
 bincode.workspace = true
 regex.workspace = true
 

@@ -288,7 +288,16 @@ impl SyncNode {
             // sync-rename-blob-rotation]
             None => {
                 if let Some(prior) = self.find_rename_source(&entry)? {
-                    self.apply_delta_from_peer(peer_id, &prior, &entry.path).await?;
+                    let peer_hashes: HashSet<String> =
+                        entry.recent_history_hashes.iter().cloned().collect();
+                    self.apply_delta_from_peer(
+                        peer_id,
+                        &prior,
+                        &entry.path,
+                        &peer_hashes,
+                        entry.tombstone,
+                    )
+                    .await?;
                     self.mark_bound(&entry.path);
                     report.bound.push(entry.path.clone());
                     report.converged.push(entry.path);
@@ -313,7 +322,7 @@ impl SyncNode {
                         // the peer delta into `accepted`, gate on a same-region
                         // overlap — concurrent edits to the SAME byte ranges must
                         // BLOCK for user resolution rather than silently
-                        // CRDT-interleave; disjoint-region edits still auto-merge.
+                        // interleave; disjoint-region edits still auto-merge.
                         // [sync-conflict-detect-same-region, sync-conflict-block-and-resolve]
                         self.sync_bound_doc(peer_id, &local, &entry, report).await?;
                     }

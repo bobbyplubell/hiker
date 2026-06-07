@@ -10,3 +10,6 @@
 [submodule "hiker-render"]
 	path = hiker-render
 	url = https://github.com/bobbyplubell/hiker-render
+[submodule "hiker-charts"]
+	path = hiker-charts
+	url = git@github.com:bobbyplubell/hiker-charts.git

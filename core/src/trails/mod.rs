@@ -689,7 +689,7 @@ pub fn list(
         walk_waypoints_depth_first(&fm.waypoints, &mut |_, _, _| {
             count += 1;
         });
-        // status: store-id-from-oplog
+        // status: store-path-is-identity
         let trail_id = match log.doc_id_for_path(&rel) {
             Ok(Some(id)) => id,
             _ => continue, // not yet seeded — skip rather than fabricate
@@ -726,7 +726,7 @@ pub fn get_trail(
 
     let waypoints = resolve_waypoint_tree(vault, store, trail_doc_rel, &fm.waypoints, "");
 
-    // status: store-id-from-oplog
+    // status: store-path-is-identity
     let trail_id = log
         .doc_id_for_path(trail_doc_rel)
         .map_err(|e| HikerError::Io(e.to_string()))?

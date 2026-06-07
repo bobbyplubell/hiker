@@ -30,6 +30,9 @@ hiker-core.workspace = true
 # build a GraniteLlmClient via core's config bridge. status: crawler-shared-llm
 hiker-llm.workspace = true
 hiker-sync = { path = "../hiker-sync" }
+# Git transport backend; `git2`/libgit2 is confined to `hiker-git` — the app
+# sees only its plain-Rust `GitBackend` surface. status: git-backend-trait
+hiker-git.workspace = true
 puffin = { version = "0.19", optional = true, features = ["serialization"] }
 puffin_http = { version = "0.16", optional = true }
 
@@ -65,9 +68,9 @@ zxr = { path = "../zxr" }
 # (`hiker-wavedrom`), all SVG-string out. The app rasterizes their SVG to RGBA
 # via resvg (same path `hiker-htmlview` uses) in panels/buffer/widgets/render.rs.
 # status: widget-render-pipeline, widget-wavedrom-render
-hiker-math = { path = "../hiker-render/hiker-render/math" }
-hiker-mermaid = { path = "../hiker-render/hiker-render/mermaid" }
-hiker-wavedrom = { path = "../hiker-render/hiker-render/wavedrom" }
+hiker-math = { path = "../hiker-render/math" }
+hiker-mermaid = { path = "../hiker-render/mermaid" }
+hiker-wavedrom = { path = "../hiker-render/wavedrom" }
 # SVG → RGBA rasterization (usvg parse + tiny-skia pixmap). Same version
 # `hiker-htmlview` already pulls in, so the dep set stays consistent.
 resvg = "0.47.0"

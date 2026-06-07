@@ -59,7 +59,7 @@ The autosave directory is in the `watcher-ignore-hardcoded` list (everything und
 
 `recover()` walks the index, computes each entry's live on-disk hash (or `None` when missing), and returns only entries whose `autosaved_hash != on_disk_hash` (or whose file is gone). Matches drop silently in the same call so the index file shrinks. [autosave-recover-cmd]
 
-Module discipline mirrors `core::store` and `core::changes` — `core::autosave` is the only module that touches `.hiker/autosave/`, returns plain Rust types (`RecoveredEntry`, `TabState`) not internal storage types, and exposes a narrow API the host wraps in 5–15 lines per command. [autosave-backend-module]
+Module discipline mirrors `core::store` and `core::activity` — `core::autosave` is the only module that touches `.hiker/autosave/`, returns plain Rust types (`RecoveredEntry`, `TabState`) not internal storage types, and exposes a narrow API the host wraps in 5–15 lines per command. [autosave-backend-module]
 
 The host command surface matches the Rust API one-to-one: `autosave_write` / `autosave_clear` / `autosave_save_tab_state` / `autosave_load_tab_state` / `autosave_recover` / `autosave_discard`. Each command parses args → calls `Autosave::*` → translates errors → returns DTO.
 

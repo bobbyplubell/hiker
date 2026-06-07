@@ -10,8 +10,7 @@
 //! edit lands as a `SetFrontmatter` op. Mirrors the module-discipline pattern
 //! of `core::trails`: all frontmatter (de)serialization stays behind this
 //! boundary, callers consume plain Rust types only. No SQLite, no
-//! schema-version file. A one-time migration (`cluster-tree-migration`)
-//! relocates legacy `.hiker/trees/<id>.md` trees on first open.
+//! schema-version file.
 //!
 //! Submodule layout (per `trees-module-discipline`):
 //!
@@ -193,7 +192,7 @@ mod tests {
     // save exercised an op-log diff that produced overlapping spans and
     // corrupted the frontmatter (`nodes:` lost its trailing newline), so the
     // reload failed with `TreeNotFound` — surfaced as a "tree could not be
-    // found" toast right after Confirm. See `oplog::doc::multi_span_delta`.
+    // found" toast right after Confirm. See `crate::merge::multi_span_delta`.
     #[test]
     fn confirm_persists_tree_loadable_by_sidebar() {
         let (_d, trees) = open_tmp();

@@ -1117,20 +1117,15 @@ mod tests {
         // Path-as-identity: leaves carry the source note's rel-path directly,
         // which `apply_tree` reads as the vault path. Bootstrap seeds the
         // op-log so the staging path the suggestions write through resolves;
-        // the resolved doc_ids double as the `notes.id` for the store upserts.
+        // the note's path is its identity (`store-path-is-identity`).
         let _ = crate::ops::op_writes::bootstrap(&vault, &log).unwrap_or(0);
-        let note_a = log.doc_id_for_path("a.md").unwrap().expect("seeded");
-        let note_b = log
-            .doc_id_for_path("inbox/b.md")
-            .unwrap()
-            .expect("seeded");
+        assert!(log.doc_id_for_path("a.md").unwrap().is_some());
+        assert!(log.doc_id_for_path("inbox/b.md").unwrap().is_some());
 
         // Index the two notes so the structural query (used elsewhere)
-        // also has rows. Use the op-log's doc_ids as `notes.id` per
-        // path-as-identity.
+        // also has rows; the note's path is its store key.
         store
             .upsert_note(&NoteUpsert {
-                id: &note_a,
                 path: "a.md",
                 content_hash: "h-a",
                 mtime: 1,
@@ -1142,7 +1137,6 @@ mod tests {
             .unwrap();
         store
             .upsert_note(&NoteUpsert {
-                id: &note_b,
                 path: "inbox/b.md",
                 content_hash: "h-b",
                 mtime: 1,
@@ -1248,7 +1242,6 @@ mod tests {
         let log = open_log(&td);
         store
             .upsert_note(&NoteUpsert {
-                id: "note-n",
                 path: "inbox/n.md",
                 content_hash: "h",
                 mtime: 1,
@@ -1318,7 +1311,6 @@ mod tests {
         let log = open_log(&td);
         store
             .upsert_note(&NoteUpsert {
-                id: "note-n",
                 path: "inbox/n.md",
                 content_hash: "h",
                 mtime: 1,

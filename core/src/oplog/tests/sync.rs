@@ -15,6 +15,20 @@ fn hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
 
+/// Apply `src`'s current document TEXT into `dst` as the text substrate's
+/// receive path: ship the source's `export_since` (whole-file text), its
+/// tombstone flag, and its content-hash history window (the merge-base anchor) —
+/// exactly what the transport hands `apply_remote_update` now that the wire
+/// carries text, not Yrs deltas. Returns whether `dst` advanced.
+fn sync_text(dst: &OpLog, dst_doc: &str, src: &OpLog, src_doc: &str, device: &str) -> bool {
+    let dst_sv = dst.state_vector_bytes(dst_doc).unwrap();
+    let text = src.export_since(src_doc, &dst_sv).unwrap();
+    let tombstone = src.materialize_accepted(src_doc).unwrap().tombstone;
+    let peer_hashes = src.doc_history_hashes(src_doc).unwrap();
+    dst.apply_remote_update(dst_doc, &text, tombstone, device, &peer_hashes)
+        .unwrap()
+}
+
 #[test]
 fn content_hash_populated_and_history_set_accumulates() {
     // status: sync-content-hash-column
@@ -150,12 +164,10 @@ fn export_import_round_trip_streams_an_edit() {
     // status: op-log-multi-device-sync
     let (_da, log_a, doc_a, _db, log_b, doc_b) = shared_lineage();
 
-    // A edits; B asks for "ops since my watermark" and applies them.
+    // A edits; B pulls A's whole-file text and merges it.
     assert!(log_a.apply_user_text(&doc_a, "# Shared\n\nline one EDITED\nline two\n").unwrap());
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    let advanced = log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap();
-    assert!(advanced, "the delta carried new ops");
+    let advanced = sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA");
+    assert!(advanced, "the peer text carried a new version");
 
     // B now materializes to A's text…
     assert_eq!(
@@ -180,7 +192,7 @@ fn disk_edit_and_peer_edit_both_survive_merge() {
     // a PEER *and* on local DISK at the same time. The ordering invariant folds
     // the offline disk edit into `accepted` as an `author=external` op (what
     // `reconcile_disk` produces) BEFORE the peer's update is applied, so the
-    // inbound merge is a standard Yrs three-way: base + local-external +
+    // inbound merge is a standard text three-way: base + local-external +
     // remote. Disjoint edits both survive, both devices converge, and the local
     // disk edit propagates back to the peer.
     // status: op-log-startup-disk-reconcile
@@ -199,10 +211,8 @@ fn disk_edit_and_peer_edit_both_survive_merge() {
         .unwrap());
 
     // Reconcile-before-sync: B's disk edit is already in `accepted` (above); the
-    // first sync round now pulls A's delta and merges it in.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    // first sync round now pulls A's text and merges it in.
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
 
     // BOTH edits survive on B — disjoint regions merge to the union.
     let merged_b = log_b.materialize_accepted(&doc_b).unwrap().text;
@@ -228,9 +238,7 @@ fn disk_edit_and_peer_edit_both_survive_merge() {
     // Convergence: push B's combined state back to A — A ends byte-identical to
     // B, so the local disk edit propagated to the peer rather than only merging
     // locally.
-    let a_sv = log_a.state_vector_bytes(&doc_a).unwrap();
-    let delta_back = log_b.export_since(&doc_b, &a_sv).unwrap();
-    assert!(log_a.apply_remote_update(&doc_a, &delta_back, "deviceB").unwrap());
+    assert!(sync_text(&log_a, &doc_a, &log_b, &doc_b, "deviceB"));
     assert_eq!(
         log_a.materialize_accepted(&doc_a).unwrap().text,
         merged_b,
@@ -239,21 +247,25 @@ fn disk_edit_and_peer_edit_both_survive_merge() {
 }
 
 #[test]
-fn three_peers_editing_the_same_line_converge() {
-    // "Can 3 peers edit the same line at once?" — yes, in the sense a CRDT
-    // guarantees: every replica CONVERGES to one deterministic text regardless
-    // of the order deltas arrive, and no peer's contribution is lost. The merge
-    // of same-position edits is a deterministic INTERLEAVE, not a clean semantic
-    // three-way — the honest claim (op-log.md: char-level merge "can interleave
-    // into nonsense"). So this asserts convergence + no-loss, NOT a pretty result.
+fn three_peers_editing_disjoint_lines_converge() {
+    // FAITHFUL text-model successor to the Yrs `three_peers_editing_the_same_line`
+    // CRDT-interleave test. Under the text substrate the wire carries whole-file
+    // TEXT reconciled by a 3-way merge over the content-hash base: three peers
+    // editing DISJOINT regions all survive and converge to one deterministic text
+    // regardless of delivery order (the auto-merge half of the spec). Three peers
+    // editing the SAME region is a CONFLICT the transport BLOCKS — never a silent
+    // interleave — and is covered by `same_region_edits_verdict_conflict`; we do
+    // NOT re-test that here. This pins convergence + no-loss for the disjoint
+    // case, the property the text substrate genuinely guarantees.
     // status: op-log-multi-device-sync
-    let seed = "shared line\n";
+    // status: op-log-sync-substrate
+    let seed = "line A\nline B\nline C\n";
     let dir_a = tempdir().unwrap();
     let log_a = OpLog::open(dir_a.path()).unwrap();
     let doc_a = log_a.create_document("s.md", "note", seed, &Author::User).unwrap();
     let canonical = log_a.export_state(&doc_a).unwrap();
-    // B and C each adopt A's canonical lineage (the enrollment flow) — three
-    // replicas of one doc, each with its own Yrs client_id.
+    // B and C each adopt A's canonical text (the enrollment flow) — three
+    // replicas of one doc on the shared content-hash base.
     let mk = |canon: &[u8]| {
         let dir = tempdir().unwrap();
         let log = OpLog::open(dir.path()).unwrap();
@@ -264,39 +276,37 @@ fn three_peers_editing_the_same_line_converge() {
     let (_db, log_b, doc_b) = mk(&canonical);
     let (_dc, log_c, doc_c) = mk(&canonical);
 
-    // Common base watermark (identical across all three after adoption).
-    let base_sv = log_a.state_vector_bytes(&doc_a).unwrap();
+    // Each peer edits a DISJOINT line, concurrently (all against the same base).
+    assert!(log_a.apply_user_text(&doc_a, "line A [A]\nline B\nline C\n").unwrap());
+    assert!(log_b.apply_user_text(&doc_b, "line A\nline B [B]\nline C\n").unwrap());
+    assert!(log_c.apply_user_text(&doc_c, "line A\nline B\nline C [C]\n").unwrap());
 
-    // Each peer edits the SAME line, concurrently (all against the same base).
-    assert!(log_a.apply_user_text(&doc_a, "shared line [A]\n").unwrap());
-    assert!(log_b.apply_user_text(&doc_b, "shared line [B]\n").unwrap());
-    assert!(log_c.apply_user_text(&doc_c, "shared line [C]\n").unwrap());
-
-    // Capture each peer's delta-since-base BEFORE any cross-application.
-    let da = log_a.export_since(&doc_a, &base_sv).unwrap();
-    let db = log_b.export_since(&doc_b, &base_sv).unwrap();
-    let dc = log_c.export_since(&doc_c, &base_sv).unwrap();
-
-    // Deliver the other two deltas to each peer in DIFFERENT orders — proving
-    // order-independent convergence.
-    log_a.apply_remote_update(&doc_a, &db, "B").unwrap();
-    log_a.apply_remote_update(&doc_a, &dc, "C").unwrap();
-    log_b.apply_remote_update(&doc_b, &dc, "C").unwrap();
-    log_b.apply_remote_update(&doc_b, &da, "A").unwrap();
-    log_c.apply_remote_update(&doc_c, &da, "A").unwrap();
-    log_c.apply_remote_update(&doc_c, &db, "B").unwrap();
+    // Deliver each peer's text to the others in DIFFERENT orders — proving
+    // order-independent convergence. Each apply merges over the shared base.
+    sync_text(&log_a, &doc_a, &log_b, &doc_b, "B");
+    sync_text(&log_a, &doc_a, &log_c, &doc_c, "C");
+    sync_text(&log_b, &doc_b, &log_c, &doc_c, "C");
+    sync_text(&log_b, &doc_b, &log_a, &doc_a, "A");
+    sync_text(&log_c, &doc_c, &log_a, &doc_a, "A");
+    sync_text(&log_c, &doc_c, &log_b, &doc_b, "B");
+    // One more pass each direction so a peer that merged a partial union also
+    // picks up the third edit it hadn't seen when first applied.
+    sync_text(&log_a, &doc_a, &log_b, &doc_b, "B");
+    sync_text(&log_a, &doc_a, &log_c, &doc_c, "C");
+    sync_text(&log_b, &doc_b, &log_a, &doc_a, "A");
+    sync_text(&log_c, &doc_c, &log_a, &doc_a, "A");
 
     let ta = log_a.materialize_accepted(&doc_a).unwrap().text;
     let tb = log_b.materialize_accepted(&doc_b).unwrap().text;
     let tc = log_c.materialize_accepted(&doc_c).unwrap().text;
 
     // Convergence: all three replicas agree despite different delivery orders.
-    assert_eq!(ta, tb, "A and B converge");
-    assert_eq!(tb, tc, "B and C converge");
-    // No contribution lost: every peer's same-line insert survives the interleave.
+    assert_eq!(ta, tb, "A and B converge: {ta:?} vs {tb:?}");
+    assert_eq!(tb, tc, "B and C converge: {tb:?} vs {tc:?}");
+    // No contribution lost: every peer's disjoint edit survives the merge.
     assert!(
         ta.contains("[A]") && ta.contains("[B]") && ta.contains("[C]"),
-        "all three concurrent same-line edits survive: {ta:?}"
+        "all three concurrent disjoint edits survive: {ta:?}"
     );
 }
 
@@ -383,11 +393,10 @@ fn fast_forward_delete_verdict_not_a_conflict() {
         "a fast-forward delete (no concurrent edit) must NOT block — it auto-applies → trash"
     );
 
-    // And the actual delta apply still tombstones B (the auto-apply path the
-    // verdict defers to), confirming the fast-forward delete lands.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    // And the actual apply still tombstones B (the auto-apply path the verdict
+    // defers to), confirming the fast-forward delete lands. The peer is
+    // tombstoned, so `sync_text` ships `peer_tombstone = true`.
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
     assert!(
         log_b.materialize_accepted(&doc_b).unwrap().tombstone,
         "the fast-forward delete auto-applied (B tombstoned)"
@@ -443,9 +452,9 @@ fn delete_vs_edit_verdict_not_applicable_when_neither_or_both_tombstoned() {
 #[test]
 fn disjoint_region_edits_verdict_clean_merge() {
     // status: sync-conflict-detect-same-region
-    // REGRESSION guard for the desired CRDT behavior: two devices edit
+    // REGRESSION guard for the desired merge behavior: two devices edit
     // DISJOINT regions of a shared-lineage doc concurrently — the verdict must
-    // be CleanMerge (no block), and the Yrs merge that follows keeps both edits.
+    // be CleanMerge (no block), and the text merge that follows keeps both edits.
     use super::super::sync::SameRegion;
     let (_da, log_a, doc_a, _db, log_b, doc_b) = shared_lineage();
     // base on both: "# Shared\n\nline one\nline two\n"
@@ -467,11 +476,9 @@ fn disjoint_region_edits_verdict_clean_merge() {
         "disjoint-region concurrent edits must NOT block — they auto-merge"
     );
 
-    // And the actual Yrs merge keeps both edits (the behavior the block must
+    // And the actual text merge keeps both edits (the behavior the block must
     // not regress).
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
     let merged = log_b.materialize_accepted(&doc_b).unwrap().text;
     assert!(merged.contains("[A]") && merged.contains("[B]"), "both edits survive: {merged:?}");
 }
@@ -527,49 +534,47 @@ fn fast_forward_verdict_clean_merge_without_fetch() {
 }
 
 #[test]
-fn apply_remote_update_noop_when_no_new_ops() {
+fn apply_remote_update_noop_when_content_unchanged() {
     // status: op-log-multi-device-sync
+    // status: op-log-sync-substrate
     let (_da, log_a, doc_a, _db, log_b, doc_b) = shared_lineage();
 
-    // A delta computed against B's *own* current SV carries no ops B lacks.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let empty_delta = log_b.export_since(&doc_b, &b_sv).unwrap();
+    // Applying B's OWN current text back to B carries no new content → no-op.
     assert!(
-        !log_b.apply_remote_update(&doc_b, &empty_delta, "deviceA").unwrap(),
-        "an update with no new ops must return false"
+        !sync_text(&log_b, &doc_b, &log_b, &doc_b, "deviceA"),
+        "an update with no new content must return false"
     );
-    // Re-applying an already-known delta is also a no-op (idempotent receive).
+    // A advances; B merges it once (advances), then a re-apply of the SAME peer
+    // text is an idempotent no-op (the merge over the now-matching content is a
+    // no-op commit).
     assert!(log_a.apply_user_text(&doc_a, "# Shared\n\nchanged\n").unwrap());
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
     assert!(
-        !log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap(),
-        "the second apply of the same delta is a no-op"
+        !sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"),
+        "the second apply of the same peer text is a no-op"
     );
 }
 
 #[test]
-fn bug_sync_clock_range_records_local_cid() {
+fn sync_receive_records_real_op() {
     // status: bug-sync-clock-range-records-local-cid
+    // status: op-log-sync-substrate
     //
-    // `apply_remote_update` captures `cid = local.accepted.client_id()` and
-    // brackets the merge with `state_clock(accepted, cid)` pre/post. But the
-    // peer's update authors ops under the *peer's* client_id, so the local
-    // cid's clock does not advance — the recorded `(yrs_client_id,
-    // yrs_clock_lo, yrs_clock_hi)` describes a zero-width range that does not
-    // correspond to any real op. The recorded row should instead reflect the
-    // span of ops the update actually introduced (peer's client id, lo<hi).
+    // FAITHFUL successor to the Yrs `bug_sync_clock_range_records_local_cid`
+    // guard, ported to the text model. Under the text substrate
+    // `apply_remote_update` lands the merged text through `commit_text_edit`,
+    // which re-expresses the peer's content as localized text ops on OUR
+    // `accepted` (a real local commit, authored `sync:<device>`). The Yrs clock
+    // range is gone (the columns are vestigial 0s now), so the faithful
+    // assertion is that the receive records a REAL accepted op — a
+    // `sync:<device>`-authored row whose content hash matches the now-merged
+    // accepted content — never a phantom that didn't actually land the bytes.
     let (_da, log_a, doc_a, _db, log_b, doc_b) = shared_lineage();
 
-    // A authors an edit — these ops live under A's client id.
+    // A authors an edit; B pulls A's text and merges it.
     let edited = "# Shared\n\nline one EDITED\nline two\n";
     assert!(log_a.apply_user_text(&doc_a, edited).unwrap());
-
-    // B applies A's delta.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
 
     // The sync row B recorded for this receive.
     let hist = log_b.doc_history(&doc_b, 50).unwrap();
@@ -578,15 +583,15 @@ fn bug_sync_clock_range_records_local_cid() {
         .find(|m| matches!(&m.author, Author::Sync(d) if d == "deviceA"))
         .expect("expected a sync:deviceA-authored row on B");
 
-    // The bug: the captured clock range is zero-width because the local cid's
-    // clock didn't advance — the peer's ops landed under the peer's cid.
-    assert!(
-        row.yrs_clock_hi > row.yrs_clock_lo,
-        "recorded clock range is zero-width ({}..{}): the row does not describe \
-         any real op (apply_remote_update captured the LOCAL cid's clock, but \
-         the peer-authored ops advanced the PEER's clock)",
-        row.yrs_clock_lo,
-        row.yrs_clock_hi,
+    // The row describes a real op that landed the merged bytes: its content
+    // hash equals the blake3 of B's now-current accepted text (which includes
+    // A's edit), so the row corresponds to actual content, not a phantom.
+    let merged = log_b.materialize_accepted(&doc_b).unwrap().text;
+    assert!(merged.contains("EDITED"), "B's accepted must hold A's merged edit");
+    assert_eq!(
+        row.content_hash.as_deref(),
+        Some(hash(&merged).as_str()),
+        "the sync row's content hash must match the merged accepted content",
     );
 }
 
@@ -628,17 +633,21 @@ fn adopt_lineage_preserves_local_divergence() {
 }
 
 #[test]
-fn bug_sync_remote_rename_overwrites_collision() {
+fn sync_text_receive_is_path_inert() {
     // status: bug-sync-remote-rename-overwrites-collision
+    // status: op-log-sync-substrate
     //
-    // `apply_remote_update` blindly calls `meta::repoint_doc` when a remote
-    // update's merge advances `meta.path`. `repoint_doc` silently overwrites a
-    // path mapping owned by a *different* local doc — and the subsequent
-    // `write_md_file` clobbers that other doc's `.md` on disk. The expected
-    // behavior (mirroring `accept_pending`'s pre-check) is to refuse the path
-    // repoint and surface a Fork-style block, or route to a conflict-sibling
-    // path. Either way, the local doc-X at `notes/foo.md` and its on-disk
-    // content must be preserved.
+    // FAITHFUL text-model successor to the Yrs `bug_sync_remote_rename_overwrites_collision`
+    // guard. The former bug was that `apply_remote_update` repointed `meta.path`
+    // from a Yrs `meta.path` op riding in the delta, clobbering a DIFFERENT
+    // local doc's `.md` at the target path. Under the text substrate the wire
+    // carries only TEXT — no path move can ride in — so `apply_remote_update` is
+    // PATH-INERT: it merges the peer's text into the named doc and NEVER touches
+    // any other doc's path or `.md`. (A concurrent rename collision is now the
+    // transport's job: the manifest path-identity routes it to a Fork block,
+    // covered by `concurrent_rename_to_same_target_blocks_for_resolution` in the
+    // scenarios suite.) This pins the no-collateral-overwrite invariant at the
+    // substrate boundary.
     let dir_local = tempdir().unwrap();
     let log_local = OpLog::open(dir_local.path()).unwrap();
     // doc-X owns `notes/foo.md` locally; its disk content is distinctive.
@@ -646,14 +655,14 @@ fn bug_sync_remote_rename_overwrites_collision() {
     let doc_x = log_local
         .create_document("notes/foo.md", "note", local_x_text, &Author::User)
         .unwrap();
-    // doc-Y lives at a different path locally; the peer will rename it.
-    let local_y_text = "PEER WILL RENAME ME\n";
+    // doc-Y lives at its own path locally; a peer shares its lineage.
+    let local_y_text = "PEER SHARES ME\n";
     let doc_y = log_local
         .create_document("notes/bar.md", "note", local_y_text, &Author::User)
         .unwrap();
 
-    // Peer log: independently has doc-Y at the same path with the same content,
-    // adopts the local's lineage for doc-Y, then renames bar.md → foo.md.
+    // Peer independently holds doc-Y at the same path + content, adopts the
+    // local's text, then edits its copy.
     let dir_peer = tempdir().unwrap();
     let log_peer = OpLog::open(dir_peer.path()).unwrap();
     let doc_y_peer = log_peer
@@ -661,38 +670,37 @@ fn bug_sync_remote_rename_overwrites_collision() {
         .unwrap();
     let canonical = log_local.export_state(&doc_y).unwrap();
     log_peer.adopt_lineage(&doc_y_peer, &canonical).unwrap();
-    // Peer renames its copy of doc-Y to the path that doc-X owns locally.
-    log_peer
-        .rename_document(&doc_y_peer, "notes/foo.md", &Author::User)
-        .unwrap();
+    let peer_edit = "PEER SHARES ME\nplus a peer edit\n";
+    log_peer.apply_user_text(&doc_y_peer, peer_edit).unwrap();
 
-    // Local pulls the peer's delta for doc-Y. The delta carries a `meta.path`
-    // advance to `notes/foo.md` — which collides with doc-X's path.
-    let local_y_sv = log_local.state_vector_bytes(&doc_y).unwrap();
-    let delta = log_peer.export_since(&doc_y_peer, &local_y_sv).unwrap();
-    let result = log_local.apply_remote_update(&doc_y, &delta, "peer-device");
+    // Local pulls the peer's TEXT for doc-Y and merges it into doc-Y. The text
+    // wire conveys no path — doc-X at notes/foo.md cannot be touched.
+    assert!(sync_text(&log_local, &doc_y, &log_peer, &doc_y_peer, "peer-device"));
 
-    // Expected fix: the collision is detected — either by returning an Err, or
-    // by NOT performing the destructive overwrite (e.g. routing to a sibling
-    // conflict path). Either way, doc-X's on-disk `.md` and path mapping must
-    // be preserved.
+    // doc-X's `.md` and content are untouched.
     let foo_on_disk = std::fs::read_to_string(dir_local.path().join("notes/foo.md"))
         .expect("doc-X's notes/foo.md should still exist on disk");
     assert_eq!(
         foo_on_disk, local_x_text,
-        "BUG: doc-X's `.md` at notes/foo.md was overwritten with doc-Y's content. \
-         apply_remote_update silently repointed the path mapping and wrote \
-         doc-Y's materialized text over doc-X's file. result={:?}",
-        result,
+        "doc-X's `.md` at notes/foo.md must be untouched by a text receive on doc-Y",
     );
-    // Optional stronger assertion: the path-index still resolves to doc-X.
+    // Both paths still resolve to their own docs; nothing was repointed.
     assert_eq!(
         log_local.doc_id_for_path("notes/foo.md").unwrap().as_deref(),
-        Some(doc_x.as_str()),
-        "BUG: doc_index path mapping for notes/foo.md was silently repointed to doc-Y, \
-         orphaning doc-X. result={:?}",
-        result,
+        Some("notes/foo.md"),
+        "doc-X's path mapping is intact",
     );
+    assert_eq!(
+        log_local.doc_id_for_path("notes/bar.md").unwrap().as_deref(),
+        Some("notes/bar.md"),
+        "doc-Y remains resolvable at its own path",
+    );
+    // doc-Y merged the peer's edit (the receive did its actual job).
+    assert!(
+        log_local.materialize_accepted(&doc_y).unwrap().text.contains("plus a peer edit"),
+        "doc-Y merged the peer's text",
+    );
+    let _ = doc_x;
 }
 
 #[test]
@@ -759,7 +767,7 @@ fn bug_sync_adopt_lineage_discards_working() {
 #[test]
 fn apply_remote_tombstone_moves_local_md_to_trash_and_restore_recovers() {
     // bug-sync-remote-delete-leaves-ghost-file: a delete on device A syncs to B
-    // as a Yrs tombstone op. Before the fix, B's `apply_remote_update` advanced
+    // as a tombstone flag. Before the fix, B's `apply_remote_update` advanced
     // the doc to tombstoned but `write_md_file` early-returned, leaving B's
     // `.md` on disk as a stale ghost (editable → could resurrect the doc). The
     // fix moves the lingering `.md` to TRASH (recoverable), referencing the
@@ -771,12 +779,10 @@ fn apply_remote_tombstone_moves_local_md_to_trash_and_restore_recovers() {
     let md_path = dir_b.path().join("shared.md");
     assert!(md_path.exists(), "B's .md exists before the remote delete");
 
-    // A deletes the doc; B receives the tombstone delta.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
+    // A deletes the doc; B receives the tombstone (text + tombstone flag).
     log_a.tombstone_document(&doc_a, &Author::User).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    let advanced = log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap();
-    assert!(advanced, "the tombstone delta carried a new op");
+    let advanced = sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA");
+    assert!(advanced, "the tombstone receive advanced B");
 
     // The doc is tombstoned on B…
     assert!(
@@ -839,20 +845,18 @@ fn apply_remote_tombstone_idempotent_does_not_double_trash() {
     let (_da, log_a, doc_a, dir_b, log_b, doc_b) = shared_lineage();
     let md_path = dir_b.path().join("shared.md");
 
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
     log_a.tombstone_document(&doc_a, &Author::User).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
 
     // First apply: transition live → tombstoned, moves the .md to trash.
-    assert!(log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap());
+    assert!(sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"));
     assert!(!md_path.exists());
     let trash = Trash::open(dir_b.path());
     assert_eq!(trash.list().unwrap().len(), 1, "first apply trashed once");
 
-    // Second apply of the SAME delta: Yrs treats the already-known tombstone op
-    // as a no-op (advanced == false), so no transition, no second trash entry.
+    // Second apply of the SAME tombstone: B is already tombstoned (both sides
+    // deleted), so the receive is a no-op — no transition, no second trash entry.
     assert!(
-        !log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap(),
+        !sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA"),
         "re-applying the same tombstone is a no-op"
     );
     assert_eq!(
@@ -863,7 +867,7 @@ fn apply_remote_tombstone_idempotent_does_not_double_trash() {
 }
 
 /// REPRO for the reported canvas corruption: edit on BOTH sides with ASYMMETRIC
-/// dirty-buffer sync. A `.canvas` rides the whole-file-as-`Y.Text` substrate and
+/// dirty-buffer sync. A `.canvas` rides the whole-file-as-text substrate and
 /// a canvas edit REPLACES the entire `working` span (no incremental editor
 /// change set — `replace_working`), re-authoring every byte. When a peer delta
 /// arrives while that re-authored `working` overlay is live, `apply_remote_update`
@@ -937,10 +941,8 @@ fn canvas_peer_delta_onto_dirty_working_interleaves_repro() {
     ]);
     log_a.apply_user_text(&doc_a, &a_edit).unwrap();
 
-    // A's delta lands on B WHILE B's dirty canvas working overlay is live.
-    let b_sv = log_b.state_vector_bytes(&doc_b).unwrap();
-    let delta = log_a.export_since(&doc_a, &b_sv).unwrap();
-    log_b.apply_remote_update(&doc_b, &delta, "deviceA").unwrap();
+    // A's text lands on B WHILE B's dirty canvas working overlay is live.
+    sync_text(&log_b, &doc_b, &log_a, &doc_a, "deviceA");
 
     // The editable buffer the canvas panel renders (and a later save commits).
     // Before the fix, A's `9876` was relocated to byte 0 (`9876{…`) because the
@@ -1057,11 +1059,9 @@ fn commit_working_no_double_via_real_remote_update_race() {
     assert!(log_b.commit_working(&doc_b).unwrap());
     assert_eq!(log_b.materialize_accepted(&doc_b).unwrap().text, content);
 
-    // A pulls B's delta: B's content lands in A's accepted via the genuine
+    // A pulls B's text: B's content lands in A's accepted via the genuine
     // remote-update path while A's working still holds the uncommitted content.
-    let a_sv = log_a.state_vector_bytes(&doc_a).unwrap();
-    let delta = log_b.export_since(&doc_b, &a_sv).unwrap();
-    log_a.apply_remote_update(&doc_a, &delta, "deviceB").unwrap();
+    sync_text(&log_a, &doc_a, &log_b, &doc_b, "deviceB");
     let accepted_after_pull = log_a.materialize_accepted(&doc_a).unwrap().text;
     assert_eq!(
         accepted_after_pull, content,

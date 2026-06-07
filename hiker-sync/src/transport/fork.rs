@@ -75,10 +75,10 @@ impl SyncNode {
         match class {
             Classification::Identical => {
                 // Same content, but two independently-seeded vaults have
-                // DISJOINT Yrs lineages (different client ids over the same
+                // DISJOINT lineages (no shared history over the same
                 // bytes). Marking bound now and letting a later round take the
-                // steady-state delta path would be a correctness bug: our state
-                // vector is meaningless to a disjoint-lineage peer, so its
+                // steady-state delta path would be a correctness bug: our
+                // watermark is meaningless to a disjoint-lineage peer, so its
                 // `export_since` returns its ENTIRE doc and applying it inserts a
                 // SECOND copy of the body alongside ours (the duplication bug).
                 //
@@ -215,7 +215,7 @@ impl SyncNode {
             Some(Resolution::KeepMine) => {
                 // Our version is canonical — and we converge BOTH sides in one
                 // click by PUSHING our base so the peer adopts it. Our content is
-                // unchanged; we send the peer our exact Yrs base
+                // unchanged; we send the peer our exact canonical text
                 // (`export_state`) for it to adopt (discarding its divergence —
                 // that's what "keep mine" means).
                 //
@@ -305,9 +305,16 @@ impl SyncNode {
                     && self.detect_rename_collision(local, entry)?;
                 if !still_colliding {
                     // The collision resolved out-of-band: the lineages converged
-                    // at this path. Pull the (now clean) delta so our state vector
+                    // at this path. Pull the (now clean) text so our content
                     // matches and drop the stale block.
-                    self.apply_delta_from_peer(peer_id, local, path).await?;
+                    self.apply_delta_from_peer(
+                        peer_id,
+                        local,
+                        path,
+                        &theirs_history,
+                        entry.tombstone,
+                    )
+                    .await?;
                     self.clear_stale_block(path);
                     report.bound.push(path.to_string());
                     report.converged.push(path.to_string());
@@ -409,7 +416,7 @@ impl SyncNode {
     }
 
     /// Steady-state delta apply for a BOUND doc, gated on a same-region
-    /// conflict check. Both sides share a lineage, so a Yrs merge of the peer's
+    /// conflict check. Both sides share a lineage, so a text merge of the peer's
     /// delta would silently interleave concurrent edits — desired for DISJOINT
     /// regions, garbling for the SAME region. Before applying, run the 3-way
     /// span-overlap verdict; on an overlap, BLOCK (hold the delta, mark
@@ -476,11 +483,14 @@ impl SyncNode {
         // auto-apply → the Phase-3 trash move. [sync-conflict-delete-vs-edit]
         let maybe_delete_vs_edit = ours.tombstone || ours_current != entry.current_hash;
         if !both_diverged && !maybe_delete_vs_edit {
-            // Clean fast-forward / disjoint history, no tombstone in play →
-            // normal delta apply. If this doc was Blocked on a prior round and
-            // the conflict has since converged out-of-band (resolved on the
-            // other device), drop the now-stale block so it stops surfacing.
-            self.apply_delta_from_peer(peer_id, local, path).await?;
+            // Clean fast-forward / disjoint history (incl. a fast-forward delete:
+            // we sit at the base and the peer tombstoned) → normal text apply.
+            // `entry.tombstone` carries the peer's delete so a fast-forward
+            // delete auto-applies (→ trash) here. If this doc was Blocked on a
+            // prior round and the conflict has since converged out-of-band, drop
+            // the now-stale block so it stops surfacing.
+            self.apply_delta_from_peer(peer_id, local, path, &theirs_history, entry.tombstone)
+                .await?;
             self.clear_stale_block(path);
             report.bound.push(path.to_string());
             report.converged.push(path.to_string());
@@ -493,7 +503,7 @@ impl SyncNode {
         let (theirs, theirs_tombstone) = self.fetch_peer_text(peer_id, path).await?;
 
         // Delete-vs-edit FIRST: a tombstone concurrent with an edit must block
-        // for Keep-deleted / Keep-edit, not be CRDT-folded (which would let the
+        // for Keep-deleted / Keep-edit, not be auto-folded (which would let the
         // delete silently win or the edit silently resurrect).
         // [sync-conflict-delete-vs-edit]
         let dve = self
@@ -518,9 +528,10 @@ impl SyncNode {
         }
 
         // Not a delete-vs-edit. If the hashes didn't both diverge it's a clean
-        // fast-forward (incl. a pure fast-forward delete) → normal delta apply.
+        // fast-forward (incl. a pure fast-forward delete) → normal text apply.
         if !both_diverged {
-            self.apply_delta_from_peer(peer_id, local, path).await?;
+            self.apply_delta_from_peer(peer_id, local, path, &theirs_history, theirs_tombstone)
+                .await?;
             self.clear_stale_block(path);
             report.bound.push(path.to_string());
             report.converged.push(path.to_string());
@@ -534,17 +545,52 @@ impl SyncNode {
             .same_region_verdict(&local.0, &theirs, &theirs_history)
             .map_err(|e| Error::Apply(format!("same_region_verdict: {e}")))?;
         match verdict {
-            SameRegion::CleanMerge | SameRegion::NoSharedBase => {
-                // Disjoint regions (or no reconstructable base) — let the Yrs
-                // merge apply the delta. NoSharedBase on a bound doc is rare
-                // (the lineage IS shared) but if it happens the safe move is the
-                // normal delta path, not a silent block. Clear any stale block:
-                // a same-region conflict resolved on the other device converges
-                // here as a clean merge, and this side's block must drop.
-                self.apply_delta_from_peer(peer_id, local, path).await?;
+            SameRegion::CleanMerge => {
+                // A real shared base exists and the divergent regions are
+                // disjoint — the 3-way text merge is exact, so apply the peer's
+                // text. Clear any stale block: a same-region conflict resolved on
+                // the other device converges here as a clean merge once the
+                // lineages re-share a base, and this side's block drops. A
+                // genuinely-converged doc reaches THIS arm (it shares a base
+                // again), so the NoSharedBase→block change below never strands a
+                // doc that truly converged.
+                self.apply_delta_from_peer(peer_id, local, path, &theirs_history, theirs_tombstone)
+                    .await?;
                 self.clear_stale_block(path);
                 report.bound.push(path.to_string());
                 report.converged.push(path.to_string());
+            }
+            SameRegion::NoSharedBase => {
+                // BOTH sides diverged (the not-both-diverged fast-forward cases
+                // returned earlier) AND no shared base is reconstructable — the
+                // base aged out of the peer's bounded `recent_history_hashes`
+                // window, or its op frame aged past retention. With no base,
+                // `apply_remote_update` falls back to `base = ours`, and
+                // `three_way_merge(ours, ours, theirs) == theirs` would SILENTLY
+                // overwrite our divergent edits. That is data loss, and it
+                // contradicts `sync.md` ("no common base → fork conflict, never
+                // silently merged"). So BLOCK for user resolution instead.
+                //
+                // Reason is `same-region` so the existing dialer dispatch routes
+                // a queued resolution to `sync_bound_doc` → `resolve_same_region`
+                // (keep-mine / keep-theirs / keep-both): a no-base fork on a bound
+                // lineage resolves exactly as a same-region conflict does, so this
+                // block is RESOLVABLE through the established path rather than a
+                // dead end. [sync-conflict-detect-same-region,
+                // sync-conflict-block-and-resolve]
+                self.status
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_string(), SyncStatus::Blocked);
+                let peer = self.peer_fingerprint(&peer_id);
+                self.record_blocked(path, "same-region", &peer);
+                report
+                    .blocked
+                    .push((path.to_string(), "same-region".to_string()));
+                tracing::warn!(
+                    path = %path,
+                    "sync: no reconstructable base — blocking for user resolution"
+                );
             }
             SameRegion::Conflict => {
                 // Same-region overlap: do NOT fold the delta into `accepted`.
@@ -609,12 +655,12 @@ impl SyncNode {
                 self.push_adopt_to_peer(peer_id, local, path).await?;
             }
             Resolution::KeepTheirs => {
-                // Their changes win the overlap. Fold the peer's ops into our SV
-                // (so the delta isn't re-offered next round), then re-assert the
-                // peer's CURRENT text as the accepted content — the decisive
-                // winner. The peer is already at this text, so when it later
-                // pulls us the states match (a clean no-op), no re-block.
-                self.apply_delta_from_peer(peer_id, local, path).await?;
+                // Their changes win the overlap. Re-assert the peer's CURRENT
+                // text as the accepted content — the decisive winner. Under the
+                // text substrate there is no delta to fold first (the wire
+                // carries whole-file text), so the peer's text directly becomes
+                // ours. The peer is already at this text, so when it later pulls
+                // us the states match (a clean no-op), no re-block.
                 let (theirs, _) = self.fetch_peer_text(peer_id, path).await?;
                 self.oplog
                     .apply_user_text(&local.0, &theirs)
@@ -625,7 +671,6 @@ impl SyncNode {
                 // note. Same shape as keep-theirs for the original path, plus the
                 // copy (written from the pre-fold text we captured).
                 self.write_conflict_copy_text(path, &ours_before)?;
-                self.apply_delta_from_peer(peer_id, local, path).await?;
                 let (theirs, _) = self.fetch_peer_text(peer_id, path).await?;
                 self.oplog
                     .apply_user_text(&local.0, &theirs)
@@ -692,10 +737,17 @@ impl SyncNode {
                 .delete_vs_edit_verdict(&local.0, &theirs, theirs_tombstone, &theirs_history)
                 .map_err(|e| Error::Apply(format!("re-eval delete_vs_edit_verdict: {e}")))?;
             if matches!(dve, hiker_core::oplog::sync::DeleteVsEdit::NotApplicable) {
-                // The delete-vs-edit contention is gone. Fold any pending peer
-                // delta in (a no-op when already converged) and drop the now-stale
-                // block so it stops surfacing.
-                self.apply_delta_from_peer(peer_id, local, path).await?;
+                // The delete-vs-edit contention is gone. Apply the peer's current
+                // text/tombstone (a no-op when already converged) and drop the
+                // now-stale block so it stops surfacing.
+                self.apply_delta_from_peer(
+                    peer_id,
+                    local,
+                    path,
+                    &theirs_history,
+                    theirs_tombstone,
+                )
+                .await?;
                 self.clear_stale_block(path);
                 report.bound.push(path.to_string());
                 report.converged.push(path.to_string());

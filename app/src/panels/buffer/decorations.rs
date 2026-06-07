@@ -106,6 +106,20 @@ pub(crate) fn rebuild_editor_decorations(
     let theme = *theme;
     let resolve_title = *resolve_title;
     let diagram_cache = diagram_cache.as_ref();
+    // status: live-preview-conflict-regions-raw
+    // A conflicted buffer (one whose text still carries the unified conflict
+    // surface's `<<<<<<< / ======= / >>>>>>>` markers, `sync-unified-conflict-
+    // surface`) renders its markers VERBATIM — every live-preview styling layer
+    // is suppressed so the user resolves against the real text, not a
+    // fading-marker view. The scan only runs on the live-preview path (which
+    // already allocates + reparses on a cache miss), so the clean common case
+    // pays a single doc walk it was going to pay anyway.
+    let live_preview = if *live_preview {
+        !hiker_core::merge::has_unresolved_conflicts(&editor.doc.to_string())
+    } else {
+        false
+    };
+    let live_preview = &live_preview;
     // Compute the visible byte range up-front so we can scope paint-only
     // providers to the viewport.
     let visible = view.visible_lines();
@@ -281,33 +295,41 @@ pub(crate) fn rebuild_editor_decorations(
             .unwrap_or(0);
         let dpr_bits = dpr.to_bits() as u64;
         let font_bits = font_px.to_bits() as u64;
+        // NOT keyed on the viewport (`vp_fp`): these layers emit the WHOLE
+        // document, so a pure scroll must NOT invalidate them. Keying on `vp_fp`
+        // and emitting viewport-scoped would re-Arc the layer every scroll frame
+        // (new `content_id` → `geometry_epoch` bump → full minimap re-raster +
+        // prewrap rescan, and a per-diagram PNG re-decode) even though nothing
+        // about the rendered widgets changed. The renders themselves are cached
+        // (in-memory + disk), so emitting whole-doc on a doc/selection change is
+        // cheap (`widget-render-cache`).
         let render_fp = mix(
-            mix(mix(doc_id, sel_fp), vp_fp),
+            mix(doc_id, sel_fp),
             mix(mix(theme_fg, dpr_bits), font_bits),
         );
         let dpr = *dpr;
         let font_px = *font_px;
         cached!(math_widget, render_fp,
-            || widgets::math_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
+            || widgets::math_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
         // Rendered Mermaid diagram widgets (`widget-mermaid-render`). Same gate,
         // same render fingerprint as the math-widget layer; emits `hide` lines +
         // a `BlockWidget` per fence so it goes through `push_with_heights`.
         cached!(mermaid_widget, render_fp,
-            || widgets::mermaid_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
+            || widgets::mermaid_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
         // Rendered WaveDrom diagram widgets (`widget-wavedrom-render`). Same
         // gate + render fingerprint as math / mermaid; emits `hide` lines + a
         // `BlockWidget` per fence, so it goes through `push_with_heights`.
         cached!(wavedrom_widget, render_fp,
-            || widgets::wavedrom_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr, diagram_cache),
+            || widgets::wavedrom_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
         // Natively-painted pipe-table widgets (`widget-table-render`). Same gate
         // + render fingerprint as math / mermaid; emits `hide` lines + a
         // `BlockWidget` per table (painted from a `paint_list`, no raster), so it
         // goes through `push_with_heights`. status: widget-table-render
         cached!(table_widget, render_fp,
-            || widgets::tables::table_widget_decorations(editor, theme, Some(&visible_range), font_px, dpr),
+            || widgets::tables::table_widget_decorations(editor, theme, None, font_px, dpr),
             heights);
     }
 
@@ -435,7 +457,7 @@ impl EditorDecorations for editor_core::state::Editor {
         set
     }
 
-    /// Strategy: line-level diff via `hiker_core::diff::compute`. Each
+    /// Strategy: line-level diff via `editor_core::diff::lines`. Each
     /// Insert in the diff is a line in `after` that has no exact
     /// counterpart in `before`. We emit `DiffModified` when a Delete on
     /// the same after-line preceded the Insert (i.e. a replace),
@@ -447,52 +469,52 @@ impl EditorDecorations for editor_core::state::Editor {
         use editor_core::decoration::Decoration;
         use editor_core::decoration::GutterMarker;
         use editor_core::decoration::LineStyle;
+        use editor_core::diff::HunkKind;
         use editor_core::rangeset::RangeSet;
-        use hiker_core::diff::Op;
         let state = self;
         let live = state.doc.to_string();
         if loaded_text == live {
             return RangeSet::empty();
         }
-        let diff = hiker_core::diff::compute(loaded_text, &live);
+        let right_line_count = live.lines().count();
+        let hunks = editor_core::diff::lines(loaded_text, &live);
         let mut per_after_line: std::collections::BTreeMap<u32, GutterMarker> =
             std::collections::BTreeMap::new();
-        let mut pending_delete = false;
+        // Max 1-based after-line index seen on a surviving (context/add/modify)
+        // hunk, used to anchor end-of-file deletions onto the last real line.
         let mut last_after_seen: u32 = 0;
-        for hunk in &diff.hunks {
-            for line in &hunk.lines {
-                match line.op {
-                    Op::Equal => {
-                        if let Some(an) = line.after_line_no {
-                            last_after_seen = an;
-                            if pending_delete {
-                                per_after_line.entry(an).or_insert(GutterMarker::DiffRemoved);
-                                pending_delete = false;
-                            }
-                        }
+        for hunk in &hunks {
+            match hunk.kind {
+                HunkKind::Context => {
+                    // end is exclusive 0-based == count, i.e. the last
+                    // context after-line as a 1-based index.
+                    last_after_seen = last_after_seen.max(hunk.right_lines.end as u32);
+                }
+                HunkKind::Added => {
+                    for r in hunk.right_lines.clone() {
+                        per_after_line.insert(r as u32 + 1, GutterMarker::DiffAdded);
+                        last_after_seen = last_after_seen.max(r as u32 + 1);
                     }
-                    Op::Insert => {
-                        if let Some(an) = line.after_line_no {
-                            let marker = if pending_delete {
-                                pending_delete = false;
-                                GutterMarker::DiffModified
-                            } else {
-                                GutterMarker::DiffAdded
-                            };
-                            per_after_line.insert(an, marker);
-                            last_after_seen = an;
-                        }
+                }
+                HunkKind::Modified => {
+                    for r in hunk.right_lines.clone() {
+                        per_after_line.insert(r as u32 + 1, GutterMarker::DiffModified);
+                        last_after_seen = last_after_seen.max(r as u32 + 1);
                     }
-                    Op::Delete => {
-                        pending_delete = true;
+                }
+                HunkKind::Removed => {
+                    // Collapse onto the next surviving after-line; if the
+                    // deletion is at EOF, onto the last seen after-line.
+                    if hunk.right_lines.start < right_line_count {
+                        let target = hunk.right_lines.start as u32 + 1;
+                        per_after_line.entry(target).or_insert(GutterMarker::DiffRemoved);
+                    } else if last_after_seen > 0 {
+                        per_after_line
+                            .entry(last_after_seen)
+                            .or_insert(GutterMarker::DiffRemoved);
                     }
                 }
             }
-        }
-        if pending_delete && last_after_seen > 0 {
-            per_after_line
-                .entry(last_after_seen)
-                .or_insert(GutterMarker::DiffRemoved);
         }
 
         let doc = &state.doc;

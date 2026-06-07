@@ -1,11 +1,13 @@
 //! Typed op shapes and the author vocabulary the side table records.
 //!
-//! A Yrs update is an opaque position-delta; the op log layers a logical
-//! [`OpKind`] over each one so the activity feed, rollback, and agent
-//! introspection have a typed handle. The kind is born on the [`PendingOp`]
-//! while pending and copied to the `op_metadata` row on accept. [`Author`]
-//! is the same vocabulary the prior changelog used, with prefix-class
-//! wildcard query support (`agent:%`).
+//! A pending edit is a text change (anchored find-replace, whole-doc content,
+//! or rename) recovered from `metadata`; the op log layers a logical
+//! [`OpKind`] over it so the activity feed, rollback, and agent introspection
+//! have a typed handle. The kind is born on the [`PendingOp`] while pending and
+//! stamped onto the self-describing `.ops` history frame on accept (and thence
+//! into the regenerable `op_history` index). [`Author`] is the same vocabulary
+//! the prior changelog used, with prefix-class wildcard query support
+//! (`agent:%`).
 //
 // status: op-log-op-shape
 // status: op-log-author-classes
@@ -42,17 +44,16 @@ impl AnchorHint {
     }
 }
 
-/// The logical shape of one op. One logical op = one Yrs update = one
-/// `op_metadata` row over one `(yrs_client_id, yrs_clock_lo, yrs_clock_hi)`
-/// range. `SetFrontmatter` is a *logical label* over a `Replace` whose byte
-/// range lands inside the leading `---` frontmatter fence — not a distinct
-/// mechanism (see [`is_frontmatter_range`]).
+/// The logical shape of one op. One logical op = one accepted `.ops` history
+/// frame = one `op_history` index row. `SetFrontmatter` is a *logical label*
+/// over a `Replace` whose byte range lands inside the leading `---` frontmatter
+/// fence — not a distinct mechanism (see [`is_frontmatter_range`]).
 ///
 /// status: op-log-op-shape
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OpKind {
-    /// A `text` Y.Text edit. `anchor` carries the `edit_note` `old_str`
+    /// A `text` edit. `anchor` carries the `edit_note` `old_str`
     /// when the edit came from an anchored replace; `None` for whole-body
     /// rewrites.
     Replace { anchor: Option<AnchorHint> },
@@ -67,7 +68,7 @@ pub enum OpKind {
 }
 
 impl OpKind {
-    /// Stable wire string for the `op_metadata.op_kind` column. The
+    /// Stable wire string for the frame's / `op_history.op_kind` column. The
     /// `Rename` variant's `from` is stored in the separate `rename_from`
     /// column, so the kind string stays a flat enum tag.
     pub const fn as_str(&self) -> &'static str {
@@ -81,8 +82,8 @@ impl OpKind {
     }
 }
 
-/// Author of a Yrs operation range. Recorded in `op_metadata` for every
-/// range the op log authors. The wire form is `class[:identifier]`;
+/// Author of an op. Recorded on every self-describing `.ops` frame (and its
+/// `op_history` index row) the op log authors. The wire form is `class[:identifier]`;
 /// [`Author::as_wire`] / [`Author::parse`] round-trip it. The class prefix
 /// drives wildcard queries (`author LIKE 'agent:%'`).
 ///
@@ -99,7 +100,7 @@ pub enum Author {
     Extractor(String),
     /// Unattended write from internal automation (e.g. `auto:triage`).
     Auto(String),
-    /// Yrs operations received from another device via the sync transport.
+    /// A whole-file text update received from another device via the sync transport.
     Sync(String),
 }
 
@@ -151,20 +152,18 @@ impl Author {
     }
 }
 
-/// One queued pending update awaiting accept/reject. Serialized as a
+/// One queued pending edit awaiting accept/reject. Serialized as a
 /// `Vec<PendingOp>` into `<doc-id>.pending` (JSON — self-describing, so the
 /// tagged [`OpKind`] enum and the free-form `metadata` round-trip directly).
-/// The `yrs_update` bytes apply against `accepted`'s *current* state; accept
-/// applies them, reject discards. Pending ops never sync — they're editorial
-/// state.
+/// The edit is recovered from `op_kind` + `metadata` and applied by text
+/// splicing; `accept` resolves it into spans against the accepted text.
+/// Pending ops never sync — they're editorial state.
 ///
 /// status: op-log-pending-queue
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingOp {
     /// ulid.
     pub op_id: String,
-    /// Serialized Yrs update bytes (v2 format).
-    pub yrs_update: Vec<u8>,
     /// Logical shape of the edit.
     pub op_kind: OpKind,
     /// Producer of the op (`agent:*` / `auto:*` / `extractor:*`).
@@ -177,12 +176,12 @@ pub struct PendingOp {
     pub created_at_ms: i64,
     /// Free-form producer metadata.
     pub metadata: serde_json::Value,
-    /// Op ids in the same session whose Yrs updates were folded into the
-    /// `base_doc` this op's update was produced against. Populated only when
+    /// Op ids in the same session whose text edits were folded into the
+    /// session view this op's anchor was resolved against. Populated only when
     /// `stage_pending` falls back to the session's pending view (the anchor
     /// wasn't in bare `accepted`). Accepting this op while a predecessor is
-    /// still pending would land a drifted update that references positions
-    /// only present after the predecessor — `accept_pending` refuses with
+    /// still pending would resolve its anchor against content only present
+    /// after the predecessor — `accept_pending` refuses with
     /// [`Error::DependsOn`] in that case. Local-only: pending ops never sync.
     ///
     /// status: op-log-pending-queue

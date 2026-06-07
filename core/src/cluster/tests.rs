@@ -360,6 +360,149 @@ fn partition_leiden_rejects_empty() {
     assert!(matches!(r, Err(Error::Empty)));
 }
 
+/// Regression for the build recipe's resolution-escalation backstop. Two
+/// blobs that stay *connected* in the kNN graph (cross-group cosine ≈ 0.8,
+/// within-group ≈ 1.0) make a single all-points community the RB-quality
+/// optimum at low γ (`Q_single = m·(1 − 2γ) > 0` for γ < 0.5), so a
+/// top-level cut at the old `top_level_resolution = 0.3` collapsed to one
+/// community and the build aborted with `VaultTooSmall`. The recipe now
+/// escalates γ until ≥2 communities emerge.
+#[test]
+fn leiden_build_escalates_resolution_past_single_community_collapse() {
+    let mut pts: Vec<Vec<f32>> = Vec::new();
+    for i in 0..10 {
+        // Blob A — direction (1, 0, …) with tiny in-blob noise.
+        let mut v = vec![0.0_f32; 8];
+        v[0] = 1.0;
+        v[2] = (i as f32) * 0.003;
+        pts.push(v);
+    }
+    for i in 0..10 {
+        // Blob B — direction (0.8, 0.6, …), cos 0.8 to A.
+        let mut v = vec![0.0_f32; 8];
+        v[0] = 0.8;
+        v[1] = 0.6;
+        v[3] = (i as f32) * 0.003;
+        pts.push(v);
+    }
+
+    fn distinct_communities(labels: &[Assignment]) -> usize {
+        let mut s = std::collections::HashSet::new();
+        for a in labels {
+            if a.cluster_label != OUTLIER_LABEL {
+                s.insert(a.cluster_label);
+            }
+        }
+        s.len()
+    }
+
+    // Sanity: a single, non-escalating Leiden pass at γ=0.3 collapses to
+    // one community on this fixture — otherwise the test below wouldn't be
+    // exercising escalation at all.
+    let collapse = LeidenParams {
+        k_nearest: 15,
+        resolution: 0.3,
+        min_cluster_size: 2,
+        ..LeidenParams::default()
+    };
+    assert_eq!(
+        distinct_communities(&partition_leiden(&pts, &collapse).unwrap()),
+        1,
+        "fixture should collapse to one community at γ=0.3"
+    );
+
+    // The build recipe starts the top-level cut at the same collapsing
+    // γ=0.3 but escalates until ≥2 communities emerge, so it succeeds
+    // instead of erroring `VaultTooSmall`.
+    let notes: Vec<NoteInput> = pts
+        .iter()
+        .enumerate()
+        .map(|(i, v)| NoteInput {
+            id: format!("n{i}"),
+            title: format!("n{i}"),
+            summary: String::new(),
+            folder: String::new(),
+            embedding: v.clone(),
+        })
+        .collect();
+    let params = Params {
+        algorithm: Algorithm::Leiden,
+        min_cluster_size: 2,
+        disable_recursion: true,
+        leiden: LeidenParams {
+            k_nearest: 15,
+            top_level_resolution: 0.3,
+            min_cluster_size: 2,
+            ..LeidenParams::default()
+        },
+        ..Default::default()
+    };
+    let built = tree(
+        BuildScope::Vault { source_types: vec![] },
+        BuildMethod::Cluster { params },
+        &notes,
+        &MockSummarizer,
+    )
+    .expect("escalation should split the blobs, not error VaultTooSmall");
+    assert!(
+        built.tree.levels[0].len() >= 2,
+        "expected >=2 top-level clusters after escalation, got {}",
+        built.tree.levels[0].len()
+    );
+}
+
+/// Increment-#2 correctness: detecting communities on a prebuilt graph
+/// (`build_leiden_graph` + `leiden_communities`) must match the fresh
+/// `partition_leiden` path exactly — including when the *same* graph is
+/// reused at a different γ (the live-preview / escalation reuse). Also
+/// checks `matches` as a cache key.
+#[test]
+fn leiden_graph_reuse_matches_fresh_partition() {
+    use crate::cluster::algo::{build_leiden_graph, leiden_communities};
+    let mut pts: Vec<Vec<f32>> = Vec::new();
+    for i in 0..12 {
+        let mut v = vec![0.0_f32; 8];
+        v[0] = 1.0;
+        v[2] = (i as f32) * 0.004;
+        pts.push(v);
+    }
+    for i in 0..12 {
+        let mut v = vec![0.0_f32; 8];
+        v[0] = 0.8;
+        v[1] = 0.6;
+        v[3] = (i as f32) * 0.004;
+        pts.push(v);
+    }
+    let lp = LeidenParams {
+        k_nearest: 10,
+        edge_weight_floor: 0.0,
+        iterations: 100,
+        min_cluster_size: 2,
+        resolution: 1.0,
+        top_level_resolution: 1.0,
+    };
+
+    let graph = build_leiden_graph(&pts, lp.k_nearest, lp.edge_weight_floor).unwrap();
+
+    // Same γ: graph-reuse == fresh.
+    let fresh = partition_leiden(&pts, &lp).unwrap();
+    let reused = leiden_communities(&graph, lp.resolution, lp.iterations, lp.min_cluster_size).unwrap();
+    assert_eq!(fresh, reused, "graph reuse diverged from fresh partition");
+
+    // Different γ over the SAME graph still matches a fresh build at that γ.
+    let mut lp2 = lp.clone();
+    lp2.resolution = 2.5;
+    let fresh2 = partition_leiden(&pts, &lp2).unwrap();
+    let reused2 = leiden_communities(&graph, 2.5, lp.iterations, lp.min_cluster_size).unwrap();
+    assert_eq!(fresh2, reused2, "graph reuse diverged at a re-tuned γ");
+
+    // Cache-key validation: same params reuse, changed k_nearest / floor rebuild.
+    assert!(graph.matches(pts.len(), lp.k_nearest, lp.edge_weight_floor));
+    assert!(!graph.matches(pts.len(), lp.k_nearest + 1, lp.edge_weight_floor));
+    assert!(!graph.matches(pts.len(), lp.k_nearest, 0.5));
+    assert!(!graph.matches(pts.len() - 1, lp.k_nearest, lp.edge_weight_floor));
+}
+
 // ── Async streaming structural pass ──────────────────────────────────
 //
 // status: cluster-build-async-pass
@@ -415,6 +558,7 @@ async fn streaming_build_emits_phase_counters_clusters_and_done() {
         BuildMethod::Cluster { params },
         notes,
         cancel,
+        None,
     );
     let mut phases: Vec<Phase> = Vec::new();
     let mut clusters_found: u32 = 0;
@@ -429,7 +573,7 @@ async fn streaming_build_emits_phase_counters_clusters_and_done() {
             BuildEvent::ClusterDiscovered { .. } => {
                 got_cluster_discovered = true;
             }
-            BuildEvent::Done { tree } => {
+            BuildEvent::Done { tree, .. } => {
                 got_done = true;
                 assert!(!tree.levels.is_empty(), "Done carries a non-empty tree");
                 break;
@@ -465,6 +609,7 @@ async fn streaming_build_respects_cancel_before_start() {
         BuildMethod::Cluster { params },
         notes,
         cancel,
+        None,
     );
     let mut got_cancelled = false;
     while let Some(ev) = rx.recv().await {
@@ -504,6 +649,7 @@ async fn streaming_build_cluster_discovered_parent_link_is_consistent() {
         BuildMethod::Cluster { params },
         notes,
         cancel,
+        None,
     );
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut parents_seen: Vec<Option<String>> = Vec::new();

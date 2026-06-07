@@ -10,7 +10,7 @@
 //! The scenarios map onto `docs/sync.md` slugs:
 //!
 //! 1. fresh two-device sync — sync-negotiated-doc-ids, sync-lineage-adoption
-//! 2. disjoint concurrent edits converge — sync-content-encryption-aes256 + CRDT
+//! 2. disjoint concurrent edits converge — sync-content-encryption-aes256 + sync-three-way-merge
 //! 3. fast-forward, no prompt — sync-enrollment-hash-classification
 //! 4. true fork → Blocked — sync-blocked-state
 //! 5. rename safety — sync-path-matching-key
@@ -102,9 +102,9 @@ fn spawn_responder(mut node: SyncNode, window: Duration) -> tokio::task::JoinHan
 
 /// Regression for the worst sync correctness bug: two vaults seeded
 /// INDEPENDENTLY (separate `create_document` calls) hold the SAME text on
-/// DISJOINT Yrs lineages — the `cp -r` + `.hiker` deleted-then-reseeded shape.
-/// Their state vectors are meaningless to each other, so a cross-lineage delta
-/// (`export_since(our_sv)`) returns the peer's WHOLE doc and applying it would
+/// DISJOINT lineages — the `cp -r` + `.hiker` deleted-then-reseeded shape.
+/// Their watermarks are meaningless to each other, so a cross-lineage delta
+/// (`export_since(our_watermark)`) returns the peer's WHOLE doc and applying it would
 /// INSERT a second copy of the body — doubling the note.
 ///
 /// The fix establishes a shared lineage before any delta: on `Identical`, the
@@ -680,7 +680,7 @@ async fn disjoint_concurrent_edits_converge() {
     assert!(ra.blocked.is_empty(), "A side not blocked: {ra:?}");
     let _b = server2.await.unwrap();
 
-    // Both replicas carry BOTH disjoint edits (CRDT positional merge).
+    // Both replicas carry BOTH disjoint edits (text 3-way merge).
     let text_a = oplog_a.materialize_accepted(&doc_a).unwrap().text;
     let text_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
     for text in [&text_a, &text_b] {
@@ -891,7 +891,7 @@ async fn fork_keep_theirs_converges() {
 // --- 4b'. Fork resolution: keep-mine resolves BOTH sides -------------------
 
 /// keep-mine now converges BOTH devices in one click: the resolver (the side
-/// that dials) makes ITS version canonical and PUSHES its Yrs base so the peer
+/// that dials) makes ITS version canonical and PUSHES its canonical text so the peer
 /// adopts it (discarding the peer's divergence — that's what "keep mine"
 /// means). After the round: the peer materializes the resolver's content
 /// exactly (its marker present once, the other's absent), the resolver's
@@ -1204,9 +1204,9 @@ async fn bound_pair(
     (a, oplog_a, doc_a, b, oplog_b, doc_b, da, db)
 }
 
-/// REGRESSION guard for the desired CRDT behavior: two BOUND devices edit
+/// REGRESSION guard for the desired merge behavior: two BOUND devices edit
 /// DISJOINT regions concurrently — the same-region gate must NOT block; the
-/// steady-state Yrs merge lands both edits. (Companion to the
+/// steady-state text merge lands both edits. (Companion to the
 /// `same_region_concurrent_edits_block` test: the boundary between auto-merge
 /// and block.) [sync-conflict-detect-same-region]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1244,7 +1244,7 @@ async fn bound_disjoint_edits_still_auto_merge() {
 }
 
 /// Two BOUND devices edit the SAME region concurrently — the gate must BLOCK
-/// (reason `same-region`) instead of silently CRDT-interleaving. The peer delta
+/// (reason `same-region`) instead of silently interleaving. The peer delta
 /// is held, NOT folded into accepted (B stays at its own text), and the block
 /// is recorded persistently for the UI. [sync-conflict-detect-same-region,
 /// sync-conflict-block-and-resolve]
@@ -1280,6 +1280,76 @@ async fn same_region_concurrent_edits_block() {
         oplog_b.materialize_accepted(&doc_b).unwrap().text,
         b_text,
         "the peer delta was held — B's content unchanged (no silent interleave)"
+    );
+}
+
+/// REGRESSION (silent data loss): two BOUND devices BOTH diverge, but the shared
+/// base has aged OUT of the peer's bounded `recent_history_hashes` window — so
+/// `same_region_verdict` returns `NoSharedBase`. The old code grouped
+/// `NoSharedBase` with `CleanMerge` and applied the peer text; with no
+/// reconstructable base `apply_remote_update` falls back to `base = ours`, and
+/// `three_way_merge(ours, ours, theirs) == theirs` silently OVERWRITES our
+/// divergent edits. The fix BLOCKS instead (reason `same-region`, resolvable),
+/// per `sync.md` ("no common base → fork conflict, never silently merged").
+///
+/// The base is forced out of the window by driving A's doc forward past the
+/// 32-hash `RECENT_HISTORY_WINDOW` WITHOUT syncing those edits to B, then having
+/// B diverge with its own content. When B pulls A: B's current isn't in A's
+/// (now seed-free) recent window, A's current isn't in B's history, AND no hash
+/// B holds is in A's recent 32 → both-diverged-no-shared-base. The assertion
+/// that matters: OURS (B's text) is NOT silently lost.
+/// [sync-conflict-detect-same-region, sync-conflict-block-and-resolve]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_diverged_no_shared_base_blocks_not_silent_loss() {
+    let key = ContentKey::generate();
+    let path = "notes/aged-out.md";
+    let seed = "title\nshared base line\n";
+    let (mut a, oplog_a, doc_a, mut b, oplog_b, doc_b, _da, _db) =
+        bound_pair(&key, path, seed).await;
+
+    // Drive A's doc forward well past RECENT_HISTORY_WINDOW (32) distinct
+    // versions WITHOUT syncing them to B, so the shared seed hash falls out of
+    // A's recent-history window. Each edit is distinct text → distinct
+    // content_hash → a fresh accepted op in A's history.
+    for i in 0..40 {
+        oplog_a
+            .apply_user_text(&doc_a, &format!("title\nA private version {i}\n"))
+            .unwrap();
+    }
+    let a_text = "title\nA's final divergent line\n";
+    oplog_a.apply_user_text(&doc_a, a_text).unwrap();
+
+    // B diverges from the shared base on its own — a genuine concurrent edit B
+    // never sent to A. B's history still contains the seed, but A's manifest no
+    // longer carries it (aged out), so no shared base is reconstructable.
+    let b_text = "title\nB's divergent line that must survive\n";
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
+
+    // B pulls A. Both diverged, no shared base in A's window → BLOCK, never a
+    // silent fast-forward to A's text.
+    let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    let server = spawn_responder(a, Duration::from_secs(3));
+    let rb = b.sync_once(&addr).await.unwrap();
+    let _a = server.await.unwrap();
+
+    assert!(
+        rb.blocked.iter().any(|(p, reason)| p == path && reason == "same-region"),
+        "both-diverged-no-shared-base must BLOCK (not silently fast-forward): {rb:?}"
+    );
+    assert_eq!(b.status_of_path(path), Some(SyncStatus::Blocked), "B blocked");
+    let blocked = b.blocked_docs();
+    assert_eq!(blocked.len(), 1, "one persistent blocked entry: {blocked:?}");
+    assert_eq!(blocked[0].reason, "same-region");
+    // THE assertion that matters: OUR text was NOT overwritten by theirs.
+    assert_eq!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        b_text,
+        "B's divergent edit must survive — no silent overwrite by A's text"
+    );
+    assert_ne!(
+        oplog_b.materialize_accepted(&doc_b).unwrap().text,
+        a_text,
+        "B must NOT have been silently fast-forwarded to A's content"
     );
 }
 
@@ -1836,17 +1906,20 @@ async fn rename_does_not_fork_identity() {
 
     assert!(report.blocked.is_empty(), "rename must not fork/block: {report:?}");
 
-    // B's same local doc now reports the NEW path (the rename op applied to its
-    // Yrs meta.path) — identity survived the rename, no second doc minted.
-    assert_eq!(
-        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
-        Some(new_path),
-        "B's existing doc moved to the new path — identity is the binding"
-    );
-    // Identity is the path; the doc_id stays the same across the rename (no
-    // phantom second doc was minted).
+    // Identity IS the path (`op-log-path-identity`): the rename relocated B's
+    // doc's files from the old path to the new one, so the doc now resolves at
+    // `new_path` and no longer at `old_path` — no phantom second doc was minted.
     let _ = &doc_b;
+    assert!(
+        oplog_b.doc_id_for_path(new_path).unwrap().is_some(),
+        "B's doc now lives at the new path — identity is the binding"
+    );
+    assert!(
+        oplog_b.doc_id_for_path(old_path).unwrap().is_none(),
+        "the old path no longer resolves after the rename moved the doc"
+    );
     // B's own edit is still present (the rename didn't clobber the body).
+    let doc_b = oplog_b.doc_id_for_path(new_path).unwrap().unwrap();
     assert!(
         oplog_b
             .materialize_accepted(&doc_b)
@@ -1901,7 +1974,19 @@ async fn rename_collision_setup(
         .rename_document(&doc_b, target_path, &Author::User)
         .unwrap();
 
-    (a, oplog_a, doc_a, b, oplog_b, doc_b, da, db)
+    // Identity is the path (`op-log-path-identity`): the rename relocated each
+    // doc's files to `target_path`, so the doc ids returned are the post-rename
+    // paths — the foo/bar paths no longer resolve.
+    (
+        a,
+        oplog_a,
+        target_path.to_string(),
+        b,
+        oplog_b,
+        target_path.to_string(),
+        da,
+        db,
+    )
 }
 
 /// Find the single `notes/target.conflict-<rand6>.md` sibling doc in `oplog`
@@ -2213,10 +2298,16 @@ async fn non_colliding_rename_does_not_block() {
         report.blocked.is_empty(),
         "an ordinary rename must NOT block: {report:?}"
     );
-    assert_eq!(
-        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
-        Some(new_path),
+    // Identity IS the path: the rename relocated B's doc to `new_path`, so the
+    // doc resolves there and not at the old path (`op-log-path-identity`).
+    let _ = &doc_b;
+    assert!(
+        oplog_b.doc_id_for_path(new_path).unwrap().is_some(),
         "B's doc moved to the new path (rename auto-applied on the shared lineage)"
+    );
+    assert!(
+        oplog_b.doc_id_for_path(old_path).unwrap().is_none(),
+        "the old path no longer resolves after the rename"
     );
     assert_eq!(
         oplog_b.list_doc_ids().unwrap().len(),
@@ -2852,14 +2943,14 @@ async fn drive_bidirectional(
 /// still hold the old path, hold exactly ONE doc, and crucially
 /// `doc_id_for_path("notes/b.md")` must resolve to that same doc.
 ///
-/// THE BUG this guards: `apply_remote_update` applied the rename to the Yrs
-/// `meta.path` and rewrote the `.md`, but did NOT repoint B's `doc-index.db`.
-/// So `path_for_doc` (reads the Yrs Doc) reported the new path while
-/// `doc_id_for_path(new_path)` (reads the index) returned `None`. A later
-/// manifest path-match on the new path would then mint a SECOND doc for the
-/// same content — content duplication. Fixed by repointing the path index in
-/// the receive path when a synced op moves `meta.path`. We re-run several
-/// rounds so any deferred second-doc minting would surface. [sync-path-matching-key]
+/// THE BUG this guards: `apply_remote_update` applied the rename but did NOT
+/// relocate B's path-keyed per-doc files, so the doc was left resolvable at the
+/// old path while a later manifest path-match on the new path minted a SECOND
+/// doc for the same content — content duplication. Under path-as-identity
+/// (`op-log-path-identity`) the receive path moves the per-doc files old→new and
+/// repoints the history rows, so the doc resolves only at the new path. We re-run
+/// several rounds so any deferred second-doc minting would surface.
+/// [sync-path-matching-key]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn synced_rename_does_not_duplicate_or_fork() {
     let key = ContentKey::generate();
@@ -2882,8 +2973,11 @@ async fn synced_rename_does_not_duplicate_or_fork() {
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, seed);
 
     // A renames a.md -> b.md AND edits the body (a meta.path op + a text op on
-    // the shared lineage, both ride the same delta).
+    // the shared lineage, both ride the same delta). Identity is the path, so
+    // after the rename A's doc is addressed by `new_path`.
     oplog_a.rename_document(&doc_a, new_path, &Author::User).unwrap();
+    let _ = &doc_a;
+    let doc_a = new_path.to_string();
     let edited = "shared head\nMARKER body\nshared tail\nRENAME-EDIT line\n";
     oplog_a.apply_user_text(&doc_a, edited).unwrap();
 
@@ -2894,24 +2988,20 @@ async fn synced_rename_does_not_duplicate_or_fork() {
     assert!(r1.blocked.is_empty(), "rename must not fork/block: {r1:?}");
     let a = server1.await.unwrap();
 
-    // B's existing doc moved to the new path (Yrs meta.path), with the content.
+    // B's existing doc moved to the new path (identity is the path), with the
+    // content. The per-doc files relocated, so it resolves at the new path only.
+    let _ = &doc_b;
     assert_eq!(
-        oplog_b.path_for_doc(&doc_b).unwrap().as_deref(),
+        oplog_b.doc_id_for_path(new_path).unwrap().as_deref(),
         Some(new_path),
-        "B's doc reports the new path"
+        "B's doc now resolves at the new path (files relocated)"
     );
+    let doc_b = new_path.to_string();
     let got_b = oplog_b.materialize_accepted(&doc_b).unwrap().text;
     assert_eq!(got_b, edited, "B has the renamed doc's content exactly: {got_b:?}");
     assert_eq!(got_b.matches("RENAME-EDIT line").count(), 1, "edit once: {got_b:?}");
 
-    // THE ASSERTION the bug failed: the path INDEX resolves the new path to the
-    // SAME doc (so a later manifest match reuses it, never minting a second).
-    assert_eq!(
-        oplog_b.doc_id_for_path(new_path).unwrap().as_deref(),
-        Some(doc_b.as_str()),
-        "doc_id_for_path(new_path) resolves to B's same doc (index repointed)"
-    );
-    // B does NOT still resolve the old path to this doc.
+    // B does NOT still resolve the old path to this doc (no stale duplicate).
     assert!(
         oplog_b.doc_id_for_path(old_path).unwrap().is_none(),
         "B no longer maps the old path"
@@ -2988,17 +3078,20 @@ async fn tombstone_propagates_over_shared_lineage() {
 
 // --- W2b. Delete-vs-edit: defined, non-corrupting outcome ------------------
 
-/// A tombstones a shared doc WHILE B edits the same doc (concurrent). After a
-/// bidirectional sync both sides must reach a DEFINED, identical state with no
-/// silent duplication or interleave. We assert convergence (both sides equal)
-/// and document the outcome: the tombstone is a `meta.tombstone=true` CRDT op
-/// and B's edit is a `text` CRDT op — disjoint Yrs fields, so they merge
-/// commutatively. The defined result is "tombstoned" (the delete wins as the
-/// meta flag), with B's text still present underneath but the doc reading as
-/// deleted. The invariant under test is convergence + no corruption, not which
-/// of delete/edit "wins". [sync-content-encryption-aes256, sync-blocked-state]
+/// A tombstones a shared doc WHILE B edits the same doc (concurrent). Under the
+/// text substrate this is a delete-vs-edit CONFLICT: the spec BLOCKS it for user
+/// resolution rather than silently picking a winner (`sync-conflict-delete-vs-edit`).
+///
+/// INVERSION NOTE: this previously asserted the Yrs-CRDT commutative merge (the
+/// tombstone `meta` flag and B's `text` op merging into a deterministic
+/// "tombstoned with B's text underneath"). That silent auto-merge is exactly
+/// what the spec replaced with block-and-resolve — a delete concurrent with an
+/// edit is contended, never auto-converged. So the corruption-probe invariant is
+/// now: the conflict BLOCKS (no silent interleave / no data loss), each side
+/// HOLDS its own state untouched while blocked, and no phantom doc is minted.
+/// [sync-conflict-delete-vs-edit, sync-conflict-block-and-resolve, sync-blocked-state]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_vs_edit_converges_without_corruption() {
+async fn delete_vs_edit_blocks_without_corruption() {
     let key = ContentKey::generate();
     let (mut a, oplog_a, _da) = mk_node(&key);
     let (mut b, oplog_b, _db) = mk_node(&key);
@@ -3012,29 +3105,50 @@ async fn delete_vs_edit_converges_without_corruption() {
     let addr0 = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
     let server0 = spawn_responder(a, Duration::from_secs(3));
     b.sync_once(&addr0).await.unwrap();
-    let a = server0.await.unwrap();
+    let mut a = server0.await.unwrap();
     let doc_b = oplog_b.doc_id_for_path(path).unwrap().unwrap();
 
-    // Concurrent: A tombstones, B edits the body (different Yrs fields).
+    // Concurrent: A tombstones, B edits the body.
     oplog_a.tombstone_document(&doc_a, &Author::User).unwrap();
-    oplog_b.apply_user_text(&doc_b, "base line\nB-EDIT marker\n").unwrap();
+    let b_text = "base line\nB-EDIT marker\n";
+    oplog_b.apply_user_text(&doc_b, b_text).unwrap();
 
-    // Bidirectional sync to settle the merge.
-    let (a, b) = drive_bidirectional(a, b, 3).await;
-    let _a = a;
-    let _b = b;
+    // B pulls A's manifest: the delete-vs-edit conflict BLOCKS (no silent
+    // interleave). Re-run extra rounds — a deferred interleave would surface,
+    // but the doc stays blocked + each side holds its own state.
+    for _ in 0..3 {
+        let addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        let server = spawn_responder(a, Duration::from_secs(3));
+        let rb = b.sync_once(&addr).await.unwrap();
+        a = server.await.unwrap();
+        // Either this round freshly blocked it, or it stays persistently blocked
+        // from a prior round — never silently merged.
+        let freshly_blocked = rb
+            .blocked
+            .iter()
+            .any(|(p, r)| p == path && r == "delete-vs-edit");
+        assert!(
+            freshly_blocked || b.status_of_path(path) == Some(SyncStatus::Blocked),
+            "delete-vs-edit must BLOCK, not silently merge: {rb:?}"
+        );
+    }
+    assert_eq!(
+        b.status_of_path(path),
+        Some(SyncStatus::Blocked),
+        "B's doc is blocked delete-vs-edit (held, not folded)"
+    );
 
-    // DEFINED OUTCOME: both sides converge to the same materialized state.
+    // HELD, not corrupted: A stays tombstoned at its base; B stays live at its
+    // own edit. Neither side silently adopted the other.
     let mat_a = oplog_a.materialize_accepted(&doc_a).unwrap();
+    assert!(mat_a.tombstone, "A stays deleted (its own state, held)");
     let mat_b = oplog_b.materialize_accepted(&doc_b).unwrap();
-    assert_eq!(mat_a.tombstone, mat_b.tombstone, "both agree on tombstone flag");
-    assert_eq!(mat_a.text, mat_b.text, "both converge to one text (no interleave)");
-    // The delete wins as the meta flag (the documented outcome).
-    assert!(mat_a.tombstone, "delete-vs-edit resolves to tombstoned");
-    // No duplication: B's edit appears at most once (not interleaved twice).
-    assert!(
-        mat_b.text.matches("B-EDIT marker").count() <= 1,
-        "B's edit is not duplicated: {:?}",
+    assert!(!mat_b.tombstone, "B's edit not silently deleted");
+    assert_eq!(mat_b.text, b_text, "B holds exactly its own edit, no interleave");
+    assert_eq!(
+        mat_b.text.matches("B-EDIT marker").count(),
+        1,
+        "B's edit appears exactly once: {:?}",
         mat_b.text
     );
     // Exactly one doc per side — neither minted a phantom.
@@ -3100,7 +3214,7 @@ async fn new_doc_mid_session_propagates_once() {
 // --- W4a. Concurrent disjoint-region edits on a shared lineage -------------
 
 /// After A & B share a lineage, disjoint-region edits on each survive once on
-/// both sides (CRDT positional merge). Extra rounds keep it byte-stable. This
+/// both sides (text 3-way merge). Extra rounds keep it byte-stable. This
 /// complements `post_convergence_disjoint_edits_appear_once` by driving 3 extra
 /// rounds after convergence to catch deferred interleave. [sync-content-encryption-aes256]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3142,7 +3256,7 @@ async fn shared_lineage_disjoint_edits_survive_once_stable() {
 // --- W4b. Concurrent SAME-region edits on a shared lineage now BLOCK --------
 
 /// After A & B share a lineage, SAME-region concurrent edits no longer silently
-/// CRDT-interleave: the bound-doc gate detects the byte-range overlap and BLOCKS
+/// interleave: the bound-doc gate detects the byte-range overlap and BLOCKS
 /// the doc for user resolution (the behavior change of
 /// `sync-conflict-detect-same-region`). A resolution then converges both sides.
 /// (This test previously asserted the OLD silent-interleave contract; the slug
@@ -3311,11 +3425,11 @@ async fn edit_while_forked_then_keep_mine_uses_current_content() {
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, b_current, "B stable");
 }
 
-// --- W7. Re-edit after a keep-theirs resolution is a CRDT merge ------------
+// --- W7. Re-edit after a keep-theirs resolution is a clean merge -----------
 
 /// keep-theirs resolves a fork → B adopts A's lineage, so AFTERWARD they SHARE a
 /// lineage. Then BOTH edit divergently again. This must NOT re-fork or corrupt:
-/// because the lineage is now shared, the subsequent divergent edits are a CRDT
+/// because the lineage is now shared, the subsequent divergent edits are a text
 /// merge (converged), not a new fork. We assert convergence + no duplication +
 /// byte-stability across extra rounds. [sync-blocked-state]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3351,7 +3465,7 @@ async fn refork_after_keep_theirs_is_crdt_merge() {
     assert_eq!(oplog_b.materialize_accepted(&doc_b).unwrap().text, a_text, "B on A's content");
 
     // NOW both edit divergently again. Post-keep-theirs the lineage is shared,
-    // so this is a CRDT merge (disjoint regions here), NOT a new fork.
+    // so this is a text merge (disjoint regions here), NOT a new fork.
     oplog_a.apply_user_text(&doc_a, "title\nbody edited by A\nA-REFORK tail\n").unwrap();
     oplog_b.apply_user_text(&doc_b, "B-REFORK head\ntitle\nbody edited by A\n").unwrap();
 
@@ -3509,12 +3623,22 @@ async fn sync_until_settled<'a>(
         a = server_a.await.unwrap();
 
         // Fixed point: this full pair reported no NEW blocks, neither side still
-        // holds a persistent block, and both materialize the same text.
-        let text_a = oplog_a.materialize_accepted(doc_a).unwrap().text;
-        let text_b = oplog_b.materialize_accepted(doc_b).unwrap().text;
+        // holds a persistent block, and both sides agree. Under the text
+        // substrate a DELETED doc keeps a per-device last-known text (a
+        // recoverable trash artifact, not canonical content), so two converged
+        // tombstones agree even when those artifacts differ — convergence for a
+        // deleted doc is "both tombstoned", per `sync-conflict-delete-vs-edit`.
+        // A live doc must converge on identical text.
+        let mat_a = oplog_a.materialize_accepted(doc_a).unwrap();
+        let mat_b = oplog_b.materialize_accepted(doc_b).unwrap();
+        let agree = if mat_a.tombstone && mat_b.tombstone {
+            true
+        } else {
+            !mat_a.tombstone && !mat_b.tombstone && mat_a.text == mat_b.text
+        };
         let no_new_blocks = ra.blocked.is_empty() && rb.blocked.is_empty();
         let no_persistent_blocks = a.blocked_docs().is_empty() && b.blocked_docs().is_empty();
-        if no_new_blocks && no_persistent_blocks && text_a == text_b {
+        if no_new_blocks && no_persistent_blocks && agree {
             tracing::info!(round, "sync_until_settled: reached quiescence");
             settled = true;
             break;
@@ -3523,11 +3647,11 @@ async fn sync_until_settled<'a>(
     assert!(
         settled,
         "sync did not reach quiescence within {max_rounds} rounds: \
-         a_blocked={:?} b_blocked={:?} text_a={:?} text_b={:?}",
+         a_blocked={:?} b_blocked={:?} mat_a={:?} mat_b={:?}",
         a.blocked_docs(),
         b.blocked_docs(),
-        oplog_a.materialize_accepted(doc_a).unwrap().text,
-        oplog_b.materialize_accepted(doc_b).unwrap().text,
+        oplog_a.materialize_accepted(doc_a).unwrap(),
+        oplog_b.materialize_accepted(doc_b).unwrap(),
     );
     (a, b)
 }
@@ -3875,7 +3999,7 @@ async fn fork_both_block_keep_theirs_settles_both() {
 /// (both-sides), then BOTH devices make fresh edits to DISJOINT regions of the now
 /// shared-lineage doc. Driving to quiescence must merge both disjoint edits with
 /// no re-block on either side — proving the post-resolution lineage is genuinely
-/// shared and steady-state CRDT merge works. [sync-conflict-block-and-resolve]
+/// shared and steady-state text merge works. [sync-conflict-block-and-resolve]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflict_resolve_then_disjoint_edits_converge_no_block() {
     use hiker_sync::identity::Resolution;
@@ -4686,7 +4810,7 @@ async fn kanban_round_trip_converges() {
 /// Generic disjoint-merge: A and B (bound on a shared lineage) make DISJOINT
 /// structural edits (different byte regions of the JSON/YAML). Driving to
 /// quiescence must auto-merge BOTH edits with NO block on either side — the
-/// desired CRDT behavior for disjoint edits. Asserts both markers survive
+/// desired merge behavior for disjoint edits. Asserts both markers survive
 /// exactly once on BOTH sides and `blocked_docs()` is empty.
 async fn disjoint_structured_auto_merges(doc: &StructuredDoc) {
     let key = ContentKey::generate();
@@ -5096,7 +5220,7 @@ async fn new_note_first_content_peer_holds_empty_replica() {
 /// minus that node), so it travels over the existing op-log sync exactly like a
 /// note edit. This pins that: a canvas's delete-committed JSON converges in one
 /// `sync_until_settled`. The canvas JSON is treated as opaque document text by
-/// the transport (kind is irrelevant to the Y.Text merge), so a node-removal is
+/// the transport (kind is irrelevant to the text merge), so a node-removal is
 /// just a localized text delete over the canonical serialization.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canvas_node_delete_syncs_in_one_settle() {
@@ -5170,7 +5294,7 @@ async fn working_only_edit_propagates_only_after_save() {
 
 // === Canvas sync corruption repro =========================================
 //
-// A `.canvas` file rides the SAME whole-file-as-one-`Y.Text` substrate as a
+// A `.canvas` file rides the SAME whole-file-as-text substrate as a
 // note (`docs/canvas.md` [canvas-doc-kind]) — the JSON text IS the document; a
 // canvas edit re-serializes the model and commits the new full text, diffed
 // into localized spans exactly like a note save (`apply_user_text`). So these
@@ -5178,7 +5302,7 @@ async fn working_only_edit_propagates_only_after_save() {
 //
 // The reported corruption is digit-level: numeric coordinates gain spliced /
 // duplicated digits (`5828` -> `582828`, `8116` -> `811116`) and garbage gets
-// prepended to byte 0 (`1113872{`). That is the fingerprint of two DISJOINT Yrs
+// prepended to byte 0 (`1113872{`). That is the fingerprint of two DISJOINT
 // lineages interleaving near-identical numeric-dense bytes. Every coordinate in
 // these fixtures is <= 4 digits, so a digit run longer than 4 is unambiguous
 // corruption — the invariant the checker enforces.
@@ -5390,7 +5514,7 @@ async fn canvas_edits_during_adoption_handshake_do_not_corrupt() {
 
 /// Two vaults INDEPENDENTLY author DIFFERENT canvases at the same path (disjoint
 /// lineages, no shared history) — the "both ran a layout command" case. This is
-/// a genuine fork: it must BLOCK for resolution, never silently CRDT-interleave
+/// a genuine fork: it must BLOCK for resolution, never silently interleave
 /// the two numeric-dense JSONs into spliced digits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canvas_independent_divergent_lineages_block_not_corrupt() {
@@ -5553,7 +5677,7 @@ async fn dial(from: SyncNode, to: SyncNode) -> (SyncNode, SyncNode) {
     (from, to)
 }
 
-/// THREE devices, each INDEPENDENTLY seeding the SAME canvas (three disjoint Yrs
+/// THREE devices, each INDEPENDENTLY seeding the SAME canvas (three disjoint
 /// lineages) — the realistic "I already have this board on laptop, phone, and
 /// desktop" case. Mesh-sync them in an order that makes a peer adopt one lineage
 /// that a later pairwise round abandons, then make concurrent edits and mesh

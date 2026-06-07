@@ -303,7 +303,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
         let _g = crate::profiling::FrameProf::guard("wb:side_bar");
         // `mode` is a `ViewId`; resolve its activity, then its view.
         // Every sidebar mode is now a registered Activity with at least
-        // one `View`: render through the narrow `activity::Ctx`, then
+        // one `View`: render through the narrow `activity::SurfaceCtx`, then
         // drain its deferred effects with full `&mut AppState`. The old
         // `panels_registry` fallback was retired once Files (the last
         // hardcoded panel) migrated. [feature-consumer-sidebar]
@@ -314,12 +314,24 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
             .and_then(|a| a.views().into_iter().find(|v| v.id() == view_key));
         match view {
             Some(view) => {
-                let state_key = view.state_key();
-                let mut effects: Vec<crate::activity::Effect> = Vec::new();
-                crate::activity::with_ctx(self.app, state_key, &mut effects, |ctx| {
-                    view.render(ui, ctx);
-                });
-                for eff in effects {
+                // Coerce `&mut AppState` to `&mut dyn AppCtx` and let the
+                // view open its own narrow `SurfaceCtx` (via `surface_ctx()`)
+                // inside `render`. Then drain any deferred effects with
+                // full `&mut AppState`. [feature-consumer-sidebar]
+                //
+                // Invariant: every surface-invocation site drains the queue
+                // synchronously, so it must be empty going in. A non-empty
+                // queue here means an earlier surface pushed effects without
+                // draining — they'd otherwise fire now against this surface's
+                // frame. The queue is a shared `AppState` field, so this
+                // guards the one weak spot of decoupling push from drain.
+                debug_assert!(
+                    self.app.pending_effects.is_empty(),
+                    "pending_effects leaked from an earlier surface — every \
+                     surface-invocation site must drain it"
+                );
+                view.render(ui, self.app as &mut dyn crate::activity::AppCtx);
+                for eff in std::mem::take(&mut self.app.pending_effects) {
                     eff(self.app);
                 }
             }

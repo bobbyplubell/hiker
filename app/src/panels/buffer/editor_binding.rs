@@ -1,6 +1,6 @@
 //! The per-frame editor binding for an op-log-backed vault buffer: the
 //! forward/reverse direction tying the editor's change sets to the document's
-//! `working` CRDT layer, plus the overlay refresh that drives inline review.
+//! `working` text layer, plus the overlay refresh that drives inline review.
 //!
 //! Run once per frame from `panels::buffer::show_editor`, after the widget has
 //! applied this frame's input. Per `op-log-editor-binding` in `op-log.md`.
@@ -13,8 +13,8 @@
 //! `working` layer with no coordinate translation; the cursor only ever needs
 //! mapping when `working` itself advances out-of-band (an accepted agent op or
 //! an external edit), handled in the reverse step. This is the "single generic
-//! editor + CRDT-as-overlay" shape (the y-codemirror.next pattern): the editor
-//! crate stays CRDT-agnostic; this binding is the only adapter.
+//! editor + suggestion-as-overlay" shape: the editor crate stays op-log-agnostic;
+//! this binding is the only adapter.
 
 use eframe::egui;
 

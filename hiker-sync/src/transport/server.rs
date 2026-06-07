@@ -1,9 +1,8 @@
 //! Server-mediated store-and-forward sync path. The zero-knowledge hub can't
-//! decrypt content or compute Yrs state-vector deltas on ciphertext, so it
-//! degrades to an append-only encrypted-blob log per document with a per-device
-//! cursor; clients push sequenced encrypted update blobs and pull everything
-//! past their cursor. All CRDT logic stays on the client.
-//! [sync-zero-knowledge-server]
+//! decrypt content, so it degrades to an append-only encrypted-blob log per
+//! document with a per-device cursor; clients push sequenced encrypted
+//! whole-file TEXT blobs and pull everything past their cursor. All merge logic
+//! (the 3-way text merge) stays on the client. [sync-zero-knowledge-server]
 //!
 //! Pure `impl SyncNode` continuation; no items of its own. The hub itself
 //! lives in [`crate::server`] (its [`crate::server::BlobStore`] is what this
@@ -29,15 +28,17 @@ impl SyncNode {
     /// the server store-and-forwards. For each bound doc:
     /// [sync-zero-knowledge-server, sync-content-encryption-aes256]
     ///
-    /// 1. **Push** — encrypt the doc's current Yrs state under the content key
-    ///    and `UpdateBlob` it to the hub keyed by `blind_id(content_key,
-    ///    logical_id)`, at this device's next monotonic per-blind-id seq. The
-    ///    full state is itself a valid v2 update; Yrs `apply_update` is
-    ///    idempotent, so a peer merging it (or a re-push) is harmless.
+    /// 1. **Push** — encrypt the doc's current whole-file TEXT under the content
+    ///    key and `UpdateBlob` it to the hub keyed by `blind_id(content_key,
+    ///    path)`, at this device's next monotonic per-blind-id seq. Shipping the
+    ///    full text is idempotent: a peer merging it (or a re-push) re-runs the
+    ///    text merge, and identical content is a no-op.
     /// 2. **Pull** — `CursorRequest` everything past our cursor for that blind
-    ///    id, decrypt each blob, and `apply_remote_update` it. Our own pushed
-    ///    blobs decrypt to already-known ops and merge as no-ops; a peer's blobs
-    ///    converge our replica. The cursor advances to the batch's high-water seq.
+    ///    id, decrypt each blob, and `apply_remote_update` it (a 3-way text merge
+    ///    that, with no shared-base window over the relay, fast-forwards to the
+    ///    peer's text). Our own pushed text decrypts to our own content and
+    ///    merges as a no-op; a peer's text converges our replica. The cursor
+    ///    advances to the batch's high-water seq.
     ///
     /// The server is dialed as an enrolled peer (its fingerprint must be enrolled
     /// on this node), so the same Noise + enrollment gate as the P2P path
@@ -92,8 +93,8 @@ impl SyncNode {
         Ok(report)
     }
 
-    /// Push the local doc's current Yrs state to the hub as one content-encrypted
-    /// `UpdateBlob` at this device's next per-blind-id seq.
+    /// Push the local doc's current whole-file TEXT to the hub as one
+    /// content-encrypted `UpdateBlob` at this device's next per-blind-id seq.
     async fn push_state(
         &mut self,
         server_id: PeerId,
@@ -152,13 +153,22 @@ impl SyncNode {
             .fingerprint_of(&server_id)
             .map(|fp| fp.0)
             .unwrap_or_else(|| server_id.to_string());
+        // The zero-knowledge hub ships opaque whole-file TEXT blobs and never the
+        // peer's content-hash history, so the receiver has no shared-base window
+        // here: pass an empty `peer_hashes`, which makes `apply_remote_update`
+        // fall back to `base = ours` → a fast-forward to the peer's text. That is
+        // exactly the server convergence contract (the relay carries an already-
+        // bound doc strictly ahead); an identical re-pull is an idempotent no-op.
+        // A delete over the relay is out of scope for the store-and-forward path
+        // (no tombstone flag on the blob), so `peer_tombstone = false`.
+        let empty_hashes = std::collections::HashSet::new();
         let mut advanced = false;
         let mut high = after;
         for (seq, ciphertext) in blobs {
-            let update = self.content_key.get().decrypt(&ciphertext)?;
+            let peer_text = self.content_key.get().decrypt(&ciphertext)?;
             if self
                 .oplog
-                .apply_remote_update(&local.0, &update, &device_id)
+                .apply_remote_update(&local.0, &peer_text, false, &device_id, &empty_hashes)
                 .map_err(|e| Error::Transport(format!("apply_remote_update: {e}")))?
             {
                 advanced = true;

@@ -19,7 +19,8 @@ use hiker_core::trees::types::Db;
 use hiker_core::vault::Vault;
 use hiker_theme as theme;
 
-use crate::activity::{Ctx, View};
+use egui_workbench::activity::View;
+use crate::activity::{AppCtx, SurfaceCtx};
 use crate::editor_pane;
 use crate::icons::{self, Icon};
 
@@ -47,15 +48,19 @@ pub struct State {
 }
 
 /// Zero-sized `View` descriptor. State lives in `AppState::appears_in_state`;
-/// the surface reaches it via `Ctx::state.downcast_mut::<State>()`. Exposed so
+/// the surface reaches it via `ctx.state.downcast_mut::<State>()`. Exposed so
 /// the `context` container activity can list it among its `views()`.
 pub struct AppearsInSidebar;
 
-impl View for AppearsInSidebar {
+impl View<dyn AppCtx> for AppearsInSidebar {
     fn id(&self) -> &'static str {
         "appears-in"
     }
-    fn render(&self, ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+    fn render(&self, ui: &mut egui::Ui, ctx: &mut (dyn AppCtx + 'static)) {
+        let Some(mut ctx) = ctx.surface_ctx(self.state_key()) else {
+            return;
+        };
+        let ctx = &mut ctx;
         // The workbench accordion owns the section header + collapse; the body is
         // just the content. [feature-panel-single-accordion]
         ui.add_space(8.0);
@@ -63,7 +68,7 @@ impl View for AppearsInSidebar {
     }
 }
 
-fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
+fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let Some(active) = ctx.active_path.clone() else {
         ui.label(
             egui::RichText::new("(open a note to see where it appears)")
@@ -138,7 +143,7 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut Ctx<'_>) {
 /// snaps the canvas to the referencing node; the other groups (boards, trails,
 /// trees) are plain `.md` docs that open in the editor and register a markdown
 /// hover-preview. Extracted from `render_body` to keep it under the line cap.
-fn draw_ref_row(ui: &mut egui::Ui, ctx: &mut Ctx<'_>, icon: Icon, r: &Ref, active: &str) {
+fn draw_ref_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, icon: Icon, r: &Ref, active: &str) {
     if r.path.ends_with(".canvas") {
         // Plain canvas icon in the normal row; the spatial canvas preview shows
         // only on hover (no inline thumbnail). status: canvas-appears-in

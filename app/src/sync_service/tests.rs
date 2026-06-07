@@ -399,6 +399,7 @@ fn vault_key_dir_survives_move() {
 fn section_maps_to_lib_config() {
     let section = SyncSection {
         enabled: true,
+        transport: hiker_core::config::vcs::SyncTransport::Libp2p,
         mode: CoreSyncMode::Both,
         server_url: "/dns4/hub.example/tcp/4001".to_string(),
         discovery: false,

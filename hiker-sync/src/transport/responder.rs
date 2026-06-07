@@ -46,11 +46,12 @@ impl SyncNode {
             else {
                 continue;
             };
-            let text = self
+            let materialized = self
                 .oplog
                 .materialize_accepted(&doc_id)
-                .map_err(|e| Error::Transport(format!("materialize {doc_id}: {e}")))?
-                .text;
+                .map_err(|e| Error::Transport(format!("materialize {doc_id}: {e}")))?;
+            let text = materialized.text;
+            let tombstone = materialized.tombstone;
             let current_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
             let history: Vec<String> = self
                 .oplog
@@ -77,6 +78,7 @@ impl SyncNode {
                 current_hash,
                 recent_history_hashes: history,
                 prior_paths,
+                tombstone,
             });
         }
         Ok(Manifest { entries })
@@ -210,7 +212,7 @@ impl SyncNode {
                 })
             }
             // The pusher's "keep mine" converge: it has made ITS version
-            // canonical and pushed its exact Yrs base. We (the peer) adopt that
+            // canonical and pushed its exact canonical text. We (the peer) adopt that
             // base — replacing our diverged doc, discarding our local branch
             // ("keep mine" means the pusher's version wins) — then clear any
             // block / pending resolution we had for the doc at `path`. Clearing
@@ -222,15 +224,18 @@ impl SyncNode {
             // (no interleave). `peer` is already enrollment-gated. The pushed
             // `state` rides the Noise channel and is never logged.
             // [sync-blocked-state, sync-lineage-adoption]
-            Message::PushAdopt { path, state } => {
+            Message::PushAdopt { path, state, tombstone } => {
                 let _ = peer; // enrollment already gated the connection.
                 let local = match self.local_doc_for_path(&path)? {
                     Some(existing) => existing,
                     None => self.create_local_for(&path)?,
                 };
                 let device_id = self.peer_fingerprint(peer).0;
+                // `tombstone` carries the pusher's delete (a keep-deleted
+                // converge): adopt the DELETE rather than resurrecting the
+                // last-known text. [sync-conflict-delete-vs-edit]
                 self.oplog
-                    .adopt_lineage_theirs(&local.0, &state, &device_id)
+                    .adopt_lineage_theirs(&local.0, &state, tombstone, &device_id)
                     .map_err(|e| Error::Transport(format!("adopt_lineage_theirs: {e}")))?;
                 self.mark_bound(&path);
                 self.clear_blocked(&path);
