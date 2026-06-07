@@ -425,20 +425,16 @@ impl eframe::App for HikerApp {
                 .workbench
                 .set_hide_tab_strip(reader_view_active && self.state.ui.reader_hide_tabs);
             self.state.sync_workbench_tabs();
-            // Snapshot the workbench's active tab AFTER `sync_tabs`
-            // pushed `session.active_tab` into the strip. Comparing
-            // against the post-render snapshot lets us distinguish two
-            // cases:
-            //   - User clicked a tab in the workbench strip — the
-            //     workbench's active changes, session.active_tab is
-            //     stale. We push the new active back into session +
-            //     nav history below.
-            //   - User clicked a file in the sidebar — `open_file`
-            //     mutated session.active_tab during render, but the
-            //     workbench's active didn't change this frame. Next
-            //     frame's `sync_tabs` calls `workbench.set_active` to
-            //     pull the strip over.
-            let prev_active_handle = self.state.workbench.active_handle();
+            // `session.active_tab` is the single source of truth for which tab
+            // is active. `sync_workbench_tabs` just pushed it into the strip
+            // (state → workbench, one-way). The only thing flowing back is a
+            // genuine user tab-click, which the workbench reports as a discrete
+            // event drained below — NOT inferred by diffing the workbench's
+            // active handle across the frame. That derived value also moves for
+            // non-click reasons (tabs landing during async session restore, a
+            // linked/driven group repointing), and treating those as clicks let
+            // the strip fight `session.active_tab` — the tab-focus oscillation
+            // this replaced.
             let mut behavior = workbench_host::HikerWbBehavior {
                 app: &mut self.state,
                 rt: &self.runtime,
@@ -451,16 +447,14 @@ impl eframe::App for HikerApp {
             // putting it back.
             let mut wb = std::mem::take(&mut behavior.app.workbench);
             wb.ui(ctx, &mut behavior);
-            let new_active_handle = wb.active_handle();
             behavior.app.workbench = wb;
-            if prev_active_handle != new_active_handle
-                && let Some(handle) = new_active_handle
+            // Consume the user's tab-strip click (if any) as the single
+            // workbench → state channel: activate it and record nav history
+            // (shared with the keyboard switch paths). Copy the id out first so
+            // the `tab` borrow ends before the `&mut self.state` call.
+            if let Some(handle) = self.state.workbench.take_user_activated()
                 && let Some(tab) = self.state.workbench.editor_area.get(handle)
             {
-                // User clicked a tab in the strip — activate it and record
-                // nav history (shared with the keyboard switch paths). Copy
-                // the id out first so `tab`'s borrow of `self.state` ends
-                // before the `&mut self.state` call.
                 let tab_id = tab.id;
                 crate::state::activate_tab(&mut self.state, tab_id);
             }
@@ -590,7 +584,7 @@ fn drain_fs_events(&mut self) {
                 state.maybe_reload_clean_buffer(to);
             }
             FileEvent::Overflow => {
-                state.file_tree_state.dir_cache.clear();
+                state.file_tree_state.invalidate_all();
             }
         }
     }
@@ -598,7 +592,7 @@ fn drain_fs_events(&mut self) {
 
 fn invalidate_for_path(&mut self, path: &str) {
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    self.file_tree_state.dir_cache.remove(parent);
+    self.file_tree_state.invalidate_dir(parent);
 }
 
 /// Copy the latest task-queue snapshot out of the pollster's `watch`

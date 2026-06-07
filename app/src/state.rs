@@ -658,6 +658,46 @@ pub struct FileTreeState {
     /// narrow `activity::SurfaceCtx` into `session.buffers` / the skipped-paths
     /// channel / another feature's trail state. [feature-filetree-migration]
     pub deco: FileTreeDeco,
+    /// Cached flattened, render-order row list for the virtualized tree.
+    /// Rebuilt only when a structural change invalidates it (an expand /
+    /// collapse toggle, or a directory-listing change) — see
+    /// [`Self::invalidate_dir`] / [`Self::invalidate_all`] /
+    /// [`Self::invalidate_flat`]. `None` means "rebuild on the next render".
+    /// Decorations / child counts / the active-row highlight are NOT baked
+    /// in here; they stay live per-render, so only structural edits ever
+    /// invalidate the cache. Avoids the previous per-frame re-walk that
+    /// cloned every expanded directory's listing.
+    pub flat_cache: Option<Vec<crate::files::sidebar::FlatRow>>,
+    /// Set when a structural change happens mid-render (an expand / collapse
+    /// toggle), so the render epilogue drops the stale `flat_cache` it took
+    /// out for the frame and rebuilds next frame rather than restoring it.
+    pub flat_dirty: bool,
+}
+
+impl FileTreeState {
+    /// Drop the cached listing for `dir` and invalidate the flattened-row
+    /// cache, so the tree re-lists `dir` and re-flattens on the next render.
+    /// Use after creating / moving / deleting an entry inside `dir`.
+    pub fn invalidate_dir(&mut self, dir: &str) {
+        self.dir_cache.remove(dir);
+        self.flat_cache = None;
+    }
+
+    /// Drop every cached directory listing and invalidate the flattened-row
+    /// cache (a full tree refresh). Use after a change whose scope isn't a
+    /// single directory (sort change, bulk move, external refresh).
+    pub fn invalidate_all(&mut self) {
+        self.dir_cache.clear();
+        self.flat_cache = None;
+    }
+
+    /// Invalidate just the flattened-row cache without dropping any directory
+    /// listing — e.g. after toggling a folder's expanded state. Safe to call
+    /// mid-render: also sets the `flat_dirty` flag the render epilogue honours.
+    pub fn invalidate_flat(&mut self) {
+        self.flat_cache = None;
+        self.flat_dirty = true;
+    }
 }
 
 /// Row-decoration snapshot for the files filetree. The sets are populated
@@ -672,14 +712,6 @@ pub struct FileTreeDeco {
     /// Vault-relative paths the indexer marked skipped (drives the
     /// `  [skip]` marker). Snapshot of `ui_cache.skipped_paths`.
     pub skipped: HashSet<String>,
-    /// Name of the active trail (the "Add to trail 'X'" context-menu
-    /// target), plus the set of paths already waypoints on it (any depth).
-    /// `None` when no trail is active. Snapshot of `trails_state`.
-    pub active_trail: Option<(String, HashSet<String>)>,
-    /// Names of every registered trail, lowercased — drives the
-    /// "Set as active trail" verb's basename match. Snapshot of
-    /// `trails_state`.
-    pub trail_names: HashSet<String>,
 }
 
 // ===========================================================================

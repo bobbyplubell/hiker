@@ -136,7 +136,7 @@ fn apply(state: &mut crate::state::AppState, action: Action) {
             Ok(entry) => {
                 let parent =
                     entry.original_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-                state.file_tree_state.dir_cache.remove(parent);
+                state.file_tree_state.invalidate_dir(parent);
                 state.push_toast(
                     format!("Restored {}", entry.original_path),
                     crate::state::ToastLevel::Info,

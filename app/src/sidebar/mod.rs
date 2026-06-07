@@ -90,7 +90,7 @@ impl AppState {
             Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
         };
         if result.is_ok() {
-            self.file_tree_state.dir_cache.remove(&target_dir);
+            self.file_tree_state.invalidate_dir(&target_dir);
         }
         result
     }
@@ -125,7 +125,7 @@ impl AppState {
         });
         match result {
             Ok(outcome) => {
-                state.file_tree_state.dir_cache.clear();
+                state.file_tree_state.invalidate_all();
                 // Open in the board view with inline-rename active so the
                 // user names it before submitting (mirrors new-trail /
                 // new-file). status: board-create
@@ -192,7 +192,7 @@ impl AppState {
         };
         match result {
             Ok(actual) => {
-                state.file_tree_state.dir_cache.remove(&target_dir);
+                state.file_tree_state.invalidate_dir(&target_dir);
                 crate::panels::canvas::open_fresh(state, &actual);
             }
             Err(err) => {

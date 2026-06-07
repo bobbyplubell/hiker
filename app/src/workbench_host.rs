@@ -487,7 +487,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
         }
         if mode == "files" {
             if ui.button("Refresh tree").clicked() {
-                self.app.file_tree_state.dir_cache.clear();
+                self.app.file_tree_state.invalidate_all();
                 self.app.push_toast("File tree refreshed", crate::state::ToastLevel::Info);
                 ui.close();
             }
@@ -518,7 +518,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
                         s => s.as_str(),
                     };
                     self.app.persist_tree_sort(s);
-                    self.app.file_tree_state.dir_cache.clear();
+                    self.app.file_tree_state.invalidate_all();
                     ui.close();
                 }
             }

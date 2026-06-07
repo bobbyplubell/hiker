@@ -824,6 +824,9 @@ pub(crate) fn reveal_in_files(app: &mut AppState, rel: &str) {
         acc.push_str(part);
         app.file_tree_state.expanded.insert(acc.clone());
     }
+    // Expanding ancestor folders is a structural change — drop the cached
+    // flattened-row list so the revealed path's rows appear.
+    app.file_tree_state.invalidate_flat();
     crate::actions::ensure_panel_visible(app, crate::tab::PANEL_FILES);
     app.file_tree_state.scroll_target = Some(rel.to_string());
 }

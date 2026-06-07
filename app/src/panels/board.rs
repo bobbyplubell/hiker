@@ -959,7 +959,7 @@ fn rename_board(app: &mut AppState, tab_id: TabId, from: &str, new_title: &str) 
         app.push_toast(format!("Rename board failed: {err}"), ToastLevel::Error);
         return;
     }
-    app.file_tree_state.dir_cache.remove(parent);
+    app.file_tree_state.invalidate_dir(parent);
     // Repoint this board tab + any editor/buffer tabs at the old path.
     if let Some(tab) = app.tab_by_id_mut(tab_id) {
         if let crate::tab::TabKind::Board { path } = &mut tab.kind {

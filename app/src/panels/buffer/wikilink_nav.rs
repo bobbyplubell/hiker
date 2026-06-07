@@ -136,7 +136,7 @@ fn create_and_open(app: &mut AppState, name: &str, sticky: bool) {
     };
     match result {
         Ok(actual) => {
-            app.file_tree_state.dir_cache.clear();
+            app.file_tree_state.invalidate_all();
             app.push_toast(format!("Created {actual}"), ToastLevel::Info);
             crate::editor_pane::open_file(app, &actual, sticky);
         }

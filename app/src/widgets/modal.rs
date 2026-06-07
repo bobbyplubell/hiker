@@ -253,7 +253,7 @@ fn apply_confirm_delete(&mut self, rel: &str) {
     }
     app.session.buffers.remove(rel);
     let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    app.file_tree_state.dir_cache.remove(parent);
+    app.file_tree_state.invalidate_dir(parent);
     app.push_toast(format!("Moved {} to trash", rel), ToastLevel::Info);
 }
 }

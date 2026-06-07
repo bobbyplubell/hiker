@@ -70,9 +70,13 @@ enum FileVerb {
 const ROW_HEIGHT: f32 = 22.0;
 
 /// One visible row in the flattened, virtualized tree. The tree is walked
-/// into a `Vec<FlatRow>` in render order each frame so `show_rows` can lay
-/// out / paint only the rows inside the scroll viewport.
-enum FlatRow {
+/// into a `Vec<FlatRow>` in render order whenever a structural change
+/// invalidates the cache (see `FileTreeState::flat_cache`); `show_rows` then
+/// lays out / paints only the rows inside the scroll viewport. Decorations,
+/// child counts, and the active-row highlight are NOT stored here — they're
+/// computed live per-render, so the cache only needs invalidating on
+/// structural edits.
+pub(crate) enum FlatRow {
     /// A file or folder row at the given indent depth.
     Entry { entry: DirEntryDto, depth: usize },
     /// A directory whose listing failed — renders the error inline, as the
@@ -137,13 +141,18 @@ impl FilesCtx<'_, '_> {
         self.sort_header(ui);
         let _g = crate::profiling::FrameProf::guard("files:tree");
 
-        // Flatten the visible tree (expanded folders + their children) into
-        // a row list, then hand it to `show_rows` so egui only lays out /
-        // paints the rows inside the scroll viewport. Building the flat list
-        // is O(visible rows) of cheap string clones; the expensive per-row
-        // work (galley layout, hover hit-testing, painting) now runs only
-        // for the ~viewport-height band of rows, not the whole vault.
-        let rows = self.flatten_visible();
+        // Reuse the cached flattened row list, rebuilding it only when a
+        // structural change invalidated it (an expand / collapse toggle, or a
+        // directory-listing change routed through `FileTreeState::invalidate_*`).
+        // Take it out of state for the frame so the per-row render below can
+        // hold `&mut self` without borrowing the cache; the epilogue restores
+        // it. This replaces the previous per-frame re-walk, which cloned every
+        // expanded directory's full listing on every frame. `show_rows` then
+        // lays out / paints only the ~viewport-height band of rows.
+        let rows = match self.st().flat_cache.take() {
+            Some(rows) => rows,
+            None => self.flatten_visible(),
+        };
 
         // Reveal-from-discovery (`reveal-in-sidebar-scroll`): a one-shot
         // scroll target arms a jump to a specific row. With virtualization
@@ -167,6 +176,13 @@ impl FilesCtx<'_, '_> {
                 self.render_flat_row(ui, &rows[i]);
             }
         });
+
+        // Epilogue: restore the cache for reuse next frame — unless an
+        // expand / collapse toggled the structure mid-render (`flat_dirty`),
+        // in which case leave `flat_cache` empty so the next render rebuilds.
+        if !std::mem::take(&mut self.st().flat_dirty) {
+            self.st().flat_cache = Some(rows);
+        }
     }
 
     /// Walk the expanded tree from the vault root into a flat, render-order
@@ -259,7 +275,7 @@ impl FilesCtx<'_, '_> {
                     &serde_json::Value::String(wire),
                     "Sort change failed",
                 );
-                app.file_tree_state.dir_cache.clear();
+                app.file_tree_state.invalidate_all();
             });
         }
     }
@@ -340,6 +356,9 @@ impl FilesCtx<'_, '_> {
                 st.expanded.insert(rel.clone());
             }
             st.selected_folder = Some(rel);
+            // Structural change: drop the flattened-row cache so the next
+            // render rebuilds it with this folder expanded / collapsed.
+            st.invalidate_flat();
         }
     }
 
@@ -445,12 +464,7 @@ impl FilesCtx<'_, '_> {
         resp.context_menu(|ui| {
             let (boards, membership, board_doc) =
                 crate::panels::board::picker_context_ctx(self.ctx, rel);
-            let active_trail = self
-                .st_ref()
-                .deco
-                .active_trail
-                .as_ref()
-                .map(|(name, paths)| (name.clone(), paths.contains(rel)));
+            let active_trail = active_trail_membership(self.ctx, rel);
             let canvases = crate::panels::canvas::list_canvases(self.ctx.vault);
             if let Some(v) = egui_workbench::menu::show(
                 ui,
@@ -505,10 +519,12 @@ impl FilesCtx<'_, '_> {
 // ----- deferred-effect free helpers (full &mut AppState) -----
 
 /// Refresh the row-decoration snapshot from the AppState data the narrow
-/// `SurfaceCtx` doesn't carry: the dirty-buffer set (`session.buffers`), the
-/// skipped-paths set (`ui_cache.skipped_paths`), and the active-trail
-/// name + membership / all trail names (`trails_state`). Runs as a
-/// deferred pre-pass so the render path reads only the snapshot.
+/// `SurfaceCtx` doesn't carry: the dirty-buffer set (`session.buffers`) and
+/// the skipped-paths set (`ui_cache.skipped_paths`). Both are cheap O(open
+/// buffers)/O(skipped) reads, so this stays a per-frame deferred pre-pass.
+/// Active-trail membership is deliberately NOT snapshotted here — it's an
+/// O(vault) read + parse, so it's gathered lazily on context-menu open
+/// instead (see [`active_trail_membership`]).
 fn refresh_deco(app: &mut AppState) {
     let dirty: std::collections::HashSet<String> = app
         .session
@@ -518,12 +534,9 @@ fn refresh_deco(app: &mut AppState) {
         .map(|(p, _)| p.clone())
         .collect();
     let skipped = app.ui_cache.skipped_paths.clone();
-    let (active_trail, trail_names) = trail_deco_snapshot(app);
     let deco = &mut app.file_tree_state.deco;
     deco.dirty = dirty;
     deco.skipped = skipped;
-    deco.active_trail = active_trail;
-    deco.trail_names = trail_names;
 }
 
 /// Dispatch a context-menu verb against `AppState`.
@@ -742,7 +755,7 @@ fn duplicate_file(app: &mut AppState, rel: &str) {
     };
     match actual {
         Ok(actual) => {
-            app.file_tree_state.dir_cache.remove(parent);
+            app.file_tree_state.invalidate_dir(parent);
             app.push_toast(
                 format!("Duplicated -> {actual}"),
                 crate::state::ToastLevel::Info,
@@ -861,8 +874,8 @@ fn move_into_folder(app: &mut AppState, src: &str, dest_dir: &str) {
         return;
     }
     let src_parent = src.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    app.file_tree_state.dir_cache.remove(src_parent);
-    app.file_tree_state.dir_cache.remove(dest_dir);
+    app.file_tree_state.invalidate_dir(src_parent);
+    app.file_tree_state.invalidate_dir(dest_dir);
     repoint_open_buffer(app, src, &dest);
     if !is_dir {
         commit_observed_rename(app, src, &dest);
@@ -900,7 +913,7 @@ fn commit_rename(app: &mut AppState, from: &str, draft: &str) {
         );
         return;
     }
-    app.file_tree_state.dir_cache.remove(parent);
+    app.file_tree_state.invalidate_dir(parent);
     repoint_open_buffer(app, from, &to);
     commit_observed_rename(app, from, &to);
     app.push_toast(format!("Renamed -> {to}"), crate::state::ToastLevel::Info);
@@ -1052,35 +1065,26 @@ fn build_file_menu(
     menu.action("Delete", FileVerb::Delete)
 }
 
-/// Snapshot the trail decorations the file tree renders, read live from
-/// `core::trails`: the active trail's `(title, source-note-membership)`
-/// (from `vault.active_trail` config + `get_trail`) and every trail's
-/// lowercased title. Empty on a store-lock or config-lock failure.
-fn trail_deco_snapshot(
-    app: &AppState,
-) -> (Option<(String, std::collections::HashSet<String>)>, std::collections::HashSet<String>) {
-    let active_rel = app
-        .vault_session
+/// The active trail's `(title, whether `rel` is already a waypoint)`, looked
+/// up lazily when a file-row context menu opens — NOT per frame. Backs the
+/// "Add to trail '…'" verb (and its "Already in '…'" disabled state).
+///
+/// Reading this is O(active-trail size) plus the trail-doc read/parse, which
+/// is why it's gathered on menu-open (mirroring the boards / canvases pickers
+/// gathered alongside it) rather than snapshotted every frame. Returns `None`
+/// when no trail is active or the active trail-doc can't be read / resolved.
+fn active_trail_membership(ctx: &SurfaceCtx<'_>, rel: &str) -> Option<(String, bool)> {
+    let active_rel = ctx
         .config
         .read()
         .ok()
-        .and_then(|c| c.vault.active_trail.clone());
-    let Ok(store) = app.vault_session.services.read_store.lock() else {
-        return (None, std::collections::HashSet::new());
-    };
-    let vault = &app.vault_session.vault;
-    let log = &app.vault_session.services.oplog;
-    let listing = hiker_core::trails::list(vault, &store, log).unwrap_or_default();
-    let trail_names = listing.iter().map(|t| t.title.to_lowercase()).collect();
-    let active_trail = active_rel
-        .filter(|rel| listing.iter().any(|t| &t.rel_path == rel))
-        .and_then(|rel| hiker_core::trails::get_trail(vault, &store, log, &rel).ok())
-        .map(|detail| {
-            let mut members = std::collections::HashSet::new();
-            collect_source_paths(&detail.waypoints, &mut members);
-            (trail_title(&detail.rel_path), members)
-        });
-    (active_trail, trail_names)
+        .and_then(|c| c.vault.active_trail.clone())?;
+    let store = ctx.services.read_store.lock().ok()?;
+    let detail =
+        hiker_core::trails::get_trail(ctx.vault, &store, &ctx.services.oplog, &active_rel).ok()?;
+    let mut members = std::collections::HashSet::new();
+    collect_source_paths(&detail.waypoints, &mut members);
+    Some((trail_title(&active_rel), members.contains(rel)))
 }
 
 /// Trail-doc title (basename without `.md`).
