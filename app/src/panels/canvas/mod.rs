@@ -246,6 +246,78 @@ pub fn open_focused(app: &mut AppState, path: &str, note: &str) {
     app.panels.canvases.entry(tab_id).or_default().focus_note_pending = Some(note.to_string());
 }
 
+/// Act on a double-clicked node: open a link node's URL in the OS browser, or a
+/// file node's referenced vault file in a tab (routing `.canvas` to the canvas
+/// view, everything else through the standard open path). Other kinds (text /
+/// group) have no activation. The in-place counterpart of
+/// [`open_target_in_new_tab`]. status: canvas-link-node-card
+pub(crate) fn activate_node(ui: &egui::Ui, app: &mut AppState, tab_id: TabId, canvas: &Canvas, id: &str) {
+    use hiker_canvas::model::NodeKind;
+    let Some(node) = canvas.nodes.iter().find(|n| n.id == id) else {
+        return;
+    };
+    match &node.kind {
+        NodeKind::Link { url } if !url.trim().is_empty() => {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+        }
+        NodeKind::File { file, .. } if !file.trim().is_empty() => {
+            if file.ends_with(".canvas") {
+                open(app, file);
+            } else {
+                // DRIVE: a linked target group opens the note there instead
+                // of this canvas's own preview/active slot. status: tab-linking
+                let target = app.tab_by_id(tab_id).and_then(|t| t.link.target);
+                match crate::editor_pane::drive_target_group(app, target) {
+                    Some(group) => {
+                        crate::editor_pane::open_file_in_group(app, file, group, true);
+                    }
+                    None => crate::editor_pane::open_file(app, file, /* sticky */ true),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A canvas node's openable target, resolved from its kind for the "Open in new
+/// tab" context-menu verb. Mirrors the kinds `activate_node` opens (a File node's
+/// referenced file, a Link node's URL); Text / group nodes (and empty targets)
+/// have none. status: canvas-open-in-new-tab
+pub(crate) enum OpenTarget {
+    /// A File node's referenced vault file (routed by extension when opened).
+    File(String),
+    /// A Link node's URL.
+    Url(String),
+}
+
+/// Resolve node `id`'s openable target, or `None` for a Text / group node or an
+/// empty File / Link target — matching the openability the node context menu
+/// gates its "Open in new tab" item on. status: canvas-open-in-new-tab
+pub(crate) fn node_open_target(canvas: &Canvas, id: &str) -> Option<OpenTarget> {
+    use hiker_canvas::model::NodeKind;
+    let node = canvas.nodes.iter().find(|n| n.id == id)?;
+    match &node.kind {
+        NodeKind::File { file, .. } if !file.trim().is_empty() => Some(OpenTarget::File(file.clone())),
+        NodeKind::Link { url } if !url.trim().is_empty() => Some(OpenTarget::Url(url.clone())),
+        _ => None,
+    }
+}
+
+/// Open a resolved [`OpenTarget`] in a NEW tab, leaving the current canvas tab in
+/// place: a File node's referenced file gets a fresh editor tab (extension-routed
+/// to the canvas / chart / graph view as usual via `open_file_new_tab`), and a
+/// Link node's URL opens in a new browser tab. The new-tab counterpart of
+/// `activate_node`'s in-place open. status: canvas-open-in-new-tab
+pub(crate) fn open_target_in_new_tab(ui: &egui::Ui, app: &mut AppState, target: OpenTarget) {
+    match target {
+        OpenTarget::File(file) => {
+            tracing::debug!(target = %file, "canvas: open node target in new tab");
+            crate::editor_pane::open_file_new_tab(app, &file);
+        }
+        OpenTarget::Url(url) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+    }
+}
+
 /// The vault path of the note currently inline-edited on canvas tab `tab_id` —
 /// the `file` of the File node in edit mode. `None` when nothing is being edited,
 /// the edited node is a Text node, or its path is empty. Lets the host treat the

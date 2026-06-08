@@ -420,6 +420,10 @@ impl FilesCtx<'_, '_> {
                 crate::panels::canvas::open(app, &rel);
             } else if is_board_doc(app, &rel) {
                 crate::panels::board::open(app, &rel);
+            } else if crate::panels::code_graph::is_project_doc(app, &rel) {
+                // A `hiker.kind: project` note opens its repo source as a code-entity graph.
+                // status: code-graph-view-source
+                crate::panels::code_graph::open(app, &rel);
             } else {
                 crate::editor_pane::open_file(app, &rel, /* sticky */ false);
             }

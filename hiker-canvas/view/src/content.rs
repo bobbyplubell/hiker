@@ -56,6 +56,18 @@ pub trait NodeContentRenderer {
     /// (the editor) clamp `view.scroll_y` to their content height; non-scrolling
     /// bodies echo it unchanged.
     fn render(&mut self, ui: &mut egui::Ui, node: &Node, inner: Rect, view: CardView) -> f32;
+
+    /// A stable signature of everything about `node` that determines its body's
+    /// *visual* output (its text / file / subpath — the same fingerprint the
+    /// host's pane cache keys on). The view's idle-card paint cache (Option B
+    /// retained paint) reuses a card's recorded shapes only while this signature
+    /// is unchanged, so a content edit re-renders while a pure pan does not.
+    /// `None` opts the node out of idle caching (always live-rendered) — the
+    /// default, so an engine that hasn't implemented this is never wrongly
+    /// cached. status: canvas-idle-card-cache
+    fn body_signature(&mut self, _node: &Node) -> Option<u64> {
+        None
+    }
 }
 
 /// A trivial [`NodeContentRenderer`] that paints each node's id and kind as

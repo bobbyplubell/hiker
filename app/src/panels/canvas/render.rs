@@ -691,12 +691,23 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
             }
         }
     }
+    // "Open in new tab" verb (node context menu): resolve the right-clicked
+    // node's openable target from the canvas WHILE `taken` is still owned, then
+    // act after `put_pane_doc` (the open needs `&mut app` alone).
+    // status: canvas-open-in-new-tab
+    let open_in_new_tab = resp
+        .request_open_in_new_tab
+        .as_deref()
+        .and_then(|id| super::node_open_target(&taken.canvas, id));
     // Resolve where the inline-edit overlay should sit (the editing node's
     // on-screen rect) BEFORE putting the widget back — the camera lives on
     // `taken.view_widget`. Selection-based exit (click empty / select another
     // node) also reads off `taken`, while it's still owned here.
     let edit = resolve_edit_overlay(ui, tab_id, &taken, viewport, app);
     put_pane_doc(app, tab_id, taken);
+    if let Some(target) = open_in_new_tab {
+        super::open_target_in_new_tab(ui, app, target);
+    }
     // "New note" verb: mint a brand-new vault note and drop a File-node pointer
     // to it onto the canvas, so it can be edited inline immediately. Runs AFTER
     // `put_pane_doc` so the widget is back in the pane — the shared
@@ -747,11 +758,11 @@ fn render_overview(ui: &mut egui::Ui, taken: &mut TakenDoc, viewport: egui::Rect
     // paints a round inset bg, leaving the area's corners transparent. The
     // full-pane (expanded) overview is opaque and covers the canvas directly.
     // status: canvas-minimap
-    taken.overview.style.background = if taken.overview_expanded {
-        None
-    } else {
-        Some(egui::Color32::TRANSPARENT)
-    };
+    let expanded = taken.overview_expanded;
+    taken.overview.style.background = (!expanded).then_some(egui::Color32::TRANSPARENT);
+    // No disk-boundary ring on the corner minimap (it would frame the circle with
+    // a thin white outline); the expanded full-pane overview keeps its ring.
+    taken.overview.show_boundary = expanded;
     if !taken.overview_expanded {
         let r = 0.5 * area.size().min_elem();
         ui.painter().with_clip_rect(area).circle_filled(
@@ -811,6 +822,10 @@ fn handle_overview_swap(ui: &egui::Ui, taken: &mut TakenDoc, area: egui::Rect, v
         if let Some(id) = model.focused_card(cfg, nav).map(ToString::to_string) {
             taken.view_widget.focus_node(viewport, &taken.canvas, &id);
         }
+        // Then snap the corner minimap back to the global overview — drop the
+        // accumulated pan/zoom/fly-to from the expanded session so the inset
+        // reads as a whole-canvas map again, not a leftover zoomed-in region.
+        taken.overview.needs_fit = true;
     }
 }
 
@@ -855,7 +870,7 @@ fn activate_or_edit(
     // Double-click: enter inline-edit for an editable full-detail card, else
     // activate (open a link / file pointer / LOD placeholder in a tab).
     if !try_enter_edit(app, tab_id, taken, id, viewport) {
-        activate_node(ui, app, tab_id, &taken.canvas, id);
+        super::activate_node(ui, app, tab_id, &taken.canvas, id);
     }
 }
 
@@ -1001,38 +1016,6 @@ fn persist_text_edit(app: &mut AppState, tab_id: TabId, path: &str, op: &hiker_c
     if let Some(pane) = app.panels.canvases.get_mut(&tab_id) {
         pane.canvas = Some(canvas);
         pane.last_parsed_text = last;
-    }
-}
-
-/// Act on a double-clicked node: open a link node's URL in the OS browser, or a
-/// file node's referenced vault file in a tab (routing `.canvas` to the canvas
-/// view, everything else through the standard open path). Other kinds (text /
-/// group) have no activation. status: canvas-link-node-card
-fn activate_node(ui: &egui::Ui, app: &mut AppState, tab_id: TabId, canvas: &Canvas, id: &str) {
-    use hiker_canvas::model::NodeKind;
-    let Some(node) = canvas.nodes.iter().find(|n| n.id == id) else {
-        return;
-    };
-    match &node.kind {
-        NodeKind::Link { url } if !url.trim().is_empty() => {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
-        }
-        NodeKind::File { file, .. } if !file.trim().is_empty() => {
-            if file.ends_with(".canvas") {
-                super::open(app, file);
-            } else {
-                // DRIVE: a linked target group opens the note there instead
-                // of this canvas's own preview/active slot. status: tab-linking
-                let target = app.tab_by_id(tab_id).and_then(|t| t.link.target);
-                match crate::editor_pane::drive_target_group(app, target) {
-                    Some(group) => {
-                        crate::editor_pane::open_file_in_group(app, file, group, true);
-                    }
-                    None => crate::editor_pane::open_file(app, file, /* sticky */ true),
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1331,8 +1314,26 @@ fn save_canvas_document(app: &mut AppState, path: &str) {
             // the last save). Keep the baseline consistent, but do NOT poke or
             // claim a save: a no-op must not masquerade as a synced change (that
             // was the "saved but didn't sync" symptom).
+            //
+            // …UNLESS the `.canvas` has since vanished from disk (deleted/moved
+            // out-of-band after an autosave): the op-log content is unchanged so
+            // there is nothing to commit, but the user pressing Ctrl+S plainly
+            // expects the file back. Re-materialize `accepted` to disk and report
+            // it as a real save. Capture the result before `advance_baseline`
+            // takes its `&mut app` borrow (which would conflict with `log`).
+            // status: op-log-disk-canonical
+            let restored = log.ensure_on_disk(&doc_id);
             advance_baseline(app);
-            tracing::info!(target: "hiker::canvas_save", path, "canvas save was a no-op (working == accepted)");
+            match restored {
+                Ok(true) => {
+                    tracing::info!(target: "hiker::canvas_save", path, "canvas restored to disk (file was missing)");
+                    app.push_toast(format!("Saved {path}"), ToastLevel::Info);
+                }
+                Ok(false) => {
+                    tracing::info!(target: "hiker::canvas_save", path, "canvas save was a no-op (working == accepted)");
+                }
+                Err(e) => app.push_toast(format!("Save failed: {e}"), ToastLevel::Error),
+            }
         }
         Err(e) => app.push_toast(format!("Save failed: {e}"), ToastLevel::Error),
     }

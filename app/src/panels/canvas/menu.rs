@@ -13,14 +13,22 @@
 //! The zoom controls are three discrete actions, so they stay plain `action`
 //! entries; the `Custom` live-widget escape hatch isn't needed here.
 
-use canvas_view::menu::{CanvasMenuRenderer, EdgeMenuAction, EmptyMenuAction, NodeMenuAction};
-use egui_workbench::menu::Menu;
+use canvas_view::menu::{
+    CanvasMenuRenderer, EdgeMenuAction, EmptyMenuAction, NodeMenuAction, NodeOpenTarget,
+};
+use egui_workbench::menu::{Action, Enabled, Menu};
 
-/// The shared node base: the options any surface showing a node offers. Today
-/// just `Delete`; the canvas splices its own section onto this with
-/// [`Menu::extend`]. status: ctxmenu-canvas
-fn node_base_menu() -> Menu<NodeMenuAction> {
-    Menu::new().action("Delete", NodeMenuAction::Delete)
+/// The shared node base: the options any surface showing a node offers — open the
+/// node's target in a new tab (greyed when the node has nothing to open, e.g. a
+/// Text node), then `Delete`. The canvas splices its own section onto this with
+/// [`Menu::extend`]. status: ctxmenu-canvas, canvas-open-in-new-tab
+fn node_base_menu(target: NodeOpenTarget) -> Menu<NodeMenuAction> {
+    let open = match target {
+        NodeOpenTarget::Openable => Action::new("Open in new tab", NodeMenuAction::OpenInNewTab),
+        NodeOpenTarget::None => Action::new("Open in new tab", NodeMenuAction::OpenInNewTab)
+            .enabled(Enabled::No("this node has nothing to open".into())),
+    };
+    Menu::new().action_with(open).action("Delete", NodeMenuAction::Delete)
 }
 
 /// The canvas-only contextual section spliced onto [`node_base_menu`]: per-card
@@ -37,8 +45,8 @@ fn node_zoom_section() -> Menu<NodeMenuAction> {
 /// composition the spec describes (base + host section), ordered to match the
 /// canvas's existing layout. `extend` keeps the base as its own group, so the
 /// renderer draws the separator between them. status: ctxmenu-canvas
-fn build_node_menu() -> Menu<NodeMenuAction> {
-    node_zoom_section().extend(node_base_menu())
+fn build_node_menu(target: NodeOpenTarget) -> Menu<NodeMenuAction> {
+    node_zoom_section().extend(node_base_menu(target))
 }
 
 /// The edge menu: edit the label, or delete the edge. status: ctxmenu-canvas
@@ -69,8 +77,8 @@ fn build_empty_menu() -> Menu<EmptyMenuAction> {
 pub(crate) struct CanvasMenus;
 
 impl CanvasMenuRenderer for CanvasMenus {
-    fn node_menu(&mut self, ui: &mut egui::Ui) -> Option<NodeMenuAction> {
-        egui_workbench::menu::show(ui, build_node_menu())
+    fn node_menu(&mut self, ui: &mut egui::Ui, target: NodeOpenTarget) -> Option<NodeMenuAction> {
+        egui_workbench::menu::show(ui, build_node_menu(target))
     }
 
     fn edge_menu(&mut self, ui: &mut egui::Ui) -> Option<EdgeMenuAction> {
@@ -85,8 +93,8 @@ impl CanvasMenuRenderer for CanvasMenus {
 #[cfg(test)]
 mod tests {
     use super::{build_edge_menu, build_empty_menu, build_node_menu, node_base_menu};
-    use canvas_view::menu::{EdgeMenuAction, EmptyMenuAction, NodeMenuAction};
-    use egui_workbench::menu::Entry;
+    use canvas_view::menu::{EdgeMenuAction, EmptyMenuAction, NodeMenuAction, NodeOpenTarget};
+    use egui_workbench::menu::{Enabled, Entry};
 
     /// Pull the action out of a plain `Action` entry, asserting its label so the
     /// menu's visible order is locked in.
@@ -100,9 +108,18 @@ mod tests {
         }
     }
 
+    /// Read an `Action` entry's enabled state (panicking on any other entry kind),
+    /// so the open-in-new-tab disable can be asserted per node target.
+    fn enabled_of<A>(entry: &Entry<A>) -> &Enabled {
+        match entry {
+            Entry::Action { enabled, .. } => enabled,
+            _ => panic!("expected an Action entry"),
+        }
+    }
+
     #[test]
-    fn node_menu_is_zoom_section_then_delete_base() {
-        let menu = build_node_menu();
+    fn node_menu_is_zoom_section_then_open_and_delete_base() {
+        let menu = build_node_menu(NodeOpenTarget::Openable);
         let sections = menu.sections();
         // Two separator-delimited groups: zoom controls, then the shared base.
         assert_eq!(sections.len(), 2, "zoom section + base section");
@@ -110,15 +127,28 @@ mod tests {
         assert_eq!(action_of(&sections[0][1], "Zoom out"), NodeMenuAction::ZoomOut);
         assert_eq!(action_of(&sections[0][2], "Reset zoom"), NodeMenuAction::ResetZoom);
         assert_eq!(sections[0].len(), 3, "exactly the three zoom verbs");
-        assert_eq!(action_of(&sections[1][0], "Delete"), NodeMenuAction::Delete);
-        assert_eq!(sections[1].len(), 1, "base is just Delete");
+        assert_eq!(action_of(&sections[1][0], "Open in new tab"), NodeMenuAction::OpenInNewTab);
+        assert_eq!(action_of(&sections[1][1], "Delete"), NodeMenuAction::Delete);
+        assert_eq!(sections[1].len(), 2, "base is Open in new tab + Delete");
     }
 
     #[test]
-    fn node_base_is_just_delete() {
-        let base = node_base_menu();
+    fn node_base_is_open_then_delete() {
+        let base = node_base_menu(NodeOpenTarget::Openable);
         assert_eq!(base.sections().len(), 1);
-        assert_eq!(action_of(&base.sections()[0][0], "Delete"), NodeMenuAction::Delete);
+        assert_eq!(action_of(&base.sections()[0][0], "Open in new tab"), NodeMenuAction::OpenInNewTab);
+        assert_eq!(action_of(&base.sections()[0][1], "Delete"), NodeMenuAction::Delete);
+    }
+
+    #[test]
+    fn open_in_new_tab_enabled_for_openable_disabled_otherwise() {
+        let openable = node_base_menu(NodeOpenTarget::Openable);
+        assert!(enabled_of(&openable.sections()[0][0]).is_enabled(), "openable → clickable");
+
+        let none = node_base_menu(NodeOpenTarget::None);
+        assert!(!enabled_of(&none.sections()[0][0]).is_enabled(), "no target → greyed");
+        // Delete stays available regardless of openability.
+        assert!(enabled_of(&none.sections()[0][1]).is_enabled(), "Delete always enabled");
     }
 
     #[test]

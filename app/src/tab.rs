@@ -201,6 +201,14 @@ pub enum TabKind {
     /// Cluster tree visualised as a radial dendrogram. Payload is the
     /// `tree_id` to render.
     ClusterGraph { tree_id: String },
+    /// Code graph: a project note's (`hiker.kind: project`) repo source rendered as a precise
+    /// entity graph through the shared graph engine. Payload is the project-note path. Per-note
+    /// (like Board), not a singleton. See `docs/hiker-code.md` `code-graph-view-source`.
+    CodeGraph { project_path: String },
+    /// Project-config form: author/edit a project note via UI (sources → save). `source_note` is
+    /// `Some(path)` when editing an existing project note, `None` for a new one. Per-form state on
+    /// `AppState::panels.project_config`, keyed by tab id.
+    ProjectConfig { source_note: Option<String> },
     /// ZIM viewer: an offline `.zim` archive (e.g. a Wikipedia export)
     /// rendered as HTML via the `hiker-htmlview` renderer. `zim_path`
     /// is the archive's vault-relative path; `article` is the currently
@@ -361,6 +369,13 @@ impl TabKind {
             TabKind::Changes => "Changes".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
+            TabKind::CodeGraph { project_path } => {
+                format!("Code graph · {}", path_basename(project_path))
+            }
+            TabKind::ProjectConfig { source_note } => match source_note {
+                Some(p) => format!("Project · {}", path_basename(p)),
+                None => "New project".to_string(),
+            },
             TabKind::ZimView { zim_path, .. } => {
                 format!("ZIM · {}", path_basename(zim_path))
             }
@@ -401,6 +416,8 @@ impl TabKind {
             TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::CodeGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::ProjectConfig { .. } => icons::ICONS.image(crate::icons::Icon::Wrench),
             // Offline encyclopedia archive — the compass "go read out
             // there, but cached" reads closest in the icon set.
             TabKind::ZimView { .. } => icons::ICONS.image(crate::icons::Icon::Compass),

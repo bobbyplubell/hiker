@@ -13,8 +13,9 @@
 //! — the app, which owns the menu primitive, builds the menus.
 
 /// What the user chose from a node card's context menu. Applied by the widget in
-/// its `EditOp` / undo pipeline (`Delete`) or by mutating the card's view state
-/// (the zoom verbs). status: ctxmenu-canvas
+/// its `EditOp` / undo pipeline (`Delete`), by mutating the card's view state
+/// (the zoom verbs), or reported as a host request (`OpenInNewTab`).
+/// status: ctxmenu-canvas
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeMenuAction {
     /// Increase the card's content zoom one step.
@@ -23,8 +24,29 @@ pub enum NodeMenuAction {
     ZoomOut,
     /// Restore the card's content zoom to 1.0.
     ResetZoom,
+    /// Open the node's target (a File node's referenced file, a Link node's URL)
+    /// in a NEW host tab, reported as [`CanvasResponse::request_open_in_new_tab`].
+    /// The widget itself stays content-display-only; opening is the host's job.
+    /// Only offered (enabled) when the node has an openable target — see
+    /// [`NodeOpenTarget`]. status: canvas-open-in-new-tab
+    OpenInNewTab,
     /// Remove the node (and its incident edges) via `EditOp::RemoveNode`.
     Delete,
+}
+
+/// Whether a node has a target the host can open, used to enable / disable the
+/// "Open in new tab" menu item per node kind. The widget resolves this from the
+/// right-clicked node's kind and hands it to [`CanvasMenuRenderer::node_menu`];
+/// the host greys the item (with a reason) when [`NodeOpenTarget::None`].
+/// status: canvas-open-in-new-tab
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NodeOpenTarget {
+    /// A File node referencing a non-empty path, or a Link node with a non-empty
+    /// URL: "Open in new tab" is enabled.
+    Openable,
+    /// A Text or Group node (or a File/Link node with an empty target): nothing
+    /// to open, so the item is disabled.
+    None,
 }
 
 /// What the user chose from an edge's context menu. status: ctxmenu-canvas
@@ -68,7 +90,9 @@ pub enum EmptyMenuAction {
 /// effect), so `&mut egui::Ui` is all the host needs. status: ctxmenu-canvas
 pub trait CanvasMenuRenderer {
     /// Draw the node card's context menu and return the chosen action, if any.
-    fn node_menu(&mut self, ui: &mut egui::Ui) -> Option<NodeMenuAction>;
+    /// `target` describes whether the right-clicked node has an openable target,
+    /// so the host can enable / disable the "Open in new tab" item accordingly.
+    fn node_menu(&mut self, ui: &mut egui::Ui, target: NodeOpenTarget) -> Option<NodeMenuAction>;
     /// Draw an edge's context menu and return the chosen action, if any.
     fn edge_menu(&mut self, ui: &mut egui::Ui) -> Option<EdgeMenuAction>;
     /// Draw the empty-canvas context menu and return the chosen action, if any.

@@ -35,71 +35,58 @@ impl AppState {
                 let full = ui.max_rect();
                 let controls_left = full.right() - CONTROLS_WIDTH;
 
-                // Right: OS-style window controls.
-                window_controls(ui, ctx, full);
+                // Drag the window by the whole strip — sensed FIRST, so it sits
+                // UNDER every button/box added below and only catches the pixels
+                // none of them claim (the egui custom-window-frame idiom). This
+                // replaces the old "carve empty gaps between widgets" model,
+                // which left no draggable region — and lost the controls under
+                // them — whenever the toolbar grew wide enough to fill the strip
+                // (`left_to_right` doesn't wrap). Double-click toggles maximize;
+                // pointer-down starts a 1:1 drag.
+                let drag = ui.interact(
+                    full,
+                    ui.id().with("titlebar-drag-bg"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.double_clicked() {
+                    let max = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!max));
+                } else if drag.is_pointer_button_down_on() {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
 
-                // Left: the first top toolbar's actions, packed left.
+                // Left: the first top toolbar's actions, packed left. Clip the
+                // sublayout to its allotted rect: egui's `left_to_right` doesn't
+                // wrap or clip, so a head wide enough to overflow `controls_left`
+                // would otherwise paint over (and steal clicks from) the window
+                // controls — a cause of the "controls go missing" report.
                 let left = egui::Rect::from_min_max(
                     full.min,
                     egui::pos2(controls_left, full.bottom()),
                 );
-                let toolbar = ui.scope_builder(
+                ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(left)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| self.render_top_bar_inline(ui),
+                    |ui| {
+                        ui.set_clip_rect(left.intersect(ui.clip_rect()));
+                        self.render_top_bar_inline(ui)
+                    },
                 );
-                // Head ends at `head_right`; the tail (sidebar toggles)
-                // starts at `tail_left`, right-aligned next to the controls.
-                let (head_right, tail_left) =
-                    toolbar.inner.unwrap_or((full.left(), controls_left));
 
-                // Center: command center.
-                let cc = show_command_center.then(|| crate::command_center::command_center_rect(full));
+                // Center: command center (its own click sense, drawn over the
+                // drag strip so a click opens the palette rather than dragging).
                 if show_command_center {
                     self.command_center(ui, full);
                 }
 
-                // Drag zones: only the empty gaps between the head, command
-                // center, and tail — never over a button — so no click is
-                // swallowed. Pointer-down initiated for 1:1 tracking (the
-                // lapce / VSCode no-drag model).
-                let pad = 4.0;
-                let gaps: [egui::Rect; 2] = match cc {
-                    Some(cc) => [
-                        egui::Rect::from_min_max(
-                            egui::pos2(head_right + pad, full.top()),
-                            egui::pos2(cc.left() - pad, full.bottom()),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::pos2(cc.right() + pad, full.top()),
-                            egui::pos2(tail_left - pad, full.bottom()),
-                        ),
-                    ],
-                    None => [
-                        egui::Rect::from_min_max(
-                            egui::pos2(head_right + pad, full.top()),
-                            egui::pos2(tail_left - pad, full.bottom()),
-                        ),
-                        egui::Rect::NOTHING,
-                    ],
-                };
-                for (i, gap) in gaps.into_iter().enumerate() {
-                    if gap.width() < 1.0 {
-                        continue;
-                    }
-                    let resp = ui.interact(
-                        gap,
-                        ui.id().with(("titlebar-drag", i)),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if resp.double_clicked() {
-                        let max = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
-                        ctx.send_viewport_cmd(ViewportCommand::Maximized(!max));
-                    } else if resp.is_pointer_button_down_on() {
-                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
-                }
+                // Right: OS-style window controls. Drawn LAST so they paint over
+                // (and take input priority over) anything that overlaps the
+                // trailing edge — a centered command center on a narrow window,
+                // or any toolbar bleed — instead of vanishing beneath it. This is
+                // what the "buttons sit above the titlebar" intent requires:
+                // same-layer z-order is call order, so they must come last.
+                window_controls(ui, ctx, full);
             });
     }
 }

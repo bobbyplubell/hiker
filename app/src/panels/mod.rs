@@ -9,6 +9,8 @@ pub mod changes;
 pub mod command_palette;
 pub mod cluster_graph;
 pub mod cluster_thumbnail;
+pub mod code_graph;
+pub mod project_config;
 pub mod board;
 pub mod boards_index;
 pub mod canvas;

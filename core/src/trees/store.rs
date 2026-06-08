@@ -558,6 +558,63 @@ impl Db {
         Ok(id)
     }
 
+    /// Create a new tree `.md` already carrying its full node set, in a
+    /// SINGLE atomic op-log write. This is the create path the cluster-review
+    /// Confirm uses: the alternative `insert_tree` (empty `nodes: []`) →
+    /// `insert_nodes` (populated block) two-step leaves a momentary
+    /// empty-nodes document on disk and lands the nodes as an op-log
+    /// *diff* of the empty→full frontmatter — a span computation that has
+    /// corrupted the `nodes:` block for some node sets, surfacing as a tree
+    /// that reloads with no nodes. Writing the doc whole sidesteps both: the
+    /// create op carries the final content verbatim (no diff), and disk is
+    /// never observably empty. Centroids still land in `index.db` exactly as
+    /// `insert_nodes` does. status: cluster-review-tab-confirm-single-path
+    pub fn insert_tree_with_nodes(
+        &self,
+        t: TreeInsert,
+        nodes: &[NodeInsert],
+    ) -> Result<super::types::TreeId, Error> {
+        let id = t.id.unwrap_or_else(crate::store::dto::new_id);
+        let dir = self
+            .new_tree_dir
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_else(|_| DEFAULT_TREE_DIR.to_string());
+        let folder = dir.trim_end_matches('/');
+        let path = if folder.is_empty() {
+            format!("{id}.md")
+        } else {
+            format!("{folder}/{id}.md")
+        };
+        let doc = TreeDoc {
+            meta: TreeRow {
+                id: id.clone(),
+                name: t.name,
+                source: t.source,
+                state: t.state,
+                scope_json: t.scope_json,
+                method_json: t.method_json,
+                created_at_ms: now_ms(),
+                vault_snapshot: t.vault_snapshot,
+            },
+            nodes: nodes.iter().map(node_from_insert).collect(),
+            path,
+            body: BODY_STUB.to_string(),
+            extra_fm: serde_yml::Mapping::new(),
+            note_ids: HashMap::new(),
+        };
+        self.save(&doc)?;
+        let mut store = self.centroids.lock().map_err(|_| Error::Poisoned)?;
+        for n in nodes {
+            if let Some(c) = &n.centroid {
+                store
+                    .put_cluster_centroid(&id, &n.node_id, c)
+                    .map_err(|e| Error::Store(e.to_string()))?;
+            }
+        }
+        Ok(id)
+    }
+
     /// Look up one tree's metadata. `None` if it doesn't exist.
     pub fn get_tree(&self, tree_id: &str) -> Result<Option<TreeRow>, Error> {
         match self.load(tree_id) {

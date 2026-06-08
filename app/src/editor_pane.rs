@@ -180,6 +180,31 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
     }
 }
 
+/// Open `rel` in a brand-NEW tab, even when an identical tab is already open —
+/// the "Open in new tab" verb (e.g. the canvas node context menu). Kind-routed
+/// targets (`.canvas`, `.csv`, cluster-tree `.md`) are singleton-per-target
+/// views with no second-instance concept, so they fall back to the shared
+/// find-or-open routing in [`open_file`]; a plain buffer file always gets a fresh
+/// sticky tab here rather than focusing the existing one. status: canvas-open-in-new-tab
+pub fn open_file_new_tab(state: &mut AppState, rel: &str) {
+    let routed = rel.ends_with(".canvas")
+        || rel.ends_with(".csv")
+        || (rel.ends_with(".md") && state.vault_session.services.trees.tree_id_at_path(rel).is_some());
+    if routed {
+        open_file(state, rel, /* sticky */ true);
+        return;
+    }
+    if !state.session.nav.locked {
+        nav_push(state, rel);
+    }
+    if !ensure_vault_buffer_loaded(state, rel) {
+        return;
+    }
+    let tab_id = state.next_tab_id();
+    state.session.tabs.push(Tab::new(tab_id, TabKind::vault_buffer(rel.to_string()), /* sticky */ true));
+    state.session.active_tab = Some(tab_id);
+}
+
 /// DRIVE seam for linked viz tabs: open `rel` as a buffer tab placed in the
 /// workbench editor `group`, rather than the viz tab's own preview slot. A
 /// graph/canvas tab with `link.target == Some(Group(g))` routes its

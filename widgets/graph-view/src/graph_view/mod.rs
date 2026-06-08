@@ -47,9 +47,11 @@ fn poincare_disk(pane_rect: egui::Rect, zoom: f32) -> (egui::Pos2, f32) {
     (pane_rect.center(), radius)
 }
 
-/// Scroll-zoom clamp for the locked Poincaré disk radius.
+/// Scroll-zoom clamp for the locked Poincaré disk radius. The max is generous
+/// so a dense graph can be magnified enough to read a recentred region (matches
+/// the canvas Poincaré zoom range).
 const POINCARE_ZOOM_MIN: f32 = 0.3;
-const POINCARE_ZOOM_MAX: f32 = 5.0;
+const POINCARE_ZOOM_MAX: f32 = 25.0;
 
 /// Persistent per-view engine state: pan/zoom, node positions, the active
 /// layout + its background worker, the configurable [`Style`], the common

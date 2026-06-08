@@ -29,6 +29,7 @@
 //! remote edit never disturbs them.
 //! status: canvas-crate-split
 
+pub mod cardcache;
 pub mod content;
 pub mod menu;
 pub mod paint;

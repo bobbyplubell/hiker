@@ -3409,6 +3409,7 @@ dependencies = [
  "hiker-charts-core",
  "hiker-charts-gui",
  "hiker-charts-plotters",
+ "hiker-code",
  "hiker-core",
  "hiker-diagram",
  "hiker-git",
@@ -3420,6 +3421,7 @@ dependencies = [
  "hiker-mcp-server",
  "hiker-mermaid",
  "hiker-projection",
+ "hiker-projects",
  "hiker-sync",
  "hiker-theme",
  "hiker-wavedrom",
@@ -3436,6 +3438,7 @@ dependencies = [
  "serde_yml",
  "similar",
  "smol_str 0.3.6",
+ "spec-engine",
  "tempfile",
  "thiserror 1.0.69",
  "time",
@@ -3493,6 +3496,15 @@ version = "0.0.0"
 dependencies = [
  "hiker-core",
  "ulid",
+]
+
+[[package]]
+name = "hiker-code"
+version = "0.0.0"
+dependencies = [
+ "protobuf",
+ "scip",
+ "spec-engine",
 ]
 
 [[package]]
@@ -3568,10 +3580,12 @@ dependencies = [
  "egui",
  "egui_kittest",
  "graph-widgets",
+ "hiker-code",
  "hiker-graph",
  "hiker-projection",
  "hiker-theme",
  "image",
+ "spec-engine",
 ]
 
 [[package]]
@@ -3674,6 +3688,14 @@ dependencies = [
 [[package]]
 name = "hiker-projection"
 version = "0.1.0"
+
+[[package]]
+name = "hiker-projects"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_yml",
+]
 
 [[package]]
 name = "hiker-sync"
@@ -6886,6 +6908,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "puffin"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7810,6 +7852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scip"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f0cc97469a1eef9e457bd6e935c8727d2e18c59489f06cd98207a6439a6498c"
+dependencies = [
+ "protobuf",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8404,6 +8455,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f58d7b0190c7f12df7e8be6b79767a0836059159811b869d5ab55721fe14d0"
 
 [[package]]
+name = "spec-engine"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "spirv"
 version = "0.3.0+sdk-1.3.268.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8812,6 +8871,19 @@ dependencies = [
  "pkg-config",
  "toml",
  "version-compare",
+]
+
+[[package]]
+name = "table-snapshot"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "editor-core",
+ "editor-egui",
+ "editor-view",
+ "egui",
+ "egui_kittest",
+ "image",
 ]
 
 [[package]]

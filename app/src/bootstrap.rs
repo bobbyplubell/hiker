@@ -983,6 +983,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         vault_state: crate::vault_view::State::default(),
         trash_state: crate::trash::State,
         canvases_activity_state: crate::canvas_activity::State,
+        projects_activity_state: crate::projects_activity::State,
         chat_state: crate::chat::state::State::default(),
         // Per-vault activity registry: built-ins (Clusters in v1) plus
         // (Phase 3) plugin-derived activities. `feature-registry`.

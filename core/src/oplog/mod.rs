@@ -458,6 +458,32 @@ impl OpLog {
         })
     }
 
+    /// Re-materialize `accepted` to disk IF the `.md`/`.canvas` is missing there,
+    /// returning whether a write happened. The op-log's `accepted` is canonical
+    /// (`op-log-disk-canonical`), so on a save whose op-log content is unchanged
+    /// (`commit_working` was a no-op) but whose file has since vanished from disk
+    /// (deleted/moved out-of-band after an autosave), this restores the file the
+    /// user expects their save to produce. A no-op when the file is present (the
+    /// canonical content already round-tripped through `commit_text_edit`), or
+    /// when the doc is tombstoned (a real delete must not be resurrected here).
+    ///
+    /// status: op-log-disk-canonical
+    pub fn ensure_on_disk(&self, doc_id: &str) -> Result<bool, Error> {
+        self.locked(|inner| {
+            let state = Self::ensure_loaded(&self.oplog_dir, inner, doc_id)?;
+            let materialized = state.accepted();
+            if materialized.tombstone {
+                return Ok(false);
+            }
+            let abs = vault_root_of(&self.oplog_dir).join(doc_id);
+            if abs.exists() {
+                return Ok(false);
+            }
+            write_md_file(&self.oplog_dir, Some(doc_id), &materialized)?;
+            Ok(true)
+        })
+    }
+
     /// A document's accepted-op history, newest-first (the version list behind
     /// the snapshot dropdown / per-file history). Thin projection over
     /// [`query_metadata`] restricted to `status = Accepted`.

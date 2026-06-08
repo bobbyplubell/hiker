@@ -307,47 +307,70 @@ pub fn rebuild_editor_layers(
             .unwrap_or(0);
         let dpr_bits = dpr.to_bits() as u64;
         let font_bits = font_px.to_bits() as u64;
+        let render_base = mix(mix(theme_fg, dpr_bits), font_bits);
+        // The widget layers depend on the selection ONLY through the REVEAL
+        // decision: a span whose byte range the cursor sits in / a selection
+        // overlaps shows its source instead of its render. So instead of the
+        // exact selection (`sel_fp`, which busts the cache on every caret tick),
+        // key on a per-family *reveal* fingerprint — a hash of which spans are
+        // currently revealed. A caret move within prose (or within one already-
+        // revealed fence) leaves every reveal fingerprint unchanged → the layer
+        // cache-hits and never re-scans / re-emits the whole document. Entering
+        // or leaving a fence flips that family's fingerprint → only that layer
+        // rebuilds (`widget-render-cache`). Computing the fingerprint reads the
+        // per-doc span cache (refilled only on an edit), so the common case is a
+        // few range comparisons, not a doc rescan.
+        //
         // NOT keyed on the viewport (`vp_fp`): these layers emit the WHOLE
-        // document, so a pure scroll must NOT invalidate them. Keying on `vp_fp`
-        // and emitting viewport-scoped would re-Arc the layer every scroll frame
-        // (new `content_id` → `geometry_epoch` bump → full minimap re-raster +
-        // prewrap rescan, and a per-diagram PNG re-decode) even though nothing
-        // about the rendered widgets changed. The renders themselves are cached
-        // (in-memory + disk), so emitting whole-doc on a doc/selection change is
-        // cheap (`widget-render-cache`).
-        let render_fp = mix(
-            mix(doc_id, sel_fp),
-            mix(mix(theme_fg, dpr_bits), font_bits),
+        // document, so a pure scroll must NOT invalidate them (a `vp_fp` key
+        // would re-Arc every scroll frame → minimap re-raster + prewrap rescan +
+        // per-diagram PNG re-decode). The renders themselves are cached
+        // (in-memory + disk), so emitting whole-doc on a reveal flip is cheap.
+        cache.widget_spans.ensure(doc_id, editor);
+        let spans = &cache.widget_spans;
+        let math_fp = mix(
+            mix(
+                reveal_fp(&spans.math_inline, |r| {
+                    widgets::line_active(editor, r) || widgets::selection_overlaps(editor, r)
+                }),
+                reveal_fp(&spans.math_display, |r| reveal(editor, r)),
+            ),
+            render_base,
         );
+        let mermaid_fp = mix(reveal_fp(&spans.mermaid, |r| reveal(editor, r)), render_base);
+        let wavedrom_fp = mix(reveal_fp(&spans.wavedrom, |r| reveal(editor, r)), render_base);
+        let table_fp = mix(reveal_fp(&spans.table, |r| reveal(editor, r)), render_base);
+        let chart_fp = mix(reveal_fp(&spans.chart, |r| reveal(editor, r)), render_base);
         let dpr = *dpr;
         let font_px = *font_px;
-        cached!(math_widget, render_fp,
+        cached!(math_widget, mix(doc_id, math_fp),
             || widgets::math_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
-        // Rendered Mermaid diagram widgets (`widget-mermaid-render`). Same gate,
-        // same render fingerprint as the math-widget layer; emits `hide` lines +
-        // a `BlockWidget` per fence so it goes through `push_with_heights`.
-        cached!(mermaid_widget, render_fp,
+        // Rendered Mermaid diagram widgets (`widget-mermaid-render`). Same gate
+        // as the math-widget layer; keyed on the mermaid reveal fingerprint so a
+        // math/table reveal flip doesn't bust it. Emits `hide` lines + a
+        // `BlockWidget` per fence so it goes through `push_with_heights`.
+        cached!(mermaid_widget, mix(doc_id, mermaid_fp),
             || widgets::mermaid_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
         // Rendered WaveDrom diagram widgets (`widget-wavedrom-render`). Same
-        // gate + render fingerprint as math / mermaid; emits `hide` lines + a
+        // gate + per-family reveal key as mermaid; emits `hide` lines + a
         // `BlockWidget` per fence, so it goes through `push_with_heights`.
-        cached!(wavedrom_widget, render_fp,
+        cached!(wavedrom_widget, mix(doc_id, wavedrom_fp),
             || widgets::wavedrom_widget_decorations(editor, theme, None, font_px, dpr, diagram_cache),
             heights);
         // Natively-painted pipe-table widgets (`widget-table-render`). Same gate
-        // + render fingerprint as math / mermaid; emits `hide` lines + a
-        // `BlockWidget` per table (painted from a `paint_list`, no raster), so it
-        // goes through `push_with_heights`. status: widget-table-render
-        cached!(table_widget, render_fp,
+        // + per-family reveal key; emits `hide` lines + a `BlockWidget` per table
+        // (painted from a `paint_list`, no raster), so it goes through
+        // `push_with_heights`. status: widget-table-render
+        cached!(table_widget, mix(doc_id, table_fp),
             || widgets::tables::table_widget_decorations(editor, theme, None, font_px, dpr),
             heights);
-        // Rendered chart widgets (`widget-chart-render`). Same gate + render
-        // fingerprint as math / mermaid; emits `hide` lines + a `BlockWidget`
-        // per ```chart fence, so it goes through `push_with_heights`. The
-        // external-`data:` resolver rides in `chart_resolver` (note-bound).
-        cached!(chart_widget, render_fp,
+        // Rendered chart widgets (`widget-chart-render`). Same gate + per-family
+        // reveal key; emits `hide` lines + a `BlockWidget` per ```chart fence, so
+        // it goes through `push_with_heights`. The external-`data:` resolver
+        // rides in `chart_resolver` (note-bound).
+        cached!(chart_widget, mix(doc_id, chart_fp),
             || widgets::chart::widget_decorations(editor, theme, None, dpr, diagram_cache, chart_resolver),
             heights);
     }
@@ -422,6 +445,36 @@ pub fn rebuild_editor_layers(
     cached!(bracket_match, mix(doc_id, sel), || {
         bracket_match_decorations(editor, DEFAULT_BRACKETS, 5000)
     }, vp_scoped);
+}
+
+/// The block-widget reveal predicate shared by every diagram family except
+/// inline math: the span shows its source (no in-place widget) when the cursor
+/// sits anywhere inside its byte range or any selection overlaps it. Mirrors the
+/// providers in `widgets/mod.rs` exactly, so a reveal flip the fingerprint sees
+/// is the same flip that changes the layer's output.
+fn reveal(state: &editor_core::state::Editor, range: &std::ops::Range<usize>) -> bool {
+    widgets::cursor_inside(state, range) || widgets::selection_overlaps(state, range)
+}
+
+/// Order-independent fingerprint of the *revealed* subset of `spans`. XOR-mixes
+/// each revealed span's `[start, end)` (the same XOR-mix shape as `sel_fp` /
+/// `folds_id`) so the hash changes iff the set of revealed spans changes — the
+/// exact condition under which a widget layer's emitted decorations differ. A
+/// caret move that reveals/unreveals nothing leaves it stable, so the layer
+/// cache-hits (`widget-render-cache`).
+fn reveal_fp(
+    spans: &[std::ops::Range<usize>],
+    mut revealed: impl FnMut(&std::ops::Range<usize>) -> bool,
+) -> u64 {
+    let mut h: u64 = 0;
+    for r in spans {
+        if revealed(r) {
+            let packed = (r.start as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (r.end as u64).rotate_left(32);
+            h ^= packed;
+        }
+    }
+    h
 }
 
 /// Combine multiple u64 values into a single fingerprint via splitmix-style

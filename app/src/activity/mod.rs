@@ -148,6 +148,7 @@ impl AppCtx for crate::state::AppState {
             "search" => &mut app.search_state,
             "trash" => &mut app.trash_state,
             "canvases" => &mut app.canvases_activity_state,
+            "projects" => &mut app.projects_activity_state,
             "chat" => &mut app.chat_state,
             _ => {
                 tracing::warn!(
@@ -198,6 +199,7 @@ pub fn builtin_activities() -> Vec<Arc<dyn Activity<dyn AppCtx>>> {
         Arc::new(crate::trails::Trails) as Arc<dyn Activity<dyn AppCtx>>,
         Arc::new(crate::vault_view::Vault) as Arc<dyn Activity<dyn AppCtx>>,
         Arc::new(crate::canvas_activity::CanvasActivity) as Arc<dyn Activity<dyn AppCtx>>,
+        Arc::new(crate::projects_activity::ProjectsActivity) as Arc<dyn Activity<dyn AppCtx>>,
         Arc::new(crate::context::Context) as Arc<dyn Activity<dyn AppCtx>>,
         Arc::new(crate::search::Search) as Arc<dyn Activity<dyn AppCtx>>,
         Arc::new(crate::trash::Trash) as Arc<dyn Activity<dyn AppCtx>>,
@@ -221,8 +223,8 @@ mod registry_tests {
         assert_eq!(
             ids,
             vec![
-                "files", "clusters", "trails", "vault", "canvases", "context", "search", "trash",
-                "chat"
+                "files", "clusters", "trails", "vault", "canvases", "projects", "context",
+                "search", "trash", "chat"
             ]
         );
     }

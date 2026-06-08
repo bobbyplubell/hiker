@@ -12,6 +12,7 @@ mod buffer;
 mod buffer_view;
 mod bootstrap;
 mod canvas_activity;
+mod projects_activity;
 mod charts;
 mod chat;
 mod clusters;

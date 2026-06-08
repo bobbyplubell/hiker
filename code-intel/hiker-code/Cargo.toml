@@ -1,0 +1,10 @@
+[package]
+name = "hiker-code"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+spec-engine = { path = "../spec-engine" }
+scip = "0.6"              # SCIP-consumer adapter: reads .scip protobuf indexes
+protobuf = "=3.7.2"       # matches scip's pinned rust-protobuf (for Message::parse_from_bytes)

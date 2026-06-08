@@ -23,3 +23,7 @@ hiker-projection = { workspace = true }
 egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }
 eframe = { version = "0.32", features = ["glow", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# The code-intelligence adapter, for the `code_graph_snapshot` example: it proves a real
+# `ScipAdapter` → `CodeGraph` renders through this engine's `Source` trait headlessly.
+hiker-code = { workspace = true }
+spec-engine = { workspace = true }

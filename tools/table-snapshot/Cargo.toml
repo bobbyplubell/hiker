@@ -1,0 +1,31 @@
+[package]
+name = "table-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "table-snapshot"
+path = "src/main.rs"
+
+[features]
+default = []
+# Screenshot rendering is OPT-IN, for the same reason as `diff-overlay-snapshot`:
+# `egui_kittest` pulls accesskit, which unifies `egui/accesskit` and breaks
+# `hiker-app`'s `egui-winit` under a `--workspace` build. Gating it keeps this
+# tool out of the default workspace build. Build with `--features screenshot` to
+# emit the PNG (compiles only the editor crates, never hiker-app).
+screenshot = ["dep:egui", "dep:egui_kittest", "dep:editor-view", "dep:editor-egui", "dep:image"]
+
+[dependencies]
+editor-core = { path = "../../editor/editor-core" }
+anyhow.workspace = true
+
+# screenshot-only (see [features].screenshot)
+egui = { workspace = true, optional = true }
+egui_kittest = { version = "0.32", default-features = false, features = ["wgpu"], optional = true }
+editor-view = { path = "../../editor/editor-view", optional = true }
+editor-egui = { path = "../../editor/editor-egui", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }

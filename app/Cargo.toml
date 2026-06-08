@@ -54,6 +54,12 @@ egui_extras.workspace = true
 egui_workbench = { workspace = true, features = ["serde"] }
 graph-widgets.workspace = true
 hiker-graph-view.workspace = true
+# Code-intelligence: the code-graph panel binds a project note's repo source
+# (hiker-projects) to the SCIP adapter (hiker-code) and renders its entity graph
+# through hiker-graph-view. One-way dep: app → hiker-code/hiker-projects → spec-engine.
+spec-engine.workspace = true
+hiker-code.workspace = true
+hiker-projects.workspace = true
 # JSON Canvas editor: the egui-agnostic core (`hiker-canvas`), the egui-free
 # view layer (`canvas-view-core`, for `CreateKind` and friends), and the egui
 # shell (`canvas-view`). The canvas panel glues them to the op-log + tab spine;

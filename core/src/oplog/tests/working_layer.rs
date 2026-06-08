@@ -90,6 +90,52 @@ fn commit_working_folds_into_accepted() {
 }
 
 #[test]
+fn ensure_on_disk_restores_a_file_that_vanished_with_no_pending_edit() {
+    // status: op-log-disk-canonical
+    // Reproduces the reported canvas bug: an autosaved doc's file is removed
+    // from disk out-of-band, then the user presses Ctrl+S. The op-log content
+    // is unchanged so `commit_working` is a no-op — but the user expects the
+    // file back. `ensure_on_disk` re-materializes `accepted` to disk only when
+    // the file is actually missing.
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("a.md", "note", "hello world\n", &Author::User)
+        .unwrap();
+    let path = dir.path().join("a.md");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
+    // No pending edit, file present → nothing to do.
+    assert!(!log.commit_working(&doc_id).unwrap());
+    assert!(!log.ensure_on_disk(&doc_id).unwrap());
+    // The file vanishes out-of-band, then the user saves.
+    std::fs::remove_file(&path).unwrap();
+    assert!(!log.commit_working(&doc_id).unwrap(), "still a no-op at the op-log level");
+    assert!(log.ensure_on_disk(&doc_id).unwrap(), "missing file is rewritten");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
+    // Idempotent: a second save with the file present writes nothing.
+    assert!(!log.ensure_on_disk(&doc_id).unwrap());
+}
+
+#[test]
+fn ensure_on_disk_does_not_resurrect_a_tombstoned_doc() {
+    // status: op-log-disk-canonical
+    // A genuine delete tombstones the doc; `ensure_on_disk` must not write the
+    // file back (that's a real deletion, not an out-of-band file loss).
+    let dir = tempdir().unwrap();
+    let log = OpLog::open(dir.path()).unwrap();
+    let doc_id = log
+        .create_document("a.md", "note", "hello world\n", &Author::User)
+        .unwrap();
+    log.tombstone_document(&doc_id, &Author::User).unwrap();
+    let path = dir.path().join("a.md");
+    // Whatever tombstone left on disk, remove it and confirm a save won't bring
+    // a deleted doc back.
+    let _ = std::fs::remove_file(&path);
+    assert!(!log.ensure_on_disk(&doc_id).unwrap(), "tombstoned doc stays gone");
+    assert!(!path.exists());
+}
+
+#[test]
 fn commit_working_saves_buffer_that_contains_conflict_marker_text() {
     // status: sync-unified-conflict-surface
     // The save path is NOT gated on conflict-marker text: a legitimate note that

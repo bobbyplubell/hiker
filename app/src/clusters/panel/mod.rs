@@ -1233,23 +1233,13 @@ fn confirm(
     };
     let scope_json = serde_json::to_string(&build.scope).unwrap_or_else(|_| "null".into());
     let method_json = serde_json::to_string(&build.method).unwrap_or_else(|_| "null".into());
-    let tree_id = match trees.insert_tree(TreeInsert {
-        id: None,
-        name: name.clone(),
-        source: "review:confirm".to_string(),
-        state: "draft".to_string(),
-        scope_json,
-        method_json,
-        vault_snapshot: None,
-    }) {
-        Ok(tid) => tid,
-        Err(err) => {
-            let pane = self.app.clusters_state.review_panes.entry(tab_id).or_default();
-            pane.confirming = false;
-            self.app.push_toast(format!("insert_tree: {err}"), ToastLevel::Error);
-            return;
-        }
-    };
+    // Build the node rows up front and persist them WITH the tree in one
+    // atomic write. The old `insert_tree` (empty) → `insert_nodes` two-step
+    // landed the nodes as an op-log diff of the empty→full frontmatter, which
+    // could corrupt the `nodes:` block for some node sets — a confirmed tree
+    // would then reload empty (empty graph view / empty canvas export). Writing
+    // the doc whole avoids the diff and the momentary empty-nodes file.
+    // status: cluster-review-tab-confirm-single-path
     let mut inserts = node_inserts(&build.tree);
     if !renamed.is_empty() {
         for ins in inserts.iter_mut() {
@@ -1259,13 +1249,26 @@ fn confirm(
             }
         }
     }
-    if let Err(err) = trees.insert_nodes(&tree_id, &inserts) {
-        let pane = self.app.clusters_state.review_panes.entry(tab_id).or_default();
-        pane.confirming = false;
-        let _ = trees.delete_tree(&tree_id);
-        self.app.push_toast(format!("insert_nodes: {err}"), ToastLevel::Error);
-        return;
-    }
+    let tree_id = match trees.insert_tree_with_nodes(
+        TreeInsert {
+            id: None,
+            name: name.clone(),
+            source: "review:confirm".to_string(),
+            state: "draft".to_string(),
+            scope_json,
+            method_json,
+            vault_snapshot: None,
+        },
+        &inserts,
+    ) {
+        Ok(tid) => tid,
+        Err(err) => {
+            let pane = self.app.clusters_state.review_panes.entry(tab_id).or_default();
+            pane.confirming = false;
+            self.app.push_toast(format!("insert_tree: {err}"), ToastLevel::Error);
+            return;
+        }
+    };
     self.app.clusters_state.selected_tree = Some(tree_id.clone());
     self.app.clusters_state.loaded = false;
     self.app.clusters_state.dirty = true;

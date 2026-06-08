@@ -53,6 +53,116 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    // Reproduction: build a REAL cluster tree (not synthetic NodeInserts),
+    // run it through node_inserts → insert_tree → insert_nodes → list_nodes,
+    // and assert the leaf NOTE nodes survive. This mirrors cluster_review::
+    // confirm with actual build output rather than hand-rolled rows.
+    #[test]
+    fn real_build_confirm_persists_leaf_notes() {
+        use crate::cluster::build::tree as build_tree;
+        use crate::cluster::{
+            BuildError, BuildMethod, BuildScope, NoteInput, Params, SummarizeMode, Summarizer,
+            SummarizeInput, SummaryOutput,
+        };
+        use crate::trees::build_adapter::node_inserts;
+
+        struct Noop;
+        impl Summarizer for Noop {
+            fn summarize(&self, _: SummarizeInput<'_>) -> Result<SummaryOutput, BuildError> {
+                Ok(SummaryOutput {
+                    name: String::new(),
+                    summary: String::new(),
+                    confidence: 0.0,
+                })
+            }
+        }
+
+        // Two well-separated cosine groups so the top-level Leiden cut yields
+        // >= 2 communities (the build aborts with VaultTooSmall otherwise).
+        let mut notes: Vec<NoteInput> = Vec::new();
+        for i in 0..12 {
+            let mut e = vec![0.0_f32; 8];
+            e[0] = 1.0;
+            e[1] = (i as f32) * 0.003;
+            notes.push(NoteInput {
+                id: format!("research/note-{i}.md"),
+                title: format!("note-{i}.md"),
+                summary: String::new(),
+                folder: "research".into(),
+                embedding: e,
+            });
+        }
+        for i in 0..12 {
+            let mut e = vec![0.0_f32; 8];
+            e[1] = 1.0;
+            e[0] = (i as f32) * 0.003;
+            notes.push(NoteInput {
+                id: format!("cooking/recipe-{i}.md"),
+                title: format!("recipe-{i}.md"),
+                summary: String::new(),
+                folder: "cooking".into(),
+                embedding: e,
+            });
+        }
+
+        let built = build_tree(
+            BuildScope::Vault { source_types: Vec::new() },
+            BuildMethod::Cluster {
+                params: Params {
+                    summarize: SummarizeMode::None,
+                    ..Params::default()
+                },
+            },
+            &notes,
+            &Noop,
+        )
+        .expect("build");
+        let leaf_members: usize = built
+            .tree
+            .levels
+            .first()
+            .map(|l| l.iter().map(|c| c.members.len()).sum())
+            .unwrap_or(0);
+        assert!(leaf_members > 0, "build produced no leaf members");
+
+        let inserts = node_inserts(&built.tree);
+        let leaf_inserts = inserts.iter().filter(|n| n.note_id.is_some()).count();
+        assert!(
+            leaf_inserts > 0,
+            "node_inserts produced no leaf note rows for a {leaf_members}-member tree"
+        );
+
+        // Match cluster_review::confirm exactly: the real serialized
+        // scope/method ride the SAME frontmatter as the nodes block.
+        let scope_json = serde_json::to_string(&built.scope).unwrap();
+        let method_json = serde_json::to_string(&built.method).unwrap();
+
+        let (_d, trees) = open_tmp();
+        // Single atomic write (the confirm path): tree + nodes together, no
+        // empty-nodes intermediate and no empty→full op-log diff.
+        let tree_id = trees
+            .insert_tree_with_nodes(
+                TreeInsert {
+                    id: None,
+                    name: "real-build".into(),
+                    source: "review:confirm".into(),
+                    state: "draft".into(),
+                    scope_json,
+                    method_json,
+                    vault_snapshot: None,
+                },
+                &inserts,
+            )
+            .unwrap();
+
+        let reloaded = trees.list_nodes(&tree_id).unwrap();
+        let reloaded_leaves = reloaded.iter().filter(|n| n.note_path.is_some()).count();
+        assert_eq!(
+            reloaded_leaves, leaf_inserts,
+            "leaf notes lost on reload: inserted {leaf_inserts}, got {reloaded_leaves}"
+        );
+    }
+
     fn open_tmp() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());

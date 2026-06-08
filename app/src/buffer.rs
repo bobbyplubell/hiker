@@ -237,6 +237,33 @@ pub struct CachedDeco {
     pub result: Set,
 }
 
+/// Memo of the diagram-widget span byte-ranges for one document revision, keyed
+/// on `doc_id` (the rope `content_id`, which changes only on an edit). The
+/// decoration rebuild uses these ranges to compute a per-family *reveal*
+/// fingerprint — a hash of which spans the selection currently reveals — so the
+/// whole-document widget layers cache-hit on a caret move that doesn't flip any
+/// span's reveal state. Detecting the spans is a pure byte scan over the doc; we
+/// hold it here so a caret move that doesn't edit the text never re-scans
+/// (`widget-render-cache`). Inline vs display math are split because their reveal
+/// predicates differ (inline reveals per-line, display per byte-range).
+#[derive(Default)]
+pub struct WidgetSpanCache {
+    /// The `doc_id` these ranges were scanned from; `None` until first filled.
+    pub doc_id: Option<u64>,
+    /// `$…$` inline math byte ranges (line-active reveal predicate).
+    pub math_inline: Vec<std::ops::Range<usize>>,
+    /// `$$…$$` display math byte ranges (cursor-inside reveal predicate).
+    pub math_display: Vec<std::ops::Range<usize>>,
+    /// ```` ```mermaid ```` fence byte ranges.
+    pub mermaid: Vec<std::ops::Range<usize>>,
+    /// ```` ```wavedrom ```` fence byte ranges.
+    pub wavedrom: Vec<std::ops::Range<usize>>,
+    /// GFM pipe-table byte ranges.
+    pub table: Vec<std::ops::Range<usize>>,
+    /// ```` ```chart ```` fence byte ranges.
+    pub chart: Vec<std::ops::Range<usize>>,
+}
+
 /// Cache for paint-only decoration providers that walk the whole document
 /// (or large viewport ranges) and would otherwise re-run every frame even
 /// when none of their inputs changed.
@@ -288,6 +315,49 @@ pub struct DecorationCache {
     pub bracket_match: Option<CachedDeco>,
     pub special_chars: Option<CachedDeco>,
     pub chunk_boundaries: Option<CachedDeco>,
+    /// Diagram-widget span byte-ranges for the current doc revision, used to
+    /// derive the per-family reveal fingerprint that keys the widget layers
+    /// (`widget-render-cache`). Refilled only on an edit (doc_id change).
+    pub widget_spans: WidgetSpanCache,
+}
+
+impl WidgetSpanCache {
+    /// Ensure the cached span ranges match `doc_id`, re-scanning the document
+    /// only when it has changed since the last fill. Each scan is a pure
+    /// byte-range walk (`editor_md::*_spans`) over the whole doc; on a caret move
+    /// (same `doc_id`) this is a no-op, so the reveal fingerprint the rebuild
+    /// derives from these ranges costs nothing on the common path.
+    pub fn ensure(&mut self, doc_id: u64, state: &Editor) {
+        if self.doc_id == Some(doc_id) {
+            return;
+        }
+        let math = editor_md::equations::math_spans(state, None);
+        self.math_inline.clear();
+        self.math_display.clear();
+        for s in math {
+            match s.kind {
+                editor_md::equations::MathKind::Inline => self.math_inline.push(s.byte_range),
+                editor_md::equations::MathKind::Display => self.math_display.push(s.byte_range),
+            }
+        }
+        self.mermaid = editor_md::diagrams::mermaid_spans(state, None)
+            .into_iter()
+            .map(|s| s.byte_range)
+            .collect();
+        self.wavedrom = editor_md::diagrams::wavedrom_spans(state, None)
+            .into_iter()
+            .map(|s| s.byte_range)
+            .collect();
+        self.table = editor_md::tables::table_spans(state, None)
+            .into_iter()
+            .map(|s| s.byte_range)
+            .collect();
+        self.chart = editor_md::diagrams::chart_spans(state, None)
+            .into_iter()
+            .map(|s| s.byte_range)
+            .collect();
+        self.doc_id = Some(doc_id);
+    }
 }
 
 impl DecorationCache {

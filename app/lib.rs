@@ -50,6 +50,8 @@ pub(crate) mod buffer_view;
 pub(crate) mod bootstrap;
 #[path = "src/canvas_activity/mod.rs"]
 pub(crate) mod canvas_activity;
+#[path = "src/projects_activity/mod.rs"]
+pub(crate) mod projects_activity;
 #[path = "src/charts.rs"]
 pub(crate) mod charts;
 #[path = "src/chat/mod.rs"]

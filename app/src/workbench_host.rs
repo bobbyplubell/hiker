@@ -729,6 +729,12 @@ impl<'a> HikerWbBehavior<'a> {
                 clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
+            TabKind::CodeGraph { project_path } => {
+                panels::code_graph::show(ui, app, tab_id, project_path)
+            }
+            TabKind::ProjectConfig { source_note } => {
+                panels::project_config::show(ui, app, tab_id, source_note.as_deref())
+            }
             TabKind::ZimView { zim_path, article } => {
                 panels::zim::show(ui, app, tab_id, zim_path, article)
             }
@@ -759,6 +765,8 @@ const fn tab_kind_name(kind: &TabKind) -> &'static str {
         TabKind::Changes => "tab:Changes",
         TabKind::ClusterReview { .. } => "tab:ClusterReview",
         TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
+        TabKind::CodeGraph { .. } => "tab:CodeGraph",
+        TabKind::ProjectConfig { .. } => "tab:ProjectConfig",
         TabKind::ZimView { .. } => "tab:ZimView",
         TabKind::ChartBuilder { .. } => "tab:ChartBuilder",
     }

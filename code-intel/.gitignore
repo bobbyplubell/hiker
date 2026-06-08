@@ -1,0 +1,4 @@
+/target
+*.scip
+.venv/
+__pycache__/

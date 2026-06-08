@@ -98,6 +98,9 @@ pub struct AppState {
     /// read fresh from disk — so a zero-field marker keeps the registry
     /// `AppCtx::session` seam uniform. status: feature-state-ownership
     pub canvases_activity_state: crate::canvas_activity::State,
+    /// Per-activity state marker for the Projects sidebar (listing is read fresh from the store's
+    /// frontmatter index each frame). status: code-graph-view-source
+    pub projects_activity_state: crate::projects_activity::State,
     /// Per-activity state for the migrated docked `chat` sidebar: the
     /// in-memory session registry + the lazy-discover gate. Relocated
     /// off `Session::chat` / `Session::chat_discovered`.
@@ -401,6 +404,11 @@ pub struct PanelStates {
     pub chart_builders: HashMap<String, crate::panels::charts_tab::Pane>,
     pub graph: Option<crate::panels::graph::VaultPanel>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterView>,
+    /// Per-project-note code-graph view state (the bound SCIP adapter + render engine + toggles).
+    /// Keyed by the project-note path. status: code-graph-view-source
+    pub code_graph: HashMap<String, crate::panels::code_graph::CodeGraphView>,
+    /// Per-tab project-config form state (name + source rows). Keyed by tab id.
+    pub project_config: HashMap<TabId, crate::panels::project_config::ProjectConfigForm>,
     pub home: crate::panels::home::State,
     /// Sync page local UI state — the per-fork "view diff" cache. [sync-fork-diff]
     pub sync: crate::panels::sync::State,

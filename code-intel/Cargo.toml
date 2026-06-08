@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "spec-engine",
+    "hiker-code",
+    "code-cli",
+]
+# `hiker-projects` used to live here but is now a top-level hiker crate (decoupled from code
+# intelligence — it only produces source descriptors). `code-cli` still uses it via a path dep
+# (../../../hiker-projects); the repo→adapter binding is done in the consumer, not in hiker-projects.
+
+# Standalone sub-workspace for the code-intelligence + spec-linking engine, now living **inside the
+# hiker repo** (references/hiker/code-intel). It is a self-contained workspace, EXCLUDED from the
+# hiker root workspace — the same pattern hiker uses for `hiker-crawler`/`editor`/`hiker-render`
+# (standalone workspace roots consumed by the app as path deps, never as members). This keeps the
+# UI-free engine buildable/QA-able on its own while hiker's UI submodules are absent.
+#
+# When the hiker UI submodules are present, `hiker-app` depends on `spec-engine`/`hiker-code`/
+# `hiker-projects` via path deps into this directory (hiker-integration-plan.md item G).
+# See ../code-intelligence-vision.md and ../docs/{spec-engine,hiker-code,hiker-projects}.md

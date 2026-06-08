@@ -158,6 +158,23 @@ impl NodeContentRenderer for Engine {
             paint_body(ui, &mut entry.body, &plan, inner, view, just_rebuilt)
         })
     }
+
+    /// A hash of the node's content fingerprint — the same string the pane cache
+    /// keys on — so the view's idle-card cache reuses a card's recorded shapes
+    /// only while its text / file / subpath is unchanged. status: canvas-idle-card-cache
+    fn body_signature(&mut self, node: &Node) -> Option<u64> {
+        let plan = plan_node(&self.vault_root, node, &self.live_text);
+        Some(fingerprint_hash(&plan.fingerprint()))
+    }
+}
+
+/// A stable 64-bit hash of a content fingerprint string, for the idle-card
+/// cache's signature. status: canvas-idle-card-cache
+fn fingerprint_hash(fp: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fp.hash(&mut h);
+    h.finish()
 }
 
 /// The resolved render plan for a node: what to draw and the inputs it needs.

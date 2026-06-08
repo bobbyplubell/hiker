@@ -1,0 +1,17 @@
+[package]
+name = "code-cli"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "code-cli"
+path = "src/main.rs"
+
+[dependencies]
+spec-engine = { path = "../spec-engine" }
+hiker-code = { path = "../hiker-code" }
+# hiker-projects now lives at the hiker repo root (decoupled from code-intel); reach it across the
+# workspace boundary by path. code-cli does the repo→adapter binding itself (hiker-projects yields
+# only descriptors).
+hiker-projects = { path = "../../hiker-projects" }

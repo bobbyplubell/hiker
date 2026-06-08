@@ -81,6 +81,105 @@ pub fn title_for_path(rel: &str) -> &str {
         .trim_end_matches(".md")
 }
 
+/// Split a link target into its page part and an optional `#section` anchor.
+///
+/// A wikilink / markdown-link target may carry a heading anchor after a `#`:
+/// `Page#Heading`, `folder/Page#Heading`, or a same-document `#Heading` (empty
+/// page). The returned page is the part before the first `#` (trimmed); the
+/// section is everything after it (trimmed), or `None` when there is no `#`.
+/// An empty page (a bare `#Heading`) signals "this document" to the caller.
+///
+/// status: wikilink-headings-blocks
+#[must_use]
+pub fn split_target_section(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('#') {
+        Some((page, section)) => (page.trim(), Some(section.trim())),
+        None => (target.trim(), None),
+    }
+}
+
+/// Slugify a heading's text the way GitHub anchors do: lowercase, drop every
+/// character that is not an ASCII alphanumeric, a space, or a hyphen, then
+/// turn runs of whitespace into single hyphens. Used to match a link's
+/// `#section` anchor against the headings in a note body.
+///
+/// This is intentionally the GitHub algorithm rather than a bespoke scheme so a
+/// `#section` authored against rendered-Markdown expectations (e.g. copied from
+/// a web view) resolves the same way here.
+///
+/// status: wikilink-headings-blocks
+#[must_use]
+pub fn heading_slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_hyphen = false;
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            // Collapse any whitespace run; emit one hyphen lazily so trailing
+            // whitespace never produces a trailing hyphen.
+            pending_hyphen = !out.is_empty();
+        } else if ch == '-' || ch.is_ascii_alphanumeric() {
+            if pending_hyphen {
+                out.push('-');
+                pending_hyphen = false;
+            }
+            out.extend(ch.to_lowercase());
+        }
+        // All other characters (punctuation, symbols) are dropped.
+    }
+    out
+}
+
+/// Byte offset of the start of the first ATX heading line (`#`…`######`) in
+/// `text` whose slug equals `section`'s slug, or `None` when no heading
+/// matches. The match is slug-based (`heading_slug`), so the link's `#section`
+/// anchor need not be byte-identical to the heading text — only slug-equal.
+///
+/// Fenced code blocks are skipped so a `#`-prefixed line inside a ``` fence is
+/// never mistaken for a heading. The returned offset is the byte index of the
+/// heading line's first character (its leading `#`), suitable for placing the
+/// caret + scrolling the heading to the top of the viewport.
+///
+/// status: wikilink-headings-blocks
+#[must_use]
+pub fn find_heading_byte(text: &str, section: &str) -> Option<usize> {
+    let want = heading_slug(section);
+    if want.is_empty() {
+        return None;
+    }
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let trimmed = trimmed.trim_end();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence
+            && let Some(rest) = heading_text(trimmed)
+            && heading_slug(rest) == want
+        {
+            return Some(offset + indent);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// If `line` is an ATX heading (`#`…`######` followed by a space or end of
+/// line), return the heading text after the markers; otherwise `None`. A run of
+/// more than six `#` is not a heading per CommonMark.
+fn heading_text(line: &str) -> Option<&str> {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    rest.strip_prefix(' ').map(str::trim)
+}
+
 /// Ambiguity policy for bare-name links that match more than one path.
 /// Mirrors `[wikilinks] ambiguous_resolution` in user/vault config.
 ///
@@ -129,7 +228,11 @@ pub fn resolve_path(
     policy: AmbiguityPolicy,
     referrer: Option<&str>,
 ) -> Resolution {
-    let needle = target.trim().trim_end_matches(".md");
+    // Drop any `#section` anchor before resolving the page: the section only
+    // affects where navigation lands, not which note the link points at.
+    // status: wikilink-headings-blocks
+    let (page, _section) = split_target_section(target);
+    let needle = page.trim_end_matches(".md");
     if needle.is_empty() {
         return Resolution::Unresolved;
     }
@@ -348,6 +451,68 @@ mod tests {
         ];
         assert_eq!(shortest_unambiguous(&paths, "work/Beta.md"), "work/Beta");
         assert_eq!(shortest_unambiguous(&paths, "personal/Beta.md"), "personal/Beta");
+    }
+
+    #[test]
+    fn splits_target_section() {
+        assert_eq!(split_target_section("Page#Heading"), ("Page", Some("Heading")));
+        assert_eq!(split_target_section("folder/Page#H"), ("folder/Page", Some("H")));
+        assert_eq!(split_target_section("#Heading"), ("", Some("Heading")));
+        assert_eq!(split_target_section("Page"), ("Page", None));
+        assert_eq!(split_target_section(" Page # H "), ("Page", Some("H")));
+    }
+
+    #[test]
+    fn heading_slug_matches_github_algorithm() {
+        assert_eq!(heading_slug("Hello World"), "hello-world");
+        assert_eq!(heading_slug("  Trim Me  "), "trim-me");
+        assert_eq!(heading_slug("Mixed CASE 123"), "mixed-case-123");
+        assert_eq!(heading_slug("Punctuation: drop! it?"), "punctuation-drop-it");
+        assert_eq!(heading_slug("multiple   spaces"), "multiple-spaces");
+        assert_eq!(heading_slug("already-hyphenated"), "already-hyphenated");
+        assert_eq!(heading_slug("symbols *& removed"), "symbols-removed");
+        assert_eq!(heading_slug(""), "");
+        assert_eq!(heading_slug("!!!"), "");
+    }
+
+    #[test]
+    fn finds_heading_byte_by_slug() {
+        let text = "# Intro\nbody\n\n## Sub Section\nmore\n### Deep Heading!\nx\n";
+        // Heading line offsets: "# Intro" at 0, "## Sub Section" after.
+        assert_eq!(find_heading_byte(text, "Intro"), Some(0));
+        let sub = text.find("## Sub Section").unwrap();
+        assert_eq!(find_heading_byte(text, "Sub Section"), Some(sub));
+        // Slug-equal but not byte-equal anchor still matches.
+        assert_eq!(find_heading_byte(text, "sub-section"), Some(sub));
+        let deep = text.find("### Deep Heading!").unwrap();
+        // The anchor drops the `!` to match the heading's slug.
+        assert_eq!(find_heading_byte(text, "Deep Heading"), Some(deep));
+        // No matching heading.
+        assert_eq!(find_heading_byte(text, "Missing"), None);
+        // Empty section never matches.
+        assert_eq!(find_heading_byte(text, ""), None);
+    }
+
+    #[test]
+    fn find_heading_skips_fenced_code() {
+        let text = "intro\n```\n# Not A Heading\n```\n# Real Heading\n";
+        let real = text.find("# Real Heading").unwrap();
+        assert_eq!(find_heading_byte(text, "Not A Heading"), None);
+        assert_eq!(find_heading_byte(text, "Real Heading"), Some(real));
+    }
+
+    #[test]
+    fn resolve_path_ignores_section_anchor() {
+        let paths = vec!["notes/Alpha.md".to_string()];
+        assert_eq!(
+            resolve_path(&paths, "Alpha#Some Heading", AmbiguityPolicy::Unresolved, None),
+            Resolution::Resolved("notes/Alpha.md".to_string()),
+        );
+        // A same-doc `#Heading` (empty page) has no note target.
+        assert_eq!(
+            resolve_path(&paths, "#Some Heading", AmbiguityPolicy::Unresolved, None),
+            Resolution::Unresolved,
+        );
     }
 
     #[test]

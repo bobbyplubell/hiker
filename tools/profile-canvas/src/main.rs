@@ -34,18 +34,31 @@
 //! `screen_rect`, state held outside the loop, a warm-up pass so caches settle,
 //! per-frame `Instant` timing, and p50/p95/max stats via `tracing`.
 //!
+//! There is also an auto-zoom SWEEP mode (`--mode zoom-sweep`) that drives a large
+//! synthetic canvas through the full zoom range — from "whole canvas visible"
+//! (every card a bare dot / placeholder) to a near zoom (a screenful of
+//! full-detail cards) — and reports the per-frame cost at each zoom step, so the
+//! LOD-transition cost curve (bare-dot → title-placeholder → full-detail) is
+//! visible. See [`crate::sweep`].
+//!
 //! Usage:
 //!   cargo run --release -p profile-canvas -- [OPTIONS]
+//!     --mode <m>           `levels` (default: the three fixed-camera situations)
+//!                          or `zoom-sweep` (the auto-zoom cost-curve sweep)
 //!     --canvas <path>      load a `.canvas` document
 //!     --vault <dir>        file-resolution root (default: the canvas's parent)
 //!     --generate <N>       instead of loading, synthesize N file nodes in a grid
-//!                          pointing at real `.md` files found by walking --vault
-//!     --frames <N>         timed frames per level (default 60)
-//!     --warmup <N>         warm-up frames for the static levels (default 8)
+//!                          pointing at real `.md` files found by walking --vault.
+//!                          In zoom-sweep mode this defaults to 800 and the grid
+//!                          gains edges between neighbouring cards.
+//!     --frames <N>         timed frames per level/step (default 60 levels, 5 sweep)
+//!     --warmup <N>         warm-up frames before each timed pass (default 8)
+//!     --steps <N>          zoom steps for zoom-sweep, fit-scale → near (default 40)
 //!     --scroll-step <px>   camera pan per timed frame for the scroll level, in
 //!                          screen px (default 6); larger = faster scroll
 //!     --scroll-scale <s>   override the auto-computed full-detail scale (pixels
-//!                          per canvas unit) used by `full-detail` and `scroll`
+//!                          per canvas unit) used by `full-detail`/`scroll`, and the
+//!                          near (zoomed-in) end of the zoom-sweep
 //!     --width <W>          screen width px (default 1600)
 //!     --height <H>         screen height px (default 1000)
 //!
@@ -53,6 +66,7 @@
 
 mod renderer;
 mod stats;
+mod sweep;
 mod synth;
 
 use std::path::PathBuf;
@@ -76,13 +90,32 @@ const LOD_MIN_PX: f32 = 150.0;
 /// The LOD height cutoff in screen px (`LOD_MIN_PX * 0.64` in `is_tiny`).
 const LOD_MIN_PX_H: f32 = LOD_MIN_PX * 0.64;
 
+/// Which profiling mode to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The three fixed-camera situations (zoom-to-fit / full-detail / scroll).
+    Levels,
+    /// The auto-zoom cost-curve sweep over a large synthetic canvas.
+    ZoomSweep,
+}
+
+/// The default number of zoom steps for the sweep.
+const DEFAULT_SWEEP_STEPS: usize = 40;
+/// The default timed frames per zoom step (the sweep has many steps, so fewer
+/// frames each keeps a run fast while p50/p95 stay meaningful).
+const DEFAULT_SWEEP_FRAMES: usize = 5;
+/// The default synthetic card count when `--generate` is omitted in sweep mode.
+const DEFAULT_SWEEP_CARDS: usize = 800;
+
 /// Parsed command-line configuration.
 struct Args {
+    mode: Mode,
     canvas: Option<PathBuf>,
     vault: Option<PathBuf>,
     generate: Option<usize>,
-    frames: usize,
+    frames: Option<usize>,
     warmup: usize,
+    steps: usize,
     scroll_step: f32,
     scroll_scale: Option<f32>,
     width: f32,
@@ -92,16 +125,38 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            mode: Mode::Levels,
             canvas: None,
             vault: None,
             generate: None,
-            frames: 60,
+            frames: None,
             warmup: 8,
+            steps: DEFAULT_SWEEP_STEPS,
             scroll_step: 6.0,
             scroll_scale: None,
             width: 1600.0,
             height: 1000.0,
         }
+    }
+}
+
+impl Args {
+    /// Timed frames per level/step, defaulting per mode (the sweep wants fewer per
+    /// step since there are many steps).
+    fn frames(&self) -> usize {
+        self.frames.unwrap_or(match self.mode {
+            Mode::Levels => 60,
+            Mode::ZoomSweep => DEFAULT_SWEEP_FRAMES,
+        })
+    }
+}
+
+/// Parse a `--mode` value into a [`Mode`].
+fn parse_mode(s: &str) -> Result<Mode> {
+    match s {
+        "levels" => Ok(Mode::Levels),
+        "zoom-sweep" => Ok(Mode::ZoomSweep),
+        other => anyhow::bail!("unknown --mode: {other} (want `levels` or `zoom-sweep`)"),
     }
 }
 
@@ -114,11 +169,13 @@ fn parse_args() -> Result<Args> {
                 .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))
         };
         match arg.as_str() {
+            "--mode" => a.mode = parse_mode(&value()?)?,
             "--canvas" => a.canvas = Some(PathBuf::from(value()?)),
             "--vault" => a.vault = Some(PathBuf::from(value()?)),
             "--generate" => a.generate = Some(value()?.parse()?),
-            "--frames" => a.frames = value()?.parse()?,
+            "--frames" => a.frames = Some(value()?.parse()?),
             "--warmup" => a.warmup = value()?.parse()?,
+            "--steps" => a.steps = value()?.parse()?,
             "--scroll-step" => a.scroll_step = value()?.parse()?,
             "--scroll-scale" => a.scroll_scale = Some(value()?.parse()?),
             "--width" => a.width = value()?.parse()?,
@@ -135,12 +192,22 @@ fn parse_args() -> Result<Args> {
 
 /// Resolve the canvas document and the vault root to render against.
 fn load(args: &Args) -> Result<(Canvas, PathBuf)> {
-    if let Some(n) = args.generate {
+    // The sweep wants a large EDGED grid and synthesises one by default (no
+    // `--canvas` needed); the fixed modes only synthesise on an explicit
+    // `--generate`.
+    let synth_count = match args.mode {
+        Mode::ZoomSweep => Some(args.generate.unwrap_or(DEFAULT_SWEEP_CARDS)),
+        Mode::Levels => args.generate,
+    };
+    if let Some(n) = synth_count {
         let vault = args
             .vault
             .clone()
-            .context("--generate requires --vault for the file pool")?;
-        let canvas = synth::grid_canvas(n, &vault)?;
+            .context("synthesising a canvas requires --vault for the file pool")?;
+        let canvas = match args.mode {
+            Mode::ZoomSweep => synth::sweep_canvas(n, &vault)?,
+            Mode::Levels => synth::grid_canvas(n, &vault)?,
+        };
         return Ok((canvas, vault));
     }
     let path = args.canvas.clone().context("need --canvas or --generate")?;
@@ -395,13 +462,58 @@ struct LevelResult {
 
 fn run(args: &Args) -> Result<()> {
     let (mut canvas, vault) = load(args)?;
+    match args.mode {
+        Mode::Levels => run_levels(args, &mut canvas, &vault),
+        Mode::ZoomSweep => run_sweep(args, &mut canvas, &vault),
+    }
+    Ok(())
+}
+
+/// How far past the just-above-LOD scale the auto-computed sweep zooms in: the
+/// `full_detail_scale` lands a card right at the LOD cutoff (1 full step), but the
+/// sweep wants several full-detail bands — a screenful of full cards thinning to a
+/// few — so the cost of the expensive tier is clearly characterised. Overridden by
+/// an explicit `--scroll-scale`.
+const SWEEP_NEAR_OVERSHOOT: f32 = 3.0;
+
+/// Run the auto-zoom cost-curve sweep over `canvas`: a large synthetic board swept
+/// from whole-canvas-visible to a near zoom, reporting the per-frame cost as cards
+/// cross the LOD tiers. The near end is a few multiples past the just-above-LOD
+/// scale the fixed-mode full-detail level uses (so the full-detail tail spans
+/// several steps), overridable with `--scroll-scale`.
+fn run_sweep(args: &Args, canvas: &mut Canvas, vault: &std::path::Path) {
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(args.width, args.height));
+    let ctx = egui::Context::default();
+    let mut renderer = ProfRenderer::new(vault.to_path_buf());
+    let near_scale = args
+        .scroll_scale
+        .unwrap_or_else(|| full_detail_scale(canvas) * SWEEP_NEAR_OVERSHOOT);
+    tracing::info!(
+        nodes = canvas.nodes.len(),
+        edges = canvas.edges.len(),
+        vault = %vault.display(),
+        steps = args.steps,
+        frames = args.frames(),
+        near_scale,
+        "canvas zoom-sweep starting",
+    );
+    sweep::run(&ctx, screen, canvas, &mut renderer, &sweep::SweepConfig {
+        steps: args.steps.max(1),
+        frames: args.frames(),
+        warmup: args.warmup,
+        near_scale,
+    });
+}
+
+/// Run the three fixed-camera situations (the original profiler behaviour).
+fn run_levels(args: &Args, canvas: &mut Canvas, vault: &std::path::Path) {
     let node_count = canvas.nodes.len();
     let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(args.width, args.height));
     let ctx = egui::Context::default();
     let mut view = CanvasView::new();
-    let mut renderer = ProfRenderer::new(vault.clone());
+    let mut renderer = ProfRenderer::new(vault.to_path_buf());
 
-    let detail_scale = args.scroll_scale.unwrap_or_else(|| full_detail_scale(&canvas));
+    let detail_scale = args.scroll_scale.unwrap_or_else(|| full_detail_scale(canvas));
     // Scroll diagonally (mostly horizontal) so the sweep streams new columns and
     // rows past the cull boundary, not just one axis.
     let step = Vec2::new(args.scroll_step, args.scroll_step * 0.4);
@@ -432,15 +544,14 @@ fn run(args: &Args) -> Result<()> {
             ctx: &ctx,
             screen,
             view: &mut view,
-            canvas: &mut canvas,
+            canvas,
             renderer: &mut renderer,
-            frames: args.frames,
+            frames: args.frames(),
             warmup: args.warmup,
         }));
     }
 
     print_summary(node_count, &results);
-    Ok(())
 }
 
 /// Print the labeled baseline table the caller copies into the report.

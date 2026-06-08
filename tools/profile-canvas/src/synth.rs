@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use hiker_canvas::model::{Canvas, Node, NodeKind};
+use hiker_canvas::model::{Canvas, Edge, Node, NodeKind};
 
 /// Card width in canvas units.
 const CARD_W: i64 = 320;
@@ -26,6 +26,53 @@ pub fn grid_canvas(n: usize, vault: &Path) -> Result<Canvas> {
         .map(|i| grid_node(i, cols, &notes[i % notes.len()]))
         .collect();
     Ok(Canvas { nodes, edges: Vec::new(), extra: BTreeMap::new() })
+}
+
+/// Build a large sweep canvas: the same `n`-node grid as [`grid_canvas`], plus an
+/// edge from each card to its right and down neighbours so the zoom sweep also
+/// exercises the edge LOD ladder (curves → simplified strokes → bare lines) in
+/// lockstep with the cards. Errors if no `.md` files are found.
+pub fn sweep_canvas(n: usize, vault: &Path) -> Result<Canvas> {
+    let notes = find_notes(vault)?;
+    anyhow::ensure!(!notes.is_empty(), "no .md files found under {}", vault.display());
+    let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
+    let nodes: Vec<Node> = (0..n)
+        .map(|i| grid_node(i, cols, &notes[i % notes.len()]))
+        .collect();
+    let edges = grid_edges(n, cols);
+    Ok(Canvas { nodes, edges, extra: BTreeMap::new() })
+}
+
+/// Edges connecting each grid slot to its right and downward neighbour, so a card
+/// at `(row, col)` links to `(row, col+1)` and `(row+1, col)` when those exist.
+fn grid_edges(n: usize, cols: usize) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for i in 0..n {
+        let col = i % cols;
+        if col + 1 < cols && i + 1 < n {
+            edges.push(grid_edge(edges.len(), i, i + 1));
+        }
+        if i + cols < n {
+            edges.push(grid_edge(edges.len(), i, i + cols));
+        }
+    }
+    edges
+}
+
+/// One edge with id `e{idx}` from `synth-{from}` to `synth-{to}`.
+fn grid_edge(idx: usize, from: usize, to: usize) -> Edge {
+    Edge {
+        id: format!("e{idx}"),
+        from_node: format!("synth-{from}"),
+        from_side: None,
+        from_end: None,
+        to_node: format!("synth-{to}"),
+        to_side: None,
+        to_end: None,
+        color: None,
+        label: None,
+        extra: BTreeMap::new(),
+    }
 }
 
 /// One grid node at slot `i` (row-major, `cols` per row) pointing at `file`.

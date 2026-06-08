@@ -68,6 +68,54 @@ fn visible(viewport: Rect, r: Rect) -> bool {
     viewport.intersects(r)
 }
 
+/// Stroke-width multiplier for a SIMPLIFIED (LOD) edge. At far zoom an edge is
+/// drawn as a straight, slightly thicker single stroke instead of a thin curve,
+/// so a dense cluster reads as clear structure rather than a hairball of faint
+/// curves. Tuned alongside the card LOD tiers (`is_tiny`/`is_bare_dot`): just
+/// enough boost that a 1.5px edge (~2.2px) still reads against shrunken cards.
+const LOD_EDGE_WIDTH_BOOST: f32 = 1.5;
+
+/// The edge counterpart to the card LOD ladder (`is_tiny`/`is_bare_dot`): how
+/// much detail an edge keeps, derived from the on-screen size of its endpoint
+/// cards so edges degrade in lockstep with the cards they connect.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EdgeLod {
+    /// Both endpoint cards are readable: full-detail curve + arrowheads.
+    Full,
+    /// At least one endpoint card is at the title-placeholder tier (`is_tiny`):
+    /// draw a straight, thicker single stroke (no curve detail) but keep arrows.
+    Simplified,
+    /// At least one endpoint card is at the bare-dot tier (`is_bare_dot`): the
+    /// deepest tier — straight thicker stroke AND no arrowheads, so a dense
+    /// constellation of dots isn't buried under a swarm of tiny arrows.
+    Bare,
+}
+
+/// The resolved draw style for one edge: base colour, stroke width (already
+/// LOD-boosted), and the LOD tier. Bundled so the affine / lensed edge painters
+/// stay within the argument budget. `Copy` (small POD), passed by value.
+#[derive(Clone, Copy)]
+struct EdgeStyle {
+    color: Color32,
+    width: f32,
+    lod: EdgeLod,
+}
+
+/// The edge LOD tier for an edge whose endpoint cards occupy `from` / `to` on
+/// screen. Mirrors the card ladder: bare-dot at either end ⇒ [`EdgeLod::Bare`],
+/// else tiny at either end ⇒ [`EdgeLod::Simplified`], else [`EdgeLod::Full`].
+/// Uses the *smaller-reading* endpoint (the worst case) so an edge from a dot to
+/// a full card still simplifies. Pure (no painter), so it is unit-testable.
+fn edge_lod(from: Rect, to: Rect) -> EdgeLod {
+    if is_bare_dot(from) || is_bare_dot(to) {
+        EdgeLod::Bare
+    } else if is_tiny(from) || is_tiny(to) {
+        EdgeLod::Simplified
+    } else {
+        EdgeLod::Full
+    }
+}
+
 /// Multiply a colour's alpha by `factor` (clamped to `[0, 1]`). A `factor` of
 /// `1.0` returns the colour untouched, so the Off/Fisheye path (where the rim
 /// fade is always `1.0`) is byte-identical. Drives the Poincaré rim fade.
@@ -273,8 +321,35 @@ pub fn node_card_filled(
     view: CardView,
     fill_scale: Option<f32>,
 ) -> f32 {
+    match card_frame(ui, viewport, camera, node, fill_scale) {
+        CardTier::Skipped => view.scroll_y,
+        CardTier::Full { inner } => render_card_body(ui, viewport, content, node, inner, view),
+    }
+}
+
+/// The LOD outcome of painting a card's frame: either it was a dot / placeholder
+/// / culled (no body to render) or it is full-detail with a content rect.
+enum CardTier {
+    /// Culled, group, bare dot, or LOD placeholder — no full body to render.
+    Skipped,
+    /// Full-detail: the frame painted; the body should render inside `inner`.
+    Full { inner: Rect },
+}
+
+/// Paint a card's *frame* and resolve its LOD tier, painting the dot / fill +
+/// border / placeholder as the tier dictates, and report whether a full-detail
+/// body remains to be rendered (and where). Splitting the frame from the body
+/// lets the caller cache an idle full-detail body's shapes and re-blit them
+/// without re-running the content engine. status: canvas-idle-card-cache
+fn card_frame(
+    ui: &mut egui::Ui,
+    viewport: Rect,
+    camera: &Camera,
+    node: &Node,
+    fill_scale: Option<f32>,
+) -> CardTier {
     if matches!(node.kind, NodeKind::Group { .. }) {
-        return view.scroll_y;
+        return CardTier::Skipped;
     }
     // Card-scale compromise (`proj-card-scale`): under a projection lens a card
     // MUST stay an axis-aligned rect (egui can't shear a glyph), so we don't map
@@ -287,7 +362,7 @@ pub fn node_card_filled(
     let bounds = node_bounds(node);
     let screen = projected_card_rect(camera, viewport, bounds, fill_scale);
     if !visible(viewport, screen) {
-        return view.scroll_y;
+        return CardTier::Skipped;
     }
     let visuals = ui.visuals().clone();
     let resolved = resolve_node(node.color.as_ref(), &visuals);
@@ -312,17 +387,29 @@ pub fn node_card_filled(
     if is_bare_dot(screen) || (camera.lens_active() && mag < BARE_DOT_MAG) {
         let r = (screen.size().min_elem() * 0.5).clamp(1.5, 4.0);
         painter.circle_filled(screen.center(), r, fade(resolved.stroke, alpha));
-        return view.scroll_y;
+        return CardTier::Skipped;
     }
     painter.rect_filled(screen, radius, fade(resolved.fill, alpha));
     painter.rect_stroke(screen, radius, Stroke::new(1.5, fade(resolved.stroke, alpha)), StrokeKind::Inside);
     if is_tiny(screen) || (camera.lens_active() && mag < LOD_MAG_THRESHOLD) {
         let pad = (CARD_PAD * camera.scale()).max(2.0);
         paint_lod_placeholder(&painter, screen.shrink(pad), lod_title(node), &visuals);
-        return view.scroll_y;
+        return CardTier::Skipped;
     }
-    let pad = CARD_PAD * camera.scale();
-    let inner = screen.shrink(pad);
+    CardTier::Full { inner: screen.shrink(CARD_PAD * camera.scale()) }
+}
+
+/// Render a full-detail card's body through the content engine, clipped to the
+/// viewport. Returns the effective scroll the body settled on. Split from the
+/// frame so the idle-card cache can wrap it (see [`CanvasView`] `paint_scene`).
+fn render_card_body(
+    ui: &mut egui::Ui,
+    viewport: Rect,
+    content: &mut dyn NodeContentRenderer,
+    node: &Node,
+    inner: Rect,
+    view: CardView,
+) -> f32 {
     // Lay content out at the full `inner` rect but hand it a child ui clipped to
     // the viewport, so a card straddling the pane edge never paints its body
     // outside the canvas (over the header / tabs / neighbouring panels). The
@@ -335,6 +422,66 @@ pub fn node_card_filled(
         content.render(&mut clipped, node, inner, view)
     } else {
         view.scroll_y
+    }
+}
+
+/// The fixed-per-frame inputs [`node_card_cached`] needs beyond the node, grouped
+/// so the call stays within the argument-count budget.
+pub struct CachedCardCtx<'a> {
+    /// The visible viewport rect (cull + clip bound).
+    pub viewport: Rect,
+    /// The camera framing the board this frame.
+    pub camera: &'a Camera,
+    /// The host content engine.
+    pub content: &'a mut dyn NodeContentRenderer,
+    /// The idle-card retained-paint cache.
+    pub cache: &'a mut crate::cardcache::CardCache,
+}
+
+/// Paint a full-detail card's body through the idle-card cache where possible:
+/// paint the frame, and for a full-detail tier consult the cache — re-blitting
+/// the recorded shapes when the card is Idle, or live-rendering and capturing
+/// them when Active. `interacting` is true when this card is being
+/// scrolled/zoomed this frame (forces a live render). Returns the effective
+/// scroll. status: canvas-idle-card-cache
+pub fn node_card_cached(
+    ui: &mut egui::Ui,
+    ctx: CachedCardCtx<'_>,
+    node: &Node,
+    view: CardView,
+    fill_scale: Option<f32>,
+    interacting: bool,
+) -> f32 {
+    let CachedCardCtx { viewport, camera, content, cache } = ctx;
+    let CardTier::Full { inner } = card_frame(ui, viewport, camera, node, fill_scale) else {
+        return view.scroll_y;
+    };
+    let clip = inner.intersect(viewport);
+    if clip.width() <= 1.0 || clip.height() <= 1.0 {
+        return view.scroll_y;
+    }
+    let signature = content.body_signature(node);
+    let req = crate::cardcache::CardRequest {
+        id: &node.id,
+        rect: inner,
+        view,
+        signature,
+        dark: ui.visuals().dark_mode,
+        interacting,
+    };
+    // The cache emits onto the central layer's painter (where the body shapes
+    // live); a Blit needs no engine call and keeps the card's stored scroll.
+    let painter = ui.painter().with_clip_rect(clip);
+    match cache.decide(&req, &painter) {
+        crate::cardcache::CardPaint::Blit => view.scroll_y,
+        crate::cardcache::CardPaint::Render => {
+            let start = painter.ctx().graphics(|g| {
+                g.get(painter.layer_id()).map_or(egui::layers::ShapeIdx(0), egui::layers::PaintList::next_idx)
+            });
+            let scroll = render_card_body(ui, viewport, content, node, inner, view);
+            cache.capture(&req, &painter, start);
+            scroll
+        }
     }
 }
 
@@ -457,48 +604,108 @@ fn one_edge(
     } else {
         resolve_edge(edge.color.as_ref(), visuals)
     };
-    let width = if selected { 2.5 } else { 1.5 };
+    // Edge LOD from the endpoint cards' on-screen size, so an edge degrades in
+    // lockstep with the cards it connects: thin curve + arrows when both ends are
+    // readable, a thicker straight stroke when either is LOD-tiny, and no
+    // arrowheads at all once either end is a bare dot. [proj-lod-ladder]
+    let from_screen = projected_card_rect(camera, viewport, node_bounds(from), None);
+    let to_screen = projected_card_rect(camera, viewport, node_bounds(to), None);
+    let lod = edge_lod(from_screen, to_screen);
+    let base_width = if selected { 2.5 } else { 1.5 };
+    let width = if lod == EdgeLod::Full { base_width } else { base_width * LOD_EDGE_WIDTH_BOOST };
+    let style = EdgeStyle { color: base_color, width, lod };
 
-    // Off / Affine: unchanged cubic-Bézier connector (no projection sampling, no
-    // rim fade) — byte-identical to the historical path. [proj-canvas-mode]
     if !camera.lens_active() {
+        affine_edge(painter, edge, camera, (start, end), (from_side, to_side), style);
+        return;
+    }
+    lensed_edge(painter, viewport, camera, edge, (from_anchor, to_anchor), style);
+}
+
+/// Draw an edge in the Off / Affine regime. At [`EdgeLod::Full`] this is the
+/// historical cubic-Bézier connector (byte-identical); at the LOD tiers it
+/// collapses to a straight, thicker single stroke (simpler to read at scale), and
+/// arrowheads are dropped entirely at [`EdgeLod::Bare`]. [proj-lod-ladder]
+fn affine_edge(
+    painter: &egui::Painter,
+    edge: &Edge,
+    camera: &Camera,
+    ends: (Pos2, Pos2),
+    sides: (Side, Side),
+    style: EdgeStyle,
+) {
+    let (start, end) = ends;
+    let EdgeStyle { color, width, lod } = style;
+    if lod == EdgeLod::Full {
         let handle = (start - end).length().clamp(40.0, 320.0) * 0.4;
-        let geo = build_geometry(start, end, from_side, to_side, handle);
+        let geo = build_geometry(start, end, sides.0, sides.1, handle);
         let curve = CubicBezierShape::from_points_stroke(
             [geo.start, geo.ctrl_a, geo.ctrl_b, geo.end],
             false,
             Color32::TRANSPARENT,
-            Stroke::new(width, base_color),
+            Stroke::new(width, color),
         );
         painter.add(curve);
-        edge_caps(painter, edge, &geo, base_color, camera.scale());
-        if let Some(label) = &edge.label {
-            let mid = bezier_midpoint(geo.start, geo.ctrl_a, geo.ctrl_b, geo.end);
-            let size = (11.0 * camera.scale()).clamp(8.0, 16.0);
-            painter.text(mid, egui::Align2::CENTER_CENTER, label, FontId::proportional(size), base_color);
-        }
+        edge_caps(painter, edge, &geo, color, camera.scale());
+        edge_label(painter, edge, bezier_midpoint(geo.start, geo.ctrl_a, geo.ctrl_b, geo.end), color, camera.scale());
         return;
     }
+    // Simplified / Bare: a straight thicker stroke; arrows only above the dot tier.
+    painter.line_segment([start, end], Stroke::new(width, color));
+    if lod != EdgeLod::Bare {
+        straight_edge_caps(painter, edge, start, end, color, camera.scale());
+    }
+    edge_label(painter, edge, start.lerp(end, 0.5), color, camera.scale());
+}
 
-    // Lensed: build a screen polyline that follows the projection.
-    // - Poincaré: the geodesic between the two disk points, mapped back to
-    //   lensed-world then through the AFFINE-only screen map (no second lens
-    //   pass) so the curvature is exact — mirroring graph-view's `draw_edges`.
-    // - Fisheye (and any non-Affine fallback): the straight world chord
-    //   subdivided, each sample pushed through the full lens-composed map so the
-    //   edge follows the bulge.
+/// Draw an edge under an active lens (Fisheye / Poincaré): a projected polyline
+/// that follows the warp. The curvature is the whole point of the lens, so the
+/// polyline is kept even at LOD tiers (only the stroke thickens); arrowheads are
+/// dropped at [`EdgeLod::Bare`] to declutter a dense periphery. [proj-lod-ladder]
+fn lensed_edge(
+    painter: &egui::Painter,
+    viewport: Rect,
+    camera: &Camera,
+    edge: &Edge,
+    anchors: (Pos2, Pos2),
+    style: EdgeStyle,
+) {
+    let (from_anchor, to_anchor) = anchors;
+    let EdgeStyle { color: base_color, width, lod } = style;
     let alpha = camera
         .rim_alpha_at(anchor_world(from_anchor))
         .min(camera.rim_alpha_at(anchor_world(to_anchor)));
     let color = fade(base_color, alpha);
     let pts = projected_edge_points(camera, viewport, from_anchor, to_anchor);
     painter.add(egui::Shape::line(pts.clone(), Stroke::new(width, color)));
-    // Arrowheads at the projected ends, oriented along the first/last segment.
-    projected_edge_caps(painter, edge, &pts, color, camera.scale());
+    if lod != EdgeLod::Bare {
+        projected_edge_caps(painter, edge, &pts, color, camera.scale());
+    }
+    edge_label(painter, edge, polyline_midpoint(&pts), color, camera.scale());
+}
+
+/// Paint an edge's label (if any) centered at `mid`, sized to the camera scale.
+/// Shared by the affine + lensed edge paths so label placement stays identical.
+fn edge_label(painter: &egui::Painter, edge: &Edge, mid: Pos2, color: Color32, scale: f32) {
     if let Some(label) = &edge.label {
-        let mid = polyline_midpoint(&pts);
-        let size = (11.0 * camera.scale()).clamp(8.0, 16.0);
+        let size = (11.0 * scale).clamp(8.0, 16.0);
         painter.text(mid, egui::Align2::CENTER_CENTER, label, FontId::proportional(size), color);
+    }
+}
+
+/// Arrowheads for a SIMPLIFIED straight edge: same caps as [`edge_caps`] but
+/// oriented along the straight `start`→`end` chord (there are no Bézier control
+/// points). Only called above the bare-dot tier. [proj-lod-ladder]
+fn straight_edge_caps(painter: &egui::Painter, edge: &Edge, start: Pos2, end: Pos2, color: Color32, scale: f32) {
+    use hiker_canvas::model::EndCap;
+    let (len, half_w) = arrowhead_size(scale);
+    if matches!(edge.to_end, None | Some(EndCap::Arrow)) {
+        let tri = arrowhead(end, end - start, len, half_w);
+        painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
+    }
+    if matches!(edge.from_end, Some(EndCap::Arrow)) {
+        let tri = arrowhead(start, start - end, len, half_w);
+        painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
     }
 }
 
@@ -783,9 +990,9 @@ pub const fn handle_size() -> f32 {
 #[cfg(test)]
 mod lod_tests {
     use super::{
-        adaptive_segments, arrowhead_size, file_basename, fill_scales, first_nonempty_line,
-        group_label_size, is_bare_dot, is_tiny, lod_title, projected_card_rect, url_host,
-        BARE_DOT_PX, MAX_GEODESIC_SEGMENTS, LOD_MIN_PX,
+        adaptive_segments, arrowhead_size, edge_lod, file_basename, fill_scales,
+        first_nonempty_line, group_label_size, is_bare_dot, is_tiny, lod_title,
+        projected_card_rect, url_host, EdgeLod, BARE_DOT_PX, MAX_GEODESIC_SEGMENTS, LOD_MIN_PX,
     };
     use canvas_view_core::camera::{Camera, CardScaleClamp};
     use hiker_projection::Complex;
@@ -871,6 +1078,27 @@ mod lod_tests {
         assert!(!is_bare_dot(rect(LOD_MIN_PX - 1.0, LOD_MIN_PX - 1.0)));
         // Every bare dot is also tiny (the ladder nests: dot ⊂ tiny ⊂ readable).
         assert!(is_tiny(rect(BARE_DOT_PX - 1.0, BARE_DOT_PX - 1.0)));
+    }
+
+    /// The edge LOD ladder mirrors the card ladder and keys off the WORST
+    /// (smallest-reading) endpoint: a readable pair is Full, a tiny endpoint
+    /// simplifies, and a bare-dot endpoint drops to Bare (no arrowheads).
+    /// [proj-lod-ladder]
+    #[test]
+    fn edge_lod_tracks_worst_endpoint() {
+        let big = rect(300.0, 200.0);
+        let tiny = rect(LOD_MIN_PX - 1.0, LOD_MIN_PX); // tiny but not a bare dot
+        let dot = rect(BARE_DOT_PX - 1.0, BARE_DOT_PX); // bare-dot tier
+        // Both endpoints readable → full detail.
+        assert_eq!(edge_lod(big, big), EdgeLod::Full);
+        // One tiny endpoint → simplified (thicker straight stroke, arrows kept).
+        assert_eq!(edge_lod(big, tiny), EdgeLod::Simplified);
+        assert_eq!(edge_lod(tiny, big), EdgeLod::Simplified);
+        // One bare-dot endpoint → bare (no arrowheads), even if the other is huge.
+        assert_eq!(edge_lod(big, dot), EdgeLod::Bare);
+        assert_eq!(edge_lod(dot, dot), EdgeLod::Bare);
+        // The bare tier strictly deepens the simplified tier (a dot is also tiny).
+        assert!(is_tiny(dot) && is_bare_dot(dot));
     }
 
     #[test]

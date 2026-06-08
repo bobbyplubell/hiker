@@ -100,6 +100,12 @@ pub struct CanvasResponse {
     /// to it on the canvas — a context-menu action whose vault file creation is
     /// host-side. status: canvas-node-create
     pub request_new_note: bool,
+    /// A node whose target the host should open in a NEW tab — the
+    /// "Open in new tab" context-menu verb. Carries the node id; the host resolves
+    /// its kind (File / Link) and opens the referenced file / URL in a fresh tab,
+    /// leaving the current canvas tab in place. `None` on frames where the verb
+    /// wasn't chosen. status: canvas-open-in-new-tab
+    pub request_open_in_new_tab: Option<String>,
 }
 
 /// The interactive handles the pointer is over this frame, resolved from the
@@ -177,6 +183,11 @@ pub struct CanvasView {
     /// a clicked card glides to the disk centre. Cleared on completion, a manual
     /// drag-recentre, or a fit/reset. View state only. [proj-poincare-nav]
     flyto: Option<FlyTo>,
+    /// Retained-paint cache for idle full-detail card bodies: records each
+    /// card's emitted egui shapes and re-blits them (translated) while the card
+    /// is idle, so a still / panning board doesn't re-run the content engine per
+    /// card per frame. View state only. status: canvas-idle-card-cache
+    card_cache: crate::cardcache::CardCache,
 }
 
 impl CanvasView {
@@ -861,6 +872,11 @@ impl CanvasView {
         paint::edges(&bg, viewport, &self.camera, canvas, &visuals, &|id| self.selection.has_edge(id));
         paint::poincare_boundary(&bg, viewport, &self.camera, &visuals);
         let camera = self.camera;
+        // The card (if any) the pointer is over WITH scroll/zoom input this frame
+        // — it is being scrolled/zoomed, so it must live-render rather than blit a
+        // cached (about-to-change) picture. status: canvas-idle-card-cache
+        let interacting = self.interacting_card(ui, viewport, canvas);
+        self.card_cache.begin_frame();
         // Pre-pass: under a lens, size each card to fill the gap to its nearest
         // on-screen neighbour so sparse regions of the disk fill out instead of
         // floating tiny cards. `None` per node with the lens Off (affine sizing).
@@ -868,11 +884,45 @@ impl CanvasView {
         let fills = paint::lens_fill_scales(&camera, viewport, canvas);
         for (node, fill) in canvas.nodes.iter().zip(fills) {
             let view = self.card_view(&node.id);
-            let effective_scroll = paint::node_card_filled(ui, viewport, &camera, node, content, view, fill);
+            let ctx = paint::CachedCardCtx {
+                viewport,
+                camera: &camera,
+                content,
+                cache: &mut self.card_cache,
+            };
+            let active = interacting.as_deref() == Some(node.id.as_str());
+            let effective_scroll = paint::node_card_cached(ui, ctx, node, view, fill, active);
             if (effective_scroll - view.scroll_y).abs() > f32::EPSILON {
                 self.card_views.entry(node.id.clone()).or_default().scroll_y = effective_scroll;
             }
         }
+    }
+
+    /// The node id (if any) the pointer is over while a scroll or zoom input is
+    /// present this frame — the card the wheel/pinch is scrolling or content-
+    /// zooming. Such a card is about to change its scroll/zoom, so it must
+    /// live-render rather than blit a stale cache. Mirrors the hit-test the wheel
+    /// handler (`handle_zoom` / `apply_card_scroll`) uses, read-only here.
+    /// status: canvas-idle-card-cache
+    fn interacting_card(&self, ui: &egui::Ui, viewport: Rect, canvas: &Canvas) -> Option<String> {
+        let (scroll, zoom, pointer) = ui.input(|i| {
+            (i.smooth_scroll_delta.length(), i.zoom_delta(), i.pointer.hover_pos())
+        });
+        if scroll <= 0.5 && (zoom - 1.0).abs() <= f32::EPSILON {
+            return None;
+        }
+        let cursor = pointer.filter(|p| viewport.contains(*p))?;
+        let world = self.camera.screen_to_world(viewport, cursor);
+        let idx = hiker_canvas::geometry::hit_test(canvas, world)?;
+        let node = &canvas.nodes[idx];
+        if matches!(node.kind, hiker_canvas::model::NodeKind::Group { .. }) {
+            return None;
+        }
+        let screen = self.camera.world_rect_to_screen(viewport, node_bounds(node));
+        if crate::paint::is_tiny(screen) {
+            return None;
+        }
+        Some(node.id.clone())
     }
 
     /// The per-card content view (zoom + scroll) for `id`, defaulting to 1.0
@@ -1043,13 +1093,15 @@ impl CanvasView {
             let target = anchor.map(|p| interaction::resolve_target(canvas, &self.camera, viewport, &self.selection, p));
             match target {
                 Some(Target::Node(id) | Target::SideHandle { node: id, .. }) => {
-                    if let Some(action) = menu.node_menu(ui) {
+                    let open = Self::open_target(canvas, &id);
+                    if let Some(action) = menu.node_menu(ui, open) {
                         self.apply_node_menu(action, &id, canvas, out);
                     }
                 }
                 Some(Target::ResizeHandle(_)) => {
                     if let Some(id) = self.selection.nodes.iter().next().cloned() {
-                        if let Some(action) = menu.node_menu(ui) {
+                        let open = Self::open_target(canvas, &id);
+                        if let Some(action) = menu.node_menu(ui, open) {
                             self.apply_node_menu(action, &id, canvas, out);
                         }
                     }
@@ -1068,11 +1120,26 @@ impl CanvasView {
         });
     }
 
+    /// Whether node `id` has a target the host can open in a new tab — a File
+    /// node with a non-empty path or a Link node with a non-empty URL. Text and
+    /// group nodes (and empty File/Link targets) have nothing to open. Drives the
+    /// enabled state of the "Open in new tab" menu item. status: canvas-open-in-new-tab
+    fn open_target(canvas: &Canvas, id: &str) -> menu::NodeOpenTarget {
+        use hiker_canvas::model::NodeKind;
+        let openable = canvas.nodes.iter().find(|n| n.id == id).is_some_and(|n| match &n.kind {
+            NodeKind::File { file, .. } => !file.trim().is_empty(),
+            NodeKind::Link { url } => !url.trim().is_empty(),
+            NodeKind::Text { .. } | NodeKind::Group { .. } => false,
+        });
+        if openable { menu::NodeOpenTarget::Openable } else { menu::NodeOpenTarget::None }
+    }
+
     /// Apply a chosen node-menu verb through the widget's existing pipeline:
     /// zoom verbs mutate the card's view state; `Delete` runs the same selection
-    /// delete + undo recording as the toolbar. status: ctxmenu-canvas
+    /// delete + undo recording as the toolbar; `OpenInNewTab` is reported as a
+    /// host request. status: ctxmenu-canvas
     fn apply_node_menu(&mut self, action: menu::NodeMenuAction, id: &str, canvas: &mut Canvas, out: &mut CanvasResponse) {
-        use crate::menu::NodeMenuAction::{Delete, ResetZoom, ZoomIn, ZoomOut};
+        use crate::menu::NodeMenuAction::{Delete, OpenInNewTab, ResetZoom, ZoomIn, ZoomOut};
         match action {
             ZoomIn | ZoomOut | ResetZoom => {
                 let entry = self.card_views.entry(id.to_owned()).or_default();
@@ -1082,6 +1149,7 @@ impl CanvasView {
                     _ => 1.0,
                 };
             }
+            OpenInNewTab => out.request_open_in_new_tab = Some(id.to_owned()),
             Delete => {
                 let mut sel = Selection::default();
                 sel.nodes.insert(id.to_owned());
@@ -1171,6 +1239,51 @@ mod tests {
         // Default camera: pan (0,0), scale 1 — so a screen point maps to the same
         // world point offset from the viewport origin.
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0))
+    }
+
+    /// A node of `kind` with id `id` at the origin, for openability tests.
+    fn node_with(id: &str, kind: NodeKind) -> Node {
+        Node {
+            id: id.into(),
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            color: None,
+            kind,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn open_target_openable_only_for_nonempty_file_and_link() {
+        use crate::menu::NodeOpenTarget;
+        let mut canvas = Canvas::default();
+        canvas.nodes.push(node_with("file", NodeKind::File { file: "notes/a.md".into(), subpath: None }));
+        canvas.nodes.push(node_with("file-empty", NodeKind::File { file: "  ".into(), subpath: None }));
+        canvas.nodes.push(node_with("link", NodeKind::Link { url: "https://x".into() }));
+        canvas.nodes.push(node_with("link-empty", NodeKind::Link { url: String::new() }));
+        canvas.nodes.push(node_with("text", NodeKind::Text { text: "hi".into() }));
+
+        assert_eq!(CanvasView::open_target(&canvas, "file"), NodeOpenTarget::Openable);
+        assert_eq!(CanvasView::open_target(&canvas, "link"), NodeOpenTarget::Openable);
+        assert_eq!(CanvasView::open_target(&canvas, "file-empty"), NodeOpenTarget::None);
+        assert_eq!(CanvasView::open_target(&canvas, "link-empty"), NodeOpenTarget::None);
+        assert_eq!(CanvasView::open_target(&canvas, "text"), NodeOpenTarget::None);
+        assert_eq!(CanvasView::open_target(&canvas, "missing"), NodeOpenTarget::None);
+    }
+
+    #[test]
+    fn apply_node_menu_open_in_new_tab_reports_request() {
+        use crate::menu::NodeMenuAction;
+        let mut view = CanvasView::new();
+        let mut canvas = Canvas::default();
+        canvas.nodes.push(node_with("n1", NodeKind::File { file: "notes/a.md".into(), subpath: None }));
+        let mut out = CanvasResponse::default();
+        view.apply_node_menu(NodeMenuAction::OpenInNewTab, "n1", &mut canvas, &mut out);
+        assert_eq!(out.request_open_in_new_tab.as_deref(), Some("n1"));
+        // No edit was committed — opening is a host request, not a canvas mutation.
+        assert!(out.committed.is_empty());
     }
 
     #[test]

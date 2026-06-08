@@ -41,7 +41,7 @@ pub mod diagram_diagnostics;
 pub mod disk_cache;
 pub mod edit_preview;
 pub(crate) mod render;
-pub mod tables;
+pub mod inline; pub mod tables;
 
 use std::collections::HashMap;
 
@@ -711,7 +711,7 @@ fn theme_fg(theme: Option<&Theme>) -> [u8; 4] {
 }
 
 /// True if the main cursor's line intersects the span's lines (inline reveal).
-fn line_active(state: &EditorState, range: &std::ops::Range<usize>) -> bool {
+pub(super) fn line_active(state: &EditorState, range: &std::ops::Range<usize>) -> bool {
     let doc_len = state.doc.len_bytes();
     let cursor = state.selection.main().head.offset();
     let cursor_line = state.doc.byte_to_line(cursor.min(doc_len));

@@ -18,6 +18,7 @@ members = [
     "tools/dagre-compare",
     "tools/wavedrom-compare",
     "tools/diff-overlay-snapshot",
+    "tools/table-snapshot",
     "tools/graph-snapshot",
     "tools/minimap-render",
     "tools/profile-buffer",
@@ -26,6 +27,9 @@ members = [
     "tools/profile-scroll",
     "widgets/graph-widgets",
     "widgets/graph-view",
+    # Generic project-sourcing/binding layer (notes → source descriptors + thin git). Decoupled
+    # from code-intel — it's a first-class hiker crate, not part of the engine. status: hiker-projects
+    "hiker-projects",
 ]
 # `hiker-crawler` is the JS-capable companion app (docs/hiker-crawler.md),
 # excluded because its optional CEF engine links a C++ Chromium FFI binding
@@ -42,7 +46,13 @@ members = [
 # is the grammar-of-graphics chart engine submodule (its own workspace root +
 # nested `[patch.crates-io]` winit fork); consumed here as path deps via
 # `[workspace.dependencies]` (hiker-charts-core/-plotters/-gui).
-exclude = ["hiker-crawler", "editor", "egui-workbench", "hiker-render", "hiker-charts"]
+# `code-intel` is the code-intelligence + spec-linking engine (spec-engine + hiker-code +
+# hiker-projects + code-cli), kept as a self-contained sub-workspace with its own
+# `[workspace]` root — same pattern as the submodule workspaces above. The app consumes its
+# UI-free crates as path deps (see `[workspace.dependencies]` below); the UI-coupled graph
+# `Source` lands in `app` once the render submodules are present. See
+# code-intel/code-intelligence-vision.md + code-intel/hiker-integration-plan.md.
+exclude = ["hiker-crawler", "editor", "egui-workbench", "hiker-render", "hiker-charts", "code-intel"]
 
 [workspace.package]
 version = "0.0.0"
@@ -52,6 +62,13 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 hiker-core = { path = "core" }
+# Code-intelligence + spec-linking engine (the `code-intel/` sub-workspace). UI-free crates the
+# app wires in for the code-graph Source + spec linking (hiker-integration-plan.md item G). The
+# dependency is one-way: hiker-app → hiker-code/hiker-projects → spec-engine.
+spec-engine = { path = "code-intel/spec-engine" }
+hiker-code = { path = "code-intel/hiker-code" }
+# hiker-projects is a top-level hiker crate (decoupled from code-intel), not under code-intel/.
+hiker-projects = { path = "hiker-projects" }
 # Grammar-of-graphics chart engine (the `hiker-charts` submodule). Three
 # egui-/eframe-free crates: `-core` (spec + CSV typing + resolve + the
 # `DataResolver` host seam), `-plotters` (the only plotters consumer; SVG-string

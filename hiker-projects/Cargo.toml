@@ -1,0 +1,14 @@
+[package]
+name = "hiker-projects"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Generic sourcing/binding layer: a project note binds N heterogeneous external sources (a code
+# repo, a docs folder, a future Jira mirror) and locates each source's data/index. Deliberately
+# dependency-light and decoupled from code intelligence — it only parses notes into typed source
+# *descriptors* + thin git metadata; consumers (the app, hiker-code, …) instantiate whatever
+# adapter a descriptor calls for. See docs/hiker-projects.md.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12" # matches hiker's workspace YAML dep (frontmatter parsing)

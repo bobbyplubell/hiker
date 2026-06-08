@@ -64,6 +64,26 @@ Hovering a resolved wikilink for ~400ms shows a small scrollable preview card wi
 - **Module placement.** Hover detection + card lifecycle live in the wikilink decoration layer; body resolution reuses the indexer's read path; painting reuses the shared card helper.
 
 
+## Heading anchors
+
+A link may target a heading inside a note, not just the note itself: `[[Page#Heading]]` opens the note and scrolls to the heading; `[[#Heading]]` is a same-document anchor that scrolls within the current note without opening anything. [wikilink-headings-blocks]
+
+- **Anchor split.** The `#section` trailer is split off the target before resolution (`split_target_section`): the page part (before the first `#`) resolves to a note exactly as a page-level link does — the anchor never changes *which* note a link points at, only where navigation lands. An empty page (a bare `#Heading`) means "this document."
+- **Slug matching.** The anchor is matched against the note's headings by **GitHub's heading-slug algorithm** (`heading_slug`): lowercase, drop every character outside `[a-z0-9 -]`, turn whitespace runs into single hyphens. The first ATX heading (`#`…`######`) whose slug equals the anchor's slug wins; fenced code blocks are skipped so a `#` inside a ``` fence is never read as a heading. Slug matching means an anchor copied from a rendered view (`#some-heading`) resolves the same as one typed against the heading text (`#Some Heading`).
+- **Navigation.** Resolution yields the heading's byte offset; the caret is placed there and a scroll-into-view is requested, so the heading sits near the top of the viewport once the (possibly just-opened) buffer's layout is built. `[[#Heading]]` scrolls the current buffer directly.
+- **Graceful miss.** An anchor that matches no heading is a no-op for scrolling — the note still opens at the top rather than erroring. A `Page#Heading` whose *page* is unresolved follows the normal unresolved/create flow.
+- **Block anchors** (`[[Name#^block]]`, which need an auto-injected anchor in the target) stay deferred.
+
+
+## GitHub-style markdown links
+
+Standard CommonMark inline links `[text](target)` to vault notes resolve and navigate through the *same* path resolution and heading-anchor logic as `[[…]]` — there is one resolver, not two. [markdown-link-vault-nav]
+
+- **Vault vs external.** A markdown link whose destination is non-external — not `http(s)://`, `mailto:`, or `zim://` — is treated as a vault target: a bare name, a relative path, or either with a `#section` anchor (`[text](Page#Section)`, `[text](#Section)`). External-destination links keep the standard markdown rendering and the OS-open behavior; only vault-target links become clickable note pills.
+- **Shared resolution.** The page part resolves through `wikilink::resolve_path` (bare-name / explicit-path / ambiguity policy) and the `#section` anchor through the same `heading_slug` matching as wikilinks. Click handling funnels both link kinds into one open path, so ambiguity policy, create-on-miss, and heading scroll all behave identically.
+- **Rendering.** A vault-target link renders as a pill labelled with its own `[text]` (markdown links carry their display text directly, unlike wikilinks which resolve a title); a destination the index can't place renders in the unresolved style. The pill rides the existing wikilink click path rather than a separate plumbing layer.
+
+
 ## Backlinks
 
 The structural index records each resolved wikilink as a typed edge (source path → target path). The set of notes linking *to* the active note is surfaced in the discovery panel alongside search results and related notes (`search.md`). Backlinks rewrite naturally when either endpoint renames — both halves go through the rename-rewrite pass. [wikilink-backlinks]
@@ -87,7 +107,7 @@ Path-form is the single representation every link producer emits:
 
 ## Deferred
 
-- **Heading and block targets** — `[[Name#Heading]]` and `[[Name#^block]]`, the latter needing an auto-injected block anchor in the target. Page-level links ship first. [wikilink-headings-blocks]
+- **Block targets** — `[[Name#^block]]`, which needs an auto-injected block anchor in the target. Heading anchors (`[[Name#Heading]]`) ship now; block anchors stay deferred. [wikilink-headings-blocks]
 - **Embeds / transclusion** — `![[Name]]` rendering the target's content (or an image/PDF) inline rather than as a link. [wikilink-embed]
 - **Bloom-filter optimization** for referrer enumeration on rename — `wikilink-rename-bloom-filter-deferred`. Build the straightforward index-driven version first; add the filter if profiling shows it matters.
 

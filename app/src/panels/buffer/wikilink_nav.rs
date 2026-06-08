@@ -31,7 +31,16 @@ use crate::state::{AppState, ToastLevel};
 pub(crate) fn title_resolver(
     _read_store: Arc<Mutex<Store>>,
 ) -> impl Fn(&str) -> Option<String> {
-    move |target: &str| Some(wikilink::title_for_path(target).to_string())
+    move |target: &str| {
+        // Strip any `#section` anchor so the pill shows the page title, not the
+        // raw `Page#Heading` body. status: wikilink-headings-blocks
+        let (page, section) = wikilink::split_target_section(target);
+        if page.is_empty() {
+            // A same-document `[[#Heading]]` anchor: label it with the heading.
+            return section.map(str::to_string);
+        }
+        Some(wikilink::title_for_path(page).to_string())
+    }
 }
 
 /// Dispatch this frame's wikilink pill clicks. Each tagged id carries the
@@ -70,12 +79,66 @@ pub(crate) fn handle_clicks(
 ///
 /// status: wikilink-click-open
 fn open_at(app: &mut AppState, text: &str, offset: usize, sticky: bool) {
-    let Some(link) = wikilink::parse_links(text)
+    // The click id's offset is the start of either a `[[…]]` wikilink or a
+    // `[label](dest)` vault-target markdown link (`markdown-link-vault-nav`).
+    // Prefer the wikilink parse; fall back to the markdown-link dest.
+    let target = wikilink::parse_links(text)
         .into_iter()
         .find(|l| l.span.start == offset)
-    else {
+        .map(|l| l.target)
+        .or_else(|| markdown_link_dest_at(text, offset));
+    let Some(target) = target else { return };
+    open_target(app, text, &target, sticky);
+}
+
+/// The destination of a `[label](dest)` markdown link whose `[` is at `offset`,
+/// when one is well-formed there. Mirrors `editor_md::links::parse_md_link`'s
+/// single-line rule so the click handler and the decoration agree on spans.
+fn markdown_link_dest_at(text: &str, offset: usize) -> Option<String> {
+    let rest = text.get(offset..)?;
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let close = rest[1..].find([']', '\n'])?;
+    if rest.as_bytes().get(1 + close) != Some(&b']') {
+        return None;
+    }
+    let after = &rest[close + 2..];
+    let dest = after.strip_prefix('(')?;
+    let end = dest.find([')', '\n'])?;
+    if dest.as_bytes().get(end) != Some(&b')') {
+        return None;
+    }
+    let dest = dest[..end].trim();
+    (!dest.is_empty()).then(|| dest.to_owned())
+}
+
+/// Resolve a wikilink / markdown-link `target` (which may carry a `#section`
+/// anchor) against the active buffer's `text` and open it, scrolling to the
+/// heading when a section is present.
+///
+/// Three cases (`wikilink-headings-blocks`):
+/// - A bare `#Section` (empty page) is a same-document anchor: stay in the
+///   current buffer and scroll to the heading; no note open.
+/// - `Page#Section` opens the page (or creates it when unresolved) and scrolls
+///   to the heading once the new buffer's height map is built.
+/// - `Page` (no section) is the existing page-level open.
+///
+/// status: wikilink-headings-blocks
+fn open_target(app: &mut AppState, text: &str, target: &str, sticky: bool) {
+    let (page, section) = wikilink::split_target_section(target);
+
+    // Same-document anchor: `[[#Section]]` / `[text](#Section)`.
+    if page.is_empty() {
+        if let Some(section) = section
+            && let Some(active) = active_buffer_path(app)
+            && let Some(byte) = wikilink::find_heading_byte(text, section)
+        {
+            scroll_buffer_to_byte(app, &active, byte);
+        }
         return;
-    };
+    }
 
     let paths = app
         .vault_session
@@ -88,20 +151,58 @@ fn open_at(app: &mut AppState, text: &str, offset: usize, sticky: bool) {
         .read()
         .map(|c| c.wikilinks.ambiguous_resolution.into())
         .unwrap_or(AmbiguityPolicy::Unresolved);
-    let referrer = app
-        .session
-        .active_tab
-        .and_then(|id| app.tab_by_id(id).and_then(|t| t.buffer_path().map(str::to_string)));
-    match wikilink::resolve_path(&paths, &link.target, policy, referrer.as_deref()) {
-        Resolution::Resolved(path) => crate::editor_pane::open_file(app, &path, sticky),
+    let referrer = active_buffer_path(app);
+    match wikilink::resolve_path(&paths, page, policy, referrer.as_deref()) {
+        Resolution::Resolved(path) => {
+            crate::editor_pane::open_file(app, &path, sticky);
+            if let Some(section) = section {
+                scroll_open_buffer_to_section(app, &path, section);
+            }
+        }
         Resolution::Ambiguous(_) => app.push_toast(
             format!(
-                "Multiple notes named \u{201c}{}\u{201d} \u{2014} pick one via the [[ menu",
-                link.target
+                "Multiple notes named \u{201c}{page}\u{201d} \u{2014} pick one via the [[ menu",
             ),
             ToastLevel::Warn,
         ),
-        Resolution::Unresolved => create_and_open(app, &link.target, sticky),
+        Resolution::Unresolved => create_and_open(app, page, sticky),
+    }
+}
+
+/// The active tab's buffer path, when it has one.
+fn active_buffer_path(app: &AppState) -> Option<String> {
+    app.session
+        .active_tab
+        .and_then(|id| app.tab_by_id(id).and_then(|t| t.buffer_path().map(str::to_string)))
+}
+
+/// Place the caret at `byte` in the buffer at `path` and request a
+/// scroll-into-view, so the heading lands near the top of the viewport on the
+/// next paint (the widget consumes `scroll_caret_into_view` after its measure
+/// pass once the height map reflects the doc). status: wikilink-headings-blocks
+fn scroll_buffer_to_byte(app: &mut AppState, path: &str, byte: usize) {
+    if let Some(buffer) = app.session.buffers.get_mut(path) {
+        let clamped = byte.min(buffer.editor.doc.len_bytes());
+        buffer.editor.selection = editor_core::selection::Selection::single(clamped);
+        buffer.view.scroll_caret_into_view = true;
+    }
+}
+
+/// After opening `path`, find the heading matching `section` in its (possibly
+/// just-loaded) buffer text and scroll to it. A `section` that matches no
+/// heading is a graceful no-op — the note simply opens at the top.
+/// status: wikilink-headings-blocks
+fn scroll_open_buffer_to_section(app: &mut AppState, path: &str, section: &str) {
+    let Some(text) = app
+        .session
+        .buffers
+        .get(path)
+        .map(crate::buffer::Buffer::current_text)
+    else {
+        return;
+    };
+    if let Some(byte) = wikilink::find_heading_byte(&text, section) {
+        scroll_buffer_to_byte(app, path, byte);
     }
 }
 

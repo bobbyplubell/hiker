@@ -31,7 +31,9 @@ use editor_view::viewport::{DecorationLayers, ViewState};
 use hiker_canvas::model::{Node, NodeKind};
 
 use canvas_view::content::{CardView, NodeContentRenderer};
-use canvas_view::menu::{CanvasMenuRenderer, EdgeMenuAction, EmptyMenuAction, NodeMenuAction};
+use canvas_view::menu::{
+    CanvasMenuRenderer, EdgeMenuAction, EmptyMenuAction, NodeMenuAction, NodeOpenTarget,
+};
 
 /// A hosted read-only editor for one node's markdown / text body, plus the
 /// fingerprint of the content it was built for.
@@ -130,6 +132,12 @@ impl NodeContentRenderer for ProfRenderer {
         let elapsed = t0.elapsed().as_micros();
         self.content_micros.set(self.content_micros.get() + elapsed);
         scroll
+    }
+
+    /// The content fingerprint hash, so the view's idle-card cache can reuse a
+    /// still card's recorded shapes — the realistic steady state to profile.
+    fn body_signature(&mut self, node: &Node) -> Option<u64> {
+        self.body_for(node).map(|(_, fp, _)| hash(&fp))
     }
 }
 
@@ -235,7 +243,7 @@ fn hash(text: &str) -> u64 {
 pub struct NoMenus;
 
 impl CanvasMenuRenderer for NoMenus {
-    fn node_menu(&mut self, _ui: &mut egui::Ui) -> Option<NodeMenuAction> {
+    fn node_menu(&mut self, _ui: &mut egui::Ui, _target: NodeOpenTarget) -> Option<NodeMenuAction> {
         None
     }
 

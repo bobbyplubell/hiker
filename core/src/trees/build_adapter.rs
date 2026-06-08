@@ -39,21 +39,25 @@ pub fn persist(
         .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
     let method_json = serde_json::to_string(&result.method)
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
-    let tree_id = trees
-        .insert_tree(TreeInsert {
-            id: None,
-            name: name.to_string(),
-            source: source.to_string(),
-            state: "draft".to_string(),
-            scope_json,
-            method_json,
-            vault_snapshot: None,
-        })
-        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
     let inserts = node_inserts(&result.tree);
-    trees
-        .insert_nodes(&tree_id, &inserts)
-        .map_err(|e| BuildError::Summarizer(format!("insert_nodes: {e}")))?;
+    // Single atomic write: tree + nodes together. The old insert_tree (empty)
+    // → insert_nodes two-step landed nodes as an op-log diff of the empty→full
+    // frontmatter, which could corrupt the `nodes:` block. status:
+    // cluster-review-tab-confirm-single-path
+    let tree_id = trees
+        .insert_tree_with_nodes(
+            TreeInsert {
+                id: None,
+                name: name.to_string(),
+                source: source.to_string(),
+                state: "draft".to_string(),
+                scope_json,
+                method_json,
+                vault_snapshot: None,
+            },
+            &inserts,
+        )
+        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
     Ok(tree_id)
 }
 
@@ -97,17 +101,19 @@ pub fn rebuild_and_persist(
         .map_err(|e| BuildError::Summarizer(format!("scope serialize: {e}")))?;
     let method_json = serde_json::to_string(&result.method)
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
-    let new_tree_id = trees
-        .insert_tree(TreeInsert {
-            id: None,
-            name: new_name.to_string(),
-            source: old_row.source.clone(),
-            state: "draft".to_string(),
-            scope_json,
-            method_json,
-            vault_snapshot: None,
-        })
-        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
+    // Tree row is created together with its nodes in one atomic write at the
+    // end (after merge-preservation rewrites the inserts) so there is never an
+    // empty-nodes intermediate, and the nodes never land as an op-log diff of
+    // the empty→full frontmatter. status: cluster-review-tab-confirm-single-path
+    let new_tree = TreeInsert {
+        id: None,
+        name: new_name.to_string(),
+        source: old_row.source.clone(),
+        state: "draft".to_string(),
+        scope_json,
+        method_json,
+        vault_snapshot: None,
+    };
 
     let mut inserts = node_inserts(&result.tree);
 
@@ -236,9 +242,9 @@ pub fn rebuild_and_persist(
         }
     }
 
-    trees
-        .insert_nodes(&new_tree_id, &inserts)
-        .map_err(|e| BuildError::Summarizer(format!("insert_nodes: {e}")))?;
+    let new_tree_id = trees
+        .insert_tree_with_nodes(new_tree, &inserts)
+        .map_err(|e| BuildError::Summarizer(format!("insert_tree: {e}")))?;
     Ok(new_tree_id)
 }
 

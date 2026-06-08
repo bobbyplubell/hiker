@@ -17,13 +17,15 @@
 use std::sync::Arc;
 
 use editor_core::decoration::{
-    BlockPaint, BlockWidget, Color, Decoration, Set as DecorationSet, TextAlign, WidgetClickRegion,
+    BlockPaint, BlockWidget, Color, Decoration, Set as DecorationSet, StyledRun, TextAlign,
+    WidgetClickRegion,
 };
 use editor_core::rangeset::RangeSet;
 use editor_core::state::Editor as EditorState;
 use editor_core::theme::Theme;
 use editor_md::tables::{ColumnAlign, table_spans};
 
+use super::inline::{Colors as InlineColors, parse_runs};
 use super::{cursor_inside, emit_block_widget, selection_overlaps};
 
 /// Build the table-widget decoration layer for the current editor state.
@@ -125,8 +127,96 @@ const RULE_W: f32 = 1.0;
 /// painter owns the real font). A monospace-ish overestimate keeps text inside
 /// its cell rather than clipping.
 const CHAR_W_RATIO: f32 = 0.52;
+/// Width multiplier for **bold** runs. The painter renders bold via a faux-bold
+/// double-paint (`editor-egui` registers no bold family), so a bold run lays out
+/// a touch wider than its plain glyphs; reserve for it so a bold header like
+/// `WaveDrom` doesn't overflow `max_width` and wrap. Tuned against the real
+/// `editor-egui` painter via `tools/table-snapshot`.
+const BOLD_W_FACTOR: f32 = 1.12;
+/// Width multiplier for inline `code` runs. They render in the Monospace family,
+/// whose glyphs are wider than the proportional `CHAR_W_RATIO` estimate; without
+/// this a code cell (e.g. a fenced-block label) overflows its column and wraps.
+/// Tuned against the real painter via `tools/table-snapshot`.
+const CODE_W_FACTOR: f32 = 1.25;
+/// Small safety margin on every style-aware width measure, so the egui-free
+/// estimate reserves slightly more than the real galley needs — the painter then
+/// fits the content on one line rather than wrapping at the column boundary.
+const WIDTH_SAFETY: f32 = 1.06;
 /// Line height as a multiple of font size.
 const LINE_H_RATIO: f32 = 1.35;
+
+/// One table cell: its inline-markdown styled runs (markers stripped, ready for
+/// [`BlockPaint::RichText`]). The egui-free width / wrap measure reads the runs
+/// directly (per-run style multipliers: bold / monospace render wider), so the
+/// reserve and the painted galley agree without a separately-cached string.
+struct Cell {
+    runs: Vec<StyledRun>,
+}
+
+impl Cell {
+    fn parse(raw: &str, colors: InlineColors) -> Self {
+        Self { runs: parse_runs(raw, colors) }
+    }
+
+
+    /// Style-aware natural (unwrapped) content width in logical pt, excluding
+    /// cell padding. Sums each run's width with its style multiplier (bold /
+    /// monospace render wider than the flat `CHAR_W_RATIO`), then applies
+    /// [`WIDTH_SAFETY`] so the reserve sits slightly above the real galley and
+    /// the painter doesn't wrap at the boundary.
+    fn natural_content_width(&self, char_w: f32) -> f32 {
+        let raw: f32 = self.runs.iter().map(|r| run_width(r, char_w)).sum();
+        raw * WIDTH_SAFETY
+    }
+
+    /// Style-aware floor (longest unbreakable word) content width in logical pt,
+    /// excluding padding. A word's style follows the run it lives in; a word
+    /// spanning runs (no whitespace between them, e.g. a bold name touching a
+    /// plain suffix) takes the max factor across the runs it overlaps, an
+    /// over-reserve that's safe (the painter never needs more). Applies
+    /// [`WIDTH_SAFETY`] like the natural measure.
+    fn floor_content_width(&self, char_w: f32) -> f32 {
+        // Build the visible text with per-char style factors, then scan words.
+        let mut chars: Vec<(char, f32)> = Vec::new();
+        for run in &self.runs {
+            let factor = run_factor(run);
+            for ch in run.text.chars() {
+                chars.push((ch, factor));
+            }
+        }
+        let mut longest = 0.0_f32;
+        let mut cur = 0.0_f32;
+        for (ch, factor) in chars {
+            if ch.is_whitespace() {
+                cur = 0.0;
+            } else {
+                cur += char_w * factor;
+                if cur > longest {
+                    longest = cur;
+                }
+            }
+        }
+        longest * WIDTH_SAFETY
+    }
+}
+
+/// Per-character width multiplier for a run's style (bold faux-bold / monospace
+/// `code` both wider than plain proportional). `code` dominates `bold` when a run
+/// is somehow both.
+const fn run_factor(run: &StyledRun) -> f32 {
+    if run.code {
+        CODE_W_FACTOR
+    } else if run.bold {
+        BOLD_W_FACTOR
+    } else {
+        1.0
+    }
+}
+
+/// Style-aware width (logical pt, no padding) of one run's text on a single line.
+fn run_width(run: &StyledRun, char_w: f32) -> f32 {
+    run.text.chars().count() as f32 * char_w * run_factor(run)
+}
 
 /// One parsed table: header cells, body rows, and per-column alignment. Built
 /// from the raw pipe-and-dash source by [`parse_table`]. `header_ends` /
@@ -134,19 +224,23 @@ const LINE_H_RATIO: f32 = 1.35;
 /// past that cell's content (its trimmed-content end) — the caret target for a
 /// cell click (`widget-table-cell-edit`), parallel to `header` / `rows`.
 struct Table {
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
+    header: Vec<Cell>,
+    rows: Vec<Vec<Cell>>,
     aligns: Vec<ColumnAlign>,
     header_ends: Vec<usize>,
     row_ends: Vec<Vec<usize>>,
 }
 
 /// Theme-derived colors for the painted grid (`widget-render-theme-color`).
+/// `inline` carries the per-run palette the cells' inline-markdown parse needs
+/// (base text, link, code background) so a `**bold**` / `[link]` cell renders in
+/// the same colors as surrounding prose.
 #[derive(Clone, Copy)]
 struct TableColors {
     text: Color,
     header_bg: Color,
     rule: Color,
+    inline: InlineColors,
 }
 
 const fn table_colors(theme: Option<&Theme>) -> TableColors {
@@ -155,11 +249,21 @@ const fn table_colors(theme: Option<&Theme>) -> TableColors {
             text: t.palette.fg,
             header_bg: t.markdown.code_bg,
             rule: with_alpha(t.palette.fg, 80),
+            inline: InlineColors {
+                text: t.palette.fg,
+                link: t.markdown.link,
+                code_bg: t.markdown.code_bg,
+            },
         },
         None => TableColors {
             text: Color::rgb(40, 40, 40),
             header_bg: Color::rgba(170, 120, 220, 25),
             rule: Color::rgba(120, 120, 120, 120),
+            inline: InlineColors {
+                text: Color::rgb(40, 40, 40),
+                link: Color::rgb(0, 90, 200),
+                code_bg: Color::rgba(120, 120, 120, 30),
+            },
         },
     }
 }
@@ -208,8 +312,8 @@ impl TableWidget {
         aligns: &[ColumnAlign],
         font_px: f32,
     ) -> Option<Self> {
-        let table = parse_table(source, aligns)?;
         let colors = table_colors(theme);
+        let table = parse_table(source, aligns, colors.inline)?;
         let content_hash = hash_table(source, &colors, font_px);
         // Flatten the per-cell content-end offsets in the same row-major order
         // `cell_boxes` / `paint_list` iterate (header first, then each row).
@@ -264,16 +368,10 @@ impl TableWidget {
         let pad = CELL_PAD_X * 2.0;
         let mut natural = vec![0.0_f32; cols];
         let mut floor = vec![0.0_f32; cols];
-        let mut consider = |cells: &[String]| {
+        let mut consider = |cells: &[Cell]| {
             for (i, cell) in cells.iter().enumerate().take(cols) {
-                let longest_word = cell
-                    .split_whitespace()
-                    .map(str::chars)
-                    .map(Iterator::count)
-                    .max()
-                    .unwrap_or(0);
-                let nat = cell.chars().count() as f32 * char_w + pad;
-                let flr = longest_word as f32 * char_w + pad;
+                let nat = cell.natural_content_width(char_w) + pad;
+                let flr = cell.floor_content_width(char_w) + pad;
                 if nat > natural[i] {
                     natural[i] = nat;
                 }
@@ -292,9 +390,21 @@ impl TableWidget {
             natural[i] = natural[i].max(floor[i]);
         }
         let nat_sum: f32 = natural.iter().sum();
-        if nat_sum <= total_width || nat_sum <= 0.0 {
+        if nat_sum <= 0.0 {
             return natural;
         }
+        if nat_sum <= total_width {
+            // Content fits: distribute the slack so the table fills the available
+            // width exactly. Slack goes proportionally to each column's natural
+            // width, so text-heavy columns grow more (a narrow label column stays
+            // tight, the prose columns absorb most of the stretch).
+            let slack = total_width - nat_sum;
+            return (0..cols)
+                .map(|i| natural[i] + slack * (natural[i] / nat_sum))
+                .collect();
+        }
+        // Overflow: shrink only the flexible part (natural − floor) toward the
+        // floors so no column drops below its longest word.
         let floor_sum: f32 = floor.iter().sum();
         let avail_flex = total_width - floor_sum;
         if avail_flex <= 0.0 {
@@ -307,57 +417,82 @@ impl TableWidget {
             .collect()
     }
 
-    /// Greedy word-wrap `text` into the visual lines it occupies in a column of
-    /// `width` logical pt at `font_px`. Whitespace is collapsed to single
-    /// spaces; a word wider than the column keeps its own line (no mid-word
-    /// break — `column_widths` sizes columns to the longest word). Always at
-    /// least one line (a single empty line for empty input). This is the single
-    /// source of truth for both the height measure ([`wrapped_line_count`]) and
-    /// the painted runs ([`paint_list`]), so they never disagree.
-    fn wrap_lines(text: &str, width: f32, font_px: f32) -> Vec<String> {
+    /// Style-aware number of visual lines a [`Cell`] occupies in a column of
+    /// `width` logical pt at `font_px`. Greedy word-wrap, but each word's width
+    /// uses its run's style multiplier (bold / monospace wider) just like
+    /// [`column_widths`], so the height estimate agrees with the style-aware
+    /// width reserve: with the wider columns those styles earn, a bold/code cell
+    /// estimates *fewer* (never more) wraps than the flat ratio would, so height
+    /// never under-reserves and clips. Always at least one line. The painter
+    /// still owns the true wrap; this only sizes the reserved box.
+    fn cell_line_count(cell: &Cell, width: f32, font_px: f32) -> usize {
         let char_w = font_px * CHAR_W_RATIO;
         let avail = (width - CELL_PAD_X * 2.0).max(char_w);
-        let cols = (avail / char_w).floor().max(1.0) as usize;
-        let mut lines: Vec<String> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_len = 0usize;
-        for word in text.split_whitespace() {
-            let wlen = word.chars().count();
-            if cur_len == 0 {
-                cur.push_str(word);
-                cur_len = wlen;
-            } else if cur_len + 1 + wlen <= cols {
-                cur.push(' ');
-                cur.push_str(word);
-                cur_len += 1 + wlen;
+        // Split the visible text into words, each carrying its widest style
+        // factor (a word straddling runs takes the max, matching the floor
+        // measure's safe over-reserve). Whitespace collapses to single spaces.
+        let words = Self::styled_words(cell);
+        let space_w = char_w; // a single inter-word space, plain width
+        let mut lines = 1usize;
+        let mut cur = 0.0_f32;
+        for (wlen, factor) in words {
+            let ww = wlen as f32 * char_w * factor;
+            if cur <= 0.0 {
+                cur = ww;
+            } else if cur + space_w + ww <= avail {
+                cur += space_w + ww;
             } else {
-                lines.push(std::mem::take(&mut cur));
-                cur.push_str(word);
-                cur_len = wlen;
+                lines += 1;
+                cur = ww;
             }
-        }
-        if lines.is_empty() || !cur.is_empty() {
-            lines.push(cur);
         }
         lines
     }
 
-    /// Number of visual lines `text` occupies in a column of `width` logical pt
-    /// at `font_px`. Always at least one. Delegates to [`wrap_lines`] so the
-    /// measured height matches the lines actually painted.
-    fn wrapped_line_count(text: &str, width: f32, font_px: f32) -> usize {
-        Self::wrap_lines(text, width, font_px).len()
+    /// The visible words of a cell as `(char_count, style_factor)`, where a word
+    /// spanning multiple runs takes the max style factor across the runs it
+    /// touches (a safe over-reserve). Whitespace separates words.
+    fn styled_words(cell: &Cell) -> Vec<(usize, f32)> {
+        let mut words: Vec<(usize, f32)> = Vec::new();
+        let mut len = 0usize;
+        let mut factor = 1.0_f32;
+        for run in &cell.runs {
+            let rf = run_factor(run);
+            for ch in run.text.chars() {
+                if ch.is_whitespace() {
+                    if len > 0 {
+                        words.push((len, factor));
+                        len = 0;
+                        factor = 1.0;
+                    }
+                } else {
+                    len += 1;
+                    factor = factor.max(rf);
+                }
+            }
+        }
+        if len > 0 {
+            words.push((len, factor));
+        }
+        words
     }
 
     /// Height (logical pt) of the row whose cells are `cells`, at `widths`.
-    fn row_height(cells: &[String], widths: &[f32], font_px: f32) -> f32 {
+    /// Measured egui-free off each cell's styled runs (markers already stripped)
+    /// via [`cell_line_count`](Self::cell_line_count), whose per-word width
+    /// honors bold / monospace styling — the same factors [`column_widths`] uses
+    /// to reserve the column. Because wider styles widen their column, the line
+    /// estimate is conservative (never more wraps than reserved), so the row
+    /// height doesn't under-reserve and clip. The painter owns the true wrap.
+    /// status: widget-table-render
+    fn row_height(cells: &[Cell], widths: &[f32], font_px: f32) -> f32 {
         let line_h = font_px * LINE_H_RATIO;
         let max_lines = cells
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let w = widths.get(i).copied().unwrap_or(0.0);
-                Self::wrapped_line_count(c, w, font_px)
+                Self::cell_line_count(c, w, font_px)
             })
             .max()
             .unwrap_or(1);
@@ -442,30 +577,30 @@ impl BlockWidget for TableWidget {
                     .get(i)
                     .copied()
                     .unwrap_or(ColumnAlign::None);
-                let (anchor_x, text_align) = match align {
-                    ColumnAlign::Right => (x + col_w - CELL_PAD_X, TextAlign::Right),
-                    ColumnAlign::Center => (x + col_w * 0.5, TextAlign::Center),
-                    ColumnAlign::Left | ColumnAlign::None => (x + CELL_PAD_X, TextAlign::Left),
+                let text_align = match align {
+                    ColumnAlign::Right => TextAlign::Right,
+                    ColumnAlign::Center => TextAlign::Center,
+                    ColumnAlign::Left | ColumnAlign::None => TextAlign::Left,
                 };
-                if !cell.is_empty() {
-                    // Wrap to the column width and paint one run per visual
-                    // line (same wrap as the height measure), stacking lines
-                    // down the cell so long content never spills into its
+                if !cell.runs.is_empty() {
+                    // One wrapping rich-text block per cell: the painter owns the
+                    // real wrap (the egui-free height measure above only
+                    // approximates it via character counts), and lays the styled
+                    // runs as a single multi-format galley inside the cell's
+                    // content box so inline markdown (bold/italic/code/strike/
+                    // link) renders in place. The block is anchored at the cell's
+                    // left content edge and aligned within `max_width`, so the
+                    // column's alignment is honored without spilling into the
                     // neighbor. status: widget-table-render
+                    let max_width = (col_w - CELL_PAD_X * 2.0).max(font_size);
                     let top = y + CELL_PAD_Y + (line_h - font_size) * 0.5;
-                    for (li, line) in Self::wrap_lines(cell, col_w, font_size).iter().enumerate() {
-                        if line.is_empty() {
-                            continue;
-                        }
-                        list.push(BlockPaint::Text {
-                            x: anchor_x,
-                            y: top + li as f32 * line_h,
-                            text: line.as_str().into(),
-                            color: self.colors.text,
-                            font_scale: 1.0,
-                            align: text_align,
-                        });
-                    }
+                    list.push(BlockPaint::RichText {
+                        x: x + CELL_PAD_X,
+                        y: top,
+                        runs: cell.runs.clone(),
+                        max_width,
+                        align: text_align,
+                    });
                 }
                 x += col_w;
             }
@@ -504,7 +639,7 @@ impl BlockWidget for TableWidget {
 /// Parse the raw pipe-table block into header + body rows + alignments, or
 /// `None` if there's no `|---|` delimiter (rule) row — i.e. it isn't a GFM
 /// table. The second non-blank line must be the delimiter row.
-fn parse_table(source: &str, aligns: &[ColumnAlign]) -> Option<Table> {
+fn parse_table(source: &str, aligns: &[ColumnAlign], inline: InlineColors) -> Option<Table> {
     // Non-blank raw lines paired with their byte offset within `source`, so each
     // cell's content-end can be reported as a source-relative offset
     // (`widget-table-cell-edit`). `split_inclusive` keeps the newline, so the
@@ -523,23 +658,23 @@ fn parse_table(source: &str, aligns: &[ColumnAlign]) -> Option<Table> {
     if !is_delimiter_row(lines[1].0) {
         return None;
     }
-    // Split a raw line into trimmed cell texts + their source-relative
-    // content-end offsets.
-    let split_abs = |&(raw, line_start): &(&str, usize)| -> (Vec<String>, Vec<usize>) {
-        let mut texts = Vec::new();
+    // Split a raw line into parsed cells (inline markdown → styled runs) + their
+    // source-relative content-end offsets.
+    let split_abs = |&(raw, line_start): &(&str, usize)| -> (Vec<Cell>, Vec<usize>) {
+        let mut cells = Vec::new();
         let mut ends = Vec::new();
         for (text, end) in split_row_cells(raw) {
-            texts.push(text);
+            cells.push(Cell::parse(&text, inline));
             ends.push(line_start + end);
         }
-        (texts, ends)
+        (cells, ends)
     };
     let (header, header_ends) = split_abs(&lines[0]);
     let mut rows = Vec::new();
     let mut row_ends = Vec::new();
     for line in &lines[2..] {
-        let (texts, ends) = split_abs(line);
-        rows.push(texts);
+        let (cells, ends) = split_abs(line);
+        rows.push(cells);
         row_ends.push(ends);
     }
     Some(Table { header, rows, aligns: aligns.to_vec(), header_ends, row_ends })
@@ -636,10 +771,27 @@ fn hash_table(source: &str, colors: &TableColors, font_px: f32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::inline::runs_text;
     use editor_core::selection::Selection;
 
     const FONT: f32 = 15.0;
     const DPR: f32 = 1.0;
+    const INLINE: InlineColors = InlineColors {
+        text: Color::rgb(40, 40, 40),
+        link: Color::rgb(0, 90, 200),
+        code_bg: Color::rgba(120, 120, 120, 30),
+    };
+
+    /// The visible text of each cell (markers stripped) for a row of [`Cell`]s.
+    fn cell_texts(cells: &[Cell]) -> Vec<String> {
+        cells.iter().map(|c| runs_text(&c.runs)).collect()
+    }
+
+    /// A plain (unstyled) cell from `text` — a single plain run — for the
+    /// style-free wrap / height assertions.
+    fn plain_cell(text: &str) -> Cell {
+        Cell { runs: vec![StyledRun::plain(text, INLINE.text)] }
+    }
 
     /// (block widgets, hide lines) for the table provider, mirroring the
     /// mermaid provider's `mermaid_counts`.
@@ -694,16 +846,54 @@ mod tests {
     #[test]
     fn parses_header_and_rows() {
         let src = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
-        let t = parse_table(src, &[ColumnAlign::None, ColumnAlign::None]).expect("a table");
-        assert_eq!(t.header, vec!["a", "b"]);
+        let t = parse_table(src, &[ColumnAlign::None, ColumnAlign::None], INLINE).expect("a table");
+        assert_eq!(cell_texts(&t.header), vec!["a", "b"]);
         assert_eq!(t.rows.len(), 2);
-        assert_eq!(t.rows[0], vec!["1", "2"]);
+        assert_eq!(cell_texts(&t.rows[0]), vec!["1", "2"]);
     }
 
     #[test]
     fn rejects_source_without_rule_row() {
         let src = "| a | b |\n| 1 | 2 |\n";
-        assert!(parse_table(src, &[]).is_none(), "no delimiter row → not a table");
+        assert!(parse_table(src, &[], INLINE).is_none(), "no delimiter row → not a table");
+    }
+
+    #[test]
+    fn cell_carries_inline_styled_runs() {
+        // status: widget-table-render — a `**bold**` cell parses to a styled run
+        // (markers stripped), not a literal `**bold**` string.
+        let src = "| h |\n|---|\n| **bold** and `code` |\n";
+        let t = parse_table(src, &[ColumnAlign::None], INLINE).expect("a table");
+        let cell = &t.rows[0][0];
+        assert_eq!(runs_text(&cell.runs), "bold and code", "visible text has markers stripped");
+        assert!(cell.runs.iter().any(|r| r.text == "bold" && r.bold), "{:?}", cell.runs);
+        assert!(cell.runs.iter().any(|r| r.text == "code" && r.code), "{:?}", cell.runs);
+    }
+
+    #[test]
+    fn paint_emits_rich_text_for_styled_cell() {
+        // status: widget-table-render — a styled cell paints as a RichText block
+        // (the wrapping multi-format galley), not flat per-line Text runs.
+        let src = "| a |\n|---|\n| *italic* x |\n";
+        let w = TableWidget::from_source(src, None, &[ColumnAlign::None], FONT).expect("a widget");
+        let list = w.paint_list(FONT, 400.0).unwrap();
+        let rich: Vec<&Vec<StyledRun>> = list
+            .iter()
+            .filter_map(|p| match p {
+                BlockPaint::RichText { runs, .. } => Some(runs),
+                _ => None,
+            })
+            .collect();
+        assert!(!rich.is_empty(), "styled cells render as RichText");
+        assert!(
+            rich.iter().any(|runs| runs.iter().any(|r| r.italic)),
+            "the italic run survives into the paint list",
+        );
+        // No literal markdown markers leak into any painted run.
+        assert!(
+            rich.iter().all(|runs| runs.iter().all(|r| !r.text.contains('*'))),
+            "markers stripped in paint",
+        );
     }
 
     #[test]
@@ -720,8 +910,8 @@ mod tests {
             "header background rect present"
         );
         assert!(
-            list.iter().any(|p| matches!(p, BlockPaint::Text { .. })),
-            "cell text runs present"
+            list.iter().any(|p| matches!(p, BlockPaint::RichText { .. })),
+            "cell rich-text runs present"
         );
         assert!(
             list.iter().any(|p| matches!(p, BlockPaint::Line { .. })),
@@ -738,7 +928,7 @@ mod tests {
         let aligns: Vec<TextAlign> = list
             .iter()
             .filter_map(|p| match p {
-                BlockPaint::Text { align, .. } => Some(*align),
+                BlockPaint::RichText { align, .. } => Some(*align),
                 _ => None,
             })
             .collect();
@@ -756,45 +946,43 @@ mod tests {
     }
 
     #[test]
-    fn long_cell_wraps_into_multiple_runs() {
+    fn long_cell_reserves_height_for_wrapped_lines() {
         // status: widget-table-render — a cell longer than its (overflow-shrunk)
-        // column paints as several stacked text runs, not one overflowing run,
-        // and the measured height reserves room for every line.
+        // column wraps; the painter owns the real wrap (one RichText per cell),
+        // so the egui-free height measure must reserve room for the multi-line
+        // wrap it estimates, and bound the cell's max_width to its column.
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
         let src = format!("| h | k |\n|---|---|\n| {long} | x |\n");
         let w = TableWidget::from_source(&src, None, &[ColumnAlign::None, ColumnAlign::None], FONT)
             .expect("a table widget");
         let width = 200.0;
-        let runs: Vec<(f32, f32)> = w
+        let col0 = w.column_widths(FONT, width)[0];
+        let line_count = TableWidget::cell_line_count(&plain_cell(long), col0, FONT);
+        assert!(line_count > 1, "the long cell should wrap to multiple lines");
+
+        // The body row's reserved height covers every estimated wrapped line.
+        let header_h = TableWidget::row_height(&w.table.header, &w.column_widths(FONT, width), FONT);
+        let total_h = w.measure(FONT, width);
+        let line_h = FONT * LINE_H_RATIO;
+        assert!(
+            total_h - header_h >= line_count as f32 * line_h,
+            "body row height ({}) reserves room for {line_count} wrapped lines",
+            total_h - header_h,
+        );
+
+        // The long cell paints as a single RichText bounded to its column width.
+        let max_widths: Vec<f32> = w
             .paint_list(FONT, width)
             .unwrap()
             .iter()
             .filter_map(|p| match p {
-                BlockPaint::Text { x, y, .. } => Some((*x, *y)),
+                BlockPaint::RichText { max_width, .. } => Some(*max_width),
                 _ => None,
             })
             .collect();
-        // The long body cell must occupy more than one line.
-        let line_count = TableWidget::wrapped_line_count(
-            long,
-            w.column_widths(FONT, width)[0],
-            FONT,
-        );
-        assert!(line_count > 1, "the long cell should wrap to multiple lines");
-        // Distinct y positions among the runs prove lines are stacked, not piled.
-        let distinct_ys = {
-            let mut ys: Vec<f32> = runs.iter().map(|&(_, y)| y).collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            ys.dedup();
-            ys.len()
-        };
-        assert!(distinct_ys >= line_count, "stacked runs at distinct y per wrapped line");
-        // Every painted run sits within the measured table height.
-        let total_h = w.measure(FONT, width);
-        let line_h = FONT * LINE_H_RATIO;
         assert!(
-            runs.iter().all(|&(_, y)| y + line_h <= total_h + 1e-3),
-            "all wrapped runs fit inside the measured height",
+            max_widths.iter().any(|&mw| mw <= col0 + 1e-3),
+            "a cell's rich-text max_width is bounded by its column ({col0})",
         );
     }
 
@@ -820,9 +1008,73 @@ mod tests {
         );
         // And that single-word cell therefore renders on one line.
         assert_eq!(
-            TableWidget::wrapped_line_count(word, widths[0], FONT),
+            TableWidget::cell_line_count(&plain_cell(word), widths[0], FONT),
             1,
             "the unbreakable label fits on one line in its protected column",
+        );
+    }
+
+    #[test]
+    fn fitting_table_stretches_to_full_width() {
+        // status: widget-table-render (Fix 1) — when the natural content fits, the
+        // columns absorb the slack so the table fills the available width exactly,
+        // instead of leaving empty space to the right.
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let w = TableWidget::from_source(src, None, &[ColumnAlign::None, ColumnAlign::None], FONT)
+            .expect("a table widget");
+        let total = 900.0;
+        let widths = w.column_widths(FONT, total);
+        let sum: f32 = widths.iter().sum();
+        assert!((sum - total).abs() < 1e-2, "columns fill the full width: sum {sum} != {total}");
+        // Slack is distributed proportionally, so a tiny two-column table splits
+        // the stretch roughly evenly (both columns hold the same content).
+        assert!((widths[0] - widths[1]).abs() < 1.0, "equal columns stretch equally");
+    }
+
+    #[test]
+    fn bold_cell_reserves_more_width_than_plain() {
+        // status: widget-table-render (Fix 2) — a bold cell measures wider than the
+        // same text plain, so its column reserves enough that the real (faux-bold)
+        // galley fits on one line instead of wrapping its last glyph.
+        let char_w = FONT * CHAR_W_RATIO;
+        let bold = Cell::parse("**WaveDrom**", INLINE);
+        let plain = Cell::parse("WaveDrom", INLINE);
+        assert_eq!(runs_text(&bold.runs), "WaveDrom", "markers stripped");
+        assert!(
+            bold.natural_content_width(char_w) > plain.natural_content_width(char_w),
+            "bold ({}) reserves more than plain ({})",
+            bold.natural_content_width(char_w),
+            plain.natural_content_width(char_w),
+        );
+        // And a `code` (monospace) run reserves more still than bold prose.
+        let codey = Cell::parse("`Vec<T>`", INLINE);
+        let prose = Cell::parse("Vec<T>", INLINE);
+        assert!(
+            codey.natural_content_width(char_w) > prose.natural_content_width(char_w),
+            "monospace code reserves more than plain proportional text",
+        );
+    }
+
+    #[test]
+    fn bold_header_stays_on_one_line_at_full_width() {
+        // status: widget-table-render (Fix 1 + 2) — the real regression: a bold
+        // "WaveDrom" header in a 3-column table, stretched to a wide page, must get
+        // a column wide enough that the style-aware measure keeps it on one line.
+        let src = "| WaveDrom | You write | Renders as |\n|---|---|---|\n\
+                   | **WaveDrom** | `wavedrom` | a timing diagram |\n";
+        let w = TableWidget::from_source(
+            src,
+            None,
+            &[ColumnAlign::None, ColumnAlign::None, ColumnAlign::None],
+            FONT,
+        )
+        .expect("a table widget");
+        let widths = w.column_widths(FONT, 1000.0);
+        let bold = Cell::parse("**WaveDrom**", INLINE);
+        assert_eq!(
+            TableWidget::cell_line_count(&bold, widths[0], FONT),
+            1,
+            "the bold WaveDrom header fits on one line in its widened column",
         );
     }
 
@@ -886,7 +1138,7 @@ mod tests {
         let widget =
             TableWidget::from_source(&src[span.byte_range.clone()], None, &span.aligns, FONT)
                 .expect("a table widget");
-        assert_eq!(widget.table.header[0], "a|b", "pipe unescaped in text");
+        assert_eq!(runs_text(&widget.table.header[0].runs), "a|b", "pipe unescaped in text");
         let off = span.byte_range.start + widget.cell_ends[0];
         assert_eq!(&src[..off], "| a\\|b", "offset is just past the source `b`");
     }
